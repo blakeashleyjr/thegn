@@ -197,16 +197,14 @@ fn stderr_with_timeout_stdin(
             Ok(Some(status)) => {
                 let feeder_result = feeder.join();
                 let waited = child.wait().ok()?;
-                if !matches!(feeder_result, Ok(Ok(()))) {
-                    return None;
-                }
+                let feeder_succeeded = matches!(feeder_result, Ok(Ok(())));
                 let err = child
                     .stderr
                     .take()
                     .and_then(read_stderr)
                     .unwrap_or_default();
                 return Some((
-                    status.success() && waited.success(),
+                    feeder_succeeded && status.success() && waited.success(),
                     redact_stderr(err, &redactions),
                 ));
             }
@@ -273,7 +271,9 @@ fn stderr_wait_after_input(
 
 fn redact_stderr(mut stderr: String, secrets: &[String]) -> String {
     for secret in secrets {
-        stderr = stderr.replace(secret, "[REDACTED]");
+        if secret.len() >= 8 {
+            stderr = stderr.replace(secret, "[REDACTED]");
+        }
     }
     stderr
 }
@@ -289,7 +289,7 @@ fn terminate_and_reap(child: &mut std::process::Child) {
 
 fn read_stderr(mut stderr: impl std::io::Read) -> Option<String> {
     let mut output = String::new();
-    stderr.read_to_string(&mut output).ok().map(|()| output)
+    stderr.read_to_string(&mut output).ok().map(|_| output)
 }
 
 /// Runtime backend (resolved from the config-facing [`SandboxBackend`]; this set
@@ -2216,7 +2216,11 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
         backend: spec.backend.label(),
     });
     let ssh_secret_env = ssh_oci_secret_env(spec);
-    let (argv, stdin) = oci_create_argv_and_stdin(spec, oci_create_opts(spec)?, &ssh_secret_env);
+    let (argv, stdin) = oci_create_argv_and_stdin(
+        spec,
+        oci_create_opts_with_ssh_secrets(spec, &ssh_secret_env)?,
+        &ssh_secret_env,
+    );
     // Keep the create's stderr: it is the only place the runtime says WHY, and
     // for the commonest macOS failure (a bind the VM cannot resolve) it names the
     // exact path. `run_control_owned` would drop it.
@@ -2260,10 +2264,9 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     // selection still produces a real container instead of forcing host use.
     if spec.backend == Backend::Podman {
         remove_container(spec);
-        let ssh_secret_env = ssh_oci_secret_env(spec);
         let (retry, stdin) = oci_create_argv_and_stdin(
             spec,
-            oci_create_opts_with_keep_id(spec, false)?,
+            oci_create_opts_with_keep_id_and_ssh_secrets(spec, false, &ssh_secret_env)?,
             &ssh_secret_env,
         );
         match stdin {
@@ -2923,15 +2926,15 @@ fn backend_enter_argv_with_env(
 /// Borrowed `(key, value)` env pairs from a spec's `env` map.
 type EnvPairs<'a> = Vec<(&'a String, &'a String)>;
 
-/// Split `spec.env` into (non-secret inline pairs, secret pairs) for local
-/// Borrowed `(key, value)` env pairs from a spec's `env` map.
+/// Split `spec.env` into inline and secret pairs for local placement.
 /// A pair whose value matches the launcher's own process env is a
 /// host-sourced passthrough secret (GH_TOKEN, API keys — see `resolve`'s
 /// env_passthrough) and MUST NOT ride the world-readable argv (`-e K=V` /
 /// `--setenv K=V` are visible in `/proc/*/cmdline`); it goes to a 0600
 /// env-file instead. Synthetic pairs (THEGN_SANDBOX, NIX_REMOTE — values absent
-/// from the host env) are not secrets and stay inline. Remote placements other
-/// than SSH retain inline delivery.
+/// from the host env) are not secrets and stay inline. SSH OCI secrets are
+/// classified separately for stdin delivery; other remote placements retain
+/// inline delivery.
 fn partition_secret_env(spec: &SandboxSpec) -> (EnvPairs<'_>, EnvPairs<'_>) {
     let mut inline: EnvPairs = Vec::new();
     let mut secret: EnvPairs = Vec::new();
@@ -2953,6 +2956,7 @@ fn ssh_oci_secret_env(spec: &SandboxSpec) -> EnvPairs<'_> {
     spec.env
         .iter()
         .filter(|(key, value)| std::env::var(key).ok().as_deref() == Some(value.as_str()))
+        .map(|(key, value)| (key, value))
         .collect()
 }
 
@@ -3012,6 +3016,14 @@ fn write_secret_env_file_in(
 /// OCI `run` options shared by the keep-alive container: mounts, network, env,
 /// and uid mapping so bind-mounted files stay host-owned.
 fn oci_create_opts(spec: &SandboxSpec) -> Result<Vec<String>, VolumeAdmissionError> {
+    let ssh_secret_env = ssh_oci_secret_env(spec);
+    oci_create_opts_with_ssh_secrets(spec, &ssh_secret_env)
+}
+
+fn oci_create_opts_with_ssh_secrets(
+    spec: &SandboxSpec,
+    ssh_secret_env: &[(&String, &String)],
+) -> Result<Vec<String>, VolumeAdmissionError> {
     admit_volumes(spec)?;
     let spec = &*sealed_view(spec);
     let mut v = Vec::new();
@@ -3140,7 +3152,6 @@ fn oci_create_opts(spec: &SandboxSpec) -> Result<Vec<String>, VolumeAdmissionErr
     // SSH creates feed the env-file body over the control process stdin. Other
     // remote placement kinds keep their existing inline delivery.
     let (inline_env, secret_env) = partition_secret_env(spec);
-    let ssh_secret_env = ssh_oci_secret_env(spec);
     let inline_env: EnvPairs<'_> = if ssh_secret_env.is_empty() {
         inline_env
     } else {
@@ -3248,6 +3259,15 @@ fn oci_create_opts_with_keep_id(
     spec: &SandboxSpec,
     keep_id: bool,
 ) -> Result<Vec<String>, VolumeAdmissionError> {
+    let ssh_secret_env = ssh_oci_secret_env(spec);
+    oci_create_opts_with_keep_id_and_ssh_secrets(spec, keep_id, &ssh_secret_env)
+}
+
+fn oci_create_opts_with_keep_id_and_ssh_secrets(
+    spec: &SandboxSpec,
+    keep_id: bool,
+    ssh_secret_env: &[(&String, &String)],
+) -> Result<Vec<String>, VolumeAdmissionError> {
     admit_volumes(spec)?;
     let mut v = Vec::new();
     match spec.backend {
@@ -3274,7 +3294,7 @@ fn oci_create_opts_with_keep_id(
     // All other opts (network, mounts, env, volumes, gpu, limits, ports) are
     // identical to oci_create_opts — delegate by temporarily re-routing:
     // build via oci_create_opts and strip the userns flag if present.
-    let mut full = oci_create_opts(spec)?;
+    let mut full = oci_create_opts_with_ssh_secrets(spec, ssh_secret_env)?;
     if spec.backend == Backend::Podman && !keep_id {
         // Drop "--userns" and "keep-id" (two consecutive entries).
         let mut out = Vec::with_capacity(full.len());
