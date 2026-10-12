@@ -51,6 +51,8 @@ enum ClientSlot {
     Live {
         client: Arc<LspClient>,
         generation: u64,
+        started_at: Instant,
+        failures: u32,
     },
     Unavailable,
     Starting {
@@ -66,6 +68,8 @@ enum ClientSlot {
 struct StartCell {
     result: Mutex<Option<Result<Arc<LspClient>, LspError>>>,
     ready: Condvar,
+    #[cfg(test)]
+    waiters: std::sync::atomic::AtomicUsize,
 }
 
 impl StartCell {
@@ -73,6 +77,8 @@ impl StartCell {
         Self {
             result: Mutex::new(None),
             ready: Condvar::new(),
+            #[cfg(test)]
+            waiters: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -83,11 +89,62 @@ impl StartCell {
 
     fn wait(&self) -> Result<Arc<LspClient>, LspError> {
         let mut result = self.result.lock().unwrap();
+        #[cfg(test)]
+        self.waiters
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         while result.is_none() {
             result = self.ready.wait(result).unwrap();
         }
         result.as_ref().unwrap().clone()
     }
+}
+
+struct StartGuard<'a> {
+    inner: &'a LspInner,
+    root: &'a Path,
+    key: &'a str,
+    map_key: (PathBuf, String),
+    cell: Arc<StartCell>,
+    generation: u64,
+    armed: bool,
+}
+
+impl StartGuard<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StartGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = match self.inner.clients.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if matches!(state.map.get(&self.map_key), Some(ClientSlot::Starting { cell, .. }) if Arc::ptr_eq(cell, &self.cell))
+        {
+            state.map.remove(&self.map_key);
+        }
+        drop(state);
+        self.inner
+            .diag_tx
+            .retire(self.root, self.key, self.generation);
+        self.cell
+            .finish(Err(LspError::Protocol("LSP start aborted".into())));
+    }
+}
+
+const LSP_RESTART_STABILITY: Duration = Duration::from_secs(10);
+
+fn start_backoff(failures: u32) -> Instant {
+    let shift = failures.saturating_sub(1).min(6);
+    let seconds = limits::START_BACKOFF_INITIAL_SECS
+        .saturating_mul(1u64 << shift)
+        .min(limits::START_BACKOFF_MAX_SECS);
+    Instant::now() + Duration::from_secs(seconds)
 }
 
 /// Keying on the registry key (not the tree-sitter `Lang`) is what lets an
@@ -217,7 +274,7 @@ impl LspInner {
             return Err(LspError::Bounded("LSP authority identity limit".into()));
         }
         let map_key = (root.to_path_buf(), key.to_string());
-        let (cell, generation, previous_failures, stale_client) = {
+        let (cell, generation, previous_failures, restart_backoff, stale_client) = {
             let mut state = self
                 .clients
                 .lock()
@@ -226,6 +283,7 @@ impl LspInner {
                 return Err(LspError::NotAvailable);
             }
             let mut previous_failures = 0;
+            let mut restart_backoff = false;
             let mut stale_client = None;
             if let Some(slot) = state.map.get(&map_key) {
                 match slot {
@@ -233,11 +291,21 @@ impl LspInner {
                         return Ok(client.clone());
                     }
                     ClientSlot::Live { .. } => {
-                        if let Some(ClientSlot::Live { client, generation }) =
-                            state.map.remove(&map_key)
+                        if let Some(ClientSlot::Live {
+                            client,
+                            generation,
+                            started_at,
+                            failures,
+                        }) = state.map.remove(&map_key)
                         {
                             self.diag_tx.retire(root, key, generation);
                             stale_client = Some(client);
+                            previous_failures = if started_at.elapsed() < LSP_RESTART_STABILITY {
+                                failures.saturating_add(1)
+                            } else {
+                                0
+                            };
+                            restart_backoff = previous_failures >= 2;
                         }
                     }
                     ClientSlot::Unavailable => return Err(LspError::NotAvailable),
@@ -287,10 +355,46 @@ impl LspInner {
                     generation,
                 },
             );
-            (cell, generation, previous_failures, stale_client)
+            (
+                cell,
+                generation,
+                previous_failures,
+                restart_backoff,
+                stale_client,
+            )
         };
         if let Some(client) = stale_client {
             teardown_off_loop(vec![client]);
+        }
+
+        let mut start_guard = StartGuard {
+            inner: self,
+            root,
+            key,
+            map_key: map_key.clone(),
+            cell: cell.clone(),
+            generation,
+            armed: true,
+        };
+
+        if restart_backoff {
+            self.diag_tx.retire(root, key, generation);
+            let backoff = start_backoff(previous_failures);
+            if let Ok(mut state) = self.clients.lock() {
+                let same_cell = matches!(state.map.get(&map_key), Some(ClientSlot::Starting { cell: existing, .. }) if Arc::ptr_eq(existing, &cell));
+                if same_cell {
+                    state.map.insert(
+                        map_key,
+                        ClientSlot::Failed {
+                            until: backoff,
+                            failures: previous_failures,
+                        },
+                    );
+                }
+            }
+            cell.finish(Err(LspError::Protocol("LSP start backoff active".into())));
+            start_guard.disarm();
+            return Err(LspError::Protocol("LSP start backoff active".into()));
         }
 
         // Only the caller that installed this cell runs startup. All map I/O
@@ -307,6 +411,8 @@ impl LspInner {
                             ClientSlot::Live {
                                 client: client.clone(),
                                 generation,
+                                started_at: Instant::now(),
+                                failures: previous_failures,
                             },
                         );
                         Ok(client)
@@ -332,14 +438,10 @@ impl LspInner {
                             state.map.insert(map_key, ClientSlot::Unavailable);
                         } else {
                             let failures = previous_failures.saturating_add(1);
-                            let shift = failures.saturating_sub(1).min(6);
-                            let seconds = limits::START_BACKOFF_INITIAL_SECS
-                                .saturating_mul(1u64 << shift)
-                                .min(limits::START_BACKOFF_MAX_SECS);
                             state.map.insert(
                                 map_key,
                                 ClientSlot::Failed {
-                                    until: Instant::now() + Duration::from_secs(seconds),
+                                    until: start_backoff(failures),
                                     failures,
                                 },
                             );
@@ -350,6 +452,7 @@ impl LspInner {
             }
         };
         cell.finish(result.clone());
+        start_guard.disarm();
         result
     }
 
@@ -363,7 +466,9 @@ impl LspInner {
             .ok()
             .and_then(|mut state| state.map.remove(&(root.to_path_buf(), key.to_string())));
         match removed {
-            Some(ClientSlot::Live { client, generation }) => {
+            Some(ClientSlot::Live {
+                client, generation, ..
+            }) => {
                 self.diag_tx.retire(root, key, generation);
                 teardown_off_loop(vec![client]);
             }
@@ -403,7 +508,9 @@ impl LspInner {
                 };
                 released += 1;
                 match slot {
-                    ClientSlot::Live { client, generation } => {
+                    ClientSlot::Live {
+                        client, generation, ..
+                    } => {
                         self.diag_tx.retire(&map_key.0, &map_key.1, generation);
                         teardown.push(client);
                     }
@@ -1682,6 +1789,26 @@ mod tests {
         let waiter = std::thread::spawn(move || {
             waiter_inner.client_with(Path::new("/a"), "rust", live_fake_client)
         });
+        let cell = {
+            let state = inner.clients.lock().unwrap();
+            match state.map.get(&(PathBuf::from("/a"), "rust".to_string())) {
+                Some(ClientSlot::Starting { cell, .. }) => cell.clone(),
+                _ => panic!("starter must still own the Starting slot"),
+            }
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while cell.waiters.load(std::sync::atomic::Ordering::SeqCst) == 0
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        let waiter_parked = cell.waiters.load(std::sync::atomic::Ordering::SeqCst) == 1;
+        if !waiter_parked {
+            release_tx.send(()).unwrap();
+            first.join().unwrap().unwrap();
+            waiter.join().unwrap();
+            panic!("same-key caller did not enter StartCell::wait before release");
+        }
         release_tx.send(()).unwrap();
         let first = first.join().unwrap().unwrap();
         let second = waiter.join().unwrap().unwrap();
@@ -1770,6 +1897,61 @@ mod tests {
             Err(LspError::Protocol(message)) if message == "LSP start backoff active"
         ));
         assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn panicking_start_releases_waiters_and_allows_a_later_start() {
+        let (inner, _rx) = enabled_inner();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            inner.client_with(Path::new("/panic"), "rust", |_, _, _, _| {
+                panic!("fixture startup panic")
+            })
+        }));
+        assert!(panicked.is_err(), "fixture starter panicked");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let retry_inner = inner.clone();
+        let retry = std::thread::spawn(move || {
+            result_tx
+                .send(retry_inner.client_with(Path::new("/panic"), "rust", live_fake_client))
+                .unwrap();
+        });
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retry must not wait forever on the aborted Starting cell");
+        assert!(result.is_ok());
+        retry.join().unwrap();
+    }
+
+    #[test]
+    fn repeated_fast_client_closure_enters_restart_backoff() {
+        let (inner, _rx) = enabled_inner();
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+        let start = |root: &Path, key: &str, tx: DiagnosticsSender, generation| {
+            starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            fake_client(root, key, tx, generation)
+        };
+        let first = inner
+            .client_with(Path::new("/storm"), "rust", start)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !first.is_closed() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(first.is_closed(), "first fixture client reached EOF");
+        let second = inner
+            .client_with(Path::new("/storm"), "rust", start)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !second.is_closed() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(second.is_closed(), "restarted fixture client reached EOF");
+        assert!(matches!(
+            inner.client_with(Path::new("/storm"), "rust", start),
+            Err(LspError::Protocol(message)) if message == "LSP start backoff active"
+        ));
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     fn stamped(
