@@ -1293,6 +1293,52 @@ pub(crate) fn verify_v78_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v79: normalize statuses the typed parser already treats as canonical and
+/// index active admission plus issue/worktree history lookups.
+pub(crate) fn migrate_v79(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE agent_dispatches SET status=trim(status) WHERE status<>trim(status)",
+        [],
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_agent_dispatches_status
+             ON agent_dispatches(status);
+         CREATE INDEX IF NOT EXISTS idx_agent_dispatches_issue_worktree
+             ON agent_dispatches(issue_id, worktree_path);",
+    )?;
+    Ok(())
+}
+
+/// Verify the v79 indexes used by compact dispatch admission projections.
+pub(crate) fn verify_v79_schema(conn: &Connection) -> Result<()> {
+    for (index_name, expected_columns) in [
+        ("idx_agent_dispatches_status", vec!["status"]),
+        (
+            "idx_agent_dispatches_issue_worktree",
+            vec!["issue_id", "worktree_path"],
+        ),
+    ] {
+        let table: Option<String> = conn
+            .query_row(
+                "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?1",
+                [index_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if table.as_deref() != Some("agent_dispatches") {
+            bail!("schema v79 migration did not add {index_name} to agent_dispatches");
+        }
+        let mut stmt = conn.prepare(&format!("PRAGMA index_info('{index_name}')"))?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(2))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if columns.iter().map(String::as_str).collect::<Vec<_>>() != expected_columns {
+            bail!("schema v79 index {index_name} has unexpected columns");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -2039,6 +2085,30 @@ mod tests {
             conn.execute_batch(index_sql).unwrap();
             assert!(super::verify_v78_schema(&conn).is_err());
         }
+    }
+
+    #[test]
+    fn v79_trims_statuses_and_creates_admission_indexes_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_dispatches (
+                 id INTEGER PRIMARY KEY, issue_id TEXT NOT NULL,
+                 worktree_path TEXT NOT NULL, status TEXT NOT NULL);
+             INSERT INTO agent_dispatches VALUES (1, 'linear:THE-259', '/wt/a', ' running ');",
+        )
+        .unwrap();
+        assert!(super::verify_v79_schema(&conn).is_err());
+        super::migrate_v79(&conn).unwrap();
+        super::migrate_v79(&conn).unwrap();
+        super::verify_v79_schema(&conn).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM agent_dispatches WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "running");
     }
 
     #[test]
