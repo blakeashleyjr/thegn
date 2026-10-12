@@ -8,7 +8,7 @@ use crate::db::Db;
 use crate::store::NotificationStore;
 use crate::util;
 use anyhow::Result;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, params, params_from_iter};
 
 impl NotificationStore for Db {
     fn has_cleanup_dispatch(&self, worktree_path: &str) -> Result<bool> {
@@ -569,6 +569,48 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    /// List the oldest rows matching the requested statuses, plus whether
+    /// additional matches were omitted. The status index keeps this bounded
+    /// query independent of terminal roster history.
+    pub fn list_dispatches_with_status(
+        &self,
+        statuses: &[crate::issue::AgentDispatchStatus],
+        limit: usize,
+    ) -> Result<(Vec<crate::issue::AgentDispatch>, bool)> {
+        if statuses.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+
+        let status_params = statuses
+            .iter()
+            .map(|status| status.as_str())
+            .collect::<Vec<_>>();
+        let placeholders = (1..=statuses.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let limit_placeholder = statuses.len() + 1;
+        let sql = format!(
+            "SELECT {DISPATCH_COLS} FROM agent_dispatches \
+             WHERE status IN ({placeholders}) \
+             ORDER BY dispatched_at_ms ASC, id ASC LIMIT ?{limit_placeholder}"
+        );
+        let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut values = status_params
+            .iter()
+            .map(|status| *status as &dyn rusqlite::ToSql)
+            .collect::<Vec<_>>();
+        values.push(&fetch_limit);
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt
+            .query_map(params_from_iter(values), map_dispatch)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let truncated = rows.len() > limit;
+        rows.truncate(limit);
+        Ok((rows, truncated))
+    }
 }
 
 impl Db {
@@ -738,5 +780,88 @@ mod tests {
                 .all(|row| row.note.is_none() && row.report.is_none())
         );
         assert_eq!(roster[1].chunk_path.as_deref(), Some("chunk.md"));
+    }
+
+    #[test]
+    fn status_projection_filters_orders_carries_text_and_reports_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("status-roster.db")).unwrap();
+        let oldest = db
+            .put_agent_dispatch(crate::issue::NewDispatch {
+                issue_id: "THE-259",
+                worktree_path: "/wt/oldest",
+                agent_name: "codex",
+                stage: Some("code"),
+                parent_id: None,
+                session_id: Some("oldest-session"),
+                artifact_path: Some("oldest.md"),
+                chunk_path: None,
+            })
+            .unwrap();
+        let terminal = db
+            .put_agent_dispatch(crate::issue::NewDispatch {
+                issue_id: "THE-259",
+                worktree_path: "/wt/terminal",
+                agent_name: "codex",
+                stage: Some("code"),
+                parent_id: None,
+                session_id: Some("terminal-session"),
+                artifact_path: Some("terminal.md"),
+                chunk_path: None,
+            })
+            .unwrap();
+        let newest = db
+            .put_agent_dispatch(crate::issue::NewDispatch {
+                issue_id: "THE-259",
+                worktree_path: "/wt/newest",
+                agent_name: "codex",
+                stage: Some("code"),
+                parent_id: None,
+                session_id: Some("newest-session"),
+                artifact_path: Some("newest.md"),
+                chunk_path: None,
+            })
+            .unwrap();
+        db.update_dispatch_status(oldest, crate::issue::AgentDispatchStatus::Running)
+            .unwrap();
+        db.update_dispatch_status(terminal, crate::issue::AgentDispatchStatus::Done)
+            .unwrap();
+        db.update_dispatch_status(newest, crate::issue::AgentDispatchStatus::Running)
+            .unwrap();
+        db.set_dispatch_report(oldest, "old report").unwrap();
+        db.stamp_dispatch_note(oldest, "old note").unwrap();
+        db.set_dispatch_report(newest, "new report").unwrap();
+        db.stamp_dispatch_note(newest, "new note").unwrap();
+
+        let statuses = [crate::issue::AgentDispatchStatus::Running];
+        let (limited, truncated) = db.list_dispatches_with_status(&statuses, 1).unwrap();
+        assert!(truncated);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, oldest);
+        assert_eq!(limited[0].report.as_deref(), Some("old report"));
+        assert_eq!(limited[0].note.as_deref(), Some("old note"));
+
+        let (all, truncated) = db.list_dispatches_with_status(&statuses, 2).unwrap();
+        assert!(!truncated);
+        assert_eq!(
+            all.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![oldest, newest]
+        );
+        assert!(
+            all.iter()
+                .all(|row| row.status == crate::issue::AgentDispatchStatus::Running)
+        );
+        assert_eq!(all[1].report.as_deref(), Some("new report"));
+        assert_eq!(all[1].note.as_deref(), Some("new note"));
+
+        let (unbounded, truncated) = db
+            .list_dispatches_with_status(&statuses, usize::MAX)
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(unbounded.len(), 2);
+
+        let (empty, truncated) = db.list_dispatches_with_status(&[], 1).unwrap();
+        assert!(empty.is_empty());
+        assert!(!truncated);
     }
 }
