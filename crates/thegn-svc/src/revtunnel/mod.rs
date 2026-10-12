@@ -769,7 +769,7 @@ mod tests {
             },
             1,
         ));
-        send_open(&mut peer, 7).await;
+        send_opens(&mut peer, &[7]).await;
         let mut decoder = FrameDecoder::new();
         assert_eq!(next_frame(&mut peer, &mut decoder).await, Frame::Close(7));
         for _ in 0..10 {
