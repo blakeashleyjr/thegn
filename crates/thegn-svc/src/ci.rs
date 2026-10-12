@@ -322,10 +322,10 @@ fn run_cli_capped(cmd: &mut Command, max: usize) -> Result<String, CiError> {
     if output.is_err() {
         // best-effort: the bounded read error is primary; still attempt to stop
         // and reap the child so it cannot outlive the failed read.
-        if let Err(error) = child.kill() {
-            if error.kind() != std::io::ErrorKind::InvalidInput {
-                tracing::debug!(target: "thegn::ci", "failed to kill provider after output limit");
-            }
+        if let Err(error) = child.kill()
+            && error.kind() != std::io::ErrorKind::InvalidInput
+        {
+            tracing::debug!(target: "thegn::ci", "failed to kill provider after output limit");
         }
         if let Err(error) = child.wait() {
             tracing::debug!(target: "thegn::ci", "failed to reap provider after output limit");
