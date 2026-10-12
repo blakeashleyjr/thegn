@@ -192,6 +192,14 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
     };
     let mut entries = Vec::new();
     for row in &rows {
+        // Held rows have already completed worktree collection. Their paths
+        // are expected to be gone, so preserve the hold semantics first.
+        if merge_sweep::CleanupHold::from_detail(row.error_detail.as_deref()).is_some() {
+            if force {
+                report.kept.push((row.branch.clone(), "worktree previously collected; branch and queue evidence retained for explicit cleanup (THE-596)".into()));
+            }
+            continue;
+        }
         // A global queue may contain the same target name in unrelated repos.
         // Unknown/missing worktree identity cannot be safely assigned this
         // repository's policy and must be refused before backfill or cleanup.
@@ -199,20 +207,18 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
         {
             Ok(candidate) => candidate,
             Err(error) => {
-                report.kept.push((
-                    row.branch.clone(),
-                    format!("repository identity unavailable; row left untouched: {error}"),
-                ));
+                if force || merge_sweep::is_due(row.updated_at, util::now(), mq.merged_ttl_secs) {
+                    report.kept.push((
+                        row.branch.clone(),
+                        format!("repository identity unavailable; row left untouched: {error}"),
+                    ));
+                } else {
+                    tracing::debug!(branch = %row.branch, %error, "landed row identity unavailable; leaving it untouched until its TTL expires");
+                }
                 continue;
             }
         };
         if candidate != identity {
-            continue;
-        }
-        if merge_sweep::CleanupHold::from_detail(row.error_detail.as_deref()).is_some() {
-            if force {
-                report.kept.push((row.branch.clone(), "worktree previously collected; branch and queue evidence retained for explicit cleanup (THE-596)".into()));
-            }
             continue;
         }
         entries.push(MergedEntry {
@@ -676,10 +682,11 @@ mod tests {
         rusqlite::Connection::open(&db_path)
             .unwrap()
             .execute(
-                "UPDATE merge_queue SET worktree=?1, result_oid=NULL, queued_at=1, updated_at=1 WHERE worktree=?2",
+                "UPDATE merge_queue SET worktree=?1, result_oid=NULL, queued_at=1, updated_at=?3 WHERE worktree=?2",
                 rusqlite::params![
                     missing.to_string_lossy().into_owned(),
-                    wt.to_string_lossy().into_owned()
+                    wt.to_string_lossy().into_owned(),
+                    util::now()
                 ],
             )
             .unwrap();
@@ -687,6 +694,12 @@ mod tests {
         let mut cfg = local_config();
         cfg.merge_queue.on_landed = OnLanded::Expire;
         cfg.merge_queue.target_branch = "main".into();
+        let startup = sweep_with_db(&cfg, &root, false, &db);
+        assert!(
+            startup.kept.is_empty(),
+            "recent unknown row must not nag at startup"
+        );
+        assert!(startup.collected.is_empty());
         let report = sweep_with_db(&cfg, &root, true, &db);
         assert!(report.collected.is_empty());
         assert!(report.kept.iter().any(|(branch, reason)| {
