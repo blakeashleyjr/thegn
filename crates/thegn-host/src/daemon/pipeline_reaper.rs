@@ -100,6 +100,74 @@ fn reap_pass(
     live_ids: &[String],
     fresh_live: &dyn Fn() -> Option<Vec<String>>,
 ) {
+    reap_running(db, live_ids, fresh_live);
+    reap_stale_spawning(
+        db,
+        thegn_core::util::now_ms(),
+        thegn_core::pipeline_reap::SPAWNING_STALE_MS,
+        fresh_live,
+    );
+}
+
+/// THE-739: park a `spawning` row abandoned by a daemon crash mid-relaunch.
+/// The reservation never bumps `run_gen`, so the only evidence is age
+/// (`status_changed_at_ms`) plus an absent session. Parked through the same
+/// run-fenced CAS: a relaunch that publishes after this check moves the row to
+/// `running` with a new `run_gen`, so the park matches nothing and the worker
+/// wins. A row whose session is live (or whose liveness is unreadable) is
+/// never touched.
+fn reap_stale_spawning(
+    db: &super::service::SharedDb,
+    now_ms: i64,
+    stale_ms: i64,
+    fresh_live: &dyn Fn() -> Option<Vec<String>>,
+) {
+    let candidates = match db.lock() {
+        Ok(db) => match db.stale_spawning_run_refs(now_ms.saturating_sub(stale_ms)) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(target: "thegn::pipeline", error = %e, "stale-spawning read failed");
+                return;
+            }
+        },
+        Err(_) => return,
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    let Some(live) = fresh_live() else {
+        return;
+    };
+    for run in &candidates {
+        if !run.session_id.is_empty() && live.iter().any(|s| *s == run.session_id) {
+            continue;
+        }
+        let db = match db.lock() {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+        if matches!(
+            db.compare_and_set_dispatch_status_run(
+                run,
+                AgentDispatchStatus::Spawning,
+                AgentDispatchStatus::WaitingHuman,
+                Some("reaped (daemon): relaunch abandoned in spawning (no live session); parked for a supervisor"),
+            ),
+            Ok(true)
+        ) {
+            tracing::info!(
+                target: "thegn::pipeline", row = run.id,
+                "reaped: stale spawning row parked for a supervisor"
+            );
+        }
+    }
+}
+
+fn reap_running(
+    db: &super::service::SharedDb,
+    live_ids: &[String],
+    fresh_live: &dyn Fn() -> Option<Vec<String>>,
+) {
     // Snapshot under the shared mutex, then release it before any filesystem
     // or git work. A large stale roster must not stop unrelated daemon DB
     // operations for the duration of hundreds of subprocesses.
@@ -467,6 +535,74 @@ mod tests {
         let shared = Arc::new(Mutex::new(db));
         reap_pass(&shared, &[], &|| Some(Vec::new()));
         assert_eq!(status_of(&shared, id), AgentDispatchStatus::Spawning);
+    }
+
+    #[test]
+    fn fresh_spawning_row_is_not_parked_by_the_stale_pass() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open_at(&dir.path().join("thegn.db")).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let id = row(&db, &wt, "a.md");
+        db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+            .unwrap();
+        let shared = Arc::new(Mutex::new(db));
+        let now = thegn_core::util::now_ms();
+        reap_stale_spawning(&shared, now, 600_000, &|| Some(Vec::new()));
+        assert_eq!(status_of(&shared, id), AgentDispatchStatus::Spawning);
+    }
+
+    #[test]
+    fn stale_spawning_row_with_dead_session_is_parked_but_live_one_is_not() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open_at(&dir.path().join("thegn.db")).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let id = row(&db, &wt, "a.md");
+        db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+            .unwrap();
+        let shared = Arc::new(Mutex::new(db));
+        // "Now" is past the stale window of the row's status stamp.
+        let later = thegn_core::util::now_ms() + 700_000;
+        reap_stale_spawning(&shared, later, 600_000, &|| {
+            Some(vec!["dead-session".to_string()])
+        });
+        assert_eq!(status_of(&shared, id), AgentDispatchStatus::Spawning);
+        reap_stale_spawning(&shared, later, 600_000, &|| None);
+        assert_eq!(status_of(&shared, id), AgentDispatchStatus::Spawning);
+        reap_stale_spawning(&shared, later, 600_000, &|| Some(Vec::new()));
+        assert_eq!(status_of(&shared, id), AgentDispatchStatus::WaitingHuman);
+    }
+
+    #[test]
+    fn relaunch_publishing_after_the_stale_check_wins() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open_at(&dir.path().join("thegn.db")).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let id = row(&db, &wt, "a.md");
+        db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+            .unwrap();
+        let shared = Arc::new(Mutex::new(db));
+        let later = thegn_core::util::now_ms() + 700_000;
+        // The relaunch publishes between the candidate read and the CAS.
+        let publish = || {
+            assert!(
+                shared
+                    .lock()
+                    .unwrap()
+                    .compare_and_set_dispatch_retry_run(
+                        id,
+                        AgentDispatchStatus::Spawning,
+                        "dead-session",
+                        "a.md",
+                    )
+                    .unwrap()
+            );
+            Some(Vec::new())
+        };
+        reap_stale_spawning(&shared, later, 600_000, &publish);
+        assert_eq!(status_of(&shared, id), AgentDispatchStatus::Running);
     }
 
     fn status_of(shared: &Arc<Mutex<Db>>, id: i64) -> AgentDispatchStatus {

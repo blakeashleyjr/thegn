@@ -124,6 +124,18 @@ pub struct Reap {
     pub verdict: ReapVerdict,
 }
 
+/// How long a row may sit in `spawning` before the daemon reaper treats the
+/// relaunch as abandoned (the daemon crashed between reserving the row and
+/// publishing the new run). Generous: a real relaunch publishes in seconds.
+pub const SPAWNING_STALE_MS: i64 = 10 * 60 * 1000;
+
+/// Whether a row last status-changed at `changed_at_ms` has sat in `spawning`
+/// longer than `stale_ms` at `now_ms`. The caller supplies the clock; a
+/// timestamp in the future (clock step) is never stale.
+pub fn spawning_is_stale(changed_at_ms: i64, now_ms: i64, stale_ms: i64) -> bool {
+    now_ms.saturating_sub(changed_at_ms) > stale_ms
+}
+
 /// Classify one row.
 ///
 /// Order matters: a terminal row is never reaped, a live or unknown worker is
@@ -228,6 +240,26 @@ impl ReapSummary {
 mod tests {
     use super::*;
     use crate::issue::AgentDispatchStatus as S;
+
+    #[test]
+    fn spawning_staleness_is_a_pure_threshold() {
+        let now = 10_000_000;
+        assert!(!spawning_is_stale(now, now, SPAWNING_STALE_MS));
+        assert!(!spawning_is_stale(
+            now - SPAWNING_STALE_MS,
+            now,
+            SPAWNING_STALE_MS
+        ));
+        assert!(spawning_is_stale(
+            now - SPAWNING_STALE_MS - 1,
+            now,
+            SPAWNING_STALE_MS
+        ));
+        assert!(
+            !spawning_is_stale(now + 1, now, SPAWNING_STALE_MS),
+            "future stamp"
+        );
+    }
 
     fn row(id: i64, status: S) -> AgentDispatch {
         AgentDispatch {
