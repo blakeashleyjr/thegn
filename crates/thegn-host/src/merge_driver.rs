@@ -1020,17 +1020,13 @@ mod tests {
             let agent = "git reset --hard main -q && echo feat > feat.txt && \
                          git add -A && git commit -q -m resolved";
             let db = Db::open_memory().unwrap();
+            let queued = item(&db, &feat_wt);
             let out_ = drive_queue(
                 &cfg(agent, 2),
                 &Config::default(),
                 &root,
                 &db,
-                vec![QueueItem {
-                    worktree: feat_wt.to_string_lossy().into(),
-                    branch: "feat".into(),
-                    location: String::new(),
-                    agent_attempts: 0,
-                }],
+                vec![queued],
                 |_| {},
             );
             assert_eq!(
@@ -1048,17 +1044,13 @@ mod tests {
             let before = out(&root, &["rev-parse", "main"]);
             // A no-op "agent" never resolves the conflict.
             let db = Db::open_memory().unwrap();
+            let queued = item(&db, &feat_wt);
             let out_ = drive_queue(
                 &cfg("true", 1),
                 &Config::default(),
                 &root,
                 &db,
-                vec![QueueItem {
-                    worktree: feat_wt.to_string_lossy().into(),
-                    branch: "feat".into(),
-                    location: String::new(),
-                    agent_attempts: 0,
-                }],
+                vec![queued],
                 |_| {},
             );
             assert_eq!(out_.needs_human, ["feat"]);
@@ -1076,20 +1068,11 @@ mod tests {
             let mut mq = cfg(&format!("touch {}", sentinel.display()), 1);
             mq.sign_commits = true;
             let db = Db::open_memory().unwrap();
+            let queued = item(&db, &feat_wt);
             let mut statuses = Vec::new();
-            let outcome = drive_queue(
-                &mq,
-                &Config::default(),
-                &root,
-                &db,
-                vec![QueueItem {
-                    worktree: feat_wt.to_string_lossy().into(),
-                    branch: "feat".into(),
-                    location: String::new(),
-                    agent_attempts: 0,
-                }],
-                |step| statuses.push(step.status.to_string()),
-            );
+            let outcome = drive_queue(&mq, &Config::default(), &root, &db, vec![queued], |step| {
+                statuses.push(step.status.to_string())
+            });
             assert_eq!(outcome.gate_error, ["feat"]);
             assert!(outcome.needs_human.is_empty(), "{outcome:?}");
             assert!(!sentinel.exists(), "signing failure woke the fixing agent");
@@ -1105,9 +1088,11 @@ mod tests {
         const FIXER: &str = "git reset --hard main -q && echo feat > feat.txt && \
                              git add -A && git commit -q -m resolved && true";
 
-        fn item(feat_wt: &std::path::Path) -> QueueItem {
+        fn item(db: &Db, feat_wt: &std::path::Path) -> QueueItem {
+            let worktree = feat_wt.to_string_lossy().into_owned();
+            db.enqueue_merge(&worktree, "feat", "main").unwrap();
             QueueItem {
-                worktree: feat_wt.to_string_lossy().into(),
+                worktree,
                 branch: "feat".into(),
                 location: String::new(),
                 agent_attempts: 0,
@@ -1140,7 +1125,7 @@ mod tests {
 
             let db = Db::open_memory().unwrap();
             let mut steps = Vec::new();
-            let out_ = drive_queue(&mq, &full, &root, &db, vec![item(&feat_wt)], |step| {
+            let out_ = drive_queue(&mq, &full, &root, &db, vec![item(&db, &feat_wt)], |step| {
                 steps.push((step.status.to_owned(), step.detail.to_owned()));
             });
             assert_eq!(
@@ -1163,7 +1148,7 @@ mod tests {
                 &Config::default(),
                 &root,
                 &db,
-                vec![item(&feat_wt)],
+                vec![item(&db, &feat_wt)],
                 |_| {},
             );
             // No agent ran, so the branch takes the classic deferred path...
@@ -1190,7 +1175,7 @@ mod tests {
                 &Config::default(),
                 &root,
                 &db,
-                vec![item(&feat_wt)],
+                vec![item(&db, &feat_wt)],
                 |_| {},
             );
             assert_eq!(
@@ -1215,7 +1200,7 @@ mod tests {
                 &Config::default(),
                 &root,
                 &db,
-                vec![item(&feat_wt)],
+                vec![item(&db, &feat_wt)],
                 |_| {},
             );
             assert_eq!(out_.needs_human, ["feat"]);

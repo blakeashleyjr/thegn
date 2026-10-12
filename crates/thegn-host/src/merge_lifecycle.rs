@@ -566,6 +566,26 @@ pub(crate) fn remove_landed_with_config(
             false
         }
     };
+    if delete_branch && !queue_removed {
+        match db.list_merge_queue() {
+            Ok(rows) => {
+                if let Some(row) = rows.into_iter().find(|row| row.worktree == worktree)
+                    && thegn_core::merge_sweep::CleanupHold::from_detail(
+                        row.error_detail.as_deref(),
+                    )
+                    .is_none()
+                    && let Err(error) = db.hold_merge_cleanup(&row)
+                {
+                    bookkeeping_errors.push(format!(
+                        "{branch}: retained branch cleanup hold could not be persisted: {error}"
+                    ));
+                }
+            }
+            Err(error) => bookkeeping_errors.push(format!(
+                "{branch}: retained branch cleanup hold could not be checked: {error}"
+            )),
+        }
+    }
     if message != "removed" {
         bookkeeping_errors.push(message);
     }
