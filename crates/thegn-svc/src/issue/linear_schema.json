@@ -48,7 +48,8 @@
     "Team": { "id": "String", "key": "String", "name": "String" },
     "IssueLabelConnection": { "nodes": "IssueLabel" },
     "CommentConnection": { "nodes": "Comment" },
-    "IssueConnection": { "nodes": "Issue" }
+    "IssueConnection": { "nodes": "Issue", "pageInfo": "PageInfo" },
+    "PageInfo": { "hasNextPage": "Boolean", "endCursor": "String" }
   },
   "workflowStateTypes": [
     "triage",

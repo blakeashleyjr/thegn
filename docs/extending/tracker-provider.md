@@ -60,14 +60,21 @@ catalog currently shared by the seam:
 
 ```rust
 IssueCaps {
+    patch_status: true,      // update_issue status
+    patch_title: true,       // update_issue title
+    patch_assignee_me: true, // update_issue current-user assignment
+    patch_priority: true,    // update_issue priority
     comments: true, // add_comment
     labels: true,   // attach_label and detach_label
 }
 ```
 
-Implement `caps()` and set a bit only when the provider implements the
-corresponding operation. A false bit must degrade locally through typed
-`IssueError::Unsupported("operation")`, without client, network, or
+Built-in providers set each patch bit only when they implement the field.
+Plugin providers keep the required `update_issue` operation usable for older
+manifests: omitted patch bits default to `true`, and a plugin can explicitly
+set a bit to `false` when it cannot apply that field. Optional operation bits
+such as comments and labels remain opt-in. A false bit must degrade locally
+through a typed unsupported error, without client, network, or
 subprocess work. `Unsupported`, `NotInstalled`, and `NotConfigured` are the
 seam's fall-through classes. `Auth`, `NotFound`, `RateLimited`, and
 `Transient` describe a real provider response and remain final; ordinary API,
@@ -130,8 +137,11 @@ labels = false
 
 The exact manifest still needs the normal plugin fields (`id`, `name`,
 `version`, `api`, `command`, and mode/timeout as appropriate). Omitted or
-`null` caps mean `{ comments = false, labels = false }`; unknown cap fields are
-rejected, and malformed declarations are treated as all-false by the host.
+`null` caps mean all four `patch_*` fields are `true`, with `comments` and
+`labels` set to `false`. If a caps table is present, omitted `patch_*` fields
+also default to `true`; explicitly set unsupported fields to `false`. Unknown
+cap fields are rejected, and malformed declarations are treated as all-false
+by the host.
 When a bit is false, the host returns typed `Unsupported` locally and does not
 send an RPC. When it is true, the host sends the existing newline-delimited
 JSON request:
