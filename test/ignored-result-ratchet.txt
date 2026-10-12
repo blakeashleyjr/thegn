@@ -303,7 +303,6 @@ crates/thegn-host/src/pane_pty.rs
 crates/thegn-host/src/pane.rs
 crates/thegn-host/src/panes.rs
 crates/thegn-host/src/pane_writer.rs
-crates/thegn-host/src/parity.rs
 crates/thegn-host/src/perf.rs
 crates/thegn-host/src/placement_flow.rs
 crates/thegn-host/src/platform/bundle_custody.rs

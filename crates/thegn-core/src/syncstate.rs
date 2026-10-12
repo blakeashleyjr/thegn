@@ -272,10 +272,11 @@ mod tests {
         assert!(full.contains("git apply --whitespace=nowarn /tmp/tg-parity.patch"));
         assert!(full.contains("git apply --3way"));
         assert!(full.contains("tar xf /tmp/tg-parity.tar -C /wd"));
-        assert!(full.contains("TG-PARITY-ERROR:fetch"));
-        assert!(full.contains("TG-PARITY-ERROR:reset"));
-        assert!(full.contains("TG-PARITY-ERROR:patch"));
-        assert!(full.contains("TG-PARITY-ERROR:extraction"));
+        assert!(full.contains("fail fetch;"));
+        assert!(full.contains("fail reset;"));
+        assert!(full.contains("fail patch;"));
+        assert!(full.contains("fail extraction;"));
+        assert!(full.contains("TG-PARITY-ERROR:%s\\n"));
         assert!(!full.contains("|| true"));
         assert!(full.contains("exit 70;"));
         assert!(!full.contains("\" >&2"));
