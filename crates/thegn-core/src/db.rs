@@ -1034,14 +1034,21 @@ fn db_path() -> PathBuf {
     util::xdg_state_home().join("thegn/thegn.db")
 }
 
-#[cfg(test)]
-fn refuse_real_state_write(path: &Path) {
-    let real_state = util::home().join(".local/state");
-    assert!(
-        !path.starts_with(&real_state),
-        "THE-744: refusing test write to real state path {}",
-        path.display()
-    );
+/// Prevent test builds from writing through an opener to the user's live
+/// XDG state database. `test-utils` is enabled for dependent host and svc test
+/// binaries, including host integration tests; ordinary builds compile this
+/// into an inline no-op.
+#[inline]
+fn refuse_real_state_write(_path: &Path) {
+    #[cfg(any(test, feature = "test-utils"))]
+    {
+        let real_state = util::home().join(".local/state");
+        assert!(
+            !_path.starts_with(&real_state),
+            "THE-744: refusing test write to real state path {}",
+            _path.display()
+        );
+    }
 }
 
 /// Return the normalized shared path when `candidate` names, or might name,
@@ -1169,7 +1176,6 @@ impl Db {
 
     fn open_timed() -> Result<Db> {
         let path = db_path();
-        #[cfg(test)]
         refuse_real_state_write(&path);
         // NOT memoized. Skipping this after the first open would save about four
         // syscalls and cost correctness twice over: one process opens many state
@@ -1205,30 +1211,24 @@ impl Db {
                 let sweep_path = path.clone();
                 if let Err(error) = std::thread::Builder::new()
                     .name("thegn-sem-prune".to_string())
-                    .spawn(move || {
-                        let Ok(conn) = Db::open_connection(&sweep_path) else {
-                            return;
-                        };
-                        if conn
-                            .busy_timeout(std::time::Duration::from_millis(5000))
-                            .is_err()
-                        {
-                            return;
-                        }
-                        let sweep_db = Db {
-                            conn,
-                            schema_mismatch: None,
-                        };
-                        let mut after_rowid = 0;
-                        // The sweep is idempotent; killing it mid-run is safe and
-                        // the next process can clean the remaining rows.
-                        loop {
-                            match sweep_db.prune_missing_semantic_files(after_rowid, 512) {
-                                Ok((scanned, next_rowid)) if scanned > 0 => {
-                                    after_rowid = next_rowid;
-                                }
-                                Ok(_) | Err(_) => break,
+                    .spawn(move || match Db::open_connection(&sweep_path) {
+                        Ok(conn) => {
+                            if let Err(error) =
+                                conn.busy_timeout(std::time::Duration::from_millis(5000))
+                            {
+                                tracing::warn!(%error, "semantic prune sweep failed");
+                                return;
                             }
+                            let sweep_db = Db {
+                                conn,
+                                schema_mismatch: None,
+                            };
+                            if let Err(error) = sweep_missing_semantic_files(&sweep_db, 512) {
+                                tracing::warn!(%error, "semantic prune sweep failed");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "semantic prune sweep failed");
                         }
                     })
                 {
@@ -1249,7 +1249,6 @@ impl Db {
     /// process-global `XDG_STATE_HOME`. Used by tests and by host integration
     /// tests across the workspace, hence `pub`.
     pub fn open_at(path: &std::path::Path) -> Result<Db> {
-        #[cfg(test)]
         refuse_real_state_write(path);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -1284,7 +1283,6 @@ impl Db {
         path: &std::path::Path,
         operation: SchemaOperation,
     ) -> Result<Option<CompatibleDb>> {
-        #[cfg(test)]
         if operation.access() == SchemaRequirementAccess::ReadWrite {
             refuse_real_state_write(path);
         }
@@ -1421,7 +1419,6 @@ impl Db {
     /// [`ALLOW_OLD_BUILD_ENV`] escape hatch, so the tolerant branch is
     /// reachable (and testable) without mutating process-global environment.
     pub fn open_at_allowing_older_build(path: &std::path::Path) -> Result<Db> {
-        #[cfg(test)]
         refuse_real_state_write(path);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -2452,6 +2449,23 @@ impl Db {
         let out = f(self)?;
         tx.commit()?;
         Ok(out)
+    }
+}
+
+/// Run the bounded semantic-file prune until it reaches the terminal slice.
+/// Returning the error keeps the worker responsible for logging failures.
+fn sweep_missing_semantic_files(db: &Db, batch: usize) -> Result<usize> {
+    let mut after_rowid = 0;
+    let mut total_scanned = 0;
+    // The sweep is idempotent; killing it mid-run is safe and the next process
+    // can clean the remaining rows.
+    loop {
+        let (scanned, next_rowid) = db.prune_missing_semantic_files(after_rowid, batch)?;
+        total_scanned += scanned;
+        if scanned == 0 {
+            return Ok(total_scanned);
+        }
+        after_rowid = next_rowid;
     }
 }
 
