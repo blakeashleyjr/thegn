@@ -1178,14 +1178,18 @@ pub(crate) fn verify_v74_schema(conn: &Connection) -> Result<()> {
 }
 
 /// v75: retain the provider resource key for each cached calendar component.
-/// Existing cache rows keep their event data with `href = NULL`; subsequent
-/// CalDAV refreshes populate it, while tombstones retain the legacy UID fallback.
+/// Existing cache rows keep their event data with `href = NULL`; clearing
+/// CalDAV sync tokens forces a full snapshot to repopulate those rows with hrefs.
 pub(crate) fn migrate_v75(conn: &Connection) -> Result<()> {
     if !has_column(conn, "calendar_events", "href") {
         conn.execute("ALTER TABLE calendar_events ADD COLUMN href TEXT", [])?;
     }
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS calendar_events_href ON calendar_events(account, href)",
+    )?;
+    conn.execute(
+        "UPDATE calendar_sync SET sync_token = '' WHERE provider = 'caldav'",
+        [],
     )?;
     Ok(())
 }
@@ -1787,7 +1791,13 @@ mod tests {
                  start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
                  recurring INTEGER NOT NULL, json TEXT NOT NULL, fetched_at INTEGER NOT NULL,
                  PRIMARY KEY(account, uid));
-             INSERT INTO calendar_events VALUES ('a','abc','','1','2',0,'{}',3);",
+             INSERT INTO calendar_events VALUES ('a','abc','','1','2',0,'{}',3);
+             CREATE TABLE calendar_sync (
+                 account TEXT PRIMARY KEY, provider TEXT NOT NULL,
+                 sync_token TEXT NOT NULL DEFAULT ''
+             );
+             INSERT INTO calendar_sync VALUES ('caldav-account','caldav','token-1');
+             INSERT INTO calendar_sync VALUES ('ics-account','ics_url','etag-1');",
         )
         .unwrap();
         assert!(super::verify_v75_schema(&conn).is_err());
@@ -1803,6 +1813,22 @@ mod tests {
             .unwrap();
         assert_eq!(uid, "abc");
         assert_eq!(href, None);
+        let caldav_token: String = conn
+            .query_row(
+                "SELECT sync_token FROM calendar_sync WHERE account='caldav-account'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ics_token: String = conn
+            .query_row(
+                "SELECT sync_token FROM calendar_sync WHERE account='ics-account'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(caldav_token.is_empty(), "v75 forces a CalDAV snapshot");
+        assert_eq!(ics_token, "etag-1", "non-CalDAV cursors are preserved");
     }
 
     #[test]
@@ -1814,16 +1840,19 @@ mod tests {
                 CalendarRow {
                     uid: "abc".into(),
                     href: Some("/cal/opaque-123.ics".into()),
+                    json: r#"{"uid":"abc","href":"/cal/opaque-123.ics"}"#.into(),
                     ..Default::default()
                 },
                 CalendarRow {
                     uid: "opaque-123".into(),
                     href: Some("/cal/other.ics".into()),
+                    json: r#"{"uid":"opaque-123","href":"/cal/other.ics"}"#.into(),
                     ..Default::default()
                 },
                 CalendarRow {
                     uid: "gone".into(),
                     href: None,
+                    json: r#"{"uid":"gone"}"#.into(),
                     ..Default::default()
                 },
             ],
@@ -1837,11 +1866,20 @@ mod tests {
             ],
         )
         .unwrap();
-        let rows = db
-            .get_calendar_events(i64::MIN, i64::MAX, &["a".into()])
+        let mut stmt = db
+            .conn()
+            .prepare("SELECT uid, href FROM calendar_events WHERE account='a'")
             .unwrap();
-        let json: Vec<_> = rows.into_iter().map(|(_, json)| json).collect();
-        assert_eq!(json.len(), 1, "only the different non-NULL href survives");
+        let survivor: Vec<(String, Option<String>)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            survivor,
+            [("opaque-123".to_owned(), Some("/cal/other.ics".to_owned()))],
+            "only the unrelated resource survives; abc and gone are deleted"
+        );
     }
 
     #[test]

@@ -41,14 +41,14 @@ pub(super) fn verify_once(
 ) -> anyhow::Result<()> {
     // An in-place malformation by another process on this inode is not
     // re-detected until restart; replacement files get a different identity.
-    let mut verified = verified()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if verified.contains(&key) {
+    if is_verified(&key) {
         return Ok(());
     }
     verify()?;
-    verified.insert(key);
+    verified()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(key);
     Ok(())
 }
 
@@ -69,7 +69,7 @@ fn verification_count() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{VerificationKey, verification_count};
+    use super::{VerificationKey, verification_count, verify_once};
     use crate::db::Db;
 
     fn ready_db(path: &Path) {
@@ -120,5 +120,25 @@ mod tests {
         let v1 = VerificationKey::for_path(&path, 1).unwrap();
         let v2 = VerificationKey::for_path(&path, 2).unwrap();
         assert_ne!(v1, v2);
+
+        let before = verification_count();
+        verify_once(v1.clone(), || {
+            super::count_verification();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(verification_count(), before + 1);
+        verify_once(v1, || {
+            super::count_verification();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(verification_count(), before + 1);
+        verify_once(v2, || {
+            super::count_verification();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(verification_count(), before + 2);
     }
 }
