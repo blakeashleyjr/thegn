@@ -139,7 +139,7 @@ fn reserve(state: &QueueState) -> bool {
 fn dequeue(state: &QueueState) {
     let previous = state.depth.fetch_sub(1, Ordering::AcqRel);
     debug_assert!(previous > 0, "dequeued a job without a queue reservation");
-    if previous <= MAX_QUEUED_JOBS {
+    if previous.saturating_sub(1) <= MAX_QUEUED_JOBS / 2 {
         state.overflow_warned.store(false, Ordering::Release);
     }
 }
@@ -147,7 +147,10 @@ fn dequeue(state: &QueueState) {
 fn note_drop(state: &QueueState) {
     state.dropped.fetch_add(1, Ordering::Relaxed);
     if !state.overflow_warned.swap(true, Ordering::AcqRel) {
-        tracing::warn!("db-writer queue full; dropping new best-effort write");
+        tracing::warn!(
+            dropped = state.dropped.load(Ordering::Relaxed),
+            "db-writer queue full; dropping new best-effort write"
+        );
     }
 }
 
@@ -200,7 +203,9 @@ pub(crate) fn persist(job: impl FnOnce(&Db) + Send + 'static) {
 }
 
 /// Queue a replaceable write. A queued write is skipped if a newer value for
-/// the same key arrived before the writer began it.
+/// the same key arrived before the writer began it. Replacements keep the FIFO
+/// position of the key's first pending enqueue, so the newest value can run
+/// ahead of `persist` jobs queued after that first `persist_latest` call.
 pub(crate) fn persist_latest(key: String, job: impl FnOnce(&Db) + Send + 'static) {
     enqueue_latest(writer(), key, job);
 }
@@ -408,6 +413,26 @@ mod tests {
         barrier(&writer);
         assert_eq!(ran.load(Ordering::SeqCst), MAX_QUEUED_JOBS);
         assert_eq!(writer.state.depth.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn overflow_warning_rearms_after_queue_drains_below_half() {
+        let state = QueueState::default();
+        for _ in 0..MAX_QUEUED_JOBS {
+            assert!(reserve(&state));
+        }
+
+        note_drop(&state);
+        dequeue(&state);
+        assert!(state.overflow_warned.load(Ordering::Acquire));
+        note_drop(&state);
+        assert_eq!(state.dropped.load(Ordering::Relaxed), 2);
+        assert!(state.overflow_warned.load(Ordering::Acquire));
+
+        while state.depth.load(Ordering::Relaxed) > MAX_QUEUED_JOBS / 2 {
+            dequeue(&state);
+        }
+        assert!(!state.overflow_warned.load(Ordering::Acquire));
     }
 
     #[test]
