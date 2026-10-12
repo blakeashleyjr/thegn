@@ -765,7 +765,7 @@ fn expand_rule(
     // INTERVAL means hours/minutes/seconds. Folding them into the day-stepping
     // loop below would read `HOURLY;INTERVAL=24` as "every 24 days".
     if matches!(r.freq, Freq::Secondly | Freq::Minutely | Freq::Hourly) {
-        return expand_subdaily(r, start, from, to, budget, &cost, zone, gap);
+        return expand_subdaily(r, start, DateWindow { from, to }, budget, &cost, zone, gap);
     }
     let mut out = Vec::new();
     let mut emitted: u32 = 0;
@@ -867,11 +867,16 @@ fn initial_period(r: &RRule, start: NaiveDate, from: NaiveDate) -> NaiveDate {
 /// from DTSTART (fast-forwarded to the window when there is no COUNT) and
 /// every `BY*` part acts as a **filter** (RFC 5545: a part finer than the
 /// frequency limits, it does not expand).
+#[derive(Clone, Copy)]
+struct DateWindow {
+    from: NaiveDate,
+    to: NaiveDate,
+}
+
 fn expand_subdaily(
     r: &RRule,
     start: NaiveDateTime,
-    from: NaiveDate,
-    to: NaiveDate,
+    window: DateWindow,
     budget: &mut ExpansionBudget,
     cost: &RuleCost,
     zone: Option<chrono_tz::Tz>,
@@ -889,7 +894,7 @@ fn expand_subdaily(
 
     let mut cur = start;
     if r.count.is_none()
-        && let Some(window_start) = from.and_hms_opt(0, 0, 0)
+        && let Some(window_start) = window.from.and_hms_opt(0, 0, 0)
         && window_start > start
     {
         let elapsed = window_start.signed_duration_since(start).num_seconds();
@@ -913,7 +918,7 @@ fn expand_subdaily(
         if past_until(r, cur, zone, gap) {
             break;
         }
-        if cur.date() > to {
+        if cur.date() > window.to {
             break;
         }
         let keep = day_matches(r, cur.date())
@@ -928,7 +933,7 @@ fn expand_subdaily(
                 }
                 emitted += 1;
             }
-            if cur.date() >= from {
+            if cur.date() >= window.from {
                 budget.expanded_local()?;
                 out.push(cur);
             }
