@@ -2854,6 +2854,23 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn worktree_create_refuses_plugin_issue_ids_with_failed_precondition() {
+        let (svc, _rx) = service(0);
+        let req = thegn_svc::control::WorktreeCreateReq {
+            issue: Some("plugin:demo:1".into()),
+            ..Default::default()
+        };
+
+        match svc.worktree_create(req).await.unwrap_err() {
+            ControlError::FailedPrecondition(message) => {
+                assert!(message.contains("TUI process hosting the plugin"));
+                assert!(message.contains("plugin:demo:1"));
+            }
+            error => panic!("expected plugin issue refusal, got {error:?}"),
+        }
+    }
+
     #[test]
     fn issue_router_errors_keep_typed_control_statuses() {
         use thegn_svc::issue::IssueError;
