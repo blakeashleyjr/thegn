@@ -7,9 +7,16 @@ use std::path::{Path, PathBuf};
 
 use thegn_core::config::Config;
 use thegn_core::plugin_api::{
-    API_VERSION, Capability, HOST_EXTENSION_SUPPORT, HostContract, NegotiatedManifest, PluginSpec,
-    SupportState,
+    API_VERSION, CadenceHint, Capability, HOST_EXTENSION_SUPPORT, HostContract, NegotiatedManifest,
+    PluginSpec, SupportState,
 };
+
+pub const MIN_PLUGIN_ID_BYTES: usize = 1;
+pub const MAX_PLUGIN_ID_BYTES: usize = 64;
+pub const MIN_PLUGIN_TIMEOUT_SECS: u64 = 1;
+pub const MAX_PLUGIN_TIMEOUT_SECS: u64 = 3600;
+pub const MIN_PLUGIN_INTERVAL_MILLIS: u64 = 100;
+pub const MAX_PLUGIN_INTERVAL_MILLIS: u64 = 86_400_000;
 
 /// The extension points this host build actually renders/consumes. The wire
 /// enum is intentionally broader; a point belongs here only after its complete
@@ -129,8 +136,37 @@ pub fn check_spec(p: &LoadedPlugin) -> Vec<SpecProblem> {
             problem,
         })
     };
-    if id.trim().is_empty() {
-        push("empty plugin id".into());
+    if !(MIN_PLUGIN_ID_BYTES..=MAX_PLUGIN_ID_BYTES).contains(&id.len())
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        push(format!(
+            "plugin id must be {MIN_PLUGIN_ID_BYTES}..={MAX_PLUGIN_ID_BYTES} ASCII bytes using [A-Za-z0-9._-]"
+        ));
+    }
+    if !(MIN_PLUGIN_TIMEOUT_SECS..=MAX_PLUGIN_TIMEOUT_SECS).contains(&p.spec.timeout_secs) {
+        push(format!(
+            "timeout_secs must be {MIN_PLUGIN_TIMEOUT_SECS}..={MAX_PLUGIN_TIMEOUT_SECS}"
+        ));
+    }
+    for cap in &p.spec.manifest.capabilities {
+        if cap.kind().is_empty()
+            || cap.target().is_empty()
+            || cap.as_str().chars().any(char::is_control)
+        {
+            push(format!("invalid capability {:?}", cap.as_str()));
+        }
+    }
+    for contribution in &p.spec.manifest.contributions {
+        if let CadenceHint::Interval { millis } = &contribution.cadence
+            && !(MIN_PLUGIN_INTERVAL_MILLIS..=MAX_PLUGIN_INTERVAL_MILLIS).contains(millis)
+        {
+            push(format!(
+                "contribution {} interval millis must be {MIN_PLUGIN_INTERVAL_MILLIS}..={MAX_PLUGIN_INTERVAL_MILLIS}",
+                contribution.id.as_str()
+            ));
+        }
     }
     match p.spec.command.first() {
         None => push("empty command".into()),
@@ -261,6 +297,124 @@ mod tests {
         assert!(text.contains("gone: command not on PATH"), "{text}");
         assert!(text.contains("future: incompatible api"), "{text}");
         assert!(text.contains("gone: duplicate plugin id"), "{text}");
+    }
+
+    #[test]
+    fn check_spec_enforces_plugin_id_grammar() {
+        let overlong = "x".repeat(MAX_PLUGIN_ID_BYTES + 1);
+        for id in [
+            "",
+            "has:delimiter",
+            "white space",
+            "control\u{7}",
+            "é",
+            overlong.as_str(),
+        ] {
+            let loaded = LoadedPlugin {
+                spec: spec(id, vec!["true".into()]),
+                dir: None,
+            };
+            assert!(
+                check_spec(&loaded)
+                    .iter()
+                    .any(|problem| problem.problem.contains("plugin id must be")),
+                "id {id:?} should fail canonical grammar"
+            );
+        }
+        let max_id = "x".repeat(MAX_PLUGIN_ID_BYTES);
+        let loaded = LoadedPlugin {
+            spec: spec(&max_id, vec!["true".into()]),
+            dir: None,
+        };
+        assert!(
+            !check_spec(&loaded)
+                .iter()
+                .any(|problem| problem.problem.contains("plugin id must be"))
+        );
+    }
+
+    #[test]
+    fn check_spec_bounds_timeout_and_interval_values() {
+        for (value, valid) in [
+            (0, false),
+            (1, true),
+            (3600, true),
+            (3601, false),
+            (u64::MAX, false),
+        ] {
+            let mut plugin = spec("bounded", vec!["true".into()]);
+            plugin.timeout_secs = value;
+            let loaded = LoadedPlugin {
+                spec: plugin,
+                dir: None,
+            };
+            assert_eq!(
+                check_spec(&loaded)
+                    .iter()
+                    .any(|problem| problem.problem.contains("timeout_secs must be")),
+                !valid,
+                "timeout {value}"
+            );
+        }
+
+        for (millis, valid) in [
+            (99, false),
+            (100, true),
+            (86_400_000, true),
+            (86_400_001, false),
+            (u64::MAX, false),
+        ] {
+            let mut plugin = spec("bounded", vec!["true".into()]);
+            plugin
+                .manifest
+                .capabilities
+                .push(Capability::new("surface", "statusbar"));
+            plugin
+                .manifest
+                .contributions
+                .push(thegn_core::plugin_api::Contribution {
+                    id: thegn_core::plugin_api::ContributionId::new("bounded.interval"),
+                    extension_point: thegn_core::plugin_api::ExtensionPoint::StatusBarSegment,
+                    label: "Bounded".into(),
+                    surface: Some(thegn_core::plugin_api::SurfaceId::new("bounded.surface")),
+                    cadence: CadenceHint::Interval { millis },
+                    metadata: Default::default(),
+                    caps: serde_json::Value::Null,
+                    chord: None,
+                });
+            let loaded = LoadedPlugin {
+                spec: plugin,
+                dir: None,
+            };
+            assert_eq!(
+                check_spec(&loaded)
+                    .iter()
+                    .any(|problem| problem.problem.contains("interval millis must be")),
+                !valid,
+                "interval {millis}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_spec_rejects_capabilities_with_empty_or_control_components() {
+        for capability in [
+            Capability::new("", "target"),
+            Capability::new("kind", ""),
+            Capability::new("a\u{7}", "b"),
+        ] {
+            let mut plugin = spec("caps", vec!["true".into()]);
+            plugin.manifest.capabilities.push(capability);
+            let loaded = LoadedPlugin {
+                spec: plugin,
+                dir: None,
+            };
+            assert!(
+                check_spec(&loaded)
+                    .iter()
+                    .any(|problem| problem.problem.contains("invalid capability"))
+            );
+        }
     }
 
     #[test]
