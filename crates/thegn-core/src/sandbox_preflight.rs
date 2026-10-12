@@ -42,6 +42,18 @@ pub(crate) fn preflight_exec_argv(spec: &SandboxSpec) -> Vec<String> {
 /// [`preflight_exec_argv`] with the probe body chosen by the caller — the pure
 /// half, so the argv shape is unit-tested without touching the filesystem.
 pub(crate) fn preflight_exec_argv_with(spec: &SandboxSpec, body: &str) -> Vec<String> {
+    if let Some(compose) = spec
+        .compose_spec()
+        .filter(|compose| spec.backend.is_oci() && compose.has_service())
+    {
+        let workdir = (spec.file_access != FileAccess::None)
+            .then(|| spec.worktree.to_string_lossy().into_owned());
+        if let Some(argv) =
+            crate::sandbox_compose::exec_argv(&spec.name, &compose, workdir.as_deref(), body, false)
+        {
+            return spec.placement.control_argv(&argv);
+        }
+    }
     let mut v = oci_prefix(spec);
     v.push("exec".into());
     // Match the pane: only pass --workdir when the worktree is actually mounted.
@@ -91,7 +103,12 @@ pub fn preflight_exec(spec: &SandboxSpec) -> Result<(), String> {
                 let failure = crate::sandbox_mountcheck::mount_failure(&probe, &|b| {
                     crate::util::which_path(b).is_some()
                 });
-                crate::sandbox::remove_container(spec);
+                if !spec
+                    .compose_spec()
+                    .is_some_and(|compose| compose.has_service())
+                {
+                    crate::sandbox::remove_container(spec);
+                }
                 return Err(failure.one_line());
             }
             let msg = stderr.trim();
@@ -269,5 +286,30 @@ mod tests {
         // No subprocess is spawned for bwrap/none — safe in the gated suite.
         assert_eq!(preflight_exec(&base_spec(Backend::Bwrap)), Ok(()));
         assert_eq!(preflight_exec(&base_spec(Backend::None)), Ok(()));
+    }
+
+    #[test]
+    fn compose_preflight_routes_to_service_and_non_oci_never_routes_to_compose() {
+        let compose = crate::sandbox_compose::ComposeSpec {
+            files: vec!["compose.yml".into()],
+            service: Some("worker".into()),
+            run_services: Vec::new(),
+        };
+        let mut spec = base_spec(Backend::Docker);
+        spec.compose = Some(compose.encode());
+        let routed = preflight_exec_argv_with(&spec, "true");
+        let workdir = spec.worktree.to_string_lossy().into_owned();
+        let pane_path =
+            crate::sandbox_compose::exec_argv(&spec.name, &compose, Some(&workdir), "true", false)
+                .unwrap();
+        assert_eq!(routed, spec.placement.control_argv(&pane_path));
+        let exec = routed.iter().position(|arg| arg == "exec").unwrap();
+        assert_eq!(routed[exec + 1], "worker");
+        assert!(!routed.contains(&"-it".into()));
+
+        spec.backend = Backend::Bwrap;
+        let bwrap = preflight_exec_argv_with(&spec, "true");
+        assert_eq!(bwrap.first().map(String::as_str), Some("bwrap"));
+        assert!(!bwrap.iter().any(|arg| arg == "compose"));
     }
 }

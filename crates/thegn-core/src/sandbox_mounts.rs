@@ -223,21 +223,25 @@ pub fn auto_cache_mounts() -> Vec<Mount> {
 /// from the sealed agent profile would be a persistence vector into the host
 /// session — exactly what the read-only `$HOME` exists to prevent.
 pub fn default_writable_carveouts(profile: SandboxProfile) -> Vec<Mount> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    if home.is_empty() {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    default_writable_carveouts_at(profile, &home, &|key| std::env::var_os(key))
+}
+
+fn default_writable_carveouts_at(
+    profile: SandboxProfile,
+    home: &Path,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<Mount> {
+    if !home.is_absolute() {
         return Vec::new();
     }
     // Personal scratch + the XDG state/data dirs where shell history, zoxide,
     // and atuin keep their databases, plus the legacy `$HOME`-root history files
     // many shells still write. Deliberately narrow: source trees, ~/.ssh,
     // ~/.config, and the rest of $HOME stay read-only.
-    let mut rels: Vec<&str> = vec![
-        "tmp",
-        ".local/state",
-        ".local/share",
-        ".zsh_history",
-        ".bash_history",
-    ];
+    let mut rels: Vec<&str> = vec!["tmp", ".zsh_history", ".bash_history"];
     // Interactive/hardened only — never the sealed agent:
     //   `~/.keychain` stores scripts host login shells later *source*.
     //   `~/.claude-profiles` is where HOME-swapping coding-agent profile wrappers
@@ -265,7 +269,7 @@ pub fn default_writable_carveouts(profile: SandboxProfile) -> Vec<Mount> {
     let mut mounts: Vec<Mount> = rels
         .iter()
         .filter_map(|rel| {
-            let p = std::path::Path::new(&home).join(rel);
+            let p = home.join(rel);
             // Dir or file — but must exist so bwrap overmounts an existing
             // inode (skips dangling symlinks, which `is_dir`/`is_file` reject).
             (p.is_dir() || p.is_file()).then(|| {
@@ -279,6 +283,59 @@ pub fn default_writable_carveouts(profile: SandboxProfile) -> Vec<Mount> {
             })
         })
         .collect();
+    let state_root = xdg_mount_root(home, "XDG_STATE_HOME", ".local/state", env);
+    let data_root = xdg_mount_root(home, "XDG_DATA_HOME", ".local/share", env);
+    let overlap = state_root
+        .as_ref()
+        .zip(data_root.as_ref())
+        .is_some_and(|((a, _), (b, _))| a == b || a.starts_with(b) || b.starts_with(a));
+    if !overlap {
+        for (root, leaves) in [
+            (state_root.as_ref(), &["bash", "zsh"][..]),
+            (data_root.as_ref(), &["fish", "zoxide", "atuin"][..]),
+        ] {
+            if let Some((root, namespace_root)) = root {
+                for leaf in leaves {
+                    if *leaf == "atuin"
+                        && matches!(
+                            profile,
+                            SandboxProfile::Sealed | SandboxProfile::SealedTunnel
+                        )
+                    {
+                        continue;
+                    }
+                    let destination = namespace_root.join(leaf);
+                    let source_path = root.join(leaf);
+                    let Ok(source) = source_path.canonicalize() else {
+                        continue;
+                    };
+                    if !source.starts_with(root) || !source.is_dir() {
+                        continue;
+                    }
+                    let protected_state = crate::util::xdg_state_home().join("thegn");
+                    if source.starts_with(&protected_state) || protected_state.starts_with(&source)
+                    {
+                        tracing::debug!(path = %destination.display(), "omitting XDG carve-out overlapping Thegn state/control paths");
+                        continue;
+                    }
+                    if (*leaf == "bash" || *leaf == "zsh")
+                        && root
+                            .join("thegn/run")
+                            .canonicalize()
+                            .is_ok_and(|p| p.starts_with(&source))
+                    {
+                        continue;
+                    }
+                    mounts.push(Mount {
+                        host: source.to_string_lossy().into_owned(),
+                        dest: destination.to_string_lossy().into_owned(),
+                        ro: false,
+                        cache: false,
+                    });
+                }
+            }
+        }
+    }
     // Coding-agent config dirs (Claude Code's `CLAUDE_CONFIG_DIR` / `~/.claude`,
     // Codex's `CODEX_HOME` / `~/.codex`) carved read-write: the agent CLI writes
     // runtime state (`session-env`, todos, shell snapshots) here, so a plain
@@ -305,6 +362,51 @@ pub fn default_writable_carveouts(profile: SandboxProfile) -> Vec<Mount> {
         }
     }
     mounts
+}
+
+fn xdg_mount_root(
+    home: &Path,
+    variable: &str,
+    fallback: &str,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<(PathBuf, PathBuf)> {
+    let root = match env(variable) {
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if path.as_os_str().is_empty() || !path.is_absolute() || path.to_str().is_none() {
+                tracing::debug!(root = %path.display(), variable, "omitting invalid XDG root");
+                return None;
+            }
+            path
+        }
+        None => home.join(fallback),
+    };
+    let metadata = match std::fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            tracing::debug!(root = %root.display(), variable, %error, "omitting missing or unreadable XDG root");
+            return None;
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || root.to_str().is_none() {
+        tracing::debug!(root = %root.display(), variable, "omitting symlinked, non-directory, or non-UTF-8 XDG root");
+        return None;
+    }
+    let canonical = match root.canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::debug!(root = %root.display(), variable, %error, "omitting unresolvable XDG root");
+            return None;
+        }
+    };
+    let parent = match root.parent().and_then(|path| path.canonicalize().ok()) {
+        Some(path) => path,
+        None => {
+            tracing::debug!(root = %root.display(), variable, "omitting XDG root with unresolvable parent");
+            return None;
+        }
+    };
+    (canonical == parent.join(root.file_name()?)).then_some((canonical, root))
 }
 
 /// Decide whether a mount `m` should be added given the mounts already
@@ -896,6 +998,136 @@ pub fn sealed_home_allowlist(home: &Path) -> Vec<Mount> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xdg_roots_mount_only_approved_existing_leaves_and_keep_destinations() {
+        let td = tempfile::tempdir().unwrap();
+        let home = td.path().join("home");
+        let state = td.path().join("state");
+        let data = td.path().join("data");
+        for path in [
+            state.join("bash"),
+            state.join("zsh"),
+            state.join("thegn"),
+            data.join("fish"),
+            data.join("zoxide"),
+            data.join("atuin"),
+            data.join("other"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let lookup = |key: &str| match key {
+            "XDG_STATE_HOME" => Some(state.as_os_str().to_owned()),
+            "XDG_DATA_HOME" => Some(data.as_os_str().to_owned()),
+            _ => None,
+        };
+        let mounts = default_writable_carveouts_at(SandboxProfile::Hardened, &home, &lookup);
+        for path in [
+            state.join("bash"),
+            state.join("zsh"),
+            data.join("fish"),
+            data.join("zoxide"),
+            data.join("atuin"),
+        ] {
+            assert!(
+                mounts
+                    .iter()
+                    .any(|mount| mount.dest == path.to_string_lossy().as_ref()),
+                "missing {path:?}"
+            );
+        }
+        assert!(
+            mounts
+                .iter()
+                .all(|mount| mount.dest != state.to_string_lossy().as_ref()
+                    && mount.dest != data.to_string_lossy().as_ref()
+                    && mount.dest != state.join("thegn").to_string_lossy().as_ref()
+                    && mount.dest != data.join("thegn").to_string_lossy().as_ref())
+        );
+        let sealed = default_writable_carveouts_at(SandboxProfile::Sealed, &home, &lookup);
+        assert!(
+            sealed
+                .iter()
+                .all(|mount| mount.dest != data.join("atuin").to_string_lossy().as_ref())
+        );
+
+        let relative = |key: &str| match key {
+            "XDG_STATE_HOME" => Some("relative".into()),
+            "XDG_DATA_HOME" => Some(data.as_os_str().to_owned()),
+            _ => None,
+        };
+        let invalid = default_writable_carveouts_at(SandboxProfile::Hardened, &home, &relative);
+        assert!(invalid.iter().all(|mount| !mount.dest.ends_with("/bash")));
+
+        let default_home = td.path().join("default-home");
+        for path in [
+            default_home.join(".local/state/bash"),
+            default_home.join(".local/share/fish"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let no_overrides = |_key: &str| None;
+        let defaults =
+            default_writable_carveouts_at(SandboxProfile::Hardened, &default_home, &no_overrides);
+        assert!(defaults.iter().any(|mount| {
+            mount.dest
+                == default_home
+                    .join(".local/state/bash")
+                    .to_string_lossy()
+                    .as_ref()
+        }));
+        assert!(defaults.iter().any(|mount| {
+            mount.dest
+                == default_home
+                    .join(".local/share/fish")
+                    .to_string_lossy()
+                    .as_ref()
+        }));
+
+        let overlap = |key: &str| match key {
+            "XDG_STATE_HOME" => Some(state.as_os_str().to_owned()),
+            "XDG_DATA_HOME" => Some(state.join("nested").into_os_string()),
+            _ => None,
+        };
+        let overlapping = default_writable_carveouts_at(SandboxProfile::Hardened, &home, &overlap);
+        assert!(
+            overlapping.iter().all(|mount| {
+                !mount.dest.ends_with("/bash") && !mount.dest.ends_with("/zoxide")
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_state_root_leaf_symlink_is_omitted() {
+        use std::os::unix::fs::symlink;
+        let td = tempfile::tempdir().unwrap();
+        let home = td.path().join("home");
+        let real = td.path().join("state-real");
+        let alias = td.path().join("state-alias");
+        std::fs::create_dir_all(real.join("bash")).unwrap();
+        symlink(&real, &alias).unwrap();
+        let env = |key: &str| match key {
+            "XDG_STATE_HOME" => Some(alias.as_os_str().to_owned()),
+            _ => None,
+        };
+        let mounts = default_writable_carveouts_at(SandboxProfile::Hardened, &home, &env);
+        assert!(mounts.iter().all(|mount| !mount.dest.ends_with("/bash")));
+
+        let real_home = td.path().join("real-home");
+        let namespace_home = td.path().join("home-alias");
+        std::fs::create_dir_all(real_home.join(".local/state/bash")).unwrap();
+        symlink(&real_home, &namespace_home).unwrap();
+        let no_overrides = |_key: &str| None;
+        let alias_mounts =
+            default_writable_carveouts_at(SandboxProfile::Hardened, &namespace_home, &no_overrides);
+        let alias_dest = namespace_home.join(".local/state/bash");
+        let alias_source = real_home.join(".local/state/bash");
+        assert!(alias_mounts.iter().any(|mount| {
+            mount.dest == alias_dest.to_string_lossy().as_ref()
+                && mount.host == alias_source.to_string_lossy().as_ref()
+        }));
+    }
 
     #[test]
     fn systemd_paths_are_refused_unless_plain_absolute_and_normalised() {
