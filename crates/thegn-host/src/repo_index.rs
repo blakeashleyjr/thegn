@@ -367,12 +367,13 @@ mod tests {
     use std::process::ExitStatus;
 
     fn git(root: &Path, args: &[&str]) -> ExitStatus {
-        thegn_core::util::git_cmd(root)
+        #[expect(clippy::disallowed_methods)]
+        let status = thegn_core::util::git_cmd(root)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(["-c", "commit.gpgsign=false"])
             .args(args)
-            .status()
-            .unwrap()
+            .status();
+        status.unwrap()
     }
 
     #[test]
