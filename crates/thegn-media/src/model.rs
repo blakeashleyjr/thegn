@@ -144,7 +144,7 @@ impl MediaKind {
 /// commonly supply relative filenames rather than URLs.
 fn url_extension(value: &str) -> Option<&str> {
     let path = if let Some((_, after_scheme)) = value.split_once("://") {
-        let boundary = after_scheme.find(|ch| matches!(ch, '/' | '?' | '#'))?;
+        let boundary = after_scheme.find(['/', '?', '#'])?;
         if after_scheme.as_bytes()[boundary] != b'/' {
             return None;
         }
