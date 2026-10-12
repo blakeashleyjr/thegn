@@ -95,7 +95,7 @@ enum Reject {
 /// The host of an admitted URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Host {
-    Ip(IpAddr),
+    Ip,
     Name(String),
 }
 
@@ -158,7 +158,7 @@ fn admit_url(url: &reqwest::Url) -> Result<Host, Reject> {
     }
     match bare.parse::<IpAddr>() {
         Ok(ip) if forbidden_ip(ip) => Err(Reject::ForbiddenAddress),
-        Ok(ip) => Ok(Host::Ip(ip)),
+        Ok(_) => Ok(Host::Ip),
         Err(_) => Ok(Host::Name(bare.to_string())),
     }
 }
@@ -263,7 +263,11 @@ async fn load_raster(art_url: &str) -> Result<crate::rasterize::Raster, Reject> 
     }
     if let Some(path) = local_path(art_url) {
         return tokio::task::spawn_blocking(move || {
-            crate::rasterize::image_file_capped(&path, MAX_ART_BYTES as u64)
+            crate::rasterize::image_file_with_limits(
+                &path,
+                MAX_ART_BYTES as u64,
+                crate::rasterize::MEDIA_ART_LIMITS,
+            )
         })
         .await
         .map_err(|_| Reject::Decode)?
@@ -275,10 +279,12 @@ async fn load_raster(art_url: &str) -> Result<crate::rasterize::Raster, Reject> 
     let bytes = tokio::time::timeout(FETCH_TOTAL_TIMEOUT, fetch_http(art_url))
         .await
         .map_err(|_| Reject::Network)??;
-    tokio::task::spawn_blocking(move || crate::rasterize::image_bytes(&bytes))
-        .await
-        .map_err(|_| Reject::Decode)?
-        .map_err(|_| Reject::Decode)
+    tokio::task::spawn_blocking(move || {
+        crate::rasterize::image_bytes_with_limits(&bytes, crate::rasterize::MEDIA_ART_LIMITS)
+    })
+    .await
+    .map_err(|_| Reject::Decode)?
+    .map_err(|_| Reject::Decode)
 }
 
 /// Fetch + decode `art_url` into an [`ArtMosaic`] off-thread, then deliver it and
@@ -415,7 +421,7 @@ mod tests {
             admit("https://i.scdn.co/a.jpg"),
             Ok(Host::Name("i.scdn.co".into()))
         );
-        assert_eq!(admit("http://8.8.8.8/x"), Ok(Host::Ip(ip("8.8.8.8"))));
+        assert_eq!(admit("http://8.8.8.8/x"), Ok(Host::Ip));
         assert_eq!(admit("ftp://example.com/x"), Err(Reject::Scheme));
         assert_eq!(admit("file:///etc/passwd"), Err(Reject::Scheme));
         assert_eq!(
