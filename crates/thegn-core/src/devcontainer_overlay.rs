@@ -23,7 +23,7 @@
 //! (repo-committed) declaration may be applied at all is `repo_trust`'s job; the
 //! caller gates before calling here.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::SandboxConfig;
 use crate::config_resolve::{Approvals, GatedRequest};
@@ -323,7 +323,19 @@ fn fold_compose(
             "devcontainer: `dockerComposeFile` needs a resolved config dir (skipped)".into(),
         ];
     };
-    let files: Vec<String> = c.files.iter().map(|f| resolve_under(dir, f)).collect();
+    let files: Vec<String> = match c
+        .files
+        .iter()
+        .map(|f| resolve_under(dir, f))
+        .collect::<Result<Vec<String>, _>>()
+    {
+        Ok(files) => files,
+        Err(error) => {
+            return vec![format!(
+                "devcontainer: `dockerComposeFile` {error} (skipped)"
+            )];
+        }
+    };
     let cs = crate::sandbox_compose::ComposeSpec {
         files,
         service: (!c.service.is_empty()).then(|| c.service.clone()),
@@ -367,9 +379,18 @@ fn fold_build(
     let Some(dir) = &dc.config_dir else {
         return vec!["devcontainer: `build` needs a resolved config dir (skipped)".into()];
     };
+    let (dockerfile, context) = match (
+        resolve_under(dir, &b.dockerfile),
+        resolve_under(dir, &b.context),
+    ) {
+        (Ok(dockerfile), Ok(context)) => (dockerfile, context),
+        (Err(error), _) | (_, Err(error)) => {
+            return vec![format!("devcontainer: build path {error} (skipped)")];
+        }
+    };
     let build = SandboxBuild {
-        dockerfile: resolve_under(dir, &b.dockerfile),
-        context: resolve_under(dir, &b.context),
+        dockerfile,
+        context,
         args: b.args.clone(),
         target: b.target.clone(),
     };
@@ -378,17 +399,69 @@ fn fold_build(
     Vec::new()
 }
 
-/// Resolve `p` against `dir` (absolute `p` wins, `.`/empty ⇒ `dir` itself),
-/// returned as a string.
-fn resolve_under(dir: &Path, p: &str) -> String {
+/// Resolve a repo-authored path under its worktree. Parent traversal is
+/// accepted only while it remains within the inferred repository root, and
+/// an existing parent is canonicalized to catch symlink escapes.
+fn resolve_under(dir: &Path, p: &str) -> Result<String, &'static str> {
     let pp = Path::new(p);
     if pp.is_absolute() {
-        p.to_string()
-    } else if p.is_empty() || p == "." {
-        dir.to_string_lossy().into_owned()
-    } else {
-        dir.join(pp).to_string_lossy().into_owned()
+        return Err("is absolute");
     }
+    let root = repository_root(dir);
+    let mut depth = dir
+        .strip_prefix(&root)
+        .expect("repository root is a prefix of config dir")
+        .components()
+        .count();
+    for component in pp.components() {
+        match component {
+            std::path::Component::Normal(_) => depth += 1,
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir if depth > 0 => depth -= 1,
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err("escapes the repository");
+            }
+        }
+    }
+    let resolved = if p.is_empty() || p == "." {
+        dir.to_path_buf()
+    } else {
+        dir.join(pp)
+    };
+    let check_path = if resolved.exists() {
+        resolved.as_path()
+    } else {
+        resolved.parent().unwrap_or(dir)
+    };
+    if let Ok(canonical_path) = check_path.canonicalize() {
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|_| "cannot verify repository containment")?;
+        if !canonical_path.starts_with(canonical_root) {
+            return Err("escapes the repository through a symlink");
+        }
+    }
+    Ok(resolved.to_string_lossy().into_owned())
+}
+
+fn repository_root(dir: &Path) -> PathBuf {
+    if dir.file_name().is_some_and(|name| name == ".devcontainer") {
+        return dir.parent().unwrap_or(dir).to_path_buf();
+    }
+    if dir
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == ".devcontainer")
+    {
+        return dir
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(dir)
+            .to_path_buf();
+    }
+    dir.to_path_buf()
 }
 
 /// A human tag hint from the config dir: the worktree/project name (the parent
@@ -1185,16 +1258,28 @@ mod tests {
     }
 
     #[test]
-    fn build_absolute_paths_pass_through() {
+    fn build_absolute_paths_are_refused() {
         let dc = parse_with_dir(
             r#"{ "build": { "dockerfile": "/abs/Dockerfile", "context": "/abs" } }"#,
             "/home/u/proj/.devcontainer",
         );
         let mut sb = SandboxConfig::default();
-        apply_to_sandbox(&dc, &mut sb, &ctx());
-        let b = sb.build.unwrap();
-        assert_eq!(b.dockerfile, "/abs/Dockerfile");
-        assert_eq!(b.context, "/abs");
+        let warns = apply_to_sandbox(&dc, &mut sb, &ctx());
+        assert!(sb.build.is_none());
+        assert!(sb.image.is_empty());
+        assert!(warns.iter().any(|warning| warning.contains("absolute")));
+    }
+
+    #[test]
+    fn build_parent_traversal_is_refused_when_it_escapes_repository() {
+        let dc = parse_with_dir(
+            r#"{ "build": { "dockerfile": "../../../etc/passwd", "context": "." } }"#,
+            "/home/u/proj/.devcontainer",
+        );
+        let mut sb = SandboxConfig::default();
+        let warns = apply_to_sandbox(&dc, &mut sb, &ctx());
+        assert!(sb.build.is_none());
+        assert!(warns.iter().any(|warning| warning.contains("escapes")));
     }
 
     #[test]
@@ -1288,6 +1373,18 @@ mod tests {
         let mut sb = SandboxConfig::default();
         let warns = apply_to_sandbox(&dc, &mut sb, &ctx());
         assert!(warns.iter().any(|w| w.contains("compose file")));
+    }
+
+    #[test]
+    fn compose_absolute_path_is_refused() {
+        let dc = parse_with_dir(
+            r#"{ "dockerComposeFile": "/abs.yml", "service": "app" }"#,
+            "/home/u/proj/.devcontainer",
+        );
+        let mut sb = SandboxConfig::default();
+        let warns = apply_to_sandbox(&dc, &mut sb, &ctx());
+        assert!(sb.compose.is_none());
+        assert!(warns.iter().any(|warning| warning.contains("absolute")));
     }
 
     #[test]
