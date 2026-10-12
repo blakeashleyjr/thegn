@@ -15,6 +15,42 @@
 //! with `up -d <service> <runServices…>`. The argv builders are pure + tested;
 //! only the callers run subprocesses.
 
+use std::fmt;
+use std::time::Duration;
+
+/// Maximum time allowed for `docker compose up`, including any pull it triggers.
+pub(crate) const COMPOSE_UP_TIMEOUT: Duration = Duration::from_secs(150);
+/// Maximum time allowed to verify that Compose reports a running service.
+pub(crate) const COMPOSE_PS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A bounded Compose startup or verification failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ComposeError {
+    Spawn,
+    Timeout,
+    Exit { code: Option<i32>, stderr: String },
+    OutputLimit,
+    NotRunning,
+}
+
+impl fmt::Display for ComposeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Spawn => write!(f, "unable to run Docker Compose command"),
+            Self::Timeout => write!(f, "Docker Compose command timed out"),
+            Self::Exit { code, stderr } => write!(
+                f,
+                "Docker Compose exited with status {code:?}: {:?}",
+                stderr.trim()
+            ),
+            Self::OutputLimit => write!(f, "Docker Compose output exceeded its size limit"),
+            Self::NotRunning => write!(f, "Docker Compose started no running service"),
+        }
+    }
+}
+
+impl std::error::Error for ComposeError {}
+
 /// Field separator (US) between the file-list, service, and run-services parts.
 const FS: char = '\u{1f}';
 /// List separator (RS) within the file-list / run-services parts.
@@ -117,6 +153,95 @@ pub fn up_argv(project: &str, c: &ComposeSpec) -> Vec<String> {
     v
 }
 
+/// `docker compose … ps --status running --quiet [service]`. Pure.
+pub fn ps_argv(project: &str, c: &ComposeSpec) -> Vec<String> {
+    let mut v = project_prefix(project, c);
+    v.extend([
+        "ps".into(),
+        "--status".into(),
+        "running".into(),
+        "--quiet".into(),
+    ]);
+    if let Some(service) = &c.service {
+        v.push(service.clone());
+    }
+    v
+}
+
+/// Run Compose startup and confirm at least one intended service is running.
+pub(crate) fn run_up_checked(
+    up: &[String],
+    ps: &[String],
+    up_timeout: Duration,
+    ps_timeout: Duration,
+) -> Result<(), ComposeError> {
+    use crate::sandbox::proc::{Capture, ProcOutcome, run_bounded};
+
+    let up_outcome = run_bounded(
+        up,
+        up_timeout,
+        Capture {
+            stdout: None,
+            stderr: Some(64 * 1024),
+        },
+    );
+    let (up_success, up_code) = match &up_outcome {
+        ProcOutcome::Exited { status, .. } => (status.success(), status.code()),
+        ProcOutcome::Timeout => return Err(ComposeError::Timeout),
+        ProcOutcome::Spawn | ProcOutcome::Wait | ProcOutcome::Read => {
+            return Err(ComposeError::Spawn);
+        }
+    };
+    let (_, up_stderr) = up_outcome.into_stderr().ok_or(ComposeError::OutputLimit)?;
+    if !up_success {
+        return Err(ComposeError::Exit {
+            code: up_code,
+            stderr: up_stderr,
+        });
+    }
+
+    let ps_outcome = run_bounded(
+        ps,
+        ps_timeout,
+        Capture {
+            stdout: Some(4096),
+            stderr: None,
+        },
+    );
+    let ps_success = match &ps_outcome {
+        ProcOutcome::Exited { status, .. } => status.success(),
+        ProcOutcome::Timeout => return Err(ComposeError::Timeout),
+        ProcOutcome::Spawn | ProcOutcome::Wait | ProcOutcome::Read => {
+            return Err(ComposeError::Spawn);
+        }
+    };
+    if !ps_success {
+        return Err(ComposeError::Exit {
+            code: match &ps_outcome {
+                ProcOutcome::Exited { status, .. } => status.code(),
+                _ => None,
+            },
+            stderr: String::new(),
+        });
+    }
+    let (_, running) = ps_outcome.into_stdout().ok_or(ComposeError::OutputLimit)?;
+    if running.trim().is_empty() {
+        return Err(ComposeError::NotRunning);
+    }
+    Ok(())
+}
+
+/// Start the declared project and verify its requested service is running.
+pub(crate) fn up_and_verify(project: &str, compose: &ComposeSpec) -> anyhow::Result<()> {
+    run_up_checked(
+        &up_argv(project, compose),
+        &ps_argv(project, compose),
+        COMPOSE_UP_TIMEOUT,
+        COMPOSE_PS_TIMEOUT,
+    )?;
+    Ok(())
+}
+
 /// `docker compose … exec [-it] [--workdir wd] <service> /bin/sh -lc <script>`.
 /// Pure. `interactive` toggles `-it` (a pane) vs a one-shot exec.
 pub fn exec_argv(
@@ -191,6 +316,105 @@ mod tests {
                 "docker", "compose", "-f", "/a/c.yml", "-f", "/a/o.yml", "-p", "proj", "up", "-d",
                 "app", "db",
             ]
+        );
+    }
+
+    #[test]
+    fn ps_argv_includes_files_project_and_service() {
+        let c = ComposeSpec {
+            files: vec!["/a/c.yml".into(), "/a/o.yml".into()],
+            service: Some("app".into()),
+            run_services: vec!["db".into()],
+        };
+        assert_eq!(
+            ps_argv("proj", &c),
+            vec![
+                "docker", "compose", "-f", "/a/c.yml", "-f", "/a/o.yml", "-p", "proj", "ps",
+                "--status", "running", "--quiet", "app",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    fn shell(script: &str) -> Vec<String> {
+        vec!["sh".into(), "-c".into(), script.into()]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compose_up_timeout_is_bounded() {
+        let started = std::time::Instant::now();
+        let result = run_up_checked(
+            &shell("sleep 5"),
+            &shell("echo abc123"),
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+        );
+        assert_eq!(result, Err(ComposeError::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compose_up_reaps_descendant_holding_capture_pipe_by_deadline() {
+        let started = std::time::Instant::now();
+        let result = run_up_checked(
+            &shell("sleep 30 & exit 0"),
+            &shell("echo abc123"),
+            Duration::from_millis(300),
+            Duration::from_secs(1),
+        );
+        assert!(result.is_ok());
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compose_up_reports_nonzero_status_and_bounded_stderr() {
+        let result = run_up_checked(
+            &shell("echo boom >&2; exit 3"),
+            &shell("echo unused"),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            result,
+            Err(ComposeError::Exit {
+                code: Some(3),
+                stderr: "boom\n".into(),
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compose_up_requires_running_service_and_rejects_oversized_ps_output() {
+        assert_eq!(
+            run_up_checked(
+                &shell("true"),
+                &shell("true"),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+            Err(ComposeError::NotRunning)
+        );
+        assert_eq!(
+            run_up_checked(
+                &shell("true"),
+                &shell("echo abc123"),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            run_up_checked(
+                &shell("true"),
+                &shell("head -c 5000 /dev/zero"),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+            Err(ComposeError::OutputLimit)
         );
     }
 
