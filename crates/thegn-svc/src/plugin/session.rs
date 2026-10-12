@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use thegn_core::plugin_api::{RpcMessage, RpcResponse};
+use thegn_core::plugin_api::{Frame, RpcMessage, RpcResponse};
 use tokio::time::Instant;
 
 pub(super) mod admission;
@@ -477,20 +477,17 @@ impl Drop for ResidentSession {
 
 /// Classify one complete NDJSON line. Junk remains diagnostic, not executable.
 fn parse_line(text: &str) -> SessionEvent {
-    match serde_json::from_str::<serde_json::Value>(text) {
-        Ok(value) if value.get("method").is_some() => {
-            match serde_json::from_value::<RpcMessage>(value) {
-                Ok(message) => SessionEvent::Message(message),
-                Err(_) => SessionEvent::Junk(text.to_string()),
-            }
+    match super::proc::decode_frame(text) {
+        Ok(Frame::Message(message)) => SessionEvent::Message(message),
+        Ok(Frame::Response(response)) => SessionEvent::Response(response),
+        Err(reason) => {
+            tracing::debug!(
+                target: "thegn::plugin",
+                ?reason,
+                "discarding rejected resident plugin frame"
+            );
+            SessionEvent::Junk(text.chars().take(200).collect())
         }
-        Ok(value) if value.get("id").is_some() => {
-            match serde_json::from_value::<RpcResponse>(value) {
-                Ok(response) => SessionEvent::Response(response),
-                Err(_) => SessionEvent::Junk(text.to_string()),
-            }
-        }
-        _ => SessionEvent::Junk(text.to_string()),
     }
 }
 #[cfg(test)]
