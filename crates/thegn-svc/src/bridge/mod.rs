@@ -29,6 +29,45 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crate::lsp::framing::{self, FramedReader};
 use thegn_core::remote::GitLoc;
 
+/// Maximum concurrent stateless bridge RPCs across all connections.
+const MAX_BRIDGE_WORK: usize = 8;
+/// Per-stream capture ceiling. Readers continue draining after this limit.
+const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+/// Worst-case JSON escaping expands captured control bytes sixfold. Five
+/// commands × two streams × the capture limit stays below the 64 MiB frame cap.
+const MAX_BATCH_CMDS: usize = 5;
+
+#[derive(Default)]
+struct AdmissionLimiter {
+    active: std::sync::atomic::AtomicUsize,
+}
+
+impl AdmissionLimiter {
+    fn try_acquire(self: &Arc<Self>) -> Option<AdmissionPermit> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_BRIDGE_WORK).then_some(active + 1)
+            })
+            .ok()?;
+        Some(AdmissionPermit(self.clone()))
+    }
+}
+
+struct AdmissionPermit(Arc<AdmissionLimiter>);
+
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn bridge_admission() -> Arc<AdmissionLimiter> {
+    static LIMITER: OnceLock<Arc<AdmissionLimiter>> = OnceLock::new();
+    LIMITER
+        .get_or_init(|| Arc::new(AdmissionLimiter::default()))
+        .clone()
+}
+
 /// Parameters for the `exec` method: run `argv` (optionally in `cwd`, with extra
 /// `env`) and return its captured output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,12 +81,17 @@ pub struct ExecParams {
 
 /// The captured result of an `exec`. `stdout`/`stderr` are UTF-8 (lossy for any
 /// non-UTF-8 bytes — git/text tooling output, incl. `-z` NUL separators which are
-/// valid UTF-8, round-trips exactly).
+/// valid UTF-8, round-trips exactly). Each stream is capped; its corresponding
+/// `*_truncated` flag is true when additional bytes were drained and discarded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecResult {
     pub stdout: String,
     pub stderr: String,
     pub exit: i32,
+    #[serde(default)]
+    pub stdout_truncated: bool,
+    #[serde(default)]
+    pub stderr_truncated: bool,
 }
 
 /// A filesystem change streamed from an `fs.watch` subscription.
@@ -427,9 +471,13 @@ impl BridgeClient {
             cwd: cwd.map(str::to_string),
             env: env.to_vec(),
         })?;
-        Ok(serde_json::from_value(
-            self.call_within("exec", params, timeout)?,
-        )?)
+        let result: ExecResult =
+            serde_json::from_value(self.call_within("exec", params, timeout)?)?;
+        if result.stdout_truncated || result.stderr_truncated {
+            let argv0 = argv.first().copied().unwrap_or("<empty argv>");
+            bail!("bridge: {argv0} output exceeded the {MAX_CAPTURE_BYTES}-byte capture limit");
+        }
+        Ok(result)
     }
 
     /// Run several commands in the env in **one** round-trip, returning each one's
@@ -447,11 +495,15 @@ impl BridgeClient {
             env: env.to_vec(),
         })?;
         // Read-only glyph fan-out — bound by the shorter interactive deadline.
-        Ok(serde_json::from_value(self.call_within(
-            "exec.batch",
-            params,
-            self.read_timeout,
-        )?)?)
+        let mut results: Vec<ExecResult> =
+            serde_json::from_value(self.call_within("exec.batch", params, self.read_timeout)?)?;
+        for result in &mut results {
+            if result.stdout_truncated || result.stderr_truncated {
+                result.exit = -1;
+                result.stderr = "bridge output exceeded capture limit".into();
+            }
+        }
+        Ok(results)
     }
 
     /// Sum of CPU jiffies per path for processes in the env whose cwd is under it
@@ -1006,11 +1058,19 @@ pub fn serve(reader: impl Read, writer: impl Write + Send + 'static) {
                     }
                 }
                 "exec" | "exec.batch" | "proc.list" => {
+                    let Some(permit) = bridge_admission().try_acquire() else {
+                        write_frame(
+                            &writer,
+                            &resp_err(req.id, "bridge busy: execution capacity exhausted".into()),
+                        );
+                        continue;
+                    };
                     let w = writer.clone();
                     let req_id = req.id;
                     if let Err(e) = std::thread::Builder::new()
                         .name("bridge-exec".into())
                         .spawn(move || {
+                            let _permit = permit;
                             let resp = match req.method.as_str() {
                                 "exec" => exec_response(&req),
                                 "exec.batch" => exec_batch_response(&req),
@@ -1399,6 +1459,9 @@ fn exec_batch_response(req: &Request) -> Response {
         Ok(p) => p,
         Err(e) => return resp_err(req.id, format!("bad exec.batch params: {e}")),
     };
+    if p.cmds.len() > MAX_BATCH_CMDS {
+        return resp_err(req.id, "bad exec.batch params: too many commands".into());
+    }
     // Each command runs independently; a spawn failure becomes a synthetic
     // exit=-1 result rather than failing the whole batch, so one bad subcommand
     // never masks its siblings' output.
@@ -1411,10 +1474,12 @@ fn exec_batch_response(req: &Request) -> Response {
                 cwd: None,
                 env: p.env.clone(),
             })
-            .unwrap_or_else(|e| ExecResult {
+            .unwrap_or_else(|_error| ExecResult {
                 stdout: String::new(),
-                stderr: e.to_string(),
+                stderr: "bridge exec failed".into(),
                 exit: -1,
+                stdout_truncated: false,
+                stderr_truncated: false,
             })
         })
         .collect();
@@ -1551,51 +1616,159 @@ fn do_exec(p: &ExecParams) -> Result<ExecResult> {
     // timeout without cancelling us, so cap it here — deadline defaults above the
     // client's read timeout so a legitimately-slow-but-live command still finishes.
     let deadline = env_timeout("THEGN_BRIDGE_EXEC_DEADLINE_SECS", 90);
-    output_bounded(c, deadline).with_context(|| format!("exec {}", p.argv.join(" ")))
+    output_bounded(c, deadline).context("bridge exec failed")
 }
 
 /// Run `c` to completion, draining stdout/stderr on threads (so a full pipe never
 /// deadlocks) and killing the child if it outlives `deadline`. Mirrors the host's
 /// `git::output_bounded`. A killed child yields `exit = -1`.
 fn output_bounded(mut c: Command, deadline: Duration) -> Result<ExecResult> {
+    crate::plugin::proc::set_process_group(&mut c);
     c.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = c.spawn().context("spawn")?;
-    let mut stdout = child.stdout.take().context("child stdout")?;
-    let mut stderr = child.stderr.take().context("child stderr")?;
+    let stdout = child.stdout.take().context("child stdout")?;
+    let stderr = child.stderr.take().context("child stderr")?;
     // Drain both pipes concurrently — a child that fills one while we block on the
     // other would otherwise deadlock, and killing on deadline needs the readers to
     // not be holding the process open.
-    let out_h = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = stdout.read_to_end(&mut b); // best-effort: read error just truncates captured output
-        b
-    });
-    let err_h = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = stderr.read_to_end(&mut b); // best-effort: read error just truncates captured output
-        b
-    });
+    let (done_tx, done_rx) = channel();
+    let stdout_capture = Arc::new(Mutex::new(CapturedOutput::default()));
+    let stderr_capture = Arc::new(Mutex::new(CapturedOutput::default()));
+    let out_state = stdout_capture.clone();
+    let out_done = done_tx.clone();
+    let out_h = match std::thread::Builder::new()
+        .name("bridge-stdout".into())
+        .spawn(move || {
+            drain_capture(stdout, out_state);
+            if let Err(error) = out_done.send(()) {
+                tracing::debug!(%error, "stdout capture completion receiver closed");
+            }
+        }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            if let Err(kill_error) = child.kill() {
+                tracing::debug!(%kill_error, "could not stop child after stdout reader failure");
+            }
+            if let Err(wait_error) = child.wait() {
+                tracing::warn!(%wait_error, "could not reap child after stdout reader failure");
+            }
+            return Err(error).context("spawn stdout capture reader");
+        }
+    };
+    let err_state = stderr_capture.clone();
+    let err_done = done_tx;
+    let err_h = match std::thread::Builder::new()
+        .name("bridge-stderr".into())
+        .spawn(move || {
+            drain_capture(stderr, err_state);
+            if let Err(error) = err_done.send(()) {
+                tracing::debug!(%error, "stderr capture completion receiver closed");
+            }
+        }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            if let Err(kill_error) = child.kill() {
+                tracing::debug!(%kill_error, "could not stop child after stderr reader failure");
+            }
+            if let Err(wait_error) = child.wait() {
+                tracing::warn!(%wait_error, "could not reap child after stderr reader failure");
+            }
+            if out_h.join().is_err() {
+                tracing::debug!("stdout capture reader panicked after stderr reader failure");
+            }
+            return Err(error).context("spawn stderr capture reader");
+        }
+    };
     let start = Instant::now();
     let status = loop {
         match child.try_wait().context("wait")? {
             Some(s) => break Some(s),
             None if start.elapsed() >= deadline => {
-                let _ = child.kill(); // best-effort: child may already have exited
-                let _ = child.wait(); // best-effort: reap-or-not is terminal here
+                crate::plugin::proc::kill_group(child.id());
+                if let Err(error) = child.wait() {
+                    tracing::debug!(%error, "could not reap bridge child after deadline");
+                }
                 break None;
             }
             None => std::thread::sleep(Duration::from_millis(20)),
         }
     };
-    let stdout = out_h.join().unwrap_or_default();
-    let stderr = err_h.join().unwrap_or_default();
+    let mut readers_remaining = 2;
+    let mut readers_timed_out = false;
+    while readers_remaining > 0 {
+        match done_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(()) => readers_remaining -= 1,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                readers_timed_out = true;
+                crate::plugin::proc::kill_group(child.id());
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                readers_timed_out = true;
+                break;
+            }
+        }
+    }
+    if readers_timed_out {
+        // Give group termination a brief bounded chance to close inherited pipes.
+        while readers_remaining > 0 {
+            match done_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(()) => readers_remaining -= 1,
+                Err(_) => break,
+            }
+        }
+    }
+    if readers_remaining == 0 {
+        if out_h.join().is_err() {
+            return Err(anyhow!("stdout capture reader panicked"));
+        }
+        if err_h.join().is_err() {
+            return Err(anyhow!("stderr capture reader panicked"));
+        }
+    }
+    let mut stdout = stdout_capture.lock().unwrap().clone();
+    let mut stderr = stderr_capture.lock().unwrap().clone();
+    if readers_remaining > 0 {
+        stdout.truncated = true;
+        stderr.truncated = true;
+    }
     Ok(ExecResult {
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
         exit: status.and_then(|s| s.code()).unwrap_or(-1),
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
     })
+}
+
+#[derive(Debug, Default, Clone)]
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn drain_capture(mut reader: impl Read, captured: Arc<Mutex<CapturedOutput>>) {
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let count = match reader.read(&mut chunk) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        if count == 0 {
+            break;
+        }
+        let mut output = captured.lock().unwrap();
+        let available = MAX_CAPTURE_BYTES - output.bytes.len();
+        let kept = count.min(available);
+        if kept > 0 {
+            output.bytes.reserve_exact(kept);
+            output.bytes.extend_from_slice(&chunk[..kept]);
+        }
+        output.truncated |= kept < count;
+    }
 }
 
 #[cfg(test)]
@@ -1915,6 +2088,23 @@ mod tests {
         // A non-zero exit is data, not an error — the batch still returns it.
         assert_eq!(r[1].exit, 7);
         assert_eq!(r[2].stdout.trim(), "third");
+    }
+
+    #[test]
+    fn exec_batch_rejects_more_than_the_frame_safe_command_count() {
+        let req = Request {
+            id: 1,
+            method: "exec.batch".into(),
+            params: serde_json::json!({
+                "cmds": vec![vec!["true".to_string()]; MAX_BATCH_CMDS + 1],
+                "env": []
+            }),
+        };
+        let response = exec_batch_response(&req);
+        assert_eq!(
+            response.err.as_deref(),
+            Some("bad exec.batch params: too many commands")
+        );
     }
 
     #[test]
@@ -2288,6 +2478,30 @@ mod tests {
     }
 
     #[test]
+    fn output_bounded_kills_pipe_holding_descendants_and_releases_admission() {
+        let limiter = Arc::new(AdmissionLimiter::default());
+        let permit = limiter.try_acquire().expect("capacity is available");
+        let mut c = Command::new("sh");
+        c.args(["-c", "sleep 30 & echo hi"]);
+        let start = Instant::now();
+        let work = std::thread::spawn(move || {
+            let _permit = permit;
+            output_bounded(c, Duration::from_secs(1)).unwrap()
+        });
+        let result = work.join().unwrap();
+        assert_eq!(result.stdout, "hi\n");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "inherited pipes are bounded: {:?}",
+            start.elapsed()
+        );
+        assert!(
+            limiter.try_acquire().is_some(),
+            "the timed-out bridge work releases admission capacity"
+        );
+    }
+
+    #[test]
     fn output_bounded_returns_output_for_a_fast_command() {
         // The happy path still captures stdout/exit for a command that finishes
         // well within the deadline.
@@ -2296,6 +2510,69 @@ mod tests {
         let r = output_bounded(c, Duration::from_secs(10)).unwrap();
         assert_eq!(r.stdout, "hi");
         assert_eq!(r.exit, 4);
+    }
+
+    #[test]
+    fn bridge_admission_fails_fast_at_the_shared_limit_and_releases_permits() {
+        let limiter = Arc::new(AdmissionLimiter::default());
+        let permits: Vec<_> = (0..MAX_BRIDGE_WORK)
+            .map(|_| limiter.try_acquire().expect("capacity is available"))
+            .collect();
+        assert_eq!(limiter.active.load(Ordering::Acquire), MAX_BRIDGE_WORK);
+        assert!(limiter.try_acquire().is_none(), "overload must fail fast");
+        drop(permits);
+        assert_eq!(limiter.active.load(Ordering::Acquire), 0);
+        assert!(
+            limiter.try_acquire().is_some(),
+            "released capacity is reusable"
+        );
+    }
+
+    #[test]
+    fn output_bounded_caps_each_stream_and_drains_excess_bytes() {
+        let mut c = Command::new("sh");
+        c.args([
+            "-c",
+            "head -c 1048577 /dev/zero; head -c 1048577 /dev/zero >&2",
+        ]);
+        let result = output_bounded(c, Duration::from_secs(10)).unwrap();
+        assert_eq!(result.stdout.len(), MAX_CAPTURE_BYTES);
+        assert_eq!(result.stderr.len(), MAX_CAPTURE_BYTES);
+        assert!(result.stdout_truncated);
+        assert!(result.stderr_truncated);
+        assert_eq!(result.exit, 0, "readers drain excess output so child exits");
+    }
+
+    #[test]
+    fn client_exec_rejects_truncated_capture() {
+        let client = connect();
+        let error = client
+            .exec(&["sh", "-c", "head -c 1048577 /dev/zero"], None, &[])
+            .expect_err("truncated output must not be returned as complete");
+        assert!(
+            error
+                .to_string()
+                .contains("sh output exceeded the 1048576-byte capture limit")
+        );
+    }
+
+    #[test]
+    fn client_exec_batch_marks_truncated_entries_as_failed() {
+        let client = connect();
+        let results = client
+            .exec_batch(
+                &[vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "head -c 1048577 /dev/zero".into(),
+                ]],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].exit, -1);
+        assert_eq!(results[0].stderr, "bridge output exceeded capture limit");
+        assert!(results[0].stdout_truncated);
     }
 
     #[test]

@@ -50,7 +50,6 @@ daemon/service.rs
 # when it is absent). There is no call site to make platform-free here —
 # moving a test behind a `platform::` function would hide the very thing it
 # asserts, namely that a truncated recording is surfaced, not swallowed.
-daemon/record.rs
 desktop_notify.rs
 fd_limit.rs
 frame_write.rs

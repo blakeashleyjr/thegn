@@ -59,6 +59,22 @@ pub(crate) fn spawn(
 /// Kept short so a genuine stop still clears the badge promptly.
 const CONFIRM_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// A push connection must remain alive this long before it is considered stable.
+/// Briefly flapping streams keep the accumulated exponential reconnect delay;
+/// only a stream that survives this window earns a reset.
+const STREAM_STABILITY: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn backoff_after_stream(
+    backoff: std::time::Duration,
+    lifetime: std::time::Duration,
+) -> std::time::Duration {
+    if lifetime >= STREAM_STABILITY {
+        std::time::Duration::from_secs(1)
+    } else {
+        backoff
+    }
+}
+
 /// What to do with a freshly read snapshot given whether a badge was already up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlapAction {
@@ -167,8 +183,6 @@ async fn run(
             backoff = (backoff * 2).min(max_backoff);
             continue;
         };
-        backoff = std::time::Duration::from_secs(1);
-
         // Initial snapshot. Nothing is shown yet, so no disappear to confirm.
         let mut active = match push_snapshot(&client, generation, &tx, &waker, false).await {
             Some(a) => a,
@@ -176,6 +190,7 @@ async fn run(
         };
 
         if let Some(mut watch) = client.watch().await {
+            let connected_at = tokio::time::Instant::now();
             // Native push path. Re-snapshot on each D-Bus signal; additionally,
             // *while no track is displayed*, run a slow safety poll so a failed
             // initial read self-heals. Once a badge shows, drop back to
@@ -204,6 +219,7 @@ async fn run(
             };
             if stream_ended {
                 tracing::debug!(target: "thegn::media", "MPRIS signal stream ended; reconnecting");
+                backoff = backoff_after_stream(backoff, connected_at.elapsed());
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(max_backoff);
                 continue;
@@ -286,7 +302,10 @@ pub(crate) fn drain_snapshots(
 mod tests {
     use tokio::sync::mpsc;
 
-    use super::{FlapAction, MediaSnapshotDelivery, drain_snapshots, flap_action};
+    use super::{
+        FlapAction, MediaSnapshotDelivery, STREAM_STABILITY, backoff_after_stream, drain_snapshots,
+        flap_action,
+    };
     use thegn_core::media::{MediaCaps, MediaSnapshot, MediaState};
 
     #[test]
@@ -299,6 +318,24 @@ mod tests {
         assert_eq!(flap_action(false, true), FlapAction::Emit);
         // Already hidden and still empty → emit (no repeated re-confirm loop).
         assert_eq!(flap_action(false, false), FlapAction::Emit);
+    }
+
+    #[test]
+    fn reconnect_backoff_resets_only_after_a_stable_stream() {
+        let accumulated = std::time::Duration::from_secs(8);
+        assert_eq!(
+            backoff_after_stream(
+                accumulated,
+                STREAM_STABILITY - std::time::Duration::from_secs(1)
+            ),
+            accumulated,
+            "an immediately ending stream must keep its exponential delay"
+        );
+        assert_eq!(
+            backoff_after_stream(accumulated, STREAM_STABILITY),
+            std::time::Duration::from_secs(1),
+            "only a stream that meets the stability window resets backoff"
+        );
     }
 
     #[test]

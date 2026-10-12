@@ -29,6 +29,8 @@ pub use capabilities::IssueCaps;
 pub enum IssueError {
     NotConfigured,
     Unsupported(&'static str),
+    UnsupportedPatchFields(Vec<&'static str>),
+    EmptyPatch,
     Network(reqwest::Error),
     Auth(String),
     Api(String),
@@ -37,6 +39,11 @@ pub enum IssueError {
         unapplied: Vec<&'static str>,
         unverified: Vec<&'static str>,
         source: Box<IssueError>,
+    },
+    /// A bounded listing stopped before Linear reported its final page.
+    PartialList {
+        issues: Vec<Issue>,
+        reason: &'static str,
     },
     Subprocess(String),
     Parse(String),
@@ -50,6 +57,11 @@ impl std::fmt::Debug for IssueError {
         match self {
             Self::NotConfigured => f.write_str("IssueError::NotConfigured"),
             Self::Unsupported(op) => f.debug_tuple("IssueError::Unsupported").field(op).finish(),
+            Self::UnsupportedPatchFields(fields) => f
+                .debug_tuple("IssueError::UnsupportedPatchFields")
+                .field(fields)
+                .finish(),
+            Self::EmptyPatch => f.write_str("IssueError::EmptyPatch"),
             Self::Network(_) => f.write_str("IssueError::Network(<redacted>)"),
             Self::Auth(message) => f.debug_tuple("IssueError::Auth").field(message).finish(),
             Self::Api(message) => f.debug_tuple("IssueError::Api").field(message).finish(),
@@ -64,6 +76,11 @@ impl std::fmt::Debug for IssueError {
                 .field("unapplied", unapplied)
                 .field("unverified", unverified)
                 .field("source", source)
+                .finish(),
+            Self::PartialList { issues, reason } => f
+                .debug_struct("IssueError::PartialList")
+                .field("issue_count", &issues.len())
+                .field("reason", reason)
                 .finish(),
             Self::Subprocess(message) => f
                 .debug_tuple("IssueError::Subprocess")
@@ -85,6 +102,12 @@ impl std::fmt::Display for IssueError {
         match self {
             IssueError::NotConfigured => write!(f, "no issue provider configured"),
             IssueError::Unsupported(op) => write!(f, "{op} is not supported by this provider"),
+            IssueError::UnsupportedPatchFields(fields) => write!(
+                f,
+                "patch fields are not supported by this provider: {}",
+                fields.join(", ")
+            ),
+            IssueError::EmptyPatch => write!(f, "issue patch contains no fields"),
             // Reqwest errors may carry the full request URL, including query
             // material. Keep tracker diagnostics static and redacted.
             IssueError::Network(_) => write!(f, "network: tracker request failed"),
@@ -107,6 +130,9 @@ impl std::fmt::Display for IssueError {
                     write!(f, " — verify before retrying")?;
                 }
                 write!(f, ": {source}")
+            }
+            IssueError::PartialList { issues, reason } => {
+                write!(f, "partial issue list ({} issues): {reason}", issues.len())
             }
             IssueError::Subprocess(s) => write!(f, "subprocess: {s}"),
             IssueError::Parse(s) => write!(f, "parse: {s}"),
@@ -144,12 +170,16 @@ impl SeamError for IssueError {
     fn class(&self) -> ErrorClass {
         match self {
             IssueError::Unsupported(_) => ErrorClass::Unsupported,
+            IssueError::UnsupportedPatchFields(_) | IssueError::EmptyPatch => {
+                ErrorClass::Unsupported
+            }
             IssueError::NotConfigured => ErrorClass::NotConfigured,
             IssueError::Auth(_) => ErrorClass::Auth,
             IssueError::Network(e) if e.is_connect() || e.is_timeout() => ErrorClass::Transient,
             IssueError::Timeout(_) => ErrorClass::Transient,
             IssueError::Network(_) => ErrorClass::Other,
             IssueError::PartialUpdate { source, .. } => source.class(),
+            IssueError::PartialList { .. } => ErrorClass::Other,
             IssueError::Subprocess(message)
                 if message
                     .to_ascii_lowercase()
@@ -634,6 +664,31 @@ impl IssueRouter {
                         tracing::warn!(provider = b.inner.provider_id(), error = %e, "issue identity rejected")
                     }
                 },
+                Err(IssueError::PartialList { issues, reason }) => {
+                    let valid = issues
+                        .into_iter()
+                        .filter_map(|issue| match validate_issue_identity(&issue) {
+                            Ok(()) => Some(issue),
+                            Err(error) => {
+                                tracing::warn!(
+                                    account = %b.account,
+                                    provider = b.inner.provider_id(),
+                                    error = %error,
+                                    "partial issue identity rejected"
+                                );
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    tracing::warn!(
+                        account = %b.account,
+                        provider = b.inner.provider_id(),
+                        partial_count = valid.len(),
+                        reason,
+                        "issue list is partial; retaining rows without caching it as complete"
+                    );
+                    all.extend(valid);
+                }
                 Err(e) => {
                     tracing::warn!(account = %b.account, provider = b.inner.provider_id(), error = %e, "issue list failed")
                 }
@@ -650,6 +705,7 @@ impl IssueRouter {
     ) -> Vec<(String, &str, Result<Vec<Issue>, IssueError>)> {
         let mut out = Vec::with_capacity(self.inner.len());
         for b in &self.inner {
+            // Keep PartialList as an error so cache refreshes never persist it as complete.
             let result = b.inner.list_issues(filter).await.and_then(|issues| {
                 issues
                     .into_iter()
@@ -689,10 +745,13 @@ impl IssueRouter {
     pub async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue, IssueError> {
         validate_control_issue_id(id)?;
         match self.backend_for_id(id) {
-            Some(b) => b.update_issue(id, patch).await.and_then(|issue| {
-                validate_issue_identity(&issue)?;
-                Ok(issue)
-            }),
+            Some(b) => {
+                validate_patch_capabilities(b.caps(), patch)?;
+                b.update_issue(id, patch).await.and_then(|issue| {
+                    validate_issue_identity(&issue)?;
+                    Ok(issue)
+                })
+            }
             None => Err(self.id_miss(id)),
         }
     }
@@ -753,6 +812,34 @@ impl IssueRouter {
             }
         }
         Ok(all)
+    }
+}
+
+fn validate_patch_capabilities(caps: IssueCaps, patch: &IssuePatch) -> Result<(), IssueError> {
+    let mut requested = Vec::new();
+    if patch.status.is_some() {
+        requested.push(("status", caps.patch_status));
+    }
+    if patch.title.is_some() {
+        requested.push(("title", caps.patch_title));
+    }
+    if patch.assignee_me.is_some() {
+        requested.push(("assignee_me", caps.patch_assignee_me));
+    }
+    if patch.priority.is_some() {
+        requested.push(("priority", caps.patch_priority));
+    }
+    if requested.is_empty() {
+        return Err(IssueError::EmptyPatch);
+    }
+    let unsupported: Vec<_> = requested
+        .into_iter()
+        .filter_map(|(field, supported)| (!supported).then_some(field))
+        .collect();
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(IssueError::UnsupportedPatchFields(unsupported))
     }
 }
 
@@ -891,6 +978,75 @@ mod spec {
         assert!(r.backend_for_id("jira:PROJ-1").is_none());
     }
 
+    #[test]
+    fn builtin_patch_capability_matrix_matches_implemented_fields() {
+        let providers: Vec<(Box<dyn IssueBackend>, bool)> = vec![
+            (
+                Box::new(github::GitHubIssuesBackend::new(Vec::new())),
+                false,
+            ),
+            (
+                Box::new(jira::JiraBackend::new(
+                    "https://example.atlassian.net".into(),
+                    "user".into(),
+                    "token".into(),
+                    None,
+                )),
+                false,
+            ),
+            (
+                Box::new(linear::LinearBackend::new("key".into(), None)),
+                true,
+            ),
+            (
+                Box::new(kaneo::KaneoBackend::new(
+                    "https://kaneo.example".into(),
+                    "key".into(),
+                    None,
+                    None,
+                )),
+                true,
+            ),
+        ];
+        for (backend, supports_priority) in providers {
+            let caps = backend.caps();
+            assert!(caps.patch_status, "{} status", backend.provider_id());
+            assert!(caps.patch_title, "{} title", backend.provider_id());
+            assert!(
+                !caps.patch_assignee_me,
+                "{} assignee",
+                backend.provider_id()
+            );
+            assert_eq!(
+                caps.patch_priority,
+                supports_priority,
+                "{} priority",
+                backend.provider_id()
+            );
+            assert!(
+                validate_patch_capabilities(
+                    caps,
+                    &IssuePatch {
+                        status: Some(thegn_core::issue::IssueStatus::Todo),
+                        ..Default::default()
+                    }
+                )
+                .is_ok()
+            );
+            assert!(matches!(
+                validate_patch_capabilities(
+                    caps,
+                    &IssuePatch {
+                        assignee_me: Some(true),
+                        ..Default::default()
+                    }
+                ),
+                Err(IssueError::UnsupportedPatchFields(fields))
+                    if fields == vec!["assignee_me"]
+            ));
+        }
+    }
+
     struct CountingBackend {
         updates: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -901,7 +1057,11 @@ mod spec {
         }
 
         fn caps(&self) -> IssueCaps {
-            IssueCaps::default()
+            IssueCaps {
+                patch_status: true,
+                patch_title: true,
+                ..Default::default()
+            }
         }
 
         fn list_issues<'a>(
@@ -941,6 +1101,90 @@ mod spec {
         ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
+    }
+
+    struct PartialListBackend;
+
+    impl IssueBackend for PartialListBackend {
+        fn provider_id(&self) -> &str {
+            "linear"
+        }
+
+        fn caps(&self) -> IssueCaps {
+            IssueCaps::default()
+        }
+
+        fn list_issues<'a>(
+            &'a self,
+            _filter: &'a IssueFilter,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            let issue = Issue {
+                id: "linear:ABC-1".into(),
+                number: "1".into(),
+                provider: "linear".into(),
+                title: "partial row".into(),
+                status: thegn_core::issue::IssueStatus::Todo,
+                priority: thegn_core::issue::IssuePriority::Low,
+                url: "https://linear.app/acme/issue/ABC-1".into(),
+                ..Default::default()
+            };
+            let issue = serde_json::from_value(serde_json::to_value(issue).unwrap()).unwrap();
+            Box::pin(async move {
+                Err(IssueError::PartialList {
+                    issues: vec![issue],
+                    reason: "test partial page",
+                })
+            })
+        }
+
+        fn get_issue<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+
+        fn create_issue<'a>(
+            &'a self,
+            _draft: &'a IssueDraft,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+
+        fn update_issue<'a>(
+            &'a self,
+            _id: &'a str,
+            _patch: &'a IssuePatch,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+    }
+
+    #[test]
+    fn best_effort_listing_retains_partial_rows_while_per_provider_keeps_error() {
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        router
+            .push_backend("partial".into(), Box::new(PartialListBackend))
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let issues = runtime
+            .block_on(router.list_issues(&IssueFilter::default()))
+            .unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].title, "partial row");
+        let per_provider = runtime.block_on(router.list_per_provider(&IssueFilter::default()));
+        assert!(matches!(
+            &per_provider[0].2,
+            Err(IssueError::PartialList { issues, .. }) if issues.len() == 1
+        ));
     }
 
     struct PluginMarker {
@@ -1023,7 +1267,7 @@ mod spec {
     }
 
     #[test]
-    fn malformed_control_id_reaches_no_fake_provider_effect() {
+    fn patch_gate_rejects_empty_and_unsupported_before_provider_call() {
         let updates = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut router = IssueRouter::from_config(&IssuesConfig::default());
         router
@@ -1038,7 +1282,10 @@ mod spec {
             .enable_all()
             .build()
             .unwrap();
-        let patch = IssuePatch::default();
+        let patch = IssuePatch {
+            status: Some(thegn_core::issue::IssueStatus::Todo),
+            ..Default::default()
+        };
         assert!(
             runtime
                 .block_on(router.update_issue("linear:bad key", &patch))
@@ -1050,7 +1297,30 @@ mod spec {
                 .block_on(router.update_issue("linear:ABC-9", &patch))
                 .is_err()
         );
+        // Status is supported by this backend, so its rejected API response
+        // still means the provider was called once.
         assert_eq!(updates.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            runtime.block_on(router.update_issue("linear:ABC-9", &IssuePatch::default())),
+            Err(IssueError::EmptyPatch)
+        ));
+        assert_eq!(updates.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            runtime.block_on(router.update_issue(
+                "linear:ABC-9",
+                &IssuePatch {
+                    priority: Some(thegn_core::issue::IssuePriority::High),
+                    ..Default::default()
+                }
+            )),
+            Err(IssueError::UnsupportedPatchFields(fields)) if fields == vec!["priority"]
+        ));
+        assert_eq!(updates.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            runtime.block_on(router.update_issue("linear:ABC-9", &patch)),
+            Err(IssueError::Api(_))
+        ));
+        assert_eq!(updates.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -1078,7 +1348,11 @@ mod spec {
             .enable_all()
             .build()
             .unwrap();
-        let result = runtime.block_on(router.update_issue("linear:ABC-9", &IssuePatch::default()));
+        let patch = IssuePatch {
+            status: Some(thegn_core::issue::IssueStatus::Todo),
+            ..Default::default()
+        };
+        let result = runtime.block_on(router.update_issue("linear:ABC-9", &patch));
         assert!(result.is_err());
         assert_eq!(first.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(second.load(std::sync::atomic::Ordering::SeqCst), 0);

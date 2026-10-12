@@ -36,6 +36,15 @@ pub enum CasOutcome {
     Moved {
         actual: String,
     },
+    /// A source ref in a fenced update no longer names its captured object.
+    SourceMoved {
+        name: String,
+        actual: String,
+    },
+    /// A source ref in a fenced update disappeared.
+    SourceMissing {
+        name: String,
+    },
     /// The ref does not exist.
     Missing,
     /// Unclassifiable (lock error, unreadable ref, still at `old`, ...). Callers
@@ -331,6 +340,10 @@ pub trait PlumbingOps: GitBackend {
         match self.update_ref_cas_outcome(loc, name, new, old)? {
             CasOutcome::Advanced => Ok(true),
             CasOutcome::Moved { .. } => Ok(false),
+            CasOutcome::SourceMoved { .. } => Ok(false),
+            CasOutcome::SourceMissing { name } => {
+                anyhow::bail!("git update-ref source {name} failed: ref no longer exists")
+            }
             CasOutcome::Missing => {
                 anyhow::bail!("git update-ref {name} failed: ref no longer exists")
             }
@@ -359,6 +372,80 @@ pub trait PlumbingOps: GitBackend {
             _ => RefRead::Unknown,
         };
         Ok(classify_cas_failure(&reread, old, stderr.trim()))
+    }
+
+    /// Verify all captured source refs and advance the target in one Git ref
+    /// transaction. Git commits none of the updates if any verify fails.
+    fn update_ref_cas_with_sources(
+        &self,
+        loc: &GitLoc,
+        target: &str,
+        new: &str,
+        old: &str,
+        sources: &[(String, String)],
+    ) -> Result<CasOutcome> {
+        let target = op::revision(target)?;
+        let new = op::revision(new)?;
+        let old = op::revision(old)?;
+        let mut transaction = String::from("start\n");
+        for (name, oid) in sources {
+            let name = op::revision(name)?;
+            let oid = op::revision(oid)?;
+            transaction.push_str(&format!("verify {name} {oid}\n"));
+        }
+        transaction.push_str(&format!("update {target} {new} {old}\nprepare\ncommit\n"));
+        match super::output_bounded_with_input(
+            loc.git_command(&["update-ref", "--stdin"]),
+            &["update-ref", "--stdin"],
+            Some(transaction.as_bytes()),
+            super::git_read_timeout(),
+        )
+        .map(|output| {
+            if !output.status.success() {
+                anyhow::bail!(
+                    "git update-ref --stdin failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        })
+        .and_then(|result| result)
+        {
+            Ok(_) => Ok(CasOutcome::Advanced),
+            Err(error) => {
+                // The transaction error itself is locale-dependent; classify
+                // only by exact ref reads and fail closed otherwise.
+                for (name, expected) in sources {
+                    let name = op::revision(name)?;
+                    let expected = op::revision(expected)?;
+                    match run_status(loc, &["rev-parse", "--verify", "--quiet", name]) {
+                        Ok((0, actual, _))
+                            if is_object_id(actual.trim()) && actual.trim() != expected =>
+                        {
+                            return Ok(CasOutcome::SourceMoved {
+                                name: name.to_owned(),
+                                actual: actual.trim().to_owned(),
+                            });
+                        }
+                        Ok((1, _, _)) => {
+                            return Ok(CasOutcome::SourceMissing {
+                                name: name.to_owned(),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                match run_status(loc, &["rev-parse", "--verify", "--quiet", target]) {
+                    Ok((0, actual, _)) if is_object_id(actual.trim()) && actual.trim() != old => {
+                        Ok(CasOutcome::Moved {
+                            actual: actual.trim().to_owned(),
+                        })
+                    }
+                    Ok((1, _, _)) => Ok(CasOutcome::Missing),
+                    _ => Ok(CasOutcome::Other(format!("{error:#}"))),
+                }
+            }
+        }
     }
 
     /// Snapshot uncommitted worktree work into a commit so `merge-tree` (which
@@ -594,6 +681,46 @@ mod tests {
             .update_ref_cas_outcome(&loc, "refs/heads/main", &main0, &main0)
             .unwrap();
         assert_eq!(out, CasOutcome::Moved { actual: main1 });
+    }
+
+    #[test]
+    fn fenced_update_ref_aborts_when_source_moves_and_keeps_target() {
+        let repo = TestRepo::new("plumb-source-fence");
+        ident(&repo.dir);
+        repo.commit_file("base", "base\n", "base");
+        let loc = repo.loc();
+        let target_before = repo.head();
+        git_in(&repo.dir, &["branch", "source"]);
+        git_in(&repo.dir, &["checkout", "-q", "source"]);
+        repo.commit_file("source", "one\n", "source one");
+        let captured_source = repo.head();
+        repo.commit_file("source", "two\n", "source two");
+        let moved_source = repo.head();
+        git_in(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit_file("target", "next\n", "target next");
+        let target_new = repo.head();
+        git_in(
+            &repo.dir,
+            &["update-ref", "refs/heads/main", &target_before],
+        );
+
+        let outcome = CliGit
+            .update_ref_cas_with_sources(
+                &loc,
+                "refs/heads/main",
+                &target_new,
+                &target_before,
+                &[("refs/heads/source".into(), captured_source)],
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            CasOutcome::SourceMoved {
+                name: "refs/heads/source".into(),
+                actual: moved_source,
+            }
+        );
+        assert_eq!(repo.out(&["rev-parse", "refs/heads/main"]), target_before);
     }
 
     #[test]

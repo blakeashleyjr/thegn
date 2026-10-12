@@ -18,6 +18,13 @@
 //! "this shell runs inside a live thegn" gotcha) carries over unchanged. The
 //! derivation and endpoint classification are pure and unit-tested on every
 //! platform; only the syscalls are `#[cfg]`-gated.
+//!
+//! Unix endpoint authenticity is bound to the daemon's effective uid and the
+//! filesystem namespace containing its owner-only socket parent. Other
+//! principals cannot replace the endpoint or lock there. A same-uid process
+//! in that namespace is the same filesystem principal, so token-only
+//! deployments must keep this private parent outside sandbox mounts. Migrate
+//! custom token-only sockets into a private per-user runtime/state directory.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -276,11 +283,12 @@ fn io_error_with_path_context(
 /// is created once and NEVER unlinked (unlinking it would resurrect the very
 /// race it closes); the flock (std's `File::lock`) dies with the process, so
 /// it can't go stale. Contention lasts a probe + a bind (milliseconds), and
-/// the caller is already on a blocking thread. Best-effort: `None` (exotic
-/// fs, permissions) degrades to the old raced path rather than refusing to
-/// serve.
+/// the caller is already on a blocking thread. Failure is fatal: probing or
+/// unlinking without this lock can race another daemon endpoint.
 #[cfg(unix)]
-fn bind_lock(sock: &Path) -> Option<std::fs::File> {
+fn bind_lock(sock: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
     let mut path = sock.as_os_str().to_owned();
     path.push(".lock");
     let file = std::fs::OpenOptions::new()
@@ -288,10 +296,52 @@ fn bind_lock(sock: &Path) -> Option<std::fs::File> {
         .read(true)
         .write(true)
         .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(std::path::Path::new(&path))
-        .ok()?;
-    file.lock().ok()?;
-    Some(file)
+        .map_err(|error| io_error_with_path_context(error, "open control socket lock", sock))?;
+    let mut metadata = file
+        .metadata()
+        .map_err(|error| io_error_with_path_context(error, "inspect control socket lock", sock))?;
+    if !metadata.is_file() || metadata.uid() != effective_uid().unwrap_or_default() {
+        let mode = metadata.mode() & 0o777;
+        return Err(io_error_with_path_context(
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "control socket lock must be an owner-owned regular file (found uid {}, mode {mode:04o})",
+                    metadata.uid()
+                ),
+            ),
+            "verify control socket lock",
+            sock,
+        ));
+    }
+    if metadata.mode() & 0o777 != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                io_error_with_path_context(error, "restrict control socket lock", sock)
+            })?;
+        metadata = file.metadata().map_err(|error| {
+            io_error_with_path_context(error, "recheck control socket lock", sock)
+        })?;
+        if !metadata.is_file()
+            || metadata.uid() != effective_uid().unwrap_or_default()
+            || metadata.mode() & 0o777 != 0o600
+        {
+            return Err(io_error_with_path_context(
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "control socket lock could not be restricted to owner mode 0600",
+                ),
+                "verify control socket lock",
+                sock,
+            ));
+        }
+    }
+    file.lock()
+        .map_err(|error| io_error_with_path_context(error, "lock control socket", sock))?;
+    Ok(file)
 }
 
 #[cfg_attr(not(unix), allow(dead_code))] // Unix-only production call site.
@@ -338,13 +388,14 @@ impl IpcListener {
         Self::bind_exclusive_with_hardening(ep, false).await
     }
 
-    /// Bind the endpoint and require owner-only endpoint hardening when
-    /// `require_hardening` is true. The strict form is used whenever the
-    /// listener can grant implicit local admin; token-only listeners retain
-    /// the portable best-effort permission behavior.
+    /// Bind the endpoint with fail-closed Unix filesystem hardening. Bearer
+    /// tokens authenticate clients, so every Unix server endpoint must also
+    /// be protected from replacement by an untrusted filesystem principal.
+    /// The flag is retained for API compatibility; Windows pipe policy does
+    /// not use it.
     pub async fn bind_exclusive_with_hardening(
         ep: &IpcEndpoint,
-        require_hardening: bool,
+        _require_hardening: bool,
     ) -> io::Result<BindOutcome> {
         match ep {
             IpcEndpoint::Unix(sock) => {
@@ -366,8 +417,40 @@ impl IpcListener {
                     }
                     let sock = sock.clone();
                     let decision = tokio::task::spawn_blocking(move || -> io::Result<UnixBind> {
-                        let _lock = bind_lock(&sock);
+                        let parent = sock.parent().ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "control socket has no parent directory",
+                            )
+                        })?;
+                        let parent_metadata = std::fs::symlink_metadata(parent)?;
+                        if parent_metadata.file_type().is_symlink() {
+                            return Err(io_error_with_path_context(
+                                io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    "control socket parent must not be a symlink",
+                                ),
+                                "verify control socket parent",
+                                parent,
+                            ));
+                        }
+                        verify_unix_bind_parent(parent, &parent_metadata)?;
+                        let _lock = bind_lock(&sock)?;
                         if sock.exists() {
+                            use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+                            let metadata = std::fs::symlink_metadata(&sock)?;
+                            if !metadata.file_type().is_socket()
+                                || metadata.uid() != effective_uid().unwrap_or_default()
+                            {
+                                return Err(io_error_with_path_context(
+                                    io::Error::new(
+                                        io::ErrorKind::PermissionDenied,
+                                        "existing control endpoint is not an owner-owned socket",
+                                    ),
+                                    "verify existing control socket",
+                                    &sock,
+                                ));
+                            }
                             match std::os::unix::net::UnixStream::connect(&sock) {
                                 Ok(_) => return Ok(UnixBind::AlreadyRunning),
                                 Err(_) => match std::fs::remove_file(&sock) {
@@ -393,11 +476,10 @@ impl IpcListener {
                                 if let Err(e) = thegn_core::fsperm::restrict_to_owner(&sock)
                                     .and_then(|()| verify_unix_owner_mode(&sock, 0o600, false))
                                 {
-                                    if require_hardening {
-                                        let _ = std::fs::remove_file(&sock);
-                                        return Err(e);
+                                    if let Err(cleanup) = std::fs::remove_file(&sock) {
+                                        tracing::error!(target: "thegn::daemon", path = %sock.display(), "failed to remove unhardened control socket: {cleanup}");
                                     }
-                                    tracing::warn!(target: "thegn::daemon", path = %sock.display(), "could not harden control socket: {e}");
+                                    return Err(e);
                                 }
                                 l.set_nonblocking(true)?;
                                 Ok(UnixBind::Bound(l))
@@ -601,22 +683,41 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, IpcL
     }
 }
 
-/// Create and owner-restrict a Unix socket's parent directory. This is strict
-/// when implicit local admin is requested, and otherwise retains the existing
-/// best-effort portability behavior.
-pub fn prepare_control_directory(path: &Path, require_hardening: bool) -> io::Result<()> {
-    std::fs::create_dir_all(path)?;
+/// Create and owner-restrict a Unix socket's parent directory. Unix endpoint
+/// parents are hardened for both local-admin and token-only listeners.
+pub fn prepare_control_directory(path: &Path, _require_hardening: bool) -> io::Result<()> {
+    // Windows control endpoints are named pipes, so their security comes from
+    // the pipe DACL and there is no filesystem parent to harden.
+    if cfg!(windows) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(path).map_err(|error| {
+        io_error_with_path_context(
+            error,
+            "prepare control socket directory; move [daemon] socket into a private directory",
+            path,
+        )
+    })?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "control socket parent {} must not be a symlink; move [daemon] socket into a private directory",
+                path.display()
+            ),
+        ));
+    }
     let result = thegn_core::fsperm::restrict_dir_to_owner(path);
     #[cfg(unix)]
     let result = result.and_then(|()| verify_unix_owner_mode(path, 0o700, true));
-    if require_hardening {
-        result
-    } else {
-        if let Err(error) = result {
-            tracing::warn!(target: "thegn::daemon", path = %path.display(), "could not harden control directory: {error}");
-        }
-        Ok(())
-    }
+    result.map_err(|error| {
+        io_error_with_path_context(
+            error,
+            "harden control socket directory; move [daemon] socket into a private directory",
+            path,
+        )
+    })
 }
 
 /// Read-only hardening status used by `thegn doctor`.
@@ -640,6 +741,25 @@ pub fn control_endpoint_hardening(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn verify_unix_bind_parent(path: &Path, metadata: &std::fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mode = metadata.mode() & 0o777;
+    let expected_uid = effective_uid().expect("unix has an effective uid");
+    if !metadata.is_dir() || metadata.uid() != expected_uid || mode & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} must be an owner-owned directory without group/other write permission (found uid {}, mode {mode:04o})",
+                path.display(),
+                metadata.uid(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn verify_unix_owner_mode(path: &Path, expected_mode: u32, directory: bool) -> io::Result<()> {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
     let metadata = std::fs::metadata(path)?;
@@ -655,7 +775,7 @@ fn verify_unix_owner_mode(path: &Path, expected_mode: u32, directory: bool) -> i
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "{} must be an owner-owned {} with mode {:04o} (found uid {uid}, mode {mode:04o}); set owner uid {expected_uid} and mode {:04o}, or set [serve] local_admin = false to require tokens",
+                "{} must be an owner-owned {} with mode {:04o} (found uid {uid}, mode {mode:04o}); set owner uid {expected_uid} and mode {:04o}",
                 path.display(),
                 if directory { "directory" } else { "socket" },
                 expected_mode,
@@ -711,7 +831,7 @@ mod tests {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let dir = std::env::temp_dir().join(format!("thegn-ipc-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
-        std::fs::create_dir_all(&dir).unwrap();
+        prepare_control_directory(&dir, false).unwrap();
         let ep = IpcEndpoint::for_socket_path(&dir.join("d.sock"));
 
         // First bind wins…
@@ -775,7 +895,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("thegn-ipc-unremovable-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
-        std::fs::create_dir_all(&dir).unwrap();
+        prepare_control_directory(&dir, false).unwrap();
         let sock = dir.join("d.sock");
         let ep = IpcEndpoint::for_socket_path(&sock);
         let listener = match IpcListener::bind_exclusive(&ep).await.unwrap() {
@@ -883,6 +1003,96 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("mode 0666"));
 
+        // Token-only mode cannot use a shared parent or a replaceable lock
+        // path as a source of server identity either.
+        let shared = dir.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let shared_error = match IpcListener::bind_exclusive_with_hardening(
+            &IpcEndpoint::for_socket_path(&shared.join("d.sock")),
+            false,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("token-only bind must reject a shared parent"),
+        };
+        assert_eq!(shared_error.kind(), io::ErrorKind::PermissionDenied);
+
+        let not_a_directory = dir.join("not-a-directory");
+        std::fs::write(&not_a_directory, b"file").unwrap();
+        let directory_error = prepare_control_directory(&not_a_directory, false).unwrap_err();
+        assert!(
+            directory_error
+                .to_string()
+                .contains("move [daemon] socket into a private directory")
+        );
+
+        let lock_sock = dir.join("replace.sock");
+        let lock_link = dir.join("replace.sock.lock");
+        let lock_target = dir.join("lock-target");
+        std::fs::write(&lock_target, b"unrelated").unwrap();
+        std::os::unix::fs::symlink(&lock_target, &lock_link).unwrap();
+        let lock_ep = IpcEndpoint::for_socket_path(&lock_sock);
+        let lock_error = match IpcListener::bind_exclusive_with_hardening(&lock_ep, false).await {
+            Err(error) => error,
+            Ok(_) => panic!("token-only bind must reject a replaceable lock path"),
+        };
+        let lock_context = lock_error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<IoPathContext>())
+            .expect("lock open error retains path context");
+        assert!(lock_error.to_string().contains("open control socket lock"));
+        assert_eq!(lock_context.source.raw_os_error(), Some(libc::ELOOP));
+        assert!(
+            !lock_sock.exists(),
+            "failed lock acquisition must not create the endpoint"
+        );
+
+        let regular_sock = dir.join("regular.sock");
+        std::fs::write(&regular_sock, b"leave this file alone").unwrap();
+        let regular_ep = IpcEndpoint::for_socket_path(&regular_sock);
+        let regular_error = match IpcListener::bind_exclusive(&regular_ep).await {
+            Err(error) => error,
+            Ok(_) => panic!("bind must reject a regular file at the socket path"),
+        };
+        assert_eq!(regular_error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read(&regular_sock).unwrap(),
+            b"leave this file alone"
+        );
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_restricts_an_existing_broad_control_lock() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir =
+            std::env::temp_dir().join(format!("thegn-ipc-lock-upgrade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        prepare_control_directory(&dir, false).unwrap();
+        let sock = dir.join("d.sock");
+        let lock = dir.join("d.sock.lock");
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let listener = match IpcListener::bind_exclusive(&IpcEndpoint::for_socket_path(&sock))
+            .await
+            .unwrap()
+        {
+            BindOutcome::Bound(listener) => listener,
+            BindOutcome::AlreadyRunning => panic!("fresh path must bind"),
+        };
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "bind must tighten the preexisting lock before using it"
+        );
+
         drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -897,7 +1107,7 @@ mod tests {
     async fn racing_binders_on_a_stale_socket_elect_exactly_one_daemon() {
         let dir = std::env::temp_dir().join(format!("thegn-ipc-race-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
-        std::fs::create_dir_all(&dir).unwrap();
+        prepare_control_directory(&dir, false).unwrap();
         let path = dir.join("d.sock");
         // A dead daemon's leftover: a socket file nothing is listening on.
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());

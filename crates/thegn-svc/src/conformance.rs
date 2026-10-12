@@ -137,22 +137,50 @@ mod tests {
             (
                 "linear",
                 "lin",
-                serde_json::json!({ "comments": false, "labels": false }),
+                serde_json::json!({
+                    "patch_status": true,
+                    "patch_title": true,
+                    "patch_assignee_me": false,
+                    "patch_priority": true,
+                    "comments": false,
+                    "labels": false
+                }),
             ),
             (
                 "github",
                 "gh",
-                serde_json::json!({ "comments": false, "labels": false }),
+                serde_json::json!({
+                    "patch_status": true,
+                    "patch_title": true,
+                    "patch_assignee_me": false,
+                    "patch_priority": false,
+                    "comments": false,
+                    "labels": false
+                }),
             ),
             (
                 "jira",
                 "jira",
-                serde_json::json!({ "comments": false, "labels": false }),
+                serde_json::json!({
+                    "patch_status": true,
+                    "patch_title": true,
+                    "patch_assignee_me": false,
+                    "patch_priority": false,
+                    "comments": false,
+                    "labels": false
+                }),
             ),
             (
                 "kaneo",
                 "kaneo",
-                serde_json::json!({ "comments": true, "labels": true }),
+                serde_json::json!({
+                    "patch_status": true,
+                    "patch_title": true,
+                    "patch_assignee_me": false,
+                    "patch_priority": true,
+                    "comments": true,
+                    "labels": true
+                }),
             ),
         ] {
             let report = reports
@@ -280,11 +308,23 @@ mod tests {
             IssueProviderKind::Kaneo => IssueCaps {
                 comments: true,
                 labels: true,
+                patch_status: true,
+                patch_title: true,
+                patch_priority: true,
+                ..Default::default()
             },
-            IssueProviderKind::None
-            | IssueProviderKind::Linear
-            | IssueProviderKind::Github
-            | IssueProviderKind::Jira => IssueCaps::default(),
+            IssueProviderKind::Linear => IssueCaps {
+                patch_status: true,
+                patch_title: true,
+                patch_priority: true,
+                ..Default::default()
+            },
+            IssueProviderKind::Github | IssueProviderKind::Jira => IssueCaps {
+                patch_status: true,
+                patch_title: true,
+                ..Default::default()
+            },
+            IssueProviderKind::None => IssueCaps::default(),
         }
     }
 
@@ -468,6 +508,7 @@ mod tests {
             declared: IssueCaps {
                 comments: true,
                 labels: false,
+                ..Default::default()
             },
             implemented: IssueCaps::default(),
         };
@@ -478,6 +519,7 @@ mod tests {
             implemented: IssueCaps {
                 comments: true,
                 labels: false,
+                ..Default::default()
             },
         };
         assert!(std::panic::catch_unwind(|| assert_optional_contract(&underclaim, &rt)).is_err());

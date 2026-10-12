@@ -58,7 +58,22 @@ pub(crate) fn resolve_personal_dotfiles(
     let mut dotfiles = Vec::new();
     let mut roots: Vec<String> = Vec::new();
     for name in candidates {
-        let contents = std::fs::read_to_string(home_dir.join(&name)).ok(); // best-effort: drain: bounded read of auxiliary output; failure loses the buffer, not the outcome
+        if !is_safe_dotfile_name(&name) {
+            thegn_core::msg::warn(&format!(
+                "[sandbox.home] skipping unsafe dotfile path {name:?}"
+            ));
+            continue;
+        }
+        let source = home_dir.join(&name);
+        // Dotfiles may intentionally link into a package store (for example
+        // home-manager); follow the link explicitly and select only files.
+        match std::fs::canonicalize(&source) {
+            Ok(resolved) if std::fs::metadata(&resolved).is_ok_and(|md| md.is_file()) => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {} // Keep it selected; the staging read will report the real failure.
+        }
+        let contents = std::fs::read_to_string(&source).ok(); // best-effort: scan failure leaves upload selected; staging reports read errors
         match home.strategy {
             ShellStrategy::Clean => {} // nothing personal under clean
             ShellStrategy::HostParity => {
@@ -97,4 +112,80 @@ pub(crate) fn resolve_personal_dotfiles(
         }
     }
     (dotfiles, roots)
+}
+
+/// Dotfile configuration names represent one item directly under HOME, never
+/// a path expression. Reject separators and control characters before any
+/// filesystem join so configuration cannot escape the selected home.
+fn is_safe_dotfile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.chars().any(char::is_control)
+        && Path::new(name).components().count() == 1
+        && Path::new(name)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_dotfiles_must_be_single_safe_components() {
+        use thegn_core::config::{HomeConfig, ShellStrategy};
+
+        let home_dir = tempfile::tempdir().unwrap();
+        std::fs::write(home_dir.path().join(".gitconfig"), "[user]\n").unwrap();
+        let store_file = home_dir.path().join("store-file");
+        std::fs::write(
+            &store_file,
+            "source /nix/store/abc123-zsh-syntax/share/x.zsh\n",
+        )
+        .unwrap();
+        let linked_dir = home_dir.path().join("linked-dir-target");
+        std::fs::create_dir(&linked_dir).unwrap();
+        let mut has_file_link = false;
+        let mut has_dir_link = false;
+        if crate::platform::test_symlink_supported() {
+            crate::platform::test_symlink(&store_file, &home_dir.path().join(".zshrc")).unwrap();
+            crate::platform::test_symlink(&linked_dir, &home_dir.path().join("linked-dir"))
+                .unwrap();
+            has_file_link = true;
+            has_dir_link = true;
+        }
+        let config = HomeConfig {
+            strategy: ShellStrategy::HostParity,
+            dotfiles: vec![
+                ".gitconfig".into(),
+                "../outside".into(),
+                "/tmp/absolute".into(),
+                "nested/.zshrc".into(),
+                "..".into(),
+                "bad\nname".into(),
+                "nested\\file".into(),
+                ".zshrc".into(),
+                "linked-dir".into(),
+            ],
+            ..HomeConfig::default()
+        };
+
+        let (files, roots) = resolve_personal_dotfiles(home_dir.path(), &config, "test");
+        let mut expected = vec![".gitconfig"];
+        if has_file_link {
+            expected.push(".zshrc");
+        }
+        assert_eq!(files, expected);
+        if has_dir_link {
+            assert!(!files.iter().any(|name| name == "linked-dir"));
+        }
+        if has_file_link {
+            assert!(roots.contains(&"/nix/store/abc123-zsh-syntax".to_string()));
+        } else {
+            assert!(roots.is_empty());
+        }
+    }
 }
