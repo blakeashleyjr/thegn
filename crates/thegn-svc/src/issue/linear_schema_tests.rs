@@ -189,9 +189,15 @@ fn get_issue_comments_selection_matches_recorded_schema() {
     let comments = selection_after(&query, "comments");
     let mut errors = Vec::new();
     check_selection(
-        &comments,
-        "CommentConnection",
-        "Issue.comments",
+        &selection_after(&comments, "nodes"),
+        "Comment",
+        "Issue.comments.nodes",
+        &mut errors,
+    );
+    check_selection(
+        &selection_after(&comments, "pageInfo"),
+        "PageInfo",
+        "Issue.comments.pageInfo",
         &mut errors,
     );
     assert!(
@@ -199,6 +205,7 @@ fn get_issue_comments_selection_matches_recorded_schema() {
         "comments selection drifted:\n{}",
         errors.join("\n")
     );
+    assert!(query.contains("comments(first: 250)"));
 }
 
 #[test]
