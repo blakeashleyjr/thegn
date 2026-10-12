@@ -47,6 +47,7 @@ pub enum IcsDiagnostic {
 pub struct IcsReport {
     diagnostics: Vec<IcsDiagnostic>,
     overflow: usize,
+    document_failure: bool,
 }
 
 pub const MAX_ICS_DIAGNOSTICS: usize = 32;
@@ -64,19 +65,19 @@ impl IcsReport {
 
     /// Whether component boundaries or document completeness cannot be trusted.
     pub fn is_document_failure(&self) -> bool {
-        self.overflow > 0
-            || self.diagnostics.iter().any(|diagnostic| {
-                matches!(
-                    diagnostic,
-                    IcsDiagnostic::Truncated
-                        | IcsDiagnostic::MismatchedEnd
-                        | IcsDiagnostic::NestedEvent
-                        | IcsDiagnostic::UnclosedChild
-                )
-            })
+        self.document_failure
     }
 
     fn record(&mut self, diagnostic: IcsDiagnostic) {
+        if matches!(
+            diagnostic,
+            IcsDiagnostic::Truncated
+                | IcsDiagnostic::MismatchedEnd
+                | IcsDiagnostic::NestedEvent
+                | IcsDiagnostic::UnclosedChild
+        ) {
+            self.document_failure = true;
+        }
         if self.diagnostics.len() < MAX_ICS_DIAGNOSTICS {
             self.diagnostics.push(diagnostic);
         } else {
@@ -550,6 +551,7 @@ pub fn parse_ics_window_reported(
 ) -> Result<(), AdmissionError> {
     report.diagnostics.clear();
     report.overflow = 0;
+    report.document_failure = false;
     let mut cur: Option<Builder> = None;
     let mut components: Vec<ComponentName> = Vec::new();
     let mut event_depth: Option<usize> = None;
@@ -564,11 +566,10 @@ pub fn parse_ics_window_reported(
             let hint = raw.name_hint();
             let in_event = cur.is_some();
             let in_alarm = event_depth.is_some_and(|depth| {
-                components
-                    .get(depth..)
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|part| matches!(part, ComponentName::Alarm))
+                components.len() > depth
+                    && components
+                        .last()
+                        .is_some_and(|part| matches!(part, ComponentName::Alarm))
             });
             let retained = match hint.as_deref() {
                 _ if !in_event => hint.as_deref() == Some("X-WR-CALNAME"),
@@ -576,7 +577,7 @@ pub fn parse_ics_window_reported(
                 // classified, and an oversized BEGIN/END would desynchronize
                 // the component stack if skipped — refuse rather than guess.
                 None | Some("BEGIN") | Some("END") => true,
-                Some(n) if event_depth.map_or(true, |depth| components.len() <= depth) => {
+                Some(n) if event_depth.is_none_or(|depth| components.len() <= depth) => {
                     is_retained_property(n)
                 }
                 Some(n) => in_alarm && n == "TRIGGER",
@@ -592,6 +593,9 @@ pub fn parse_ics_window_reported(
             continue;
         }
         let text = raw.text();
+        if text.trim().is_empty() {
+            continue;
+        }
         let Some(line) = parse_line(&text) else {
             if !components.is_empty() {
                 report.record(IcsDiagnostic::MalformedLine);
@@ -634,9 +638,10 @@ pub fn parse_ics_window_reported(
                 }
             }
             "END" => {
-                let matched = components
-                    .last()
-                    .is_some_and(|component| component.matches(&line.value));
+                let matching_depth = components
+                    .iter()
+                    .rposition(|component| component.matches(&line.value));
+                let matched = matching_depth.is_some();
                 if !matched {
                     report.record(IcsDiagnostic::MismatchedEnd);
                 }
@@ -644,17 +649,13 @@ pub fn parse_ics_window_reported(
                 if ending_event && event_depth.is_some_and(|depth| components.len() > depth) {
                     report.record(IcsDiagnostic::UnclosedChild);
                 }
-                if matched
-                    && let Some(component) = components.pop()
-                    && matches!(component, ComponentName::Calendar)
-                    && line.value.eq_ignore_ascii_case("VCALENDAR")
-                {
-                    closed_calendar = true;
-                }
                 if ending_event {
+                    if let Some(depth) = event_depth {
+                        components.truncate(depth.saturating_sub(1));
+                    } else if let Some(depth) = matching_depth {
+                        components.truncate(depth);
+                    }
                     event_depth = None;
-                }
-                if ending_event {
                     match cur.take() {
                         Some(b) if window.is_some_and(|w| !b.may_occur_in(w, default_zone)) => {
                             meter.abandon_event();
@@ -679,8 +680,13 @@ pub fn parse_ics_window_reported(
                     }
                     continue;
                 }
-                if !matched {
-                    continue;
+                if let Some(depth) = matching_depth {
+                    if matches!(components[depth], ComponentName::Calendar)
+                        && line.value.eq_ignore_ascii_case("VCALENDAR")
+                    {
+                        closed_calendar = true;
+                    }
+                    components.truncate(depth);
                 }
                 continue;
             }
@@ -694,11 +700,10 @@ pub fn parse_ics_window_reported(
         let child_components = event_depth.is_some_and(|depth| components.len() > depth);
         if child_components {
             let in_alarm = event_depth.is_some_and(|depth| {
-                components
-                    .get(depth..)
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|part| matches!(part, ComponentName::Alarm))
+                components.len() > depth
+                    && components
+                        .last()
+                        .is_some_and(|part| matches!(part, ComponentName::Alarm))
             });
             if in_alarm
                 && line.name == "TRIGGER"
