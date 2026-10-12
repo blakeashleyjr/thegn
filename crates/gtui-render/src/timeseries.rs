@@ -7,6 +7,8 @@ pub struct TimeseriesRenderer;
 /// Samples per horizontal braille pixel above which a series is reduced. Below
 /// it every sample is drawn, so the output is identical to the naive walk.
 const SAMPLES_PER_PIXEL: usize = 4;
+/// Timestamp changes larger than three mean sample intervals break a line.
+const GAP_FACTOR: f64 = 3.0;
 
 /// The points to draw as `(index, value)`, bounded by the panel width.
 ///
@@ -134,6 +136,38 @@ fn segments(points: &[(f64, f64)]) -> impl Iterator<Item = [(f64, f64); 2]> + '_
     })
 }
 
+/// Estimate a line-break threshold from the finite timestamp domain. The
+/// threshold is three times the mean interval (`span / (finite_count - 1)`);
+/// for width-reduced series it is at least two timestamp bucket widths so
+/// bucket reduction does not create artificial gaps. Consequently, holes
+/// narrower than two buckets are invisible at that width. Segment checks use
+/// the absolute timestamp delta, so out-of-order samples follow the same rule.
+fn gap_threshold(times: &[f64], domain: [f64; 2], width: usize) -> Option<f64> {
+    let finite_count = times.iter().filter(|time| time.is_finite()).count();
+    if finite_count < 2 {
+        return None;
+    }
+    let span = domain[1] - domain[0];
+    if !span.is_finite() || span <= 0.0 {
+        return None;
+    }
+    let mean_interval = span / (finite_count - 1) as f64;
+    let mut threshold = GAP_FACTOR * mean_interval;
+    let pixels = width.saturating_mul(2).max(1);
+    if times.len() > pixels.saturating_mul(SAMPLES_PER_PIXEL) {
+        let bucket_width = span / pixels as f64;
+        threshold = threshold.max(2.0 * bucket_width);
+    }
+    threshold.is_finite().then_some(threshold)
+}
+
+fn segments_with_gap(
+    points: &[(f64, f64)],
+    gap: f64,
+) -> impl Iterator<Item = [(f64, f64); 2]> + '_ {
+    segments(points).filter(move |[left, right]| (right.0 - left.0).abs() <= gap)
+}
+
 impl TimeseriesRenderer {
     /// `width` is the panel width in columns; it bounds how many samples are
     /// walked (see [`plot_points`]).
@@ -150,13 +184,18 @@ impl TimeseriesRenderer {
                 .iter()
                 .find(|field| field.ty == FieldType::Time && field.len() == y.len())
         });
-        let (points, x_bounds) = match (time_field, y_field) {
+        let (points, x_bounds, gap) = match (time_field, y_field) {
             (Some(time), Some(y)) => {
                 let (points, domain) = plot_time_points(time.floats(), y.floats(), width);
-                (points, domain.unwrap_or([bounds[0], bounds[1]]))
+                let x_bounds = domain.unwrap_or([bounds[0], bounds[1]]);
+                (
+                    points,
+                    x_bounds,
+                    gap_threshold(time.floats(), x_bounds, width),
+                )
             }
-            (_, Some(y)) => (plot_points(y.floats(), width), [bounds[0], bounds[1]]),
-            (_, None) => (Vec::new(), [bounds[0], bounds[1]]),
+            (_, Some(y)) => (plot_points(y.floats(), width), [bounds[0], bounds[1]], None),
+            (_, None) => (Vec::new(), [bounds[0], bounds[1]], None),
         };
         Canvas::default()
             .block(
@@ -167,14 +206,26 @@ impl TimeseriesRenderer {
             .x_bounds(x_bounds)
             .y_bounds([bounds[2], bounds[3]])
             .paint(move |ctx| {
-                for [(x1, y1), (x2, y2)] in segments(&points) {
-                    ctx.draw(&Line {
-                        x1,
-                        y1,
-                        x2,
-                        y2,
-                        color: Color::Green,
-                    });
+                if let Some(gap) = gap {
+                    for [(x1, y1), (x2, y2)] in segments_with_gap(&points, gap) {
+                        ctx.draw(&Line {
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                            color: Color::Green,
+                        });
+                    }
+                } else {
+                    for [(x1, y1), (x2, y2)] in segments(&points) {
+                        ctx.draw(&Line {
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                            color: Color::Green,
+                        });
+                    }
                 }
             })
     }
@@ -279,6 +330,64 @@ mod tests {
         assert_eq!(
             segments(&[(0.0, 1.0), (1.0, f64::NAN), (2.0, 1.0), (3.0, 2.0)]).collect::<Vec<_>>(),
             vec![[(2.0, 1.0), (3.0, 2.0)]]
+        );
+    }
+
+    #[test]
+    fn timestamp_gap_breaks_line_without_breaking_even_intervals() {
+        let irregular = [
+            (0.0, 1.0),
+            (1.0, 1.0),
+            (2.0, 1.0),
+            (3.0, 1.0),
+            (100.0, 1.0),
+            (101.0, 1.0),
+            (102.0, 1.0),
+        ];
+        let threshold = gap_threshold(
+            &irregular.iter().map(|point| point.0).collect::<Vec<_>>(),
+            [0.0, 102.0],
+            20,
+        )
+        .unwrap();
+        let lines = segments_with_gap(&irregular, threshold).collect::<Vec<_>>();
+        assert!(!lines.contains(&[(3.0, 1.0), (100.0, 1.0)]));
+
+        let even = (0..10).map(|time| (time as f64, 1.0)).collect::<Vec<_>>();
+        let threshold = gap_threshold(
+            &even.iter().map(|point| point.0).collect::<Vec<_>>(),
+            [0.0, 9.0],
+            20,
+        )
+        .unwrap();
+        assert_eq!(segments_with_gap(&even, threshold).count(), even.len() - 1);
+    }
+
+    #[test]
+    fn dense_timestamp_series_preserves_every_segment_around_a_hole() {
+        let times: Vec<f64> = (0..100_000)
+            .map(|index| {
+                if index < 50_000 {
+                    index as f64
+                } else {
+                    index as f64 + 10_000.0
+                }
+            })
+            .collect();
+        let points: Vec<(f64, f64)> = times
+            .iter()
+            .enumerate()
+            .map(|(index, &time)| (time, index as f64))
+            .collect();
+        let domain = [times[0], *times.last().unwrap()];
+        let threshold = gap_threshold(&times, domain, 40).unwrap();
+        let lines = segments_with_gap(&points, threshold).collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), points.len() - 2);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line[0].0 >= 50_000.0 || line[1].0 < 60_000.0)
         );
     }
 

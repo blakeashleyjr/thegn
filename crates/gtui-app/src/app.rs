@@ -36,7 +36,7 @@ pub struct ObserveApp {
     /// Which panel is focused (index into `dashboard.panels`), for input nav.
     pub selected_panel: usize,
     panels: HashMap<u32, PanelState>,
-    frames_rx: mpsc::UnboundedReceiver<PanelUpdate>,
+    frames_rx: mpsc::Receiver<PanelUpdate>,
     cmd_tx: mpsc::UnboundedSender<EngineCmd>,
     gate: Arc<WakeGate>,
 }
