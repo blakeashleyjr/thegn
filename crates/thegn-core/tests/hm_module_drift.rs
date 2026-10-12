@@ -135,6 +135,52 @@ fn enum_lists(src: &str) -> Vec<(String, Vec<String>)> {
     out
 }
 
+/// Option names and their declared Nix type expressions for scalar numeric
+/// options. The destination map below pins each name to its Rust schema path.
+fn numeric_options(src: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let lines: Vec<&str> = src.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(expr) = line
+            .trim()
+            .strip_prefix("type = ")
+            .map(|s| s.trim_end_matches(';'))
+        else {
+            continue;
+        };
+        if !(expr.starts_with("lib.types.int") || expr == "lib.types.port") {
+            continue;
+        }
+        let name = lines[..i]
+            .iter()
+            .rev()
+            .find_map(|previous| {
+                previous
+                    .trim()
+                    .strip_suffix("= lib.mkOption {")
+                    .map(|n| n.trim().to_string())
+            })
+            .unwrap_or_else(|| format!("numeric@{}", i + 1));
+        out.push((name, expr.to_string()));
+    }
+    out
+}
+
+fn schema_field(path: &str) -> Value {
+    let schema = schemars::schema_for!(thegn_core::config::Config);
+    let root = serde_json::to_value(&schema).expect("schema to json");
+    let defs = root["definitions"].as_object().expect("schema definitions");
+    let mut current = &root;
+    for segment in path.split('.') {
+        current = common::resolve(defs, current)
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get(segment))
+            .unwrap_or_else(|| panic!("schema path `{path}` is missing segment `{segment}`"));
+    }
+    common::resolve(defs, current).clone()
+}
+
 /// Every `config_enum!` in the schema: its accepted spellings (canonical +
 /// aliases), keyed by definition name.
 fn schema_enums() -> Vec<(String, BTreeSet<String>)> {
@@ -237,4 +283,113 @@ fn every_nix_enum_is_a_subset_of_a_config_enum() {
         "nix/hm-module.nix enum options offer values the binary rejects:\n{}",
         bad.join("\n")
     );
+}
+
+#[test]
+fn every_numeric_option_matches_its_destination_range() {
+    let expected = [
+        ("rotationSizeMb", "log.rotation_size_mb"),
+        ("maxFiles", "log.max_files"),
+        ("repoScanDepth", "repo_scan_depth"),
+        ("prTtlSecs", "pr.ttl_secs"),
+        ("watchPrIntervalSecs", "watch.pr_interval_secs"),
+        ("port", "sandbox.remote.port"),
+    ];
+    let options = numeric_options(&module_src());
+    let actual_names: BTreeSet<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
+    let expected_names: BTreeSet<&str> = expected.iter().map(|(name, _)| *name).collect();
+    assert_eq!(
+        actual_names, expected_names,
+        "every Nix integer/port type must have an explicit Rust schema destination"
+    );
+
+    for (name, nix_type) in options {
+        let path = expected
+            .iter()
+            .find_map(|(option, path)| (*option == name).then_some(*path))
+            .expect("numeric option destination");
+        let schema = schema_field(path);
+        assert_eq!(
+            schema.get("type").and_then(Value::as_str),
+            Some("integer"),
+            "schema type for {path}"
+        );
+        if name == "port" {
+            assert_eq!(schema.get("format").and_then(Value::as_str), Some("uint16"));
+            assert_eq!(nix_type, "lib.types.port", "Nix type for {path}");
+            continue;
+        }
+
+        let minimum = schema.get("minimum").and_then(Value::as_u64);
+        let maximum = schema.get("maximum").and_then(Value::as_u64);
+        assert_eq!(minimum, Some(0), "schema minimum for unsigned field {path}");
+        if let Some(maximum) = maximum {
+            assert_eq!(
+                nix_type,
+                format!("lib.types.ints.between 0 {maximum}"),
+                "Nix type for bounded schema field {path}"
+            );
+        } else {
+            assert_eq!(
+                nix_type, "lib.types.ints.unsigned",
+                "Nix type for unsigned schema field {path}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_nix_enum_matches_its_destination_enum() {
+    let expected = [
+        ("transport", "sandbox.remote.transport"),
+        ("mode", "sandbox.remote.mode"),
+        ("backend", "sandbox.backend"),
+        ("network", "sandbox.network"),
+        ("onMissing", "sandbox.on_missing"),
+        ("level", "log.level"),
+        ("format", "log.format"),
+        ("picker", "picker"),
+        ("worktreeMode", "worktree_mode"),
+        ("nameScheme", "name_scheme"),
+    ];
+    let enums = enum_lists(&module_src());
+    let actual_names: BTreeSet<&str> = enums.iter().map(|(name, _)| name.as_str()).collect();
+    let expected_names: BTreeSet<&str> = expected.iter().map(|(name, _)| *name).collect();
+    assert_eq!(
+        actual_names, expected_names,
+        "every Nix enum must have an explicit Rust schema destination"
+    );
+
+    for (name, values) in enums {
+        let path = expected
+            .iter()
+            .find_map(|(option, path)| (*option == name).then_some(*path))
+            .expect("enum option destination");
+        let schema = schema_field(path);
+        let mut accepted: BTreeSet<String> = schema["enum"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        if let Some(marker) = schema.get(thegn_core::config_validate::ENUM_MARKER) {
+            accepted.extend(
+                marker["aliases"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string),
+            );
+        }
+        assert!(
+            values.iter().all(|value| accepted.contains(value)),
+            "Nix enum option `{name}` offers values outside `{path}`: {:?}",
+            values
+                .iter()
+                .filter(|value| !accepted.contains(*value))
+                .collect::<Vec<_>>()
+        );
+    }
 }
