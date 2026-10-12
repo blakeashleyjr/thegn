@@ -15,7 +15,7 @@
 
 use crate::config::DataMode;
 use crate::env::Environment;
-use crate::placement::Placement;
+use crate::placement::{Placement, SshPlacement};
 use sha2::{Digest, Sha256};
 
 /// A resolved plan for projecting one worktree into its execution environment.
@@ -35,28 +35,47 @@ pub struct ProjectionSpec {
 }
 
 impl ProjectionSpec {
-    /// The pre-digest mountpoint for ssh placements, if it is safe to target.
+    /// Pre-identity mountpoint candidates for ssh placements that are safe to target.
     ///
     /// The legacy slug collapses distinct `(host, path)` pairs, which is why
     /// current mountpoints include a digest. Teardown may therefore target a
-    /// colliding pre-upgrade mount belonging to another env. A non-lazy
-    /// `fusermount3 -u` refuses a busy mount, so this is safe; do not make it
-    /// lazy (`-uz`).
-    pub fn legacy_mountpoint(&self) -> Option<String> {
+    /// The result contains the old slug path and, for a non-default SSH
+    /// placement, its former v1 digest path. A non-lazy `fusermount3 -u`
+    /// refuses a busy mount; do not make it lazy (`-uz`).
+    pub fn legacy_mountpoints(&self) -> Vec<String> {
         let Placement::Ssh(ssh) = &self.placement else {
-            return None;
+            return Vec::new();
         };
-        legacy_mountpoint(&ssh.host, &self.remote_dir)
+        let mut candidates = Vec::new();
+        if let Some(slug_path) = legacy_mountpoint(&ssh.host, &self.remote_dir) {
+            candidates.push(slug_path);
+        }
+        let v1_path = mountpoint_v1(&ssh.host, &self.remote_dir);
+        if v1_path != self.mountpoint && !candidates.contains(&v1_path) {
+            candidates.push(v1_path);
+        }
+        candidates
     }
 }
 
-/// A stable local mountpoint for the exact UTF-8 bytes of a host and remote
-/// path, under `<thegn_dir>/mounts/<readable-prefix>--<digest>`. The digest is
-/// versioned, domain-separated, and length-delimited so separators and
-/// concatenation boundaries cannot alias. Only byte-identical pairs coalesce;
-/// host aliases and path normalization are not inferred here.
-pub fn mountpoint(host: &str, remote_path: &str) -> String {
-    let component = projection_component(host, remote_path);
+/// A stable local mountpoint under `<thegn_dir>/mounts/<readable-prefix>--<digest>`.
+/// The default SSH placement (`port == 22`, no jump host, identity, or ssh
+/// config) retains the v1 host/path hash. Otherwise the digest also includes
+/// those four tagged placement values. Values compare as exact UTF-8 bytes:
+/// DNS aliases, path normalization, and equivalent SSH config semantics do not
+/// coalesce. Transport kind, agent forwarding, and extra SSH args are not part
+/// of this bounded placement identity.
+pub fn mountpoint(placement: &SshPlacement, remote_path: &str) -> String {
+    let component = projection_component(placement, remote_path);
+    crate::util::thegn_dir()
+        .join("mounts")
+        .join(component)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn mountpoint_v1(host: &str, remote_path: &str) -> String {
+    let component = projection_component_v1(host, remote_path);
     crate::util::thegn_dir()
         .join("mounts")
         .join(component)
@@ -73,7 +92,7 @@ pub fn legacy_mountpoint(host: &str, remote_path: &str) -> Option<String> {
         return None;
     }
     let candidate = crate::util::thegn_dir().join("mounts").join(component);
-    distinct_mountpoint(candidate, &mountpoint(host, remote_path))
+    distinct_mountpoint(candidate, &mountpoint_v1(host, remote_path))
 }
 
 fn distinct_mountpoint(candidate: std::path::PathBuf, current: &str) -> Option<String> {
@@ -89,7 +108,7 @@ const PROJECTION_DIGEST_HEX_BYTES: usize = 32; // 128 bits
 
 /// Build a filesystem-safe, bounded path component. The slug is display-only;
 /// the SHA-256 suffix is computed from the exact pair of input byte strings.
-fn projection_component(host: &str, remote_path: &str) -> String {
+fn projection_component_v1(host: &str, remote_path: &str) -> String {
     const DOMAIN: &[u8] = b"thegn/projection-mountpoint/v1";
     let mut hasher = Sha256::new();
     hasher.update(DOMAIN);
@@ -97,6 +116,50 @@ fn projection_component(host: &str, remote_path: &str) -> String {
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part);
     }
+    projection_component_from_digest(host, remote_path, hasher)
+}
+
+fn projection_component(placement: &SshPlacement, remote_path: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"thegn/projection-mountpoint/v1");
+    for part in [placement.host.as_bytes(), remote_path.as_bytes()] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    if placement.port != 22
+        || placement.jump_host.is_some()
+        || placement.identity.is_some()
+        || placement.ssh_config.is_some()
+    {
+        hasher.update(b"thegn/projection-mountpoint/placement/v1");
+        hash_projection_field(&mut hasher, b"port", &placement.port.to_be_bytes());
+        hash_projection_option(&mut hasher, b"jump_host", placement.jump_host.as_deref());
+        hash_projection_option(&mut hasher, b"identity", placement.identity.as_deref());
+        hash_projection_option(&mut hasher, b"ssh_config", placement.ssh_config.as_deref());
+    }
+    projection_component_from_digest(&placement.host, remote_path, hasher)
+}
+
+fn hash_projection_field(hasher: &mut Sha256, tag: &[u8], value: &[u8]) {
+    hasher.update((tag.len() as u64).to_be_bytes());
+    hasher.update(tag);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn hash_projection_option(hasher: &mut Sha256, tag: &[u8], value: Option<&str>) {
+    let mut encoded = Vec::new();
+    if let Some(value) = value {
+        encoded.push(1);
+        encoded.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        encoded.extend_from_slice(value.as_bytes());
+    } else {
+        encoded.push(0);
+    }
+    hash_projection_field(hasher, tag, &encoded);
+}
+
+fn projection_component_from_digest(host: &str, remote_path: &str, hasher: Sha256) -> String {
     let digest = hasher.finalize();
     let digest_hex: String = digest[..PROJECTION_DIGEST_HEX_BYTES / 2]
         .iter()
@@ -129,6 +192,16 @@ fn projection_component(host: &str, remote_path: &str) -> String {
     format!("{prefix}--{digest_hex}")
 }
 
+/// Identifies legacy slug-only mount directory names. Current components
+/// contain `--` before their digest, while `slugify` never emits that pair.
+pub fn is_legacy_mount_component(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains("--")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 /// Build the projection plan for a resolved environment, or `None` when the data
 /// mode needs no projection (`in_env`/`local_exec`) or the inputs are incomplete
 /// (e.g. `sshfs` without an ssh placement or a `remote_dir`).
@@ -143,7 +216,7 @@ pub fn for_environment(env: &Environment) -> Option<ProjectionSpec> {
             if remote_dir.is_empty() {
                 return None;
             }
-            let mountpoint = mountpoint(&s.host, &remote_dir);
+            let mountpoint = mountpoint(s, &remote_dir);
             Some(ProjectionSpec {
                 mode: env.data,
                 placement: env.placement.clone(),
@@ -160,6 +233,10 @@ mod tests {
     use super::*;
     use crate::config::SandboxConfig;
     use crate::placement::{SshPlacement, TransportKind};
+
+    fn ssh_placement() -> SshPlacement {
+        SshPlacement::plain("dev-box".into(), 22, false, TransportKind::Ssh)
+    }
 
     fn ssh_env(data: DataMode, remote_dir: &str) -> Environment {
         let mut sandbox = SandboxConfig::default();
@@ -210,7 +287,7 @@ mod tests {
         assert_eq!(spec.mode, DataMode::Sshfs);
         assert_eq!(spec.remote_dir, "/srv/work");
         // Deterministic: recomputing from the same inputs matches.
-        assert_eq!(spec.mountpoint, mountpoint("dev-box", "/srv/work"));
+        assert_eq!(spec.mountpoint, mountpoint(&ssh_placement(), "/srv/work"));
         assert!(spec.mountpoint.contains("mounts"));
     }
 
@@ -225,7 +302,7 @@ mod tests {
             legacy_mountpoint("dev-box", "/srv/work"),
             Some(expected.clone())
         );
-        assert_ne!(expected, mountpoint("dev-box", "/srv/work"));
+        assert_ne!(expected, mountpoint(&ssh_placement(), "/srv/work"));
     }
 
     #[test]
@@ -239,14 +316,14 @@ mod tests {
     }
 
     #[test]
-    fn sshfs_spec_exposes_legacy_mountpoint() {
+    fn sshfs_spec_exposes_legacy_mountpoints() {
         let env = ssh_env(DataMode::Sshfs, "/srv/work");
         let spec = for_environment(&env).expect("sshfs spec");
-        assert!(spec.legacy_mountpoint().is_some());
+        assert_eq!(spec.legacy_mountpoints().len(), 1);
 
         let mut local_spec = spec;
         local_spec.placement = Placement::Local;
-        assert_eq!(local_spec.legacy_mountpoint(), None);
+        assert!(local_spec.legacy_mountpoints().is_empty());
     }
 
     #[test]
@@ -263,7 +340,12 @@ mod tests {
         ];
         let components: Vec<_> = pairs
             .iter()
-            .map(|(host, path)| projection_component(host, path))
+            .map(|(host, path)| {
+                projection_component(
+                    &SshPlacement::plain((*host).into(), 22, false, TransportKind::Ssh),
+                    path,
+                )
+            })
             .collect();
         for (index, component) in components.iter().enumerate() {
             assert!(
@@ -276,7 +358,10 @@ mod tests {
 
     #[test]
     fn projection_mountpoint_component_is_bounded_safe_and_never_empty() {
-        let component = projection_component(&"x".repeat(100_000), &"/".repeat(100_000));
+        let component = projection_component(
+            &SshPlacement::plain("x".repeat(100_000), 22, false, TransportKind::Ssh),
+            &"/".repeat(100_000),
+        );
         assert!(component.len() <= PROJECTION_PREFIX_MAX_BYTES + 2 + PROJECTION_DIGEST_HEX_BYTES);
         assert!(!component.is_empty());
         assert!(
@@ -290,13 +375,85 @@ mod tests {
             PROJECTION_DIGEST_HEX_BYTES
         );
 
-        let punctuation_only = projection_component("///", "\\\\");
+        let punctuation_only = projection_component(
+            &SshPlacement::plain("///".into(), 22, false, TransportKind::Ssh),
+            "\\\\",
+        );
         assert!(punctuation_only.starts_with("projection--"));
         assert!(!punctuation_only.is_empty());
-        let path = mountpoint("///", "\\\\");
+        let path = mountpoint(
+            &SshPlacement::plain("///".into(), 22, false, TransportKind::Ssh),
+            "\\\\",
+        );
         assert_eq!(
             std::path::Path::new(&path).file_name().unwrap(),
             std::ffi::OsStr::new(&punctuation_only)
         );
+    }
+
+    #[test]
+    fn default_placement_keeps_v1_mountpoint_and_nondefault_knobs_separate() {
+        let default = ssh_placement();
+        assert_eq!(
+            projection_component(&default, "/srv/work"),
+            "dev-box-srv-work--eac76ad6c9ad2796ac78198144530994"
+        );
+        assert_eq!(
+            mountpoint(&default, "/srv/work"),
+            mountpoint_v1("dev-box", "/srv/work")
+        );
+        let mut port_2222 = SshPlacement::plain("dev-box".into(), 2222, false, TransportKind::Ssh);
+        let mut port_2223 = port_2222.clone();
+        port_2223.port = 2223;
+        assert_ne!(
+            projection_component(&port_2222, "/srv/work"),
+            projection_component(&port_2223, "/srv/work")
+        );
+        assert_ne!(
+            projection_component(&default, "/srv/work"),
+            projection_component(&port_2222, "/srv/work")
+        );
+
+        port_2222.jump_host = Some("bastion".into());
+        let jump = projection_component(&port_2222, "/srv/work");
+        port_2222.jump_host = None;
+        port_2222.identity = Some("/keys/id".into());
+        let identity = projection_component(&port_2222, "/srv/work");
+        port_2222.identity = None;
+        port_2222.ssh_config = Some("/cfg/ssh".into());
+        let config = projection_component(&port_2222, "/srv/work");
+        assert_ne!(jump, identity);
+        assert_ne!(identity, config);
+    }
+
+    #[test]
+    fn legacy_mountpoints_include_v1_for_nondefault_placement() {
+        let mut env = ssh_env(DataMode::Sshfs, "/srv/work");
+        let Placement::Ssh(ssh) = &mut env.placement else {
+            unreachable!()
+        };
+        ssh.port = 2222;
+        let spec = for_environment(&env).expect("sshfs spec");
+        assert_eq!(spec.legacy_mountpoints().len(), 2);
+        assert!(
+            spec.legacy_mountpoints()
+                .contains(&mountpoint(&ssh_placement(), "/srv/work"))
+        );
+    }
+
+    #[test]
+    fn legacy_mount_component_classifier_matches_slug_domain() {
+        for (name, expected) in [
+            ("dev-box-srv-work", true),
+            ("a", true),
+            ("", false),
+            ("--", false),
+            ("name--0123", false),
+            ("Upper", false),
+            ("has_under", false),
+            ("é", false),
+        ] {
+            assert_eq!(is_legacy_mount_component(name), expected, "{name:?}");
+        }
     }
 }
