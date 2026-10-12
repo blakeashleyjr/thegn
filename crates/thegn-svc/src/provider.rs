@@ -23,26 +23,21 @@ use thegn_core::remote::SshTarget;
 /// has **no timeouts**, so a stalled TCP handshake or a hung TLS negotiation to
 /// the provider's control plane blocks the calling request *forever* — which is
 /// exactly what strands the "Sync agent logins" provisioning step on a bad
-/// network. We bound only **connection establishment** (not the whole request),
-/// so legitimately long transfers (large binary/closure pushes) still complete,
-/// and an unreachable endpoint fails fast instead of hanging. An invalid client
-/// policy is fatal rather than falling back to an unbounded client. Redirects
-/// are rejected so authenticated requests cannot be replayed to another host.
+/// network. Control requests have a total deadline; individual file-transfer
+/// requests override it with their separate, longer deadline. An invalid
+/// client policy is fatal rather than falling back to an unbounded client.
+/// Redirects are rejected so authenticated requests cannot be replayed to
+/// another host.
 pub(crate) fn provider_http_client() -> reqwest::Client {
-    match reqwest::Client::builder()
+    reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(CONTROL_TIMEOUT)
         // Reap idle keep-alive sockets so a half-open connection to a sprite that
         // was suspended/rotated doesn't get reused into a silent stall.
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-    {
-        Ok(client) => client,
-        Err(error) => {
-            tracing::error!(target: "thegn::provider", %error, "provider HTTP client policy could not be built");
-            reqwest::Client::new()
-        }
-    }
+        .expect("provider HTTP client policy must be supported")
 }
 
 /// Maximum decoded control-plane JSON response. File contents use their
@@ -130,11 +125,9 @@ mod sessions;
 
 /// Per-request deadline for the small JSON **control-plane** calls (create,
 /// list, destroy, fs read/list, network policy, checkpoint metadata). The shared
-/// client (above) bounds only *connection* setup so genuinely long transfers
-/// (large binary/closure pushes via `write_with_mode`) can still run; but a
-/// control call whose response the server withholds while a sprite cold-boots
-/// would otherwise hang the caller **forever** — the "hung on startup" failure.
-/// Capping each such call turns an infinite stall into a fast, retryable error.
+/// client applies this deadline by default; long file transfers override it
+/// with their separate policy. Capping control calls turns an infinite stall
+/// into a fast, retryable error.
 pub(crate) const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Control-plane retry budget for the idempotent create/list calls: a transient
@@ -869,7 +862,7 @@ fn valid_remote_component(name: &str) -> bool {
         && name != ".."
         && !name.chars().any(|ch| matches!(ch, '/' | '\\' | '\0'))
         && !name.chars().any(char::is_control)
-        && !(name.as_bytes().len() >= 2
+        && !(name.len() >= 2
             && name.as_bytes()[0].is_ascii_alphabetic()
             && name.as_bytes()[1] == b':')
 }
