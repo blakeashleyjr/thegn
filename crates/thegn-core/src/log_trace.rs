@@ -77,9 +77,9 @@ fn current_wt() -> Option<String> {
     CURRENT_WT.with(|c| c.borrow().clone())
 }
 
-/// A bounded worktree tag derived from exact native path bytes. The slug is for
-/// display only; the versioned digest binds the tag to the complete path. If
-/// exact bytes cannot be encoded within the identity bound, the `unbound` suffix
+/// A bounded worktree tag derived from normalized native path bytes. The slug is
+/// for display only; the versioned digest binds the tag to the complete path. If
+/// those bytes cannot be encoded within the identity bound, the `unbound` suffix
 /// marks the ambiguous fallback. Empty path ⇒ `""` (host-global).
 pub fn wt_slug(path: &Path) -> String {
     if path.as_os_str().is_empty() {
@@ -92,13 +92,16 @@ pub fn wt_slug(path: &Path) -> String {
         .unwrap_or_else(|| "worktree".to_string());
     let label: String = label.chars().take(32).collect();
     let max_path_bytes = crate::identity::MAX_IDENTITY_BYTES - 64;
-    match crate::util::native_path_bytes_bounded(path, max_path_bytes).and_then(|bytes| {
-        crate::identity::digest_parts(
-            b"thegn/log-worktree",
-            &[crate::identity::BytePart::new(&bytes)],
-        )
-        .map_err(|_| crate::util::NativePathError::TooLong)
-    }) {
+    let normalized_path: PathBuf = path.components().collect();
+    match crate::util::native_path_bytes_bounded(&normalized_path, max_path_bytes).and_then(
+        |bytes| {
+            crate::identity::digest_parts(
+                b"thegn/log-worktree",
+                &[crate::identity::BytePart::new(&bytes)],
+            )
+            .map_err(|_| crate::util::NativePathError::TooLong)
+        },
+    ) {
         Ok(digest) => format!("{label}.{}", crate::identity::hex_bytes(&digest)),
         Err(_) => format!("{label}.unbound"),
     }
@@ -950,6 +953,14 @@ mod tests {
         assert!(!first.chars().any(char::is_whitespace));
         assert!(!first.contains('='));
         assert_eq!(wt_slug(Path::new("")), "");
+    }
+
+    #[test]
+    fn wt_slug_normalizes_trailing_separator() {
+        assert_eq!(
+            wt_slug(Path::new("/repos/a/wt/")),
+            wt_slug(Path::new("/repos/a/wt"))
+        );
     }
 
     #[test]
