@@ -472,7 +472,7 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
                 &n,
             ],
         )?;
-        Ok(thegn_core::gitrefs::parse_commits(&out)?)
+        thegn_core::gitrefs::parse_commits(&out)
     }
 
     /// The last `n` commits reachable from `refname` — the branches pane's
@@ -492,7 +492,7 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
                 refname,
             ],
         )?;
-        Ok(thegn_core::gitrefs::parse_commits(&out)?)
+        thegn_core::gitrefs::parse_commits(&out)
     }
 
     /// All local branches with upstream/divergence detail, newest first.
@@ -509,7 +509,7 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
                 "--format=%(HEAD)\u{1f}%(refname:short)\u{1f}%(upstream:short)\u{1f}%(upstream:track)\u{1f}%(objectname)\u{1f}%(committerdate:unix)\u{1f}%(contents:subject)",
             ],
         )?;
-        Ok(thegn_core::gitrefs::parse_branches(&out)?)
+        thegn_core::gitrefs::parse_branches(&out)
     }
 
     /// The stash as structured entries (empty on a stash-less repo). Routes
@@ -525,7 +525,7 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
         if exit != 0 {
             anyhow::bail!("git stash list exited with status {exit}");
         }
-        Ok(thegn_core::gitrefs::parse_stashes(&out)?)
+        thegn_core::gitrefs::parse_stashes(&out)
     }
 
     /// The last `n` HEAD reflog entries (the undo planner's feed).

@@ -35,7 +35,10 @@ pub fn parse_commits(out: &str) -> anyhow::Result<Vec<Commit>> {
         fields.pop();
     }
     anyhow::ensure!(!fields.is_empty(), "empty commit record terminator");
-    anyhow::ensure!(fields.len() % 8 == 0, "malformed commit record field count");
+    anyhow::ensure!(
+        fields.len().is_multiple_of(8),
+        "malformed commit record field count"
+    );
     let mut commits = Vec::with_capacity(fields.len() / 8);
     let mut seen = std::collections::HashSet::new();
     for row in fields.chunks_exact(8) {
