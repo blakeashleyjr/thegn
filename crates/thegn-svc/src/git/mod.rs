@@ -948,6 +948,8 @@ fn parse_ahead_behind(out: &str) -> Option<(usize, usize)> {
 /// *gained* an `origin/HEAD` mid-session keeps serving the `main`/`master`
 /// fallback.
 const GLYPH_BASE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const GLYPH_BASE_FAILURE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
+const GLYPH_BASE_CACHE_CAPACITY: usize = 256;
 
 /// Process-global cache of [`glyph_base`]'s resolution, keyed by full execution
 /// authority and placement path (with sensitive remote fields hashed).
@@ -969,6 +971,14 @@ fn base_cache() -> &'static std::sync::Mutex<
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+fn failed_base_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<RepoExecutionIdentity, std::time::Instant>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<RepoExecutionIdentity, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Opaque key for one repository execution placement. The digest prevents SSH
 /// identity/config and provider control arguments from reaching cache storage.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -986,9 +996,9 @@ fn repo_execution_identity(loc: &GitLoc) -> RepoExecutionIdentity {
             feed(b"local");
             let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
             feed(canonical.as_os_str().as_encoded_bytes());
-            // Cheap replacement fence: include the .git entry's stable path and
-            // filesystem metadata when available. This also distinguishes a
-            // replaced gitdir at the same worktree path on common filesystems.
+            // Resolve linked worktrees' .git pointer, then use the gitdir's
+            // stable filesystem identity. Directory mtime/length are unstable:
+            // ordinary index refreshes change them.
             let git_entry = canonical.join(".git");
             let git_entry = std::fs::read_to_string(&git_entry)
                 .ok()
@@ -1008,13 +1018,8 @@ fn repo_execution_identity(loc: &GitLoc) -> RepoExecutionIdentity {
                 .unwrap_or(git_entry);
             let git_entry = std::fs::canonicalize(&git_entry).unwrap_or(git_entry);
             feed(git_entry.as_os_str().as_encoded_bytes());
-            if let Ok(meta) = std::fs::metadata(&git_entry) {
-                feed(&meta.len().to_be_bytes());
-                if let Ok(modified) = meta.modified()
-                    && let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH)
-                {
-                    feed(&since_epoch.as_nanos().to_be_bytes());
-                }
+            if let Some(identity) = thegn_core::util::file_identity(&git_entry) {
+                feed(identity.as_bytes());
             }
         }
         GitLoc::Remote { ssh, path } => {
@@ -1112,6 +1117,17 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
             return base.clone();
         }
     }
+    {
+        let failed = failed_base_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if failed
+            .get(&key)
+            .is_some_and(|at| base_probe_backoff_active(at.elapsed()))
+        {
+            return None;
+        }
+    }
     let origin_result = run_status(
         loc,
         &[
@@ -1124,7 +1140,10 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
     let origin_head = match origin_result {
         Ok((0, out)) => Some(out.trim().to_string()),
         Ok((1, _)) => None, // no origin/HEAD is an expected observation
-        _ => return None,
+        _ => {
+            record_base_probe_failure(key);
+            return None;
+        }
     };
     let mut probe_failed = false;
     let base = base_from_probe(origin_head.as_deref(), |b| {
@@ -1146,16 +1165,50 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
         }
     });
     if probe_failed {
+        record_base_probe_failure(key);
         return None;
     }
     let mut cache = base_cache().lock().unwrap_or_else(|e| e.into_inner());
-    if cache.len() >= 256 && !cache.contains_key(&key) {
-        if let Some(evict) = cache.keys().next().cloned() {
-            cache.remove(&evict);
-        }
+    if cache.len() >= GLYPH_BASE_CACHE_CAPACITY
+        && !cache.contains_key(&key)
+        && let Some(evict) = cache
+            .iter()
+            .filter(|(_, (_, at, _))| at.elapsed() >= GLYPH_BASE_TTL)
+            .min_by_key(|(_, (_, at, _))| *at)
+            .or_else(|| cache.iter().min_by_key(|(_, (_, at, _))| *at))
+            .map(|(key, _)| key.clone())
+    {
+        cache.remove(&evict);
     }
-    cache.insert(key, (base.clone(), std::time::Instant::now(), print));
+    cache.insert(
+        key.clone(),
+        (base.clone(), std::time::Instant::now(), print),
+    );
+    failed_base_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
     base
+}
+
+fn record_base_probe_failure(key: RepoExecutionIdentity) {
+    let mut failed = failed_base_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if failed.len() >= GLYPH_BASE_CACHE_CAPACITY
+        && !failed.contains_key(&key)
+        && let Some(evict) = failed
+            .iter()
+            .min_by_key(|(_, at)| *at)
+            .map(|(key, _)| key.clone())
+    {
+        failed.remove(&evict);
+    }
+    failed.insert(key, std::time::Instant::now());
+}
+
+fn base_probe_backoff_active(age: std::time::Duration) -> bool {
+    age < GLYPH_BASE_FAILURE_BACKOFF
 }
 
 /// What a cached default-base resolution was validated by when stored.
@@ -2286,6 +2339,15 @@ mod tests {
     }
 
     #[test]
+    fn base_probe_failure_backoff_is_short_and_expires() {
+        assert!(base_probe_backoff_active(std::time::Duration::ZERO));
+        assert!(base_probe_backoff_active(
+            GLYPH_BASE_FAILURE_BACKOFF - std::time::Duration::from_millis(1)
+        ));
+        assert!(!base_probe_backoff_active(GLYPH_BASE_FAILURE_BACKOFF));
+    }
+
+    #[test]
     fn execution_identity_separates_placements_without_retaining_authority_secrets() {
         let a = GitLoc::provider(
             vec!["sprite".into(), "exec".into(), "-s".into(), "alpha".into()],
@@ -2334,6 +2396,23 @@ mod tests {
         assert_ne!(ssh_key, repo_execution_identity(&ssh_b));
         assert!(!ssh_key.0.contains("secret"));
         assert!(!ssh_key.0.contains("key-a"));
+    }
+
+    #[test]
+    fn local_execution_identity_survives_gitdir_entry_churn() {
+        let dir = std::env::temp_dir().join(format!("tg-git-identity-{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let loc = GitLoc::Local(dir.clone());
+        let before = repo_execution_identity(&loc);
+        // Index lock/rename activity changes gitdir mtime and length. It must
+        // not invalidate the repository execution identity.
+        std::fs::write(dir.join(".git/index.lock"), b"lock").unwrap();
+        std::fs::rename(dir.join(".git/index.lock"), dir.join(".git/index")).unwrap();
+        assert_eq!(before, repo_execution_identity(&loc));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn repo_root() -> std::path::PathBuf {
