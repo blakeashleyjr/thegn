@@ -33,26 +33,29 @@ impl AppleScript {
     }
 
     /// The first running + non-stopped player (the control target).
-    async fn active_app(&self) -> Option<(&'static str, String)> {
+    async fn active_app(&self) -> Result<Option<(&'static str, String)>, MediaError> {
+        let mut reads = Vec::with_capacity(APPS.len());
         for app in APPS {
-            if let Ok(Some(line)) = self.read_one(app).await {
-                return Some((app, line));
-            }
+            reads.push((*app, self.read_one(app).await));
         }
-        None
+        crate::applescript_parse::pick_active(reads)
     }
 
     pub async fn list_players(&self) -> Vec<String> {
         match self.active_app().await {
-            Some((app, _)) => vec![app.to_string()],
-            None => Vec::new(),
+            Ok(Some((app, _))) => vec![app.to_string()],
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                tracing::debug!(target: "thegn::media", %error, "AppleScript player read failed");
+                Vec::new()
+            }
         }
     }
 
     /// Send a control body to the active app (Spotify and Music share most verbs;
     /// the differing ones pass distinct bodies).
     async fn control(&self, spotify_body: &str, music_body: &str) -> Result<(), MediaError> {
-        let (app, _) = self.active_app().await.ok_or(MediaError::NoPlayer)?;
+        let (app, _) = self.active_app().await?.ok_or(MediaError::NoPlayer)?;
         let body = if app == "Spotify" {
             spotify_body
         } else {
@@ -75,8 +78,8 @@ impl Default for AppleScript {
 impl MediaBackend for AppleScript {
     fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
         Box::pin(async move {
-            match self.active_app().await {
-                Some((_, line)) => Ok(Some(crate::applescript_parse::parse_line(&line))),
+            match self.active_app().await? {
+                Some((_, line)) => Ok(Some(crate::applescript_parse::parse_line(&line)?)),
                 None => Ok(None),
             }
         })
@@ -128,12 +131,14 @@ impl MediaBackend for AppleScript {
     }
 
     fn playlists(&self) -> BoxFuture<'_, Result<Vec<Playlist>, MediaError>> {
-        Box::pin(async move {
-            Ok(Vec::new()) // not exposed via this scripting floor
-        })
+        Box::pin(async move { Err(MediaError::Unsupported("AppleScript playlists".into())) })
     }
     fn activate_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {
+            Err(MediaError::Unsupported(
+                "AppleScript playlist activation".into(),
+            ))
+        })
     }
 
     fn seek(

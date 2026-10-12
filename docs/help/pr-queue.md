@@ -31,6 +31,12 @@ Queueing is explicit by default: thegn does not watch every PR on the forge.
 Set `auto_enqueue = "worktree"` if you would rather every PR you open from a
 worktree be queued.
 
+The add command stores the forge PR URL and checks that later fetches
+still identify the same repository and PR number before refreshing reviews,
+merging, rerunning checks, or launching an agent. On upgrade, older active rows
+have no recorded identity and are held for a human; re-add the PR with
+`thegn pr queue add --pr 42` to verify and bind it.
+
 ## What blocks a PR
 
 Each pass classifies one blocker, most actionable first:

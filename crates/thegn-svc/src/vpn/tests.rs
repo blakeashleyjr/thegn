@@ -336,11 +336,15 @@ fn oci_runtime_argv_prefixes_subcommand() {
 /// not chmodded after a world-readable window.
 #[cfg(unix)]
 #[test]
-fn write_secret_0600_creates_owner_only() {
+fn private_dir_secret_write_creates_owner_only_file() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("wg.conf");
-    write_secret_0600(&path, b"[Interface]\nPrivateKey=xxx\n").unwrap();
+    let private =
+        thegn_core::fsperm::ensure_private_dir_beneath(dir.path(), std::path::Path::new("staging"))
+            .unwrap();
+    let path = private
+        .write_owner_only_atomic("wg.conf", b"[Interface]\nPrivateKey=xxx\n")
+        .unwrap();
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "secret file must be created 0600");
     assert_eq!(
@@ -348,10 +352,179 @@ fn write_secret_0600_creates_owner_only() {
         b"[Interface]\nPrivateKey=xxx\n"
     );
     // Overwriting an existing (possibly wrong-mode) file re-establishes 0600.
-    write_secret_0600(&path, b"new").unwrap();
+    private.write_owner_only_atomic("wg.conf", b"new").unwrap();
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
     assert_eq!(std::fs::read(&path).unwrap(), b"new");
+}
+
+fn staging_plan(
+    container: &str,
+    files: Vec<SidecarFile>,
+    env: Vec<(String, String)>,
+) -> SidecarPlan {
+    SidecarPlan {
+        container: container.into(),
+        image: "img".into(),
+        run_flags: vec![],
+        env,
+        mounts: vec![],
+        files,
+        command: vec![],
+        ready: ReadyProbe {
+            argv: vec!["true".into()],
+            when: ReadyWhen::ExitZero,
+        },
+        proxy: None,
+    }
+}
+
+fn state_home_env(home: &std::path::Path) -> thegn_core::testenv::EnvGuard {
+    thegn_core::testenv::EnvGuard::set(&[("XDG_STATE_HOME", &home.to_string_lossy())])
+}
+
+#[cfg(unix)]
+#[test]
+fn stage_files_rejects_symlinked_sidecar_directory() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let home = tempfile::tempdir().unwrap();
+    let victim = tempfile::tempdir().unwrap();
+    let _env = state_home_env(home.path());
+    let vpn = home.path().join("thegn/vpn");
+    std::fs::create_dir_all(&vpn).unwrap();
+    std::fs::set_permissions(&vpn, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(victim.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let container = "vpn-stage-symlink-files";
+    symlink(victim.path(), vpn.join(container)).unwrap();
+    let plan = staging_plan(
+        container,
+        vec![SidecarFile {
+            contents: "canary-secret".into(),
+            dest: "/secret".into(),
+        }],
+        vec![],
+    );
+
+    assert!(stage_files(&plan).is_err());
+    assert_eq!(std::fs::read_dir(victim.path()).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::metadata(victim.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stage_env_file_rejects_symlinked_sidecar_directory() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let home = tempfile::tempdir().unwrap();
+    let victim = tempfile::tempdir().unwrap();
+    let _env = state_home_env(home.path());
+    let vpn = home.path().join("thegn/vpn");
+    std::fs::create_dir_all(&vpn).unwrap();
+    std::fs::set_permissions(&vpn, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(victim.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let container = "vpn-stage-symlink-env";
+    symlink(victim.path(), vpn.join(container)).unwrap();
+    let plan = staging_plan(
+        container,
+        vec![],
+        vec![("API_TOKEN".into(), "canary-secret".into())],
+    );
+
+    assert!(stage_env_file(&plan).is_err());
+    assert_eq!(std::fs::read_dir(victim.path()).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::metadata(victim.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+}
+
+#[test]
+fn stage_all_cleans_files_when_environment_validation_fails() {
+    let home = tempfile::tempdir().unwrap();
+    let _env = state_home_env(home.path());
+    let container = "vpn-stage-invalid-env";
+    let plan = staging_plan(
+        container,
+        vec![SidecarFile {
+            contents: "canary-secret".into(),
+            dest: "/secret".into(),
+        }],
+        vec![("1BAD".into(), "value".into())],
+    );
+
+    assert!(stage_all(&plan).is_err());
+    assert!(!staged_dir(container).unwrap().exists());
+}
+
+#[test]
+fn staging_refuses_container_names_with_path_components() {
+    let home = tempfile::tempdir().unwrap();
+    let _env = state_home_env(home.path());
+    let plan = staging_plan(
+        "nested/container",
+        vec![SidecarFile {
+            contents: "canary-secret".into(),
+            dest: "/secret".into(),
+        }],
+        vec![],
+    );
+
+    assert!(stage_files(&plan).is_err());
+}
+
+#[test]
+fn staging_fails_when_state_home_and_home_are_unset() {
+    let _env = thegn_core::testenv::EnvGuard::unset(&["XDG_STATE_HOME", "HOME"]);
+    let plan = staging_plan(
+        "vpn-stage-no-home",
+        vec![SidecarFile {
+            contents: "canary-secret".into(),
+            dest: "/secret".into(),
+        }],
+        vec![],
+    );
+
+    let error = stage_files(&plan).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("XDG_STATE_HOME and HOME are unset")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn staging_repairs_permissive_legacy_vpn_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let _env = state_home_env(home.path());
+    let vpn = home.path().join("thegn/vpn");
+    std::fs::create_dir_all(&vpn).unwrap();
+    std::fs::set_permissions(&vpn, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let plan = staging_plan(
+        "vpn-stage-legacy-mode",
+        vec![SidecarFile {
+            contents: "canary-secret".into(),
+            dest: "/secret".into(),
+        }],
+        vec![],
+    );
+
+    assert!(stage_files(&plan).is_ok());
+    assert_eq!(
+        std::fs::metadata(vpn).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
 }
 
 /// `stage_files` writes each secret 0600 in a 0700 dir, and `cleanup_staged`
@@ -360,7 +533,7 @@ fn write_secret_0600_creates_owner_only() {
 #[test]
 fn stage_files_are_0600_in_0700_dir_and_cleaned_up() {
     use std::os::unix::fs::PermissionsExt;
-    // Isolate XDG_STATE_HOME so state_dir() lands in a scratch tree. This test
+    // Isolate XDG_STATE_HOME so state_root() lands in a scratch tree. This test
     // owns the env var for its duration (marked serial by the unique container).
     let home = tempfile::tempdir().unwrap();
     // The shared env lock, so no other env-mutating test in this binary can

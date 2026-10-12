@@ -32,6 +32,7 @@
 pub(crate) mod helper;
 pub mod model;
 
+mod admit;
 pub mod aggregate;
 #[cfg(target_os = "macos")]
 pub mod applescript;
@@ -320,7 +321,7 @@ pub type MediaClient = Box<dyn MediaBackend>;
 /// OS, or its transport can't be reached (the caller then shows nothing — the
 /// feature is silently inert).
 pub async fn client_for(mut opts: ResolveOpts) -> Option<MediaClient> {
-    match opts.backend {
+    let client: Option<MediaClient> = match opts.backend {
         BackendKind::None => None,
         BackendKind::Auto => auto_client(&mut opts).await,
         BackendKind::Mpris => mpris_client(&opts).await,
@@ -336,7 +337,8 @@ pub async fn client_for(mut opts: ResolveOpts) -> Option<MediaClient> {
             tracing::debug!(target: "thegn::media", "jellyfin backend not implemented yet");
             None
         }
-    }
+    };
+    client.map(|client| Box::new(admit::Admitted(client)) as MediaClient)
 }
 
 /// Pick the native backend for the current OS. On Linux this composes *every*

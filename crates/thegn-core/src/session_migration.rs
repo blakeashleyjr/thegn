@@ -106,6 +106,8 @@ pub struct MigrationDispatch {
     pub note: Option<String>,
     pub chunk_path: Option<String>,
     pub report: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_scope: Option<String>,
 }
 
 impl From<AgentDispatch> for MigrationDispatch {
@@ -124,6 +126,7 @@ impl From<AgentDispatch> for MigrationDispatch {
             note: row.note,
             chunk_path: row.chunk_path,
             report: row.report,
+            chunk_scope: None,
         }
     }
 }
@@ -562,6 +565,8 @@ struct MigrationDispatchFingerprint {
     note: Option<String>,
     chunk_path: Option<String>,
     report: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chunk_scope: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -621,6 +626,7 @@ impl FingerprintMaterial {
                     note: d.note.clone(),
                     chunk_path: d.chunk_path.clone(),
                     report: d.report.clone(),
+                    chunk_scope: d.chunk_scope.clone(),
                 })
                 .collect(),
             notes: notes
@@ -798,6 +804,47 @@ mod tests {
     }
 
     #[test]
+    fn legacy_dispatch_bundle_defaults_chunk_scope_and_fingerprint_omits_it() {
+        let mut current = bundle();
+        current.dispatches.push(MigrationDispatch {
+            source_id: 1,
+            issue_id: "THE-214".into(),
+            worktree_path: "/w".into(),
+            agent_name: "agent".into(),
+            dispatched_at_ms: 1,
+            status: "running".into(),
+            stage: None,
+            parent_id: None,
+            session_id: None,
+            artifact_path: None,
+            note: None,
+            chunk_path: None,
+            report: None,
+            chunk_scope: None,
+        });
+
+        let legacy_json = serde_json::to_value(&current).unwrap();
+        assert!(
+            !legacy_json["dispatches"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("chunk_scope")
+        );
+        let legacy: MigrationBundle = serde_json::from_value(legacy_json).unwrap();
+
+        assert_eq!(legacy.dispatches[0].chunk_scope, None);
+        assert_eq!(legacy.fingerprint(), current.fingerprint());
+        assert!(
+            !serde_json::to_string(&FingerprintMaterial::from_bundle(&legacy))
+                .unwrap()
+                .contains("chunk_scope")
+        );
+
+        current.dispatches[0].chunk_scope = Some(r#"{"v":1,"files":["src/**"]}"#.into());
+        assert_ne!(legacy.fingerprint(), current.fingerprint());
+    }
+
+    #[test]
     fn strict_conflicts_and_identical_resume() {
         let source = bundle();
         let mut target = MigrationTarget {
@@ -852,6 +899,7 @@ mod tests {
             note: None,
             chunk_path: None,
             report: None,
+            chunk_scope: None,
         });
         assert_eq!(
             plan_migration(source, target),
@@ -876,6 +924,7 @@ mod tests {
                 note: None,
                 chunk_path: None,
                 report: None,
+                chunk_scope: None,
             },
             MigrationDispatch {
                 source_id: 9,
@@ -891,6 +940,7 @@ mod tests {
                 note: None,
                 chunk_path: None,
                 report: None,
+                chunk_scope: None,
             },
         ];
         let map = BTreeMap::from([(7, 101), (9, 102)]);

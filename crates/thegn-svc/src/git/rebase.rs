@@ -584,7 +584,7 @@ pub trait RebaseOps: GitBackend {
     }
 
     /// Rewrite the PENDING entries of a paused rebase (reorder/drop/retag
-    /// mid-flight). Local writes use an exact-byte check followed by atomic
+    /// mid-flight). Writes use an exact-byte check followed by atomic
     /// replacement. Git does not lock this file, so this cannot be a true CAS;
     /// git must not be running against this worktree.
     fn rewrite_pending_todo(&self, loc: &GitLoc, todo: &[TodoEntry]) -> Result<()> {
@@ -595,11 +595,12 @@ pub trait RebaseOps: GitBackend {
             return replace_local_pending_todo(&path, &disk, serialize_todo(todo).as_bytes())
                 .context("rewrite live rebase todo");
         }
-        if read_rebase_marker(loc, "rebase-merge/git-rebase-todo")?.is_none() {
+        let Some(disk) = read_rebase_marker(loc, "rebase-merge/git-rebase-todo")? else {
             bail!("no interactive rebase in progress");
-        }
-        loc.write_git_path(
+        };
+        loc.write_git_path_if_unchanged(
             "rebase-merge/git-rebase-todo",
+            &disk,
             serialize_todo(todo).as_bytes(),
         )
         .context("rewrite live rebase todo")
@@ -608,8 +609,9 @@ pub trait RebaseOps: GitBackend {
     /// [`rewrite_pending_todo`](Self::rewrite_pending_todo) with a
     /// lost-update guard: `baseline` is the pending list AS THE EDITOR READ
     /// IT, and the write is refused when the on-disk todo bytes differ from
-    /// the bytes read before parsing. The final check narrows the race to the
-    /// rename; Git does not provide a lock or CAS for this file.
+    /// the bytes read before parsing. Local and remote writes both make an
+    /// exact-byte final check; Git does not lock this file, so a race remains
+    /// between that check and rename.
     fn rewrite_pending_todo_checked(
         &self,
         loc: &GitLoc,
@@ -636,8 +638,9 @@ pub trait RebaseOps: GitBackend {
             return replace_local_pending_todo(&path, &disk, serialize_todo(todo).as_bytes())
                 .context("rewrite live rebase todo");
         }
-        loc.write_git_path(
+        loc.write_git_path_if_unchanged(
             "rebase-merge/git-rebase-todo",
+            &disk,
             serialize_todo(todo).as_bytes(),
         )
         .context("rewrite live rebase todo")
@@ -1282,6 +1285,33 @@ mod tests {
                 .is_err()
         );
         assert_eq!(std::fs::read(&outside).unwrap(), original);
+    }
+
+    #[test]
+    fn checked_provider_todo_rewrite_publishes_when_exact_bytes_match() {
+        let r = linear("checked-provider-todo-rewrite");
+        let c2 = r.sha_of("c2");
+        assert_eq!(
+            CliGit
+                .rebase_retag(&r.loc(), &c2, &[&c2], TodoAction::Edit, &opts())
+                .unwrap(),
+            RebaseOutcome::Paused
+        );
+        let provider = GitLoc::provider(vec!["env".into()], r.dir.to_string_lossy());
+        let baseline = CliGit.rebase_status(&provider).unwrap().unwrap().remaining;
+        let edited: Vec<TodoEntry> = baseline
+            .iter()
+            .filter(|entry| entry.subject != "c3")
+            .cloned()
+            .collect();
+
+        CliGit
+            .rewrite_pending_todo_checked(&provider, &edited, &baseline)
+            .unwrap();
+        assert_eq!(
+            CliGit.rebase_status(&provider).unwrap().unwrap().remaining,
+            edited
+        );
     }
 
     #[test]

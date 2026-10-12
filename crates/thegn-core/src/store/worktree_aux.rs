@@ -234,6 +234,20 @@ pub trait WorktreeAuxStore {
         forge: &str,
     ) -> Result<()>;
 
+    /// Queue a PR with the canonical URL fetched from the forge. Re-adding a
+    /// bound PR replaces both its identity and checkout binding.
+    #[allow(clippy::too_many_arguments)] // mirrors enqueue_pr plus the bound URL
+    fn enqueue_bound_pr(
+        &self,
+        repo_root: &str,
+        number: u64,
+        worktree: Option<&str>,
+        branch: &str,
+        base_branch: &str,
+        forge: &str,
+        pr_url: &str,
+    ) -> Result<()>;
+
     /// Update a queued PR's status and, optionally, its blocker word, detail,
     /// and last observed head. Passing `None` leaves that column unchanged, so a
     /// failed refresh can update a note without clobbering a known-good head.
