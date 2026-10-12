@@ -277,7 +277,6 @@ crates/thegn-host/src/measure/loc.rs
 crates/thegn-host/src/measure/mod.rs
 crates/thegn-host/src/media_art.rs
 crates/thegn-host/src/media_ctl.rs
-crates/thegn-host/src/media_watch.rs
 crates/thegn-host/src/menu.rs
 crates/thegn-host/src/merge_cleanup.rs
 crates/thegn-host/src/merge_driver.rs
