@@ -652,16 +652,46 @@
         assert thegn.meta.license == (with pkgs.lib.licenses; [mit asl20]);
         assert thegnDev.meta.license == (with pkgs.lib.licenses; [mit asl20]);
         assert (system != "x86_64-linux" || thegnMusl.meta.license == (with pkgs.lib.licenses; [mit asl20]));
+        assert (pkgs.callPackage ./nix/package.nix {
+          src = thegnSrc;
+          yazi = yaziPinned;
+          inherit yaziDeps craneLib cargoArtifacts;
+          version = "9.9.9";
+        }).version
+        == "9.9.9";
+        assert (pkgs.callPackage ./nix/package.nix {
+          src = thegnSrc;
+          yazi = yaziPinned;
+          inherit yaziDeps craneLib cargoArtifacts;
+          version = "9.9.9";
+        }).pname
+        == "thegn";
+        assert (pkgs.callPackage ./nix/package.nix {
+          src = thegnSrc;
+          yazi = yaziPinned;
+          inherit yaziDeps craneLib cargoArtifacts;
+          version = "9.9.9-rc.1";
+          channel = "dev";
+        }).version
+        == "9.9.9-rc.1";
+        assert (pkgs.callPackage ./nix/package.nix {
+          src = thegnSrc;
+          yazi = yaziPinned;
+          inherit yaziDeps craneLib cargoArtifacts;
+          version = "9.9.9-rc.1";
+          channel = "dev";
+        }).pname
+        == "thegn-dev";
           pkgs.runCommand "thegn-version-metadata" {nativeBuildInputs = [pkgs.gnugrep];} ''
             set -euo pipefail
-            ${thegn}/bin/thegn --version | grep -F ${cargoVersion}
-            ${thegnDev}/bin/thegn-dev --version | grep -F ${cargoVersion}
+            test "$(${thegn}/bin/thegn --version)" = "thegn ${cargoVersion}"
+            test "$(${thegnDev}/bin/thegn-dev --version)" = "thegn ${cargoVersion}"
             test -f ${thegn}/share/licenses/thegn/LICENSE-MIT
             test -f ${thegn}/share/licenses/thegn/LICENSE-APACHE
             test -f ${thegnDev}/share/licenses/thegn-dev/LICENSE-MIT
             test -f ${thegnDev}/share/licenses/thegn-dev/LICENSE-APACHE
             ${pkgs.lib.optionalString (system == "x86_64-linux") ''
-              ${thegnMusl}/bin/thegn --version | grep -F ${cargoVersion}
+              test "$(${thegnMusl}/bin/thegn --version)" = "thegn ${cargoVersion}"
               test -f ${thegnMusl}/share/licenses/thegn-musl/LICENSE-MIT
               test -f ${thegnMusl}/share/licenses/thegn-musl/LICENSE-APACHE
             ''}
