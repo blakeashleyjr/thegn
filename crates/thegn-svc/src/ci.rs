@@ -439,7 +439,10 @@ fn run_bounded_log_within(
     if bounded_group_termination_supported() {
         let cancel = AtomicBool::new(false);
         let (log_result, _status) =
-            run_blocking_streaming(cmd, limits, &cancel, collect_log).map_err(ci_run_error)?;
+            run_blocking_streaming(cmd, limits, &cancel, |reader: &mut dyn Read| {
+                collect_log(reader)
+            })
+            .map_err(ci_run_error)?;
         let (text, truncated) = log_result?;
         return Ok(CiLog { text, truncated });
     }
