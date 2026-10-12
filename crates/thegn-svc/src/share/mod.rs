@@ -16,8 +16,9 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -32,6 +33,234 @@ use crate::vpn::{OciRuntime, exec_in};
 #[cfg(test)]
 mod tests;
 
+/// A validated public address. Tickets remain opaque data; callers decide how
+/// to display or copy them and must not treat them as command text.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PublicEndpoint {
+    kind: EndpointKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicEndpointKind {
+    Url,
+    SocketAddr,
+    Ticket,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EndpointKind {
+    Url(String),
+    SocketAddr(String),
+    Ticket(String),
+}
+
+impl fmt::Debug for PublicEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PublicEndpoint(<redacted>)")
+    }
+}
+
+impl PublicEndpoint {
+    const MAX_URL_BYTES: usize = 2048;
+    const MAX_TICKET_BYTES: usize = 512;
+
+    pub fn parse_url(value: &str) -> Option<Self> {
+        if value.len() > Self::MAX_URL_BYTES
+            || value.chars().any(|c| c.is_control() || c.is_whitespace())
+            || value.contains('#')
+        {
+            return None;
+        }
+        let (scheme, rest) = value.split_once("://")?;
+        if !matches!(scheme, "http" | "https") || rest.is_empty() || rest.contains('@') {
+            return None;
+        }
+        let authority = rest.split('/').next()?;
+        if authority.is_empty() || authority.contains('?') || authority.contains('#') {
+            return None;
+        }
+        let (host, port) = if authority.starts_with('[') {
+            let close = authority.find(']')?;
+            let ip = match authority[1..close].parse::<IpAddr>() {
+                Ok(ip) => ip,
+                Err(_) => return None,
+            };
+            if !ip.is_ipv6() {
+                return None;
+            }
+            let tail = &authority[close + 1..];
+            if tail.is_empty() {
+                (format!("[{ip}]"), None)
+            } else {
+                let port = match tail.strip_prefix(':')?.parse::<u16>() {
+                    Ok(port) => port,
+                    Err(_) => return None,
+                };
+                if port == 0 {
+                    return None;
+                }
+                (format!("[{ip}]"), Some(port))
+            }
+        } else {
+            let (host, port) = match authority.rsplit_once(':') {
+                Some((host, port)) if !host.contains(':') => {
+                    let port = match port.parse::<u16>() {
+                        Ok(port) => port,
+                        Err(_) => return None,
+                    };
+                    if port == 0 {
+                        return None;
+                    }
+                    (host, Some(port))
+                }
+                Some(_) => return None,
+                None => (authority, None),
+            };
+            if host.is_empty() || host.len() > 253 || !host.is_ascii() {
+                return None;
+            }
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                (ip.to_string(), port)
+            } else {
+                let valid = host.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && label.as_bytes()[0].is_ascii_alphanumeric()
+                        && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                        && label
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                });
+                if !valid {
+                    return None;
+                }
+                (host.to_ascii_lowercase(), port)
+            }
+        };
+        let path = &rest[authority.len()..];
+        if path.contains('@') || !valid_percent_encoding(path) {
+            return None;
+        }
+        let port =
+            port.filter(|p| !((*p == 80 && scheme == "http") || (*p == 443 && scheme == "https")));
+        let canonical = format!(
+            "{scheme}://{host}{}{}",
+            port.map(|p| format!(":{p}")).unwrap_or_default(),
+            path
+        );
+        Some(Self {
+            kind: EndpointKind::Url(canonical),
+        })
+    }
+
+    pub fn parse_ticket(value: &str) -> Option<Self> {
+        if value.is_empty()
+            || value.len() > Self::MAX_TICKET_BYTES
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.~".contains(&b))
+        {
+            return None;
+        }
+        Some(Self {
+            kind: EndpointKind::Ticket(value.to_owned()),
+        })
+    }
+
+    fn parse_fixed(value: &str) -> Option<Self> {
+        if let Some(url) = Self::parse_url(value) {
+            return Some(url);
+        }
+        if value.len() > 260 || value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return None;
+        }
+        let (host, port) = value.rsplit_once(':')?;
+        let port = match port.parse::<u16>() {
+            Ok(port) => port,
+            Err(_) => return None,
+        };
+        if port == 0 {
+            return None;
+        }
+        if host.is_empty() || host.contains('@') || host.contains('/') {
+            return None;
+        }
+        let canonical_host = if host.starts_with('[') {
+            let inner = host.strip_prefix('[')?.strip_suffix(']')?;
+            match inner.parse::<IpAddr>() {
+                Ok(ip) if ip.is_ipv6() => format!("[{ip}]"),
+                _ => return None,
+            }
+        } else if let Ok(ip) = host.parse::<IpAddr>() {
+            match ip {
+                IpAddr::V4(_) => ip.to_string(),
+                IpAddr::V6(_) => return None,
+            }
+        } else {
+            if host.len() > 253
+                || !host.is_ascii()
+                || !host.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && label.as_bytes()[0].is_ascii_alphanumeric()
+                        && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                        && label
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                })
+            {
+                return None;
+            }
+            host.to_ascii_lowercase()
+        };
+        Some(Self {
+            kind: EndpointKind::SocketAddr(format!("{canonical_host}:{port}")),
+        })
+    }
+
+    pub fn canonical(&self) -> String {
+        match &self.kind {
+            EndpointKind::Url(url) => url.clone(),
+            EndpointKind::SocketAddr(addr) => addr.clone(),
+            EndpointKind::Ticket(ticket) => ticket.clone(),
+        }
+    }
+
+    pub fn as_url(&self) -> Option<&str> {
+        match &self.kind {
+            EndpointKind::Url(url) => Some(url),
+            _ => None,
+        }
+    }
+
+    pub fn kind(&self) -> PublicEndpointKind {
+        match &self.kind {
+            EndpointKind::Url(_) => PublicEndpointKind::Url,
+            EndpointKind::SocketAddr(_) => PublicEndpointKind::SocketAddr,
+            EndpointKind::Ticket(_) => PublicEndpointKind::Ticket,
+        }
+    }
+}
+
+fn valid_percent_encoding(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len()
+                || !bytes[i + 1].is_ascii_hexdigit()
+                || !bytes[i + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    true
+}
+
 /// How to derive the public URL/address from a started share.
 #[derive(Clone, PartialEq, Eq)]
 pub enum UrlRule {
@@ -43,10 +272,8 @@ pub enum UrlRule {
     /// `subdomain`/`server_addr`; the client never prints it). `start` returns it
     /// as soon as the child is confirmed alive.
     Fixed(String),
-    /// Find `marker` in a line and capture the next whitespace token verbatim
-    /// (no host:port shape required), substituting it into `template`'s `{}`.
-    /// Used for opaque addresses like a dumbpipe ticket.
-    AfterMarkerRaw { marker: String, template: String },
+    /// Find `marker` in a line and capture the next bounded opaque ticket.
+    AfterMarkerRaw { marker: String },
 }
 
 impl fmt::Debug for UrlRule {
@@ -64,7 +291,6 @@ impl fmt::Debug for UrlRule {
             Self::AfterMarkerRaw { .. } => f
                 .debug_struct("UrlRule::AfterMarkerRaw")
                 .field("marker", &"<redacted>")
-                .field("template", &"<redacted>")
                 .finish(),
         }
     }
@@ -73,34 +299,35 @@ impl fmt::Debug for UrlRule {
 impl UrlRule {
     /// Apply the rule to one output line, returning the URL if this line matches.
     /// `Fixed` never matches a line (it's resolved at spawn time, see [`start`]).
-    pub fn apply(&self, line: &str) -> Option<String> {
+    pub fn apply(&self, line: &str) -> Option<PublicEndpoint> {
         match self {
             UrlRule::AfterMarker { marker, scheme } => {
+                if marker.is_empty() || line.matches(marker).count() != 1 {
+                    return None;
+                }
                 let rest = line.split_once(marker)?.1.trim_start();
                 let token = rest.split_whitespace().next()?.trim_end_matches(['.', ',']);
-                // Require a host:port shape so stray log lines don't false-match.
-                let (host, port) = token.rsplit_once(':')?;
-                if host.is_empty() || port.is_empty() || port.parse::<u16>().is_err() {
+                if !matches!(scheme.as_str(), "http" | "https") {
                     return None;
                 }
-                Some(format!("{scheme}://{token}"))
+                PublicEndpoint::parse_url(&format!("{scheme}://{token}"))
             }
-            UrlRule::AfterMarkerRaw { marker, template } => {
+            UrlRule::AfterMarkerRaw { marker } => {
+                if marker.is_empty() || line.matches(marker).count() != 1 {
+                    return None;
+                }
                 let rest = line.split_once(marker)?.1.trim_start();
                 let token = rest.split_whitespace().next()?;
-                if token.is_empty() {
-                    return None;
-                }
-                Some(template.replace("{}", token))
+                PublicEndpoint::parse_ticket(token)
             }
             UrlRule::Fixed(_) => None,
         }
     }
 
     /// The config-derived URL, if this is a `Fixed` rule.
-    pub fn fixed(&self) -> Option<&str> {
+    pub fn fixed(&self) -> Option<PublicEndpoint> {
         match self {
-            UrlRule::Fixed(u) => Some(u),
+            UrlRule::Fixed(u) => PublicEndpoint::parse_fixed(u),
             UrlRule::AfterMarker { .. } | UrlRule::AfterMarkerRaw { .. } => None,
         }
     }
@@ -154,8 +381,8 @@ impl fmt::Debug for SharePlan {
 }
 
 impl SharePlan {
-    /// Scan one output line for the public URL.
-    pub fn match_url(&self, line: &str) -> Option<String> {
+    /// Scan one output line for a validated public endpoint.
+    pub fn match_url(&self, line: &str) -> Option<PublicEndpoint> {
         self.url_rule.apply(line)
     }
 }
@@ -551,8 +778,7 @@ fn plan_tailscale(spec: &ShareSpec, t: &TailscaleShareConfig) -> ServePlan {
 }
 
 /// iroh peer share via dumbpipe: `dumbpipe listen-tcp --host 127.0.0.1:<port>`
-/// prints a ticket; the consumer runs `dumbpipe connect-tcp <ticket>`. We scrape
-/// the ticket and present the full connect command as the share's "address".
+/// prints a ticket; we preserve it as opaque data for display/copy consumers.
 fn plan_iroh(spec: &ShareSpec, i: &IrohShareConfig) -> SharePlan {
     let mut args = vec![
         "listen-tcp".to_string(),
@@ -567,7 +793,6 @@ fn plan_iroh(spec: &ShareSpec, i: &IrohShareConfig) -> SharePlan {
         files: Vec::new(),
         url_rule: UrlRule::AfterMarkerRaw {
             marker: "connect-tcp".into(),
-            template: "dumbpipe connect-tcp {}".into(),
         },
     }
 }
@@ -588,7 +813,7 @@ fn likely_runtimes() -> Vec<OciRuntime> {
 /// Bring a tailscale serve/funnel up inside the worktree's VPN `sidecar` and
 /// return the resulting public URL (derived from the node's MagicDNS name).
 /// Errors with guidance if no sidecar with tailscale is reachable.
-pub fn serve_up(sidecar: &str, serve: &ServePlan) -> Result<String> {
+pub fn serve_up(sidecar: &str, serve: &ServePlan) -> Result<PublicEndpoint> {
     for rt in likely_runtimes() {
         match exec_in(&rt, sidecar, &serve.up_argv) {
             Ok((true, _)) => {
@@ -598,7 +823,9 @@ pub fn serve_up(sidecar: &str, serve: &ServePlan) -> Result<String> {
                 } else {
                     format!(":{}", serve.port)
                 };
-                return Ok(format!("{}://{dns}{suffix}", serve.scheme));
+                let url = format!("{}://{dns}{suffix}", serve.scheme);
+                return PublicEndpoint::parse_url(&url)
+                    .ok_or_else(|| anyhow::anyhow!("share: invalid tailscale public URL"));
             }
             _ => continue,
         }
@@ -646,7 +873,8 @@ fn serve_dns_name(rt: &OciRuntime, sidecar: &str) -> Result<String> {
 /// A live share: the running tunnel-client child and its public URL.
 pub struct RunningShare {
     pub child: Child,
-    pub public_url: String,
+    pub public_url: PublicEndpoint,
+    cleanup: Option<(std::path::PathBuf, Vec<String>, Option<Vec<u8>>)>,
 }
 
 impl fmt::Debug for RunningShare {
@@ -663,25 +891,220 @@ impl RunningShare {
     pub fn stop(mut self) {
         let _ = self.child.kill(); // best-effort: child may already have exited
         let _ = self.child.wait(); // best-effort: reap-or-not is terminal here
+        self.cleanup_files();
+    }
+
+    pub fn wait(mut self) {
+        #[expect(clippy::disallowed_methods)]
+        if let Err(error) = self.child.wait() {
+            tracing::debug!(%error, "share child wait failed");
+        }
+        self.cleanup_files();
+    }
+
+    fn cleanup_files(&mut self) {
+        if let Some((dir, files, manifest)) = self.cleanup.take() {
+            if let Err(error) = verify_owner_manifest(&dir, manifest.as_deref()) {
+                tracing::warn!(%error, "share ownership changed before credential cleanup");
+                return;
+            }
+            for file in files {
+                if validate_dest(&file).is_ok() {
+                    if let Err(error) = std::fs::remove_file(dir.join(file)) {
+                        if error.kind() != std::io::ErrorKind::NotFound {
+                            tracing::warn!(%error, "could not remove share credential file");
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
-/// The per-share state directory `$XDG_STATE_HOME/thegn/share/<wt>-<port>/`,
-/// where materialized config files (e.g. `frpc.toml`) live. Caller-supplied so
-/// both the host supervisor and the CLI key it the same way.
-pub fn share_state_dir(worktree: &str, port: u16) -> std::path::PathBuf {
+/// Create or verify the per-share state directory. The path component is
+/// bounded and includes a SHA-256 digest of canonical native path bytes,
+/// provider, port, and generation. Its manifest detects digest collisions and
+/// prevents reusing another share's directory.
+pub fn share_state_dir(
+    worktree: &std::path::Path,
+    provider: &str,
+    port: u16,
+    generation: u64,
+) -> Result<std::path::PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-            home.map(|h| h.join(".local/state"))
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|h| h.join(".local/state"))
+                .unwrap_or_default()
         });
-    let slug: String = worktree
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect();
-    base.join("thegn/share").join(format!("{slug}-{port}"))
+    if base.as_os_str().is_empty() {
+        anyhow::bail!("share: set XDG_STATE_HOME or HOME; no safe state directory is available");
+    }
+    share_state_dir_at(&base, worktree, provider, port, generation)
+}
+
+fn share_state_dir_at(
+    base: &std::path::Path,
+    worktree: &std::path::Path,
+    provider: &str,
+    port: u16,
+    generation: u64,
+) -> Result<std::path::PathBuf> {
+    let canonical = std::fs::canonicalize(worktree)
+        .with_context(|| format!("share: cannot canonicalize worktree {}", worktree.display()))?;
+    let path_bytes = canonical.as_os_str().as_encoded_bytes();
+    let repo_bytes = repository_identity(&canonical);
+    let mut identity = format!(
+        "share-state-v1\n{}\n{}\n{provider}\n{port}\n{generation}\n",
+        path_bytes.len(),
+        repo_bytes.len()
+    );
+    for byte in repo_bytes {
+        identity.push_str(&format!("{byte:02x}"));
+    }
+    identity.push('\n');
+    for byte in path_bytes {
+        identity.push_str(&format!("{byte:02x}"));
+    }
+    let digest = Sha256::digest(identity.as_bytes());
+    let digest = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let prefix = canonical
+        .file_name()
+        .unwrap_or(canonical.as_os_str())
+        .to_string_lossy()
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                b as char
+            } else {
+                '-'
+            }
+        })
+        .take(24)
+        .collect::<String>()
+        .trim_matches('-')
+        .to_owned();
+    let prefix = if prefix.is_empty() {
+        "worktree"
+    } else {
+        &prefix
+    };
+    let dir = base.join("thegn/share").join(format!("{prefix}-{digest}"));
+    let parent = dir.parent().context("share: state dir has no parent")?;
+    thegn_core::fsperm::ensure_private_dir(parent)
+        .with_context(|| format!("share: state parent {}", parent.display()))?;
+    let created = match std::fs::create_dir(&dir) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("share: create state dir {}", dir.display()));
+        }
+    };
+    let metadata = std::fs::symlink_metadata(&dir).context("share: inspect state dir")?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        anyhow::bail!("share: refusing non-directory state path");
+    }
+    let manifest = dir.join("owner.manifest");
+    if created {
+        thegn_core::fsperm::ensure_private_dir(&dir)
+            .with_context(|| format!("share: state dir {}", dir.display()))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&manifest)
+            .context("share: create owner manifest")?;
+        file.write_all(identity.as_bytes())
+            .context("share: write owner manifest")?;
+        file.sync_all().context("share: sync owner manifest")?;
+    } else {
+        let manifest_meta = match std::fs::symlink_metadata(&manifest) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Another creator may have won mkdir and be writing its manifest.
+                let mut found = false;
+                for _ in 0..50 {
+                    match std::fs::symlink_metadata(&manifest) {
+                        Ok(_) => {
+                            found = true;
+                            break;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            std::thread::sleep(Duration::from_millis(2))
+                        }
+                        Err(e) => return Err(e).context("share: inspect owner manifest"),
+                    }
+                }
+                if !found {
+                    anyhow::bail!("share: existing state directory has no owner manifest");
+                }
+                std::fs::symlink_metadata(&manifest).context("share: inspect owner manifest")?
+            }
+            Err(error) => return Err(error).context("share: inspect owner manifest"),
+        };
+        if !manifest_meta.file_type().is_file() {
+            anyhow::bail!("share: refusing non-regular owner manifest");
+        }
+        let mut matches = false;
+        for _ in 0..50 {
+            let mut existing = String::new();
+            std::fs::File::open(&manifest)?.read_to_string(&mut existing)?;
+            if existing == identity {
+                matches = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if !matches {
+            anyhow::bail!("share: state directory ownership manifest mismatch");
+        }
+        thegn_core::fsperm::ensure_private_dir(&dir)
+            .with_context(|| format!("share: state dir {}", dir.display()))?;
+    }
+    Ok(dir)
+}
+
+/// Identify the repository shared by linked worktrees. If `.git` cannot be
+/// decoded, retain the canonical worktree path as the repository identity;
+/// the worktree bytes below still distinguish it losslessly.
+fn repository_identity(worktree: &std::path::Path) -> Vec<u8> {
+    let dot_git = worktree.join(".git");
+    let Ok(metadata) = std::fs::metadata(&dot_git) else {
+        return worktree.as_os_str().as_encoded_bytes().to_vec();
+    };
+    let git_dir = if metadata.is_dir() {
+        match std::fs::canonicalize(&dot_git) {
+            Ok(path) => Some(path),
+            Err(_) => None,
+        }
+    } else {
+        match std::fs::read_to_string(&dot_git) {
+            Ok(contents) => match contents.trim().strip_prefix("gitdir:") {
+                Some(raw) => match std::fs::canonicalize(worktree.join(raw.trim())) {
+                    Ok(path) => Some(path),
+                    Err(_) => None,
+                },
+                None => None,
+            },
+            Err(_) => None,
+        }
+    };
+    let Some(git_dir) = git_dir else {
+        return worktree.as_os_str().as_encoded_bytes().to_vec();
+    };
+    let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(raw) => match std::fs::canonicalize(git_dir.join(raw.trim())) {
+            Ok(path) => path,
+            Err(_) => git_dir.clone(),
+        },
+        Err(_) => git_dir,
+    };
+    common_dir.as_os_str().as_encoded_bytes().to_vec()
 }
 
 /// Spawn the tunnel client described by `plan`, materializing its files into
@@ -696,6 +1119,70 @@ pub fn start(
     statedir: &std::path::Path,
     timeout: Duration,
 ) -> Result<RunningShare> {
+    let manifest = read_owner_manifest(statedir)?;
+    match start_inner(plan, statedir, timeout, manifest.as_deref()) {
+        Ok(mut running) => {
+            running.cleanup = Some((
+                statedir.to_path_buf(),
+                plan.files.iter().map(|f| f.dest.clone()).collect(),
+                manifest,
+            ));
+            Ok(running)
+        }
+        Err(error) => {
+            if verify_owner_manifest(statedir, manifest.as_deref()).is_ok() {
+                cleanup_plan_files(plan, statedir);
+            }
+            Err(error)
+        }
+    }
+}
+
+fn cleanup_plan_files(plan: &SharePlan, statedir: &std::path::Path) {
+    for file in &plan.files {
+        if validate_dest(&file.dest).is_ok() {
+            if let Err(error) = std::fs::remove_file(statedir.join(&file.dest)) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(%error, "could not remove share credential file");
+                }
+            }
+        }
+    }
+}
+
+fn read_owner_manifest(statedir: &std::path::Path) -> Result<Option<Vec<u8>>> {
+    let path = statedir.join("owner.manifest");
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("share: inspect owner manifest"),
+    };
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("share: refusing non-regular owner manifest");
+    }
+    std::fs::read(path)
+        .map(Some)
+        .context("share: read owner manifest")
+}
+
+fn verify_owner_manifest(statedir: &std::path::Path, expected: Option<&[u8]>) -> Result<()> {
+    let actual = read_owner_manifest(statedir)?;
+    if actual.as_deref() != expected {
+        anyhow::bail!("share: state directory ownership manifest changed");
+    }
+    Ok(())
+}
+
+fn start_inner(
+    plan: &SharePlan,
+    statedir: &std::path::Path,
+    timeout: Duration,
+    owner_manifest: Option<&[u8]>,
+) -> Result<RunningShare> {
+    verify_owner_manifest(statedir, owner_manifest)?;
+    if matches!(&plan.url_rule, UrlRule::Fixed(_)) && plan.url_rule.fixed().is_none() {
+        anyhow::bail!("share: invalid fixed public endpoint");
+    }
     materialize_files(plan, statedir)?;
     let sd = statedir.to_string_lossy().into_owned();
     let args: Vec<String> = plan
@@ -720,7 +1207,7 @@ pub fn start(
     let (tx, rx) = mpsc::sync_channel::<String>(64);
     // URL discovery has a separate bounded signal so noisy diagnostics cannot
     // consume the only startup result.
-    let (url_tx, url_rx) = mpsc::sync_channel::<String>(1);
+    let (url_tx, url_rx) = mpsc::sync_channel::<PublicEndpoint>(2);
     for stream in [
         child.stdout.take().map(Streamable::Out),
         child.stderr.take().map(Streamable::Err),
@@ -752,7 +1239,8 @@ pub fn start(
         }
         return Ok(RunningShare {
             child,
-            public_url: url.to_string(),
+            public_url: url,
+            cleanup: None,
         });
     }
 
@@ -768,35 +1256,45 @@ pub fn start(
             );
         }
         if let Ok(url) = url_rx.try_recv() {
+            if let Err(error) = reject_duplicate_announcement(&url_rx) {
+                abort_child(child);
+                return Err(error);
+            }
             return Ok(RunningShare {
                 child,
                 public_url: url,
+                cleanup: None,
             });
         }
         match rx.recv_timeout(remaining.min(Duration::from_millis(50))) {
-            Ok(line) => {
-                if let Some(url) = plan.match_url(&line) {
-                    return Ok(RunningShare {
-                        child,
-                        public_url: url,
-                    });
-                }
-            }
+            Ok(_line) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // The priority check may have run before a reader published
                 // its URL. If the diagnostic channel then disconnects, give
                 // the already-published priority signal one final check.
                 if let Ok(url) = url_rx.try_recv() {
+                    if let Err(error) = reject_duplicate_announcement(&url_rx) {
+                        abort_child(child);
+                        return Err(error);
+                    }
                     return Ok(RunningShare {
                         child,
                         public_url: url,
+                        cleanup: None,
                     });
                 }
                 abort_child(child);
                 anyhow::bail!("share: '{}' exited before reporting a URL", plan.program);
             }
         }
+    }
+}
+
+fn reject_duplicate_announcement(url_rx: &mpsc::Receiver<PublicEndpoint>) -> Result<()> {
+    match url_rx.recv_timeout(Duration::from_millis(50)) {
+        Ok(_) => anyhow::bail!("share: provider reported multiple public endpoints"),
+        Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => Ok(()),
     }
 }
 
@@ -916,7 +1414,7 @@ const MAX_PROVIDER_LINE: usize = 4096;
 fn drain_stream(
     stream: Streamable,
     tx: mpsc::SyncSender<String>,
-    url_tx: mpsc::SyncSender<String>,
+    url_tx: mpsc::SyncSender<PublicEndpoint>,
     url_rule: UrlRule,
 ) {
     match stream {
@@ -928,7 +1426,7 @@ fn drain_stream(
 fn drain_reader<R: Read>(
     mut reader: R,
     tx: mpsc::SyncSender<String>,
-    url_tx: mpsc::SyncSender<String>,
+    url_tx: mpsc::SyncSender<PublicEndpoint>,
     url_rule: UrlRule,
 ) {
     let mut bytes = [0_u8; 1024];
@@ -976,7 +1474,7 @@ fn emit_line(
     line: &mut Vec<u8>,
     oversized: &mut bool,
     tx: &mpsc::SyncSender<String>,
-    url_tx: &mpsc::SyncSender<String>,
+    url_tx: &mpsc::SyncSender<PublicEndpoint>,
     url_rule: &UrlRule,
 ) {
     if !*oversized && !line.is_empty() {

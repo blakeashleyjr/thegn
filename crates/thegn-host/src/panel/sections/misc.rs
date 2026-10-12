@@ -233,7 +233,7 @@ pub(super) fn share(ctx: &SectionCtx) -> Vec<PanelRow> {
         .enumerate()
         .map(|(i, s)| {
             let (color, status) = match &s.url {
-                Some(url) => (hue(Hue::Teal), url.clone()),
+                Some(url) => (hue(Hue::Teal), thegn_svc::lsp::sanitize_for_terminal(url)),
                 // Surface the captured failure reason, not just "failed".
                 None if s.failed => (
                     hue(Hue::Red),
@@ -242,9 +242,10 @@ pub(super) fn share(ctx: &SectionCtx) -> Vec<PanelRow> {
                         _ => "failed".to_string(),
                     },
                 ),
+                None if s.stopping => (g2(), "stopping…".to_string()),
                 None => (g2(), "starting…".to_string()),
             };
-            // Reach glyph (🌐 public / 👥 team / 🔗 peer) + port → URL/command.
+            // Reach glyph (🌐 public / 👥 team / 🔗 peer) + port → endpoint.
             // Each row is a cursor target so `j/k` walk the list and
             // Enter/`o`/`x` act on the highlighted share, not always the first.
             PanelRow::plain(Line::segs(vec![
@@ -399,8 +400,9 @@ fn share_full(ctx: &SectionCtx) -> Vec<PanelRow> {
     ];
     match &s.url {
         Some(url) => {
-            detail.push(vec![seg(g2(), "url / consumer command".to_string())]);
-            for chunk in wrap_text(url, detail_w) {
+            detail.push(vec![seg(g2(), "public endpoint / ticket".to_string())]);
+            let safe = thegn_svc::lsp::sanitize_for_terminal(url);
+            for chunk in wrap_text(&safe, detail_w) {
                 detail.push(vec![seg(hue(Hue::Teal), chunk)]);
             }
         }
@@ -410,6 +412,7 @@ fn share_full(ctx: &SectionCtx) -> Vec<PanelRow> {
                 detail.push(vec![seg(hue(Hue::Red), chunk)]);
             }
         }
+        None if s.stopping => detail.push(vec![seg(g2(), "stopping…".to_string())]),
         None => detail.push(vec![seg(g2(), "starting…".to_string())]),
     }
 
@@ -424,7 +427,7 @@ fn share_full(ctx: &SectionCtx) -> Vec<PanelRow> {
         }
     }));
     rows.push(hint_row(&[
-        ("↵", "copy url"),
+        ("↵", "copy endpoint"),
         ("o", "browser"),
         ("x", "stop"),
     ]));
