@@ -16,6 +16,7 @@
 use crate::config::DataMode;
 use crate::env::Environment;
 use crate::placement::Placement;
+use sha2::{Digest, Sha256};
 
 /// A resolved plan for projecting one worktree into its execution environment.
 /// Pure data; the bring-up/teardown lives in `thegn-svc::projection`.
@@ -33,16 +34,63 @@ pub struct ProjectionSpec {
     pub mountpoint: String,
 }
 
-/// A stable local mountpoint for a `host:remote_path` pair, under
-/// `<thegn_dir>/mounts/<slug>`. Deterministic so mount and unmount agree
-/// without persisting state.
+/// A stable local mountpoint for the exact UTF-8 bytes of a host and remote
+/// path, under `<thegn_dir>/mounts/<readable-prefix>--<digest>`. The digest is
+/// versioned, domain-separated, and length-delimited so separators and
+/// concatenation boundaries cannot alias. Only byte-identical pairs coalesce;
+/// host aliases and path normalization are not inferred here.
 pub fn mountpoint(host: &str, remote_path: &str) -> String {
-    let slug = crate::util::slugify(&format!("{host}-{remote_path}"));
+    let component = projection_component(host, remote_path);
     crate::util::thegn_dir()
         .join("mounts")
-        .join(slug)
+        .join(component)
         .to_string_lossy()
         .into_owned()
+}
+
+const PROJECTION_PREFIX_MAX_BYTES: usize = 40;
+const PROJECTION_DIGEST_HEX_BYTES: usize = 32; // 128 bits
+
+/// Build a filesystem-safe, bounded path component. The slug is display-only;
+/// the SHA-256 suffix is computed from the exact pair of input byte strings.
+fn projection_component(host: &str, remote_path: &str) -> String {
+    const DOMAIN: &[u8] = b"thegn/projection-mountpoint/v1";
+    let mut hasher = Sha256::new();
+    hasher.update(DOMAIN);
+    for part in [host.as_bytes(), remote_path.as_bytes()] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    let digest = hasher.finalize();
+    let digest_hex: String = digest[..PROJECTION_DIGEST_HEX_BYTES / 2]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    let mut prefix = String::with_capacity(PROJECTION_PREFIX_MAX_BYTES);
+    let mut separator_pending = false;
+    for byte in host
+        .bytes()
+        .chain(std::iter::once(b'-'))
+        .chain(remote_path.bytes())
+    {
+        if byte.is_ascii_alphanumeric() {
+            if separator_pending && !prefix.is_empty() {
+                prefix.push('-');
+            }
+            separator_pending = false;
+            prefix.push(byte.to_ascii_lowercase() as char);
+            if prefix.len() == PROJECTION_PREFIX_MAX_BYTES {
+                break;
+            }
+        } else {
+            separator_pending = true;
+        }
+    }
+    if prefix.is_empty() {
+        prefix.push_str("projection");
+    }
+    format!("{prefix}--{digest_hex}")
 }
 
 /// Build the projection plan for a resolved environment, or `None` when the data
@@ -128,5 +176,56 @@ mod tests {
         // Deterministic: recomputing from the same inputs matches.
         assert_eq!(spec.mountpoint, mountpoint("dev-box", "/srv/work"));
         assert!(spec.mountpoint.contains("mounts"));
+    }
+
+    #[test]
+    fn projection_mountpoint_digest_separates_old_slug_collisions() {
+        let pairs = [
+            ("a_b", "c"),
+            ("a-b", "c"),
+            ("A-B", "c"),
+            ("a", "b-c"),
+            ("a-", "b-c"),
+            ("a", "-b-c"),
+            ("é", "/tree"),
+            ("e\u{301}", "/tree"),
+        ];
+        let components: Vec<_> = pairs
+            .iter()
+            .map(|(host, path)| projection_component(host, path))
+            .collect();
+        for (index, component) in components.iter().enumerate() {
+            assert!(
+                components[index + 1..]
+                    .iter()
+                    .all(|other| other != component)
+            );
+        }
+    }
+
+    #[test]
+    fn projection_mountpoint_component_is_bounded_safe_and_never_empty() {
+        let component = projection_component(&"x".repeat(100_000), &"/".repeat(100_000));
+        assert!(component.len() <= PROJECTION_PREFIX_MAX_BYTES + 2 + PROJECTION_DIGEST_HEX_BYTES);
+        assert!(!component.is_empty());
+        assert!(
+            component
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        );
+        assert!(!component.contains('/'));
+        assert_eq!(
+            component.rsplit_once("--").unwrap().1.len(),
+            PROJECTION_DIGEST_HEX_BYTES
+        );
+
+        let punctuation_only = projection_component("///", "\\\\");
+        assert!(punctuation_only.starts_with("projection--"));
+        assert!(!punctuation_only.is_empty());
+        let path = mountpoint("///", "\\\\");
+        assert_eq!(
+            std::path::Path::new(&path).file_name().unwrap(),
+            std::ffi::OsStr::new(&punctuation_only)
+        );
     }
 }
