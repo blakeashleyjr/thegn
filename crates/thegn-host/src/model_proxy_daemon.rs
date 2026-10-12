@@ -44,11 +44,27 @@ fn secret_for_path(path: &std::path::Path) -> Result<Vec<u8>> {
     let mut random = [0u8; 32];
     getrandom::fill(&mut random).context("generate model-proxy secret")?;
     let hex: String = random.iter().map(|b| format!("{b:02x}")).collect();
-    match thegn_core::fsperm::write_owner_only_new(&path, hex.as_bytes()) {
-        Ok(()) => Ok(random.to_vec()),
+    let parent = path
+        .parent()
+        .context("model-proxy secret path has no parent")?;
+    let name = path
+        .file_name()
+        .context("model-proxy secret path has no filename")?
+        .to_string_lossy();
+    let temporary = parent.join(format!(".{name}.tmp-{}-{hex}", std::process::id()));
+    thegn_core::fsperm::write_owner_only_new(&temporary, hex.as_bytes())
+        .with_context(|| format!("write temporary model-proxy secret {}", temporary.display()))?;
+    match std::fs::hard_link(&temporary, path) {
+        Ok(()) => {
+            std::fs::remove_file(&temporary)
+                .with_context(|| format!("remove temporary secret {}", temporary.display()))?;
+            Ok(random.to_vec())
+        }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(&temporary)
+                .with_context(|| format!("remove temporary secret {}", temporary.display()))?;
             let mut last_error = None;
-            for _ in 0..20 {
+            for _ in 0..200 {
                 match read_host_secret(path) {
                     Ok(secret) => return Ok(secret),
                     Err(error) => last_error = Some(error),
@@ -58,25 +74,24 @@ fn secret_for_path(path: &std::path::Path) -> Result<Vec<u8>> {
             Err(last_error.expect("at least one read attempt"))
         }
         Err(e) => {
+            std::fs::remove_file(&temporary)
+                .with_context(|| format!("remove temporary secret {}", temporary.display()))?;
             Err(e).with_context(|| format!("create owner-only proxy secret {}", path.display()))
         }
     }
 }
 
+/// Attribution credentials expire after seven days. A pane or agent that lives
+/// longer than this (possible after daemon warm-reattach) receives HTTP 402 on
+/// every request until it is respawned with a fresh credential. These are bearer
+/// credentials and can be replayed until expiry.
+const ATTRIBUTION_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
 fn read_host_secret(path: &std::path::Path) -> Result<Vec<u8>> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("read proxy secret {}", path.display()))?;
-    let bytes = raw.trim().as_bytes();
-    if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
-        anyhow::bail!("invalid model-proxy secret file {}", path.display());
-    }
-    Ok((0..64)
-        .step_by(2)
-        .map(|i| {
-            (((bytes[i] as char).to_digit(16).expect("validated hex") << 4)
-                | (bytes[i + 1] as char).to_digit(16).expect("validated hex")) as u8
-        })
-        .collect())
+    thegn_core::proxy::attribution::parse_secret_hex(raw.trim())
+        .with_context(|| format!("invalid model-proxy secret file {}", path.display()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,11 +187,17 @@ enum ProbeState {
     Owned,
     Foreign(String),
     Incompatible(u64),
+    LocalError(String),
 }
 
 fn verify_probe_response(secret: &[u8], challenge: &str, status: u16, body: &[u8]) -> ProbeState {
     if status != 200 {
-        return ProbeState::Foreign(format!("identity endpoint returned HTTP {status}"));
+        let upgrade = if status == 404 {
+            "; this may be an older tgproxy; run `thegn proxy stop` to stop the recorded daemon, then restart"
+        } else {
+            ""
+        };
+        return ProbeState::Foreign(format!("identity endpoint returned HTTP {status}{upgrade}"));
     }
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return ProbeState::Foreign("invalid identity response".into());
@@ -198,13 +219,16 @@ fn verify_probe_response(secret: &[u8], challenge: &str, status: u16, body: &[u8
 }
 
 fn probe(cfg: &ModelProxyConfig) -> ProbeState {
-    let addr = listen_addr(cfg);
+    let secret = match host_secret() {
+        Ok(secret) => secret,
+        Err(error) => return ProbeState::LocalError(error.to_string()),
+    };
+    probe_with(listen_addr(cfg), &secret)
+}
+
+fn probe_with(addr: SocketAddr, secret: &[u8]) -> ProbeState {
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) else {
         return ProbeState::Down;
-    };
-    let secret = match host_secret() {
-        Ok(s) => s,
-        Err(e) => return ProbeState::Foreign(format!("cannot load daemon secret: {e}")),
     };
     let mut random = [0u8; 16];
     if let Err(e) = getrandom::fill(&mut random) {
@@ -253,7 +277,7 @@ fn probe(cfg: &ModelProxyConfig) -> ProbeState {
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|n| n.parse().ok())
         .unwrap_or(0);
-    verify_probe_response(&secret, &challenge, status, &response[body_start..])
+    verify_probe_response(secret, &challenge, status, &response[body_start..])
 }
 
 /// Whether the configured listener proves this daemon's authenticated identity.
@@ -276,7 +300,8 @@ fn write_config(cfg: &ModelProxyConfig) -> Result<PathBuf> {
 }
 
 /// Launches `tgproxy` detached, wrapped into `thegn.slice` like the other
-/// background jobs. The listen socket is the lock, so a duplicate launch exits 0.
+/// background jobs. A duplicate bind fails; the supervisor verifies an incumbent
+/// with the authenticated identity probe before deciding whether to reuse it.
 /// Returns `true` if a process was spawned (it may still lose the bind race).
 pub fn spawn(cfg: &ModelProxyConfig) -> Result<bool> {
     let config_file = write_config(cfg)?;
@@ -330,7 +355,14 @@ pub fn serve_foreground(cfg: &ModelProxyConfig) -> Result<i32> {
 /// Ensures the proxy is running: a quick probe, then a spawn + short poll if it
 /// is down. Returns `true` when the proxy is up afterwards.
 pub fn ensure_running(cfg: &ModelProxyConfig) -> Result<bool> {
-    match probe(cfg) {
+    let secret = host_secret()
+        .with_context(|| format!("cannot load model-proxy secret {}", secret_path().display()))?;
+    ensure_running_with_secret(cfg, &secret)
+}
+
+fn ensure_running_with_secret(cfg: &ModelProxyConfig, secret: &[u8]) -> Result<bool> {
+    let probe = || probe_with(listen_addr(cfg), secret);
+    match probe() {
         ProbeState::Owned => return Ok(true),
         ProbeState::Down => {}
         ProbeState::Foreign(reason) => anyhow::bail!(
@@ -341,11 +373,15 @@ pub fn ensure_running(cfg: &ModelProxyConfig) -> Result<bool> {
             "model-proxy port {} is held by incompatible tgproxy protocol {version}; upgrade or stop it",
             cfg.listen
         ),
+        ProbeState::LocalError(reason) => anyhow::bail!(
+            "cannot load model-proxy secret {}: {reason}",
+            secret_path().display()
+        ),
     }
     spawn(cfg)?;
     for _ in 0..30 {
         std::thread::sleep(Duration::from_millis(100));
-        match probe(cfg) {
+        match probe() {
             ProbeState::Owned => return Ok(true),
             ProbeState::Down => {}
             ProbeState::Foreign(reason) => anyhow::bail!(
@@ -356,9 +392,13 @@ pub fn ensure_running(cfg: &ModelProxyConfig) -> Result<bool> {
                 "model-proxy port {} is held by incompatible tgproxy protocol {version}; upgrade or stop it",
                 cfg.listen
             ),
+            ProbeState::LocalError(reason) => anyhow::bail!(
+                "cannot load model-proxy secret {}: {reason}",
+                secret_path().display()
+            ),
         }
     }
-    match probe(cfg) {
+    match probe() {
         ProbeState::Owned => Ok(true),
         ProbeState::Down => Ok(false),
         ProbeState::Foreign(reason) => anyhow::bail!(
@@ -368,6 +408,10 @@ pub fn ensure_running(cfg: &ModelProxyConfig) -> Result<bool> {
         ProbeState::Incompatible(version) => anyhow::bail!(
             "model-proxy port {} is held by incompatible tgproxy protocol {version}; upgrade or stop it",
             cfg.listen
+        ),
+        ProbeState::LocalError(reason) => anyhow::bail!(
+            "cannot load model-proxy secret {}: {reason}",
+            secret_path().display()
         ),
     }
 }
@@ -415,7 +459,23 @@ pub fn agent_proxy_env(cfg: &Config, choice: &str, worktree: &str) -> ProxyEnvDe
     if !mp.enabled {
         return ProxyEnvDecision::Skipped("[model_proxy] disabled".to_string());
     }
-    match probe(mp) {
+    let secret = match host_secret() {
+        Ok(secret) => secret,
+        Err(error) => {
+            return ProxyEnvDecision::Skipped(format!("proxy secret unavailable: {error}"));
+        }
+    };
+    agent_proxy_env_with_secret(cfg, choice, worktree, &secret)
+}
+
+fn agent_proxy_env_with_secret(
+    cfg: &Config,
+    choice: &str,
+    worktree: &str,
+    secret: &[u8],
+) -> ProxyEnvDecision {
+    let mp = &cfg.model_proxy;
+    match probe_with(listen_addr(mp), secret) {
         ProbeState::Owned => {}
         ProbeState::Down => {
             return ProxyEnvDecision::Skipped(format!("proxy unreachable at {}", mp.listen));
@@ -432,12 +492,11 @@ pub fn agent_proxy_env(cfg: &Config, choice: &str, worktree: &str) -> ProxyEnvDe
                 mp.listen
             ));
         }
+        ProbeState::LocalError(reason) => {
+            return ProxyEnvDecision::Skipped(format!("proxy secret unavailable: {reason}"));
+        }
     }
-    let secret = match host_secret() {
-        Ok(s) => s,
-        Err(e) => return ProxyEnvDecision::Skipped(format!("proxy secret unavailable: {e}")),
-    };
-    let key = mint_attribution_key(worktree, choice, &secret);
+    let key = mint_attribution_key(worktree, choice, secret);
     let base = format!("http://{}", listen_addr(mp));
     ProxyEnvDecision::Inject(vec![
         ("ANTHROPIC_BASE_URL".to_string(), base.clone()),
@@ -447,9 +506,9 @@ pub fn agent_proxy_env(cfg: &Config, choice: &str, worktree: &str) -> ProxyEnvDe
     ])
 }
 
-/// Mints a per-worktree virtual attribution key. Random nonce → revocable and
-/// unguessable; carries the worktree scope for spend accounting. NOT an upstream
-/// secret (leaking it leaks attribution + local spend capacity only).
+/// Mints a per-worktree signed attribution key. HMAC authenticates its claims;
+/// the nonce is only a discriminator. The key carries the worktree and agent
+/// scopes for spend accounting and is not an upstream secret.
 fn mint_attribution_key(worktree: &str, choice: &str, secret: &[u8]) -> String {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
@@ -477,7 +536,7 @@ fn mint_attribution_key(worktree: &str, choice: &str, secret: &[u8]) -> String {
             exp_ms: None,
         },
         secret,
-        now.saturating_add(7 * 24 * 60 * 60 * 1000),
+        now.saturating_add(ATTRIBUTION_TTL_MS),
     )
 }
 
@@ -557,13 +616,15 @@ mod tests {
 
     #[test]
     fn fake_listener_never_passes_identity_probe() {
+        let secret = b"fake-listener-test-secret";
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             for _ in 0..3 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = [0u8; 512];
-                stream.read(&mut request).unwrap();
+                let count = stream.read(&mut request).unwrap();
+                assert!(count > 0);
                 stream
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
@@ -571,18 +632,22 @@ mod tests {
                     .unwrap();
             }
         });
-        let mut cfg = ModelProxyConfig::default();
-        cfg.enabled = true;
-        cfg.listen = addr.to_string();
-        assert!(matches!(probe(&cfg), ProbeState::Foreign(_)));
+        let cfg = ModelProxyConfig {
+            enabled: true,
+            listen: addr.to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(probe_with(addr, secret), ProbeState::Foreign(_)));
         assert!(
-            ensure_running(&cfg)
+            ensure_running_with_secret(&cfg, secret)
                 .unwrap_err()
                 .to_string()
                 .contains("non-thegn")
         );
-        let mut app_cfg = Config::default();
-        app_cfg.model_proxy = cfg;
+        let mut app_cfg = Config {
+            model_proxy: cfg,
+            ..Default::default()
+        };
         app_cfg.agents.push(thegn_core::config::NamedCommand {
             name: "test-agent".into(),
             command: "unused".into(),
@@ -598,7 +663,7 @@ mod tests {
             drawer_cwd: None,
         });
         assert!(matches!(
-            agent_proxy_env(&app_cfg, "test-agent", "/tmp/wt"),
+            agent_proxy_env_with_secret(&app_cfg, "test-agent", "/tmp/wt", secret),
             ProxyEnvDecision::Skipped(_)
         ));
         server.join().unwrap();
@@ -606,7 +671,7 @@ mod tests {
 
     #[test]
     fn concurrent_supervisors_accept_the_same_authenticated_instance() {
-        let secret = host_secret().unwrap();
+        let secret = b"concurrent-supervisor-test-secret".to_vec();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server_secret = secret.clone();
@@ -643,8 +708,14 @@ mod tests {
         };
         let left_cfg = cfg.clone();
         let right_cfg = cfg;
-        let left = std::thread::spawn(move || ensure_running(&left_cfg).unwrap());
-        let right = std::thread::spawn(move || ensure_running(&right_cfg).unwrap());
+        let left_secret = secret.clone();
+        let right_secret = secret.clone();
+        let left = std::thread::spawn(move || {
+            ensure_running_with_secret(&left_cfg, &left_secret).unwrap()
+        });
+        let right = std::thread::spawn(move || {
+            ensure_running_with_secret(&right_cfg, &right_secret).unwrap()
+        });
         assert!(left.join().unwrap());
         assert!(right.join().unwrap());
         server.join().unwrap();
@@ -684,7 +755,18 @@ mod tests {
         assert_eq!(claims.scope, "worktree:/repo/wt");
         assert_eq!(claims.agent.as_deref(), Some("agent:reviewer"));
         let remaining = claims.exp_ms.unwrap() - now;
-        assert!((7 * 24 * 60 * 60 * 1000..=7 * 24 * 60 * 60 * 1000 + 1000).contains(&remaining));
+        assert!((ATTRIBUTION_TTL_MS..=ATTRIBUTION_TTL_MS + 1000).contains(&remaining));
+    }
+
+    #[test]
+    fn old_proxy_404_explains_pid_bound_replacement() {
+        let state = verify_probe_response(b"secret", "challenge", 404, b"not found");
+        let ProbeState::Foreign(reason) = state else {
+            panic!("expected a foreign listener");
+        };
+        assert!(reason.contains("older tgproxy"));
+        assert!(reason.contains("thegn proxy stop"));
+        assert!(reason.contains("restart"));
     }
 
     #[test]

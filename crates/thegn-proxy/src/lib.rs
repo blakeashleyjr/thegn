@@ -98,19 +98,8 @@ fn identity_proof(secret: &[u8], challenge: &str) -> String {
 fn read_secret(path: &std::path::Path) -> Result<Vec<u8>> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("read proxy secret {}", path.display()))?;
-    let bytes = raw.trim().as_bytes();
-    if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
-        anyhow::bail!("proxy secret file must contain 32 bytes encoded as hex");
-    }
-    let decoded = (0..bytes.len())
-        .step_by(2)
-        .map(|i| {
-            let h = (bytes[i] as char).to_digit(16).expect("validated hex");
-            let l = (bytes[i + 1] as char).to_digit(16).expect("validated hex");
-            ((h << 4) | l) as u8
-        })
-        .collect();
-    Ok(decoded)
+    thegn_core::proxy::attribution::parse_secret_hex(raw.trim())
+        .context("proxy secret file must contain 32 bytes encoded as hex")
 }
 
 async fn shutdown_signal() {
