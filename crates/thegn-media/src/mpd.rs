@@ -665,14 +665,24 @@ impl MediaBackend for Mpd {
             c.command(&format!("repeat {repeat}")).await?;
             match c.command(&format!("single {single}")).await {
                 Ok(_) => Ok(()),
-                Err(single_error) => match c.command(&format!("repeat {previous_repeat}")).await {
-                    Ok(_) => Err(MediaError::Backend(format!(
-                        "mpd single update failed; repeat was rolled back: {single_error}"
-                    ))),
-                    Err(rollback_error) => Err(MediaError::Backend(format!(
-                        "mpd single update failed and repeat rollback failed: {single_error}; {rollback_error}"
-                    ))),
-                },
+                Err(single_error) => {
+                    let rollback = match self.conn().await {
+                        Ok(mut rollback_conn) => {
+                            rollback_conn
+                                .command(&format!("repeat {previous_repeat}"))
+                                .await
+                        }
+                        Err(rollback_error) => Err(rollback_error),
+                    };
+                    match rollback {
+                        Ok(_) => Err(MediaError::Backend(format!(
+                            "mpd single update failed; repeat was rolled back: {single_error}"
+                        ))),
+                        Err(rollback_error) => Err(MediaError::Backend(format!(
+                            "mpd single update failed and repeat rollback failed: {single_error}; {rollback_error}"
+                        ))),
+                    }
+                }
             }
         })
     }
@@ -1148,6 +1158,75 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
+            let index = std::sync::Arc::new(std::sync::Mutex::new(0));
+            while let Ok((sock, _)) = listener.accept().await {
+                let (r, mut w) = tokio::io::split(sock);
+                if w.write_all(b"OK MPD 0.23.0\n").await.is_err() {
+                    continue;
+                }
+                let mut r = BufReader::new(r);
+                let log = log.clone();
+                let replies = replies.clone();
+                let index = index.clone();
+                tokio::spawn(async move {
+                    while let Ok(Some(line)) = read_bounded_line(&mut r, 1024).await {
+                        log.lock().unwrap().push(line);
+                        let reply = {
+                            let mut next = index.lock().unwrap();
+                            let reply = replies.get(*next).copied().unwrap_or("OK\n");
+                            *next += 1;
+                            reply
+                        };
+                        if w.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (
+            MpdEndpoint::resolve(&format!("127.0.0.1:{port}"), None).unwrap(),
+            seen,
+        )
+    }
+
+    /// Fake server that leaves `single` unanswered on the first connection,
+    /// then answers the rollback only on a newly accepted connection.
+    async fn single_timeout_server() -> (MpdEndpoint, std::sync::Arc<std::sync::Mutex<Vec<String>>>)
+    {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let (r, mut w) = tokio::io::split(sock);
+            if w.write_all(b"OK MPD 0.23.0\n").await.is_err() {
+                return;
+            }
+            let first_log = log.clone();
+            tokio::spawn(async move {
+                let mut r = BufReader::new(r);
+                while let Ok(Some(line)) = read_bounded_line(&mut r, 1024).await {
+                    first_log.lock().unwrap().push(line.clone());
+                    match line.as_str() {
+                        "status" => {
+                            if w.write_all(b"repeat: 0\nsingle: 0\nOK\n").await.is_err() {
+                                return;
+                            }
+                        }
+                        "repeat 1" => {
+                            if w.write_all(b"OK\n").await.is_err() {
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+
             let Ok((sock, _)) = listener.accept().await else {
                 return;
             };
@@ -1156,12 +1235,9 @@ mod tests {
                 return;
             }
             let mut r = BufReader::new(r);
-            let mut index = 0;
-            while let Ok(Some(line)) = read_bounded_line(&mut r, 1024).await {
+            if let Ok(Some(line)) = read_bounded_line(&mut r, 1024).await {
                 log.lock().unwrap().push(line);
-                let reply = replies.get(index).copied().unwrap_or("OK\n");
-                index += 1;
-                if w.write_all(reply.as_bytes()).await.is_err() {
+                if w.write_all(b"OK\n").await.is_err() {
                     return;
                 }
             }
@@ -1282,6 +1358,31 @@ mod tests {
         };
         let error = m.set_loop(LoopMode::Track).await.unwrap_err();
         assert!(error.to_string().contains("rolled back"), "{error}");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                "status".to_string(),
+                "repeat 1".to_string(),
+                "single 1".to_string(),
+                "repeat 0".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_loop_rolls_back_on_a_fresh_connection_after_single_timeout() {
+        // COMMAND_TIMEOUT is fixed at ten seconds, so exercising the timeout
+        // path costs ten seconds rather than shortening the production budget.
+        let (ep, seen) = single_timeout_server().await;
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
+        let error = m.set_loop(LoopMode::Track).await.unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(error.to_string().contains("rolled back"), "{error}");
+        assert!(!error.to_string().contains("rollback failed"), "{error}");
         assert_eq!(
             seen.lock().unwrap().clone(),
             vec![
