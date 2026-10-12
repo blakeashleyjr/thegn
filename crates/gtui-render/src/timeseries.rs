@@ -258,12 +258,11 @@ fn gap_threshold_in(
     let mean_interval = span / (finite_count - 1) as f64;
     let mut threshold = GAP_FACTOR * mean_interval;
     let pixels = width.saturating_mul(2).max(1);
-    let sample_count = times
-        .iter()
-        .filter(|time| {
-            time.is_finite() && window.is_none_or(|[lo, hi]| **time >= lo && **time <= hi)
-        })
-        .count();
+    let sample_count = if window.is_some() {
+        finite_count
+    } else {
+        times.len()
+    };
     if sample_count > pixels.saturating_mul(SAMPLES_PER_PIXEL) {
         let bucket_width = span / pixels as f64;
         threshold = threshold.max(2.0 * bucket_width);
@@ -434,6 +433,16 @@ mod tests {
     }
 
     #[test]
+    fn index_points_preserve_offset_after_sample_limit() {
+        let count = MAX_SAMPLES_PER_SERIES + 10;
+        let values = vec![1.0; count];
+        let points = plot_points(&values, 40);
+
+        assert!(points.iter().all(|&(x, _)| x >= 10.0));
+        assert_eq!(points.last().map(|&(x, _)| x), Some((count - 1) as f64));
+    }
+
+    #[test]
     fn time_points_use_timestamp_coordinates_and_domain() {
         let (points, domain) = plot_time_points(&[0.0, 1.0, 2.0, 100.0], &[2.0, 4.0, 3.0, 8.0], 20);
         assert_eq!(
@@ -512,6 +521,16 @@ mod tests {
         );
 
         assert_eq!(threshold, Some(3.0));
+    }
+
+    #[test]
+    fn no_window_gap_threshold_uses_all_samples_for_reduction_trigger() {
+        let mut times = vec![0.0, 1.0, 2.0, 3.0, 100.0];
+        times.extend(std::iter::repeat_n(f64::NAN, 20));
+
+        let threshold = gap_threshold_in(&times, [0.0, 100.0], 1, None);
+
+        assert_eq!(threshold, Some(100.0));
     }
 
     #[test]
