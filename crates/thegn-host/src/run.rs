@@ -3303,6 +3303,7 @@ fn queue_terminal_launch(
     after: GitAfter,
     tx: &tokio_mpsc::UnboundedSender<TerminalLaunchDone>,
     waker: &TerminalWaker,
+    status: &mut String,
 ) {
     let GitAfter::Terminal {
         command,
@@ -3312,6 +3313,7 @@ fn queue_terminal_launch(
     else {
         return;
     };
+    *status = "Resolving custom command worktree…".into();
     let tx = tx.clone();
     let wk = waker.clone();
     tokio::task::spawn_blocking(move || {
@@ -3337,6 +3339,16 @@ fn terminal_launch_is_current(
     current_worktree: &std::path::Path,
 ) -> bool {
     generation == current_generation && worktree == current_worktree
+}
+
+fn terminal_worktree_path(session: &crate::session::Session) -> Result<std::path::PathBuf, String> {
+    let Some(group) = session.active_group() else {
+        return Err("there is no active worktree".into());
+    };
+    if group.path.is_empty() {
+        return Err("the active worktree path is empty".into());
+    }
+    Ok(std::path::PathBuf::from(&group.path))
 }
 
 fn short_sha(sha: &str) -> String {
@@ -3409,6 +3421,7 @@ fn git_template_ctx(
     panel_ui: &crate::panel::PanelUi,
     model: &FrameModel,
     session: &crate::session::Session,
+    terminal_worktree: Option<&std::path::Path>,
     prompts: std::collections::BTreeMap<String, String>,
 ) -> thegn_core::custom_cmd::TemplateCtx {
     use thegn_core::custom_cmd::{BranchVars, CommitVars, StashVars, TemplateCtx};
@@ -3432,7 +3445,13 @@ fn git_template_ctx(
             index: s.index,
             message: s.message,
         }),
-        worktree_path: Some(active_tab_path(session).to_string_lossy().into_owned()),
+        worktree_path: Some(
+            terminal_worktree
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| active_tab_path(session))
+                .to_string_lossy()
+                .into_owned(),
+        ),
         prompt_responses: prompts,
     }
 }
@@ -3449,13 +3468,30 @@ fn run_custom_command(
     let Some(cmd) = wires.cfg.git_commands.get(idx) else {
         return GitAfter::None;
     };
-    let ctx = git_template_ctx(panel_ui, model, wires.session, prompts);
+    let terminal_worktree = if matches!(&cmd.output, GitCmdOutput::Terminal) {
+        match terminal_worktree_path(wires.session) {
+            Ok(path) => Some(path),
+            Err(reason) => {
+                model.status = format!("custom command terminal refused: {reason}");
+                return GitAfter::None;
+            }
+        }
+    } else {
+        None
+    };
+    let ctx = git_template_ctx(
+        panel_ui,
+        model,
+        wires.session,
+        terminal_worktree.as_deref(),
+        prompts,
+    );
     match thegn_core::custom_cmd::compile(cmd, &ctx) {
         Ok(line) => match cmd.output {
             GitCmdOutput::Terminal => GitAfter::Terminal {
                 command: line,
                 generation: panel_ui.git.op_gen,
-                worktree: active_tab_path(wires.session),
+                worktree: terminal_worktree.expect("terminal worktree captured above"),
             },
             out => {
                 enqueue_git_op(
@@ -9912,13 +9948,17 @@ async fn event_loop<T: Terminal>(
 
         while let Ok(done) = terminal_launch_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::GitOp);
-            let current_worktree = active_tab_path(&session);
+            let current_worktree = terminal_worktree_path(&session);
             if !terminal_launch_is_current(
                 done.generation,
                 &done.worktree,
                 panel_ui.git.op_gen,
-                &current_worktree,
+                current_worktree
+                    .as_deref()
+                    .unwrap_or_else(|_| std::path::Path::new("")),
             ) {
+                model.status = "custom command cancelled: worktree changed".into();
+                dirty = true;
                 continue;
             }
             match done.result {
@@ -17362,7 +17402,12 @@ async fn event_loop<T: Terminal>(
                                     need_relayout = true;
                                 }
                                 terminal @ GitAfter::Terminal { .. } => {
-                                    queue_terminal_launch(terminal, &terminal_launch_tx, &waker);
+                                    queue_terminal_launch(
+                                        terminal,
+                                        &terminal_launch_tx,
+                                        &waker,
+                                        &mut model.status,
+                                    );
                                 }
                             }
                         }
@@ -17439,6 +17484,7 @@ async fn event_loop<T: Terminal>(
                                             terminal,
                                             &terminal_launch_tx,
                                             &waker,
+                                            &mut model.status,
                                         );
                                     }
                                 }
@@ -18843,7 +18889,12 @@ async fn event_loop<T: Terminal>(
                             forced_palette_action = Some(crate::keymap::Action::NewWorktree);
                         }
                         terminal @ GitAfter::Terminal { .. } => {
-                            queue_terminal_launch(terminal, &terminal_launch_tx, &waker);
+                            queue_terminal_launch(
+                                terminal,
+                                &terminal_launch_tx,
+                                &waker,
+                                &mut model.status,
+                            );
                         }
                         GitAfter::OpenEditor(path) => {
                             let cwd = active_cwd(&session);
