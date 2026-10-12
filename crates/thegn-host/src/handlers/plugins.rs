@@ -34,8 +34,6 @@ pub(crate) struct PluginEntry {
     pub writer: Option<SessionWriter>,
     /// A live feed bridge, if one was started for this resident generation.
     pub feed_bridge: Option<std::thread::JoinHandle<()>>,
-    /// Set between claiming a bridge and storing its thread handle.
-    feed_bridge_starting: bool,
     /// Contributions currently in effect, selected during manifest negotiation.
     /// Runtime `register` messages confirm these declarations but cannot add to them.
     pub contributions: Vec<Contribution>,
@@ -207,7 +205,6 @@ fn build_entry(st: LoadedState) -> PluginEntry {
         plugin: st.plugin,
         writer: st.writer,
         feed_bridge: None,
-        feed_bridge_starting: false,
         contributions,
         restarts: 0,
         disabled: false,
@@ -461,7 +458,6 @@ pub(crate) fn drain(
                     Some(w) => {
                         let entry = state.plugins.get_mut(&plugin).expect("checked above");
                         entry.feed_bridge = None;
-                        entry.feed_bridge_starting = false;
                         if entry
                             .contributions
                             .iter()
@@ -509,7 +505,6 @@ fn handle_exit(
     };
     entry.writer = None;
     entry.feed_bridge = None;
-    entry.feed_bridge_starting = false;
     entry.bridge = None;
     sync_provider_registry(state);
     let entry = state.plugins.get_mut(plugin).expect("looked up above");
@@ -806,7 +801,6 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
     if cap == "events.subscribe" {
         if claim_feed_bridge(entry) {
             entry.feed_bridge = spawn_feed_bridge(state.cfg.clone(), writer.clone());
-            entry.feed_bridge_starting = false;
         }
         respond(
             entry,
@@ -824,18 +818,12 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
 
 /// Claim the per-session feed bridge slot, reclaiming a completed bridge.
 fn claim_feed_bridge(entry: &mut PluginEntry) -> bool {
-    if entry.feed_bridge_starting {
-        return false;
-    }
-    if entry
-        .feed_bridge
-        .as_ref()
-        .is_some_and(|bridge| !bridge.is_finished())
-    {
-        return false;
+    if let Some(bridge) = &entry.feed_bridge {
+        if !bridge.is_finished() {
+            return false;
+        }
     }
     entry.feed_bridge = None;
-    entry.feed_bridge_starting = true;
     true
 }
 
@@ -1100,8 +1088,16 @@ mod tests {
     #[test]
     fn feed_bridge_claim_is_limited_to_one_per_entry() {
         let mut entry = build_entry(loaded_state(seg_spec("p")));
-        assert!(claim_feed_bridge(&mut entry));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        entry.feed_bridge = Some(std::thread::spawn(move || {
+            receiver.recv().unwrap();
+        }));
         assert!(!claim_feed_bridge(&mut entry));
+        drop(sender);
+        while !entry.feed_bridge.as_ref().unwrap().is_finished() {
+            std::thread::yield_now();
+        }
+        assert!(claim_feed_bridge(&mut entry));
     }
 
     fn msg(method: &str, params: serde_json::Value) -> RpcMessage {

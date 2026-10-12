@@ -939,7 +939,7 @@ impl PluginRuntime {
         val: serde_json::Value,
     ) -> Result<(), PluginApiError> {
         let state_key = format!("{}:{key}", plugin.as_str());
-        let cap = Capability::parse(&format!("state:{}", plugin.as_str())).unwrap();
+        let cap = Capability::new("state", plugin.as_str());
         self.audit(plugin, cap, "state.set")?;
         self.state.insert(state_key, val);
         Ok(())
@@ -951,7 +951,7 @@ impl PluginRuntime {
         key: &str,
     ) -> Result<Option<serde_json::Value>, PluginApiError> {
         let state_key = format!("{}:{key}", plugin.as_str());
-        let cap = Capability::parse(&format!("state:{}", plugin.as_str())).unwrap();
+        let cap = Capability::new("state", plugin.as_str());
         self.audit(plugin, cap, "state.get")?;
         Ok(self.state.get(&state_key).cloned())
     }
@@ -2598,6 +2598,22 @@ timeout_secs = 5
                 && entry.operation == "host.call"
                 && entry.decision == AuditDecision::Denied
         }));
+    }
+
+    #[test]
+    fn state_access_audits_invalid_plugin_ids_without_panicking() {
+        for id in ["", "bad\u{7}"] {
+            let plugin = PluginId::new(id);
+            let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
+            assert!(matches!(
+                runtime.state_set(plugin.clone(), "key", serde_json::Value::Null),
+                Err(PluginApiError::CapabilityDenied { .. })
+            ));
+            assert!(matches!(
+                runtime.state_get(plugin, "key"),
+                Err(PluginApiError::CapabilityDenied { .. })
+            ));
+        }
     }
 
     #[test]
