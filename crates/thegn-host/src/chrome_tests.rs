@@ -910,6 +910,72 @@ fn masthead_disk_widget_shows_free_pct_with_inverted_colors() {
 }
 
 #[test]
+fn masthead_network_widget_selects_medium_icon_and_preserves_rates() {
+    use thegn_metrics::NetMedium;
+
+    let glyphs = crate::caps::active_glyphs();
+    let mut model = FrameModel::default();
+    model.bars.top_right = vec!["net".into()];
+    model.stats.net_bps = Some((1536, 1024));
+
+    model.stats.net_medium = NetMedium::Ethernet;
+    let ethernet = masthead_widget("net", &model).expect("network rates present");
+    assert_eq!(
+        ethernet.text,
+        format!(
+            "{} {}{} {}{}",
+            glyphs.net_wired,
+            glyphs.arrow_down,
+            thegn_metrics::fmt_rate(1536),
+            glyphs.arrow_up,
+            thegn_metrics::fmt_rate(1024)
+        ),
+        "Ethernet uses the wired glyph and keeps aggregate rate formatting"
+    );
+
+    model.stats.net_medium = NetMedium::Wifi;
+    assert!(
+        masthead_widget("net", &model)
+            .unwrap()
+            .text
+            .starts_with(&model.stats_icons.net_icon)
+    );
+
+    model.stats.net_medium = NetMedium::Unknown;
+    assert!(
+        masthead_widget("net", &model)
+            .unwrap()
+            .text
+            .starts_with(glyphs.net_generic)
+    );
+
+    model.stats_icons.net_icon = "NET".into();
+    assert!(
+        masthead_widget("net", &model)
+            .unwrap()
+            .text
+            .starts_with("NET")
+    );
+
+    let wide = crate::masthead::masthead_layout(&model, 80, None).right_spans;
+    assert!(
+        wide.iter()
+            .any(|(id, _, _)| id == &BarItemId::Widget("net".into()))
+    );
+    let narrow_layout = crate::masthead::masthead_layout(&model, 12, None);
+    assert!(
+        narrow_layout
+            .right_spans
+            .iter()
+            .all(|(id, _, _)| id != &BarItemId::Widget("net".into())),
+        "network widget sheds cleanly when the masthead is too narrow"
+    );
+    let left_width = crate::seg::seg_width(&narrow_layout.left);
+    let right_width = crate::seg::seg_width(&narrow_layout.right);
+    assert!(left_width + right_width + usize::from(right_width > 0) <= 12);
+}
+
+#[test]
 fn bottombar_disk_widget_shows_active_worktree_size() {
     let mut model = FrameModel::default();
     assert!(
