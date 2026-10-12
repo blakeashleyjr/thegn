@@ -21,6 +21,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -734,8 +735,7 @@ fn run_sidecar(rt: &OciRuntime, plan: &SidecarPlan) -> Result<()> {
     // any stale carcass so bring-up self-heals rather than wedging forever.
     remove_stale_sidecar(rt, &plan.container);
 
-    let staged = stage_files(plan)?;
-    let env_file = stage_env_file(plan)?;
+    let (staged, env_file) = stage_all(plan)?;
 
     let args = sidecar_run_args(plan, &staged, env_file.as_deref());
 
@@ -791,10 +791,7 @@ fn stage_env_file(plan: &SidecarPlan) -> Result<Option<std::path::PathBuf>> {
     if plan.env.is_empty() {
         return Ok(None);
     }
-    let dir = staged_dir(&plan.container);
-    std::fs::create_dir_all(&dir).with_context(|| format!("vpn: mkdir {}", dir.display()))?;
-    thegn_core::fsperm::restrict_dir_to_owner(&dir)
-        .with_context(|| format!("vpn: restrict {}", dir.display()))?;
+    let dir = open_staged_dir(&plan.container)?;
     let mut body = String::new();
     for (key, value) in &plan.env {
         if key.is_empty()
@@ -811,10 +808,30 @@ fn stage_env_file(plan: &SidecarPlan) -> Result<Option<std::path::PathBuf>> {
         body.push_str(value);
         body.push('\n');
     }
-    let path = dir.join("environment");
-    write_secret_0600(&path, body.as_bytes())
-        .with_context(|| format!("vpn: write {}", path.display()))?;
+    let path = dir
+        .write_owner_only_atomic("environment", body.as_bytes())
+        .context("vpn: write staged environment file")?;
     Ok(Some(path))
+}
+
+type StagedSecrets = (Vec<(String, String)>, Option<PathBuf>);
+
+/// Stage both secret classes as one operation so a failure cannot leave only
+/// one class of the sidecar's credentials behind.
+fn stage_all(plan: &SidecarPlan) -> Result<StagedSecrets> {
+    match stage_all_inner(plan) {
+        Ok(staged) => Ok(staged),
+        Err(error) => {
+            cleanup_staged(&plan.container);
+            Err(error)
+        }
+    }
+}
+
+fn stage_all_inner(plan: &SidecarPlan) -> Result<StagedSecrets> {
+    let staged = stage_files(plan)?;
+    let env_file = stage_env_file(plan)?;
+    Ok((staged, env_file))
 }
 
 /// If a container with this name exists but isn't running, `rm -f` it so the
@@ -852,50 +869,87 @@ fn stage_files(plan: &SidecarPlan) -> Result<Vec<(String, String)>> {
     if plan.files.is_empty() {
         return Ok(Vec::new());
     }
-    let dir = staged_dir(&plan.container);
-    std::fs::create_dir_all(&dir).with_context(|| format!("vpn: mkdir {}", dir.display()))?;
-    thegn_core::fsperm::restrict_dir_to_owner(&dir)
-        .with_context(|| format!("vpn: restrict {}", dir.display()))?;
+    let dir = open_staged_dir(&plan.container)?;
     let mut out = Vec::new();
     for (i, f) in plan.files.iter().enumerate() {
-        let host = dir.join(format!("f{i}"));
-        write_secret_0600(&host, f.contents.as_bytes())
-            .with_context(|| format!("vpn: write {}", host.display()))?;
+        let name = format!("f{i}");
+        let host = dir
+            .write_owner_only_atomic(&name, f.contents.as_bytes())
+            .with_context(|| format!("vpn: write staged secret file {name}"))?;
         out.push((host.to_string_lossy().into_owned(), f.dest.clone()));
     }
     Ok(out)
 }
 
 /// The per-sidecar directory holding its materialized secret files.
-fn staged_dir(container: &str) -> std::path::PathBuf {
-    state_dir().join(container)
+fn open_staged_dir(container: &str) -> Result<thegn_core::fsperm::PrivateDir> {
+    validate_container_name(container)?;
+    let root = state_root()?;
+    // Tighten legacy vpn roots before checking the sidecar directory. The
+    // final component is chmodded to 0700 by PrivateDir.
+    thegn_core::fsperm::ensure_private_dir_beneath(&root, Path::new("vpn"))
+        .context("vpn: open private staging root")?;
+    thegn_core::fsperm::ensure_private_dir_beneath(&root, &Path::new("vpn").join(container))
+        .context("vpn: open private sidecar staging directory")
+}
+
+fn validate_container_name(container: &str) -> Result<()> {
+    let mut components = Path::new(container).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        bail!("vpn: invalid sidecar container name");
+    }
+    Ok(())
+}
+
+fn staged_dir(container: &str) -> Result<PathBuf> {
+    validate_container_name(container)?;
+    Ok(state_root()?.join("vpn").join(container))
 }
 
 /// Remove a sidecar's materialized secret directory (secrets must not outlive
 /// the tunnel they were minted for). Best-effort — absence is fine.
 pub fn cleanup_staged(container: &str) {
-    let dir = staged_dir(container);
+    let dir = match staged_dir(container) {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::debug!(target: "thegn::vpn", %error, "could not resolve staged secret directory for cleanup");
+            return;
+        }
+    };
+    let root = match state_root() {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::debug!(target: "thegn::vpn", %error, "could not resolve VPN secret root for cleanup");
+            return;
+        }
+    };
+    if let Err(error) = thegn_core::fsperm::ensure_private_dir_beneath(&root, Path::new("vpn")) {
+        tracing::debug!(target: "thegn::vpn", %error, "could not verify VPN secret root for cleanup");
+        return;
+    }
     // best-effort: secret-file teardown; a leftover dir is a security issue but
     // a failed remove must not take down teardown.
-    let _ = std::fs::remove_dir_all(&dir); // best-effort: secret-file teardown; a leftover dir is a security issue but must not down teardown (see above)
+    if let Err(error) = std::fs::remove_dir_all(&dir) {
+        tracing::debug!(target: "thegn::vpn", %error, "failed to remove staged VPN secrets");
+    }
 }
 
-/// Atomically write `contents` with strict owner-only permissions applied before
-/// any secret bytes become visible on every supported platform.
-fn write_secret_0600(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-    thegn_core::fsperm::write_owner_only_atomic(path, contents)
-}
-
-fn state_dir() -> std::path::PathBuf {
+fn state_root() -> Result<PathBuf> {
     let base = std::env::var("XDG_STATE_HOME")
         .ok()
         .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            std::path::PathBuf::from(home).join(".local/state")
-        });
-    base.join("thegn").join("vpn")
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|home| !home.is_empty())
+                .map(|home| PathBuf::from(home).join(".local/state"))
+        })
+        .ok_or_else(|| anyhow!("vpn: XDG_STATE_HOME and HOME are unset"))?;
+    let root = base.join("thegn");
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("vpn: create state root {}", root.display()))?;
+    Ok(root)
 }
 
 /// Is the sidecar already running? (`inspect` exits 0 only for live containers.)
