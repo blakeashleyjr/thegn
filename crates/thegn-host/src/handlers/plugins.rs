@@ -10,6 +10,7 @@
 //! through [`crate::plugins::PluginsHost::respawn`].
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use thegn_core::plugin_api::{
     API_VERSION, Alert, AuditDecision, Capability, Contribution, Event, EventKind, ExtensionPoint,
@@ -27,6 +28,15 @@ use crate::plugins::{LoadedState, PluginMsg, PluginsHost};
 
 const MAX_PENDING_ALERTS_PER_PLUGIN: usize = 16;
 const MAX_ALERT_MESSAGE_BYTES: usize = 1024;
+const MAX_FEED_BRIDGES: usize = 8;
+const MAX_SUBSCRIPTIONS_PER_PLUGIN: usize = 64;
+
+/// Owns a feed worker and its cancellation signal. Dropping the owner cancels
+/// the worker even if the feed is idle and the plugin never reads another frame.
+pub(crate) struct FeedBridge {
+    handle: Arc<std::thread::JoinHandle<()>>,
+    _cancel: tokio::sync::oneshot::Sender<()>,
+}
 
 /// One live (or dead-but-remembered) plugin on the loop side.
 pub(crate) struct PluginEntry {
@@ -36,7 +46,7 @@ pub(crate) struct PluginEntry {
     /// and dead residents.
     pub writer: Option<SessionWriter>,
     /// A live feed bridge, if one was started for this resident generation.
-    pub feed_bridge: Option<std::thread::JoinHandle<()>>,
+    pub feed_bridge: Option<FeedBridge>,
     /// Contributions currently in effect, selected during manifest negotiation.
     /// Runtime `register` messages confirm these declarations but cannot add to them.
     pub contributions: Vec<Contribution>,
@@ -101,6 +111,16 @@ pub(crate) fn host_call_check(spec: &PluginSpec, cap: &str) -> Result<(), RpcErr
     }
     let need = thegn_core::control::required_scope(row.verb);
     if spec.scope_set().allows(need) {
+        if row.verb == thegn_core::control::Verb::MergeAdd
+            && !thegn_core::control::route_to_host_token_allows_worktree(spec.scope_set(), "", "")
+        {
+            // An empty label means there is no route binding; the worktree
+            // argument is unused by this pure scope predicate.
+            return Err(RpcError::new(
+                RpcErrorCode::Denied,
+                "merge.add requires a worktree-bound route-to-host grant; plugins need the git scope",
+            ));
+        }
         Ok(())
     } else {
         Err(RpcError::new(
@@ -690,13 +710,37 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> Plu
                 .unwrap_or_else(|| Ok(Vec::new()));
             match kinds {
                 Ok(kinds) => {
-                    let mut r = Ok(serde_json::Value::Null);
-                    for k in kinds {
-                        if let Err(e) = entry.runtime.subscribe(pid.clone(), k) {
-                            r = Err(rpc_error_of(e));
+                    if kinds.len() > MAX_SUBSCRIPTIONS_PER_PLUGIN {
+                        Err(RpcError::new(
+                            RpcErrorCode::RateLimited,
+                            format!(
+                                "subscription list exceeds {MAX_SUBSCRIPTIONS_PER_PLUGIN} events"
+                            ),
+                        ))
+                    } else {
+                        let mut r = Ok(serde_json::Value::Null);
+                        for k in kinds {
+                            if !entry
+                                .runtime
+                                .subscriptions()
+                                .contains(&(pid.clone(), k.clone()))
+                                && entry.runtime.subscriptions().len()
+                                    >= MAX_SUBSCRIPTIONS_PER_PLUGIN
+                            {
+                                r = Err(RpcError::new(
+                                    RpcErrorCode::RateLimited,
+                                    format!(
+                                        "plugin subscription limit is {MAX_SUBSCRIPTIONS_PER_PLUGIN}"
+                                    ),
+                                ));
+                                break;
+                            }
+                            if let Err(e) = entry.runtime.subscribe(pid.clone(), k) {
+                                r = Err(rpc_error_of(e));
+                            }
                         }
+                        r
                     }
-                    r
                 }
                 Err(e) => Err(RpcError::new(
                     RpcErrorCode::Invalid,
@@ -804,6 +848,8 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> Plu
 /// `host.call`: scope-check on the loop, dispatch on the dispatcher thread,
 /// answer directly through the plugin's writer.
 fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> PluginDamage {
+    let feed_admission = (param_str(&msg.params, "cap").as_deref() == Some("events.subscribe"))
+        .then(|| feed_bridge_admission(state, plugin));
     let Some(entry) = state.plugins.get_mut(plugin) else {
         return PluginDamage::None;
     };
@@ -837,13 +883,37 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
     // starts an off-loop bridge that forwards feed frames as `on_event`
     // notifications, and the host.call itself is acknowledged immediately.
     if cap == "events.subscribe" {
-        if claim_feed_bridge(entry) {
-            entry.feed_bridge = spawn_feed_bridge(state.cfg.clone(), writer.clone());
+        match feed_admission.expect("events.subscribe admission was computed") {
+            Ok(false) => respond(
+                entry,
+                RpcResponse::ok(id, serde_json::json!({ "subscribed": true })),
+            ),
+            Err(error) => respond(entry, RpcResponse::err(id, error)),
+            Ok(true) => {
+                let cfg = state.cfg.clone();
+                let bridge = if claim_feed_bridge(entry) {
+                    spawn_feed_bridge(cfg, writer.clone())
+                } else {
+                    None
+                };
+                match bridge {
+                    Some(bridge) => {
+                        entry.feed_bridge = Some(bridge);
+                        respond(
+                            entry,
+                            RpcResponse::ok(id, serde_json::json!({ "subscribed": true })),
+                        );
+                    }
+                    None => respond(
+                        entry,
+                        RpcResponse::err(
+                            id,
+                            RpcError::new(RpcErrorCode::Other, "feed bridge could not be started"),
+                        ),
+                    ),
+                }
+            }
         }
-        respond(
-            entry,
-            RpcResponse::ok(id, serde_json::json!({ "subscribed": true })),
-        );
         return PluginDamage::None;
     }
     let cfg = state.cfg.clone();
@@ -857,12 +927,42 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
 /// Claim the per-session feed bridge slot, reclaiming a completed bridge.
 fn claim_feed_bridge(entry: &mut PluginEntry) -> bool {
     if let Some(bridge) = &entry.feed_bridge
-        && !bridge.is_finished()
+        && !bridge.handle.is_finished()
     {
         return false;
     }
     entry.feed_bridge = None;
     true
+}
+
+/// Count live bridges before taking a mutable plugin-entry borrow. A second
+/// request for the same live entry is an idempotent acknowledgment.
+fn feed_bridge_admission(state: &PluginsState, plugin: &str) -> Result<bool, RpcError> {
+    if state.plugins.get(plugin).is_some_and(|entry| {
+        entry
+            .feed_bridge
+            .as_ref()
+            .is_some_and(|bridge| !bridge.handle.is_finished())
+    }) {
+        return Ok(false);
+    }
+    let live = state
+        .plugins
+        .values()
+        .filter(|entry| {
+            entry
+                .feed_bridge
+                .as_ref()
+                .is_some_and(|bridge| !bridge.handle.is_finished())
+        })
+        .count();
+    if live >= MAX_FEED_BRIDGES {
+        return Err(RpcError::new(
+            RpcErrorCode::RateLimited,
+            format!("feed bridge limit is {MAX_FEED_BRIDGES}"),
+        ));
+    }
+    Ok(true)
 }
 
 /// Start an off-loop bridge that forwards the daemon control event feed to a
@@ -872,14 +972,14 @@ fn claim_feed_bridge(entry: &mut PluginEntry) -> bool {
 /// straight to the plugin's [`SessionWriter`] — it never re-enters the
 /// compositor loop, so a subscribing plugin costs the idle render loop nothing.
 /// The bridge ends when the feed closes or the plugin's session goes away.
-fn spawn_feed_bridge(
-    cfg: thegn_core::config::Config,
-    writer: SessionWriter,
-) -> Option<std::thread::JoinHandle<()>> {
+fn spawn_cancellable_bridge(
+    name: &str,
+    fut: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Option<FeedBridge> {
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     let spawn = std::thread::Builder::new()
-        .name("thegn-plugin-feed".into())
+        .name(name.into())
         .spawn(move || {
-            // Utility: forwards the control event feed to a plugin whose output the user sees.
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -892,58 +992,70 @@ fn spawn_feed_bridge(
                 }
             };
             rt.block_on(async move {
-                let client = match crate::cmd::session::connect(&cfg).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::debug!(target: "thegn::plugin", error = %e, "feed-bridge: no daemon");
-                        return;
-                    }
-                };
-                let mut stream = match client.subscribe_events().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::debug!(target: "thegn::plugin", error = %e, "feed-bridge subscribe failed");
-                        return;
-                    }
-                };
-                while let Some(frame) = stream.frames.recv().await {
-                    use thegn_core::control_wire::EventFrame;
-                    // Pane byte streams never reach a plugin this way; and the
-                    // greeting frame is not a feed event.
-                    if matches!(
-                        frame,
-                        EventFrame::Hello(_)
-                            | EventFrame::PaneSnapshot { .. }
-                            | EventFrame::PaneDelta { .. }
-                    ) {
-                        continue;
-                    }
-                    let payload = thegn_svc::control::http::frame_json(&frame);
-                    if writer
-                        .notify(
-                            thegn_core::plugin_api::PluginCallback::OnEvent,
-                            serde_json::json!({
-                                "kind": thegn_core::plugin_api::EventKind::Custom(
-                                    "control.feed".into()
-                                ),
-                                "payload": payload,
-                            }),
-                        )
-                        .is_err()
-                    {
-                        // The plugin's session is gone — stop forwarding.
-                        return;
-                    }
+                tokio::select! {
+                    _ = cancel_rx => {},
+                    _ = fut => {},
                 }
             });
         });
     match spawn {
-        Ok(handle) => Some(handle),
+        Ok(handle) => Some(FeedBridge {
+            handle: Arc::new(handle),
+            _cancel: cancel_tx,
+        }),
         Err(e) => {
             tracing::warn!(target: "thegn::plugin", error = %e, "feed-bridge thread failed to start");
             None
         }
     }
+}
+
+fn spawn_feed_bridge(cfg: thegn_core::config::Config, writer: SessionWriter) -> Option<FeedBridge> {
+    spawn_cancellable_bridge("thegn-plugin-feed", async move {
+        let client = match crate::cmd::session::connect(&cfg).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(target: "thegn::plugin", error = %e, "feed-bridge: no daemon");
+                return;
+            }
+        };
+        let mut stream = match client.subscribe_events().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(target: "thegn::plugin", error = %e, "feed-bridge subscribe failed");
+                return;
+            }
+        };
+        while let Some(frame) = stream.frames.recv().await {
+            use thegn_core::control_wire::EventFrame;
+            // Pane byte streams never reach a plugin this way; and the
+            // greeting frame is not a feed event.
+            if matches!(
+                frame,
+                EventFrame::Hello(_)
+                    | EventFrame::PaneSnapshot { .. }
+                    | EventFrame::PaneDelta { .. }
+            ) {
+                continue;
+            }
+            let payload = thegn_svc::control::http::frame_json(&frame);
+            if writer
+                .notify(
+                    thegn_core::plugin_api::PluginCallback::OnEvent,
+                    serde_json::json!({
+                        "kind": thegn_core::plugin_api::EventKind::Custom(
+                            "control.feed".into()
+                        ),
+                        "payload": payload,
+                    }),
+                )
+                .is_err()
+            {
+                // The plugin's session is gone — stop forwarding.
+                return;
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,16 +1238,87 @@ mod tests {
     #[test]
     fn feed_bridge_claim_is_limited_to_one_per_entry() {
         let mut entry = build_entry(loaded_state(seg_spec("p")));
-        let (sender, receiver) = std::sync::mpsc::channel::<()>();
-        entry.feed_bridge = Some(std::thread::spawn(move || {
-            receiver.recv().unwrap();
-        }));
+        entry.feed_bridge = spawn_cancellable_bridge("feed-claim-test", async {
+            std::future::pending::<()>().await;
+        });
         assert!(!claim_feed_bridge(&mut entry));
-        drop(sender);
-        while !entry.feed_bridge.as_ref().unwrap().is_finished() {
+        let handle = Arc::clone(&entry.feed_bridge.as_ref().unwrap().handle);
+        drop(entry.feed_bridge.take());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
+        assert!(
+            handle.is_finished(),
+            "dropping entry bridge must cancel its worker"
+        );
+        let (cancel, _receiver) = tokio::sync::oneshot::channel();
+        entry.feed_bridge = Some(FeedBridge {
+            handle,
+            _cancel: cancel,
+        });
         assert!(claim_feed_bridge(&mut entry));
+    }
+
+    #[test]
+    fn dropping_feed_bridge_cancels_idle_worker() {
+        let bridge = spawn_cancellable_bridge("feed-cancel-test", async {
+            std::future::pending::<()>().await;
+        })
+        .expect("worker thread starts");
+        let handle = Arc::clone(&bridge.handle);
+        drop(bridge);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            handle.is_finished(),
+            "dropping bridge must cancel its idle worker"
+        );
+    }
+
+    #[test]
+    fn feed_bridge_admission_enforces_global_cap_and_same_plugin_idempotence() {
+        let mut state = state_with(
+            (0..=MAX_FEED_BRIDGES)
+                .map(|i| seg_spec(&format!("p{i}")))
+                .collect(),
+        );
+        for i in 0..MAX_FEED_BRIDGES {
+            state.plugins.get_mut(&format!("p{i}")).unwrap().feed_bridge =
+                spawn_cancellable_bridge("feed-cap-test", async {
+                    std::future::pending::<()>().await;
+                });
+        }
+        assert!(!feed_bridge_admission(&state, "p0").unwrap());
+        assert_eq!(
+            feed_bridge_admission(&state, &format!("p{MAX_FEED_BRIDGES}"))
+                .unwrap_err()
+                .code,
+            RpcErrorCode::RateLimited
+        );
+    }
+
+    #[test]
+    fn subscribe_verb_caps_custom_kinds_per_plugin() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let mut model = FrameModel::default();
+        let events = (0..100)
+            .map(|i| serde_json::to_value(EventKind::Custom(format!("custom-{i}"))).unwrap())
+            .collect::<Vec<_>>();
+        drain_one(
+            &mut state,
+            &mut model,
+            PluginMsg::Event {
+                plugin: "p".into(),
+                event: SessionEvent::Message(msg(
+                    "subscribe",
+                    serde_json::json!({ "events": events }),
+                )),
+            },
+        );
+        assert!(state.plugins["p"].runtime.subscriptions().len() <= MAX_SUBSCRIPTIONS_PER_PLUGIN);
     }
 
     fn msg(method: &str, params: serde_json::Value) -> RpcMessage {
@@ -1541,6 +1724,17 @@ mod tests {
             let err = host_call_check(&admin, cap).unwrap_err();
             assert_eq!(err.code, RpcErrorCode::Unsupported, "{cap}");
         }
+    }
+
+    #[test]
+    fn merge_add_requires_git_scope_not_naked_merge_scope() {
+        let merge = spec("p", Vec::new(), vec![Scope::MergeAdd]);
+        assert_eq!(
+            host_call_check(&merge, "merge.add").unwrap_err().code,
+            RpcErrorCode::Denied
+        );
+        let git = spec("p", Vec::new(), vec![Scope::Git]);
+        assert!(host_call_check(&git, "merge.add").is_ok());
     }
 
     #[test]
