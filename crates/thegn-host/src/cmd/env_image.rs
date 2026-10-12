@@ -77,9 +77,9 @@ fn bake_outcome(bake: Result<String>, cleanup: Result<()>, name: &str) -> Result
         (Err(bake), Err(cleanup)) => Err(anyhow!(
             "bake failed: {bake:#}; cleanup of source instance {name} failed: {cleanup:#}"
         )),
-        (Err(bake), Ok(())) => Err(bake.context(format!(
-            "bake failed; source instance {name} cleanup succeeded"
-        ))),
+        (Err(bake), Ok(())) => Err(anyhow!(
+            "bake failed: {bake:#}; source instance {name} cleanup succeeded"
+        )),
     }
 }
 
