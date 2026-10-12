@@ -247,9 +247,8 @@ impl LspInner {
             let keys = state
                 .map
                 .iter()
-                .filter_map(|(key, slot)| {
-                    matches!(slot, ClientSlot::Live { .. }).then(|| key.clone())
-                })
+                .filter(|(_, slot)| matches!(slot, ClientSlot::Live { .. }))
+                .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>();
             let mut clients = Vec::with_capacity(keys.len());
             for (root, key) in keys {
@@ -552,8 +551,11 @@ impl LspInner {
         }
     }
 
-    /// Retire live clients that have not been used within `idle`. The caller
-    /// supplies `now` so the sweep can be tested without sleeping.
+    /// Retire live clients that have not been used within `idle`. Usage is
+    /// refreshed when `client_with` returns a cached client; requests made
+    /// through a held `Arc<LspClient>` do not refresh it, so long sessions
+    /// using a retained handle can still be evicted. The caller supplies `now`
+    /// so the sweep can be tested without sleeping.
     #[allow(dead_code)] // the run-loop-2 lane owns periodic sweep wiring
     pub fn evict_idle(&self, idle: Duration, now: Instant) -> usize {
         let mut teardown = Vec::new();
@@ -1896,6 +1898,14 @@ mod tests {
         let started = Instant::now();
         drop(sup);
         assert!(started.elapsed() < Duration::from_secs(2));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !String::from_utf8(captured.lock().unwrap().clone())
+            .unwrap()
+            .contains("\"method\":\"exit\"")
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let bytes = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
         let shutdown = bytes.find("\"method\":\"shutdown\"").unwrap();
         let exit = bytes.find("\"method\":\"exit\"").unwrap();
