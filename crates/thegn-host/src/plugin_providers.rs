@@ -9,7 +9,9 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use thegn_svc::issue::{IssueBackend, IssueCaps};
+use thegn_svc::issue::{
+    Issue, IssueBackend, IssueCaps, IssueDetail, IssueDraft, IssueError, IssueFilter, IssuePatch,
+};
 use thegn_svc::plugin::{PluginIssueBackend, ProviderBridge};
 
 /// One live plugin issue provider: `(plugin id, account label, bridge, caps)`.
@@ -18,6 +20,122 @@ type Row = (String, String, Arc<ProviderBridge>, IssueCaps);
 fn registry() -> &'static Mutex<Vec<Row>> {
     static REG: OnceLock<Mutex<Vec<Row>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Guard a router-held adapter against use after its bridge is removed from
+/// the published provider set.
+struct LiveBackend {
+    inner: PluginIssueBackend,
+    bridge: Arc<ProviderBridge>,
+}
+
+impl LiveBackend {
+    fn ensure_live(&self) -> Result<(), IssueError> {
+        let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+        if reg.iter().any(|row| Arc::ptr_eq(&row.2, &self.bridge)) {
+            Ok(())
+        } else {
+            Err(IssueError::Api(
+                "plugin issue provider handle is stale: the plugin was reloaded, restarted or removed"
+                    .into(),
+            ))
+        }
+    }
+}
+
+impl IssueBackend for LiveBackend {
+    fn provider_id(&self) -> &str {
+        self.inner.provider_id()
+    }
+
+    fn caps(&self) -> IssueCaps {
+        self.inner.caps()
+    }
+
+    fn list_issues<'a>(
+        &'a self,
+        filter: &'a IssueFilter,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+        Box::pin(async move {
+            self.ensure_live()?;
+            self.inner.list_issues(filter).await
+        })
+    }
+
+    fn get_issue<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<IssueDetail, IssueError>> {
+        Box::pin(async move {
+            self.ensure_live()?;
+            self.inner.get_issue(id).await
+        })
+    }
+
+    fn create_issue<'a>(
+        &'a self,
+        draft: &'a IssueDraft,
+    ) -> futures::future::BoxFuture<'a, Result<Issue, IssueError>> {
+        Box::pin(async move {
+            self.ensure_live()?;
+            self.inner.create_issue(draft).await
+        })
+    }
+
+    fn update_issue<'a>(
+        &'a self,
+        id: &'a str,
+        patch: &'a IssuePatch,
+    ) -> futures::future::BoxFuture<'a, Result<Issue, IssueError>> {
+        Box::pin(async move {
+            self.ensure_live()?;
+            self.inner.update_issue(id, patch).await
+        })
+    }
+
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        limit: usize,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+        Box::pin(async move {
+            self.ensure_live()?;
+            self.inner.search(query, limit).await
+        })
+    }
+
+    fn add_comment<'a>(
+        &'a self,
+        id: &'a str,
+        body: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<(), IssueError>> {
+        Box::pin(async move {
+            self.ensure_live()?;
+            self.inner.add_comment(id, body).await
+        })
+    }
+
+    fn attach_label<'a>(
+        &'a self,
+        id: &'a str,
+        label: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<(), IssueError>> {
+        Box::pin(async move {
+            self.ensure_live()?;
+            self.inner.attach_label(id, label).await
+        })
+    }
+
+    fn detach_label<'a>(
+        &'a self,
+        id: &'a str,
+        label: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<(), IssueError>> {
+        Box::pin(async move {
+            self.ensure_live()?;
+            self.inner.detach_label(id, label).await
+        })
+    }
 }
 
 /// Replace the published set (the drain calls this after Loaded/Exit/reload).
@@ -43,7 +161,10 @@ pub(crate) fn issue_backends() -> Vec<(String, Box<dyn IssueBackend>)> {
             };
             Some((
                 account.clone(),
-                Box::new(backend) as Box<dyn IssueBackend>,
+                Box::new(LiveBackend {
+                    inner: backend,
+                    bridge: bridge.clone(),
+                }) as Box<dyn IssueBackend>,
             ))
         })
         .collect()
@@ -84,6 +205,18 @@ mod tests {
         assert_eq!(backends[0].1.caps(), caps);
         set_issue_providers(Vec::new());
         assert!(issue_backends().is_empty());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(backends[0].1.get_issue("plugin:demo:1"))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            IssueError::Api(message)
+                if message.contains("plugin issue provider handle is stale")
+        ));
     }
 
     fn fake_session() -> (thegn_svc::plugin::SessionWriter, ()) {
