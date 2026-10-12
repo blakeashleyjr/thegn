@@ -21,7 +21,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::io::Read;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
