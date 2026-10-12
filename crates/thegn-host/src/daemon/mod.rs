@@ -174,6 +174,13 @@ fn socket_usable_decision(
     let Some(parent) = socket.parent() else {
         return false;
     };
+    if parent
+        .parent()
+        .and_then(std::path::Path::file_name)
+        .is_some_and(|name| name == "thegn")
+    {
+        return runtime_socket_parent_usable(parent, probe);
+    }
     if let Some(metadata) = probe(parent) {
         return metadata.is_dir
             && !metadata.is_symlink
@@ -185,10 +192,17 @@ fn socket_usable_decision(
             metadata.is_dir && !metadata.is_symlink && metadata.mode & 0o1000 != 0
         });
     }
+    false
+}
+
+#[cfg(unix)]
+fn runtime_socket_parent_usable(
+    parent: &std::path::Path,
+    probe: &dyn Fn(&std::path::Path) -> Option<DirMeta>,
+) -> bool {
     // Runtime sockets have three directory levels below XDG_RUNTIME_DIR:
     // `thegn/<scope-key>/daemon.sock`. Check every existing ancestor in that
-    // layout. In particular, never trust a shared `thegn` directory merely
-    // because the per-scope leaf has not been created yet.
+    // layout, even when the private per-scope leaf already exists.
     let mut ancestor = Some(parent);
     let mut found = false;
     let mut has_private_anchor = false;
