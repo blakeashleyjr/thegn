@@ -102,8 +102,10 @@ pub struct Seg {
 
 /// The standard constructor: `seg(Tok::Slot(S::Dim), "text")`.
 pub fn seg(fg: Tok, text: impl Into<String>) -> Seg {
+    let text = text.into();
+    let text = thegn_core::neutralize_bidi_controls(&text).into_owned();
     Seg {
-        text: text.into(),
+        text,
         fg,
         bg: None,
         bold: false,

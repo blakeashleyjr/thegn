@@ -96,6 +96,28 @@ fn normalize_posix_locale(value: &str) -> Cow<'_, str> {
     }
 }
 
+/// Remove bidi formatting controls from text composed into host chrome.
+///
+/// Ordinary RTL letters are preserved. The removed characters have no
+/// display width, and returning borrowed text keeps clean per-frame strings
+/// allocation-free.
+pub fn neutralize_bidi_controls(text: &str) -> Cow<'_, str> {
+    const BIDI_CONTROLS: &[char] = &[
+        '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
+        '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+    ];
+
+    if !text.chars().any(|ch| BIDI_CONTROLS.contains(&ch)) {
+        return Cow::Borrowed(text);
+    }
+
+    Cow::Owned(
+        text.chars()
+            .filter(|ch| !BIDI_CONTROLS.contains(ch))
+            .collect(),
+    )
+}
+
 fn resolved_default(source: LocaleSource, diagnostic: Option<String>) -> LocaleResolution {
     LocaleResolution {
         language: default_language(),
@@ -190,5 +212,27 @@ mod tests {
         let configured = resolve(Some("en-XA"), None, None);
         assert!(!configured.pseudolocale);
         assert_eq!(configured.language.to_string(), "en-XA");
+    }
+
+    #[test]
+    fn neutralize_bidi_controls_removes_every_formatting_control() {
+        let controls = [
+            '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
+            '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ];
+        let hostile: String = controls.into_iter().collect();
+        assert_eq!(neutralize_bidi_controls(&hostile), "");
+    }
+
+    #[test]
+    fn neutralize_bidi_controls_preserves_rtl_cjk_emoji_and_fluent_text() {
+        let text = "שלום مرحبا 你好 🧭 { $name }";
+        assert_eq!(neutralize_bidi_controls(text), text);
+    }
+
+    #[test]
+    fn neutralize_bidi_controls_borrows_clean_input() {
+        let text = "ordinary text";
+        assert!(matches!(neutralize_bidi_controls(text), Cow::Borrowed(_)));
     }
 }

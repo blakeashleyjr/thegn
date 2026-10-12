@@ -11,6 +11,48 @@ fn lines(s: &Surface) -> Vec<String> {
         .collect()
 }
 
+fn has_bidi_control(text: &str) -> bool {
+    text.chars().any(|ch| {
+        matches!(
+            ch as u32,
+            0x061c | 0x200e | 0x200f | 0x202a..=0x202e | 0x2066..=0x2069
+        )
+    })
+}
+
+#[test]
+fn draw_text_neutralizes_bidi_controls_before_clipping() {
+    let mut s = Surface::new(8, 1);
+    draw_text(&mut s, 0, 0, "ab\u{202e}cd", col(S::Text), col(S::Bg1), 4);
+    let rendered = lines(&s).remove(0);
+    assert_eq!(rendered, "abcd    ");
+    assert!(!has_bidi_control(&rendered));
+}
+
+#[test]
+fn draw_text_bold_neutralizes_bidi_controls_before_clipping() {
+    let mut s = Surface::new(8, 1);
+    draw_text_bold(&mut s, 0, 0, "ab\u{202e}cd", col(S::Text), col(S::Bg1), 4);
+    let rendered = lines(&s).remove(0);
+    assert_eq!(rendered, "abcd    ");
+    assert!(!has_bidi_control(&rendered));
+}
+
+#[test]
+fn seg_labels_neutralize_bidi_controls_without_shifting_the_next_label() {
+    let mut s = Surface::new(20, 1);
+    let line = crate::seg::Line::segs(vec![
+        crate::seg::seg(crate::seg::Tok::Slot(S::Text), "feat/\u{2066}evil\u{2069}"),
+        crate::seg::seg(crate::seg::Tok::Slot(S::Text), "|"),
+        crate::seg::seg(crate::seg::Tok::Slot(S::Text), "next"),
+    ]);
+    crate::seg::draw_line(&mut s, 0, 0, 20, &line, crate::seg::Tok::Slot(S::Bg1));
+
+    let rendered = lines(&s).remove(0);
+    assert_eq!(rendered, "feat/evil|next      ");
+    assert!(!has_bidi_control(&rendered));
+}
+
 #[test]
 fn config_banner_persists_over_transient_status_until_cleared() {
     let mut model = FrameModel {
