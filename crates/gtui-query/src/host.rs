@@ -125,11 +125,7 @@ impl HostSource {
                     break;
                 }
                 if let Ok(mut r) = ring_bg.lock() {
-                    r.retain(|(sample_ts, _)| ts - *sample_ts <= RETENTION_SECS);
-                    r.push_back((ts, snap));
-                    while r.len() > RING_CAP {
-                        r.pop_front();
-                    }
+                    admit(&mut r, ts, snap);
                 }
                 // `unpark` interrupts this wait, retaining a 1 Hz cadence
                 // while making idle shutdown immediate.
@@ -243,6 +239,19 @@ fn now_secs() -> f64 {
     timestamp_secs(SystemTime::now())
 }
 
+/// Admit a sample against the current wall clock, keeping a sorted, bounded
+/// window. Samples newer than `ts` are discarded after a backward clock step;
+/// equal timestamps retain arrival order.
+fn admit(ring: &mut VecDeque<(f64, StatsSnapshot)>, ts: f64, snap: StatsSnapshot) {
+    let cutoff = ts - RETENTION_SECS;
+    ring.retain(|(sample_ts, _)| *sample_ts >= cutoff && *sample_ts <= ts);
+    let index = ring.partition_point(|(sample_ts, _)| *sample_ts <= ts);
+    ring.insert(index, (ts, snap));
+    while ring.len() > RING_CAP {
+        ring.pop_front();
+    }
+}
+
 fn timestamp_secs(now: SystemTime) -> f64 {
     now.duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -290,19 +299,20 @@ mod tests {
     }
 
     #[test]
-    fn query_uses_inclusive_requested_range_and_preserves_sample_order() {
+    fn query_uses_inclusive_range_and_sorted_sample_order() {
         let source = HostSource::try_new().unwrap();
         source.set_active(false);
         wait_for("worker parked", || source.in_park.load(Ordering::Acquire));
         let mut ring = source.ring.lock().unwrap();
-        for (ts, cpu) in [(10.0, 10), (20.0, 20), (20.0, 21), (30.0, 30)] {
-            ring.push_back((
+        for (ts, cpu) in [(10.0, 10), (30.0, 30), (20.0, 20), (20.0, 21)] {
+            admit(
+                &mut ring,
                 ts,
                 StatsSnapshot {
                     cpu_pct: Some(cpu),
                     ..Default::default()
                 },
-            ));
+            );
         }
         drop(ring);
 
@@ -313,6 +323,98 @@ mod tests {
         let frame = source.frame_for("host_cpu_pct", &range);
         assert_eq!(frame.fields[0].floats(), &[20.0, 20.0]);
         assert_eq!(frame.fields[1].floats(), &[20.0, 21.0]);
+    }
+
+    #[test]
+    fn backward_clock_step_discards_future_samples() {
+        let mut ring = VecDeque::new();
+        for ts in [1000.0, 1100.0, 900.0] {
+            admit(
+                &mut ring,
+                ts,
+                StatsSnapshot {
+                    cpu_pct: Some(ts as u8),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(
+            ring.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+            vec![900.0]
+        );
+    }
+
+    #[test]
+    fn retention_evicts_strictly_older_samples_and_keeps_boundary() {
+        let mut ring = VecDeque::new();
+        for ts in [100.0, 701.0] {
+            admit(
+                &mut ring,
+                ts,
+                StatsSnapshot {
+                    cpu_pct: Some(ts as u8),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(
+            ring.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+            vec![701.0]
+        );
+
+        let mut ring = VecDeque::new();
+        admit(&mut ring, 700.0, StatsSnapshot::default());
+        admit(&mut ring, 1300.0, StatsSnapshot::default());
+        assert_eq!(
+            ring.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+            vec![700.0, 1300.0]
+        );
+    }
+
+    #[test]
+    fn seeded_timestamp_interleavings_are_sorted_and_stable_for_duplicates() {
+        let mut ring = VecDeque::new();
+        let mut seed = 0x5eed_u64;
+        for arrival in 0..256 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let ts = ((seed >> 32) % 80) as f64;
+            admit(
+                &mut ring,
+                ts,
+                StatsSnapshot {
+                    cpu_pct: Some(arrival as u8),
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(ring.len() > 1, "seeded ring should retain multiple samples");
+        let samples: Vec<_> = ring.iter().collect();
+        let mut saw_duplicate_timestamp = false;
+        for pair in samples.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                saw_duplicate_timestamp = true;
+                assert!(
+                    pair[0].1.cpu_pct.unwrap() < pair[1].1.cpu_pct.unwrap(),
+                    "equal-timestamp samples must retain arrival order"
+                );
+            }
+        }
+        assert!(
+            saw_duplicate_timestamp,
+            "seeded ring should exercise duplicate timestamps"
+        );
+
+        let source = HostSource::try_new().unwrap();
+        source.set_active(false);
+        wait_for("worker parked", || source.in_park.load(Ordering::Acquire));
+        *source.ring.lock().unwrap() = ring.clone();
+        let range = TimeRange {
+            from: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            to: chrono::DateTime::from_timestamp(100, 0).unwrap(),
+        };
+        let frame = source.frame_for("host_cpu_pct", &range);
+        let times = frame.fields[0].floats();
+        assert!(times.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 
     #[tokio::test]
