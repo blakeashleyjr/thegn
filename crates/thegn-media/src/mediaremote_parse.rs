@@ -95,7 +95,8 @@ pub fn to_state(v: &Value) -> Option<MediaState> {
         can_go_previous: true,
         art_url: None, // artwork is a base64 blob; deferred
         kind,
-        can_seek: length.is_some(),
+        // The MediaRemote adapter has no seek operation, even when duration is known.
+        can_seek: false,
         track_id: None,
     })
 }
@@ -133,6 +134,7 @@ mod tests {
         assert_eq!(s.artist, "Daft Punk");
         assert_eq!(s.state, PlaybackState::Playing);
         assert_eq!(s.length, Some(Duration::from_secs_f64(248.0)));
+        assert!(!s.can_seek);
         assert_eq!(s.player, "spotify");
     }
 
@@ -156,5 +158,13 @@ mod tests {
         assert_eq!(to_state(&wrapped).unwrap().title, "X");
         // No metadata at all → nothing to show.
         assert!(to_state(&json!({ "playing": false })).is_none());
+    }
+
+    #[test]
+    fn duration_does_not_imply_seek_support() {
+        let v = json!({ "title": "X", "duration": 90.0 });
+        let s = to_state(&v).unwrap();
+        assert_eq!(s.length, Some(Duration::from_secs(90)));
+        assert!(!s.can_seek);
     }
 }

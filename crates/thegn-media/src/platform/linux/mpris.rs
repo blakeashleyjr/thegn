@@ -117,16 +117,11 @@ impl MprisZbus {
             }
             return Ok(None);
         }
-        let mut candidates: Vec<(String, PlaybackState)> = Vec::with_capacity(names.len());
+        let mut reads = Vec::with_capacity(names.len());
         for n in names {
-            let state = match self.player_props(&n).await {
-                Ok(props) => playback_state(&props),
-                // A player that won't answer `GetAll` still counts as present
-                // (Stopped) so priority/sticky can target it if nothing better.
-                Err(_) => PlaybackState::Stopped,
-            };
-            candidates.push((n, state));
+            reads.push((n.clone(), self.player_props(&n).await));
         }
+        let candidates = readable_candidates(reads)?;
         let sticky = self.last.lock().ok().and_then(|g| g.clone());
         let chosen = choose_player(&candidates, &self.priority, sticky.as_deref());
         if let Ok(mut last) = self.last.lock() {
@@ -704,6 +699,32 @@ fn playback_state(props: &HashMap<String, OwnedValue>) -> PlaybackState {
         .unwrap_or(PlaybackState::Stopped)
 }
 
+/// Keep only players whose property read succeeded. If every present player
+/// failed its read, surface an error so the caller can fall back to playerctl.
+fn readable_candidates(
+    reads: Vec<(String, Result<HashMap<String, OwnedValue>, MediaError>)>,
+) -> Result<Vec<(String, PlaybackState)>, MediaError> {
+    let had_players = !reads.is_empty();
+    let mut candidates = Vec::with_capacity(reads.len());
+    for (bus, read) in reads {
+        match read {
+            Ok(props) => candidates.push((bus, playback_state(&props))),
+            Err(error) => tracing::debug!(
+                target: "thegn::media",
+                bus = %bus,
+                %error,
+                "MPRIS player properties unreadable; skipping candidate",
+            ),
+        }
+    }
+    if had_players && candidates.is_empty() {
+        return Err(MediaError::Backend(
+            "no readable MPRIS player properties".into(),
+        ));
+    }
+    Ok(candidates)
+}
+
 /// Fold a `Player` property map into a normalized [`MediaState`].
 fn parse_state(player: &str, props: &HashMap<String, OwnedValue>) -> MediaState {
     // `Metadata` arrives from `Properties.GetAll` inside a variant; peel any
@@ -850,6 +871,45 @@ mod tests {
     #[test]
     fn choose_empty_is_none() {
         assert_eq!(choose_player(&[], &["mpv".to_string()], Some(MPV)), None);
+    }
+
+    #[test]
+    fn unreadable_priority_candidate_is_excluded() {
+        let reads = vec![
+            (
+                MPV.to_string(),
+                Err(MediaError::Backend("unreadable".into())),
+            ),
+            (
+                MPD.to_string(),
+                Ok(HashMap::from([(
+                    "PlaybackStatus".into(),
+                    Value::new("Playing").try_to_owned().unwrap(),
+                )])),
+            ),
+        ];
+        let candidates = readable_candidates(reads).unwrap();
+        assert_eq!(
+            choose_player(&candidates, &["mpv".to_string()], None).as_deref(),
+            Some(MPD)
+        );
+    }
+
+    #[test]
+    fn all_unreadable_players_return_an_error() {
+        let reads = vec![(
+            MPV.to_string(),
+            Err(MediaError::Backend("unreadable".into())),
+        )];
+        assert!(matches!(
+            readable_candidates(reads),
+            Err(MediaError::Backend(_))
+        ));
+    }
+
+    #[test]
+    fn no_mpris_players_remains_an_empty_candidate_list() {
+        assert!(readable_candidates(Vec::new()).unwrap().is_empty());
     }
 
     #[test]
