@@ -8136,9 +8136,7 @@ async fn event_loop<T: Terminal>(
                         corner_name = Some(pin.name.clone());
                         // Corner panes parse on the loop: the kitty relay must
                         // feed text pieces at exact cursor positions.
-                        if let Some(p) = panes.table.get(&id) {
-                            p.set_loop_fed(true);
-                        }
+                        panes.enter_corner_role(id);
                     }
                 }
                 continue;
@@ -11488,9 +11486,7 @@ async fn event_loop<T: Terminal>(
                                             corner_name = Some(pin.name.clone());
                                             // Corner panes parse on the loop
                                             // (kitty relay feeds text pieces).
-                                            if let Some(p) = panes.table.get(&id) {
-                                                p.set_loop_fed(true);
-                                            }
+                                            panes.enter_corner_role(id);
                                         }
                                     }
                                     continue;
@@ -21391,9 +21387,7 @@ async fn event_loop<T: Terminal>(
                                                 corner_name = Some(pin.name.clone());
                                                 // Corner panes parse on the loop
                                                 // (kitty relay feeds text pieces).
-                                                if let Some(p) = panes.table.get(&id) {
-                                                    p.set_loop_fed(true);
-                                                }
+                                                panes.enter_corner_role(id);
                                                 // Fresh child → fresh relay state.
                                                 corner_relay.reset();
                                                 corner_gfx.clear();

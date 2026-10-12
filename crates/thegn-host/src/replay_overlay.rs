@@ -490,11 +490,7 @@ impl ReplayOverlay {
         let end = rec.end_ms();
         let span = end.saturating_sub(start).max(1);
         let frac = (self.cursor_ms.saturating_sub(start)) as f64 / span as f64;
-        let bar_w = if rec.history_truncated() {
-            rect.cols.saturating_sub(72).clamp(4, 12)
-        } else {
-            rect.cols.saturating_sub(2).clamp(4, 40)
-        };
+        let bar_w = rect.cols.saturating_sub(2).clamp(4, 40);
         let filled = ((frac * bar_w as f64).round() as usize).min(bar_w);
         // Keyframe positions become faint tick marks so the timeline shows where
         // activity clustered.
@@ -523,7 +519,7 @@ impl ReplayOverlay {
 
         let mut left = vec![seg(Tok::Slot(S::Accent), icon).bold()];
         if rec.history_truncated() {
-            left.push(seg(Tok::Slot(S::Ghost3), "partial history"));
+            left.push(seg(Tok::Slot(S::Ghost3), " partial history "));
         }
         left.extend([
             seg(Tok::Slot(S::Accent), track),
@@ -542,7 +538,11 @@ impl ReplayOverlay {
             rect.x,
             by,
             rect.cols,
-            &Line::split(left, right),
+            &Line::SplitMinLeft {
+                l: left,
+                r: right,
+                min_l: 20,
+            },
             panel,
         );
 
@@ -1115,7 +1115,6 @@ mod tests {
 
     #[test]
     fn render_shows_partial_history_badge_only_after_boundary_loss() {
-        let epoch = Instant::now();
         let mut truncated = Recording::from_config(
             &ReplayConfig {
                 max_bytes_per_pane: 140,
@@ -1125,6 +1124,7 @@ mod tests {
             24,
             80,
         );
+        let epoch = truncated.epoch();
         truncated.push_bytes(b"\x1b[2;3H  ", epoch);
         truncated.push_bytes(b"X", epoch + std::time::Duration::from_millis(1));
         let truncated_overlay = ReplayOverlay::new(1, &truncated, 1000);
@@ -1146,6 +1146,11 @@ mod tests {
             .map(|cell| cell.str())
             .collect();
         assert!(truncated_text.contains("partial history"));
+        let track_cells = truncated_text
+            .chars()
+            .filter(|ch| matches!(ch, '━' | '┿' | '─'))
+            .count();
+        assert!(track_cells > 12);
 
         let fresh = recording_with(&[(b"hello", 10)]);
         let fresh_overlay = ReplayOverlay::new(1, &fresh, 1000);

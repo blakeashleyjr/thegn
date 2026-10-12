@@ -777,8 +777,8 @@ mod tests {
 
     #[test]
     fn eviction_and_oversized_chunks_mark_history_partial() {
-        let epoch = Instant::now();
         let mut evicted = Recording::from_config(&replay_cfg(140), 24, 80);
+        let epoch = evicted.epoch();
         assert!(!evicted.history_truncated());
         evicted.push_bytes(b"\x1b[2;3H  ", epoch);
         evicted.push_bytes(b"X", epoch + Duration::from_millis(1));
@@ -786,18 +786,20 @@ mod tests {
         assert!(evicted.search_snapshot().history_truncated);
 
         let mut oversized = Recording::from_config(&replay_cfg(140), 24, 80);
-        oversized.push_bytes(&[b'x'; 200], epoch);
+        let oversized_epoch = oversized.epoch();
+        oversized.push_bytes(&[b'x'; 200], oversized_epoch);
         assert!(oversized.history_truncated());
 
         let mut retained = Recording::from_config(&replay_cfg(256), 24, 80);
-        retained.push_bytes(b"small", epoch);
+        let retained_epoch = retained.epoch();
+        retained.push_bytes(b"small", retained_epoch);
         assert!(!retained.history_truncated());
     }
 
     #[test]
     fn search_results_disclose_a_partial_retained_window() {
-        let epoch = Instant::now();
         let mut rec = Recording::from_config(&replay_cfg(140), 24, 80);
+        let epoch = rec.epoch();
         rec.push_bytes(b"discarded", epoch);
         rec.push_bytes(b"needle", epoch + Duration::from_millis(1));
         let cancelled = std::sync::atomic::AtomicBool::new(false);
@@ -809,8 +811,8 @@ mod tests {
 
     #[test]
     fn truncated_cast_has_partial_marker_and_fresh_cast_does_not() {
-        let epoch = Instant::now();
         let mut truncated = Recording::from_config(&replay_cfg(140), 24, 80);
+        let epoch = truncated.epoch();
         truncated.push_bytes(b"\x1b[2;3H  ", epoch);
         truncated.push_bytes(b"X", epoch + Duration::from_millis(1));
         let mut cast = Vec::new();
@@ -819,7 +821,8 @@ mod tests {
         assert!(cast.contains("Replay history is partial"));
 
         let mut fresh = Recording::from_config(&replay_cfg(256), 24, 80);
-        fresh.push_bytes(b"X", epoch);
+        let fresh_epoch = fresh.epoch();
+        fresh.push_bytes(b"X", fresh_epoch);
         let mut cast = Vec::new();
         fresh.export_cast(&mut cast).unwrap();
         let cast = String::from_utf8(cast).unwrap();
