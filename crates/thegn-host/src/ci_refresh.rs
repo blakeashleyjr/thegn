@@ -267,7 +267,13 @@ fn refresh_ci_cache_for(
         Ok(result) => {
             let runs = result.runs;
             if result.discarded_rows > 0 {
-                tracing::warn!(target: "thegn::ci", discarded_rows = result.discarded_rows, "CI provider returned an incomplete run list");
+                let message = format!(
+                    "CI provider returned an incomplete run list ({} malformed row(s)); keeping stale cache",
+                    result.discarded_rows
+                );
+                tracing::warn!(target: "thegn::ci", discarded_rows = result.discarded_rows, "{message}");
+                record_failure(&key, &message, now, cfg.poll_interval_secs);
+                return true;
             }
             if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
                 return false;
@@ -371,6 +377,8 @@ fn ingest_failed_logs(
         };
         if detail.discarded_jobs > 0 {
             tracing::warn!(target: "thegn::ci", discarded_rows = detail.discarded_jobs, "CI detail omitted malformed job rows");
+            // A partial matrix is not enough evidence for log ingestion or an autofix handoff.
+            continue;
         }
         // A run first seen on this refresh gets priority, while a previously
         // seen run is still expanded when its cache is cold or its head moved.
