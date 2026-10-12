@@ -601,6 +601,14 @@ mod tests {
     }
 
     #[test]
+    fn handoff_present_is_true_only_for_a_verified_handoff() {
+        assert!(HandoffOutcome::VerifiedHandoff.handoff_present());
+        assert!(!HandoffOutcome::UnverifiedCandidate.handoff_present());
+        assert!(!HandoffOutcome::Absent.handoff_present());
+        assert!(!HandoffOutcome::InfrastructureUnknown.handoff_present());
+    }
+
+    #[test]
     fn a_present_tracked_artifact_passes() {
         let r = verify_report(&facts(
             Some(".thegn/pipeline/THE-76/code/5.md"),

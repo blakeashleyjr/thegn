@@ -15,7 +15,7 @@ use thegn_core::outln;
 use thegn_core::pipeline_resume;
 use thegn_core::pipeline_run;
 use thegn_core::store::NotificationStore;
-use thegn_core::util::git_out;
+use thegn_core::util::{git_out, git_out_allow_empty};
 use thegn_svc::control::client::{AttachControl, ControlAddr, ControlClient};
 // NOTE: stage `permissions` ride the daemon's launch command (the harness's
 // command-scoped grant, over the *effective* list — THE-440); the dispatch
@@ -1441,7 +1441,8 @@ async fn resume_work(
     //    read the done gate applies), the worktree's git state, and the
     //    previous session's final screen.
     let source_vf = crate::cmd::dispatch::verify_facts(&row);
-    let git_status = git_out(Path::new(&wt), &["status", "--porcelain"]).unwrap_or_default();
+    let git_status = git_out_allow_empty(Path::new(&wt), &["status", "--porcelain"])
+        .unwrap_or_else(|| "unknown (git status probe failed)".to_string());
     let diff_stat = git_out(Path::new(&wt), &["diff", "--stat"]).unwrap_or_default();
     let screen_tail = screen_tail_of(client, row.session_id.as_deref()).await;
     // 6. Reconcile the source before competing for a fresh slot. Failed rows
