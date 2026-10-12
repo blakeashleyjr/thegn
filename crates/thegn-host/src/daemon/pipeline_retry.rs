@@ -183,6 +183,19 @@ fn observe_exit(obs: &Arc<Observer>, session: String, code: Option<i32>) {
                 cap = MAX_PENDING_EXITS,
                 "transport retry queue full; exit deferred to durable reconcile"
             );
+            // Queue capacity must not decide whether the durable exit stamp
+            // is written. Reconciliation can recover classification later.
+            let svc = obs.svc.clone();
+            let stamp_session = session.clone();
+            tokio::spawn(async move {
+                if let Err(e) = stamp_dispatch_exit(&svc, stamp_session.clone(), Some(code)).await {
+                    tracing::warn!(
+                        target: "thegn::daemon",
+                        session = %stamp_session,
+                        "dispatch exit stamp: {e:#}"
+                    );
+                }
+            });
             return;
         }
         pending.insert(session.clone());
@@ -326,20 +339,16 @@ pub(crate) async fn stamp_dispatch_exit(
 
 /// Handle one nonzero headless exit. Split from [`spawn`] so a stub test can
 /// drive a synthetic exit through the same path with no PTY and no harness.
-/// `_code` is already known nonzero (the caller's gate); the classifier's
-/// `failed` argument is true by that same construction — the value itself is
-/// deliberately unused here (the underscore, not a discarded binding: the
-/// ignored-result ratchet pins `let _ = …` shapes).
 pub(crate) async fn handle_exit(
     svc: &DaemonService,
     session: &str,
-    _code: i32,
+    code: i32,
     attempts: &Attempts,
     permits: Option<&tokio::sync::Semaphore>,
 ) -> anyhow::Result<()> {
     // Associate and stamp first. Classification below uses this exact row/run
     // identity, never a second session lookup with a different timing window.
-    let Some(run) = stamp_dispatch_exit(svc, session.to_string(), Some(_code)).await? else {
+    let Some(run) = stamp_dispatch_exit(svc, session.to_string(), Some(code)).await? else {
         svc.native_ids
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -971,6 +980,81 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .starts_with("transport")
+        );
+    }
+
+    /// THE-257: an exit with no published row gives up at the bounded lookup
+    /// deadline, logs from `stamp_dispatch_exit`, and consumes its native id.
+    #[tokio::test]
+    async fn exit_without_a_published_row_gives_up_cleanly() {
+        use crate::daemon::service::DaemonService;
+        use crate::daemon::session::IdleTransition;
+        use crate::daemon::tombstone::{MAX_TOMBSTONES, TOMBSTONE_TTL_MS};
+        use thegn_core::db::Db;
+        use thegn_core::graveyard::Graveyard;
+        use thegn_core::issue::{AgentDispatchStatus as St, NewDispatch};
+        use tokio::sync::{broadcast, mpsc};
+
+        let (events, _rx) = broadcast::channel(16);
+        let (idle_tx, _idle_rx) = mpsc::unbounded_channel::<IdleTransition>();
+        let svc = DaemonService {
+            daemon_id: "test".into(),
+            sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            actor_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            accepting: AtomicBool::new(true),
+            tombs: Arc::new(tokio::sync::Mutex::new(Graveyard::new(
+                MAX_TOMBSTONES,
+                TOMBSTONE_TTL_MS,
+            ))),
+            native_ids: Mutex::new(HashMap::from([(
+                "s-never-published".into(),
+                "native-id".into(),
+            )])),
+            spawning_relaunches: Arc::new(Mutex::new(HashSet::new())),
+            events,
+            db: Arc::new(Mutex::new(Db::open_memory().expect("db"))),
+            grace_ms: 0,
+            idle_tx,
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            config: Arc::new(thegn_core::config::Config::default()),
+            profile_root: std::env::temp_dir(),
+            endpoint: "/tmp/test.sock".into(),
+        };
+        let row_id = {
+            let db = svc.db.lock().unwrap();
+            let id = db
+                .put_agent_dispatch(NewDispatch::new("linear:THE-257", "/wt/257", "aider"))
+                .unwrap();
+            db.update_dispatch_status(id, St::Running).unwrap();
+            assert!(db.bind_dispatch_session(id, "s-still-published").unwrap());
+            id
+        };
+        let attempts = Mutex::new(HashMap::new());
+        let started = tokio::time::Instant::now();
+        handle_exit(&svc, "s-never-published", 1, &attempts, None)
+            .await
+            .unwrap();
+
+        assert!(
+            started.elapsed() <= Duration::from_millis(750),
+            "unassociated exit exceeded its 500 ms lookup deadline"
+        );
+        let row = svc
+            .db
+            .lock()
+            .unwrap()
+            .get_dispatch(row_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, St::Running, "unrelated row remains unchanged");
+        assert_eq!(row.session_id.as_deref(), Some("s-still-published"));
+        assert_eq!(row.exit_code, None);
+        assert!(
+            !svc.native_ids
+                .lock()
+                .unwrap()
+                .contains_key("s-never-published"),
+            "native id is consumed when association gives up"
         );
     }
 }
