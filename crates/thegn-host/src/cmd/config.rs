@@ -82,7 +82,9 @@ pub fn run(
                     .map(|d| d.message.clone())
                     .collect();
                 let prior_errs: std::collections::HashSet<String> =
-                    thegn_core::config::validate_str(prior).into_iter().collect();
+                    thegn_core::config::validate_str(prior)
+                        .into_iter()
+                        .collect();
                 let new_enum_errs: Vec<&String> = enum_errs
                     .iter()
                     .filter(|error| !prior_errs.contains(*error))
@@ -90,8 +92,7 @@ pub fn run(
                 if parse_err.is_some() || !new_enum_errs.is_empty() {
                     if let Some(error) = parse_err {
                         anyhow::bail!(
-                            "{}: {key} = {:?} would make the config unparseable ({error}); not written",
-                            path.display(),
+                            "{key} = {:?} would make the config unparseable ({error}); not written",
                             shown_value(&key, &value)
                         );
                     }
@@ -99,8 +100,7 @@ pub fn run(
                         msg::error(&format!("{}: {error}", path.display()));
                     }
                     anyhow::bail!(
-                        "{}: {key} = {:?} is invalid ({} problem(s)); not written",
-                        path.display(),
+                        "{key} = {:?} is invalid ({} problem(s)); not written",
                         shown_value(&key, &value),
                         new_enum_errs.len(),
                     );
@@ -636,17 +636,21 @@ mod tests {
         assert_eq!(config.workspaces_dir, "/canonical");
         let original_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        assert!(
-            run(
-                &Config::default(),
-                Action::Set {
-                    key: "picker".into(),
-                    value: "42".into()
-                },
-                path.clone(),
-                Some(dir.path().to_owned()),
-            )
-            .is_err()
+        let error = run(
+            &Config::default(),
+            Action::Set {
+                key: "picker".into(),
+                value: "42".into(),
+            },
+            path.clone(),
+            Some(dir.path().to_owned()),
+        )
+        .unwrap_err();
+        let error_text = error.to_string();
+        assert_eq!(
+            error_text.matches(&path.display().to_string()).count(),
+            1,
+            "the rejected config set error should include the path once: {error_text}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
         assert_eq!(
