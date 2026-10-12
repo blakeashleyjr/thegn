@@ -822,6 +822,56 @@ fn log_view_renders_legibly() {
     assert!(seg::text_contrast_violations(&mut s, 3.0).is_empty());
 }
 
+#[test]
+fn notification_rows_replace_terminal_and_format_controls() {
+    let model = notif_model(
+        vec![notif(
+            NotificationKind::AgentFailed,
+            "THE-1\r\n",
+            "x\r\ny\u{202e}",
+            5,
+        )],
+        vec![],
+    );
+    let ov = open_notifications(&model);
+    let DetailContent::List(list) = &ov.content else {
+        panic!("expected notification list");
+    };
+    let text = list
+        .rows
+        .iter()
+        .map(|row| row.text.as_str())
+        .collect::<String>();
+
+    for ch in ['\r', '\n', '\u{202e}'] {
+        assert!(!text.contains(ch), "rendered notification contains {ch:?}");
+    }
+    assert!(text.contains('\u{fffd}'));
+}
+
+#[test]
+fn log_view_replaces_carriage_return_and_line_separator() {
+    let model = notif_model(
+        vec![notif(NotificationKind::LogError, "log:thegn", "errs", 5)],
+        vec![err_line("a\rb\u{2028}")],
+    );
+    let mut ov = open_notifications(&model);
+    ov.handle_key(&KeyCode::Enter, Modifiers::NONE);
+    let mut s = Surface::new(120, 40);
+    ov.render(&mut s, screen());
+    let text = s
+        .screen_cells()
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.str().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("a\u{fffd}b\u{fffd}"), "screen was: {text:?}");
+}
+
 // --- unified surface: grouping, dedup, cursor-skip, log gate -----------
 
 /// Attach a needs-you (Failure-tier) attention signal for `path` to `model`.
