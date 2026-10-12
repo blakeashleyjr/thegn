@@ -156,9 +156,9 @@ pub fn redact(text: &str) -> String {
     let mut unmatched_end = false;
     for part in text.split_inclusive('\n') {
         let line = part.strip_suffix('\n').unwrap_or(part);
-        if line.trim_start().starts_with("-----BEGIN ") {
+        if line.contains("-----BEGIN ") {
             seen_begin = true;
-        } else if line.trim_start().starts_with("-----END ") && !seen_begin {
+        } else if line.contains("-----END ") && !seen_begin {
             unmatched_end = true;
             break;
         }
@@ -167,7 +167,7 @@ pub fn redact(text: &str) -> String {
     let mut pem_safe = String::with_capacity(text.len());
     for part in text.split_inclusive('\n') {
         let line = part.strip_suffix('\n').unwrap_or(part);
-        let begin = line.trim_start().starts_with("-----BEGIN ");
+        let begin = line.contains("-----BEGIN ");
         if begin {
             in_pem = true;
         }
@@ -176,7 +176,7 @@ pub fn redact(text: &str) -> String {
         } else {
             pem_safe.push_str(line);
         }
-        if in_pem && line.trim_start().starts_with("-----END ") {
+        if in_pem && line.contains("-----END ") {
             in_pem = false;
         }
         if part.ends_with('\n') {
@@ -212,7 +212,7 @@ pub fn redact_stream_line(line: &[u8], in_pem: &mut bool) -> String {
     let (body, cr) = body
         .strip_suffix('\r')
         .map_or((body, ""), |body| (body, "\r"));
-    if body.trim_start().starts_with("-----BEGIN ") {
+    if body.contains("-----BEGIN ") {
         *in_pem = true;
     }
     let result = if *in_pem {
@@ -220,7 +220,7 @@ pub fn redact_stream_line(line: &[u8], in_pem: &mut bool) -> String {
     } else {
         redact(body)
     };
-    if *in_pem && body.trim_start().starts_with("-----END ") {
+    if *in_pem && body.contains("-----END ") {
         *in_pem = false;
     }
     format!("{result}{cr}{newline}")
@@ -312,6 +312,28 @@ mod tests {
         assert!(!tail.contains("SYNTHETIC_PRIVATE_KEY_BODY"));
         assert!(tail.contains("ordinary failure"));
         assert!(tail.contains(REDACTION_MARKER));
+    }
+
+    #[test]
+    fn provider_prefixed_pem_is_redacted_in_batch_and_streaming_paths() {
+        let text = concat!(
+            "build\tstep\t2024-01-01T00:00:00.0000000Z -----BEGIN OPENSSH PRIVATE KEY-----\n",
+            "SYNTHETICKEYBODY\n",
+            "build\tstep\t2024-01-01T00:00:01.0000000Z -----END OPENSSH PRIVATE KEY-----\n",
+            "ordinary failure diagnostic\n",
+        );
+        let batch = redact(text);
+        assert!(!batch.contains("SYNTHETICKEYBODY"));
+        assert!(batch.contains("ordinary failure diagnostic"));
+
+        let mut in_pem = false;
+        let streamed = text
+            .split_inclusive('\n')
+            .map(|line| redact_stream_line(line.as_bytes(), &mut in_pem))
+            .collect::<String>();
+        assert!(!streamed.contains("SYNTHETICKEYBODY"));
+        assert!(streamed.contains("ordinary failure diagnostic"));
+        assert!(!in_pem);
     }
 
     #[test]
