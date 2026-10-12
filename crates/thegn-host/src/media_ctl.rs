@@ -2,10 +2,63 @@
 //! picker result, and the off-thread spawners the event loop calls. Split out of
 //! the ratcheted `run.rs` god-file; the loop `use`s these by their bare names.
 
+use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::panel::media::{MediaQueueDelivery, MediaRequest, MediaSourcesDelivery};
+
+const MAX_PENDING_MEDIA_OPS: usize = 8;
+const MEDIA_OP_BUDGET: Duration = Duration::from_secs(5);
+
+type MediaOpTail = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
+
+static MEDIA_OP_TAIL: LazyLock<MediaOpTail> = LazyLock::new(|| Arc::new(Mutex::new(None)));
+static MEDIA_OP_PENDING: LazyLock<Arc<AtomicUsize>> =
+    LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
+
+struct PendingOp(Arc<AtomicUsize>);
+
+impl Drop for PendingOp {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Queue one operation behind the current tail. The reservation bounds both
+/// running and queued work, and the tail lock defines the operation order.
+fn chain_op<F>(tail: &MediaOpTail, pending: &Arc<AtomicUsize>, cap: usize, future: F) -> bool
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    if pending
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < cap).then_some(count + 1)
+        })
+        .is_err()
+    {
+        return false;
+    }
+
+    let mut tail = tail.lock().unwrap_or_else(|error| error.into_inner());
+    let previous = tail.take();
+    let pending_guard = PendingOp(pending.clone());
+    *tail = Some(tokio::spawn(async move {
+        let _pending = pending_guard;
+        if let Some(previous) = previous {
+            match previous.await {
+                Ok(()) | Err(_) => {}
+            }
+        }
+        if tokio::time::timeout(MEDIA_OP_BUDGET, future).await.is_err() {
+            tracing::warn!(target: "thegn::media", budget_secs = MEDIA_OP_BUDGET.as_secs(), "media operation exceeded its time budget");
+        }
+    }));
+    true
+}
 
 async fn snapshot_or_log(
     client: &thegn_media::MediaClient,
@@ -161,51 +214,59 @@ pub(crate) fn spawn_media_op(
     waker: TerminalWaker,
 ) {
     let generation = generation.current();
-    tokio::spawn(async move {
-        let Some(client) = crate::media_secret::client_for(&cfg).await else {
-            return;
-        };
-        let cur = snapshot_or_log(&client, "preflight").await;
-        let cur_state = cur.as_ref().map(|snapshot| &snapshot.state);
-        let res = match op {
-            MediaOp::PlayPause => Some(client.play_pause().await),
-            MediaOp::Next => Some(client.next().await),
-            MediaOp::Previous => Some(client.previous().await),
-            MediaOp::ShuffleToggle => match shuffle_target(cur.as_ref()) {
-                Ok(on) => Some(client.set_shuffle(on).await),
-                Err(error) => {
-                    tracing::warn!(target: "thegn::media", outcome = ?error, "media shuffle toggle preflight failed");
-                    None
+    let accepted = chain_op(
+        &MEDIA_OP_TAIL,
+        &MEDIA_OP_PENDING,
+        MAX_PENDING_MEDIA_OPS,
+        async move {
+            let Some(client) = crate::media_secret::client_for(&cfg).await else {
+                return;
+            };
+            let cur = snapshot_or_log(&client, "preflight").await;
+            let cur_state = cur.as_ref().map(|snapshot| &snapshot.state);
+            let res = match op {
+                MediaOp::PlayPause => Some(client.play_pause().await),
+                MediaOp::Next => Some(client.next().await),
+                MediaOp::Previous => Some(client.previous().await),
+                MediaOp::ShuffleToggle => match shuffle_target(cur.as_ref()) {
+                    Ok(on) => Some(client.set_shuffle(on).await),
+                    Err(error) => {
+                        tracing::warn!(target: "thegn::media", outcome = ?error, "media shuffle toggle preflight failed");
+                        None
+                    }
+                },
+                MediaOp::LoopCycle => match loop_target(cur.as_ref()) {
+                    Ok(next) => Some(client.set_loop(next).await),
+                    Err(error) => {
+                        tracing::warn!(target: "thegn::media", outcome = ?error, "media loop cycle preflight failed");
+                        None
+                    }
+                },
+                MediaOp::VolumeUp => Some(client.volume_step(cfg.volume_step).await),
+                MediaOp::VolumeDown => Some(client.volume_step(-cfg.volume_step).await),
+                MediaOp::SeekForward | MediaOp::SeekBack => {
+                    let kind = cur_state.map(|s| s.kind).unwrap_or_default();
+                    let step = cfg.seek_step(kind);
+                    Some(client.seek(step, matches!(op, MediaOp::SeekForward)).await)
                 }
-            },
-            MediaOp::LoopCycle => match loop_target(cur.as_ref()) {
-                Ok(next) => Some(client.set_loop(next).await),
-                Err(error) => {
-                    tracing::warn!(target: "thegn::media", outcome = ?error, "media loop cycle preflight failed");
-                    None
-                }
-            },
-            MediaOp::VolumeUp => Some(client.volume_step(cfg.volume_step).await),
-            MediaOp::VolumeDown => Some(client.volume_step(-cfg.volume_step).await),
-            MediaOp::SeekForward | MediaOp::SeekBack => {
-                let kind = cur_state.map(|s| s.kind).unwrap_or_default();
-                let step = cfg.seek_step(kind);
-                Some(client.seek(step, matches!(op, MediaOp::SeekForward)).await)
+                MediaOp::PlayQueueItem(ref id) => Some(client.play_queue_item(id).await),
+                MediaOp::ChapterNext => Some(client.chapter_next().await),
+                MediaOp::ChapterPrev => Some(client.chapter_prev().await),
+                MediaOp::FullscreenToggle => Some(client.toggle_fullscreen().await),
+            };
+            if let Some(Err(e)) = res {
+                tracing::warn!(target: "thegn::media", error = %e, "media op {op:?} failed");
             }
-            MediaOp::PlayQueueItem(ref id) => Some(client.play_queue_item(id).await),
-            MediaOp::ChapterNext => Some(client.chapter_next().await),
-            MediaOp::ChapterPrev => Some(client.chapter_prev().await),
-            MediaOp::FullscreenToggle => Some(client.toggle_fullscreen().await),
-        };
-        if let Some(Err(e)) = res {
-            tracing::warn!(target: "thegn::media", error = %e, "media op {op:?} failed");
-        }
-        let _ = tx.send(crate::media_watch::MediaSnapshotDelivery {
-            generation,
-            snapshot: snapshot_or_log(&client, "transport").await,
-        }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-    });
+            let _ = tx.send(crate::media_watch::MediaSnapshotDelivery {
+                generation,
+                snapshot: snapshot_or_log(&client, "transport").await,
+            }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        },
+    );
+    if !accepted {
+        tracing::debug!(target: "thegn::media", "media operation dropped because the pending limit was reached");
+    }
 }
 
 /// Map a panel hit to the same off-loop operation used by keyboard actions.
@@ -323,7 +384,9 @@ pub(crate) fn spawn_media_sources(
 
 #[cfg(test)]
 mod tests {
-    use super::{MediaPreflightError, loop_target, shuffle_target};
+    use super::{MediaPreflightError, chain_op, loop_target, shuffle_target};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
     use thegn_core::media::{LoopMode, MediaSnapshot, MediaState};
 
     #[test]
@@ -378,5 +441,65 @@ mod tests {
         };
         assert_eq!(shuffle_target(Some(&snapshot)), Ok(true));
         assert_eq!(loop_target(Some(&snapshot)), Ok(LoopMode::Playlist));
+    }
+
+    #[tokio::test]
+    async fn transport_operations_run_in_enqueue_order() {
+        let tail = Arc::new(Mutex::new(None));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        let first_records = records.clone();
+        assert!(chain_op(&tail, &pending, 8, async move {
+            release_rx.await.unwrap();
+            first_records.lock().unwrap().push(1);
+        }));
+        let second_records = records.clone();
+        assert!(chain_op(&tail, &pending, 8, async move {
+            second_records.lock().unwrap().push(2);
+        }));
+
+        release_tx.send(()).unwrap();
+        let last = tail.lock().unwrap().take().unwrap();
+        last.await.unwrap();
+        assert_eq!(*records.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn transport_operation_queue_rejects_work_over_its_cap() {
+        let tail = Arc::new(Mutex::new(None));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        assert!(chain_op(&tail, &pending, 1, async move {
+            release_rx.await.unwrap();
+        }));
+        assert!(!chain_op(&tail, &pending, 1, async {}));
+        assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 1);
+
+        release_tx.send(()).unwrap();
+        let last = tail.lock().unwrap().take().unwrap();
+        last.await.unwrap();
+        assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_transport_operation_does_not_block_the_queue() {
+        let tail = Arc::new(Mutex::new(None));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+
+        assert!(chain_op(&tail, &pending, 8, async {
+            std::future::pending::<()>().await;
+        }));
+        assert!(chain_op(&tail, &pending, 8, async move {
+            assert!(second_tx.send(()).is_ok());
+        }));
+
+        let last = tail.lock().unwrap().take().unwrap();
+        last.await.unwrap();
+        second_rx.await.unwrap();
+        assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 }
