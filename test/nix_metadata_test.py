@@ -207,7 +207,7 @@ def validate_release_texts(
             target for target, metadata in targets.items() if metadata.get("enabled") is True
         }
         archive_files = set(json.loads(release_json)["archive"]["root_files"])
-    except (tomllib.TOMLDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+    except (tomllib.TOMLDecodeError, json.JSONDecodeError, KeyError, TypeError, AttributeError) as exc:
         return [f"release metadata is unreadable: {exc}"]
 
     license_parts = [part.strip() for part in license_expr.split(" OR ")]
@@ -244,13 +244,17 @@ def validate_release_texts(
             f"manifest-only={sorted(enabled_targets - matrix_targets)}"
         )
 
-    upload_step = re.search(r"^\s*- id: upload\s*$", release_yml, re.MULTILINE)
-    upload_config = release_yml[upload_step.start() :] if upload_step else ""
+    upload_step = re.search(r"^[ \t]*- id: upload[ \t]*$", release_yml, re.MULTILINE)
+    upload_config = release_yml[upload_step.end() :] if upload_step else ""
     next_step = re.search(r"\n[ \t]*- (?:name:|id:|uses:)", upload_config)
     if next_step:
         upload_config = upload_config[: next_step.start()]
     include_match = re.search(r"^\s*include:\s*([^\n#]+)", upload_config, re.MULTILINE)
-    include_files = set(include_match.group(1).strip().split(",")) if include_match else set()
+    include_files = (
+        {part.strip() for part in include_match.group(1).split(",") if part.strip()}
+        if include_match
+        else set()
+    )
     missing_licenses = sorted(LICENSE_FILES - include_files)
     if missing_licenses:
         problems.append(f"release.yml upload include is missing license files: {missing_licenses}")
@@ -288,7 +292,10 @@ def main(root: Path = ROOT) -> int:
         for problem in problems:
             print(f"  {problem}")
         return 1
-    print("OK: Nix package versions, licenses, and installed license files follow Cargo")
+    print(
+        "OK: Nix package metadata, release templates, upload matrix, and archive files "
+        "follow Cargo and packaging metadata"
+    )
     return 0
 
 
@@ -424,6 +431,36 @@ def self_test() -> int:
     problems = validate_release_texts(*release_good)
     if problems:
         print(f"SELF-TEST FAIL: good release fixture rejected: {problems}")
+        return 1
+    spaced_include = release_good[1].replace(
+        "LICENSE-MIT,LICENSE-APACHE", "LICENSE-MIT, LICENSE-APACHE"
+    )
+    problems = validate_release_texts(
+        release_good[0], spaced_include, release_good[2], release_good[3]
+    )
+    if problems:
+        print(f"SELF-TEST FAIL: spaced include list rejected: {problems}")
+        return 1
+    blank_before_upload = release_good[1].replace(
+        "        - id: upload", "\n        - id: upload"
+    )
+    problems = validate_release_texts(
+        release_good[0], blank_before_upload, release_good[2], release_good[3]
+    )
+    if problems:
+        print(f"SELF-TEST FAIL: blank line before upload step rejected: {problems}")
+        return 1
+    malformed_targets = json.dumps(
+        {
+            "archive": {"root_files": ["LICENSE-MIT", "LICENSE-APACHE"]},
+            "targets": {"x86_64-unknown-linux-gnu": None},
+        }
+    )
+    problems = validate_release_texts(
+        release_good[0], release_good[1], malformed_targets, release_good[3]
+    )
+    if not any(problem.startswith("release metadata is unreadable:") for problem in problems):
+        print(f"SELF-TEST FAIL: malformed target metadata was not reported: {problems}")
         return 1
     bad_release_fixtures = (
         (
