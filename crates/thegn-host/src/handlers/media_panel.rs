@@ -11,6 +11,7 @@ pub(crate) fn art_request(
     visible: bool,
 ) -> Option<String> {
     if !visible {
+        panel.cancel_art_request();
         return None;
     }
     panel.wants_art(state, show_art)
@@ -57,6 +58,20 @@ mod tests {
             ..MediaState::default()
         };
 
+        assert!(art_request(&mut panel, Some(&state), true, false).is_none());
+        assert!(art_request(&mut panel, Some(&state), true, true).is_some());
+    }
+
+    #[test]
+    fn art_request_retries_after_hidden_period() {
+        let mut panel = crate::panel::media::MediaPanelState::default();
+        panel.set_art_enabled(true);
+        let state = MediaState {
+            art_url: Some("https://example.invalid/cover.png".into()),
+            ..MediaState::default()
+        };
+
+        assert!(art_request(&mut panel, Some(&state), true, true).is_some());
         assert!(art_request(&mut panel, Some(&state), true, false).is_none());
         assert!(art_request(&mut panel, Some(&state), true, true).is_some());
     }

@@ -11909,6 +11909,7 @@ async fn event_loop<T: Terminal>(
             chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Media;
         if media_art_was_visible && !media_position_visible {
             crate::media_art::cancel_in_flight();
+            panel_ui.media.cancel_art_request();
         }
         media_art_was_visible = media_position_visible;
         let (media_full, media_bars) = crate::media_watch::drain_snapshots(
@@ -12008,9 +12009,12 @@ async fn event_loop<T: Terminal>(
             );
             dirty = true;
         }
-        if let Ok(true) = media_art_rx.has_changed()
-            && let Some(art) = media_art_rx.borrow_and_update().clone()
-        {
+        let art = if matches!(media_art_rx.has_changed(), Ok(true)) {
+            media_art_rx.borrow_and_update().clone()
+        } else {
+            None
+        };
+        if let Some(art) = art {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             panel_ui.media.set_art(model.panel.media.as_ref(), art);
             dirty = true;
@@ -12234,6 +12238,7 @@ async fn event_loop<T: Terminal>(
                         &waker,
                     );
                     crate::media_art::cancel_in_flight();
+                    panel_ui.media.cancel_art_request();
                     // Live `[[plugins]]` reload: tear the running set down
                     // (deactivate + kill) and start fresh from the reloaded
                     // specs — the documented way to deliberately restart a

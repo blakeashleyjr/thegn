@@ -367,18 +367,15 @@ pub(crate) fn spawn_fetch(
         if !LATEST.is_current(generation) {
             return;
         }
-        if tx.send_if_modified(|stored| {
-            *stored = Some(ArtMosaic {
-                url: art_url,
-                lines,
-            });
-            true
-        }) {
-            if let Err(error) = waker.wake() {
-                tracing::debug!(target: "thegn::media_art", %error, "cover art wake failed");
-            }
-        } else if tx.is_closed() {
+        if tx.is_closed() {
             tracing::debug!(target: "thegn::media_art", "cover art receiver closed");
+        }
+        drop(tx.send_replace(Some(ArtMosaic {
+            url: art_url,
+            lines,
+        })));
+        if let Err(error) = waker.wake() {
+            tracing::debug!(target: "thegn::media_art", %error, "cover art wake failed");
         }
     });
     replace_in_flight(&IN_FLIGHT, handle);
@@ -744,6 +741,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_invalidates_and_aborts_the_in_flight_task() {
+        use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
 
         struct DropFlag(Arc<AtomicBool>);
@@ -756,9 +754,9 @@ mod tests {
         let latest = Latest::default();
         let slot = Mutex::new(None);
         let dropped = Arc::new(AtomicBool::new(false));
-        let task_dropped = dropped.clone();
+        let guard = DropFlag(dropped.clone());
         let handle = tokio::spawn(async move {
-            let _guard = DropFlag(task_dropped);
+            let _guard = guard;
             std::future::pending::<()>().await;
         });
         replace_in_flight(&slot, handle);
