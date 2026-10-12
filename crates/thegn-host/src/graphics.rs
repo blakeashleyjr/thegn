@@ -22,9 +22,9 @@ pub const PREVIEW_IMAGE_ID: u32 = crate::kitty_relay::CORNER_ID_BASE - 1;
 
 const _: () = assert!(
     PREVIEW_IMAGE_ID != 0
-        && !(PREVIEW_IMAGE_ID >= crate::kitty_relay::CORNER_ID_BASE
-            && PREVIEW_IMAGE_ID
-                < crate::kitty_relay::CORNER_ID_BASE + crate::kitty_relay::CORNER_IDS as u32)
+        && (PREVIEW_IMAGE_ID < crate::kitty_relay::CORNER_ID_BASE
+            || PREVIEW_IMAGE_ID
+                >= crate::kitty_relay::CORNER_ID_BASE + crate::kitty_relay::CORNER_IDS as u32)
 );
 
 /// A placed image: where (0-based screen cell origin) and how big (in cells) to
@@ -233,6 +233,5 @@ mod tests {
         assert!(!delete_preview().windows(5).any(|w| w == b"a=d\x1b\\"));
         assert_ne!(delete_preview(), b"\x1b_Ga=d\x1b\\");
         assert_ne!(PREVIEW_IMAGE_ID, 0);
-        assert!(PREVIEW_IMAGE_ID < crate::kitty_relay::CORNER_ID_BASE);
     }
 }
