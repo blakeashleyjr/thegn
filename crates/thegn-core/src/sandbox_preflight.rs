@@ -330,13 +330,14 @@ mod tests {
         let mut spec = base_spec(Backend::Docker);
         spec.name = "thegn-x".into();
         spec.compose = Some(compose.encode());
-        let observed = std::cell::RefCell::new(Vec::new());
-        let result = preflight_exec_with(&spec, &|argv| {
-            *observed.borrow_mut() = argv.to_vec();
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner_observed = std::sync::Arc::clone(&observed);
+        let result = preflight_exec_with(&spec, &move |argv| {
+            *runner_observed.lock().unwrap() = argv.to_vec();
             Some((true, String::new()))
         });
         assert_eq!(result, Ok(()));
-        let observed = observed.borrow();
+        let observed = observed.lock().unwrap();
         let exec = observed.iter().position(|arg| arg == "exec").unwrap();
         assert_eq!(observed[exec - 2].as_str(), "-p");
         assert_eq!(observed[exec - 1].as_str(), "thegn-x");
