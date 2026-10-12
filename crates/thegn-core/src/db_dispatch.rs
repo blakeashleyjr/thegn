@@ -752,6 +752,126 @@ impl Db {
         }
     }
 
+    /// Renew a live lease only while it is still held by `owner`.
+    ///
+    /// The write lock covers both the identity/expiry check and the extension,
+    /// so a takeover or release cannot be hidden by a late heartbeat. The inner
+    /// success is the new `expires_at_ms`; refusal contains the raw row observed,
+    /// or `None` when no row exists.
+    pub fn renew_pipeline_lease(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl_secs: i64,
+    ) -> Result<std::result::Result<i64, Option<(String, i64)>>> {
+        validate_lease_text("name", name)?;
+        validate_lease_text("owner", owner)?;
+        if !(MIN_LEASE_TTL_SECS..=MAX_LEASE_TTL_SECS).contains(&ttl_secs) {
+            return Err(anyhow::Error::new(LeaseInputError {
+                field: "ttl",
+                reason: "outside the admitted lease TTL range",
+            }));
+        }
+        let now = util::now_ms();
+        let expires = ttl_secs
+            .checked_mul(1000)
+            .and_then(|ttl_ms| now.checked_add(ttl_ms))
+            .ok_or_else(|| {
+                anyhow::Error::new(LeaseInputError {
+                    field: "ttl",
+                    reason: "expiry is outside the supported timestamp range",
+                })
+            })?;
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<std::result::Result<i64, Option<(String, i64)>>> {
+            let row = conn
+                .query_row(
+                    "SELECT owner, expires_at_ms FROM pipeline_leases WHERE name=?1",
+                    [name],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            if let Some((row_owner, row_expiry)) = row {
+                if row_owner == owner && row_expiry > now {
+                    conn.execute(
+                        "UPDATE pipeline_leases SET acquired_at_ms=?1, expires_at_ms=?2 \
+                         WHERE name=?3 AND owner=?4 AND expires_at_ms=?5",
+                        rusqlite::params![now, expires, name, owner, row_expiry],
+                    )?;
+                    return Ok(Ok(expires));
+                }
+                return Ok(Err(Some((row_owner, row_expiry))));
+            }
+            Ok(Err(None))
+        })();
+        match result {
+            Ok(outcome) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(outcome)
+            }
+            Err(err) => {
+                conn.execute_batch("ROLLBACK")?;
+                Err(err)
+            }
+        }
+    }
+
+    /// Return the stored lease row even when it has expired.
+    pub fn pipeline_lease_row(&self, name: &str) -> Result<Option<(String, i64)>> {
+        validate_lease_text("name", name)?;
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT owner, expires_at_ms FROM pipeline_leases WHERE name=?1",
+                [name],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Release a lease and return the row observed before deletion.
+    /// A foreign owner's row is reported but never deleted.
+    pub fn release_pipeline_lease_row(
+        &self,
+        name: &str,
+        owner: &str,
+    ) -> Result<Option<(String, i64)>> {
+        validate_lease_text("name", name)?;
+        validate_lease_text("owner", owner)?;
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<Option<(String, i64)>> {
+            let row = conn
+                .query_row(
+                    "SELECT owner, expires_at_ms FROM pipeline_leases WHERE name=?1",
+                    [name],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            if row
+                .as_ref()
+                .is_some_and(|(row_owner, _)| row_owner == owner)
+            {
+                conn.execute(
+                    "DELETE FROM pipeline_leases WHERE name=?1 AND owner=?2",
+                    rusqlite::params![name, owner],
+                )?;
+            }
+            Ok(row)
+        })();
+        match result {
+            Ok(row) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(row)
+            }
+            Err(err) => {
+                conn.execute_batch("ROLLBACK")?;
+                Err(err)
+            }
+        }
+    }
+
     /// Release a lease this owner holds. A no-op when someone else holds it —
     /// releasing another process's lease is never correct.
     pub fn release_pipeline_lease(&self, name: &str, owner: &str) -> Result<bool> {
@@ -1480,6 +1600,147 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0, "expired abandoned names are pruned on acquire");
+    }
+
+    #[test]
+    fn lease_renewal_requires_the_same_live_owner_and_reports_the_observed_row() {
+        let db = Db::open_memory().unwrap();
+        let ttl = MIN_LEASE_TTL_SECS;
+        db.acquire_pipeline_lease("renew", "owner-a", ttl)
+            .unwrap()
+            .unwrap();
+        let expiry = db
+            .renew_pipeline_lease("renew", "owner-a", ttl)
+            .unwrap()
+            .unwrap();
+        assert!(expiry > util::now_ms());
+
+        let replaced = db
+            .renew_pipeline_lease("renew", "owner-b", ttl)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(replaced, db.pipeline_lease_row("renew").unwrap());
+
+        db.conn()
+            .execute(
+                "UPDATE pipeline_leases SET owner='owner-a', expires_at_ms=1 WHERE name='renew'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.acquire_pipeline_lease("renew", "owner-b", ttl)
+                .unwrap()
+                .is_ok()
+        );
+        let owner_b_expiry = db.pipeline_lease_row("renew").unwrap().unwrap().1;
+        assert_eq!(
+            db.renew_pipeline_lease("renew", "owner-a", ttl)
+                .unwrap()
+                .unwrap_err(),
+            Some(("owner-b".into(), owner_b_expiry))
+        );
+        db.conn()
+            .execute(
+                "UPDATE pipeline_leases SET owner='owner-a', expires_at_ms=1 WHERE name='renew'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.renew_pipeline_lease("renew", "owner-a", ttl)
+                .unwrap()
+                .unwrap_err(),
+            db.pipeline_lease_row("renew").unwrap()
+        );
+        assert_eq!(
+            db.renew_pipeline_lease("missing", "owner-a", ttl)
+                .unwrap()
+                .unwrap_err(),
+            None
+        );
+        assert!(db.renew_pipeline_lease("renew", "owner-a", 0).is_err());
+    }
+
+    #[test]
+    fn lease_renewal_rolls_back_on_storage_error() {
+        let db = Db::open_memory().unwrap();
+        db.acquire_pipeline_lease("renew-error", "owner", MIN_LEASE_TTL_SECS)
+            .unwrap()
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_lease_renew BEFORE UPDATE ON pipeline_leases \
+                 BEGIN SELECT RAISE(ABORT, 'renew refused'); END;",
+            )
+            .unwrap();
+        assert!(
+            db.renew_pipeline_lease("renew-error", "owner", MIN_LEASE_TTL_SECS)
+                .is_err()
+        );
+        assert!(db.pipeline_lease_row("renew-error").unwrap().is_some());
+    }
+
+    #[test]
+    fn lease_release_reports_the_row_and_deletes_only_the_named_owner() {
+        let db = Db::open_memory().unwrap();
+        db.acquire_pipeline_lease("release", "owner-a", MIN_LEASE_TTL_SECS)
+            .unwrap()
+            .unwrap();
+        let before = db.pipeline_lease_row("release").unwrap().unwrap();
+        assert_eq!(
+            db.release_pipeline_lease_row("release", "owner-b").unwrap(),
+            Some(before.clone())
+        );
+        assert_eq!(db.pipeline_lease_row("release").unwrap(), Some(before));
+        assert!(
+            db.release_pipeline_lease_row("release", "owner-a")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(db.pipeline_lease_row("release").unwrap(), None);
+        assert_eq!(
+            db.renew_pipeline_lease("release", "owner-a", MIN_LEASE_TTL_SECS)
+                .unwrap()
+                .unwrap_err(),
+            None,
+            "renew after release must report missing"
+        );
+        assert_eq!(
+            db.release_pipeline_lease_row("missing", "owner-a").unwrap(),
+            None
+        );
+
+        db.conn()
+            .execute(
+                "INSERT INTO pipeline_leases (name, owner, acquired_at_ms, expires_at_ms) \
+                 VALUES ('expired-release', 'owner-a', 1, 1)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.release_pipeline_lease_row("expired-release", "owner-a")
+                .unwrap(),
+            Some(("owner-a".into(), 1))
+        );
+        assert_eq!(db.pipeline_lease_row("expired-release").unwrap(), None);
+    }
+
+    #[test]
+    fn lease_release_rolls_back_on_storage_error() {
+        let db = Db::open_memory().unwrap();
+        db.acquire_pipeline_lease("release-error", "owner", MIN_LEASE_TTL_SECS)
+            .unwrap()
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_lease_release BEFORE DELETE ON pipeline_leases \
+                 BEGIN SELECT RAISE(ABORT, 'release refused'); END;",
+            )
+            .unwrap();
+        assert!(
+            db.release_pipeline_lease_row("release-error", "owner")
+                .is_err()
+        );
+        assert!(db.pipeline_lease_row("release-error").unwrap().is_some());
     }
 
     #[test]

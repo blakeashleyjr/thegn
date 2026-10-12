@@ -150,7 +150,7 @@ pub enum Action {
     /// Take, renew, release or inspect the pipeline monitor lease — the guard
     /// that stops two Leads driving one pipeline and filling the same slots.
     Lease {
-        /// What to do: `acquire` | `release` | `show`.
+        /// What to do: `acquire` | `renew` | `release` | `show`.
         action: String,
         /// Who is asking (a stable id for this monitor process).
         #[arg(long)]
@@ -869,37 +869,86 @@ fn lease(action: &str, owner: Option<&str>, ttl: i64, name: &str, json: bool) ->
     let db = Db::open()?;
     match action {
         "show" => {
-            let held = db.pipeline_lease_holder(name)?;
+            let row = db.pipeline_lease_row(name)?;
+            let now = thegn_core::util::now_ms();
+            let outcome = lease_show_outcome(row.as_ref(), now);
+            let owner = row.as_ref().map(|(owner, _)| owner);
+            let remaining = row
+                .as_ref()
+                .filter(|(_, expires_at)| *expires_at > now)
+                .map(|(_, expires_at)| expires_at - now);
             if json {
                 return super::emit_json(&serde_json::json!({
                     "name": name,
-                    "owner": held.as_ref().map(|(o, _)| o.clone()),
-                    "expires_in_ms": held.as_ref().map(|(_, ms)| *ms),
+                    "outcome": outcome,
+                    "owner": owner,
+                    "expires_in_ms": remaining,
                 }));
             }
-            match held {
-                Some((o, ms)) => outln!("lease {name}: held by {o} ({}s left)", ms / 1000),
-                None => outln!("lease {name}: free"),
+            match (outcome, owner, remaining) {
+                ("live", Some(owner), Some(ms)) => {
+                    outln!(
+                        "lease {}: held by {} ({}s left)",
+                        pipeline_report::display_cell(name),
+                        pipeline_report::display_cell(owner),
+                        ms / 1000
+                    )
+                }
+                ("expired", Some(owner), _) => {
+                    outln!(
+                        "lease {}: expired (last held by {})",
+                        pipeline_report::display_cell(name),
+                        pipeline_report::display_cell(owner)
+                    )
+                }
+                _ => outln!("lease {}: free", pipeline_report::display_cell(name)),
             }
             Ok(())
         }
-        "acquire" | "release" => {
+        "acquire" | "renew" | "release" => {
             let owner = owner.ok_or_else(|| {
                 anyhow::anyhow!("--owner is required for `{action}` (a stable id for this monitor)")
             })?;
             if action == "release" {
-                let dropped = db.release_pipeline_lease(name, owner)?;
+                let row = db.release_pipeline_lease_row(name, owner)?;
+                let now = thegn_core::util::now_ms();
+                let outcome = lease_release_outcome(owner, row.as_ref(), now);
+                let released = outcome == "released";
                 if json {
-                    return super::emit_json(&serde_json::json!({ "released": dropped }));
+                    return super::emit_json(&serde_json::json!({
+                        "released": released,
+                        "outcome": outcome,
+                        "holder": row.map(|(holder, _)| holder),
+                    }));
                 }
                 outln!(
-                    "lease {name}: {}",
-                    if dropped {
-                        "released"
-                    } else {
-                        "not held by this owner — nothing released"
+                    "lease {}: {}",
+                    pipeline_report::display_cell(name),
+                    match outcome {
+                        "released" => "released",
+                        "missing" => "missing",
+                        "expired" => "expired",
+                        _ => "replaced by another owner",
                     }
                 );
+                return Ok(());
+            }
+            if action == "renew" {
+                let renewed = db.renew_pipeline_lease(name, owner, ttl)?;
+                let (outcome, holder) =
+                    lease_renewal_outcome(owner, renewed, thegn_core::util::now_ms());
+                if json {
+                    super::emit_json(&serde_json::json!({
+                        "renewed": outcome == "renewed",
+                        "outcome": outcome,
+                        "holder": holder,
+                    }))?;
+                } else {
+                    outln!("lease {}: {outcome}", pipeline_report::display_cell(name));
+                }
+                if outcome != "renewed" {
+                    anyhow::bail!("lease {name} renewal failed: {outcome}");
+                }
                 return Ok(());
             }
             match db.acquire_pipeline_lease(name, owner, ttl)? {
@@ -909,7 +958,11 @@ fn lease(action: &str, owner: Option<&str>, ttl: i64, name: &str, json: bool) ->
                             &serde_json::json!({ "acquired": true, "owner": owner, "ttl": ttl }),
                         );
                     }
-                    outln!("lease {name}: held by {owner} for {ttl}s");
+                    outln!(
+                        "lease {}: held by {} for {ttl}s",
+                        pipeline_report::display_cell(name),
+                        pipeline_report::display_cell(owner)
+                    );
                     Ok(())
                 }
                 Err(holder) => {
@@ -919,14 +972,49 @@ fn lease(action: &str, owner: Option<&str>, ttl: i64, name: &str, json: bool) ->
                         )?;
                     }
                     Err(anyhow::Error::new(crate::cmd::Retryable(anyhow::anyhow!(
-                        "lease {name} is held by {holder} — another monitor is already driving \
+                        "lease {} is held by {} — another monitor is already driving \
                          this pipeline. Stop it, or wait for its lease to lapse, before starting \
-                         a second one.\n(exit 2 — retryable)"
+                         a second one.\n(exit 2 — retryable)",
+                        pipeline_report::display_cell(name),
+                        pipeline_report::display_cell(&holder)
                     ))))
                 }
             }
         }
-        other => anyhow::bail!("unknown lease action {other:?} (expected: acquire, release, show)"),
+        other => anyhow::bail!(
+            "unknown lease action {other:?} (expected: acquire, renew, release, show)"
+        ),
+    }
+}
+
+fn lease_show_outcome(row: Option<&(String, i64)>, now_ms: i64) -> &'static str {
+    match row {
+        None => "free",
+        Some((_, expires_at)) if *expires_at <= now_ms => "expired",
+        Some(_) => "live",
+    }
+}
+
+fn lease_release_outcome(owner: &str, row: Option<&(String, i64)>, now_ms: i64) -> &'static str {
+    match row {
+        None => "missing",
+        Some((row_owner, _)) if row_owner != owner => "replaced",
+        Some((_, expires_at)) if *expires_at <= now_ms => "expired",
+        Some(_) => "released",
+    }
+}
+
+fn lease_renewal_outcome(
+    owner: &str,
+    result: std::result::Result<i64, Option<(String, i64)>>,
+    now_ms: i64,
+) -> (&'static str, Option<String>) {
+    match result {
+        Ok(_) => ("renewed", None),
+        Err(None) => ("missing", None),
+        Err(Some((holder, _))) if holder != owner => ("replaced", Some(holder)),
+        Err(Some((holder, expires_at))) if expires_at <= now_ms => ("expired", Some(holder)),
+        Err(Some((holder, _))) => ("replaced", Some(holder)),
     }
 }
 
@@ -1021,6 +1109,11 @@ fn list(active: bool, json: bool) -> Result<()> {
         } else {
             verdict.to_string()
         };
+        let (issue_cell, stage_cell, note) = display_dispatch_cells(
+            &d.issue_id,
+            d.stage.as_deref().unwrap_or("-"),
+            d.note.as_deref(),
+        );
         // The pipeline columns print as `-` when absent rather than collapsing
         // the row's shape, so the table stays column-aligned for a roster that
         // mixes pipeline and plain dispatches.
@@ -1029,14 +1122,14 @@ fn list(active: bool, json: bool) -> Result<()> {
             d.id,
             status_cell,
             verdict_cell,
-            d.stage.as_deref().unwrap_or("-"),
+            stage_cell,
             d.parent_id
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "-".into()),
-            d.issue_id,
-            d.agent_name,
-            d.worktree_path,
-            note_cell(d.note.as_deref()),
+            issue_cell,
+            pipeline_report::display_cell(&d.agent_name),
+            pipeline_report::display_cell(&d.worktree_path),
+            note,
             chunk_cell(d.chunk_path.as_deref()),
         );
     }
@@ -1072,6 +1165,7 @@ fn chunk_cell(chunk_path: Option<&str>) -> String {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
         })
+        .map(|name| pipeline_report::display_cell(&name))
         .unwrap_or_else(|| "-".into())
 }
 
@@ -1079,17 +1173,34 @@ fn chunk_cell(chunk_path: Option<&str>) -> String {
 /// collapsed to one line and truncated so the roster stays scannable. `-`
 /// when absent (every pre-v59 row and anything the observer never touched).
 fn note_cell(note: Option<&str>) -> String {
-    const MAX: usize = 32;
+    const MAX: usize = 33;
     let Some(n) = note else {
         return "-".into();
     };
     let one_line = n.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() <= MAX {
-        one_line
-    } else {
-        let t: String = one_line.chars().take(MAX).collect();
-        format!("{t}…")
-    }
+    pipeline_report::display_fit(&one_line, MAX)
+        .trim_end()
+        .to_string()
+}
+
+fn display_dispatch_cells(
+    issue_id: &str,
+    stage: &str,
+    note: Option<&str>,
+) -> (String, String, String) {
+    (
+        pipeline_report::display_cell(issue_id),
+        pipeline_report::display_cell(stage),
+        note_cell(note),
+    )
+}
+
+/// Render legacy multiline text one terminal-safe physical line at a time.
+fn display_multiline(text: &str) -> String {
+    text.lines()
+        .map(pipeline_report::display_cell)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Should recording `status` prompt for a reason that was not given?
@@ -1406,7 +1517,13 @@ fn worktree_state_from_status(status: Option<&str>) -> pipeline_run::WorktreeSta
 ///
 /// Blocking: reads each row's worktree and shells out to `git`, so a caller on
 /// an async runtime must run this inside `spawn_blocking`.
-pub(crate) fn reap_plan(db: &Db, live_ids: Option<&[String]>) -> Result<Vec<pipeline_reap::Reap>> {
+pub(crate) fn reap_plan(
+    db: &Db,
+    live_ids: Option<&[String]>,
+) -> Result<(
+    Vec<pipeline_reap::Reap>,
+    HashMap<i64, thegn_core::issue::DispatchRunRef>,
+)> {
     let rows: Vec<_> = db
         .list_dispatches()?
         .into_iter()
@@ -1417,7 +1534,19 @@ pub(crate) fn reap_plan(db: &Db, live_ids: Option<&[String]>) -> Result<Vec<pipe
             )
         })
         .collect();
-    Ok(reap_plan_rows(&rows, live_ids))
+    let run_refs = db
+        .running_dispatch_run_refs()?
+        .into_iter()
+        .filter(|run| {
+            rows.iter().any(|row| {
+                row.id == run.id
+                    && row.status == AgentDispatchStatus::Running
+                    && row.session_id.as_deref() == Some(run.session_id.as_str())
+            })
+        })
+        .map(|run| (run.id, run))
+        .collect();
+    Ok((reap_plan_rows(&rows, live_ids), run_refs))
 }
 
 /// Plan from a caller-owned row snapshot. The periodic daemon uses this form
@@ -1455,7 +1584,7 @@ fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
     let live_ids = rt.block_on(live_session_ids(cfg));
     let daemon_up = live_ids.is_some();
     let db = Db::open()?;
-    let plan = reap_plan(&db, live_ids.as_deref())?;
+    let (plan, run_refs) = reap_plan(&db, live_ids.as_deref())?;
     let summary = pipeline_reap::summarize(&plan);
 
     if json {
@@ -1525,35 +1654,62 @@ fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
     if !apply {
         return Ok(());
     }
-    apply_reap_plan(&db, &plan)
+    apply_reap_plan(&db, &plan, &run_refs)
 }
 
-fn apply_reap_plan(db: &Db, plan: &[pipeline_reap::Reap]) -> Result<()> {
+fn apply_reap_plan(
+    db: &Db,
+    plan: &[pipeline_reap::Reap],
+    run_refs: &HashMap<i64, thegn_core::issue::DispatchRunRef>,
+) -> Result<()> {
     for r in plan {
         match &r.verdict {
             pipeline_reap::ReapVerdict::CloseDone => {
                 // Plain, gated `done`: it passes unforced precisely because the
                 // artifact is committed and a report exists.
-                if db.compare_and_set_dispatch_status(
-                    r.id,
+                let Some(run) = run_refs.get(&r.id) else {
+                    outln!(
+                        "dispatch {} skipped (run changed or spawning; decide by hand)",
+                        r.id
+                    );
+                    continue;
+                };
+                if db.compare_and_set_dispatch_status_run(
+                    run,
                     r.observed_status,
                     AgentDispatchStatus::Done,
                     None,
                 )? {
                     outln!("dispatch {} → done", r.id);
+                } else {
+                    outln!(
+                        "dispatch {} skipped (run changed or spawning; decide by hand)",
+                        r.id
+                    );
                 }
             }
-            pipeline_reap::ReapVerdict::MarkFailed { why }
-                if db.compare_and_set_dispatch_status(
-                    r.id,
+            pipeline_reap::ReapVerdict::MarkFailed { why } => {
+                let Some(run) = run_refs.get(&r.id) else {
+                    outln!(
+                        "dispatch {} skipped (run changed or spawning; decide by hand)",
+                        r.id
+                    );
+                    continue;
+                };
+                if db.compare_and_set_dispatch_status_run(
+                    run,
                     r.observed_status,
                     AgentDispatchStatus::Failed,
                     Some(&format!("reaped: {why}")),
-                )? =>
-            {
-                outln!("dispatch {} → failed", r.id);
+                )? {
+                    outln!("dispatch {} → failed", r.id);
+                } else {
+                    outln!(
+                        "dispatch {} skipped (run changed or spawning; decide by hand)",
+                        r.id
+                    );
+                }
             }
-            pipeline_reap::ReapVerdict::MarkFailed { .. } => {}
             _ => {}
         }
     }
@@ -1839,8 +1995,8 @@ pub(crate) fn read_status(
                 "{} {} {} {} notes={} last={}",
                 digest.id,
                 digest.status,
-                digest.stage.as_deref().unwrap_or("-"),
-                digest.issue_id,
+                pipeline_report::display_cell(digest.stage.as_deref().unwrap_or("-")),
+                pipeline_report::display_cell(&digest.issue_id),
                 digest.note_count,
                 latest
             );
@@ -1848,12 +2004,14 @@ pub(crate) fn read_status(
         if row_mode {
             if let Some(report) = digests.first().and_then(|d| d.report.as_deref()) {
                 outln!("report:");
-                outln!("{report}");
+                outln!("{}", display_multiline(report));
             }
             outln!("notes:");
             if let Some(all_notes) = notes_map.get(&row.expect("row mode")) {
                 for note in newest_status_notes(all_notes) {
-                    outln!("- {}", note.text);
+                    for line in note.text.lines() {
+                        outln!("- {}", pipeline_report::display_cell(line));
+                    }
                 }
             }
         }
@@ -2518,6 +2676,78 @@ mod tests {
         assert_eq!(
             note_cell(Some(two_lines)),
             "transport: connection error. (at…"
+        );
+    }
+
+    #[test]
+    fn dispatch_display_cells_replace_terminal_and_bidi_controls() {
+        let hostile = "issue\x1b[2J\u{202e}\u{0085}";
+        let (issue, stage, note) = display_dispatch_cells(
+            hostile,
+            "stage\x1b[2J\u{202e}\u{0085}",
+            Some("note\x1b[2J\u{202e}\u{0085}"),
+        );
+        for value in [&issue, &stage, &note] {
+            assert!(
+                value
+                    .chars()
+                    .all(|c| !c.is_control() && !pipeline_report::is_format_control(c)),
+                "unsafe display value: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_multiline_display_sanitizes_each_legacy_line() {
+        let shown = display_multiline("report\x1b[2J\n\u{202e}verdict\u{0085}");
+        assert_eq!(shown.lines().count(), 2);
+        assert!(
+            shown
+                .chars()
+                .all(|c| !c.is_control() && !pipeline_report::is_format_control(c))
+        );
+    }
+
+    #[test]
+    fn lease_cli_classifies_missing_expired_replaced_and_live_outcomes() {
+        let now = 10_000;
+        assert_eq!(lease_show_outcome(None, now), "free");
+        assert_eq!(
+            lease_show_outcome(Some(&("owner".into(), now)), now),
+            "expired"
+        );
+        assert_eq!(
+            lease_show_outcome(Some(&("owner".into(), now + 1)), now),
+            "live"
+        );
+        assert_eq!(lease_release_outcome("owner", None, now), "missing");
+        assert_eq!(
+            lease_release_outcome("owner", Some(&("other".into(), now + 1)), now),
+            "replaced"
+        );
+        assert_eq!(
+            lease_release_outcome("owner", Some(&("owner".into(), now)), now),
+            "expired"
+        );
+        assert_eq!(
+            lease_release_outcome("owner", Some(&("owner".into(), now + 1)), now),
+            "released"
+        );
+        assert_eq!(
+            lease_renewal_outcome("owner", Err(None), now),
+            ("missing", None)
+        );
+        assert_eq!(
+            lease_renewal_outcome("owner", Err(Some(("owner".into(), now))), now),
+            ("expired", Some("owner".into()))
+        );
+        assert_eq!(
+            lease_renewal_outcome("owner", Err(Some(("other".into(), now + 1))), now),
+            ("replaced", Some("other".into()))
+        );
+        assert_eq!(
+            lease_renewal_outcome("owner", Ok(now + 1), now),
+            ("renewed", None)
         );
     }
 
@@ -3521,14 +3751,99 @@ mod tests {
         db.update_dispatch_status(id, AgentDispatchStatus::Running)
             .unwrap();
 
-        let plan = reap_plan(&db, None).unwrap();
+        let (plan, run_refs) = reap_plan(&db, None).unwrap();
         assert_eq!(plan[0].verdict.token(), "unknown");
         assert_eq!(pipeline_reap::summarize(&plan).actionable(), 0);
-        apply_reap_plan(&db, &plan).unwrap();
+        apply_reap_plan(&db, &plan, &run_refs).unwrap();
         assert_eq!(
             db.get_dispatch(id).unwrap().unwrap().status,
             AgentDispatchStatus::Running,
             "unavailable daemon liveness must not fail or close a possibly-live worker"
+        );
+    }
+
+    #[test]
+    fn reap_plan_cannot_close_a_relaunched_run() {
+        let (_dir, db) = db("reap-relaunch-fence");
+        let row = put(
+            &db,
+            NewDispatch {
+                session_id: Some("old-session"),
+                ..NewDispatch::new("linear:THE-242", "/unused", "worker")
+            },
+        )
+        .unwrap();
+        db.update_dispatch_status(row.id, AgentDispatchStatus::Running)
+            .unwrap();
+        let old_run = db.dispatch_run_ref(row.id).unwrap().unwrap();
+        db.stamp_dispatch_exit(&old_run, Some(1)).unwrap();
+        let (plan, run_refs) = reap_plan(&db, Some(&[])).unwrap();
+        assert!(matches!(
+            &plan[0].verdict,
+            pipeline_reap::ReapVerdict::MarkFailed { .. }
+        ));
+        assert!(
+            db.compare_and_set_dispatch_status(
+                row.id,
+                AgentDispatchStatus::Running,
+                AgentDispatchStatus::Spawning,
+                None,
+            )
+            .unwrap()
+        );
+        assert!(
+            db.compare_and_set_dispatch_retry_run(
+                row.id,
+                AgentDispatchStatus::Spawning,
+                "new-session",
+                "artifact.md",
+            )
+            .unwrap()
+        );
+
+        apply_reap_plan(&db, &plan, &run_refs).unwrap();
+        let after = db.get_dispatch(row.id).unwrap().unwrap();
+        let new_run = db.dispatch_run_ref(row.id).unwrap().unwrap();
+        assert_eq!(after.status, AgentDispatchStatus::Running);
+        assert_eq!(after.session_id.as_deref(), Some("new-session"));
+        assert_eq!(new_run.run_gen, old_run.run_gen + 1);
+    }
+
+    #[test]
+    fn reap_plan_skips_spawning_rows_with_stale_exit_stamps() {
+        let (_dir, db) = db("reap-spawning-stale-exit");
+        let row = put(
+            &db,
+            NewDispatch {
+                session_id: Some("old-session"),
+                ..NewDispatch::new("linear:THE-242", "/unused", "worker")
+            },
+        )
+        .unwrap();
+        db.update_dispatch_status(row.id, AgentDispatchStatus::Running)
+            .unwrap();
+        let old_run = db.dispatch_run_ref(row.id).unwrap().unwrap();
+        db.stamp_dispatch_exit(&old_run, Some(1)).unwrap();
+        assert!(
+            db.compare_and_set_dispatch_status(
+                row.id,
+                AgentDispatchStatus::Running,
+                AgentDispatchStatus::Spawning,
+                None,
+            )
+            .unwrap()
+        );
+
+        let (plan, run_refs) = reap_plan(&db, Some(&[])).unwrap();
+        assert!(matches!(
+            &plan[0].verdict,
+            pipeline_reap::ReapVerdict::MarkFailed { .. }
+        ));
+        assert!(!run_refs.contains_key(&row.id));
+        apply_reap_plan(&db, &plan, &run_refs).unwrap();
+        assert_eq!(
+            db.get_dispatch(row.id).unwrap().unwrap().status,
+            AgentDispatchStatus::Spawning
         );
     }
 }
