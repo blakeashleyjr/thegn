@@ -113,8 +113,7 @@ pub fn likely_unchanged_since(path: &Path, since: i64) -> bool {
     // but unresolvable one is uncertain and must force a walk.
     match std::fs::symlink_metadata(path.join(".git")) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-        Err(_) => false,
-        Ok(_) => {
+        _ => {
             let Some(git_dir) = crate::git_memo::git_dir(path) else {
                 return false;
             };
@@ -641,6 +640,8 @@ mod tests {
                 };
                 touch_at(&p, 1_000);
             }
+            touch_at(&d.path().join(".git/HEAD"), 1_000);
+            touch_at(&d.path().join(".git/index"), 1_000);
             assert!(
                 likely_unchanged_since(d.path(), 2_000),
                 "baseline should be quiet before moving {rel:?}"
@@ -657,23 +658,27 @@ mod tests {
             );
         }
 
+        // Main checkouts keep HEAD and index under the `.git` directory.
+        for rel in [".git/HEAD", ".git/index"] {
+            let d = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(d.path().join(".git")).unwrap();
+            for name in ["HEAD", "index"] {
+                std::fs::write(d.path().join(".git").join(name), b"").unwrap();
+                touch_at(&d.path().join(".git").join(name), 1_000);
+            }
+            touch_at(d.path(), 1_000);
+            assert!(likely_unchanged_since(d.path(), 2_000));
+            touch_at(&d.path().join(rel), 5_000);
+            assert!(
+                !likely_unchanged_since(d.path(), 2_000),
+                "moving directory-layout sentinel {rel:?} did not force a walk"
+            );
+        }
+
         // Linked worktrees store HEAD and index in the gitdir named by their
         // `.git` file, not in `<worktree>/.git/`.
         for name in ["HEAD", "index"] {
-            let worktree = tempfile::tempdir().unwrap();
-            let common = tempfile::tempdir().unwrap();
-            let git_dir = common.path().join("worktrees/wt");
-            std::fs::create_dir_all(&git_dir).unwrap();
-            std::fs::write(
-                worktree.path().join(".git"),
-                format!("gitdir: {}\n", git_dir.display()),
-            )
-            .unwrap();
-            for git_sentinel in ["HEAD", "index"] {
-                std::fs::write(git_dir.join(git_sentinel), b"").unwrap();
-                touch_at(&git_dir.join(git_sentinel), 1_000);
-            }
-            touch_at(worktree.path(), 1_000);
+            let (worktree, _common, git_dir) = linked_worktree_fixture();
             assert!(likely_unchanged_since(worktree.path(), 2_000));
             touch_at(&git_dir.join(name), 5_000);
             assert!(
