@@ -1118,6 +1118,7 @@ key = "p"
 context = "branches"
 command = "git push {{.SelectedBranch.Name | quote}}"
 output = "terminal"
+timeout_secs = 900
 description = "push selected branch"
 prompts = [{ type = "input", title = "Remote", key = "Remote" }]
 
@@ -1133,6 +1134,7 @@ command = "git notes add {{.SelectedCommit.Sha}}"
     assert_eq!(c.key, "p");
     assert_eq!(c.context, "branches");
     assert_eq!(c.output, GitCmdOutput::Terminal);
+    assert_eq!(c.timeout_secs, 900);
     assert_eq!(c.description.as_deref(), Some("push selected branch"));
     assert_eq!(c.prompts.len(), 1);
     assert_eq!(c.prompts[0].key, "Remote");
@@ -1142,6 +1144,7 @@ command = "git notes add {{.SelectedCommit.Sha}}"
     let c = &cfg.git_commands[1];
     assert_eq!(c.context, "global");
     assert_eq!(c.output, GitCmdOutput::Popup);
+    assert_eq!(c.timeout_secs, crate::custom_cmd::DEFAULT_TIMEOUT_SECS);
     assert!(c.prompts.is_empty());
 
     // Absent section → defaults.
