@@ -454,10 +454,6 @@ fn page_size(limit: usize) -> usize {
 // emitted strings are reachable from unit tests — every THE-72 defect was a
 // query string no test could see.
 
-fn build_list_query(filter: &IssueFilter, team_id: Option<&str>) -> String {
-    build_list_page_query(filter, team_id, None, page_size(filter.limit))
-}
-
 fn build_list_page_query(
     filter: &IssueFilter,
     team_id: Option<&str>,
