@@ -1170,6 +1170,16 @@ fn check_path_expansion_budget(
     cfg: &Config,
     paths: &PathExpansionContext,
 ) -> Result<(), ConfigAdmissionError> {
+    if projected_path_expansion_size(cfg, paths)? > config_budget::MAX_NORMALIZED_BYTES {
+        return Err(ConfigAdmissionError::Oversized);
+    }
+    Ok(())
+}
+
+fn projected_path_expansion_size(
+    cfg: &Config,
+    paths: &PathExpansionContext,
+) -> Result<usize, ConfigAdmissionError> {
     let home = paths
         .home()
         .to_str()
@@ -1203,7 +1213,13 @@ fn check_path_expansion_budget(
     if cfg.repo_roots.is_empty() {
         // post_process_inner first copies the expanded workspaces_dir here,
         // then expands that copy as a repo root too.
-        account(&cfg.workspaces_dir, false)?;
+        let implicit_root_bytes = match expanded_path_json_len(&cfg.workspaces_dir, home)? {
+            Some(expanded) => expanded,
+            None => json_string_content_len(&cfg.workspaces_dir)?,
+        };
+        new_path_bytes = new_path_bytes
+            .checked_add(implicit_root_bytes)
+            .ok_or(ConfigAdmissionError::Oversized)?;
         new_path_bytes = new_path_bytes
             .checked_add(2)
             .ok_or(ConfigAdmissionError::Oversized)?;
@@ -1213,12 +1229,7 @@ fn check_path_expansion_budget(
         }
     }
 
-    let projected_bytes =
-        projected_serialized_size(serialized_bytes, old_path_bytes, new_path_bytes)?;
-    if projected_bytes > config_budget::MAX_NORMALIZED_BYTES {
-        return Err(ConfigAdmissionError::Oversized);
-    }
-    Ok(())
+    projected_serialized_size(serialized_bytes, old_path_bytes, new_path_bytes)
 }
 
 fn projected_serialized_size(
