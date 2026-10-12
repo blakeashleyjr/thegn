@@ -7679,9 +7679,19 @@ async fn event_loop<T: Terminal>(
                         && !switch_cache.get(&path).is_some_and(|s| s.is_fresh())
                         && prefetch_inflight.try_begin(&path)
                     {
+                        let prefetch_generation = prefetch_inflight
+                            .generation(&path)
+                            .expect("path was just marked in flight");
                         let hints =
                             crate::hydrate::HydrateHints::for_switch(&panel_ui, &current_config);
-                        spawn_panel_prefetch(prefetch_tx.clone(), path, hints, Some(waker.clone()));
+                        let admission = spawn_panel_prefetch(
+                            prefetch_tx.clone(),
+                            path.clone(),
+                            prefetch_generation,
+                            hints,
+                            Some(waker.clone()),
+                        );
+                        prefetch_inflight.finish_if_refused(&path, prefetch_generation, admission);
                     }
                     continue;
                 }
@@ -8163,12 +8173,17 @@ async fn event_loop<T: Terminal>(
             if !prefetch_inflight.try_begin(&path) {
                 continue;
             }
-            spawn_panel_prefetch(
+            let prefetch_generation = prefetch_inflight
+                .generation(&path)
+                .expect("path was just marked in flight");
+            let admission = spawn_panel_prefetch(
                 prefetch_tx.clone(),
-                path,
+                path.clone(),
+                prefetch_generation,
                 hints.clone(),
                 Some(waker.clone()),
             );
+            prefetch_inflight.finish_if_refused(&path, prefetch_generation, admission);
         }
         // Cross-WORKSPACE warmth: the switch cache is path-keyed and global,
         // but nothing used to feed it other workspaces' paths — so a workspace
@@ -8185,12 +8200,17 @@ async fn event_loop<T: Terminal>(
             if !prefetch_inflight.try_begin(&path) {
                 continue;
             }
-            spawn_panel_prefetch(
+            let prefetch_generation = prefetch_inflight
+                .generation(&path)
+                .expect("path was just marked in flight");
+            let admission = spawn_panel_prefetch(
                 prefetch_tx.clone(),
-                path,
+                path.clone(),
+                prefetch_generation,
                 hints.clone(),
                 Some(waker.clone()),
             );
+            prefetch_inflight.finish_if_refused(&path, prefetch_generation, admission);
         }
     }
 
@@ -8621,12 +8641,17 @@ async fn event_loop<T: Terminal>(
                 {
                     continue;
                 }
-                spawn_panel_prefetch(
+                let prefetch_generation = prefetch_inflight
+                    .generation(&path)
+                    .expect("path was just marked in flight");
+                let admission = spawn_panel_prefetch(
                     prefetch_tx.clone(),
-                    path,
+                    path.clone(),
+                    prefetch_generation,
                     hints.clone(),
                     Some(waker.clone()),
                 );
+                prefetch_inflight.finish_if_refused(&path, prefetch_generation, admission);
             }
             // And the likeliest OTHER workspaces (sidebar order): cross-
             // workspace destinations were never warmed at all, making every
@@ -8644,12 +8669,17 @@ async fn event_loop<T: Terminal>(
                 {
                     continue;
                 }
-                spawn_panel_prefetch(
+                let prefetch_generation = prefetch_inflight
+                    .generation(&path)
+                    .expect("path was just marked in flight");
+                let admission = spawn_panel_prefetch(
                     prefetch_tx.clone(),
-                    path,
+                    path.clone(),
+                    prefetch_generation,
                     hints.clone(),
                     Some(waker.clone()),
                 );
+                prefetch_inflight.finish_if_refused(&path, prefetch_generation, admission);
             }
             spawn_pr_cache_refresh(
                 current_worktree.clone(),

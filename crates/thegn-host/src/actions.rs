@@ -1582,7 +1582,7 @@ impl CiActionCtx<'_> {
         from: chrono::NaiveDate,
         to: chrono::NaiveDate,
     ) {
-        crate::hydrate_calendar::spawn_month_fetch(
+        crate::sched::report_required_result(crate::hydrate_calendar::spawn_month_fetch(
             self.cfg.calendar.clone(),
             year,
             month,
@@ -1590,7 +1590,7 @@ impl CiActionCtx<'_> {
             to,
             self.refresh_tx.clone(),
             self.waker.clone(),
-        );
+        ));
     }
 
     /// Fire a CI mutation off the loop after posting an in-progress status.
