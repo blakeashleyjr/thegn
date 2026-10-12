@@ -596,7 +596,12 @@ impl Db {
                     )?;
                     let files = if let Some(raw) = admitted_scope {
                         snapshot_rows.insert(row.id);
-                        decode_chunk_scope(&raw)?
+                        decode_chunk_scope(&raw).map_err(|e| {
+                            anyhow::anyhow!(
+                                "active sibling row {} has a corrupt admitted chunk scope: {e}",
+                                row.id
+                            )
+                        })?
                     } else {
                         let Some(snapshot) = prepared.siblings.iter().find(|s| s.row == row.id)
                         else {
@@ -1217,6 +1222,49 @@ mod tests {
             db.dispatch_chunk_scope(a).unwrap(),
             Some(vec!["src/**".into()])
         );
+    }
+
+    #[test]
+    fn corrupt_active_sibling_snapshot_names_row_and_inserts_no_dispatch() {
+        let db = Db::open_memory().unwrap();
+        let worktree = "/wt/corrupt-snapshot";
+        let mut first = crate::issue::NewDispatch::new("linear:THE-214", worktree, "claude");
+        first.chunk_path = Some("a.md");
+        let a = db
+            .claim_dispatch_admitted(
+                first,
+                10,
+                None,
+                Some(&admitted_chunk("a.md", vec!["src/**".into()], vec![])),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET chunk_scope='not-json' WHERE id=?1",
+                [a],
+            )
+            .unwrap();
+
+        let mut second = crate::issue::NewDispatch::new("linear:THE-214", worktree, "claude");
+        second.chunk_path = Some("b.md");
+        let error = db
+            .claim_dispatch_admitted(
+                second,
+                10,
+                None,
+                Some(&admitted_chunk("b.md", vec!["docs/x.md".into()], vec![])),
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "active sibling row {a} has a corrupt admitted chunk scope"
+            )),
+            "{error:#}"
+        );
+        assert_eq!(db.list_dispatches().unwrap().len(), 1);
     }
 
     #[test]
