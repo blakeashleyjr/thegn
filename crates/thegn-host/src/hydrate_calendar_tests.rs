@@ -54,7 +54,23 @@ fn event(uid: &str) -> CalEvent {
 
 /// A complete page admitted against a private pool.
 fn page(events: Vec<CalEvent>, deleted: Vec<String>, sync_token: &str) -> EventPage {
+    // Legacy shorthand: a cursor-less page is a snapshot, otherwise a delta.
+    let mode = if sync_token.is_empty() {
+        PageMode::Snapshot
+    } else {
+        PageMode::Delta
+    };
+    page_in(mode, events, deleted, sync_token)
+}
+
+fn page_in(
+    mode: PageMode,
+    events: Vec<CalEvent>,
+    deleted: Vec<String>,
+    sync_token: &str,
+) -> EventPage {
     EventPage::try_new(
+        mode,
         events,
         deleted,
         sync_token,
@@ -733,4 +749,113 @@ fn an_invalid_horizon_is_refused_and_never_collapses_to_today() {
     refuse_horizon("calendar.horizon_past_days: bad", &mut |m| seen.push(m));
     assert_eq!(seen.len(), 1);
     assert!(seen[0].contains("horizon_past_days"));
+}
+
+#[test]
+fn a_snapshot_that_returns_a_cursor_still_replaces_the_cache() {
+    // THE-452: the host used to read a non-empty token as "delta" and merge,
+    // resurrecting everything the authoritative snapshot omitted.
+    let t = TmpDb::new("snapshot-with-token");
+    let (from, to) = window();
+    apply_page(
+        &t.db,
+        "work",
+        "caldav",
+        &page_in(PageMode::Snapshot, vec![event("a"), event("b")], vec![], ""),
+        from,
+        to,
+    );
+    apply_page(
+        &t.db,
+        "work",
+        "caldav",
+        &page_in(PageMode::Snapshot, vec![event("c")], vec![], "tok-9"),
+        from,
+        to,
+    );
+    let cached = load_cached(&t.db, from, to).unwrap().events;
+    assert_eq!(cached.len(), 1);
+    assert_eq!(cached[0].uid, "c");
+    assert_eq!(
+        t.db.get_calendar_sync("work").unwrap().unwrap().sync_token,
+        "tok-9"
+    );
+}
+
+#[test]
+fn a_delta_without_a_cursor_never_erases_unrelated_rows() {
+    let t = TmpDb::new("delta-no-token");
+    let (from, to) = window();
+    apply_page(
+        &t.db,
+        "work",
+        "caldav",
+        &page_in(
+            PageMode::Snapshot,
+            vec![event("a"), event("b")],
+            vec![],
+            "t1",
+        ),
+        from,
+        to,
+    );
+    apply_page(
+        &t.db,
+        "work",
+        "caldav",
+        &page_in(PageMode::Delta, vec![event("c")], vec!["a".into()], ""),
+        from,
+        to,
+    );
+    let mut uids: Vec<String> = load_cached(&t.db, from, to)
+        .unwrap()
+        .events
+        .into_iter()
+        .map(|e| e.uid)
+        .collect();
+    uids.sort();
+    assert_eq!(uids, ["b", "c"]);
+    // The lost cursor is dropped, so the next fetch is a full one.
+    assert!(
+        t.db.get_calendar_sync("work")
+            .unwrap()
+            .unwrap()
+            .sync_token
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_reset_is_believed_even_when_empty_but_an_empty_snapshot_is_not() {
+    let t = TmpDb::new("reset");
+    let (from, to) = window();
+    apply_page(
+        &t.db,
+        "work",
+        "command",
+        &page_in(PageMode::Snapshot, vec![event("a")], vec![], ""),
+        from,
+        to,
+    );
+    apply_page(
+        &t.db,
+        "work",
+        "command",
+        &page_in(PageMode::Snapshot, vec![], vec![], "x"),
+        from,
+        to,
+    );
+    assert!(
+        t.db.has_calendar_events("work").unwrap(),
+        "guard still holds"
+    );
+    apply_page(
+        &t.db,
+        "work",
+        "command",
+        &page_in(PageMode::Reset, vec![], vec![], ""),
+        from,
+        to,
+    );
+    assert!(!t.db.has_calendar_events("work").unwrap());
 }

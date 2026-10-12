@@ -21,7 +21,7 @@ use thegn_core::calendar::CalendarWindow;
 use thegn_core::config_calendar::CalendarAccount;
 use tokio::time::Instant;
 
-use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage};
+use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage, PageMode};
 use crate::http::{
     CalendarHttpClient, CalendarHttpError, ExpectedMedia, MAX_BODY_BYTES, MAX_REQUEST_BYTES,
     discard_body, map_error, read_body, validate_encoding, validate_media,
@@ -325,8 +325,10 @@ fn page_from_multistatus(
     text: &str,
     zone: &str,
     calendar_ids: &[String],
+    mode: PageMode,
     mut meter: AdmissionMeter,
 ) -> Result<EventPage, CalendarError> {
+    debug_assert!(matches!(mode, PageMode::Snapshot | PageMode::Delta));
     let mut events = Vec::new();
     let mut deleted = Vec::new();
     let token = walk_multistatus(text, |r| {
@@ -337,6 +339,11 @@ fn page_from_multistatus(
             return Ok(());
         }
         if r.deleted {
+            // A snapshot is the complete picture: what it omits is already
+            // gone, so a stray 404 entry in a `calendar-query` carries nothing.
+            if mode != PageMode::Delta {
+                return Ok(());
+            }
             // The href is all a tombstone carries, so it has to be the id.
             // `uid_from_href` mirrors what the fetch path stores.
             let id = uid_from_href(&r.href);
@@ -359,7 +366,7 @@ fn page_from_multistatus(
         parsed.map_err(CalendarError::from)
     })?;
     let token = scope_token(calendar_ids, &token);
-    EventPage::from_meter(meter, events, deleted, token)
+    EventPage::from_meter(meter, mode, events, deleted, token)
 }
 
 const SCOPE_PREFIX: &str = "tgf1:";
@@ -608,7 +615,17 @@ impl CalDavBackend {
             meter.release_transient(MAX_BODY_BYTES - text.capacity().min(MAX_BODY_BYTES));
             let text = String::from_utf8(text)
                 .map_err(|_| CalendarError::Parse("CalDAV response is not UTF-8".into()))?;
-            match page_from_multistatus(&text, self.zone(), &self.calendar_ids, meter) {
+            match page_from_multistatus(
+                &text,
+                self.zone(),
+                &self.calendar_ids,
+                if incremental {
+                    PageMode::Delta
+                } else {
+                    PageMode::Snapshot
+                },
+                meter,
+            ) {
                 // A delta over the account's own budget (a bulk delete, a
                 // server re-stamping everything) would be refused again on
                 // every tick, because the cursor is — correctly — not
@@ -688,7 +705,15 @@ impl CalDavBackend {
         meter.release_transient(MAX_BODY_BYTES - bytes.capacity().min(MAX_BODY_BYTES));
         let text = String::from_utf8(bytes)
             .map_err(|_| CalendarError::Parse("CalDAV response is not UTF-8".into()))?;
-        page_from_multistatus(&text, self.zone(), &self.calendar_ids, meter)
+        // Whatever the original request was, this page is a `calendar-query`
+        // snapshot: it is authoritative regardless of the token it returns.
+        page_from_multistatus(
+            &text,
+            self.zone(),
+            &self.calendar_ids,
+            PageMode::Snapshot,
+            meter,
+        )
     }
 }
 
@@ -786,7 +811,7 @@ mod tests {
         let ids: Vec<String> = ids.iter().map(|s| (*s).to_string()).collect();
         let meter =
             AccountAdmission::isolated(Default::default(), thegn_core::calendar::Tz::UTC).meter();
-        page_from_multistatus(&multistatus(), "UTC", &ids, meter).unwrap()
+        page_from_multistatus(&multistatus(), "UTC", &ids, PageMode::Delta, meter).unwrap()
     }
 
     #[test]
@@ -853,7 +878,7 @@ mod tests {
         let ids = vec!["work".to_string()];
         let meter =
             AccountAdmission::isolated(Default::default(), thegn_core::calendar::Tz::UTC).meter();
-        let p = page_from_multistatus(&multistatus(), "UTC", &ids, meter).unwrap();
+        let p = page_from_multistatus(&multistatus(), "UTC", &ids, PageMode::Delta, meter).unwrap();
         assert_eq!(unscope_token(&ids, p.sync_token()), "t1");
         assert_eq!(unscope_token(&["personal".to_string()], p.sync_token()), "");
     }

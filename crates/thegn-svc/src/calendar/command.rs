@@ -17,12 +17,20 @@
 //! | `THEGN_CAL_MAX_EVENTS` | the account's admission budget: more events + deletions than this fails the whole run |
 //! | `THEGN_PLUGIN_API` | the API version thegn speaks |
 //!
+//! `mode` is optional and says what the run produced: `snapshot` (the whole
+//! window; anything cached and absent is dropped, and a `sync_token` may still
+//! be returned), `delta` (changes since `THEGN_CAL_SYNC_TOKEN`; only valid when
+//! one was sent), `unchanged` (nothing changed; only valid when a token was
+//! sent, and with no events) or `reset` (replace the cache even if empty). A
+//! plugin that omits it keeps the old reading: no token sent means a snapshot;
+//! otherwise a returned `sync_token` means a delta and none means a snapshot.
+//!
 //! Out — one JSON object per line:
 //!
 //! | verb | params |
 //! |---|---|
 //! | `manifest` | a [`PluginManifest`]; optional, but the only way to request capabilities |
-//! | `events` | `{events: [...], deleted: [...], sync_token: "..."}`; repeatable |
+//! | `events` | `{events: [...], deleted: [...], sync_token: "...", mode: "..."}`; repeatable |
 //! | `log` | `{level, message}` → tracing, never the UI |
 //!
 //! ```sh
@@ -45,7 +53,7 @@ use thegn_core::calendar::{AdmissionError, AdmissionMeter, CalEvent};
 use thegn_core::config_calendar::CalendarAccount;
 use thegn_core::plugin_api::{Capability, ExtensionPoint, HostContract, PluginManifest};
 
-use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage};
+use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage, PageMode};
 use crate::plugin::proc::{self, NdjsonSink, PluginError};
 
 /// Non-JSON stdout lines kept for the warning log.
@@ -57,6 +65,8 @@ struct Admitted {
     events: Vec<CalEvent>,
     deleted: Vec<String>,
     sync_token: String,
+    /// The mode the plugin declared, if any (THE-452).
+    mode: Option<PageMode>,
     /// Set when a visitor stopped on the budget, so the serde error it had to
     /// raise to stop is reported as the admission refusal it really is.
     refusal: Option<AdmissionError>,
@@ -168,6 +178,17 @@ impl<'de> Visitor<'de> for EventsParams<'_> {
                 "events" => map.next_value_seed(EventList(&mut *sink))?,
                 "deleted" => map.next_value_seed(DeletedList(&mut *sink))?,
                 "sync_token" => sink.sync_token = map.next_value::<String>()?,
+                "mode" => {
+                    let raw = map.next_value::<std::borrow::Cow<'de, str>>()?;
+                    let Some(mode) = PageMode::parse(&raw) else {
+                        return Err(de::Error::custom("unknown page mode"));
+                    };
+                    // Messages are repeatable; they must agree on what the run is.
+                    if sink.mode.is_some_and(|prior| prior != mode) {
+                        return Err(de::Error::custom("conflicting page modes"));
+                    }
+                    sink.mode = Some(mode);
+                }
                 _ => {
                     map.next_value::<IgnoredAny>()?;
                 }
@@ -482,6 +503,7 @@ impl CommandBackend {
                 events: Vec::new(),
                 deleted: Vec::new(),
                 sync_token: String::new(),
+                mode: None,
                 refusal: None,
             },
             granted: self.granted.clone(),
@@ -519,6 +541,46 @@ impl CommandBackend {
             return Err(AdmissionError::new(AdmissionLimit::Messages).into());
         }
         let a = sink.admitted;
-        EventPage::from_meter(a.meter, a.events, a.deleted, a.sync_token)
+        let resumed = !sync_token.is_empty();
+        let mode = match a.mode {
+            Some(declared) => declared,
+            // A plugin that predates `mode` (THE-452): a request with no
+            // cursor can only have produced a full picture, and on a resume a
+            // returned cursor is read as a delta, none as a snapshot.
+            None if resumed && !a.sync_token.is_empty() => PageMode::Delta,
+            None => PageMode::Snapshot,
+        };
+        match mode {
+            // Fail closed on a contradiction rather than guess at one.
+            PageMode::Unchanged if !resumed => Err(CalendarError::Parse(
+                "plugin declared the calendar unchanged without a cursor to compare".into(),
+            )),
+            PageMode::Unchanged if !a.events.is_empty() || !a.deleted.is_empty() => Err(
+                CalendarError::Parse("plugin declared the calendar unchanged but sent data".into()),
+            ),
+            PageMode::Unchanged => {
+                let token = if a.sync_token.is_empty() {
+                    sync_token
+                } else {
+                    a.sync_token.as_str()
+                };
+                Ok(EventPage::unchanged(token))
+            }
+            PageMode::Delta if !resumed => Err(CalendarError::Parse(
+                "plugin declared a delta for a request that carried no cursor".into(),
+            )),
+            mode => {
+                // A snapshot omits what is gone, so tombstones a mode-less
+                // plugin sent alongside one carry nothing. A plugin that
+                // *declared* `snapshot` and sent them anyway is contradicting
+                // itself, and `from_meter` refuses that.
+                let deleted = if a.mode.is_none() && mode != PageMode::Delta {
+                    Vec::new()
+                } else {
+                    a.deleted
+                };
+                EventPage::from_meter(a.meter, mode, a.events, deleted, a.sync_token)
+            }
+        }
     }
 }
