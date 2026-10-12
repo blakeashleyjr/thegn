@@ -77,10 +77,7 @@ impl TokenBucket {
         }
         let deficit = 1.0 - self.tokens;
         let secs = deficit / self.rps;
-        if !secs.is_finite() || secs >= u64::MAX as f64 {
-            return Duration::MAX;
-        }
-        let wait = Duration::from_secs_f64(secs.max(0.0));
+        let wait = Duration::try_from_secs_f64(secs.max(0.0)).unwrap_or(Duration::MAX);
         // Mirror Go's floor of 1ms so a busy-wait can't spin.
         wait.max(Duration::from_millis(1))
     }

@@ -317,6 +317,19 @@ mod tests {
     }
 
     #[test]
+    fn build_rejects_nan_rate_before_constructing_runtime_config() {
+        let mut c = base_cfg();
+        c.providers.push(ProviderEntry {
+            name: "p".into(),
+            rpm: f64::NAN,
+            ..Default::default()
+        });
+
+        let error = build(&c).err().expect("NaN rpm must be rejected");
+        assert!(error.to_string().contains("rpm"));
+    }
+
+    #[test]
     fn resolve_ref_env_and_file() {
         unsafe { std::env::set_var("RR_ENV", "v") };
         assert_eq!(resolve_ref("env:RR_ENV").as_deref(), Some("v"));
