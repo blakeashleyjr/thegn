@@ -1591,6 +1591,8 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
+    use super::ORPHAN_CACHE_SWEEP_MAX_KEYS;
+
     #[test]
     fn worktree_record_preserves_absence_nullable_fields_and_decode_errors() {
         let db = Db::open_memory().unwrap();
