@@ -536,14 +536,10 @@ fn xdg_mount_root(
             return None;
         }
     };
-    let Some(file_name) = root.file_name() else {
-        omissions.push(XdgOmissionEntry {
-            path: root,
-            reason: XdgOmission::UnresolvableRoot,
-        });
-        return None;
-    };
-    if canonical != parent.join(file_name) {
+    if !root
+        .file_name()
+        .is_some_and(|file_name| canonical == parent.join(file_name))
+    {
         omissions.push(XdgOmissionEntry {
             path: root,
             reason: XdgOmission::UnresolvableRoot,
