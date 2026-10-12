@@ -102,6 +102,8 @@ pub(crate) enum Edge {
 pub(crate) struct BoardRow {
     pub row: PipelineRow,
     pub edge: Edge,
+    /// Configured stage of the parent for a cross-stage inbound edge.
+    pub inbound_from: Option<String>,
     /// This row is some other row's [`Edge::Inbound`] parent — it carries an
     /// outbound tick so the flow reads in both directions.
     pub outbound: bool,
@@ -244,7 +246,7 @@ pub(crate) fn board(
                     next: stage.and_then(|s| s.next_name()).map(str::to_string),
                     configured: stage.is_some(),
                     model: stage.map_or(EffectiveModel::Unspecified, |stage| {
-                        effective_model(cfg, &stage.agent, Some(name), stage.model.is_some())
+                        effective_model(cfg, &stage.agent, Some(name))
                     }),
                 },
                 rows: Vec::new(),
@@ -283,12 +285,20 @@ pub(crate) fn board(
             },
             None => Edge::None,
         };
+        let inbound_from = if edge == Edge::Inbound {
+            r.parent_id
+                .and_then(|parent| row_of_id.get(&parent))
+                .map(|parent| parent.stage.clone())
+        } else {
+            None
+        };
         let timeout = columns[ci].head.timeout_secs;
         columns[ci].rows.push(BoardRow {
             edge,
+            inbound_from,
             outbound: outbound.contains(&r.id),
             stalled: stalled(r, timeout, now_ms),
-            model: effective_model(cfg, &r.agent_name, Some(&r.stage), false),
+            model: effective_model(cfg, &r.agent_name, Some(&r.stage)),
             row: r.clone(),
         });
     }
@@ -312,12 +322,15 @@ pub(crate) fn board(
     }
 }
 
-fn effective_model(
-    cfg: &Config,
-    agent: &str,
-    stage: Option<&str>,
-    stage_override: bool,
-) -> EffectiveModel {
+fn effective_model(cfg: &Config, agent: &str, stage: Option<&str>) -> EffectiveModel {
+    // Historical and UNSTAGED rows have no configured stage overrides. Resolve
+    // their agent defaults without asking effective_agent to validate a stale
+    // stage name.
+    let stage = stage.filter(|name| cfg.pipeline.stage(name).is_some());
+    let stage_override = stage
+        .and_then(|name| cfg.pipeline.stage(name))
+        .and_then(|stage| stage.model.as_deref())
+        .is_some_and(|model| !model.trim().is_empty());
     match thegn_core::agent_task::effective_agent(cfg, agent, stage) {
         Ok(eff) => match eff.model {
             Some(name) if stage_override => EffectiveModel::Selected {
@@ -600,12 +613,14 @@ mod tests {
             stage("override", None),
             stage("none", None),
             stage("invalid", None),
+            stage("blank-override", None),
         ];
         for s in &mut stages {
             s.agent = if s.name == "none" { "plain" } else { "worker" }.into();
         }
         stages[1].model = Some("opus".into());
         stages[3].model = Some("not-supported".into());
+        stages[4].model = Some("  ".into());
         let mut cfg = config(&stages);
         cfg.agents
             .push(agent("worker", Some("claude"), Some("sonnet")));
@@ -620,6 +635,7 @@ mod tests {
                 d(2, Some("override"), None, 20),
                 d(3, Some("none"), None, 30),
                 d(4, Some("invalid"), None, 40),
+                d(5, Some("blank-override"), None, 50),
             ],
             &stages,
             0,
@@ -654,6 +670,48 @@ mod tests {
             &b.columns[3].rows[0].model,
             EffectiveModel::Error(_)
         ));
+        assert_eq!(
+            b.columns[4].head.model,
+            EffectiveModel::Selected {
+                name: "sonnet".into(),
+                source: ModelSource::EntryDefault,
+            }
+        );
+        assert_eq!(b.columns[4].rows[0].model, b.columns[4].head.model);
+    }
+
+    #[test]
+    fn unstaged_and_historical_rows_resolve_the_entry_model_without_stage_errors() {
+        let stages = [stage("current", None)];
+        let mut cfg = config(&stages);
+        cfg.agents
+            .push(agent("worker", Some("claude"), Some("sonnet")));
+        let rows = fold(
+            &[d(1, None, None, 10), d(2, Some("renamed-stage"), None, 20)],
+            &stages,
+            0,
+        );
+        let mut rows = rows;
+        for row in &mut rows {
+            row.agent_name = "worker".into();
+        }
+
+        let b = board(&rows, &cfg, 200, 0, false);
+        let expected = EffectiveModel::Selected {
+            name: "sonnet".into(),
+            source: ModelSource::EntryDefault,
+        };
+        for name in [UNSTAGED, "renamed-stage"] {
+            let row = b
+                .columns
+                .iter()
+                .find(|column| column.head.name == name)
+                .unwrap()
+                .rows
+                .first()
+                .unwrap();
+            assert_eq!(row.model, expected, "unexpected model for {name}");
+        }
     }
 
     #[test]

@@ -50,7 +50,7 @@ Below the rail, each row is one dispatch: a status mark, the worktree it works
 in, and how long it has been going.
 
 - A `→` at the left of a row means its parent row's configured stage `next`
-  names this row's stage. The stage name beside the arrow labels the target,
+  names this row's stage. The stage name beside the arrow labels the source,
   including when columns are not neighbours or appear out of transition order.
   The parent carries a matching `→` at its right edge, so the flow reads in
   both directions. Column adjacency alone never creates a flow; if the parent's
