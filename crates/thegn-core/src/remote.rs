@@ -1036,8 +1036,8 @@ fn cas_git_path_write_script(path: &str, expected_len: usize) -> String {
     format!(
         "set -C; umask 077; p={quoted}; e=\"$p.thegn-cas.$$\"; t=\"$p.thegn-tmp.$$\"; \
          [ ! -L \"$p\" ] && [ ! -d \"$p\" ] && [ -e \"$p\" ] || exit 1; \
-         created=0; trap 'if [ \"$created\" = 1 ]; then rm -f -- \"$e\" \"$t\"; fi' 0; \
-         trap 'exit 1' HUP INT TERM; : > \"$e\" || exit 1; created=1; : > \"$t\" || exit 1; \
+         ce=0; ct=0; trap 'if [ \"$ce\" = 1 ]; then rm -f -- \"$e\"; fi; if [ \"$ct\" = 1 ]; then rm -f -- \"$t\"; fi' 0; \
+         trap 'exit 1' HUP INT TERM; : > \"$e\" || exit 1; ce=1; : > \"$t\" || exit 1; ct=1; \
          set +C; dd bs=1 count={expected_len} 2>/dev/null > \"$e\" || exit 1; \
          [ \"$(wc -c < \"$e\")\" -eq {expected_len} ] || exit 1; cat > \"$t\" || exit 1; \
          cmp -s -- \"$e\" \"$p\"; cmp_status=$?; \
@@ -1211,7 +1211,7 @@ mod tests {
     #[test]
     fn ssh_cas_write_script_is_explicitly_run_by_posix_shell() {
         let command = cas_git_path_write_ssh_command("/work tree/todo", 7);
-        let script = "set -C; umask 077; p='/work tree/todo'; e=\"$p.thegn-cas.$$\"; t=\"$p.thegn-tmp.$$\"; [ ! -L \"$p\" ] && [ ! -d \"$p\" ] && [ -e \"$p\" ] || exit 1; created=0; trap 'if [ \"$created\" = 1 ]; then rm -f -- \"$e\" \"$t\"; fi' 0; trap 'exit 1' HUP INT TERM; : > \"$e\" || exit 1; created=1; : > \"$t\" || exit 1; set +C; dd bs=1 count=7 2>/dev/null > \"$e\" || exit 1; [ \"$(wc -c < \"$e\")\" -eq 7 ] || exit 1; cat > \"$t\" || exit 1; cmp -s -- \"$e\" \"$p\"; cmp_status=$?; if [ \"$cmp_status\" -eq 1 ]; then exit 42; fi; [ \"$cmp_status\" -eq 0 ] || exit 1; mv -f -- \"$t\" \"$p\"";
+        let script = "set -C; umask 077; p='/work tree/todo'; e=\"$p.thegn-cas.$$\"; t=\"$p.thegn-tmp.$$\"; [ ! -L \"$p\" ] && [ ! -d \"$p\" ] && [ -e \"$p\" ] || exit 1; ce=0; ct=0; trap 'if [ \"$ce\" = 1 ]; then rm -f -- \"$e\"; fi; if [ \"$ct\" = 1 ]; then rm -f -- \"$t\"; fi' 0; trap 'exit 1' HUP INT TERM; : > \"$e\" || exit 1; ce=1; : > \"$t\" || exit 1; ct=1; set +C; dd bs=1 count=7 2>/dev/null > \"$e\" || exit 1; [ \"$(wc -c < \"$e\")\" -eq 7 ] || exit 1; cat > \"$t\" || exit 1; cmp -s -- \"$e\" \"$p\"; cmp_status=$?; if [ \"$cmp_status\" -eq 1 ]; then exit 42; fi; [ \"$cmp_status\" -eq 0 ] || exit 1; mv -f -- \"$t\" \"$p\"";
         assert_eq!(command, format!("sh -c {}", util::sh_quote(script)));
     }
 
