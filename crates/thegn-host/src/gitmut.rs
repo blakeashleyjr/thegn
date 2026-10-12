@@ -679,7 +679,14 @@ fn custom_command_result(
             if redact_failure {
                 GitOpResult::Err(format!("custom command failed ({status})"))
             } else {
-                let tail: Vec<&str> = stderr.trim().lines().rev().take(4).collect();
+                let redacted = thegn_core::ci_log::redact(&stderr);
+                let tail: Vec<String> = redacted
+                    .lines()
+                    .map(thegn_svc::lsp::sanitize_for_terminal)
+                    .filter(|line| !line.trim().is_empty())
+                    .map(|line| line.chars().take(200).collect())
+                    .collect();
+                let tail: Vec<&str> = tail.iter().rev().take(4).map(String::as_str).collect();
                 let tail: Vec<&str> = tail.into_iter().rev().collect();
                 GitOpResult::Err(if tail.is_empty() {
                     format!("command failed ({status})")
@@ -934,6 +941,33 @@ mod tests {
         ));
         if let Err(error) = std::fs::remove_dir_all(&dir) {
             tracing::debug!(%error, "custom none test repo cleanup failed");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_failure_redacts_secrets_and_sanitizes_terminal_controls() {
+        let dir = tmp_repo("custom-failure-redaction");
+        let loc = GitLoc::Local(dir.clone());
+        match execute(
+            GitOp::Custom {
+                command: "printf 'fatal: https://user:hunter2@example.invalid/r.git\\n\\033]0;owned\\007bad\\033[31mred\\n' >&2; exit 3".into(),
+                capture: false,
+            },
+            &loc,
+            false,
+        ) {
+            GitOpResult::Err(msg) => {
+                assert!(msg.starts_with("command failed"));
+                assert!(!msg.contains("hunter2"));
+                assert!(msg.contains(thegn_core::ci_log::REDACTION_MARKER));
+                assert!(!msg.contains('\u{1b}'));
+                assert!(!msg.contains('\u{7}'));
+            }
+            other => panic!("expected custom command failure, got {other:?}"),
+        }
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::debug!(%error, "custom failure redaction test repo cleanup failed");
         }
     }
 }
