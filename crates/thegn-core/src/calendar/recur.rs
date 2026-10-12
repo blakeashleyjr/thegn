@@ -712,12 +712,13 @@ fn past_until(
 }
 
 /// The zone a series' recurrence candidates live in: its own `TZID`, UTC for
-/// an absolute DTSTART, else `home` for floating dates and unknown TZIDs.
+/// an absolute DTSTART or a floating DATE, else `home` for unknown TZIDs.
+/// Dates have no zone, so the fixed UTC frame keeps UTC-form UNTIL and timed
+/// RDATE/EXDATE normalization independent of the configured display zone.
 pub(crate) fn series_zone(start: &EventTime, home: chrono_tz::Tz) -> chrono_tz::Tz {
     match start {
         EventTime::Zoned { zone, .. } => zone.resolve().unwrap_or(home),
-        EventTime::Instant { .. } => chrono_tz::UTC,
-        _ => home,
+        EventTime::Instant { .. } | EventTime::Date { .. } => chrono_tz::UTC,
     }
 }
 
