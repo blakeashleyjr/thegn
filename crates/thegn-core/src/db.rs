@@ -191,7 +191,9 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 /// v73: `agent_dispatches.status_changed_at_ms`, stamped by a trigger on every
 /// `status` write so a stale `spawning` row (daemon crash mid-relaunch) is
 /// recognisable without a per-call-site stamp (additive nullable column).
-pub const SCHEMA_VERSION: i64 = 73;
+/// v74: `pr_queue.ci_rerun_head`, the head OID whose one automatic CI rerun
+/// allowance has been reserved (additive nullable column).
+pub const SCHEMA_VERSION: i64 = 74;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -972,6 +974,9 @@ pub struct PrQueueRow {
     /// Human-readable detail for the current status (failing checks, an error).
     pub detail: Option<String>,
     pub agent_attempts: u32,
+    /// Head OID whose bounded automatic CI rerun was reserved. Cleared only
+    /// when `last_head_oid` changes; provider errors keep the allowance spent.
+    pub ci_rerun_head: Option<String>,
     /// The head commit thegn last observed. A change it did not cause means a
     /// teammate pushed — see [`crate::pr_queue::foreign_push`].
     pub last_head_oid: Option<String>,
@@ -2083,6 +2088,7 @@ impl Db {
         crate::db_migrate::migrate_v71(&conn)?;
         crate::db_migrate::migrate_v72(&conn)?;
         crate::db_migrate::migrate_v73(&conn)?;
+        crate::db_migrate::migrate_v74(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2094,6 +2100,7 @@ impl Db {
             crate::db_migrate::verify_v71_schema(&conn)?;
             crate::db_migrate::verify_v72_schema(&conn)?;
             crate::db_migrate::verify_v73_schema(&conn)?;
+            crate::db_migrate::verify_v74_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can

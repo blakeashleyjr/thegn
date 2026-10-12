@@ -445,24 +445,43 @@ pub(crate) fn drive_queue(
                 // Before waking an agent on a red build, try the cheap thing: a
                 // lot of red CI is a flake, and a re-run costs nothing but a
                 // little wall-clock.
-                if kind == TaskKind::PrCiFailure
-                    && attempts == 0
-                    && let Ok(n) = forge.rerun_failed(&loc, PrRef::Number(item.number))
-                    && n > 0
-                {
-                    {
-                        let detail = format!("re-ran {n} failed check(s) before dispatching");
-                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                        let _ = db.update_pr_status(
-                            &item.key,
-                            PrqStatus::BlockedCi.as_str(),
-                            Some(blocker.as_str()),
-                            Some(&detail),
-                            Some(&head),
-                        );
-                        step(PrqStatus::BlockedCi.as_str(), &detail, &mut progress);
-                        out.blocked.push(item.number);
-                        continue;
+                if kind == TaskKind::PrCiFailure && attempts == 0 {
+                    // Spend the durable per-head allowance before the network
+                    // mutation. An error may mean the provider accepted the
+                    // request but its response was lost; keep it spent and
+                    // let this pass continue to remediation.
+                    match db.reserve_pr_ci_rerun(
+                        &item.key,
+                        item.last_head_oid.as_deref(),
+                        &head,
+                    ) {
+                        Ok(true) => match forge.rerun_failed(&loc, PrRef::Number(item.number)) {
+                            Ok(n) if n > 0 => {
+                                let detail = format!("re-ran {n} failed check(s) before dispatching");
+                                // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                                let _ = db.update_pr_status(
+                                    &item.key,
+                                    PrqStatus::BlockedCi.as_str(),
+                                    Some(blocker.as_str()),
+                                    Some(&detail),
+                                    Some(&head),
+                                );
+                                step(PrqStatus::BlockedCi.as_str(), &detail, &mut progress);
+                                out.blocked.push(item.number);
+                                continue;
+                            }
+                            Ok(_) => {}
+                            Err(error) => out.warnings.push(format!(
+                                "PR #{}: CI rerun response was ambiguous; retry allowance remains spent: {}",
+                                item.number,
+                                describe(&error)
+                            )),
+                        },
+                        Ok(false) => {}
+                        Err(error) => out.warnings.push(format!(
+                            "PR #{}: could not reserve CI rerun; continuing without rerun: {error}",
+                            item.number
+                        )),
                     }
                 }
 
@@ -1189,6 +1208,8 @@ mod tests {
         pr: std::sync::Mutex<Option<PrStatus>>,
         conversation: std::sync::Mutex<Option<thegn_core::forge::model::PrConversation>>,
         calls: std::sync::Mutex<Vec<String>>,
+        rerun_count: std::sync::atomic::AtomicU32,
+        rerun_error: std::sync::atomic::AtomicBool,
     }
     impl FakeForge {
         fn new(pr: Option<PrStatus>) -> Self {
@@ -1196,6 +1217,8 @@ mod tests {
                 pr: std::sync::Mutex::new(pr),
                 conversation: std::sync::Mutex::new(Some(Default::default())),
                 calls: Default::default(),
+                rerun_count: std::sync::atomic::AtomicU32::new(0),
+                rerun_error: std::sync::atomic::AtomicBool::new(false),
             }
         }
         fn with_conversation(self, conversation: thegn_core::forge::model::PrConversation) -> Self {
@@ -1208,6 +1231,16 @@ mod tests {
         }
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+        fn with_rerun_count(self, count: u32) -> Self {
+            self.rerun_count
+                .store(count, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+        fn with_rerun_error(self) -> Self {
+            self.rerun_error
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self
         }
         fn record(&self, s: impl Into<String>) {
             self.calls.lock().unwrap().push(s.into());
@@ -1258,7 +1291,11 @@ mod tests {
         }
         fn rerun_failed(&self, _: &GitLoc, pr: PrRef) -> Result<u32, ForgeError> {
             self.record(format!("rerun {pr:?}"));
-            Ok(0)
+            if self.rerun_error.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(ForgeError::Offline)
+            } else {
+                Ok(self.rerun_count.load(std::sync::atomic::Ordering::SeqCst))
+            }
         }
         fn whoami(&self, _: &GitLoc) -> Result<String, ForgeError> {
             self.record("whoami");
@@ -1296,6 +1333,22 @@ mod tests {
     fn requested_pr() -> PrStatus {
         let mut pr = fetched(vec![]).pr;
         pr.review_decision = Some("CHANGES_REQUESTED".into());
+        pr
+    }
+
+    fn failing_ci_pr(head: &str) -> PrStatus {
+        let mut pr = fetched(vec![]).pr;
+        pr.head_ref_oid = head.into();
+        pr.status_check_rollup = vec![thegn_core::forge::model::CheckRun {
+            name: "test".into(),
+            status: "COMPLETED".into(),
+            conclusion: Some("FAILURE".into()),
+            state: None,
+            workflow_name: None,
+            details_url: None,
+            started_at: None,
+            completed_at: None,
+        }];
         pr
     }
 
@@ -1441,6 +1494,239 @@ mod tests {
                 .any(|c| c.starts_with("merge Number(7)") && c.ends_with("auto=false")),
             "{:?}",
             forge.calls()
+        );
+    }
+
+    #[test]
+    fn successful_ci_rerun_is_bounded_across_database_reopen_then_dispatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pr-rerun.db");
+        let mut cfg = cfg();
+        cfg.watch = vec![PrWatchKind::Ci];
+        cfg.agent_command = "true {prompt}".into();
+        cfg.own_prs_only = false;
+        let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(1);
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.enqueue_pr("/repo", 7, Some("/w/feat"), "feat", "main", "github")
+                .unwrap();
+            let out = drive_queue(
+                &cfg,
+                &Config::default(),
+                &forge,
+                Path::new("/repo"),
+                &db,
+                vec![PrItem::from(&db.list_pr_queue().unwrap()[0])],
+                |_| {},
+            );
+            assert_eq!(
+                out.blocked,
+                vec![7],
+                "the successful rerun gets a fresh CI pass"
+            );
+            assert_eq!(
+                forge
+                    .calls()
+                    .iter()
+                    .filter(|call| call.starts_with("rerun"))
+                    .count(),
+                1
+            );
+
+            let mut pending = failing_ci_pr("abc");
+            pending.status_check_rollup[0].status = "IN_PROGRESS".into();
+            pending.status_check_rollup[0].conclusion = None;
+            *forge.pr.lock().unwrap() = Some(pending);
+            let row = db.list_pr_queue().unwrap().remove(0);
+            let out = drive_queue(
+                &cfg,
+                &Config::default(),
+                &forge,
+                Path::new("/repo"),
+                &db,
+                vec![PrItem::from(&row)],
+                |_| {},
+            );
+            assert_eq!(
+                out.blocked,
+                vec![7],
+                "in-flight CI remains blocked while the rerun is pending"
+            );
+            assert!(out.needs_human.is_empty());
+            assert_eq!(db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+            assert_eq!(
+                forge
+                    .calls()
+                    .iter()
+                    .filter(|call| call.starts_with("rerun"))
+                    .count(),
+                1,
+                "in-flight checks wait without spending another rerun or agent attempt"
+            );
+
+            *forge.pr.lock().unwrap() = Some(failing_ci_pr("abc"));
+        }
+
+        let db = Db::open_at(&path).unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(row.ci_rerun_head.as_deref(), Some("abc"));
+        let out = drive_queue(
+            &cfg,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+        assert!(out.blocked.is_empty());
+        assert_eq!(
+            forge
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("rerun"))
+                .count(),
+            1,
+            "reopening and repeated deterministic failure cannot repeat the mutation"
+        );
+        assert_eq!(db.list_pr_queue().unwrap()[0].agent_attempts, 1);
+    }
+
+    #[test]
+    fn ambiguous_rerun_response_keeps_allowance_spent() {
+        let (_dir, db) = temp_db("prq-rerun-ambiguous");
+        let mut cfg = cfg();
+        cfg.watch = vec![PrWatchKind::Ci];
+        cfg.pause_on_foreign_push = false;
+        cfg.agent_command = "true {prompt}".into();
+        cfg.own_prs_only = false;
+        db.enqueue_pr("/repo", 7, Some("/w/feat"), "feat", "main", "github")
+            .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_error();
+        let out = drive_queue(
+            &cfg,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+        assert!(
+            out.warnings
+                .iter()
+                .any(|warning| warning.contains("ambiguous"))
+        );
+        assert_eq!(
+            db.list_pr_queue().unwrap()[0].ci_rerun_head.as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            forge
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("rerun"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_new_pr_head_rearms_the_ci_rerun_allowance() {
+        let (_dir, db) = temp_db("prq-rerun-head-change");
+        let mut cfg = cfg();
+        cfg.watch = vec![PrWatchKind::Ci];
+        cfg.pause_on_foreign_push = false;
+        cfg.agent_command = "true {prompt}".into();
+        cfg.own_prs_only = false;
+        db.enqueue_pr("/repo", 7, Some("/w/feat"), "feat", "main", "github")
+            .unwrap();
+        let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(1);
+        let row = db.list_pr_queue().unwrap().remove(0);
+        drive_queue(
+            &cfg,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+        *forge.pr.lock().unwrap() = Some(failing_ci_pr("def"));
+        let row = db.list_pr_queue().unwrap().remove(0);
+        drive_queue(
+            &cfg,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+        assert_eq!(
+            forge
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("rerun"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            db.list_pr_queue().unwrap()[0].ci_rerun_head.as_deref(),
+            Some("def")
+        );
+    }
+
+    #[test]
+    fn concurrent_drivers_can_only_reserve_one_rerun_for_a_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pr-rerun-race.db");
+        let db = Db::open_at(&path).unwrap();
+        db.enqueue_pr("/repo", 7, Some("/w/feat"), "feat", "main", "github")
+            .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        drop(db);
+
+        let forge =
+            std::sync::Arc::new(FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(1));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let forge = forge.clone();
+                let barrier = barrier.clone();
+                let row = row.clone();
+                std::thread::spawn(move || {
+                    let db = Db::open_at(&path).unwrap();
+                    let mut cfg = cfg();
+                    cfg.watch = vec![PrWatchKind::Ci];
+                    cfg.agent_command = "true {prompt}".into();
+                    cfg.own_prs_only = false;
+                    barrier.wait();
+                    drive_queue(
+                        &cfg,
+                        &Config::default(),
+                        forge.as_ref(),
+                        Path::new("/repo"),
+                        &db,
+                        vec![PrItem::from(&row)],
+                        |_| {},
+                    );
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            forge
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("rerun"))
+                .count(),
+            1,
+            "driver workers racing the same persisted head share one reservation"
         );
     }
 
