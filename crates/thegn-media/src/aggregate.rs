@@ -7,13 +7,13 @@
 //! Selection reuses the same five-tier precedence the MPRIS picker uses
 //! (`players_priority` → sticky-active → first-playing → sticky-present →
 //! first-present), generalized across sources on the player name. The push
-//! [`AggregateWatch`] fans every child's own signal stream (MPRIS D-Bus signals,
-//! MPD `idle`) into one, so the ~0%-idle contract holds — poll-only children just
-//! contribute nothing to the stream and ride the host's safety poll.
+//! [`AggregateWatch`] polls every child's own signal stream (MPRIS D-Bus signals,
+//! MPD `idle`) concurrently, so the ~0%-idle contract holds — poll-only children
+//! just contribute nothing to the stream and ride the host's safety poll.
 
 use std::sync::Mutex;
 
-use futures::future::{BoxFuture, join_all};
+use futures::future::{BoxFuture, join_all, select_all};
 
 use crate::model::{MediaState, PlaybackState};
 use crate::{MediaBackend, MediaCaps, MediaClient, MediaError, MediaWatch};
@@ -170,23 +170,11 @@ impl MediaBackend for Aggregate {
                     .map(|c| bounded_watch(c.watch(), SNAPSHOT_BUDGET)),
             )
             .await;
-            let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
-            let mut any = false;
-            let mut tasks = Vec::new();
-            for mut w in watches.into_iter().flatten() {
-                any = true;
-                let tx = tx.clone();
-                // A notification means “refresh current state”; while one
-                // refresh is pending, more notifications carry no information.
-                tasks.push(tokio::spawn(async move {
-                    while w.changed().await {
-                        if !signal_refresh(&tx) {
-                            break;
-                        }
-                    }
-                }));
-            }
-            any.then(|| Box::new(AggregateWatch { rx, tasks }) as Box<dyn MediaWatch + Send>)
+            let children = watches;
+            children
+                .iter()
+                .any(Option::is_some)
+                .then(|| Box::new(AggregateWatch { children }) as Box<dyn MediaWatch + Send>)
         })
     }
 
@@ -285,33 +273,40 @@ pub fn choose_state(
     Some(0)
 }
 
-/// A merged push stream: fires whenever any child's watcher fires. Ends when
-/// every child stream has ended (all sender tasks dropped).
+/// A merged push stream that directly owns every child watcher. Child futures
+/// are polled concurrently; dropping this value drops all watchers immediately.
 pub struct AggregateWatch {
-    rx: tokio::sync::mpsc::Receiver<()>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
-}
-
-fn signal_refresh(tx: &tokio::sync::mpsc::Sender<()>) -> bool {
-    !matches!(
-        tx.try_send(()),
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
-    )
-}
-
-impl Drop for AggregateWatch {
-    fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
-        }
-    }
+    children: Vec<Option<Box<dyn MediaWatch + Send>>>,
 }
 
 impl MediaWatch for AggregateWatch {
     fn changed(
         &mut self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
-        Box::pin(async move { self.rx.recv().await.is_some() })
+        Box::pin(async move {
+            loop {
+                let futures = self
+                    .children
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(|(index, child)| {
+                        child.as_mut().map(|watch| {
+                            Box::pin(async move { (index, watch.changed().await) })
+                                as BoxFuture<'_, (usize, bool)>
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if futures.is_empty() {
+                    return false;
+                }
+                let ((index, changed), _, remaining) = select_all(futures).await;
+                drop(remaining);
+                if changed {
+                    return true;
+                }
+                self.children[index] = None;
+            }
+        })
     }
 }
 
@@ -358,24 +353,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aggregate_refresh_signals_coalesce_and_drop_cancels_children() {
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        assert!(signal_refresh(&tx));
-        assert!(signal_refresh(&tx));
-        assert_eq!(rx.len(), 1);
-
-        let task = tokio::spawn(std::future::pending::<()>());
-        let task_abort = task.abort_handle();
-        let watch = AggregateWatch {
-            rx,
-            tasks: vec![task],
-        };
-        drop(watch);
-        tokio::task::yield_now().await;
-        assert!(
-            task_abort.is_finished(),
-            "dropping the aggregate must abort its child tasks"
+    async fn dropping_aggregate_watch_drops_children_immediately() {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let aggregate = Aggregate::new(
+            vec![fake_backend(Box::new(DropWatch(dropped.clone())))],
+            Vec::new(),
         );
+        let watch = aggregate.watch().await.unwrap();
+        drop(watch);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn aborting_aggregate_changed_drops_children() {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let aggregate = Aggregate::new(
+            vec![fake_backend(Box::new(DropWatch(dropped.clone())))],
+            Vec::new(),
+        );
+        let watch = aggregate.watch().await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut watch = watch;
+            let changed = watch.changed();
+            started_tx.send(()).unwrap();
+            changed.await
+        });
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn healthy_child_wakes_while_stalled_child_stays_owned() {
+        let stalled_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let aggregate = Aggregate::new(
+            vec![
+                fake_backend(Box::new(DropWatch(stalled_dropped.clone()))),
+                fake_backend(Box::new(ReadyWatch(Some(true)))),
+            ],
+            Vec::new(),
+        );
+        let mut watch = aggregate.watch().await.unwrap();
+        assert!(watch.changed().await);
+        assert!(!stalled_dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn aggregate_watch_ends_when_all_children_end() {
+        let aggregate = Aggregate::new(
+            vec![fake_backend(Box::new(ReadyWatch(Some(false))))],
+            Vec::new(),
+        );
+        let mut watch = aggregate.watch().await.unwrap();
+        assert!(!watch.changed().await);
+    }
+
+    #[tokio::test]
+    async fn aggregate_watch_reports_simultaneous_changes_as_refresh_wakes() {
+        let aggregate = Aggregate::new(
+            vec![
+                fake_backend(Box::new(ReadyWatch(Some(true)))),
+                fake_backend(Box::new(ReadyWatch(Some(true)))),
+            ],
+            Vec::new(),
+        );
+        let mut watch = aggregate.watch().await.unwrap();
+        // Both ready children produce their own wake, then the stream ends.
+        assert!(watch.changed().await);
+        assert!(watch.changed().await);
+        assert!(!watch.changed().await);
     }
 
     #[tokio::test]
@@ -399,6 +447,96 @@ mod tests {
             &mut self,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
             Box::pin(std::future::pending())
+        }
+    }
+
+    struct DropWatch(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropWatch {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl MediaWatch for DropWatch {
+        fn changed(
+            &mut self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    struct ReadyWatch(Option<bool>);
+
+    impl MediaWatch for ReadyWatch {
+        fn changed(
+            &mut self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+            Box::pin(async move { self.0.take().unwrap_or(false) })
+        }
+    }
+
+    struct FakeBackend {
+        watch: std::sync::Mutex<Option<Box<dyn MediaWatch + Send>>>,
+    }
+
+    fn fake_backend(watch: Box<dyn MediaWatch + Send>) -> MediaClient {
+        Box::new(FakeBackend {
+            watch: std::sync::Mutex::new(Some(watch)),
+        })
+    }
+
+    fn no_player<'a, T: Send + 'a>() -> BoxFuture<'a, Result<T, MediaError>> {
+        Box::pin(async { Err(MediaError::NoPlayer) })
+    }
+
+    impl MediaBackend for FakeBackend {
+        fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
+            no_player()
+        }
+
+        fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+
+        fn next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+
+        fn previous(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+
+        fn set_shuffle(&self, _on: bool) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+
+        fn set_loop(&self, _mode: crate::model::LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+
+        fn volume_step(&self, _delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+
+        fn playlists(&self) -> BoxFuture<'_, Result<Vec<crate::model::Playlist>, MediaError>> {
+            no_player()
+        }
+
+        fn activate_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
+            no_player()
+        }
+
+        fn caps(&self) -> MediaCaps {
+            NO_CAPS
+        }
+
+        fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
+            Box::pin(async move { self.watch.lock().unwrap().take() })
+        }
+
+        fn players(&self) -> BoxFuture<'_, Vec<String>> {
+            Box::pin(async { Vec::new() })
         }
     }
 }
