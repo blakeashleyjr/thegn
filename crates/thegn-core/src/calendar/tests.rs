@@ -722,11 +722,32 @@ fn an_instant_event_time_buckets_into_the_viewers_local_date() {
 }
 
 #[test]
-fn an_unknown_event_zone_falls_back_to_home_rather_than_vanishing() {
+fn an_unknown_event_zone_reports_unknown_instead_of_falling_back_to_home() {
     let t = zoned(2026, 6, 1, 12, 0, "Mars/Olympus_Mons");
     assert_eq!(
-        t.instant_in(Tz::UTC, GapPolicy::ShiftForward),
-        Some(utc(2026, 6, 1, 12, 0))
+        t.try_instant_in(Tz::UTC, GapPolicy::ShiftForward),
+        Err(InstantError::UnknownZone)
+    );
+    assert_eq!(InstantError::UnknownZone.to_string(), "unknown time zone");
+    assert_eq!(t.instant_in(Tz::UTC, GapPolicy::ShiftForward), None);
+}
+
+#[test]
+fn event_time_resolution_distinguishes_gaps_and_floating_zones() {
+    let gap = zoned(2026, 3, 8, 2, 30, "America/New_York");
+    assert_eq!(
+        gap.try_instant_in(Tz::UTC, GapPolicy::Skip),
+        Err(InstantError::Nonexistent)
+    );
+    assert_eq!(
+        InstantError::Nonexistent.to_string(),
+        "nonexistent local time"
+    );
+
+    let floating = zoned(2026, 6, 1, 12, 0, "  ");
+    assert_eq!(
+        floating.try_instant_in(Tz::Europe__London, GapPolicy::ShiftForward),
+        Ok(utc(2026, 6, 1, 11, 0))
     );
 }
 
@@ -1177,18 +1198,14 @@ fn recurrence_rejects_an_unknown_rdate_zone_unless_it_matches_dtstart() {
         local: d(2026, 8, 5).and_hms_opt(9, 0, 0).unwrap(),
         zone: unknown,
     }];
-    let occurrences = same_unknown
-        .occurrences_bounded(
+    assert_eq!(
+        same_unknown.occurrences_bounded(
             d(2026, 8, 1),
             d(2026, 8, 6),
             Tz::UTC,
             &mut ExpansionBudget::default(),
-        )
-        .unwrap();
-    assert_eq!(occurrences.len(), 3);
-    assert_eq!(
-        occurrences[2].start,
-        zoned(2026, 8, 5, 9, 0, "Nowhere/Land")
+        ),
+        Err(ExpansionError::InvalidSpan)
     );
 }
 
