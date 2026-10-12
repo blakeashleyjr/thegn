@@ -22,6 +22,7 @@ use crate::db::Db;
 use crate::store::{AccountStore, WorkspaceStore};
 use crate::util;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 /// A `[[accounts]]` entry — one credential home for a coding-agent provider
@@ -37,7 +38,7 @@ pub struct Account {
     pub name: String,
     pub provider: String,
     /// Credential home directory (`~` expanded). When absent, thegn manages a
-    /// dir at `$XDG_STATE_HOME/thegn/accounts/<provider>/<slug>/`.
+    /// dir at `$XDG_STATE_HOME/thegn/accounts/<provider>/<identity>/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
 }
@@ -125,10 +126,26 @@ pub fn managed_root() -> PathBuf {
     util::xdg_state_home().join("thegn").join("accounts")
 }
 
+/// Canonical, lossless component used for every managed account-home path.
+/// Existing canonical slugs keep their paths; other names carry a digest of
+/// the exact configured name so slug aliases cannot share credential bytes.
+pub fn home_component(name: &str) -> String {
+    let slug = util::slugify(name);
+    if !slug.is_empty() && slug == name {
+        return slug;
+    }
+    use sha2::{Digest, Sha256};
+    let prefix = if slug.is_empty() { "acct" } else { &slug };
+    let prefix = &prefix[..prefix.len().min(40)];
+    let digest = Sha256::digest(name.as_bytes());
+    let hex = format!("{digest:x}");
+    format!("{prefix}_{}", &hex[..16])
+}
+
 /// The managed credential-home dir for an account thegn owns
-/// (`$XDG_STATE_HOME/thegn/accounts/<provider>/<slug>/`).
+/// (`$XDG_STATE_HOME/thegn/accounts/<provider>/<identity>/`).
 pub fn managed_dir(provider_id: &str, name: &str) -> PathBuf {
-    managed_root().join(provider_id).join(util::slugify(name))
+    managed_root().join(provider_id).join(home_component(name))
 }
 
 /// One resolved account: where its creds live and whether it is logged in.
@@ -153,20 +170,54 @@ fn marked_authed(provider_id: &str, dir: &std::path::Path) -> bool {
 /// The credential-home dir for a named account: config entries first
 /// (adopted `dir`, or its managed dir), then the DB-managed table.
 pub fn account_dir(cfg: &Config, db: &Db, provider_id: &str, name: &str) -> Option<PathBuf> {
-    if let Some(a) = cfg
-        .accounts
-        .iter()
-        .find(|a| a.provider == provider_id && a.name == name)
-    {
-        return Some(match &a.dir {
-            Some(d) => PathBuf::from(util::expand_tilde(d)),
-            None => managed_dir(provider_id, name),
-        });
+    let entries = resolved_entries(cfg, db, provider_id);
+    let shared = shared_dirs(
+        &entries
+            .iter()
+            .map(|(n, d, _)| (n.clone(), d.clone()))
+            .collect::<Vec<_>>(),
+    );
+    if shared.contains(&name.to_string()) {
+        return None;
     }
-    db.account_dir(provider_id, name)
-        .ok()
-        .flatten()
-        .map(PathBuf::from)
+    entries
+        .into_iter()
+        .find(|(n, _, _)| n == name)
+        .map(|(_, dir, _)| dir)
+}
+
+fn resolved_entries(cfg: &Config, db: &Db, provider_id: &str) -> Vec<(String, PathBuf, bool)> {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    for account in cfg.accounts.iter().filter(|a| a.provider == provider_id) {
+        let dir = match &account.dir {
+            Some(d) => PathBuf::from(util::expand_tilde(d)),
+            None => managed_dir(provider_id, &account.name),
+        };
+        seen.insert(account.name.clone());
+        entries.push((account.name.clone(), dir, account.dir.is_none()));
+    }
+    for (name, dir, managed) in db.list_accounts(provider_id).unwrap_or_default() {
+        if seen.insert(name.clone()) {
+            entries.push((name, PathBuf::from(dir), managed));
+        }
+    }
+    entries
+}
+
+/// Names participating in a shared physical directory. Repeated records for
+/// the same exact logical name do not constitute a collision.
+fn shared_dirs(entries: &[(String, PathBuf)]) -> HashSet<String> {
+    let mut owners: std::collections::HashMap<&PathBuf, HashSet<&str>> =
+        std::collections::HashMap::new();
+    for (name, dir) in entries {
+        owners.entry(dir).or_default().insert(name);
+    }
+    owners
+        .into_values()
+        .filter(|names| names.len() > 1)
+        .flat_map(|names| names.into_iter().map(str::to_owned))
+        .collect()
 }
 
 /// The agent's effective on-host config dir when thegn does **not** manage
@@ -201,36 +252,32 @@ fn resolve_config_dir(
 /// The full merged account list for a provider (config + DB-managed), for the
 /// picker. Config entries take precedence on name collisions.
 pub fn list(cfg: &Config, db: &Db, provider_id: &str) -> Vec<AccountInfo> {
-    let mut out: Vec<AccountInfo> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for a in cfg.accounts.iter().filter(|a| a.provider == provider_id) {
-        let dir = match &a.dir {
-            Some(d) => PathBuf::from(util::expand_tilde(d)),
-            None => managed_dir(provider_id, &a.name),
-        };
-        seen.insert(a.name.clone());
-        out.push(AccountInfo {
-            authed: marked_authed(provider_id, &dir),
-            managed: a.dir.is_none(),
-            name: a.name.clone(),
-            provider: provider_id.to_string(),
-            dir,
-        });
+    let entries = resolved_entries(cfg, db, provider_id);
+    let shared = shared_dirs(
+        &entries
+            .iter()
+            .map(|(n, d, _)| (n.clone(), d.clone()))
+            .collect::<Vec<_>>(),
+    );
+    if !shared.is_empty() {
+        let mut names: Vec<_> = shared.iter().cloned().collect();
+        names.sort();
+        crate::msg::warn(&format!(
+            "refusing coding-agent accounts with shared credential directories: {}",
+            names.join(", ")
+        ));
     }
-    for (name, dir, managed) in db.list_accounts(provider_id).unwrap_or_default() {
-        if seen.contains(&name) {
-            continue;
-        }
-        let dir = PathBuf::from(dir);
-        out.push(AccountInfo {
+    entries
+        .into_iter()
+        .filter(|(name, _, _)| !shared.contains(name))
+        .map(|(name, dir, managed)| AccountInfo {
             authed: marked_authed(provider_id, &dir),
             managed,
             name,
             provider: provider_id.to_string(),
             dir,
-        });
-    }
-    out
+        })
+        .collect()
 }
 
 // --- active-account pointers (over the ui_state KV store) -------------------
@@ -433,6 +480,40 @@ mod tests {
         assert_eq!(
             account_dir(&cfg, &db, "codex", "db-only"),
             Some(PathBuf::from("/var/creds"))
+        );
+    }
+
+    #[test]
+    fn home_components_are_distinct_for_separator_and_case_aliases() {
+        let components: HashSet<_> = ["work/a", "work-a", "work_a", "Work-A"]
+            .into_iter()
+            .map(home_component)
+            .collect();
+        assert_eq!(components.len(), 4);
+        let punctuation = home_component("!!!");
+        let empty = home_component("");
+        assert!(!punctuation.is_empty());
+        assert!(!empty.is_empty());
+        assert_ne!(punctuation, empty);
+        assert_eq!(home_component("acct1"), "acct1");
+    }
+
+    #[test]
+    fn colliding_db_rows_are_refused() {
+        let db = Db::open_memory().unwrap();
+        let cfg = Config::default();
+        db.put_account("codex", "first", "/shared/creds", true, 1)
+            .unwrap();
+        db.put_account("codex", "second", "/shared/creds", true, 2)
+            .unwrap();
+
+        assert_eq!(account_dir(&cfg, &db, "codex", "first"), None);
+        assert_eq!(account_dir(&cfg, &db, "codex", "second"), None);
+        let listed = list(&cfg, &db, "codex");
+        assert!(
+            !listed
+                .iter()
+                .any(|account| { account.name == "first" || account.name == "second" })
         );
     }
 
@@ -831,7 +912,12 @@ mod tests {
                     .join("codex")
             )
         );
-        // Name is slugified.
-        assert!(d.ends_with("my-work"));
+        // Non-canonical names keep a readable slug prefix and exact-name hash.
+        assert!(
+            d.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("my-work_")
+        );
     }
 }
