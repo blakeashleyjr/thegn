@@ -545,14 +545,13 @@ fn issue_prompt(
 }
 
 fn issue_vars(issue: &thegn_core::issue::Issue, branch: &str, worktree: &str) -> TaskVars {
-    let vars = TaskVars::new()
+    TaskVars::new()
         .set("issue_number", &issue.number)
         .set("issue_title", &issue.title)
         .set("issue_body", issue.body.as_deref().unwrap_or_default())
         .set("issue_url", &issue.url)
         .set("branch", branch)
-        .set("worktree", worktree);
-    vars
+        .set("worktree", worktree)
 }
 
 /// Keep writes routed to the same named tracker account that supplied the
