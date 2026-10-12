@@ -6,8 +6,9 @@
 //! shapes `thegn serve`: remote thin-client listening and the pairing policy.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::{config_enum, config_warn};
 
@@ -185,21 +186,38 @@ pub const fn max_socket_path_len(linux: bool) -> usize {
     if linux { 107 } else { 103 }
 }
 
-/// A short control-socket path under `short_dir`, standing in for a `natural`
-/// path that does not fit `sun_path`.
-///
-/// The filename is a hash of the natural path, which is what preserves the
-/// one-daemon-per-`XDG_STATE_HOME` isolation the natural path gave for free:
-/// two state dirs keep two sockets. This is deliberately the same trick the
-/// Windows arm already uses (`ipc::pipe_name_for_path`) — a fixed-length name
-/// derived from the path — just applied to unix, where it was missing.
-///
-/// [`crate::util::short_hash`] rather than a digest: it exists for exactly this
-/// "collision-defusing suffix" job, and 12 base36 chars consumes essentially the
-/// whole 64-bit hash. The hash is an isolation key, not a security boundary —
-/// the directory's 0700 ownership is what keeps other users out.
-pub fn short_socket_path(short_dir: &std::path::Path, natural: &std::path::Path) -> PathBuf {
-    let key = crate::util::short_hash(&natural.to_string_lossy(), 12);
+/// Versioned, lossless identity for a daemon state path. Unix paths are hashed
+/// from raw `OsStr` bytes; Windows paths use Rust's encoded UTF-16/WTF-8 form.
+/// The versioned domain keeps this identity separate from unrelated SHA-256
+/// uses. The full SHA-256 digest provides 256 bits of identity.
+pub fn state_scope_identity(state_dir: &Path) -> String {
+    format!("v1-{}", state_path_digest(state_dir))
+}
+
+/// The 128-bit endpoint key derived from the same versioned state-path digest
+/// used by [`state_scope_identity`].
+pub fn state_endpoint_key(state_dir: &Path) -> String {
+    state_path_digest(state_dir)[..32].to_string()
+}
+
+fn state_path_digest(path: &Path) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"thegn/daemon-scope/v1\0");
+    digest.update(path.as_os_str().as_encoded_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// A short control-socket path under `short_dir`, standing in for a path that
+/// does not fit `sun_path`. `path` may be either a state directory or the
+/// natural socket path, depending on the caller. Its 128-bit key is derived
+/// from lossless encoded path bytes, so invalid Unix path bytes remain distinct.
+pub fn short_socket_path(short_dir: &Path, path: &Path) -> PathBuf {
+    let key = state_endpoint_key(path);
     short_dir.join(format!("thegn-{key}.sock"))
 }
 
@@ -455,6 +473,25 @@ mod tests {
         assert_eq!(
             d.socket_path(Some(""), state),
             PathBuf::from("/state/thegn/run/daemon.sock")
+        );
+    }
+
+    #[test]
+    fn state_path_identity_is_versioned_lossless_and_stable() {
+        let state = Path::new("/state/one");
+        let identity = state_scope_identity(state);
+        assert_eq!(
+            identity,
+            "v1-d5540fd295b8113c54acb235599c8d23a3f2dc082010337ea4c3c46b765bf84d"
+        );
+        assert!(identity.starts_with("v1-"));
+        assert_eq!(identity.len(), 67);
+        assert_eq!(state_scope_identity(state), identity);
+        assert_eq!(state_endpoint_key(state), &identity[3..35]);
+        assert_eq!(state_endpoint_key(state).len(), 32);
+        assert_ne!(
+            state_scope_identity(state),
+            state_scope_identity(Path::new("/state/two"))
         );
     }
 
