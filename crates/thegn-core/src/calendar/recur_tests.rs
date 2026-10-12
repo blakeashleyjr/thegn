@@ -60,10 +60,22 @@ fn a_rule_without_freq_is_rejected() {
 }
 
 #[test]
-fn a_zero_interval_cannot_produce_an_infinite_loop() {
-    // INTERVAL=0 is invalid; treating it literally would never advance.
-    let r = RRule::parse("FREQ=DAILY;INTERVAL=0").unwrap();
-    assert_eq!(r.interval, 1);
+fn a_zero_interval_is_rejected_not_rewritten() {
+    // INTERVAL=0 is invalid; it neither advances nor may silently become 1.
+    assert!(matches!(
+        RRule::parse("FREQ=DAILY;INTERVAL=0"),
+        Err(RecurError::OutOfRange(_))
+    ));
+    assert!(matches!(
+        RRule::parse("FREQ=DAILY;INTERVAL=x"),
+        Err(RecurError::BadValue(_))
+    ));
+    assert_eq!(
+        RRule::parse("FREQ=DAILY;INTERVAL=4294967295")
+            .unwrap()
+            .interval,
+        u32::MAX
+    );
 }
 
 #[test]
@@ -896,18 +908,54 @@ fn a_yearly_rule_can_intersect_byday_with_bymonthday() {
 }
 
 #[test]
-fn an_out_of_range_by_value_produces_nothing_rather_than_panicking() {
-    // Feeds do contain nonsense; it must degrade to "no occurrence".
+fn an_out_of_range_by_value_is_rejected_at_parse() {
+    // RFC 5545 domains are enforced up front; nothing is clamped or dropped.
     for rule in [
         "FREQ=MONTHLY;BYMONTHDAY=40",
         "FREQ=MONTHLY;BYMONTHDAY=-40",
+        "FREQ=MONTHLY;BYMONTHDAY=0",
         "FREQ=YEARLY;BYYEARDAY=400",
+        "FREQ=YEARLY;BYYEARDAY=0",
         "FREQ=YEARLY;BYWEEKNO=60",
-        "FREQ=MONTHLY;BYDAY=9MO",
-        "FREQ=MONTHLY;BYDAY=-9MO",
+        "FREQ=YEARLY;BYWEEKNO=0",
+        "FREQ=MONTHLY;BYDAY=54MO",
+        "FREQ=MONTHLY;BYDAY=-54MO",
+        "FREQ=MONTHLY;BYDAY=0MO",
+        "FREQ=DAILY;BYHOUR=24",
+        "FREQ=DAILY;BYHOUR=-1",
+        "FREQ=DAILY;BYMINUTE=60",
+        "FREQ=DAILY;BYSECOND=61",
+        "FREQ=YEARLY;BYMONTH=0",
+        "FREQ=YEARLY;BYMONTH=13",
+        "FREQ=MONTHLY;BYDAY=MO;BYSETPOS=0",
+        "FREQ=MONTHLY;BYDAY=MO;BYSETPOS=367",
+        "FREQ=MONTHLY;BYDAY=MO;BYSETPOS=-2147483648",
     ] {
-        let got = dates(rule, dt(2026, 1, 1, 9, 0), d(2026, 1, 1), d(2026, 12, 31));
-        assert!(got.is_empty(), "{rule} produced {got:?}");
+        assert!(
+            matches!(RRule::parse(rule), Err(RecurError::OutOfRange(_))),
+            "{rule} should be out of range"
+        );
+    }
+    // The inclusive edges are accepted.
+    RRule::parse("FREQ=YEARLY;BYSECOND=60;BYMINUTE=59;BYHOUR=23;BYMONTH=12").unwrap();
+    RRule::parse("FREQ=YEARLY;BYMONTHDAY=-31,31;BYYEARDAY=-366,366;BYWEEKNO=-53,53").unwrap();
+    RRule::parse("FREQ=YEARLY;BYDAY=-53MO,53FR;BYSETPOS=-366,366").unwrap();
+}
+
+#[test]
+fn an_oversized_by_list_is_rejected() {
+    let ok = vec!["1"; MAX_BY_LIST].join(",");
+    RRule::parse(&format!("FREQ=DAILY;BYHOUR={ok}")).unwrap();
+    for part in ["BYHOUR", "BYMONTHDAY", "BYDAY"] {
+        let v = if part == "BYDAY" { "MO" } else { "1" };
+        let big = vec![v; MAX_BY_LIST + 1].join(",");
+        assert!(
+            matches!(
+                RRule::parse(&format!("FREQ=DAILY;{part}={big}")),
+                Err(RecurError::OutOfRange(_))
+            ),
+            "{part}"
+        );
     }
 }
 
@@ -920,23 +968,31 @@ fn a_bysetpos_outside_the_candidate_list_selects_nothing() {
         d(2026, 3, 31),
     );
     assert!(got.is_empty());
-    // 0 is not a valid position either.
-    let zero = dates(
-        "FREQ=MONTHLY;BYDAY=MO;BYSETPOS=0",
-        dt(2026, 1, 1, 9, 0),
-        d(2026, 1, 1),
-        d(2026, 3, 31),
-    );
-    assert!(zero.is_empty());
 }
 
 #[test]
-fn a_malformed_byday_token_is_skipped() {
-    // `parse_by_day` returns None for junk; the rule keeps its other parts.
-    let r = RRule::parse("FREQ=WEEKLY;BYDAY=MO,XX,FR,Q").unwrap();
+fn malformed_byday_count_until_and_wkst_reject_the_rule() {
+    // A junk token must not silently drop out and change the rule's meaning.
+    for rule in [
+        "FREQ=WEEKLY;BYDAY=MO,XX,FR",
+        "FREQ=WEEKLY;BYDAY=Q",
+        "FREQ=DAILY;COUNT=many",
+        "FREQ=DAILY;COUNT=-1",
+        "FREQ=DAILY;UNTIL=soon",
+        "FREQ=WEEKLY;WKST=XX",
+    ] {
+        assert!(
+            matches!(RRule::parse(rule), Err(RecurError::BadValue(_))),
+            "{rule}"
+        );
+    }
+    let r = RRule::parse("FREQ=WEEKLY;BYDAY=MO,FR").unwrap();
     assert_eq!(r.by_day.len(), 2);
-    assert_eq!(r.by_day[0].weekday, Weekday::Mon);
-    assert_eq!(r.by_day[1].weekday, Weekday::Fri);
+    assert!(
+        RecurError::OutOfRange("BYHOUR=24".into())
+            .to_string()
+            .contains("BYHOUR=24")
+    );
 }
 
 #[test]
@@ -1051,4 +1107,16 @@ fn an_instant_seeded_recurrence_expands_in_the_home_zone() {
     );
     assert_eq!(occ.len(), 3);
     assert!(matches!(occ[0], EventTime::Zoned { .. }));
+}
+
+#[test]
+fn a_huge_count_stops_at_the_end_of_the_window() {
+    // COUNT must not keep the walk alive past the requested window.
+    let got = dates(
+        "FREQ=DAILY;COUNT=4294967295",
+        dt(2026, 1, 1, 9, 0),
+        d(2026, 1, 1),
+        d(2026, 1, 7),
+    );
+    assert_eq!(got.len(), 7);
 }

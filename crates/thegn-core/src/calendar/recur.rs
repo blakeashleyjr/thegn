@@ -117,6 +117,9 @@ pub enum RecurError {
     BadFreq(String),
     /// A numeric part would not parse.
     BadValue(String),
+    /// A numeric part parsed but lies outside its RFC 5545 domain (or a list
+    /// exceeds [`MAX_BY_LIST`] entries).
+    OutOfRange(String),
 }
 
 impl std::fmt::Display for RecurError {
@@ -124,6 +127,7 @@ impl std::fmt::Display for RecurError {
         match self {
             RecurError::BadFreq(s) => write!(f, "unsupported or missing FREQ in {s:?}"),
             RecurError::BadValue(s) => write!(f, "invalid recurrence value {s:?}"),
+            RecurError::OutOfRange(s) => write!(f, "recurrence value out of range: {s}"),
         }
     }
 }
@@ -207,13 +211,71 @@ fn parse_by_day(s: &str) -> Option<ByDay> {
     Some(ByDay { nth, weekday })
 }
 
-fn nums<T: std::str::FromStr>(v: &str) -> Result<Vec<T>, RecurError> {
-    v.split(',')
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| {
-            s.trim()
-                .parse::<T>()
-                .map_err(|_| RecurError::BadValue(s.to_string()))
+/// Most values one `BY*` list may carry. The largest legitimate list is 366
+/// (`BYYEARDAY`); anything beyond this is a hostile or broken feed, and the
+/// expander's cost model is linear in these lengths.
+const MAX_BY_LIST: usize = 400;
+
+/// Parse one `BY*` list of integers, validating every value against its RFC
+/// 5545 domain. `signed` lists accept `-hi..=-1` and `1..=hi` (zero is never
+/// valid); unsigned lists accept `0..=hi`. Nothing is clamped or dropped: an
+/// invalid token rejects the rule so its meaning cannot silently change.
+fn checked_list<T: TryFrom<i64>>(
+    part: &str,
+    v: &str,
+    hi: i64,
+    signed: bool,
+) -> Result<Vec<T>, RecurError> {
+    let toks: Vec<&str> = v
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if toks.len() > MAX_BY_LIST {
+        return Err(RecurError::OutOfRange(format!(
+            "{part}: more than {MAX_BY_LIST} values"
+        )));
+    }
+    toks.into_iter()
+        .map(|t| {
+            let n = t
+                .parse::<i64>()
+                .map_err(|_| RecurError::BadValue(t.to_string()))?;
+            let ok = if signed {
+                n != 0 && n.abs() <= hi
+            } else {
+                (0..=hi).contains(&n)
+            };
+            if !ok {
+                return Err(RecurError::OutOfRange(format!("{part}={t}")));
+            }
+            T::try_from(n).map_err(|_| RecurError::OutOfRange(format!("{part}={t}")))
+        })
+        .collect()
+}
+
+/// Parse `BYDAY`: every entry must be a weekday with an optional ordinal in
+/// `±1..=±53`.
+fn checked_by_day(v: &str) -> Result<Vec<ByDay>, RecurError> {
+    let toks: Vec<&str> = v
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if toks.len() > MAX_BY_LIST {
+        return Err(RecurError::OutOfRange(format!(
+            "BYDAY: more than {MAX_BY_LIST} values"
+        )));
+    }
+    toks.into_iter()
+        .map(|t| {
+            let d = parse_by_day(t).ok_or_else(|| RecurError::BadValue(t.to_string()))?;
+            match d.nth {
+                Some(n) if n == 0 || n.unsigned_abs() > 53 => {
+                    Err(RecurError::OutOfRange(format!("BYDAY={t}")))
+                }
+                _ => Ok(d),
+            }
         })
         .collect()
 }
@@ -238,23 +300,39 @@ impl RRule {
                     r.freq = Freq::parse(v).ok_or_else(|| RecurError::BadFreq(v.to_string()))?;
                     saw_freq = true;
                 }
-                // RFC 5545: INTERVAL must be positive; 0 would be an infinite
-                // loop, so treat it as the default rather than trusting it.
+                // RFC 5545: INTERVAL is a positive integer. 0 would never
+                // advance and a non-number has no meaning, so both reject the
+                // rule rather than silently becoming 1.
                 "INTERVAL" => {
-                    r.interval = v.parse::<u32>().unwrap_or(1).max(1);
+                    r.interval = match v.parse::<u32>() {
+                        Ok(0) => return Err(RecurError::OutOfRange(format!("INTERVAL={v}"))),
+                        Ok(n) => n,
+                        Err(_) => return Err(RecurError::BadValue(v.to_string())),
+                    };
                 }
-                "COUNT" => r.count = v.parse::<u32>().ok(),
-                "UNTIL" => r.until = parse_ics_datetime(v),
-                "BYSECOND" => r.by_second = nums(v)?,
-                "BYMINUTE" => r.by_minute = nums(v)?,
-                "BYHOUR" => r.by_hour = nums(v)?,
-                "BYDAY" => r.by_day = v.split(',').filter_map(parse_by_day).collect(),
-                "BYMONTHDAY" => r.by_month_day = nums(v)?,
-                "BYYEARDAY" => r.by_year_day = nums(v)?,
-                "BYWEEKNO" => r.by_week_no = nums(v)?,
-                "BYMONTH" => r.by_month = nums(v)?,
-                "BYSETPOS" => r.by_set_pos = nums(v)?,
-                "WKST" => r.wkst = weekday(v).unwrap_or(Weekday::Mon),
+                "COUNT" => {
+                    r.count = Some(
+                        v.parse::<u32>()
+                            .map_err(|_| RecurError::BadValue(v.to_string()))?,
+                    );
+                }
+                "UNTIL" => {
+                    r.until = Some(
+                        parse_ics_datetime(v).ok_or_else(|| RecurError::BadValue(v.to_string()))?,
+                    );
+                }
+                "BYSECOND" => r.by_second = checked_list("BYSECOND", v, 60, false)?,
+                "BYMINUTE" => r.by_minute = checked_list("BYMINUTE", v, 59, false)?,
+                "BYHOUR" => r.by_hour = checked_list("BYHOUR", v, 23, false)?,
+                "BYDAY" => r.by_day = checked_by_day(v)?,
+                "BYMONTHDAY" => r.by_month_day = checked_list("BYMONTHDAY", v, 31, true)?,
+                "BYYEARDAY" => r.by_year_day = checked_list("BYYEARDAY", v, 366, true)?,
+                "BYWEEKNO" => r.by_week_no = checked_list("BYWEEKNO", v, 53, true)?,
+                "BYMONTH" => r.by_month = checked_list("BYMONTH", v, 12, false)?,
+                "BYSETPOS" => r.by_set_pos = checked_list("BYSETPOS", v, 366, true)?,
+                "WKST" => {
+                    r.wkst = weekday(v).ok_or_else(|| RecurError::BadValue(v.to_string()))?;
+                }
                 // Unknown parts are ignored rather than fatal: a newer RFC
                 // extension shouldn't make an otherwise usable rule unusable.
                 _ => {}
