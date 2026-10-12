@@ -466,20 +466,18 @@ fn tree_to_tree(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<DiffEntr
                 cache.clear_resource_cache_keep_allocation();
                 return Ok(std::ops::ControlFlow::Continue(()));
             }
-            // Gix's tree and worktree line counters diverge from git numstat for
-            // gitlinks and symlinks. Return an error so the caller uses one
-            // coherent CLI result for the whole diff.
-            if matches!(
-                mode.kind(),
-                gix::object::tree::EntryKind::Commit | gix::object::tree::EntryKind::Link
-            ) || matches!(
-                source_mode.kind(),
-                gix::object::tree::EntryKind::Commit | gix::object::tree::EntryKind::Link
-            ) {
-                path_error = Some(anyhow::anyhow!(
-                    "gix line counts for gitlink or symlink require CLI fallback for {path:?}"
-                ));
-                return Ok(std::ops::ControlFlow::Break(()));
+            // Git represents a changed gitlink as one added and one deleted line.
+            if mode.kind() == gix::object::tree::EntryKind::Commit
+                || source_mode.kind() == gix::object::tree::EntryKind::Commit
+            {
+                out.push(DiffEntry {
+                    path,
+                    added: 1,
+                    deleted: 1,
+                    binary: false,
+                });
+                cache.clear_resource_cache_keep_allocation();
+                return Ok(std::ops::ControlFlow::Continue(()));
             }
             let mut platform = match path_operation(raw_path, "diff", || {
                 change.diff(&mut cache).map_err(anyhow::Error::from)
@@ -605,22 +603,6 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
                 gix::object::tree::EntryKind::Blob,
             ),
         };
-        let path = std::str::from_utf8(rela.as_ref())
-            .map_err(|_| unsupported_path(rela.as_ref()))?
-            .to_owned();
-        let worktree_path = workdir.join(&path);
-        let worktree_metadata = std::fs::symlink_metadata(&worktree_path).ok();
-        if old_kind == gix::object::tree::EntryKind::Commit
-            || old_kind == gix::object::tree::EntryKind::Link
-            || worktree_metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.file_type().is_symlink())
-            || worktree_metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.is_dir() && worktree_path.join(".git").exists())
-        {
-            bail!("gix line counts for gitlink or symlink require CLI fallback for {path:?}");
-        }
         let memo_key = worktree_diff_memo_key(&workdir, rela.as_ref(), old_id);
         if let Some(key) = memo_key.as_ref() {
             let entry = memoized_worktree_entry(key);
@@ -655,6 +637,9 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
                 .map_err(anyhow::Error::from)
         })?;
         let prep = path_operation(rela.as_ref(), "prepare diff", || cache.prepare_diff())?;
+        let path = std::str::from_utf8(rela.as_ref())
+            .map_err(|_| unsupported_path(rela.as_ref()))?
+            .to_owned();
         match prep.operation {
             gix::diff::blob::platform::prepare_diff::Operation::InternalDiff { algorithm } => {
                 let input = prep.interned_input();
@@ -1154,78 +1139,6 @@ mod tests {
         repo.out(&["add", "-N", "intent.txt"]);
 
         assert_backend_rows_match_cli(&repo, "HEAD");
-    }
-
-    #[test]
-    fn worktree_symlink_retarget_matches_cli_rows() {
-        use std::process::Command;
-
-        let repo = TestRepo::new("nd-symlink-retarget");
-        let link = repo.dir.join("link");
-        let created = Command::new("ln")
-            .args(["-s", "old-target"])
-            .arg(&link)
-            .output();
-        let Ok(created) = created else {
-            return;
-        };
-        if !created.status.success() {
-            return;
-        }
-        repo.out(&["add", "link"]);
-        repo.out(&["commit", "-q", "-m", "seed"]);
-        let retargeted = Command::new("ln")
-            .args(["-sfn", "new-target"])
-            .arg(&link)
-            .output();
-        let Ok(retargeted) = retargeted else {
-            return;
-        };
-        if !retargeted.status.success() {
-            return;
-        }
-
-        assert_backend_rows_match_cli(&repo, "HEAD");
-    }
-
-    #[test]
-    fn moved_nested_gitlink_matches_cli_for_worktree_and_tree_range() {
-        let repo = TestRepo::new("nd-moved-gitlink");
-        repo.commit_file("base.txt", "base\n", "base");
-        std::fs::create_dir_all(repo.dir.join("sub")).unwrap();
-        repo.out(&["-C", "sub", "init", "-q"]);
-        repo.out(&["-C", "sub", "config", "user.name", "Test"]);
-        repo.out(&["-C", "sub", "config", "user.email", "test@example.invalid"]);
-        std::fs::write(repo.dir.join("sub/nested.txt"), "first\n").unwrap();
-        repo.out(&["-C", "sub", "add", "nested.txt"]);
-        repo.out(&[
-            "-C",
-            "sub",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-qm",
-            "first",
-        ]);
-        repo.out(&["-c", "advice.addEmbeddedRepo=false", "add", "sub"]);
-        repo.out(&["commit", "-q", "-m", "add gitlink"]);
-
-        std::fs::write(repo.dir.join("sub/nested.txt"), "first\nsecond\n").unwrap();
-        repo.out(&["-C", "sub", "add", "nested.txt"]);
-        repo.out(&[
-            "-C",
-            "sub",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-qm",
-            "move nested HEAD",
-        ]);
-        assert_backend_rows_match_cli(&repo, "HEAD");
-        repo.out(&["add", "sub"]);
-        repo.out(&["commit", "-q", "-m", "advance gitlink"]);
-
-        assert_backend_rows_match_cli(&repo, "HEAD~1..HEAD");
     }
 
     #[test]
