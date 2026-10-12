@@ -572,19 +572,36 @@ impl KaneoBackend {
         } else {
             None
         };
-        let per_project = filter.limit.clamp(1, 100);
+        let per_project = if filter.limit == 0 {
+            100
+        } else {
+            filter.limit.min(100)
+        };
         let mut all = Vec::new();
+        let mut successful_projects = 0;
+        let mut first_error = None;
         for pid in projects {
             match self
                 .project_issues(op, &pid, assignee.as_deref(), per_project)
                 .await
             {
-                Ok(issues) => all.extend(issues),
+                Ok(issues) => {
+                    successful_projects += 1;
+                    all.extend(issues);
+                }
                 Err(e @ IssueError::Timeout(_)) => return Err(e),
                 Err(e) => {
-                    tracing::warn!(project = %pid, error = %e, "kaneo project fetch failed")
+                    tracing::warn!(project = %pid, error = %e, "kaneo project fetch failed");
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
                 }
             }
+        }
+        if successful_projects == 0
+            && let Some(error) = first_error
+        {
+            return Err(error);
         }
         // Client-side status filter (Kaneo filters by a single column slug, not
         // our status buckets) + overall limit.
@@ -594,6 +611,12 @@ impl KaneoBackend {
         all.sort_by_key(|i| std::cmp::Reverse(i.updated_at_ms));
         if filter.limit > 0 {
             all.truncate(filter.limit);
+        }
+        if first_error.is_some() {
+            return Err(IssueError::PartialList {
+                issues: all,
+                reason: "Kaneo project listing was incomplete",
+            });
         }
         Ok(all)
     }
@@ -643,9 +666,8 @@ impl IssueBackend for KaneoBackend {
             // A bare task fetch has no column `isFinal` context; map from the slug.
             let status = map_column_status(&task.status, &task.status, false);
             let issue = task_to_domain(task, status, &self.base_url, self.workspace_id.as_deref())?;
-            let comments: Vec<KaneoComment> = Self::get(&mut op, &format!("comment/{task_id}"))
-                .await
-                .unwrap_or_default();
+            let comments: Vec<KaneoComment> =
+                Self::get(&mut op, &format!("comment/{task_id}")).await?;
             let comments = comments
                 .into_iter()
                 .map(|c| IssueComment {
@@ -846,9 +868,8 @@ impl IssueBackend for KaneoBackend {
             checked_id(ws, "Kaneo workspace id")?;
             // Reuse an existing workspace label of the same name; otherwise create
             // it and assign in one shot (labels are workspace-scoped).
-            let existing: Vec<KaneoLabelRow> = Self::get(&mut op, &format!("label/workspace/{ws}"))
-                .await
-                .unwrap_or_default();
+            let existing: Vec<KaneoLabelRow> =
+                Self::get(&mut op, &format!("label/workspace/{ws}")).await?;
             if let Some(l) = existing.iter().find(|l| l.name.eq_ignore_ascii_case(label)) {
                 checked_id(&l.id, "Kaneo label id")?;
                 let _: serde_json::Value = Self::send_body(
@@ -886,9 +907,8 @@ impl IssueBackend for KaneoBackend {
             let mut op = http.operation();
             op.prepare().await?;
             let task_id = checked_task_id(id)?;
-            let on_task: Vec<KaneoLabelRow> = Self::get(&mut op, &format!("label/task/{task_id}"))
-                .await
-                .unwrap_or_default();
+            let on_task: Vec<KaneoLabelRow> =
+                Self::get(&mut op, &format!("label/task/{task_id}")).await?;
             let Some(l) = on_task.iter().find(|l| l.name.eq_ignore_ascii_case(label)) else {
                 return Err(IssueError::Api("Kaneo label target unavailable".into()));
             };
@@ -920,6 +940,59 @@ mod tests {
     use axum::routing::any;
     use serde_json::json;
     use std::sync::Arc;
+
+    async fn kaneo_fixture(
+        responses: Vec<(String, StatusCode, String)>,
+        project_id: Option<String>,
+    ) -> (
+        KaneoBackend,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let route_calls = Arc::clone(&calls);
+        let responses = Arc::new(responses);
+        let route_responses = Arc::clone(&responses);
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |request: Request| {
+                let route_calls = Arc::clone(&route_calls);
+                let route_responses = Arc::clone(&route_responses);
+                async move {
+                    let path = request.uri().path().to_string();
+                    let method_path = format!("{} {}", request.method(), request.uri());
+                    route_calls.lock().unwrap().push(method_path.clone());
+                    let (_, status, body) = route_responses
+                        .iter()
+                        .find(|(route, _, _)| route == &path)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            (
+                                method_path,
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "unconfigured fixture route".into(),
+                            )
+                        });
+                    let mut response = (status, Body::from(body)).into_response();
+                    response.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend = KaneoBackend::new_with_budget(
+            format!("http://{address}"),
+            "kaneo-secret".into(),
+            Some("ws-1".into()),
+            project_id,
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+        );
+        (backend, server, calls)
+    }
 
     #[test]
     fn priority_maps_and_reverses() {
@@ -1133,6 +1206,136 @@ mod tests {
         assert_eq!(l.id, "l1");
         assert_eq!(l.name, "bug");
     }
+    #[tokio::test]
+    async fn zero_list_limit_requests_one_hundred_tasks_per_project() {
+        let (backend, server, calls) = kaneo_fixture(
+            vec![(
+                "/api/task/tasks/p1".into(),
+                StatusCode::OK,
+                json!({"data": {"columns": []}}).to_string(),
+            )],
+            Some("p1".into()),
+        )
+        .await;
+        let result = backend.list_issues(&IssueFilter::default()).await;
+        assert!(result.unwrap().is_empty());
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["GET /api/task/tasks/p1?limit=100"]
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn failed_comment_read_is_returned_from_get_issue() {
+        let task = json!({
+            "id": "t1", "status": "backlog", "projectId": "p1", "title": "Task"
+        });
+        let (backend, server, _) = kaneo_fixture(
+            vec![
+                ("/api/task/t1".into(), StatusCode::OK, task.to_string()),
+                (
+                    "/api/comment/t1".into(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "comment failure".into(),
+                ),
+            ],
+            Some("p1".into()),
+        )
+        .await;
+        let result = backend.get_issue("t1").await;
+        assert!(matches!(result, Err(IssueError::Api(_))), "{result:?}");
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn failed_workspace_label_read_never_posts_a_duplicate() {
+        let (backend, server, calls) = kaneo_fixture(
+            vec![(
+                "/api/label/workspace/ws-1".into(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "label read failure".into(),
+            )],
+            Some("p1".into()),
+        )
+        .await;
+        let result = backend.attach_label("t1", "bug").await;
+        assert!(matches!(result, Err(IssueError::Api(_))), "{result:?}");
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded, ["GET /api/label/workspace/ws-1"]);
+        assert!(!recorded.iter().any(|call| call.starts_with("POST ")));
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn failed_task_label_read_is_not_reported_as_a_missing_label() {
+        let (backend, server, _) = kaneo_fixture(
+            vec![(
+                "/api/label/task/t1".into(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "label read failure".into(),
+            )],
+            Some("p1".into()),
+        )
+        .await;
+        let result = backend.detach_label("t1", "bug").await;
+        match result {
+            Err(IssueError::Api(message)) => {
+                assert_eq!(message, "kaneo HTTP 500 Internal Server Error")
+            }
+            other => panic!("expected label read error, got {other:?}"),
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn one_failed_project_returns_partial_rows_from_successful_projects() {
+        let board = json!({
+            "data": {"workspaceId": "ws-1", "columns": [{
+                "slug": "todo", "name": "To Do", "tasks": [{
+                    "id": "t1", "number": 1, "title": "Kept task",
+                    "status": "todo", "projectId": "p1"
+                }]
+            }]}
+        });
+        let (backend, server, _) = kaneo_fixture(
+            vec![
+                (
+                    "/api/project".into(),
+                    StatusCode::OK,
+                    json!([{"id": "p1"}, {"id": "p2"}]).to_string(),
+                ),
+                (
+                    "/api/task/tasks/p1".into(),
+                    StatusCode::OK,
+                    board.to_string(),
+                ),
+                (
+                    "/api/task/tasks/p2".into(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "project failure".into(),
+                ),
+            ],
+            None,
+        )
+        .await;
+        let result = backend.list_issues(&IssueFilter::default()).await;
+        match result {
+            Err(IssueError::PartialList { issues, reason }) => {
+                assert_eq!(issues.len(), 1);
+                assert_eq!(issues[0].id, "kaneo:t1");
+                assert_eq!(reason, "Kaneo project listing was incomplete");
+            }
+            other => panic!("expected partial project listing, got {other:?}"),
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
     #[tokio::test]
     async fn list_expansion_returns_budget_error_before_kaneo_project_fetch() {
         use std::sync::atomic::{AtomicUsize, Ordering};
