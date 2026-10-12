@@ -113,7 +113,7 @@ pprof = { version = "0.14", features = ["flamegraph"], optional = true }
 # The app-tab embedding contract (AppTile, shared theme, the pinned ratatui
 # re-export). The host renders embedded apps' ratatui buffers through
 # `tg_kit::ratatui` so the Buffer type is identical to what the apps produce.
-tg-kit = { path = "../tg-kit" }
+tg-kit = { path = "../tg-kit", features = ["host-presets"] }
 # The embedded "Observe" observability app tile (gtui). Rendered through the
 # same `tg_kit::ratatui` Buffer as any other AppTile.
 gtui-embed = { path = "../gtui-embed" }
