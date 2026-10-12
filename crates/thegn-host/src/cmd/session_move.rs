@@ -1105,6 +1105,7 @@ mod tests {
                 note: Some("SECRET_NOTE".into()),
                 chunk_path: Some("SECRET_CHUNK".into()),
                 report: Some("SECRET_REPORT".into()),
+                chunk_scope: None,
             }],
             notes: Vec::new(),
             pin_state: Some("SECRET_PIN".into()),
