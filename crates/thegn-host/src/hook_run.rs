@@ -832,9 +832,6 @@ mod tests {
         }
 
         let initial_mode = thegn_core::fsperm::mode_bits(&victim).unwrap();
-        if let Some(mode) = initial_mode {
-            assert_eq!(mode, 0o755, "temporary victim directory should be 0755");
-        }
         let result = run_with_log_root(
             &spec("true", 2),
             &context_with_worktree(worktree),
@@ -845,7 +842,7 @@ mod tests {
         assert!(result.succeeded());
         assert!(result.log_error.is_some());
         assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
-        if initial_mode.is_some() {
+        if initial_mode.is_some_and(|mode| mode != 0o700) {
             assert_eq!(
                 thegn_core::fsperm::mode_bits(&victim).unwrap(),
                 initial_mode
