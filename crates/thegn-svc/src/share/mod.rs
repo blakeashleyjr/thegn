@@ -895,7 +895,6 @@ impl RunningShare {
     }
 
     pub fn wait(mut self) {
-        #[expect(clippy::disallowed_methods)]
         if let Err(error) = self.child.wait() {
             tracing::debug!(%error, "share child wait failed");
         }
@@ -904,19 +903,7 @@ impl RunningShare {
 
     fn cleanup_files(&mut self) {
         if let Some((dir, files, manifest)) = self.cleanup.take() {
-            if let Err(error) = verify_owner_manifest(&dir, manifest.as_deref()) {
-                tracing::warn!(%error, "share ownership changed before credential cleanup");
-                return;
-            }
-            for file in files {
-                if validate_dest(&file).is_ok() {
-                    if let Err(error) = std::fs::remove_file(dir.join(file)) {
-                        if error.kind() != std::io::ErrorKind::NotFound {
-                            tracing::warn!(%error, "could not remove share credential file");
-                        }
-                    }
-                }
-            }
+            cleanup_state_files(&dir, &files, manifest.as_deref());
         }
     }
 }
@@ -952,8 +939,7 @@ fn share_state_dir_at(
     port: u16,
     generation: u64,
 ) -> Result<std::path::PathBuf> {
-    let canonical = std::fs::canonicalize(worktree)
-        .with_context(|| format!("share: cannot canonicalize worktree {}", worktree.display()))?;
+    let canonical = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
     let path_bytes = canonical.as_os_str().as_encoded_bytes();
     let repo_bytes = repository_identity(&canonical);
     let mut identity = format!(
@@ -1053,7 +1039,9 @@ fn share_state_dir_at(
         let mut matches = false;
         for _ in 0..50 {
             let mut existing = String::new();
-            std::fs::File::open(&manifest)?.read_to_string(&mut existing)?;
+            thegn_core::fsperm::open_regular_file_nofollow(&manifest)
+                .context("share: open owner manifest")?
+                .read_to_string(&mut existing)?;
             if existing == identity {
                 matches = true;
                 break;
@@ -1130,23 +1118,51 @@ pub fn start(
             Ok(running)
         }
         Err(error) => {
-            if verify_owner_manifest(statedir, manifest.as_deref()).is_ok() {
-                cleanup_plan_files(plan, statedir);
-            }
+            let files = plan
+                .files
+                .iter()
+                .map(|file| file.dest.clone())
+                .collect::<Vec<_>>();
+            cleanup_state_files(statedir, &files, manifest.as_deref());
             Err(error)
         }
     }
 }
 
-fn cleanup_plan_files(plan: &SharePlan, statedir: &std::path::Path) {
-    for file in &plan.files {
-        if validate_dest(&file.dest).is_ok() {
-            if let Err(error) = std::fs::remove_file(statedir.join(&file.dest)) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(%error, "could not remove share credential file");
-                }
-            }
+fn cleanup_state_files(statedir: &std::path::Path, files: &[String], manifest: Option<&[u8]>) {
+    if let Err(error) = verify_owner_manifest(statedir, manifest) {
+        tracing::warn!(%error, "share ownership changed before credential cleanup");
+        return;
+    }
+    let mut credentials_removed = true;
+    for file in files {
+        if validate_dest(file).is_ok()
+            && let Err(error) = std::fs::remove_file(statedir.join(file))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            credentials_removed = false;
+            tracing::warn!(%error, "could not remove share credential file");
         }
+    }
+    if manifest.is_none() || !credentials_removed {
+        return;
+    }
+    remove_owned_path(&statedir.join("owner.manifest"), "share owner manifest");
+    if let Err(error) = std::fs::remove_dir(statedir)
+        && !matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+        )
+    {
+        tracing::warn!(%error, "could not remove share state directory");
+    }
+}
+
+fn remove_owned_path(path: &std::path::Path, description: &str) {
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(%error, "could not remove {description}");
     }
 }
 
@@ -1160,9 +1176,12 @@ fn read_owner_manifest(statedir: &std::path::Path) -> Result<Option<Vec<u8>>> {
     if !metadata.file_type().is_file() {
         anyhow::bail!("share: refusing non-regular owner manifest");
     }
-    std::fs::read(path)
-        .map(Some)
-        .context("share: read owner manifest")
+    let mut file = thegn_core::fsperm::open_regular_file_nofollow(&path)
+        .context("share: open owner manifest")?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)
+        .context("share: read owner manifest")?;
+    Ok(Some(contents))
 }
 
 fn verify_owner_manifest(statedir: &std::path::Path, expected: Option<&[u8]>) -> Result<()> {
@@ -1256,7 +1275,7 @@ fn start_inner(
             );
         }
         if let Ok(url) = url_rx.try_recv() {
-            if let Err(error) = reject_duplicate_announcement(&url_rx) {
+            if let Err(error) = reject_duplicate_announcement(&url_rx, &url) {
                 abort_child(child);
                 return Err(error);
             }
@@ -1274,7 +1293,7 @@ fn start_inner(
                 // its URL. If the diagnostic channel then disconnects, give
                 // the already-published priority signal one final check.
                 if let Ok(url) = url_rx.try_recv() {
-                    if let Err(error) = reject_duplicate_announcement(&url_rx) {
+                    if let Err(error) = reject_duplicate_announcement(&url_rx, &url) {
                         abort_child(child);
                         return Err(error);
                     }
@@ -1291,10 +1310,25 @@ fn start_inner(
     }
 }
 
-fn reject_duplicate_announcement(url_rx: &mpsc::Receiver<PublicEndpoint>) -> Result<()> {
-    match url_rx.recv_timeout(Duration::from_millis(50)) {
-        Ok(_) => anyhow::bail!("share: provider reported multiple public endpoints"),
-        Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => Ok(()),
+fn reject_duplicate_announcement(
+    url_rx: &mpsc::Receiver<PublicEndpoint>,
+    first: &PublicEndpoint,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_millis(50);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        match url_rx.recv_timeout(remaining) {
+            Ok(next) if next.canonical() != first.canonical() => {
+                anyhow::bail!("share: provider reported multiple public endpoints")
+            }
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                return Ok(());
+            }
+        }
     }
 }
 

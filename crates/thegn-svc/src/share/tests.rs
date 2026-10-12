@@ -179,7 +179,7 @@ fn public_endpoint_parsing_canonicalizes_and_rejects_ambiguous_input() {
     let ticket = PublicEndpoint::parse_ticket("safe-ticket").expect("valid opaque ticket");
     assert!(ticket.as_url().is_none());
     assert_eq!(ticket.kind(), PublicEndpointKind::Ticket);
-    assert!(!format!("{ticket:?}").contains("opaque-ticket_7"));
+    assert!(!format!("{ticket:?}").contains("safe-ticket"));
 }
 
 #[test]
@@ -202,11 +202,20 @@ fn announcements_reject_repeated_markers_and_ticket_delimiters() {
 #[test]
 fn startup_rejects_two_provider_endpoint_announcements() {
     let (tx, rx) = std::sync::mpsc::sync_channel(2);
-    tx.send(PublicEndpoint::parse_url("https://first.test").expect("valid URL"))
-        .expect("first announcement");
+    let first = PublicEndpoint::parse_url("https://first.test").expect("valid URL");
+    tx.send(first.clone()).expect("first announcement");
     tx.send(PublicEndpoint::parse_url("https://second.test").expect("valid URL"))
         .expect("second announcement");
-    assert!(reject_duplicate_announcement(&rx).is_err());
+    assert!(reject_duplicate_announcement(&rx, &first).is_err());
+}
+
+#[test]
+fn startup_accepts_byte_identical_endpoint_announcements() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    let first = PublicEndpoint::parse_url("https://first.test").expect("valid URL");
+    tx.send(first.clone()).expect("repeat announcement");
+    drop(tx);
+    assert!(reject_duplicate_announcement(&rx, &first).is_ok());
 }
 
 #[test]
@@ -250,6 +259,12 @@ fn share_state_identity_is_bounded_canonical_and_manifest_owned() {
     let after_rename = share_state_dir_at(&base, &renamed, "bore", 3001, 1).expect("after rename");
     assert_ne!(before_rename, after_rename);
 
+    let missing_worktree = repo.join("remote-or-deleted-worktree");
+    assert!(
+        share_state_dir_at(&base, &missing_worktree, "bore", 3002, 1).is_ok(),
+        "missing worktree paths retain their raw identity"
+    );
+
     std::fs::write(a.join("owner.manifest"), b"foreign owner").expect("tamper manifest");
     assert!(share_state_dir_at(&base, &nested, "bore", 3000, 1).is_err());
 }
@@ -270,6 +285,29 @@ fn failed_start_removes_materialized_provider_credentials() {
     let error = start(&plan, state.path(), Duration::from_millis(1)).expect_err("missing command");
     assert!(error.to_string().contains("failed to spawn"));
     assert!(!state.path().join("frpc.toml").exists());
+}
+
+#[test]
+fn start_then_stop_removes_share_state_directory() {
+    let temp = tempfile::tempdir().expect("temporary root");
+    let base = temp.path().join("state");
+    let worktree = temp.path().join("repo");
+    std::fs::create_dir_all(&worktree).expect("worktree fixture");
+    let statedir =
+        share_state_dir_at(&base, &worktree, "bore", 3000, 42).expect("share state directory");
+    let plan = SharePlan {
+        program: "sh".into(),
+        args: vec!["-c".into(), "sleep 10".into()],
+        env: Vec::new(),
+        files: Vec::new(),
+        url_rule: UrlRule::Fixed("https://share.example".into()),
+    };
+    let running = start(&plan, &statedir, Duration::from_secs(1)).expect("start share");
+    running.stop();
+    assert!(
+        !statedir.exists(),
+        "stop must remove the owned state directory"
+    );
 }
 
 #[test]

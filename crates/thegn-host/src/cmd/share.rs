@@ -89,7 +89,10 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
     match launch {
         ShareLaunch::Process(plan) => {
             let generation = cli_generation()?;
-            let statedir = share::share_state_dir(&wt_path, &kind, port, generation)?;
+            let statedir = match share::share_state_dir(&wt_path, &kind, port, generation) {
+                Ok(path) => path,
+                Err(e) => return on_error_exit(spec.on_error, e),
+            };
             let running = match share::start(&plan, &statedir, spec.ready_timeout) {
                 Ok(r) => r,
                 Err(e) => return on_error_exit(spec.on_error, e),
