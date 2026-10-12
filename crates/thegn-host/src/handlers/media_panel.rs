@@ -4,6 +4,19 @@ use termwiz::input::KeyCode;
 
 use crate::panel::MediaAction;
 
+pub(crate) fn art_request(
+    panel: &mut crate::panel::media::MediaPanelState,
+    state: Option<&thegn_core::media::MediaState>,
+    show_art: bool,
+    visible: bool,
+) -> Option<String> {
+    if !visible {
+        panel.cancel_art_request();
+        return None;
+    }
+    panel.wants_art(state, show_art)
+}
+
 /// The section's transport keys and the painted control targets converge on
 /// the same `MediaAction` before entering the off-loop media controller.
 pub(crate) fn action_for_key(key: &KeyCode) -> Option<MediaAction> {
@@ -20,6 +33,7 @@ pub(crate) fn action_for_key(key: &KeyCode) -> Option<MediaAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::media::MediaState;
 
     #[test]
     fn keyboard_transport_keys_have_panel_intents() {
@@ -33,5 +47,32 @@ mod tests {
             Some(MediaAction::Previous)
         );
         assert_eq!(action_for_key(&KeyCode::Char('x')), None);
+    }
+
+    #[test]
+    fn hidden_panel_requests_no_art_and_reopen_does() {
+        let mut panel = crate::panel::media::MediaPanelState::default();
+        panel.set_art_enabled(true);
+        let state = MediaState {
+            art_url: Some("https://example.invalid/cover.png".into()),
+            ..MediaState::default()
+        };
+
+        assert!(art_request(&mut panel, Some(&state), true, false).is_none());
+        assert!(art_request(&mut panel, Some(&state), true, true).is_some());
+    }
+
+    #[test]
+    fn art_request_retries_after_hidden_period() {
+        let mut panel = crate::panel::media::MediaPanelState::default();
+        panel.set_art_enabled(true);
+        let state = MediaState {
+            art_url: Some("https://example.invalid/cover.png".into()),
+            ..MediaState::default()
+        };
+
+        assert!(art_request(&mut panel, Some(&state), true, true).is_some());
+        assert!(art_request(&mut panel, Some(&state), true, false).is_none());
+        assert!(art_request(&mut panel, Some(&state), true, true).is_some());
     }
 }
