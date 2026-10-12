@@ -657,6 +657,9 @@ pub enum AuditDecision {
     Denied,
 }
 
+pub const MAX_AUDIT_ENTRIES: usize = 1024;
+pub const MAX_AUDIT_STRING_BYTES: usize = 256;
+
 #[derive(Debug, Clone)]
 pub struct AuditLogEntry {
     pub plugin: PluginId,
@@ -664,6 +667,19 @@ pub struct AuditLogEntry {
     pub operation: String,
     pub decision: AuditDecision,
     pub timestamp_ms: u64,
+    pub seq: u64,
+}
+
+fn bound_audit_string(value: &str) -> String {
+    const MARKER: &str = "…";
+    if value.len() <= MAX_AUDIT_STRING_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_AUDIT_STRING_BYTES - MARKER.len();
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{MARKER}", &value[..end])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
@@ -745,6 +761,8 @@ impl Alert {
 pub struct PluginRuntime {
     manifest: NegotiatedManifest,
     audit: Vec<AuditLogEntry>,
+    next_audit_seq: u64,
+    audit_evicted: u64,
     state: BTreeMap<String, serde_json::Value>,
     host_values: BTreeMap<String, serde_json::Value>,
     subscriptions: std::collections::HashSet<(PluginId, EventKind)>,
@@ -768,6 +786,8 @@ impl PluginRuntime {
         Self {
             manifest,
             audit: Vec::new(),
+            next_audit_seq: 0,
+            audit_evicted: 0,
             state: Default::default(),
             host_values: Default::default(),
             subscriptions: Default::default(),
@@ -900,22 +920,10 @@ impl PluginRuntime {
         operation: &str,
     ) -> Result<(), PluginApiError> {
         if self.manifest.granted.contains(&capability) {
-            self.audit.push(AuditLogEntry {
-                plugin,
-                capability,
-                operation: operation.to_string(),
-                decision: AuditDecision::Granted,
-                timestamp_ms: 0,
-            });
+            self.push_audit(plugin, capability, operation, AuditDecision::Granted);
             Ok(())
         } else {
-            self.audit.push(AuditLogEntry {
-                plugin: plugin.clone(),
-                capability: capability.clone(),
-                operation: operation.to_string(),
-                decision: AuditDecision::Denied,
-                timestamp_ms: 0,
-            });
+            self.push_audit(plugin, capability.clone(), operation, AuditDecision::Denied);
             Err(PluginApiError::CapabilityDenied {
                 capability,
                 operation: operation.to_string(),
@@ -964,6 +972,37 @@ impl PluginRuntime {
         &self.audit
     }
 
+    pub fn audit_evicted(&self) -> u64 {
+        self.audit_evicted
+    }
+
+    fn push_audit(
+        &mut self,
+        plugin: PluginId,
+        capability: Capability,
+        operation: &str,
+        decision: AuditDecision,
+    ) {
+        if self.audit.len() == MAX_AUDIT_ENTRIES {
+            let evict_count = (MAX_AUDIT_ENTRIES / 4).max(1);
+            self.audit.drain(..evict_count);
+            self.audit_evicted = self.audit_evicted.saturating_add(evict_count as u64);
+        }
+
+        self.next_audit_seq = self
+            .next_audit_seq
+            .checked_add(1)
+            .expect("plugin audit sequence exhausted");
+        self.audit.push(AuditLogEntry {
+            plugin,
+            capability: Capability(bound_audit_string(capability.as_str())),
+            operation: bound_audit_string(operation),
+            decision,
+            timestamp_ms: u64::try_from(crate::util::now_ms()).unwrap_or(0),
+            seq: self.next_audit_seq,
+        });
+    }
+
     /// Record the independent control-scope decision for a `host.call` before
     /// the request crosses onto the generic control dispatcher. Host calls do
     /// not use manifest `Capability` grants, so they cannot go through
@@ -975,13 +1014,12 @@ impl PluginRuntime {
         capability_id: &str,
         decision: AuditDecision,
     ) {
-        self.audit.push(AuditLogEntry {
+        self.push_audit(
             plugin,
-            capability: Capability::new("host", capability_id),
-            operation: "host.call".into(),
+            Capability::new("host", capability_id),
+            "host.call",
             decision,
-            timestamp_ms: 0,
-        });
+        );
     }
 }
 
@@ -2600,13 +2638,88 @@ timeout_secs = 5
                 && entry.capability == Capability::new("network", "api.example.com")
                 && entry.operation == "io.network"
                 && entry.decision == AuditDecision::Granted
-                && entry.timestamp_ms == 0
+                && entry.timestamp_ms > 0
         }));
         assert!(audit.iter().any(|entry| {
             entry.capability == Capability::new("host", "sessions.kill")
                 && entry.operation == "host.call"
                 && entry.decision == AuditDecision::Denied
         }));
+    }
+
+    #[test]
+    fn audit_events_have_wall_clock_timestamps_and_increasing_sequences() {
+        let plugin = PluginId::new("timestamp-test");
+        let manifest = NegotiatedManifest {
+            granted: [Capability::new("state", plugin.as_str())]
+                .into_iter()
+                .collect(),
+            ..NegotiatedManifest::default()
+        };
+        let mut runtime = PluginRuntime::new(manifest);
+        let before = crate::util::now_ms();
+        runtime
+            .state_set(plugin.clone(), "key", serde_json::Value::Null)
+            .unwrap();
+        runtime.record_host_call_decision(plugin, "sessions.list", AuditDecision::Granted);
+        let after = crate::util::now_ms();
+
+        let audit = runtime.audit_log();
+        assert_eq!(audit.len(), 2);
+        for entry in audit {
+            assert!(entry.timestamp_ms >= u64::try_from(before).unwrap());
+            assert!(entry.timestamp_ms <= u64::try_from(after).unwrap());
+        }
+        assert!(audit[0].seq < audit[1].seq);
+    }
+
+    #[test]
+    fn audit_retention_evicts_oldest_entries_in_batches_and_counts_them() {
+        let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
+        let total = MAX_AUDIT_ENTRIES + 10;
+        for _ in 0..total {
+            runtime.record_host_call_decision(
+                PluginId::new("retention-test"),
+                "sessions.list",
+                AuditDecision::Granted,
+            );
+        }
+
+        let audit = runtime.audit_log();
+        assert!(audit.len() <= MAX_AUDIT_ENTRIES);
+        assert!(audit[0].seq > 0);
+        assert_eq!(audit.last().map(|entry| entry.seq), Some(total as u64));
+        assert_eq!(runtime.audit_evicted(), (MAX_AUDIT_ENTRIES / 4) as u64);
+    }
+
+    #[test]
+    fn audit_strings_are_capped_with_a_char_boundary_marker() {
+        let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
+        let long_capability_id = "c".repeat(10_240);
+        runtime.record_host_call_decision(
+            PluginId::new("bounded-test"),
+            &long_capability_id,
+            AuditDecision::Denied,
+        );
+        let request = IoRequest {
+            scheme: "x".repeat(10_000),
+            target: "y".repeat(10_000),
+            payload: serde_json::Value::Null,
+        };
+        assert!(runtime.io(PluginId::new("bounded-test"), request).is_err());
+
+        for entry in runtime.audit_log() {
+            assert!(entry.capability.as_str().len() <= MAX_AUDIT_STRING_BYTES);
+            assert!(entry.operation.len() <= MAX_AUDIT_STRING_BYTES);
+        }
+        assert!(runtime.audit_log()[0].capability.as_str().ends_with('…'));
+        assert!(runtime.audit_log()[1].capability.as_str().ends_with('…'));
+
+        let straddling = format!("{}é-rest", "a".repeat(MAX_AUDIT_STRING_BYTES - 4));
+        let bounded = bound_audit_string(&straddling);
+        assert!(bounded.len() <= MAX_AUDIT_STRING_BYTES);
+        assert!(bounded.ends_with('…'));
+        assert!(!bounded.ends_with("é…"));
     }
 
     #[test]
