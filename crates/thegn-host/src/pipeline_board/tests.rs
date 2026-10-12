@@ -36,6 +36,12 @@ fn stage(name: &str, next: Option<&str>) -> PipelineStage {
     }
 }
 
+fn config() -> thegn_core::config::Config {
+    let mut cfg = thegn_core::config::Config::default();
+    cfg.pipeline.stages = stages();
+    cfg
+}
+
 fn stages() -> Vec<PipelineStage> {
     vec![
         stage("architect", Some("code")),
@@ -83,7 +89,7 @@ fn full_roster() -> DispatchRoster {
 
 fn open_on(screen: Rect, r: &DispatchRoster) -> (PipelineBoard, TelemetryHistory) {
     let h = hist();
-    let b = PipelineBoard::open(r, &stages(), &ctx_at(&h, screen));
+    let b = PipelineBoard::open(r, &config(), &ctx_at(&h, screen));
     (b, h)
 }
 
@@ -200,7 +206,7 @@ fn the_cursor_follows_the_row_id_when_the_roster_moves_under_it() {
     extra.dispatched_at_ms = NOW_MS - 10_000;
     let mut rows = full_roster().rows;
     rows.push(extra);
-    b.refresh(&roster(rows), &stages(), &ctx_at(&h, Rect::full(140, 40)));
+    b.refresh(&roster(rows), &config(), &ctx_at(&h, Rect::full(140, 40)));
     assert_eq!(
         b.cursor,
         Some(3),
@@ -214,7 +220,7 @@ fn the_cursor_follows_the_row_id_when_the_roster_moves_under_it() {
             d(1, Some("architect"), None),
             d(2, Some("code"), Some(1)),
         ]),
-        &stages(),
+        &config(),
         &ctx_at(&h, Rect::full(140, 40)),
     );
     assert_eq!(b.cursor, Some(2));
@@ -274,7 +280,7 @@ fn space_freezes_the_view_and_stops_paying_for_samples() {
     assert!(!b.wants_dispatches(), "a frozen board asks for no samples");
     // A refresh while frozen changes nothing at all.
     let before = b.board.clone();
-    assert!(!b.refresh(&roster(vec![]), &stages(), &ctx_at(&h, Rect::full(140, 40))));
+    assert!(!b.refresh(&roster(vec![]), &config(), &ctx_at(&h, Rect::full(140, 40))));
     assert_eq!(b.board, before);
     ch(&mut b, ' ');
     assert!(b.wants_dispatches());
@@ -292,7 +298,7 @@ fn x_hides_finished_rows_without_lying_about_the_stage_count() {
     let (mut b, h) = open_on(Rect::full(140, 40), &r);
     assert_eq!(b.board.columns[1].rows.len(), 2);
     ch(&mut b, 'x');
-    b.rebuild_after_key(&r, &stages(), &ctx_at(&h, Rect::full(140, 40)));
+    b.rebuild_after_key(&r, &config(), &ctx_at(&h, Rect::full(140, 40)));
     assert_eq!(b.board.columns[1].rows.len(), 1);
     assert_eq!(
         b.board.columns[1].head.total, 2,
@@ -398,7 +404,7 @@ fn a_stale_roster_keeps_its_rows_and_says_how_old_they_are() {
         last_good_ms: Some(NOW_MS - 12_000),
         error: "database is locked".into(),
     });
-    assert!(b.refresh(&r, &stages(), &ctx_at(&h, Rect::full(140, 40))));
+    assert!(b.refresh(&r, &config(), &ctx_at(&h, Rect::full(140, 40))));
     let t = render_text(&b, 140, 40);
     assert!(t.contains("stale 12s"), "{t}");
     assert!(t.contains("architect"), "rows survive a failed sample");

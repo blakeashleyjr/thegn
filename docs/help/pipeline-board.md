@@ -24,9 +24,12 @@ says so in the status bar instead of opening an empty box.
 The top two rows are the **stage rail**. The first names each stage and how
 many of its rows are live against that stage's `concurrency` — `code 2/3` means
 two workers running where the config allows three. The second names the agent
-configured to run the stage and points a `→` at whatever its `next` is. That
-arrow chain is the org chart: it is what makes the board read as a pipeline
-rather than as a row of unrelated buckets.
+configured to run the stage, shows its effective model and source, and points a
+`→` at whatever its `next` is. `entry: sonnet` means the agent entry supplied
+the model; `stage: opus` means the stage overrode it; `model: none` means
+neither supplied one. A resolution failure is shown as `model error`, never as
+a blank. That arrow chain is the org chart: it is what makes the board read as
+a pipeline rather than as a row of unrelated buckets.
 
 Every configured stage gets a column **even with no rows in it**, so a stage
 nobody has reached yet is visibly waiting rather than missing. Stages that show
@@ -46,9 +49,15 @@ stage's `model` / `env` / `permissions` overrides (see [[configuration]]).
 Below the rail, each row is one dispatch: a status mark, the worktree it works
 in, and how long it has been going.
 
-- A `→` at the left of a row means its **parent is the stage to the left** — an
-  architect's coder, say. The parent carries a matching `→` at its right edge,
-  so the flow reads in both directions.
+- A `→` at the left of a row means its parent row's configured stage `next`
+  names this row's stage. The stage name beside the arrow labels the target,
+  including when columns are not neighbours or appear out of transition order.
+  The parent carries a matching `→` at its right edge, so the flow reads in
+  both directions. Column adjacency alone never creates a flow; if the parent's
+  stage is historical or unconfigured, no cross-stage edge is drawn.
+- Each active row also shows its effective model and source using the same
+  `entry:` / `stage:` / `model: none` labels. A resolution failure is shown as
+  `model error`.
 - Rows fanned out inside a single stage hang off **tree connectors** under the
   row they came from.
 - An age drawn in red means the row has been live longer than its stage's
