@@ -643,8 +643,12 @@ pub(crate) fn row_action_for(
         },
         'r' => match row_status {
             None => Err("Merge queue: no row selected"),
-            Some("deferred" | "gate_failed" | "needs_human") => Ok(MqAction::Retry),
-            Some(_) => Err("Merge queue: retry applies to deferred / gate-failed / needs-human"),
+            Some(status) if MqStatus::parse(status).is_some_and(MqStatus::is_held) => {
+                Ok(MqAction::Retry)
+            }
+            Some(_) => Err(
+                "Merge queue: retry applies to held rows (deferred, gate-failed, gate error, agent-blocked, needs-human)",
+            ),
         },
         _ => Err(""),
     }
@@ -1301,11 +1305,23 @@ mod tests {
         assert_eq!(row_action_for('l', Some("ready")), Ok(Land));
         assert!(row_action_for('l', Some("queued")).is_err());
         assert!(row_action_for('l', None).is_err());
-        // Retry: the blocked statuses only.
-        for s in ["deferred", "gate_failed", "needs_human"] {
-            assert_eq!(row_action_for('r', Some(s)), Ok(Retry), "{s}");
+        // Retry: every typed held status and no runnable/settled status.
+        for status in MqStatus::ALL {
+            assert_eq!(
+                row_action_for('r', Some(status.as_str())),
+                if status.is_held() {
+                    Ok(Retry)
+                } else {
+                    Err(
+                        "Merge queue: retry applies to held rows (deferred, gate-failed, gate error, agent-blocked, needs-human)",
+                    )
+                },
+                "{}",
+                status.as_str()
+            );
         }
         assert!(row_action_for('r', Some("landed")).is_err());
+        assert!(row_action_for('r', Some("unknown-status")).is_err());
         // Remove: any row, but a row is required.
         assert_eq!(row_action_for('x', Some("landed")), Ok(Remove));
         assert!(row_action_for('x', None).is_err());
