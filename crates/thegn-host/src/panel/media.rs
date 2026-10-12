@@ -19,7 +19,7 @@ pub(crate) struct MediaRequest {
 #[derive(Debug)]
 pub(crate) struct MediaQueueDelivery {
     pub(crate) request: MediaRequest,
-    pub(crate) queue: Vec<QueueItem>,
+    pub(crate) queue: Result<Vec<QueueItem>, String>,
 }
 
 #[derive(Debug)]
@@ -34,6 +34,7 @@ pub(crate) struct MediaSourcesDelivery {
 pub(crate) struct MediaPanelState {
     pub(crate) sources: Vec<String>,
     pub(crate) queue: Vec<QueueItem>,
+    pub(crate) queue_error: Option<String>,
     pub(crate) art: Option<ArtMosaic>,
     caps: Option<MediaCaps>,
     generation: u64,
@@ -67,7 +68,7 @@ impl MediaPanelState {
             // snapshot is still displayed and compares equal to the next one.
             self.watcher_generation = watcher_generation;
             self.generation = self.generation.wrapping_add(1);
-            self.queue.clear();
+            self.clear_queue();
             self.queue_identity = None;
             self.queue_request = state
                 .map(Self::identity)
@@ -76,7 +77,7 @@ impl MediaPanelState {
         }
         let Some(state) = state else {
             self.sources.clear();
-            self.queue.clear();
+            self.clear_queue();
             self.caps = None;
             if self.snapshot_identity.is_some() {
                 self.generation = self.generation.wrapping_add(1);
@@ -95,7 +96,7 @@ impl MediaPanelState {
         if self.snapshot_identity.as_ref() != Some(&identity) {
             self.generation = self.generation.wrapping_add(1);
             self.snapshot_identity = Some(identity.clone());
-            self.queue.clear();
+            self.clear_queue();
             self.queue_identity = None;
             self.queue_request = Some(self.request_for(Some(identity)));
             self.sources_stale = true;
@@ -118,7 +119,7 @@ impl MediaPanelState {
     pub(crate) fn begin_request(&mut self, state: Option<&MediaState>) {
         self.generation = self.generation.wrapping_add(1);
         self.snapshot_identity = state.map(Self::identity);
-        self.queue.clear();
+        self.clear_queue();
         self.queue_identity = None;
         self.queue_request = state
             .map(Self::identity)
@@ -166,7 +167,7 @@ impl MediaPanelState {
         &mut self,
         request: MediaRequest,
         state: Option<&MediaState>,
-        queue: Vec<QueueItem>,
+        queue: Result<Vec<QueueItem>, String>,
     ) {
         let Some(state) = state else { return };
         if request.generation == self.generation
@@ -174,8 +175,22 @@ impl MediaPanelState {
             && request.identity.as_ref() == Some(&Self::identity(state))
         {
             self.queue_identity = Some(Self::identity(state));
-            self.queue = queue;
+            match queue {
+                Ok(queue) => {
+                    self.queue = queue;
+                    self.queue_error = None;
+                }
+                Err(error) => {
+                    self.queue.clear();
+                    self.queue_error = Some(error);
+                }
+            }
         }
+    }
+
+    fn clear_queue(&mut self) {
+        self.queue.clear();
+        self.queue_error = None;
     }
 
     pub(crate) fn set_sources(
@@ -342,19 +357,19 @@ mod tests {
         panel.set_queue(
             old,
             Some(&current),
-            vec![QueueItem {
+            Ok(vec![QueueItem {
                 title: "stale".into(),
                 ..Default::default()
-            }],
+            }]),
         );
         assert!(panel.queue.is_empty());
         panel.set_queue(
             fresh,
             Some(&current),
-            vec![QueueItem {
+            Ok(vec![QueueItem {
                 title: "fresh".into(),
                 ..Default::default()
-            }],
+            }]),
         );
         assert_eq!(panel.queue[0].title, "fresh");
     }
@@ -373,10 +388,10 @@ mod tests {
         panel.set_queue(
             old_queue,
             Some(&current),
-            vec![QueueItem {
+            Ok(vec![QueueItem {
                 title: "stale".into(),
                 ..Default::default()
-            }],
+            }]),
         );
         panel.set_sources(old_sources, Some(&current), vec!["stale".into()]);
         assert!(panel.queue.is_empty());
