@@ -317,7 +317,9 @@ fn tree_to_tree(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<DiffEntr
                 cache.clear_resource_cache_keep_allocation();
                 return Ok(std::ops::ControlFlow::Continue(()));
             }
-            let mut platform = match path_operation(raw_path, "diff", || change.diff(&mut cache)) {
+            let mut platform = match path_operation(raw_path, "diff", || {
+                change.diff(&mut cache).map_err(anyhow::Error::from)
+            }) {
                 Ok(platform) => platform,
                 Err(error) => {
                     path_error = Some(error);
@@ -435,23 +437,27 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
             ),
         };
         path_operation(rela.as_ref(), "load old resource", || {
-            cache.set_resource(
-                old_id,
-                old_kind,
-                rela.as_ref(),
-                gix::diff::blob::ResourceKind::OldOrSource,
-                &repo.objects,
-            )
+            cache
+                .set_resource(
+                    old_id,
+                    old_kind,
+                    rela.as_ref(),
+                    gix::diff::blob::ResourceKind::OldOrSource,
+                    &repo.objects,
+                )
+                .map_err(anyhow::Error::from)
         })?;
         // The worktree side: a null id means "read it from the worktree root".
         path_operation(rela.as_ref(), "load worktree resource", || {
-            cache.set_resource(
-                repo.object_hash().null(),
-                gix::object::tree::EntryKind::Blob,
-                rela.as_ref(),
-                gix::diff::blob::ResourceKind::NewOrDestination,
-                &repo.objects,
-            )
+            cache
+                .set_resource(
+                    repo.object_hash().null(),
+                    gix::object::tree::EntryKind::Blob,
+                    rela.as_ref(),
+                    gix::diff::blob::ResourceKind::NewOrDestination,
+                    &repo.objects,
+                )
+                .map_err(anyhow::Error::from)
         })?;
         let prep = path_operation(rela.as_ref(), "prepare diff", || cache.prepare_diff())?;
         let path = std::str::from_utf8(rela.as_ref())
@@ -967,12 +973,7 @@ mod tests {
         let typed = unsupported_path(bytes);
         assert!(is_unsupported_path(&typed));
         assert!(format!("{typed:#}").contains("66696c65ff"));
-        let error = std::str::from_utf8(bytes).expect_err("fixture is invalid UTF-8");
-        let message = format!(
-            "unsupported non-UTF-8 git path ({} bytes, hex {}): {error}",
-            bytes.len(),
-            hex_path(bytes)
-        );
+        let message = typed.to_string();
         assert!(message.contains("66696c65ff"));
         assert!(!message.contains('\u{fffd}'));
     }
