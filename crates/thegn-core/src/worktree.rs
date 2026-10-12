@@ -6,8 +6,29 @@ use crate::msg;
 use crate::repo;
 use crate::util;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const MAX_GIT_IDENTITY_OUTPUT: usize = 64 * 1024;
+const WORKTREE_MUTATION_LOCK_WAIT: Duration = Duration::from_secs(120);
+
+#[cfg(test)]
+thread_local! {
+    static WORKTREE_MUTATION_LOCK_WAIT_OVERRIDE: std::cell::Cell<Option<Duration>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+fn worktree_mutation_lock_wait() -> Duration {
+    #[cfg(test)]
+    if let Some(wait) = WORKTREE_MUTATION_LOCK_WAIT_OVERRIDE.get() {
+        return wait;
+    }
+    WORKTREE_MUTATION_LOCK_WAIT
+}
+
+fn acquire_mutation_lock(root: &Path) -> std::io::Result<util::GitLock> {
+    util::try_lock_git_mutations_within(root, worktree_mutation_lock_wait())
+}
 
 /// Exact Git metadata for one registered worktree. The paths retain their
 /// native bytes and the branch is kept separate from its display label. Git
@@ -644,7 +665,7 @@ pub fn add_checked_with_state(
     // pre-existence check below is worthless — two processes would both pass
     // it, and the loser's rollback would remove the WINNER's checkout — so an
     // unavailable lock refuses instead of proceeding unlocked.
-    let _lock = match util::try_lock_git_mutations(root) {
+    let _lock = match acquire_mutation_lock(root) {
         Ok(lock) => lock,
         Err(error) => {
             let lock_path = util::git_common_dir(root).join("thegn-git.lock");
@@ -782,7 +803,7 @@ pub fn remove_detailed(
     branch: &str,
     delete_branch: bool,
 ) -> Result<(), String> {
-    let _lock = util::try_lock_git_mutations(root).map_err(|error| {
+    let _lock = acquire_mutation_lock(root).map_err(|error| {
         format!(
             "refusing to remove worktree at {}: could not take the repository mutation lock at {}: {error}; retry",
             path.display(),
@@ -965,7 +986,7 @@ pub fn rename(
     }
     // As in `add_checked_with_state`: without the lock the preflight below
     // cannot fence a concurrent create/rename, so refuse rather than mutate.
-    let _lock = util::try_lock_git_mutations(root).map_err(|error| {
+    let _lock = acquire_mutation_lock(root).map_err(|error| {
         format!(
             "refusing to rename {old_branch} → {new_branch}: could not take the repository \
              mutation lock at {}: {error}; retry",
@@ -1075,6 +1096,91 @@ mod tests {
         );
         assert!(path.exists(), "the worktree must remain untouched");
         assert!(branch_exists(&repo, "locked"), "the branch must remain");
+    }
+
+    #[test]
+    fn remove_detailed_gives_up_when_the_mutation_lock_stays_held() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        temp_repo_in(&repo);
+        let path = repo.join(".wt-timeout");
+        assert!(util::git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "timeout",
+                &path.to_string_lossy()
+            ]
+        ));
+        let held = util::try_lock_git_mutations(&repo).unwrap();
+        let worker_repo = repo.clone();
+        let worker_path = path.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            WORKTREE_MUTATION_LOCK_WAIT_OVERRIDE.with(|wait| {
+                wait.set(Some(Duration::from_millis(100)));
+            });
+            sender
+                .send(remove_detailed(&worker_repo, &worker_path, "timeout", true))
+                .unwrap();
+        });
+
+        let received = receiver.recv_timeout(Duration::from_secs(10));
+        drop(held);
+        worker.join().unwrap();
+        let error = received
+            .expect("worktree removal must return while the lock remains held")
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("mutation lock"), "{error}");
+        assert!(error.contains("timed out"), "{error}");
+        assert!(path.exists(), "the worktree must remain untouched");
+        assert!(branch_exists(&repo, "timeout"), "the branch must remain");
+    }
+
+    #[test]
+    fn add_gives_up_when_the_mutation_lock_stays_held() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        temp_repo_in(&repo);
+        let path = repo.join(".wt-timeout-add");
+        let cfg = scratch_cfg(&repo);
+        let held = util::try_lock_git_mutations(&repo).unwrap();
+        let worker_repo = repo.clone();
+        let worker_path = path.clone();
+        let worker_cfg = cfg.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            WORKTREE_MUTATION_LOCK_WAIT_OVERRIDE.with(|wait| {
+                wait.set(Some(Duration::from_millis(100)));
+            });
+            sender
+                .send(add_checked_with_state(
+                    &worker_repo,
+                    "timeout-add",
+                    "main",
+                    &worker_path,
+                    &worker_cfg,
+                ))
+                .unwrap();
+        });
+
+        let received = receiver.recv_timeout(Duration::from_secs(10));
+        drop(held);
+        worker.join().unwrap();
+        let error = received
+            .expect("worktree creation must return while the lock remains held")
+            .unwrap()
+            .unwrap_err();
+        assert!(error.lock_unavailable);
+        assert!(error.message.contains("timed out"), "{}", error.message);
+        assert!(!path.exists());
+        assert!(!branch_exists(&repo, "timeout-add"));
     }
 
     #[test]
