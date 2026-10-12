@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, MissedTickBehavior, interval};
+use tokio::task::JoinSet;
+use tokio::time::{Duration, MissedTickBehavior, interval, timeout};
 
 use gtui_core::dashboard::Dashboard;
 use gtui_core::datasource::{DataSource, Query, QueryError, TimeRange};
@@ -131,7 +132,14 @@ pub enum EngineCmd {
 /// One panel's query result, delivered to the view-model.
 pub struct PanelUpdate {
     pub panel_id: u32,
-    pub result: Result<Vec<Frame>, QueryError>,
+    pub targets: Vec<TargetUpdate>,
+}
+
+/// One target's independently queryable result, retaining its dashboard identity.
+#[derive(Debug, Clone)]
+pub struct TargetUpdate {
+    pub ref_id: String,
+    pub result: Result<Vec<Frame>, String>,
 }
 
 pub struct QueryEngine {
@@ -147,6 +155,19 @@ pub struct QueryEngine {
     waker: Waker,
     gate: Arc<WakeGate>,
 }
+
+/// Bound dashboard fan-out independently of dashboard size.
+const MAX_CONCURRENT_PANELS: usize = 4;
+/// Bound target fan-out and the amount of per-panel state retained by a refresh.
+const MAX_TARGETS_PER_PANEL: usize = 32;
+/// A panel that does not finish cannot hold the next refresh forever.
+const PANEL_DEADLINE: Duration = Duration::from_secs(15);
+type PanelQueryJob = (
+    u32,
+    String,
+    Option<Arc<dyn DataSource>>,
+    Vec<(String, Query)>,
+);
 
 impl QueryEngine {
     /// Spawn the engine on `rt` and return the command sender + result receiver.
@@ -276,39 +297,108 @@ impl QueryEngine {
         }
     }
 
-    /// Query every panel sequentially, emitting each result (and waking the loop)
-    /// as it completes so the UI fills in incrementally. Awaiting here parks the
-    /// task, never the UI thread.
+    /// Query panels with a sliding concurrency window, emitting each result as it completes.
+    /// The UI thread is never involved in the waits and fan-out is capped.
     async fn query_all(&mut self) {
-        // Resolve once before iterating panels. In particular, do not call the
-        // clock from the target mapper: sequential panels must share one range.
+        // Resolve once so every panel in a refresh sees an identical window.
         let time_range = self.resolve_window();
-        for panel in &self.dashboard.panels {
-            let result = match self.resolve_source(&panel.datasource) {
-                Some(source) => {
-                    let queries: Vec<Query> = panel
-                        .targets
-                        .iter()
-                        .map(|t| Query {
-                            ref_id: t.ref_id.clone(),
-                            expr: t.expr.clone(),
-                            time_range: time_range.clone(),
-                        })
-                        .collect();
-                    source.query(queries).await
+        let jobs: Vec<_> = self
+            .dashboard
+            .panels
+            .iter()
+            .map(|panel| {
+                let source = self.resolve_source(&panel.datasource);
+                let targets = panel
+                    .targets
+                    .iter()
+                    .map(|t| {
+                        (
+                            t.ref_id.clone(),
+                            Query {
+                                ref_id: t.ref_id.clone(),
+                                expr: t.expr.clone(),
+                                time_range: time_range.clone(),
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (panel.id, panel.datasource.clone(), source, targets)
+            })
+            .collect();
+        let mut pending = JoinSet::new();
+        let mut job_ids = HashMap::new();
+        let mut jobs = jobs.into_iter();
+        let spawn_job = |pending: &mut JoinSet<(u32, Vec<TargetUpdate>)>,
+                         job_ids: &mut HashMap<tokio::task::Id, (u32, Vec<String>)>,
+                         job: PanelQueryJob| {
+            let (panel_id, datasource, source, targets) = job;
+            let has_more_targets = targets.len() > MAX_TARGETS_PER_PANEL;
+            let target_ids = targets
+                .iter()
+                .take(MAX_TARGETS_PER_PANEL)
+                .map(|(ref_id, _)| ref_id.clone())
+                .collect::<Vec<_>>();
+            let targets = targets
+                .into_iter()
+                .take(MAX_TARGETS_PER_PANEL)
+                .collect::<Vec<_>>();
+            let abort = pending.spawn(async move {
+                let mut results = Vec::with_capacity(targets.len());
+                for (ref_id, query) in targets {
+                    let result = match &source {
+                        Some(source) => timeout(PANEL_DEADLINE, source.query(vec![query]))
+                            .await
+                            .unwrap_or(Err(QueryError::Timeout))
+                            .map_err(|error| error.to_string()),
+                        None => Err(format!("no datasource '{datasource}'")),
+                    };
+                    results.push(TargetUpdate { ref_id, result });
                 }
-                None => Err(QueryError::Other(format!(
-                    "no datasource '{}'",
-                    panel.datasource
-                ))),
-            };
-            // Best-effort: if the receiver is gone the tab is closing.
-            let _ = self.frames_tx.send(PanelUpdate {
-                // best-effort: UI may be gone during shutdown
-                panel_id: panel.id,
-                result,
+                if has_more_targets {
+                    results.push(TargetUpdate {
+                        ref_id: "…".into(),
+                        result: Err(format!(
+                            "additional targets omitted (limit {MAX_TARGETS_PER_PANEL})"
+                        )),
+                    });
+                }
+                (panel_id, results)
             });
-            self.gate.wake(&self.waker);
+            let mut target_ids = target_ids;
+            if has_more_targets {
+                target_ids.push("…".into());
+            }
+            drop(job_ids.insert(abort.id(), (panel_id, target_ids)));
+        };
+        for job in jobs.by_ref().take(MAX_CONCURRENT_PANELS) {
+            spawn_job(&mut pending, &mut job_ids, job);
+        }
+        while let Some(joined) = pending.join_next_with_id().await {
+            match joined {
+                Ok((id, (panel_id, targets))) => {
+                    drop(job_ids.remove(&id));
+                    // Best-effort: the UI may be gone during shutdown.
+                    let _ = self.frames_tx.send(PanelUpdate { panel_id, targets });
+                    self.gate.wake(&self.waker);
+                }
+                Err(join_error) => {
+                    if let Some((panel_id, target_ids)) = job_ids.remove(&join_error.id()) {
+                        let message = format!("panel query panicked: {join_error}");
+                        let targets = target_ids
+                            .into_iter()
+                            .map(|ref_id| TargetUpdate {
+                                ref_id,
+                                result: Err(message.clone()),
+                            })
+                            .collect();
+                        let _ = self.frames_tx.send(PanelUpdate { panel_id, targets });
+                        self.gate.wake(&self.waker);
+                    }
+                }
+            }
+            if let Some(job) = jobs.next() {
+                spawn_job(&mut pending, &mut job_ids, job);
+            }
         }
     }
 
@@ -483,6 +573,242 @@ mod tests {
                 .expect("timed out waiting for the real refresh path")
                 .expect("query engine exited before delivering a panel update");
         }
+    }
+
+    struct ConcurrentSource {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DataSource for ConcurrentSource {
+        fn query(
+            &self,
+            _queries: Vec<Query>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>, QueryError>> + Send>> {
+            let active = self.active.clone();
+            let peak = self.peak.clone();
+            Box::pin(async move {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn panel_queries_are_concurrent_and_capped() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source: Arc<dyn DataSource> = Arc::new(ConcurrentSource {
+            active,
+            peak: peak.clone(),
+        });
+        let sources = HashMap::from([("test".to_string(), source)]);
+        let (cmd, mut updates) = QueryEngine::spawn_with_window(
+            Handle::current(),
+            dashboard(11),
+            sources,
+            RelativeWindow::new(std::time::Duration::from_secs(60)),
+            Duration::from_secs(3600),
+            Arc::new(Utc::now),
+            Arc::new(|| {}),
+            WakeGate::new(true),
+        );
+        receive_updates(&mut updates, 11).await;
+        assert!(peak.load(Ordering::SeqCst) > 1, "panels should overlap");
+        assert!(peak.load(Ordering::SeqCst) <= MAX_CONCURRENT_PANELS);
+        drop(cmd);
+    }
+
+    struct OneHungPanelSource;
+
+    impl DataSource for OneHungPanelSource {
+        fn query(
+            &self,
+            queries: Vec<Query>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>, QueryError>> + Send>> {
+            if queries[0].expr == "hang" {
+                Box::pin(std::future::pending())
+            } else {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_panels_progress_while_a_sibling_is_hung() {
+        let mut dashboard = dashboard(MAX_CONCURRENT_PANELS * 2 + 1);
+        dashboard.panels[0].targets[0].expr = "hang".into();
+        let sources = HashMap::from([(
+            "test".to_string(),
+            Arc::new(OneHungPanelSource) as Arc<dyn DataSource>,
+        )]);
+        let (cmd, mut updates) = QueryEngine::spawn_with_window(
+            Handle::current(),
+            dashboard,
+            sources,
+            RelativeWindow::new(std::time::Duration::from_secs(60)),
+            Duration::from_secs(3600),
+            Arc::new(Utc::now),
+            Arc::new(|| {}),
+            WakeGate::new(true),
+        );
+        let mut arrived = Vec::new();
+        for _ in 0..(MAX_CONCURRENT_PANELS * 2) {
+            arrived.push(
+                tokio::time::timeout(Duration::from_secs(1), updates.recv())
+                    .await
+                    .expect("fast panel stalled behind hung sibling")
+                    .expect("query engine exited before fast panel update")
+                    .panel_id,
+            );
+        }
+        assert!(!arrived.contains(&0));
+        arrived.sort_unstable();
+        assert_eq!(
+            arrived,
+            (1..=MAX_CONCURRENT_PANELS as u32 * 2).collect::<Vec<_>>()
+        );
+        drop(cmd);
+    }
+
+    struct PanicSource;
+
+    impl DataSource for PanicSource {
+        fn query(
+            &self,
+            _queries: Vec<Query>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>, QueryError>> + Send>> {
+            Box::pin(async { panic!("fixture panic") })
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_panel_query_becomes_a_target_error() {
+        let sources = HashMap::from([(
+            "test".to_string(),
+            Arc::new(PanicSource) as Arc<dyn DataSource>,
+        )]);
+        let (cmd, mut updates) = QueryEngine::spawn_with_window(
+            Handle::current(),
+            dashboard(1),
+            sources,
+            RelativeWindow::new(std::time::Duration::from_secs(60)),
+            Duration::from_secs(3600),
+            Arc::new(Utc::now),
+            Arc::new(|| {}),
+            WakeGate::new(true),
+        );
+        let update = tokio::time::timeout(Duration::from_secs(1), updates.recv())
+            .await
+            .expect("panicking query failed to produce a result")
+            .unwrap();
+        assert!(
+            matches!(&update.targets[0].result, Err(error) if error.contains("panel query panicked"))
+        );
+        drop(cmd);
+    }
+
+    struct MixedTargetSource;
+
+    impl DataSource for MixedTargetSource {
+        fn query(
+            &self,
+            queries: Vec<Query>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>, QueryError>> + Send>> {
+            let query = queries.into_iter().next().unwrap();
+            Box::pin(async move {
+                if query.ref_id == "B" {
+                    Err(QueryError::Other("target B failed".into()))
+                } else {
+                    Ok(vec![Frame::new(Vec::new())])
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn target_failure_does_not_erase_successful_sibling() {
+        let mut dashboard = dashboard(1);
+        dashboard.panels[0].targets.push(Target {
+            ref_id: "B".into(),
+            expr: "other".into(),
+        });
+        let sources = HashMap::from([(
+            "test".to_string(),
+            Arc::new(MixedTargetSource) as Arc<dyn DataSource>,
+        )]);
+        let (cmd, mut updates) = QueryEngine::spawn_with_window(
+            Handle::current(),
+            dashboard,
+            sources,
+            RelativeWindow::new(std::time::Duration::from_secs(60)),
+            Duration::from_secs(3600),
+            Arc::new(Utc::now),
+            Arc::new(|| {}),
+            WakeGate::new(true),
+        );
+        let update = tokio::time::timeout(Duration::from_secs(1), updates.recv())
+            .await
+            .expect("target results did not arrive")
+            .unwrap();
+        assert_eq!(update.targets[0].ref_id, "A");
+        assert_eq!(update.targets[0].result.as_ref().unwrap().len(), 1);
+        assert_eq!(update.targets[1].ref_id, "B");
+        assert!(
+            matches!(&update.targets[1].result, Err(error) if error.contains("target B failed"))
+        );
+        drop(cmd);
+    }
+
+    struct CountingTargetSource(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl DataSource for CountingTargetSource {
+        fn query(
+            &self,
+            _queries: Vec<Query>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>, QueryError>> + Send>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn excess_targets_are_bounded_and_reported() {
+        let mut dashboard = dashboard(1);
+        for index in 1..=MAX_TARGETS_PER_PANEL {
+            dashboard.panels[0].targets.push(Target {
+                ref_id: format!("T{index}"),
+                expr: "value".into(),
+            });
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sources = HashMap::from([(
+            "test".to_string(),
+            Arc::new(CountingTargetSource(calls.clone())) as Arc<dyn DataSource>,
+        )]);
+        let (cmd, mut updates) = QueryEngine::spawn_with_window(
+            Handle::current(),
+            dashboard,
+            sources,
+            RelativeWindow::new(std::time::Duration::from_secs(60)),
+            Duration::from_secs(3600),
+            Arc::new(Utc::now),
+            Arc::new(|| {}),
+            WakeGate::new(true),
+        );
+        let update = tokio::time::timeout(Duration::from_secs(1), updates.recv())
+            .await
+            .expect("bounded target result did not arrive")
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_TARGETS_PER_PANEL);
+        assert_eq!(update.targets.len(), MAX_TARGETS_PER_PANEL + 1);
+        assert!(
+            matches!(&update.targets[MAX_TARGETS_PER_PANEL].result, Err(error) if error.contains("additional targets omitted"))
+        );
+        drop(cmd);
     }
 
     fn recorded_ranges(queries: &Arc<Mutex<Vec<Vec<Query>>>>) -> Vec<TimeRange> {

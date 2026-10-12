@@ -16,17 +16,16 @@ use tokio::sync::mpsc;
 
 use gtui_core::dashboard::Dashboard;
 use gtui_core::datasource::{DataSource, TimeRange};
-use gtui_core::frame::Frame;
 
-use crate::engine::{EngineCmd, PanelUpdate, QueryEngine, WakeGate, Waker};
+use crate::engine::{EngineCmd, PanelUpdate, QueryEngine, TargetUpdate, WakeGate, Waker};
 
 /// The latest state of a single panel.
 #[derive(Debug, Clone)]
 pub enum PanelState {
     /// No result has arrived yet.
     Loading,
-    /// The most recent successful query result (one frame per target).
-    Ready(Vec<Frame>),
+    /// The most recent results, preserving each target's identity and error.
+    Ready(Vec<TargetUpdate>),
     /// The most recent query failed; carries a user-facing message.
     Error(String),
 }
@@ -100,10 +99,7 @@ impl ObserveApp {
         // this point re-arms a wake instead of being swallowed by a stale flag.
         self.gate.drained();
         while let Ok(update) = self.frames_rx.try_recv() {
-            let state = match update.result {
-                Ok(frames) => PanelState::Ready(frames),
-                Err(e) => PanelState::Error(e.to_string()),
-            };
+            let state = PanelState::Ready(update.targets);
             self.panels.insert(update.panel_id, state);
             changed = true;
         }
@@ -158,8 +154,8 @@ mod tests {
 
     #[tokio::test]
     async fn tick_folds_engine_results_into_panel_state() {
-        // No sources ⇒ the engine emits an Error PanelUpdate for each panel; a
-        // short pump lets those land, exercising the drain path.
+        // No sources ⇒ the engine emits a target-scoped error for each panel;
+        // a short pump lets those land, exercising the drain path.
         let mut app = ObserveApp::new(
             Handle::current(),
             builtin_host_dashboard(),
@@ -170,6 +166,8 @@ mod tests {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(app.tick(), "expected at least one panel update to drain");
-        assert!(matches!(app.panel_state(1), PanelState::Error(_)));
+        assert!(
+            matches!(app.panel_state(1), PanelState::Ready(targets) if targets.iter().all(|target| target.result.is_err()))
+        );
     }
 }
