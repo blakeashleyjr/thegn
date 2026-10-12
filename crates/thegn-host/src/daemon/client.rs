@@ -403,7 +403,7 @@ fn adapt(session_id: String, stream: AttachStream) -> ExecSession {
     let AttachStream {
         mut frames,
         control,
-        end: _,
+        end: mut end_rx,
     } = stream;
     let (out_tx, out_rx) = tokio_mpsc::channel::<ExecFrame>(256);
     let (in_tx, mut in_rx) = tokio_mpsc::channel::<ExecControl>(64);
@@ -435,7 +435,23 @@ fn adapt(session_id: String, stream: AttachStream) -> ExecSession {
                         return;
                     }
                     Some(_) => {} // Hello / feed frames: not pane bytes
-                    None => return, // transport dropped ⇒ relay reconnects
+                    None => {
+                        match tokio::time::timeout(Duration::from_secs(1), &mut end_rx).await {
+                            Ok(Ok(end)) if end.reconnects() => {
+                                tracing::debug!(target: "thegn::daemon", session = %session_id, ?end, "pane attach stream ended");
+                            }
+                            Ok(Ok(end)) => {
+                                tracing::warn!(target: "thegn::daemon", session = %session_id, ?end, "pane attach stream ended permanently");
+                            }
+                            Ok(Err(error)) => {
+                                tracing::debug!(target: "thegn::daemon", session = %session_id, %error, "pane attach stream ended without an outcome");
+                            }
+                            Err(_) => {
+                                tracing::debug!(target: "thegn::daemon", session = %session_id, "pane attach terminal outcome timed out");
+                            }
+                        }
+                        return; // transport dropped ⇒ relay reconnects
+                    }
                 },
                 c = in_rx.recv() => match c {
                     Some(ExecControl::Stdin(bytes)) => {
