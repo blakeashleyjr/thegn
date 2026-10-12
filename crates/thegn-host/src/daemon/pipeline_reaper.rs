@@ -53,8 +53,8 @@ use super::service::DaemonService;
 /// attention, not a user's frame.
 const REAP_INTERVAL_SECS: u64 = 300;
 
-/// Stage concurrency bounds live rows; this cap only defers excess reaping to
-/// the next slow pass and does not release or ignore any active row.
+/// Stage concurrency bounds live rows, and this cap bounds each read. If the
+/// oldest page stays Running without a transition, newer rows may be starved.
 const REAP_ROW_LIMIT: usize = 512;
 
 /// Wait this long after daemon start before the first pass, so a restart that
@@ -190,7 +190,7 @@ fn reap_running(
                         tracing::warn!(
                             target: "thegn::pipeline",
                             limit,
-                            "reap pass truncated; remaining running rows deferred to the next pass"
+                            "reap pass truncated; older non-transitionable running rows may starve newer rows"
                         );
                     }
                     // Same lock as the roster snapshot: the generation each plan
