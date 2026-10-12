@@ -104,40 +104,44 @@ fn decode_and_fit(bytes: &[u8], limits: DecodeLimits) -> Result<Raster, String> 
 }
 
 /// Read at most `cap` bytes from a REGULAR file. The kind is verified on the
-/// opened handle (not just the path), the final symlink is not followed, the
-/// open cannot block on a FIFO, and `take` bounds a file that grows mid-read.
+/// opened handle (not just the path), the resolved final target is opened
+/// without following a symlink, the open cannot block on a FIFO, and `take`
+/// bounds a file that grows mid-read.
 pub(crate) fn read_regular_capped(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
     use std::io::Read;
-    // Cheap pre-check so special files are refused before opening them at all.
-    match std::fs::metadata(path) {
-        Ok(m) if m.is_file() => {}
-        Ok(_) => return Err("not a regular file".to_string()),
-        Err(e) => return Err(format!("read failed: {e}")),
-    }
-    let file = crate::platform::open_read_nonblocking_nofollow(path)
-        .map_err(|e| format!("read failed: {e}"))?;
+    let file = open_regular_nonblocking(path)?;
     let meta = file.metadata().map_err(|e| format!("read failed: {e}"))?;
-    if !meta.is_file() {
-        return Err("not a regular file".to_string());
-    }
     if meta.len() > cap {
-        return Err("file exceeds the size cap".to_string());
+        return Err(format!(
+            "file exceeds the {cap} byte preview cap ({} bytes)",
+            meta.len()
+        ));
     }
     let mut buf = Vec::new();
     file.take(cap.saturating_add(1))
         .read_to_end(&mut buf)
         .map_err(|e| format!("read failed: {e}"))?;
     if buf.len() as u64 > cap {
-        return Err("file exceeds the size cap".to_string());
+        return Err(format!(
+            "file exceeds the {cap} byte preview cap (more than {cap} bytes)"
+        ));
     }
     Ok(buf)
 }
 
-/// Read a small prefix from the opened regular file without following its
-/// final symlink. Used only for extension-less content sniffing.
-pub(crate) fn read_regular_prefix(path: &Path, cap: usize) -> Result<Vec<u8>, String> {
-    use std::io::Read;
-    let file = crate::platform::open_read_nonblocking_nofollow(path)
+/// Resolve a caller path (allowing a final symlink), then open the resolved
+/// path without following a final symlink. Validate the opened handle too.
+/// Nonblocking open prevents a path swapped to a FIFO from parking the caller.
+fn open_regular_nonblocking(path: &Path) -> Result<std::fs::File, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("read failed: {e}"))?;
+    match std::fs::metadata(&canonical) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Err("not a regular file".to_string()),
+        Err(e) => return Err(format!("read failed: {e}")),
+    }
+    let file = crate::platform::open_read_nonblocking_nofollow(&canonical)
         .map_err(|e| format!("read failed: {e}"))?;
     if !file
         .metadata()
@@ -146,6 +150,14 @@ pub(crate) fn read_regular_prefix(path: &Path, cap: usize) -> Result<Vec<u8>, St
     {
         return Err("not a regular file".to_string());
     }
+    Ok(file)
+}
+
+/// Read a small prefix from the opened regular file. Used only for
+/// extension-less content sniffing.
+pub(crate) fn read_regular_prefix(path: &Path, cap: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let file = open_regular_nonblocking(path)?;
     let mut prefix = Vec::with_capacity(cap);
     file.take(cap as u64)
         .read_to_end(&mut prefix)
@@ -220,11 +232,10 @@ pub fn mermaid(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
         .arg(&tmp)
         .arg("-b")
         .arg("transparent");
-    let result = match crate::preview_jobs::run_renderer_quiet(&mut cmd, cancel) {
+    match crate::preview_jobs::run_renderer_quiet(&mut cmd, cancel) {
         Ok(()) => read_mermaid_output(&tmp, MAX_MERMAID_OUTPUT_BYTES),
         Err(e) => Err(format!("mmdc: {}", capture_err(&e))),
-    };
-    result
+    }
 }
 
 fn read_mermaid_output(path: &Path, cap: u64) -> Result<Raster, String> {
@@ -336,10 +347,7 @@ mod tests {
             let link = dir.join("link");
             std::fs::write(&target, b"secret").unwrap();
             crate::platform::test_symlink(&target, &link).unwrap();
-            assert!(
-                read_regular_capped(&link, 100).is_err(),
-                "final symlink refused"
-            );
+            assert_eq!(read_regular_capped(&link, 100).unwrap(), b"secret");
         }
         if crate::platform::test_fifo_supported() {
             let fifo = dir.join("p");
@@ -356,7 +364,7 @@ mod tests {
         let output = dir.path().join("render.png");
         std::fs::write(&output, [0u8; 33]).unwrap();
         let error = read_mermaid_output(&output, 32).err().expect("must refuse");
-        assert!(error.contains("mmdc output read failed: file exceeds the size cap"));
+        assert!(error.contains("mmdc output read failed: file exceeds the 32 byte preview cap"));
     }
 
     #[test]
