@@ -80,7 +80,9 @@ struct RefreshGuard<'a, R> {
 
 impl<R> Drop for RefreshGuard<'_, R> {
     fn drop(&mut self) {
-        self.coalescer.abandon(&self.key);
+        if std::thread::panicking() {
+            self.coalescer.abandon(&self.key);
+        }
     }
 }
 
@@ -116,6 +118,9 @@ pub(crate) fn spawn_issue_cache_refresh(
 
 /// Request a user-visible or background refresh. Overlapping requests for the
 /// same worktree keep only the newest config/waker and share one admission slot.
+/// If admission is refused, cleanup also drops any request coalesced between
+/// `begin` and the refusal; those callers already received `Coalesced` and
+/// have no separate notification that their queued pass was discarded.
 pub(crate) fn request_issue_refresh(
     cwd: std::path::PathBuf,
     app_cfg: thegn_core::config::Config,
@@ -434,5 +439,24 @@ mod tests {
         }));
         assert!(result.is_err());
         assert_eq!(coalescer.begin("repo", 'B'), Some('B'));
+    }
+
+    #[test]
+    fn finished_worker_guard_does_not_remove_a_new_workers_key() {
+        let coalescer = RefreshCoalescer::new();
+        assert_eq!(coalescer.begin("repo", 'A'), Some('A'));
+        let guard = RefreshGuard {
+            coalescer: &coalescer,
+            key: "repo".to_owned(),
+        };
+
+        // The active worker's final next() releases its key before the
+        // closure returns and drops its guard.
+        assert_eq!(coalescer.next("repo"), None);
+        assert_eq!(coalescer.begin("repo", 'B'), Some('B'));
+        drop(guard);
+
+        // A normal guard drop must not release worker B's admission slot.
+        assert_eq!(coalescer.begin("repo", 'C'), None);
     }
 }
