@@ -413,8 +413,10 @@ fn captured_path_context_is_part_of_deterministic_admission_revision() {
 
 #[test]
 fn path_expansion_budget_refuses_aggregate_roots_and_pin_cwds_before_normalizing() {
-    let mut cfg = Config::default();
-    cfg.repo_roots = vec!["~".into(); crate::host_config_checked::MAX_CONTAINER];
+    let mut cfg = Config {
+        repo_roots: vec!["~".into(); crate::host_config_checked::MAX_CONTAINER],
+        ..Config::default()
+    };
     cfg.pins.push(crate::config::Pin {
         name: "pin".into(),
         command: "echo".into(),
