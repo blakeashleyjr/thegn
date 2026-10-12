@@ -18,6 +18,7 @@ use super::admission::{
     MAX_COMPONENT_DEPTH, MAX_LINE_BYTES,
 };
 use super::recur::{RRule, Recurrence, parse_ics_datetime};
+use super::tz::resolve_tzid;
 use super::validate::validate_event;
 use super::{CalEvent, EventStatus, EventTime, Reminder, TzRef};
 
@@ -41,6 +42,8 @@ pub enum IcsDiagnostic {
     DuplicateProperty(&'static str),
     Truncated,
     MissingEnvelope,
+    UnknownTimeZone,
+    UnmappedTimeZone,
 }
 
 /// Bounded diagnostics from one iCalendar parse.
@@ -92,6 +95,7 @@ enum ComponentName {
     Calendar,
     Event,
     Alarm,
+    Timezone,
     Other(u64, usize),
 }
 
@@ -101,6 +105,7 @@ impl ComponentName {
             "VCALENDAR" => Self::Calendar,
             "VEVENT" => Self::Event,
             "VALARM" => Self::Alarm,
+            "VTIMEZONE" => Self::Timezone,
             _ => {
                 // Fixed-size identity keeps arbitrary extension names out of the stack.
                 let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -118,6 +123,7 @@ impl ComponentName {
             (Self::Calendar, Self::Calendar)
             | (Self::Event, Self::Event)
             | (Self::Alarm, Self::Alarm) => true,
+            (Self::Timezone, Self::Timezone) => true,
             (Self::Other(a, al), Self::Other(b, bl)) => a == b && al == bl,
             _ => false,
         }
@@ -559,6 +565,7 @@ pub fn parse_ics_window_reported(
     report.diagnostics.clear();
     report.overflow = 0;
     report.document_failure = false;
+    let timezone_bindings = prescan_timezones(input, &mut check, report)?;
     let mut cur: Option<Builder> = None;
     let mut components: Vec<ComponentName> = Vec::new();
     let mut event_depth: Option<usize> = None;
@@ -733,7 +740,7 @@ pub fn parse_ics_window_reported(
             }
             continue;
         }
-        b.property(&line, meter, report)?;
+        b.property(&line, meter, report, &timezone_bindings)?;
     }
     if cur.is_some() || !components.is_empty() {
         report.record(IcsDiagnostic::Truncated);
@@ -751,6 +758,91 @@ pub fn parse_ics_window_reported(
     // A document that ends mid-event keeps nothing of it, as before.
     meter.abandon_event();
     Ok(())
+}
+
+const MAX_TIMEZONE_BINDINGS: usize = 64;
+const MAX_TZID_BYTES: usize = 128;
+
+/// Bind at most 64 VTIMEZONE definitions. Definitions beyond the cap and
+/// names over 128 bytes are skipped and reported as truncated metadata.
+fn prescan_timezones(
+    input: &str,
+    check: &mut impl FnMut() -> Result<(), AdmissionError>,
+    report: &mut IcsReport,
+) -> Result<BTreeMap<String, Option<String>>, AdmissionError> {
+    let mut bindings = BTreeMap::new();
+    let mut stack = Vec::new();
+    let mut timezone_depth = None;
+    let mut definition: Option<(String, Option<String>)> = None;
+    for raw in LogicalLines::new(input) {
+        check()?;
+        if raw.len() > MAX_LINE_BYTES {
+            if timezone_depth.is_some() {
+                report.record(IcsDiagnostic::Truncated);
+            }
+            continue;
+        }
+        let text = raw.text();
+        let Some(line) = parse_line(&text) else {
+            continue;
+        };
+        match line.name.as_str() {
+            "BEGIN" => {
+                let component = ComponentName::parse(&line.value);
+                let pushed = stack.len() < MAX_COMPONENT_DEPTH;
+                if pushed {
+                    stack.push(component);
+                }
+                if pushed && matches!(component, ComponentName::Timezone) {
+                    timezone_depth = Some(stack.len());
+                    definition = Some((String::new(), None));
+                }
+            }
+            "END" => {
+                let ending_timezone = line.value.eq_ignore_ascii_case("VTIMEZONE");
+                if ending_timezone {
+                    if let (Some((tzid, location)), Some(_)) = (definition.take(), timezone_depth) {
+                        if !tzid.is_empty() && tzid.len() <= MAX_TZID_BYTES {
+                            if bindings.len() < MAX_TIMEZONE_BINDINGS {
+                                let canonical = resolve_tzid(&tzid)
+                                    .or_else(|| location.as_deref().and_then(resolve_tzid))
+                                    .map(|zone| zone.name().to_string());
+                                if canonical.is_none() {
+                                    report.record(IcsDiagnostic::UnmappedTimeZone);
+                                }
+                                bindings.entry(tzid).or_insert(canonical);
+                            } else {
+                                report.record(IcsDiagnostic::Truncated);
+                            }
+                        } else {
+                            report.record(IcsDiagnostic::Truncated);
+                        }
+                    }
+                    timezone_depth = None;
+                }
+                if let Some(depth) = stack.iter().rposition(|part| part.matches(&line.value)) {
+                    stack.truncate(depth);
+                }
+            }
+            "TZID" | "X-LIC-LOCATION" => {
+                if timezone_depth == Some(stack.len())
+                    && let Some((tzid, location)) = &mut definition
+                {
+                    if line.value.len() > MAX_TZID_BYTES {
+                        report.record(IcsDiagnostic::Truncated);
+                    } else if line.name == "TZID" {
+                        if tzid.is_empty() {
+                            *tzid = line.value;
+                        }
+                    } else if location.is_none() {
+                        *location = Some(line.value);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(bindings)
 }
 
 /// `-PT15M` / `-PT1H` / `-P1D` → minutes before. A positive (after-start)
@@ -910,7 +1002,38 @@ impl Builder {
         line: &ContentLine,
         meter: &mut AdmissionMeter,
         report: &mut IcsReport,
+        timezone_bindings: &BTreeMap<String, Option<String>>,
     ) -> Result<(), AdmissionError> {
+        let mut normalized;
+        let line = if matches!(line.name.as_str(), "DTSTART" | "DTEND" | "RDATE" | "EXDATE")
+            && let Some(tzid) = line.params.get("TZID")
+            && !tzid.is_empty()
+        {
+            match timezone_bindings.get(tzid) {
+                Some(Some(name)) => {
+                    normalized = line.clone();
+                    normalized.params.insert("TZID".to_string(), name.clone());
+                    &normalized
+                }
+                Some(None) => line,
+                None => match resolve_tzid(tzid) {
+                    Some(zone) => {
+                        normalized = line.clone();
+                        normalized
+                            .params
+                            .insert("TZID".to_string(), zone.name().to_string());
+                        &normalized
+                    }
+                    None => {
+                        self.quarantined = true;
+                        report.record(IcsDiagnostic::UnknownTimeZone);
+                        line
+                    }
+                },
+            }
+        } else {
+            line
+        };
         let text = line.value.len() + ENTRY_OVERHEAD;
         let tz = line.params.get("TZID").map_or(0, String::len);
         if let Some(name) = singleton_property(&line.name)
@@ -1256,3 +1379,7 @@ mod tests;
 #[cfg(test)]
 #[path = "ics_structure_tests.rs"]
 mod structure_tests;
+
+#[cfg(test)]
+#[path = "ics_tz_tests.rs"]
+mod tz_tests;
