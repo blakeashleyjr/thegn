@@ -511,7 +511,7 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
             gix::diff::blob::pipeline::Mode::ToGit,
             gix::diff::blob::pipeline::WorktreeRoots {
                 old_root: None,
-                new_root: Some(workdir),
+                new_root: Some(workdir.clone()),
             },
         )
         .context("gix worktree diff resource cache")?,
