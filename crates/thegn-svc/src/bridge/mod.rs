@@ -1762,7 +1762,7 @@ fn start_watch(
     std::thread::Builder::new()
         .name("bridge-fs-flush".into())
         .spawn(move || flush_watch_events(flush_coalescer, flush_writer, nudge_rx, watch_id))
-        .map_err(notify::Error::generic)?;
+        .map_err(notify::Error::io)?;
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(ev) = res else {
