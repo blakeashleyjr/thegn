@@ -19,16 +19,19 @@
 //!   instead: with 2 frames in flight the loop defers composing (damage stays
 //!   armed and coalesces), so the terminal's drain rate paces frame *rate*,
 //!   never blocks the loop, and staleness is capped at ~2 frames.
-//! - OOB bytes are small and unbounded (they must not be dropped either).
+//! - OOB admission is bounded to 128 messages and 4 MiB total, including the
+//!   message currently being written. This admits one maximum-size kitty APC
+//!   or preview image on an empty queue. `submit_oob` warns and drops on queue
+//!   pressure; `try_submit_oob` returns refused bytes to retry-capable callers.
 //! - A transient write error (EIO/EINTR/EAGAIN — see `frame_write`) sets a
 //!   status the loop converts to a full-repaint retry, exactly like the old
 //!   synchronous path; [`RETRY_MAX`](crate::frame_write::RETRY_MAX)
 //!   consecutive failures escalate to Fatal (tear down).
 //!
-//! `sync` mode (the termwiz debug renderer, or `THEGN_SYNC_WRITER=1` as the
-//! A/B lever / field kill-switch) spawns no thread: submissions write directly
-//! on the caller, preserving the old synchronous behavior through the same
-//! call sites.
+//! `sync` mode (the termwiz debug renderer, or `THEGN_SYNC_WRITER=1`) still
+//! writes on the caller thread. `THEGN_SYNC_WRITER=1` is an unbounded
+//! synchronous diagnostic/field override, not a liveness-safe production
+//! fallback; use only when the output sink is known to be writable.
 
 use std::collections::VecDeque;
 use std::io::Write as _;
@@ -66,9 +69,13 @@ struct Q {
     frames_queued: usize,
     clipboard_queued: usize,
     clipboard_bytes: usize,
+    /// Includes queued and currently-writing OOB messages.
+    oob_in_flight: usize,
+    oob_bytes: usize,
     status: WriterStatus,
     consec_errs: u32,
     shutdown: bool,
+    worker_done: bool,
     metrics: WriterMetrics,
 }
 
@@ -77,6 +84,8 @@ struct Inner {
     cv: Condvar,
     metrics_deferrals: AtomicU64,
     clipboard_retry: AtomicBool,
+    oob_retry: AtomicBool,
+    oob_pressure_logged: AtomicBool,
 }
 
 pub(crate) struct FrameWriter {
@@ -88,6 +97,13 @@ pub(crate) struct FrameWriter {
 
 /// Max frames in flight before `frame_slot_free` reports Busy.
 const FRAME_QUEUE_DEPTH: usize = 2;
+const OOB_QUEUE_COUNT: usize = 128;
+const OOB_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+const WRITER_SHUTDOWN_BOUND: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(30)
+} else {
+    std::time::Duration::from_millis(500)
+};
 
 impl FrameWriter {
     /// Spawn the writer thread (or a sync-mode handle when `sync` is set).
@@ -100,14 +116,19 @@ impl FrameWriter {
                 frames_queued: 0,
                 clipboard_queued: 0,
                 clipboard_bytes: 0,
+                oob_in_flight: 0,
+                oob_bytes: 0,
                 status: WriterStatus::Ok,
                 consec_errs: 0,
                 shutdown: false,
+                worker_done: sync,
                 metrics: WriterMetrics::default(),
             }),
             cv: Condvar::new(),
             metrics_deferrals: AtomicU64::new(0),
             clipboard_retry: AtomicBool::new(false),
+            oob_retry: AtomicBool::new(false),
+            oob_pressure_logged: AtomicBool::new(false),
         });
         let handle = (!sync).then(|| {
             let inner = Arc::clone(&inner);
@@ -160,20 +181,55 @@ impl FrameWriter {
         true
     }
 
-    /// Submit order-preserving passthrough bytes (never dropped, unbounded —
-    /// these are small: non-clipboard OSC, kitty deletes, BEL, markers).
+    /// Submit order-preserving passthrough bytes. Queue pressure drops this
+    /// message with a warning; it never makes the compositor fatal.
     pub(crate) fn submit_oob(&self, bytes: Vec<u8>) {
+        if let Err(bytes) = self.try_submit_oob(bytes) {
+            if self.inner.oob_pressure_logged.swap(true, Ordering::SeqCst) {
+                tracing::debug!(
+                    bytes = bytes.len(),
+                    count_limit = OOB_QUEUE_COUNT,
+                    byte_limit = OOB_QUEUE_BYTES,
+                    "terminal OOB admission refused during existing pressure episode; dropping message"
+                );
+            } else {
+                tracing::warn!(
+                    bytes = bytes.len(),
+                    count_limit = OOB_QUEUE_COUNT,
+                    byte_limit = OOB_QUEUE_BYTES,
+                    "terminal OOB admission refused; dropping message"
+                );
+            }
+        }
+    }
+
+    /// Typed, lossless admission for producers able to retain and retry bytes.
+    pub(crate) fn try_submit_oob(&self, bytes: Vec<u8>) -> Result<(), Vec<u8>> {
         if bytes.is_empty() {
-            return;
+            return Ok(());
         }
         if self.sync {
             self.write_inline(&bytes, None);
-            return;
+            return Ok(());
         }
         let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
+        if q.shutdown
+            || matches!(q.status, WriterStatus::Fatal(_))
+            || q.oob_in_flight >= OOB_QUEUE_COUNT
+            || bytes.len() > OOB_QUEUE_BYTES.saturating_sub(q.oob_bytes)
+        {
+            self.inner.oob_retry.store(true, Ordering::SeqCst);
+            return Err(bytes);
+        }
+        self.inner
+            .oob_pressure_logged
+            .store(false, Ordering::SeqCst);
+        q.oob_in_flight += 1;
+        q.oob_bytes += bytes.len();
         q.msgs.push_back(Msg::Oob(bytes));
         drop(q);
         self.inner.cv.notify_one();
+        Ok(())
     }
 
     /// Only validated pane clipboard sets enter this bounded queue. One
@@ -283,9 +339,60 @@ impl Drop for FrameWriter {
         }
         self.inner.cv.notify_one();
         if let Some(h) = self.handle.take() {
-            let _ = h.join(); // best-effort: thread join: a panicked helper loses its output, not the caller
+            let deadline = std::time::Instant::now() + WRITER_SHUTDOWN_BOUND;
+            let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
+            while !q.worker_done {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    tracing::warn!(
+                        "terminal writer exceeded shutdown bound; detaching degraded worker"
+                    );
+                    abandon_queued_messages(&mut q);
+                    drop(h);
+                    return;
+                }
+                let (next, timeout) = self
+                    .inner
+                    .cv
+                    .wait_timeout(q, deadline.saturating_duration_since(now))
+                    .unwrap_or_else(|e| e.into_inner());
+                q = next;
+                if timeout.timed_out() && !q.worker_done {
+                    tracing::warn!(
+                        "terminal writer exceeded shutdown bound; detaching degraded worker"
+                    );
+                    abandon_queued_messages(&mut q);
+                    drop(h);
+                    return;
+                }
+            }
+            drop(q);
+            if h.join().is_err() {
+                tracing::warn!("terminal writer thread panicked before shutdown");
+            }
         }
     }
+}
+
+fn abandon_queued_messages(q: &mut Q) {
+    q.status = WriterStatus::Fatal("terminal writer shutdown deadline".into());
+    let queued_oob_count = q
+        .msgs
+        .iter()
+        .filter(|msg| matches!(msg, Msg::Oob(_)))
+        .count();
+    let queued_oob_bytes = q.msgs.iter().fold(0usize, |total, msg| match msg {
+        Msg::Oob(bytes) => total.saturating_add(bytes.len()),
+        Msg::Frame(..) | Msg::Clipboard(_) => total,
+    });
+    q.msgs.clear();
+    q.frames_queued = 0;
+    q.clipboard_queued = 0;
+    q.clipboard_bytes = 0;
+    // Keep accounting for an in-flight write; write_message releases it when
+    // that write returns. Everything still in msgs has been abandoned.
+    q.oob_in_flight = q.oob_in_flight.saturating_sub(queued_oob_count);
+    q.oob_bytes = q.oob_bytes.saturating_sub(queued_oob_bytes);
 }
 
 fn pop_message(q: &mut Q) -> Option<Msg> {
@@ -316,14 +423,26 @@ fn writer_main(inner: &Inner, waker: &TerminalWaker) {
         };
         let Some(msg) = msg else { break };
         if inner.clipboard_retry.swap(false, Ordering::SeqCst) {
-            let _ = waker.wake(); // best-effort: capacity release wakes pending clipboard admission
+            wake_loop(waker, "clipboard capacity released");
         }
-        let errored = write_message(inner, msg, write_and_flush);
-        if errored {
-            // The loop acts on the status (full repaint / teardown) — wake it.
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        let (errored, released_oob) = write_message(inner, msg, write_and_flush);
+        if errored || oob_capacity_wake_requested(inner, released_oob) {
+            wake_loop(waker, "writer state changed");
         }
     }
+    let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
+    q.worker_done = true;
+    inner.cv.notify_all();
+}
+
+fn wake_loop(waker: &TerminalWaker, reason: &'static str) {
+    if let Err(error) = waker.wake() {
+        tracing::trace!(?error, reason, "terminal writer wake failed");
+    }
+}
+
+fn oob_capacity_wake_requested(inner: &Inner, released_oob: bool) -> bool {
+    released_oob && inner.oob_retry.swap(false, Ordering::SeqCst)
 }
 
 /// One message, with the sink injected for isolated boundary tests. Queue locks
@@ -332,18 +451,25 @@ fn write_message(
     inner: &Inner,
     msg: Msg,
     write: impl FnOnce(&[u8]) -> std::io::Result<()>,
-) -> bool {
+) -> (bool, bool) {
     let bytes = match &msg {
         Msg::Frame(b, _) | Msg::Oob(b) | Msg::Clipboard(b) => b,
     };
     // After a Fatal, drop writes (the loop is tearing down); keep draining
     // so shutdown never deadlocks.
     let fatal = {
-        let q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
-        matches!(q.status, WriterStatus::Fatal(_))
+        let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
+        let fatal = matches!(q.status, WriterStatus::Fatal(_));
+        let released = if fatal {
+            release_oob_capacity(&mut q, &msg);
+            matches!(&msg, Msg::Oob(_))
+        } else {
+            false
+        };
+        (fatal, released)
     };
-    if fatal {
-        return false;
+    if fatal.0 {
+        return (false, fatal.1);
     }
     let stamp = match &msg {
         Msg::Frame(_, stamp) => *stamp,
@@ -353,14 +479,23 @@ fn write_message(
     let result = write(bytes);
     let finished = started.map(|_| Instant::now());
     let errored = result.is_err();
+    let released_oob = matches!(&msg, Msg::Oob(_));
     {
         let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
+        release_oob_capacity(&mut q, &msg);
         if let (Some(stamp), Some(started), Some(finished)) = (stamp, started, finished) {
             q.metrics.record(stamp, started, finished, !errored);
         }
         apply_write_result(&mut q, result);
     }
-    errored
+    (errored, released_oob)
+}
+
+fn release_oob_capacity(q: &mut Q, msg: &Msg) {
+    if let Msg::Oob(bytes) = msg {
+        q.oob_in_flight = q.oob_in_flight.saturating_sub(1);
+        q.oob_bytes = q.oob_bytes.saturating_sub(bytes.len());
+    }
 }
 
 fn write_and_flush(bytes: &[u8]) -> std::io::Result<()> {
@@ -409,9 +544,12 @@ mod tests {
             frames_queued: 0,
             clipboard_queued: 0,
             clipboard_bytes: 0,
+            oob_in_flight: 0,
+            oob_bytes: 0,
             status: WriterStatus::Ok,
             consec_errs: 0,
             shutdown: false,
+            worker_done: false,
             metrics: WriterMetrics::default(),
         }
     }
@@ -423,6 +561,8 @@ mod tests {
                 cv: Condvar::new(),
                 metrics_deferrals: AtomicU64::new(0),
                 clipboard_retry: AtomicBool::new(false),
+                oob_retry: AtomicBool::new(false),
+                oob_pressure_logged: AtomicBool::new(false),
             }),
             handle: None,
             sync: false,
@@ -477,10 +617,13 @@ mod tests {
         assert!(writer.try_submit_clipboard(vec![7], || wakes += 1).is_ok());
         assert_eq!(wakes, 1);
         let msg = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
-        assert!(!write_message(&writer.inner, msg, |b| {
-            assert_eq!(b, &[7]);
-            Ok(())
-        }));
+        assert!(
+            !write_message(&writer.inner, msg, |b| {
+                assert_eq!(b, &[7]);
+                Ok(())
+            })
+            .0
+        );
         assert_eq!(writer.take_metrics().unwrap().completion_us.count(), 0);
     }
 
@@ -491,18 +634,23 @@ mod tests {
             queued_at: Instant::now(),
             input_at: Some(Instant::now()),
         };
-        assert!(!write_message(
-            &writer.inner,
-            Msg::Frame(vec![1], Some(stamp)),
-            |bytes| {
+        assert!(
+            !write_message(&writer.inner, Msg::Frame(vec![1], Some(stamp)), |bytes| {
                 assert_eq!(bytes, [1]);
                 // A blocked sink must not hold the UI's queue/metrics mutex.
                 assert_eq!(writer.take_metrics().unwrap().completion_us.count(), 0);
                 Ok(())
-            }
-        ));
+            })
+            .0
+        );
         assert_eq!(writer.take_metrics().unwrap().completion_us.count(), 1);
-        assert!(!write_message(&writer.inner, Msg::Oob(vec![2]), |_| Ok(())));
+        let (errored, released_oob) = write_message(&writer.inner, Msg::Oob(vec![2]), |_| Ok(()));
+        assert!(!errored);
+        assert!(released_oob, "completed OOB write must release capacity");
+        assert!(
+            !oob_capacity_wake_requested(&writer.inner, released_oob),
+            "capacity release without a refused submission must not wake the loop"
+        );
         let metrics = writer.take_metrics().unwrap();
         assert_eq!(metrics.completion_us.count(), 0);
         assert_eq!(metrics.failed_frames, 0);
@@ -515,11 +663,12 @@ mod tests {
             queued_at: Instant::now(),
             input_at: None,
         };
-        assert!(write_message(
-            &writer.inner,
-            Msg::Frame(vec![], Some(stamp)),
-            |_| { Err(std::io::ErrorKind::Interrupted.into()) }
-        ));
+        assert!(
+            write_message(&writer.inner, Msg::Frame(vec![], Some(stamp)), |_| {
+                Err(std::io::ErrorKind::Interrupted.into())
+            })
+            .0
+        );
         let metrics = writer.take_metrics().unwrap();
         assert_eq!(metrics.failed_frames, 1);
         assert_eq!(metrics.completion_us.count(), 0);
@@ -547,6 +696,144 @@ mod tests {
         assert!(!writer.frame_slot_free());
         assert!(!writer.submit_frame(vec![3], None));
         assert_eq!(writer.inner.q.lock().unwrap().msgs.len(), FRAME_QUEUE_DEPTH);
+    }
+
+    #[test]
+    fn oob_admission_accepts_four_mib_and_refusal_is_not_fatal() {
+        let writer = test_writer();
+        assert!(writer.try_submit_oob(vec![0; OOB_QUEUE_BYTES]).is_ok());
+        assert_eq!(writer.inner.q.lock().unwrap().oob_bytes, 4 * 1024 * 1024);
+
+        let byte_bounded = test_writer();
+        assert!(
+            byte_bounded
+                .try_submit_oob(vec![0; 3 * 1024 * 1024])
+                .is_ok()
+        );
+        assert_eq!(
+            byte_bounded
+                .try_submit_oob(vec![1; 2 * 1024 * 1024])
+                .unwrap_err()
+                .len(),
+            2 * 1024 * 1024
+        );
+
+        let refusing = test_writer();
+        for _ in 0..OOB_QUEUE_COUNT {
+            assert!(refusing.try_submit_oob(vec![1]).is_ok());
+        }
+        refusing.submit_oob(vec![2]);
+        assert_eq!(refusing.take_status(), WriterStatus::Ok);
+        let refused = refusing.try_submit_oob(vec![3]).unwrap_err();
+        assert_eq!(refused, vec![3]);
+        assert!(refusing.inner.oob_retry.load(Ordering::SeqCst));
+
+        let release_writer = test_writer();
+        assert!(release_writer.try_submit_oob(vec![9]).is_ok());
+        let active = pop_message(&mut release_writer.inner.q.lock().unwrap()).unwrap();
+        let (errored, released) = write_message(&release_writer.inner, active, |_| Ok(()));
+        assert!(!errored);
+        assert!(released, "completed OOB write must release capacity");
+        assert!(!oob_capacity_wake_requested(
+            &release_writer.inner,
+            released
+        ));
+        assert!(release_writer.try_submit_oob(vec![4]).is_ok());
+    }
+
+    #[test]
+    fn oob_pressure_warns_once_and_refusal_wakes_on_capacity_release() {
+        let writer = test_writer();
+        for _ in 0..OOB_QUEUE_COUNT {
+            assert!(writer.try_submit_oob(vec![1]).is_ok());
+        }
+        assert_eq!(writer.try_submit_oob(vec![2]), Err(vec![2]));
+        assert!(writer.inner.oob_retry.load(Ordering::SeqCst));
+
+        writer.submit_oob(vec![3]);
+        assert!(writer.inner.oob_pressure_logged.load(Ordering::SeqCst));
+        writer.submit_oob(vec![4]);
+        assert!(writer.inner.oob_pressure_logged.load(Ordering::SeqCst));
+
+        let active = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        let (errored, released) = write_message(&writer.inner, active, |_| Ok(()));
+        assert!(!errored);
+        assert!(released);
+        assert!(oob_capacity_wake_requested(&writer.inner, released));
+        assert!(!writer.inner.oob_retry.load(Ordering::SeqCst));
+
+        assert!(writer.try_submit_oob(vec![5]).is_ok());
+        assert!(!writer.inner.oob_pressure_logged.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn drop_deadline_discards_queued_messages_while_sink_is_blocked() {
+        let base = test_writer();
+        let inner = Arc::clone(&base.inner);
+        drop(base);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let written = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        {
+            let mut q = inner.q.lock().unwrap();
+            q.msgs.push_back(Msg::Oob(vec![2]));
+            q.msgs.push_back(Msg::Frame(vec![3], None));
+            q.oob_in_flight = 1;
+            q.oob_bytes = 1;
+            q.frames_queued = 1;
+        }
+        let written_by_worker = Arc::clone(&written);
+        let inner_for_worker = Arc::clone(&inner);
+        let handle = std::thread::spawn(move || {
+            let (errored, _) =
+                write_message(&inner_for_worker, Msg::Frame(vec![1], None), |bytes| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    written_by_worker.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                });
+            assert!(!errored);
+            let mut q = inner_for_worker.q.lock().unwrap();
+            while let Some(msg) = pop_message(&mut q) {
+                drop(q);
+                let (errored, _) = write_message(&inner_for_worker, msg, |bytes| {
+                    written_by_worker.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                });
+                assert!(!errored);
+                q = inner_for_worker.q.lock().unwrap();
+            }
+            q.worker_done = true;
+            inner_for_worker.cv.notify_all();
+            done_tx.send(()).unwrap();
+        });
+        let writer = FrameWriter {
+            inner: Arc::clone(&inner),
+            handle: Some(handle),
+            sync: false,
+        };
+        started_rx.recv().unwrap();
+        let started_at = Instant::now();
+        drop(writer);
+        assert!(
+            started_at.elapsed() < WRITER_SHUTDOWN_BOUND + std::time::Duration::from_millis(100)
+        );
+        {
+            let q = inner.q.lock().unwrap();
+            assert!(matches!(q.status, WriterStatus::Fatal(_)));
+            assert!(q.msgs.is_empty());
+            assert_eq!(q.frames_queued, 0);
+            assert_eq!(q.oob_in_flight, 0);
+            assert_eq!(q.oob_bytes, 0);
+        }
+        release_tx.send(()).unwrap();
+        // The only bytes that may land after the deadline are from the one
+        // write already in flight; the queued frame must be discarded.
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(*written.lock().unwrap(), vec![vec![1]]);
     }
 
     #[cfg(unix)] // EIO-as-transient is unix errno classification
