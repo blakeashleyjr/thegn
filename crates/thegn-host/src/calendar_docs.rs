@@ -76,7 +76,13 @@ pub(crate) fn fold_month(
     errors: &mut BTreeMap<(i32, u32), CalendarViewError>,
     payload: &crate::detail::CalendarPayload,
 ) {
+    if !crate::hydrate_calendar::calendar_payload_is_current(payload) {
+        return;
+    }
     if let Some(month) = &payload.events {
+        if payload.error.is_none() {
+            events.retain(|date, _| *date < payload.covered.0 || *date > payload.covered.1);
+        }
         for (date, evs) in month {
             events.insert(*date, evs.clone());
         }
@@ -250,6 +256,11 @@ mod tests {
     ) -> CalendarPayload {
         CalendarPayload {
             month: (2026, 8),
+            covered: (
+                NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            ),
+            request: None,
             events,
             error,
         }
@@ -287,6 +298,53 @@ mod tests {
         docs.merge(&payload(Some(Vec::new()), None));
         assert!(docs.loaded.contains(&month));
         assert!(!docs.errors.contains_key(&month));
+    }
+
+    #[test]
+    fn authoritative_delivery_replaces_covered_dates_including_grid_slack() {
+        let mut docs = CalendarDocs::default();
+        let stale_in_month = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+        let stale_in_slack = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        let outside_coverage = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        docs.events.insert(stale_in_month, vec![event()]);
+        docs.events.insert(stale_in_slack, vec![event()]);
+        docs.events.insert(outside_coverage, vec![event()]);
+
+        let mut replacement = payload(Some(Vec::new()), None);
+        replacement.covered = (
+            NaiveDate::from_ymd_opt(2026, 7, 25).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 7).unwrap(),
+        );
+        docs.merge(&replacement);
+
+        assert!(!docs.events.contains_key(&stale_in_month));
+        assert!(!docs.events.contains_key(&stale_in_slack));
+        assert!(docs.events.contains_key(&outside_coverage));
+        assert!(docs.loaded.contains(&(2026, 8)));
+    }
+
+    #[test]
+    fn failed_refresh_keeps_data_inside_covered_range() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+        let mut docs = CalendarDocs::default();
+        docs.events.insert(date, vec![event()]);
+        let failed = CalendarViewError::CacheUnavailable;
+        docs.merge(&payload(None, Some(failed)));
+        assert_eq!(docs.events[&date].len(), 1);
+        assert_eq!(docs.errors.get(&(2026, 8)), Some(&failed));
+    }
+
+    #[test]
+    fn incomplete_refresh_keeps_existing_dates_it_did_not_reach() {
+        let retained = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+        let mut docs = CalendarDocs::default();
+        docs.events.insert(retained, vec![event()]);
+
+        let incomplete = CalendarViewError::MalformedCache;
+        docs.merge(&payload(Some(Vec::new()), Some(incomplete)));
+
+        assert!(docs.events.contains_key(&retained));
+        assert_eq!(docs.errors.get(&(2026, 8)), Some(&incomplete));
     }
 
     #[test]

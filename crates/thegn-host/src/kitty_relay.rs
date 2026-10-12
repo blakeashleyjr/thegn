@@ -38,7 +38,8 @@
 //! (`a=T`/`a=p`) is prefixed with an absolute CUP to the corner origin ([`cup`])
 //! and receives cell dimensions bounded by the content rect. Continuation APCs
 //! are buffered into their transfer, then one ordered unit is emitted at `m=0`
-//! with a single CUP. Delete APCs are rebuilt with quiet mode. An orphan `Gm=`
+//! with a single CUP. Child IDs are translated through a bounded reserved ID
+//! block, and delete APCs are rebuilt with an explicit scope and quiet mode. An orphan `Gm=`
 //! is rejected until a fresh `a=T` or `a=d`. A query (`a=q`) is answered locally
 //! and never forwarded (forwarding it would make the OUTER terminal reply to us).
 //!
@@ -92,6 +93,9 @@ const MAX_TRANSFER_BYTES: usize = MAX_APC_BYTES - 64;
 const MAX_TRANSFER_CHUNKS: usize = 4096;
 /// Text is emitted incrementally even when the caller supplies a huge slice.
 const TEXT_PIECE_BYTES: usize = 8192;
+/// Reserved outer-terminal IDs used only by the corner relay.
+pub const CORNER_ID_BASE: u32 = 0x7fff_0000;
+pub const CORNER_IDS: usize = 16;
 
 #[derive(Debug, Default)]
 enum ScanState {
@@ -113,8 +117,57 @@ pub struct KittyRelay {
     state: ScanState,
     partial: Vec<u8>,
     transfer: Option<Transfer>,
+    ids: CornerIds,
     #[cfg(test)]
     scanned: usize,
+}
+
+/// Child IDs are reserved when a first chunk is classified. If later transfer
+/// aggregation or payload validation rejects that transfer, its bounded slot
+/// remains reserved until the child deletes it or the relay resets. This keeps
+/// the table bounded; a later placement can still map to that rejected image.
+#[derive(Debug, Default)]
+struct CornerIds {
+    child: [Option<u32>; CORNER_IDS],
+    anonymous_live: bool,
+}
+
+impl CornerIds {
+    fn host_id(slot: usize) -> u32 {
+        CORNER_ID_BASE + slot as u32
+    }
+
+    fn slot_for(&self, child_id: u32) -> Option<usize> {
+        self.child.iter().position(|id| *id == Some(child_id))
+    }
+
+    fn allocate(&mut self, child_id: u32) -> Option<usize> {
+        if let Some(slot) = self.slot_for(child_id) {
+            return Some(slot);
+        }
+        let slot = self
+            .child
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(slot, id)| id.is_none().then_some(slot))?;
+        self.child[slot] = Some(child_id);
+        Some(slot)
+    }
+
+    fn delete_live(&mut self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if self.anonymous_live {
+            bytes.extend_from_slice(&delete_id(Self::host_id(0)));
+        }
+        for (slot, child_id) in self.child.iter_mut().enumerate() {
+            if child_id.take().is_some() {
+                bytes.extend_from_slice(&delete_id(Self::host_id(slot)));
+            }
+        }
+        self.anonymous_live = false;
+        bytes
+    }
 }
 
 #[derive(Debug)]
@@ -133,6 +186,7 @@ impl KittyRelay {
         self.state = ScanState::Text;
         self.partial = Vec::new();
         self.transfer = None;
+        self.ids = CornerIds::default();
     }
 
     /// Emit pieces as they complete instead of accumulating an input-sized
@@ -204,7 +258,7 @@ impl KittyRelay {
                         self.partial.push(byte);
                         if ended {
                             let seq = std::mem::take(&mut self.partial);
-                            let piece = classify(seq, content_size);
+                            let piece = classify(seq, content_size, &mut self.ids);
                             self.accept_piece(piece, &mut emit);
                             self.state = ScanState::Text;
                         } else {
@@ -270,6 +324,11 @@ impl KittyRelay {
                     self.transfer = Some(transfer);
                 }
             }
+            Piece::GfxOther(bytes) if bytes.is_empty() => {
+                // A child delete-all with no live IDs still terminates any
+                // incomplete transfer, but has no outer-terminal command.
+                self.transfer = None;
+            }
             Piece::GfxOther(bytes) if is_delete(&bytes) => {
                 self.transfer = None;
                 emit(Piece::GfxOther(bytes));
@@ -296,7 +355,7 @@ impl KittyRelay {
 
 /// Classify a complete APC sequence (`ESC _ … ESC \`). Non-graphics APCs (not
 /// `ESC _ G`) pass through to the emulator verbatim.
-fn classify(seq: Vec<u8>, content_size: (usize, usize)) -> Piece {
+fn classify(seq: Vec<u8>, content_size: (usize, usize), ids: &mut CornerIds) -> Piece {
     // seq = ESC _ <body> ESC \  → body is seq[2 .. len-2].
     if seq.len() < 4 || seq[2] != b'G' {
         return Piece::Emulator(seq);
@@ -311,7 +370,7 @@ fn classify(seq: Vec<u8>, content_size: (usize, usize)) -> Piece {
     } else {
         &[]
     };
-    match canonical_graphics(ctrl, payload, content_size) {
+    match canonical_graphics(ctrl, payload, content_size, ids) {
         Some(Canonical::Query) => Piece::GfxAnswer(answer_for(ctrl)),
         Some(Canonical::Display(bytes)) => Piece::GfxDisplay(bytes),
         Some(Canonical::Other(bytes)) => Piece::GfxOther(bytes),
@@ -469,6 +528,7 @@ fn canonical_graphics(
     ctrl: &[u8],
     payload: &[u8],
     content_size: (usize, usize),
+    ids: &mut CornerIds,
 ) -> Option<Canonical> {
     let control = Control::parse(ctrl)?;
     let get = |key: &[u8]| control.get(key);
@@ -568,6 +628,15 @@ fn canonical_graphics(
         if !payload.is_empty() {
             return None;
         }
+        let bytes = if let Some(child_id) = get(b"i") {
+            let child_id = parse_u32_positive(child_id)?;
+            let slot = ids.slot_for(child_id)?;
+            ids.child[slot] = None;
+            delete_id(CornerIds::host_id(slot))
+        } else {
+            ids.delete_live()
+        };
+        return Some(Canonical::Other(bytes));
     } else if action == b"p" {
         if control.fields.iter().any(|(key, _)| {
             !matches!(
@@ -665,6 +734,21 @@ fn canonical_graphics(
     if cell_cols > cols || cell_rows > rows {
         return None;
     }
+    let mapped_id = if action == b"T" {
+        if let Some(child_id) = get(b"i") {
+            let child_id = parse_u32_positive(child_id)?;
+            let slot = ids.allocate(child_id)?;
+            Some(CornerIds::host_id(slot))
+        } else {
+            ids.anonymous_live = true;
+            Some(CornerIds::host_id(0))
+        }
+    } else if action == b"p" {
+        let child_id = parse_u32_positive(get(b"i")?)?;
+        Some(CornerIds::host_id(ids.slot_for(child_id)?))
+    } else {
+        None
+    };
     let mut out = Vec::from(&b"\x1b_G"[..]);
     let mut emitted = false;
     for (key, value) in &control.fields {
@@ -694,13 +778,22 @@ fn canonical_graphics(
                     value
                 });
             }
-            b"i" | b"s" | b"v" | b"m" | b"x" | b"y" | b"w" | b"h" | b"X" | b"Y" => {
+            b"i" => out.extend_from_slice(mapped_id?.to_string().as_bytes()),
+            b"s" | b"v" | b"m" | b"x" | b"y" | b"w" | b"h" | b"X" | b"Y" => {
                 out.extend_from_slice(parse_num(value)?.to_string().as_bytes())
             }
             _ => out.extend_from_slice(value),
         }
     }
     let display = matches!(action, b"T" | b"p");
+    if display && get(b"i").is_none() {
+        if emitted {
+            out.push(b',');
+        }
+        emitted = true;
+        out.extend_from_slice(b"i=");
+        out.extend_from_slice(mapped_id?.to_string().as_bytes());
+    }
     for (key, value) in [(b"q".as_slice(), b"2".as_slice())]
         .into_iter()
         .chain(display.then_some((b"C".as_slice(), b"1".as_slice())))
@@ -846,10 +939,17 @@ pub fn cup(origin: (u16, u16), cursor: (u16, u16)) -> Vec<u8> {
     format!("\x1b[{row};{col}H").into_bytes()
 }
 
-/// Delete all images on the outer terminal (matches mpv's own per-frame `a=d`).
-/// Emitted on dismiss/exit/resize/occlude so no frame lingers.
-pub fn delete_all() -> &'static [u8] {
-    b"\x1b_Ga=d\x1b\\"
+/// Delete only the reserved corner ID block on the outer terminal.
+/// Emitted on dismiss/exit/resize/occlude so no corner frame lingers.
+pub fn delete_all() -> Vec<u8> {
+    (0..CORNER_IDS).fold(Vec::new(), |mut bytes, slot| {
+        bytes.extend_from_slice(&delete_id(CornerIds::host_id(slot)));
+        bytes
+    })
+}
+
+fn delete_id(host_id: u32) -> Vec<u8> {
+    format!("\x1b_Ga=d,d=I,i={host_id},q=2;\x1b\\").into_bytes()
 }
 
 /// Whether the outer terminal speaks the kitty graphics protocol, from the
@@ -918,7 +1018,7 @@ mod tests {
             }
             assert!(
                 wire.starts_with(
-                    b"hello\x1b_Ga=T,f=24,s=1,v=1,q=2,C=1,z=-1,c=65535,r=65535;AQID\x1b\\tail"
+                    b"hello\x1b_Ga=T,f=24,s=1,v=1,i=2147418112,q=2,C=1,z=-1,c=65535,r=65535;AQID\x1b\\tail"
                 ),
                 "split {split}"
             );
@@ -975,10 +1075,7 @@ mod tests {
                 relay.feed(b"\\safe"),
                 vec![Piece::Emulator(b"safe".to_vec())]
             );
-            assert_eq!(
-                relay.feed(&apc("Ga=d")),
-                vec![Piece::GfxOther(apc("Ga=d,q=2;"))]
-            );
+            assert!(relay.feed(&apc("Ga=d")).is_empty());
         }
     }
 
@@ -1039,10 +1136,10 @@ mod tests {
         assert_eq!(
             pieces,
             vec![
-                Piece::GfxOther(apc("Ga=d,q=2;")),
                 Piece::Emulator(b"\x1b[2J\x1b[0;0f".to_vec()),
                 Piece::GfxDisplay({
-                    let mut unit = apc("Ga=T,f=24,s=1,v=1,C=1,q=2,m=1,z=-1,c=65535,r=65535;AQ");
+                    let mut unit =
+                        apc("Ga=T,f=24,s=1,v=1,C=1,q=2,m=1,i=2147418112,z=-1,c=65535,r=65535;AQ");
                     unit.extend(apc("Gm=0,q=2;ID"));
                     unit
                 }),
@@ -1067,7 +1164,8 @@ mod tests {
         let mut got = relay.feed(&apc("Ga=T,m=1,f=24,s=1,v=1;AQ"));
         assert!(got.is_empty());
         got.extend(relay.feed(&apc("Gm=0;ID")));
-        let mut expected = apc("Ga=T,m=1,f=24,s=1,v=1,q=2,C=1,z=-1,c=65535,r=65535;AQ");
+        let mut expected =
+            apc("Ga=T,m=1,f=24,s=1,v=1,i=2147418112,q=2,C=1,z=-1,c=65535,r=65535;AQ");
         expected.extend(apc("Gm=0,q=2;ID"));
         assert_eq!(got, [Piece::GfxDisplay(expected)]);
     }
@@ -1182,7 +1280,18 @@ mod tests {
         assert_eq!(p1, vec![Piece::Emulator(b"hello".to_vec())]);
         // Next read completes an APC begun by that ESC.
         let p2 = r.feed(b"_Ga=d\x1b\\");
-        assert_eq!(p2, vec![Piece::GfxOther(apc("Ga=d,q=2;"))]);
+        assert!(p2.is_empty());
+    }
+
+    #[test]
+    fn child_delete_cancels_an_incomplete_transfer_before_its_final_chunk() {
+        let mut relay = KittyRelay::new();
+        assert!(relay.feed(&apc("Ga=T,i=2,m=1,f=24,s=1,v=1;AQ")).is_empty());
+        assert!(matches!(
+            relay.feed(&apc("Ga=d,i=2;")).as_slice(),
+            [Piece::GfxOther(_)]
+        ));
+        assert_eq!(relay.feed(&apc("Gm=0;ID")), [Piece::Rejected]);
     }
 
     #[test]
@@ -1298,7 +1407,7 @@ mod tests {
         assert!(matches!(
             &pieces[..],
             [Piece::GfxDisplay(bytes)]
-                if bytes.starts_with(b"\x1b_Ga=T,m=1,f=24,s=1,v=1,q=2,C=1,z=-1,c=8,r=5;AQ\x1b\\")
+                if bytes.starts_with(b"\x1b_Ga=T,m=1,f=24,s=1,v=1,i=2147418112,q=2,C=1,z=-1,c=8,r=5;AQ\x1b\\")
                     && bytes.ends_with(b"\x1b_Gm=0,q=2;ID\x1b\\")
         ));
         assert_eq!(
@@ -1309,12 +1418,156 @@ mod tests {
 
     #[test]
     fn transmit_then_place_rebuilds_the_placement_with_corner_limits() {
-        let pieces = relayed("Ga=p,i=41,c=3,r=2,q=0,C=0,z=5;", (8, 5));
+        let mut relay = KittyRelay::new();
+        relay.feed_with_rect(&apc("Ga=T,i=41,f=24,s=1,v=1;AQID"), (8, 5), |_| {});
+        let mut pieces = Vec::new();
+        relay.feed_with_rect(&apc("Ga=p,i=41,c=3,r=2,q=0,C=0,z=5;"), (8, 5), |piece| {
+            pieces.push(piece)
+        });
         let [Piece::GfxDisplay(bytes)] = pieces.as_slice() else {
             panic!("placement expected");
         };
-        assert_eq!(bytes, b"\x1b_Ga=p,i=41,c=3,r=2,q=2,C=1,z=-1;\x1b\\");
+        assert_eq!(bytes, b"\x1b_Ga=p,i=2147418113,c=3,r=2,q=2,C=1,z=-1;\x1b\\");
         assert_eq!(relayed("Ga=p,c=2,r=2;", (8, 5)), [Piece::Rejected]);
+    }
+
+    #[test]
+    fn child_ids_are_rewritten_stable_distinct_and_placeable() {
+        let mut relay = KittyRelay::new();
+        let transmit = |relay: &mut KittyRelay, id| {
+            let mut pieces = Vec::new();
+            relay.feed_with_rect(
+                &apc(&format!("Ga=T,i={id},f=24,s=1,v=1;AQID")),
+                (8, 5),
+                |p| pieces.push(p),
+            );
+            pieces
+        };
+        let first = transmit(&mut relay, 7);
+        let again = transmit(&mut relay, 7);
+        let other = transmit(&mut relay, 8);
+        let [Piece::GfxDisplay(first)] = first.as_slice() else {
+            panic!("transmit expected")
+        };
+        let [Piece::GfxDisplay(again)] = again.as_slice() else {
+            panic!("transmit expected")
+        };
+        let [Piece::GfxDisplay(other)] = other.as_slice() else {
+            panic!("transmit expected")
+        };
+        assert!(first.windows(12).any(|bytes| bytes == b"i=2147418113"));
+        assert!(again.windows(12).any(|bytes| bytes == b"i=2147418113"));
+        assert!(other.windows(12).any(|bytes| bytes == b"i=2147418114"));
+        let mut placed = Vec::new();
+        relay.feed_with_rect(&apc("Ga=p,i=7;"), (8, 5), |piece| placed.push(piece));
+        assert!(
+            matches!(placed.as_slice(), [Piece::GfxDisplay(bytes)] if bytes.starts_with(b"\x1b_Ga=p,i=2147418113,"))
+        );
+    }
+
+    #[test]
+    fn anonymous_transmit_uses_the_default_reserved_id() {
+        let pieces = relayed("Ga=T,f=24,s=1,v=1;AQID", (8, 5));
+        let [Piece::GfxDisplay(bytes)] = pieces.as_slice() else {
+            panic!("transmit expected")
+        };
+        assert!(bytes.starts_with(b"\x1b_Ga=T,f=24,s=1,v=1,i=2147418112,"));
+    }
+
+    #[test]
+    fn child_deletes_are_scoped_and_never_reach_unmapped_ids() {
+        let mut relay = KittyRelay::new();
+        relay.feed_with_rect(&apc("Ga=T,i=5,f=24,s=1,v=1;AQID"), (8, 5), |_| {});
+        let mut deleted = Vec::new();
+        relay.feed_with_rect(&apc("Ga=d,i=5;"), (8, 5), |piece| deleted.push(piece));
+        assert_eq!(
+            deleted,
+            [Piece::GfxOther(apc("Ga=d,d=I,i=2147418113,q=2;"))]
+        );
+        let mut unknown = Vec::new();
+        relay.feed_with_rect(&apc("Ga=d,i=5;"), (8, 5), |piece| unknown.push(piece));
+        assert_eq!(unknown, [Piece::Rejected]);
+
+        let mut relay = KittyRelay::new();
+        let mut emitted = Vec::new();
+        relay.feed_with_rect(&apc("Ga=T,i=5,f=24,s=1,v=1;AQID"), (8, 5), |piece| {
+            emitted.push(piece)
+        });
+        emitted.clear();
+        relay.feed_with_rect(&apc("Ga=d;"), (8, 5), |piece| emitted.push(piece));
+        let [Piece::GfxOther(bytes)] = emitted.as_slice() else {
+            panic!("scoped deletes expected")
+        };
+        assert_eq!(*bytes, apc("Ga=d,d=I,i=2147418113,q=2;"));
+        assert!(!bytes.windows(4).any(|part| part == b"a=d;"));
+    }
+
+    #[test]
+    fn id_table_overflow_recovers_after_child_delete_all() {
+        let mut relay = KittyRelay::new();
+        for id in 1..CORNER_IDS {
+            let mut pieces = Vec::new();
+            relay.feed_with_rect(
+                &apc(&format!("Ga=T,i={id},f=24,s=1,v=1;AQID")),
+                (8, 5),
+                |piece| pieces.push(piece),
+            );
+            assert!(matches!(pieces.as_slice(), [Piece::GfxDisplay(_)]));
+        }
+        let mut pieces = Vec::new();
+        relay.feed_with_rect(
+            &apc(&format!("Ga=T,i={CORNER_IDS},f=24,s=1,v=1;AQID")),
+            (8, 5),
+            |piece| pieces.push(piece),
+        );
+        assert_eq!(pieces, [Piece::Rejected]);
+        relay.feed_with_rect(&apc("Ga=d;"), (8, 5), |_| {});
+        pieces.clear();
+        relay.feed_with_rect(&apc("Ga=T,i=99,f=24,s=1,v=1;AQID"), (8, 5), |piece| {
+            pieces.push(piece)
+        });
+        assert!(matches!(pieces.as_slice(), [Piece::GfxDisplay(_)]));
+    }
+
+    #[test]
+    fn reset_clears_child_id_mappings() {
+        let mut relay = KittyRelay::new();
+        relay.feed_with_rect(&apc("Ga=T,i=7,f=24,s=1,v=1;AQID"), (8, 5), |_| {});
+        relay.reset();
+        let mut pieces = Vec::new();
+        relay.feed_with_rect(&apc("Ga=p,i=7;"), (8, 5), |piece| pieces.push(piece));
+        assert_eq!(pieces, [Piece::Rejected]);
+    }
+
+    #[test]
+    fn lifecycle_delete_all_only_targets_the_reserved_block() {
+        let bytes = delete_all();
+        assert_eq!(
+            bytes.windows(4).filter(|part| *part == b"a=d,").count(),
+            CORNER_IDS
+        );
+        assert!(!bytes.windows(4).any(|part| part == b"a=d;"));
+        for slot in 0..CORNER_IDS {
+            let expected = format!("d=I,i={},q=2", CORNER_ID_BASE + slot as u32);
+            assert!(
+                bytes
+                    .windows(expected.len())
+                    .any(|part| part == expected.as_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn multi_chunk_transmit_rewrites_only_its_first_apc_id() {
+        let mut relay = KittyRelay::new();
+        assert!(relay.feed(&apc("Ga=T,i=19,m=1,f=24,s=1,v=1;AQ")).is_empty());
+        let pieces = relay.feed(&apc("Gm=0;ID"));
+        let [Piece::GfxDisplay(bytes)] = pieces.as_slice() else {
+            panic!("complete transfer expected")
+        };
+        assert!(bytes.starts_with(b"\x1b_Ga=T,i=2147418113,m=1,"));
+        assert!(bytes.ends_with(b"\x1b_Gm=0,q=2;ID\x1b\\"));
+        assert_eq!(bytes.windows(2).filter(|part| *part == b"i=").count(), 1);
     }
 
     #[test]
@@ -1347,9 +1600,6 @@ mod tests {
     #[test]
     fn image_ids_must_fit_the_kitty_u32_protocol() {
         assert_eq!(relayed("Ga=d,i=4294967296;", (8, 5)), [Piece::Rejected]);
-        assert_eq!(
-            relayed("Ga=d,i=4294967295;", (8, 5)),
-            [Piece::GfxOther(apc("Ga=d,i=4294967295,q=2;"))]
-        );
+        assert_eq!(relayed("Ga=d,i=4294967295;", (8, 5)), [Piece::Rejected]);
     }
 }

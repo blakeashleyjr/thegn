@@ -14,6 +14,25 @@ use thegn_core::secretref::{BareAs, SecretRef};
 /// allocation-free and `Send + Sync`; first installation wins.
 pub type Resolver = fn(&SecretRef, &str) -> Option<String>;
 
+/// Outcome of resolving a configured secret field. `Absent` is distinct from
+/// a configured reference that could not be resolved.
+#[derive(Clone, PartialEq, Eq)]
+pub enum SecretResolution {
+    Absent,
+    Resolved(String),
+    Failed,
+}
+
+impl std::fmt::Debug for SecretResolution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => f.write_str("Absent"),
+            Self::Resolved(_) => f.write_str("Resolved(<redacted>)"),
+            Self::Failed => f.write_str("Failed"),
+        }
+    }
+}
+
 static RESOLVER: OnceLock<Resolver> = OnceLock::new();
 
 /// Install the host's typed broker resolver. Idempotent: the first call wins.
@@ -25,6 +44,18 @@ pub fn install_resolver(resolver: Resolver) {
 /// then resolve through the installed broker.
 pub fn resolve(raw: &str, bare_as: BareAs, consumer: &str) -> Option<String> {
     resolve_ref(&SecretRef::parse(raw, bare_as), consumer)
+}
+
+/// Resolve a raw config field without conflating absence with failure.
+pub fn resolve_outcome(raw: &str, bare_as: BareAs, consumer: &str) -> SecretResolution {
+    let reference = SecretRef::parse(raw, bare_as);
+    if !reference.is_configured() {
+        return SecretResolution::Absent;
+    }
+    match resolve_ref(&reference, consumer) {
+        Some(value) if !value.trim().is_empty() => SecretResolution::Resolved(value),
+        Some(_) | None => SecretResolution::Failed,
+    }
 }
 
 /// Resolve an already-parsed ref. Values are never logged here; the installed
@@ -71,5 +102,23 @@ mod tests {
             None
         );
         assert_eq!(resolve("", BareAs::Literal, "test"), None);
+    }
+
+    #[test]
+    fn outcome_distinguishes_absent_resolved_and_failed_references() {
+        assert_eq!(
+            resolve_outcome("", BareAs::Literal, "test"),
+            SecretResolution::Absent
+        );
+        let resolved = resolve_outcome("fixture-secret", BareAs::Literal, "test");
+        assert_eq!(
+            resolved,
+            SecretResolution::Resolved("fixture-secret".into())
+        );
+        assert!(!format!("{resolved:?}").contains("fixture-secret"));
+        assert_eq!(
+            resolve_outcome("keyring:the541-no-resolver", BareAs::Literal, "test"),
+            SecretResolution::Failed
+        );
     }
 }

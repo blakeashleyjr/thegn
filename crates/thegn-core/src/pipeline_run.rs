@@ -99,9 +99,13 @@ pub struct VerifyFacts {
     /// the gated rule in [`verify_report`] names `dispatch report` as the
     /// fix.
     pub report_present: bool,
+    /// Typed result parsed once from the row report.
+    pub report_verdict: crate::pipeline_report::Verdict,
     /// The report does not make an unsupported PASS claim. Non-PASS reports
     /// satisfy this automatically; PASS requires meaningful gate evidence.
     pub report_gate_valid: bool,
+    /// Relationship between the filed report's HEAD and the current artifact.
+    pub report_commit_binding: ReportCommitBinding,
 }
 
 /// Result of observing `git status --porcelain` for an artifact-bearing row.
@@ -143,11 +147,43 @@ pub struct VerifyReport {
     pub worktree_state: Option<WorktreeState>,
     pub report_present: bool,
     pub report_gate_valid: bool,
+    /// Whether the filed report still describes the current artifact commit.
+    pub report_commit_binding: ReportCommitBinding,
     /// Only the things that make `ok` false — a caller prints this verbatim
     /// on refusal. `dirty` is deliberately *not* here: it never blocks.
     pub reasons: Vec<String>,
     /// Non-blocking diagnostics about facts that could not be observed.
     pub warnings: Vec<String>,
+}
+
+/// Relationship between the report's recorded HEAD and the current artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportCommitBinding {
+    Unbound,
+    Bound,
+    Stale,
+    Unknown,
+}
+
+/// Classify whether a report filed at `report_head` still describes `head`.
+/// Missing report binding is a legacy row; missing Git facts are uncertainty.
+pub fn report_commit_binding(
+    report_head: Option<&str>,
+    head: Option<&str>,
+    is_ancestor: Option<bool>,
+    artifact_unchanged: Option<bool>,
+) -> ReportCommitBinding {
+    if report_head.is_none() {
+        return ReportCommitBinding::Unbound;
+    }
+    if is_ancestor == Some(false) || artifact_unchanged == Some(false) {
+        return ReportCommitBinding::Stale;
+    }
+    if head.is_none() || is_ancestor.is_none() || artifact_unchanged.is_none() {
+        return ReportCommitBinding::Unknown;
+    }
+    ReportCommitBinding::Bound
 }
 
 /// The run-completion verdict for one roster row.
@@ -157,8 +193,10 @@ pub struct VerifyReport {
 /// - `artifact == None && stage == None` ⇒ plain dispatch, `ok`.
 /// - `artifact == None && stage != None` ⇒ unpublished pipeline reservation,
 ///   refused until its handoff path is assigned (or an operator forces done).
-/// - Otherwise `ok = exists && tracked && report_present`, with one reason per
-///   miss. The tracked check is what catches the real pilot failure ("session
+/// - Otherwise `ok` requires `exists && tracked && report_present`, an explicit
+///   PASS, successful gate evidence, and a current report/artifact commit
+///   binding when one is recorded. Each failed condition has a reason. The
+///   tracked check is what catches the real pilot failure ("session
 ///   exit ≠ done": the worker wrote the file and never committed it) — git is
 ///   the source of truth, so an uncommitted artifact is not a handoff yet. The
 ///   report check gates on the worker filing a handoff summary via `thegn
@@ -181,6 +219,7 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
             worktree_state: f.worktree_state.clone(),
             report_present: f.report_present,
             report_gate_valid: f.report_gate_valid,
+            report_commit_binding: f.report_commit_binding,
             reasons,
             warnings: Vec::new(),
         };
@@ -211,6 +250,26 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
                 .into(),
         );
     }
+    if f.report_present && f.report_verdict != crate::pipeline_report::Verdict::Pass {
+        reasons.push(format!(
+            "report verdict is {} — a Lead must review the committed artifact and decide whether to close it",
+            f.report_verdict
+        ));
+    }
+    if f.report_present {
+        match f.report_commit_binding {
+            ReportCommitBinding::Stale => reasons.push(
+                "report is bound to an older or changed artifact commit — file a fresh report at the current HEAD".into(),
+            ),
+            ReportCommitBinding::Unknown => reasons.push(
+                "could not verify the report's commit binding — retry verification before completion".into(),
+            ),
+            ReportCommitBinding::Unbound => warnings.push(
+                "report has no recorded HEAD binding (legacy row); commit binding was not verified".into(),
+            ),
+            ReportCommitBinding::Bound => {}
+        }
+    }
     VerifyReport {
         ok: reasons.is_empty(),
         artifact: f.artifact.clone(),
@@ -220,6 +279,7 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
         worktree_state: f.worktree_state.clone(),
         report_present: f.report_present,
         report_gate_valid: f.report_gate_valid,
+        report_commit_binding: f.report_commit_binding,
         reasons,
         warnings,
     }
@@ -542,6 +602,8 @@ mod tests {
             }),
             report_present,
             report_gate_valid: true,
+            report_verdict: crate::pipeline_report::Verdict::Pass,
+            report_commit_binding: ReportCommitBinding::Unbound,
         }
     }
 
@@ -605,6 +667,92 @@ mod tests {
         // …and a refusal's dirty flag is still just a report.
         let both = verify_report(&facts(Some("a.md"), true, false, true));
         assert!(!both.ok && both.dirty && both.reasons.len() == 1);
+    }
+
+    #[test]
+    fn every_non_pass_report_verdict_requires_a_lead_decision() {
+        for verdict in [
+            crate::pipeline_report::Verdict::Fail,
+            crate::pipeline_report::Verdict::Blocked,
+            crate::pipeline_report::Verdict::Revise,
+            crate::pipeline_report::Verdict::None,
+        ] {
+            let mut f = facts(Some("a.md"), true, true, false);
+            f.report_verdict = verdict;
+            let report = verify_report(&f);
+            assert!(!report.ok, "accepted {verdict}");
+            assert!(
+                report
+                    .reasons
+                    .iter()
+                    .any(|why| { why.contains(&verdict.to_string()) && why.contains("Lead") }),
+                "{report:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn report_commit_binding_classifies_all_outcomes() {
+        assert_eq!(
+            report_commit_binding(None, Some("c1"), None, None),
+            ReportCommitBinding::Unbound
+        );
+        assert_eq!(
+            report_commit_binding(Some("c1"), Some("c1"), Some(true), Some(true)),
+            ReportCommitBinding::Bound
+        );
+        assert_eq!(
+            report_commit_binding(Some("c1"), Some("c2"), Some(true), Some(true)),
+            ReportCommitBinding::Bound
+        );
+        assert_eq!(
+            report_commit_binding(Some("c2"), Some("c1"), Some(false), Some(true)),
+            ReportCommitBinding::Stale
+        );
+        assert_eq!(
+            report_commit_binding(Some("c1"), Some("c2"), Some(true), Some(false)),
+            ReportCommitBinding::Stale
+        );
+        assert_eq!(
+            report_commit_binding(Some("c1"), None, None, None),
+            ReportCommitBinding::Unknown
+        );
+    }
+
+    #[test]
+    fn verify_report_rejects_stale_and_unknown_bindings_and_warns_for_legacy() {
+        let mut f = facts(Some("a.md"), true, true, false);
+
+        f.report_commit_binding = ReportCommitBinding::Stale;
+        let stale = verify_report(&f);
+        assert!(!stale.ok);
+        assert!(
+            stale
+                .reasons
+                .iter()
+                .any(|why| why.contains("older or changed artifact commit"))
+        );
+
+        f.report_commit_binding = ReportCommitBinding::Unknown;
+        let unknown = verify_report(&f);
+        assert!(!unknown.ok);
+        assert!(
+            unknown
+                .reasons
+                .iter()
+                .any(|why| why.contains("could not verify the report's commit binding"))
+        );
+
+        f.report_commit_binding = ReportCommitBinding::Unbound;
+        let legacy = verify_report(&f);
+        assert!(legacy.ok);
+        assert!(legacy.reasons.is_empty());
+        assert!(
+            legacy
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("legacy row"))
+        );
     }
 
     #[test]

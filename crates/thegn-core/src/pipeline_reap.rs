@@ -44,6 +44,8 @@ pub struct ReapFacts {
     pub artifact_tracked: bool,
     /// The row carries a worker report.
     pub report_present: bool,
+    /// The already-parsed report verdict.
+    pub report_verdict: crate::pipeline_report::Verdict,
     /// PASS reports carry a meaningful successful gate citation.
     pub report_gate_valid: bool,
 }
@@ -166,19 +168,41 @@ pub fn classify(row: &AgentDispatch, facts: &ReapFacts) -> ReapVerdict {
     match (
         facts.artifact_tracked,
         facts.report_present && facts.report_gate_valid,
+        facts.report_verdict,
     ) {
-        (true, true) => ReapVerdict::CloseDone,
-        (true, false) => ReapVerdict::NeedsDecision {
+        (true, true, crate::pipeline_report::Verdict::Pass) => ReapVerdict::CloseDone,
+        (true, _, verdict)
+            if facts.report_present && verdict != crate::pipeline_report::Verdict::Pass =>
+        {
+            ReapVerdict::NeedsDecision {
+                why: match verdict {
+                    crate::pipeline_report::Verdict::Fail => {
+                        "worker is gone and its artifact IS committed, but its report verdict is FAIL — Lead must review the artifact and decide whether to close it"
+                    }
+                    crate::pipeline_report::Verdict::Blocked => {
+                        "worker is gone and its artifact IS committed, but its report verdict is BLOCKED — Lead must review the artifact and decide whether to close it"
+                    }
+                    crate::pipeline_report::Verdict::Revise => {
+                        "worker is gone and its artifact IS committed, but its report verdict is REVISE — Lead must review the artifact and decide whether to close it"
+                    }
+                    crate::pipeline_report::Verdict::None => {
+                        "worker is gone and its artifact IS committed, but its report has no recognized verdict — Lead must review the artifact and decide whether to close it"
+                    }
+                    crate::pipeline_report::Verdict::Pass => unreachable!(),
+                },
+            }
+        }
+        (true, _, _) => ReapVerdict::NeedsDecision {
             why: "worker is gone and its artifact IS committed, but its report is missing or \
                   claims PASS without a successful gate citation — read the artifact and close \
                   it yourself; auto-closing would mean forcing the gate or inventing evidence",
         },
-        (false, _) if facts.artifact_exists => ReapVerdict::MarkFailed {
+        (false, _, _) if facts.artifact_exists => ReapVerdict::MarkFailed {
             why: "worker is gone and its artifact exists but is NOT committed and clean in \
                   HEAD — an uncommitted or subsequently edited artifact is not a handoff (a \
                   worker whose sandbox forbade the commit leaves exactly this state; see THE-91)",
         },
-        (false, _) => ReapVerdict::MarkFailed {
+        (false, _, _) => ReapVerdict::MarkFailed {
             why: "worker is gone and its artifact was never written — the stage produced \
                   nothing",
         },
@@ -287,6 +311,7 @@ mod tests {
         artifact_exists: true,
         artifact_tracked: true,
         report_present: true,
+        report_verdict: crate::pipeline_report::Verdict::Pass,
         report_gate_valid: true,
     };
 
@@ -332,12 +357,33 @@ mod tests {
     }
 
     #[test]
+    fn committed_artifacts_with_non_pass_verdicts_need_a_lead_decision() {
+        for (verdict, label) in [
+            (crate::pipeline_report::Verdict::Fail, "FAIL"),
+            (crate::pipeline_report::Verdict::Blocked, "BLOCKED"),
+            (crate::pipeline_report::Verdict::Revise, "REVISE"),
+            (crate::pipeline_report::Verdict::None, "verdict"),
+        ] {
+            let facts = ReapFacts {
+                report_verdict: verdict,
+                ..GONE_COMMITTED_REPORTED
+            };
+            let ReapVerdict::NeedsDecision { why } = classify(&row(1, S::Running), &facts) else {
+                panic!("{verdict} must not close done");
+            };
+            assert!(why.contains(label), "{why}");
+            assert!(why.contains("Lead"), "{why}");
+        }
+    }
+
+    #[test]
     fn gone_with_a_committed_artifact_but_no_report_needs_a_human() {
         // The 2026-08-29 shape, and the one the supervisor hand-resolved ~15
         // times: real work in git, contract incomplete. Auto-closing means
         // forcing the gate or inventing a report — neither is the tool's call.
         let f = ReapFacts {
             report_present: false,
+            report_verdict: crate::pipeline_report::Verdict::None,
             report_gate_valid: true,
             ..GONE_COMMITTED_REPORTED
         };
@@ -356,6 +402,7 @@ mod tests {
             artifact_exists: true,
             artifact_tracked: false,
             report_present: false,
+            report_verdict: crate::pipeline_report::Verdict::None,
             report_gate_valid: true,
         };
         match classify(&row(1, S::Running), &f) {
@@ -377,6 +424,7 @@ mod tests {
             artifact_exists: false,
             artifact_tracked: false,
             report_present: false,
+            report_verdict: crate::pipeline_report::Verdict::None,
             report_gate_valid: true,
         };
         match classify(&row(1, S::Running), &f) {
@@ -394,6 +442,7 @@ mod tests {
             artifact_exists: true,
             artifact_tracked: false,
             report_present: true,
+            report_verdict: crate::pipeline_report::Verdict::Pass,
             report_gate_valid: true,
         };
         assert!(matches!(
@@ -419,6 +468,7 @@ mod tests {
             2 => GONE_COMMITTED_REPORTED,
             3 => ReapFacts {
                 report_present: false,
+                report_verdict: crate::pipeline_report::Verdict::None,
                 report_gate_valid: true,
                 ..GONE_COMMITTED_REPORTED
             },
@@ -427,6 +477,7 @@ mod tests {
                 artifact_exists: false,
                 artifact_tracked: false,
                 report_present: false,
+                report_verdict: crate::pipeline_report::Verdict::None,
                 report_gate_valid: true,
             },
         });

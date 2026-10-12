@@ -11,9 +11,12 @@
 //! through the provider, so no call site can forget the bookkeeping.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpsRecord {
@@ -39,7 +42,28 @@ pub fn dir() -> PathBuf {
 /// fresh host keys, so each sandbox gets its own file (`accept-new` pins the
 /// first key) instead of polluting the global known_hosts. Removed on destroy.
 pub fn known_hosts_path(name: &str) -> PathBuf {
-    dir().join("known_hosts.d").join(name)
+    let safe = checked_name(name).unwrap_or("invalid..");
+    dir().join("known_hosts.d").join(safe)
+}
+
+/// Accept only a single provider name component using the RFC 1123 hostname
+/// subset used by VPS admission.
+pub fn checked_name(name: &str) -> Result<&str> {
+    if name.is_empty() || name.len() > 63 || !name.split('.').all(valid_dns_label) {
+        anyhow::bail!("vps registry: invalid provider name")
+    }
+    Ok(name)
+}
+
+fn valid_dns_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
 }
 
 fn record_path(d: &Path, name: &str) -> PathBuf {
@@ -48,11 +72,22 @@ fn record_path(d: &Path, name: &str) -> PathBuf {
 
 /// Write (atomically: tmp + rename) a record into `d`.
 pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
+    checked_name(&rec.name)?;
     std::fs::create_dir_all(d)?;
     let path = record_path(d, &rec.name);
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(rec)?)
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = d.join(format!(
+        "{}.json.{}.{}.tmp",
+        rec.name,
+        std::process::id(),
+        counter
+    ));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
         .with_context(|| format!("write {}", tmp.display()))?;
+    serde_json::to_writer_pretty(file, rec)?;
     std::fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
     Ok(())
 }
@@ -62,6 +97,7 @@ pub fn write(rec: &VpsRecord) -> Result<()> {
 }
 
 pub fn read_at(d: &Path, name: &str) -> Option<VpsRecord> {
+    checked_name(name).ok()?;
     let bytes = std::fs::read(record_path(d, name)).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
@@ -72,6 +108,9 @@ pub fn read(name: &str) -> Option<VpsRecord> {
 
 /// Remove a record (and the instance's known_hosts pin). Idempotent.
 pub fn remove_at(d: &Path, name: &str) {
+    if checked_name(name).is_err() {
+        return;
+    }
     let _ = std::fs::remove_file(record_path(d, name)); // best-effort: idempotent removal; absence is fine
     let _ = std::fs::remove_file(d.join("known_hosts.d").join(name)); // best-effort: idempotent removal; absence is fine
 }
@@ -148,5 +187,42 @@ mod tests {
         assert_eq!(names, vec!["a"]);
         // A missing dir lists empty, not an error.
         assert!(list_at(&d.join("nope")).is_empty());
+    }
+
+    #[test]
+    fn unsafe_names_cannot_write_outside_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("registry");
+        std::fs::create_dir_all(d.join("a")).unwrap();
+        let absolute = tmp.path().join("absolute");
+        let absolute_json = absolute.with_extension("json");
+        let parent = tmp.path().join("x.json");
+        std::fs::write(absolute_json.as_path(), b"untouched").unwrap();
+        std::fs::write(&parent, b"untouched").unwrap();
+        for name in [absolute.to_str().unwrap(), "../x", "a/b", "", "."] {
+            assert!(write_at(&d, &rec(name, "creating")).is_err(), "{name:?}");
+        }
+        assert_eq!(std::fs::read(absolute_json).unwrap(), b"untouched");
+        assert_eq!(std::fs::read(parent).unwrap(), b"untouched");
+        assert!(std::fs::read_dir(d).unwrap().all(|entry| {
+            let entry = entry.unwrap();
+            entry.path().is_dir()
+        }));
+    }
+
+    #[test]
+    fn invalid_remove_and_known_hosts_names_stay_within_owned_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("registry");
+        std::fs::create_dir_all(&d).unwrap();
+        let victim = tmp.path().join("victim.json");
+        std::fs::write(&victim, b"untouched").unwrap();
+        remove_at(&d, "../victim");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+
+        let root = dir().join("known_hosts.d");
+        let path = known_hosts_path("../../x");
+        assert!(path.starts_with(root));
+        assert!(path.ends_with("invalid.."));
     }
 }

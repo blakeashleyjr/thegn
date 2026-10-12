@@ -12,7 +12,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use thegn_core::config::Config;
-use thegn_core::{msg, outln};
+use thegn_core::outln;
 
 pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let env = super::env::resolve_for(cfg, worktree);
@@ -35,35 +35,52 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
     if thegn_svc::vps::hetzner::snapshot_image(&bake_pc.template).is_some() {
         bake_pc.template = String::new();
     }
-    let name = format!(
-        "tg-bake-{}",
-        thegn_core::util::short_hash(
-            &format!("{}-{}", std::process::id(), thegn_core::util::now()),
-            6
-        )
-    );
+    let mut random = [0_u8; 8];
+    getrandom::fill(&mut random)
+        .map_err(|error| anyhow!("generate bake operation name: {error}"))?;
+    let name = bake_name(random);
     let provider = crate::provider_factory::vps_provider_for(&bake_pc, &name)
         .ok_or_else(|| anyhow!("the {} API token is not set", pc.provider))?;
     let rt = tokio::runtime::Runtime::new()?;
 
     outln!("baking a {} base image (instance {name})…", pc.provider);
     use thegn_svc::provider::RemoteProvider;
-    rt.block_on(provider.create())
-        .context("create bake instance")?;
-    // From here on the instance MUST be destroyed — success or failure.
-    let result = bake(&rt, &provider, &name, &bake_pc);
+    let result = rt
+        .block_on(provider.create())
+        .context("create bake instance")
+        .and_then(|_| bake(&rt, &provider, &name, &bake_pc));
     outln!("destroying bake instance {name}…");
-    if let Err(e) = rt.block_on(provider.destroy(&name)) {
-        msg::warn(&format!(
-            "could not destroy bake instance {name}: {e}; destroy it manually — it bills until then"
-        ));
-    }
-    let snapshot = result?;
+    let cleanup = rt.block_on(provider.destroy(&name));
+    let snapshot = bake_outcome(result, cleanup, &name)?;
     outln!("baked snapshot {snapshot}. To use it, set:");
     outln!("  [env.{}.provider]", env.name);
     outln!("  template = \"snapshot:{snapshot}\"");
     outln!("(snapshots bill ~pennies/GB-month; re-run image-bake to refresh a stale one)");
     Ok(())
+}
+
+fn bake_name(bytes: [u8; 8]) -> String {
+    let mut name = String::from("tg-bake-");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut name, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    name
+}
+
+fn bake_outcome(bake: Result<String>, cleanup: Result<()>, name: &str) -> Result<String> {
+    match (bake, cleanup) {
+        (Ok(snapshot), Ok(())) => Ok(snapshot),
+        (Ok(snapshot), Err(cleanup)) => Err(anyhow!(
+            "bake produced snapshot {snapshot}, but source instance {name} may still be billing; cleanup failed: {cleanup:#}"
+        )),
+        (Err(bake), Err(cleanup)) => Err(anyhow!(
+            "bake failed: {bake:#}; cleanup of source instance {name} failed: {cleanup:#}"
+        )),
+        (Err(bake), Ok(())) => Err(anyhow!(
+            "bake failed: {bake:#}; source instance {name} cleanup succeeded"
+        )),
+    }
 }
 
 /// The bake body: run the repo-independent scripts, quiesce, snapshot.
@@ -105,4 +122,59 @@ fn bake(
     rt.block_on(provider.poweroff(name))?;
     outln!("  snapshotting (this can take a few minutes)…");
     rt.block_on(provider.snapshot(name, "thegn-base"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bake_outcome_requires_bake_and_cleanup_success() {
+        assert_eq!(
+            bake_outcome(Ok("42".into()), Ok(()), "tg-bake-a").unwrap(),
+            "42"
+        );
+
+        let cleanup_error = bake_outcome(
+            Ok("42".into()),
+            Err(anyhow!("delete unavailable")),
+            "tg-bake-a",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(cleanup_error.contains("snapshot 42"));
+        assert!(cleanup_error.contains("tg-bake-a"));
+        assert!(cleanup_error.contains("delete unavailable"));
+
+        let bake_error = bake_outcome(Err(anyhow!("script failed")), Ok(()), "tg-bake-a")
+            .unwrap_err()
+            .to_string();
+        assert!(bake_error.contains("script failed"));
+
+        let both_error = bake_outcome(
+            Err(anyhow!("script failed")),
+            Err(anyhow!("delete unavailable")),
+            "tg-bake-a",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(both_error.contains("script failed"));
+        assert!(both_error.contains("delete unavailable"));
+        assert!(both_error.contains("tg-bake-a"));
+    }
+
+    #[test]
+    fn bake_name_is_a_provider_safe_dns_name() {
+        let name = bake_name([0, 1, 2, 3, 0xfa, 0xfb, 0xfe, 0xff]);
+        assert_eq!(name, "tg-bake-00010203fafbfeff");
+        assert!(name.len() <= 63);
+        assert!(name.split('.').all(|label| {
+            !label.is_empty()
+                && label.as_bytes()[0].is_ascii_alphanumeric()
+                && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        }));
+    }
 }

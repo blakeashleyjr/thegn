@@ -5,7 +5,7 @@
 //! mechanism (WASM, subprocess, Rhai).
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Display;
 
 /// Semantic version of the API contract itself.
@@ -136,11 +136,9 @@ pub struct Capability(String);
 
 impl Capability {
     pub fn parse(s: &str) -> Option<Self> {
-        if s.split_once(':').is_some() {
-            Some(Self(s.to_string()))
-        } else {
-            None
-        }
+        let (kind, target) = s.split_once(':')?;
+        (!kind.is_empty() && !target.is_empty() && !s.chars().any(char::is_control))
+            .then(|| Self(s.to_string()))
     }
 
     pub fn new(kind: impl AsRef<str>, target: impl AsRef<str>) -> Self {
@@ -549,12 +547,14 @@ impl HostContract {
             }
         }
 
+        let mut accepted_ids = HashSet::new();
         for contrib in &manifest.contributions {
+            let support = self.support_for(&contrib.extension_point);
             let reason = if !self
                 .available_extension_points
                 .contains(&contrib.extension_point)
             {
-                self.support_for(&contrib.extension_point)
+                support
                     .map(ExtensionPointSupport::unavailable_reason)
                     .unwrap_or_else(|| {
                         format!(
@@ -563,9 +563,14 @@ impl HostContract {
                         )
                     })
                     .into()
-            } else if let Some(required) = self
-                .support_for(&contrib.extension_point)
-                .and_then(|row| row.required_capability)
+            } else if support.is_some_and(|row| row.since > manifest.api) {
+                Some(format!(
+                    "extension point {} requires API {}; manifest declares {}",
+                    contrib.extension_point.wire_name(),
+                    support.expect("checked support row").since,
+                    manifest.api
+                ))
+            } else if let Some(required) = support.and_then(|row| row.required_capability)
                 && !manifest
                     .capabilities
                     .iter()
@@ -575,6 +580,8 @@ impl HostContract {
                     "extension point {} requires declared capability {required}",
                     contrib.extension_point.wire_name()
                 ))
+            } else if accepted_ids.contains(contrib.id.as_str()) {
+                Some(format!("duplicate contribution id {}", contrib.id.as_str()))
             } else {
                 None
             };
@@ -585,6 +592,7 @@ impl HostContract {
                     reason,
                 });
             } else {
+                accepted_ids.insert(contrib.id.as_str().to_string());
                 neg.accepted_contributions.push(contrib.clone());
             }
         }
@@ -931,7 +939,7 @@ impl PluginRuntime {
         val: serde_json::Value,
     ) -> Result<(), PluginApiError> {
         let state_key = format!("{}:{key}", plugin.as_str());
-        let cap = Capability::parse(&format!("state:{}", plugin.as_str())).unwrap();
+        let cap = Capability::new("state", plugin.as_str());
         self.audit(plugin, cap, "state.set")?;
         self.state.insert(state_key, val);
         Ok(())
@@ -943,7 +951,7 @@ impl PluginRuntime {
         key: &str,
     ) -> Result<Option<serde_json::Value>, PluginApiError> {
         let state_key = format!("{}:{key}", plugin.as_str());
-        let cap = Capability::parse(&format!("state:{}", plugin.as_str())).unwrap();
+        let cap = Capability::new("state", plugin.as_str());
         self.audit(plugin, cap, "state.get")?;
         Ok(self.state.get(&state_key).cloned())
     }
@@ -2593,6 +2601,22 @@ timeout_secs = 5
     }
 
     #[test]
+    fn state_access_audits_invalid_plugin_ids_without_panicking() {
+        for id in ["", "bad\u{7}"] {
+            let plugin = PluginId::new(id);
+            let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
+            assert!(matches!(
+                runtime.state_set(plugin.clone(), "key", serde_json::Value::Null),
+                Err(PluginApiError::CapabilityDenied { .. })
+            ));
+            assert!(matches!(
+                runtime.state_get(plugin, "key"),
+                Err(PluginApiError::CapabilityDenied { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn io_capability_parsing_strips_credentials_ports_and_paths() {
         for (url, host) in [
             ("https://api.example.com/v1", "api.example.com"),
@@ -2750,6 +2774,59 @@ timeout_secs = 5
             neg.rejected_contributions[0]
                 .reason
                 .contains("does not support mode one_shot")
+        );
+    }
+
+    #[test]
+    fn negotiation_rejects_extensions_newer_than_the_manifest_api() {
+        let host = current_host_contract();
+        let mut spec = support_spec(
+            ExtensionPoint::IssueProvider,
+            vec![Capability::new("surface", "provider")],
+            PluginMode::Resident,
+        );
+        spec.manifest.api = ApiVersion::new(0, 1, 0);
+        let negotiated = host.negotiate_spec(&spec).unwrap();
+        assert!(negotiated.accepted_contributions.is_empty());
+        assert_eq!(negotiated.rejected_contributions.len(), 1);
+        assert!(
+            negotiated.rejected_contributions[0]
+                .reason
+                .contains("requires API 0.2.0")
+        );
+    }
+
+    #[test]
+    fn negotiation_rejects_a_later_duplicate_contribution_id() {
+        let host = current_host_contract();
+        let mut spec = support_spec(
+            ExtensionPoint::StatusBarSegment,
+            vec![Capability::new("surface", "statusbar")],
+            PluginMode::Resident,
+        );
+        let mut duplicate = spec.manifest.contributions[0].clone();
+        duplicate.label = "Second declaration".into();
+        spec.manifest.contributions.push(duplicate);
+        let negotiated = host.negotiate_spec(&spec).unwrap();
+        assert_eq!(negotiated.accepted_contributions.len(), 1);
+        assert_eq!(negotiated.rejected_contributions.len(), 1);
+        assert!(
+            negotiated.rejected_contributions[0]
+                .reason
+                .contains("duplicate contribution id support-test.row")
+        );
+    }
+
+    #[test]
+    fn capability_parser_rejects_empty_components_and_controls() {
+        for invalid in [":x", "x:", "a\u{7}:b"] {
+            assert!(Capability::parse(invalid).is_none(), "{invalid:?}");
+        }
+        assert_eq!(
+            Capability::parse("network:api.example.com:443")
+                .unwrap()
+                .as_str(),
+            "network:api.example.com:443"
         );
     }
 

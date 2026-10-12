@@ -183,6 +183,19 @@ impl VoiceController {
                 .is_some_and(|worker| !worker.is_finished())
         {
             tracing::warn!("voice capture start refused while previous worker is still running");
+            self.capture_generation = self.capture_generation.saturating_add(1);
+            let generation = self.capture_generation;
+            self.capture_stop = None;
+            self.capture_terminal = true;
+            send_capture(
+                &self.tx,
+                waker,
+                VoiceMessage::CaptureFailed {
+                    pane_id,
+                    generation,
+                    reason: "previous voice worker is still shutting down".into(),
+                },
+            );
             return;
         }
         self.join_finished_workers();
@@ -581,7 +594,7 @@ fn spawn_capture(
             // A child can exit while a descendant still owns one of the
             // pipes. Kill the grouped process tree before joining helpers so
             // no reader survives the utterance.
-            if (output.is_none() || error.is_none())
+            if (!group.is_empty() || output.is_none() || error.is_none())
                 && !terminate_capture_child(child, group, &on_reaped)
             {
                 let readers_stopped = join_capture_workers(output_thread, error_thread);
@@ -826,6 +839,7 @@ pub(crate) fn mode_chip(mode: crate::keymap::Mode, full: bool, recording: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::sound_process::test_support::{UNIX, pid_gone, proc_state, test_waker};
 
     #[test]
     fn idle_chip_is_unchanged_and_recording_chip_is_ascii_safe() {
@@ -890,5 +904,90 @@ mod tests {
         controller.capture_finished(1, true);
         assert!(!controller.is_recording());
         assert!(controller.shutdown_pending());
+    }
+
+    #[test]
+    fn refused_capture_start_sends_a_terminal_failure_for_its_generation() {
+        if !UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) = test_waker();
+        let mut controller = VoiceController::new(VoiceConfig::default());
+        controller.transcription_worker = Some(thread::spawn(|| {
+            thread::sleep(Duration::from_millis(150));
+        }));
+
+        controller.start_capture(1, &waker);
+
+        match controller.messages().try_recv().unwrap() {
+            VoiceMessage::CaptureFailed {
+                generation, reason, ..
+            } => {
+                assert_eq!(generation, controller.capture_generation());
+                assert_eq!(reason, "previous voice worker is still shutting down");
+            }
+            other => panic!("expected CaptureFailed, got {other:?}"),
+        }
+        assert!(controller.capture_worker.is_none());
+        assert!(controller.capture_terminal);
+        assert!(controller.capture_stop.is_none());
+        controller
+            .transcription_worker
+            .take()
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn successful_capture_terminates_a_redirected_group_descendant() {
+        if !UNIX {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let config = VoiceConfig {
+            capture_command: vec![
+                "sh".into(),
+                "-c".into(),
+                "sleep 30 </dev/null >/dev/null 2>&1 & echo $! >\"$1\"; printf RIFF0000WAVE; exec >&- 2>&-; sleep 0.05".into(),
+                "sh".into(),
+                pid_file.display().to_string(),
+            ],
+            ..VoiceConfig::default()
+        };
+        let (waker, _master, _terminal) = test_waker();
+        let (tx, rx) = mpsc::channel();
+        let (_stop_tx, stop_rx) = mpsc::channel();
+        let worker = spawn_capture(config, 1, 1, stop_rx, tx, waker).unwrap();
+        let mut saw_reaped = false;
+        let terminal = loop {
+            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                VoiceMessage::CaptureReaped { generation } => {
+                    assert_eq!(generation, 1);
+                    saw_reaped = true;
+                }
+                message @ (VoiceMessage::CaptureComplete { .. }
+                | VoiceMessage::CaptureFailed { .. }
+                | VoiceMessage::CaptureUnresolved { .. }) => break message,
+                other => panic!("expected a capture terminal message, got {other:?}"),
+            }
+        };
+        assert!(saw_reaped);
+        assert!(matches!(terminal, VoiceMessage::CaptureComplete { .. }));
+        worker.join().unwrap();
+        let pid = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        let started = std::time::Instant::now();
+        while !pid_gone(pid) && proc_state(pid) != Some('Z') {
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "descendant {pid} remains live"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 }

@@ -244,6 +244,9 @@ impl MediaPanelState {
             return None;
         }
         let url = state?.art_url.as_ref()?;
+        if url.len() > crate::media_art::MAX_URL_LEN {
+            return None;
+        }
         if self.art_identity.as_deref() == Some(url.as_str())
             || self.art_requested.as_deref() == Some(url.as_str())
         {
@@ -310,6 +313,21 @@ mod tests {
         assert!(panel.wants_art(Some(&current), true).is_none());
         panel.begin_request(Some(&current));
         assert!(panel.wants_art(Some(&current), true).is_some());
+    }
+
+    #[test]
+    fn oversized_art_url_is_not_requested_or_retained() {
+        let mut panel = MediaPanelState::default();
+        panel.set_art_enabled(true);
+        let oversized = MediaState {
+            art_url: Some(format!(
+                "https://example.com/{}",
+                "a".repeat(crate::media_art::MAX_URL_LEN)
+            )),
+            ..state()
+        };
+        assert!(panel.wants_art(Some(&oversized), true).is_none());
+        assert!(panel.art_requested.is_none());
     }
 
     #[test]
