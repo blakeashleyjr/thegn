@@ -763,8 +763,9 @@ pub fn parse_ics_window_reported(
 const MAX_TIMEZONE_BINDINGS: usize = 64;
 const MAX_TZID_BYTES: usize = 128;
 
-/// Bind at most 64 VTIMEZONE definitions. Definitions beyond the cap and
-/// names over 128 bytes are skipped and reported as truncated metadata.
+/// Bind at most 64 VTIMEZONE definitions. Definitions beyond the cap, names
+/// over 128 bytes, and oversized lines inside a definition are skipped and
+/// reported as unmapped timezone metadata without failing the document.
 fn prescan_timezones(
     input: &str,
     check: &mut impl FnMut() -> Result<(), AdmissionError>,
@@ -778,7 +779,7 @@ fn prescan_timezones(
         check()?;
         if raw.len() > MAX_LINE_BYTES {
             if timezone_depth.is_some() {
-                report.record(IcsDiagnostic::Truncated);
+                report.record(IcsDiagnostic::UnmappedTimeZone);
             }
             continue;
         }
@@ -812,10 +813,10 @@ fn prescan_timezones(
                                 }
                                 bindings.entry(tzid).or_insert(canonical);
                             } else {
-                                report.record(IcsDiagnostic::Truncated);
+                                report.record(IcsDiagnostic::UnmappedTimeZone);
                             }
                         } else {
-                            report.record(IcsDiagnostic::Truncated);
+                            report.record(IcsDiagnostic::UnmappedTimeZone);
                         }
                     }
                     timezone_depth = None;
@@ -829,7 +830,7 @@ fn prescan_timezones(
                     && let Some((tzid, location)) = &mut definition
                 {
                     if line.value.len() > MAX_TZID_BYTES {
-                        report.record(IcsDiagnostic::Truncated);
+                        report.record(IcsDiagnostic::UnmappedTimeZone);
                     } else if line.name == "TZID" {
                         if tzid.is_empty() {
                             *tzid = line.value;

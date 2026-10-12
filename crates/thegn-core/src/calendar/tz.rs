@@ -83,6 +83,17 @@ pub fn resolve_zone(name: &str) -> Option<Tz> {
         .copied()
 }
 
+const WINDOWS_TZ_ALIASES: &[(&str, &str)] = &[
+    ("Eastern Standard Time", "America/New_York"),
+    ("Central Standard Time", "America/Chicago"),
+    ("Mountain Standard Time", "America/Denver"),
+    ("Pacific Standard Time", "America/Los_Angeles"),
+    ("W. Europe Standard Time", "Europe/Berlin"),
+    ("GMT Standard Time", "Europe/London"),
+    ("Tokyo Standard Time", "Asia/Tokyo"),
+    ("China Standard Time", "Asia/Shanghai"),
+];
+
 /// Resolve an iCalendar TZID, including a small set of CLDR Windows aliases
 /// and vendor paths that suffix an IANA zone with a provider namespace.
 pub fn resolve_tzid(name: &str) -> Option<Tz> {
@@ -90,19 +101,7 @@ pub fn resolve_tzid(name: &str) -> Option<Tz> {
     if let Some(zone) = resolve_zone(name) {
         return Some(zone);
     }
-    // CLDR windowsZones rows for territory 001. Keep this table intentionally
-    // small; targets are checked against chrono-tz in the tests below.
-    const WINDOWS: &[(&str, &str)] = &[
-        ("Eastern Standard Time", "America/New_York"),
-        ("Central Standard Time", "America/Chicago"),
-        ("Mountain Standard Time", "America/Denver"),
-        ("Pacific Standard Time", "America/Los_Angeles"),
-        ("W. Europe Standard Time", "Europe/Berlin"),
-        ("GMT Standard Time", "Europe/London"),
-        ("Tokyo Standard Time", "Asia/Tokyo"),
-        ("China Standard Time", "Asia/Shanghai"),
-    ];
-    if let Some((_, target)) = WINDOWS
+    if let Some((_, target)) = WINDOWS_TZ_ALIASES
         .iter()
         .find(|(alias, _)| alias.eq_ignore_ascii_case(name))
     {

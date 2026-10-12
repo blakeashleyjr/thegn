@@ -1,4 +1,5 @@
 use super::*;
+use crate::calendar::GapPolicy;
 use chrono::{TimeZone, Utc};
 
 fn parse_reported(input: &str) -> (Vec<CalEvent>, IcsReport) {
@@ -138,12 +139,22 @@ fn timezone_prescan_caps_bindings_and_oversized_metadata() {
             "BEGIN:VTIMEZONE\nTZID:Vendor/Zone{index}\nEND:VTIMEZONE\n"
         ));
     }
+    input.push_str(&event("kept", "TZID=Vendor/Zone0:20250115T090000"));
+    input.push_str(&event("over-cap", "TZID=Vendor/Zone64:20250115T090000"));
     input.push_str("BEGIN:VTIMEZONE\nTZID:");
     input.push_str(&"x".repeat(129));
     input.push_str("\nX-PADDING:");
     input.push_str(&"y".repeat(MAX_LINE_BYTES));
     input.push_str("\nEND:VTIMEZONE\nEND:VCALENDAR");
 
-    let (_, report) = parse_reported(&input);
-    assert!(report.diagnostics().contains(&IcsDiagnostic::Truncated));
+    let (events, report) = parse_reported(&input);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].uid, "kept");
+    assert!(!events.iter().any(|event| event.uid == "over-cap"));
+    assert!(
+        report
+            .diagnostics()
+            .contains(&IcsDiagnostic::UnmappedTimeZone)
+    );
+    assert!(!report.is_document_failure());
 }
