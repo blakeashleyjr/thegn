@@ -1,26 +1,59 @@
 //! Virtual attribution keys (V 287).
 //!
 //! The host mints a per-worktree token at agent spawn and injects it with
-//! `route_via_proxy`; the proxy decodes it to attribute spend. The token is
-//! **self-describing** — the caller-scope chain is baked in at mint time — so the
-//! proxy needs no virtual-keys table and does no DB lookup to resolve a caller.
-//!
-//! An attribution key is NOT an upstream secret: leaking one leaks attribution
-//! plus local spend capacity against the loopback proxy, never a provider key.
-//! It carries a random nonce so it is unguessable and revocable (regenerated per
-//! session). Encoding is `mpk_<hex(json)>` — dependency-free and header-safe.
+//! `route_via_proxy`; the proxy verifies it to attribute spend. The signed token
+//! carries the caller-scope chain, so the proxy needs no virtual-keys table or DB
+//! lookup to resolve a caller. Legacy `mpk_<hex(json)>` helpers remain for data
+//! compatibility, but are never accepted for proxy authorization.
 
+use hmac::Mac;
 use serde::{Deserialize, Serialize};
 
 /// Token prefix for the proxy's virtual attribution keys.
 pub const KEY_PREFIX: &str = "mpk_";
+const SIGNED_PREFIX: &str = "mpk2_";
+/// Protocol version expected by the host identity probe.
+pub const IDENTITY_PROTOCOL_VERSION: u32 = 1;
+const ATTR_DOMAIN: &[u8] = b"thegn-attribution-v2:";
+const IDENTITY_DOMAIN: &[u8] = b"tgproxy-identity-v1:";
 
-/// The caller scope a virtual key carries, most specific first. The proxy rolls
-/// spend up `scope → workspace → zone → global`.
+/// HMAC proof for the local daemon identity challenge.
+pub fn identity_proof(secret: &[u8], challenge: &str) -> String {
+    let mut mac =
+        <HmacSha256 as hmac::Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(IDENTITY_DOMAIN);
+    mac.update(challenge.as_bytes());
+    hex_encode(&mac.finalize().into_bytes())
+}
+
+/// Verifies an identity proof in constant time.
+pub fn verify_identity_proof(secret: &[u8], challenge: &str, proof: &str) -> bool {
+    let Ok(bytes) = hex_decode(proof) else {
+        return false;
+    };
+    let mut mac =
+        <HmacSha256 as hmac::Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(IDENTITY_DOMAIN);
+    mac.update(challenge.as_bytes());
+    mac.verify_slice(&bytes).is_ok()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttrError {
+    Malformed,
+    BadSignature,
+    Expired,
+}
+
+/// The caller scope a virtual key carries. The proxy rolls spend up `scope →
+/// agent → workspace → zone → global`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttributionScope {
     /// The most-specific scope, e.g. `worktree:/repo/wt`, `agent:reviewer`.
     pub scope: String,
+    /// Agent identity bound by the trusted host when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// The enclosing `workspace:<repo>` scope, when derivable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
@@ -30,9 +63,74 @@ pub struct AttributionScope {
     /// Optional upstream-account pin: routing prefers this provider's lanes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<String>,
-    /// Random nonce — makes the key unguessable and per-session revocable.
+    /// Issuer-supplied discriminator carried inside the authenticated payload.
     #[serde(default)]
     pub nonce: String,
+    /// Expiration time in Unix milliseconds for signed keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp_ms: Option<i64>,
+}
+
+type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+
+/// Authenticates a scope with the host-owned runtime secret and an expiry.
+pub fn encode_signed(scope: &AttributionScope, secret: &[u8], expires_ms: i64) -> String {
+    let mut payload = scope.clone();
+    payload.exp_ms = Some(expires_ms);
+    let json = serde_json::to_vec(&payload).unwrap_or_default();
+    let body = hex_encode(&json);
+    let mut mac =
+        <HmacSha256 as hmac::Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(ATTR_DOMAIN);
+    mac.update(body.as_bytes());
+    format!(
+        "{SIGNED_PREFIX}{body}.{}",
+        hex_encode(&mac.finalize().into_bytes())
+    )
+}
+
+/// Verifies an authenticated, unexpired host-issued attribution key.
+pub fn verify(token: &str, secret: &[u8], now_ms: i64) -> Result<AttributionScope, AttrError> {
+    let token = token
+        .strip_prefix(SIGNED_PREFIX)
+        .ok_or(AttrError::Malformed)?;
+    let (body, signature) = token.split_once('.').ok_or(AttrError::Malformed)?;
+    let signature = hex_decode(signature).ok_or(AttrError::Malformed)?;
+    let mut mac =
+        <HmacSha256 as hmac::Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(ATTR_DOMAIN);
+    mac.update(body.as_bytes());
+    mac.verify_slice(&signature)
+        .map_err(|_| AttrError::BadSignature)?;
+    let payload: AttributionScope =
+        serde_json::from_slice(&hex_decode(body).ok_or(AttrError::Malformed)?)
+            .map_err(|_| AttrError::Malformed)?;
+    match payload.exp_ms {
+        Some(exp) if now_ms < exp => Ok(payload),
+        Some(_) => Err(AttrError::Expired),
+        None => Err(AttrError::Malformed),
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        out.push(char::from_digit((b & 15) as u32, 16).unwrap());
+    }
+    out
+}
+
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let mut chars = hex.bytes();
+    while let (Some(h), Some(l)) = (chars.next(), chars.next()) {
+        out.push(((h as char).to_digit(16)? * 16 + (l as char).to_digit(16)?) as u8);
+    }
+    Some(out)
 }
 
 /// Encodes an attribution scope into a `mpk_<hex>` token.
@@ -72,10 +170,12 @@ mod tests {
     fn round_trips_full_scope() {
         let s = AttributionScope {
             scope: "worktree:/repo/wt".into(),
+            agent: Some("reviewer".into()),
             workspace: Some("workspace:/repo".into()),
             zone: Some("zone:clientA".into()),
             upstream: Some("anthropic".into()),
             nonce: "abc123".into(),
+            exp_ms: None,
         };
         let token = encode(&s);
         assert!(token.starts_with(KEY_PREFIX));
@@ -105,5 +205,67 @@ mod tests {
         assert_eq!(decode("mpk_zz"), None); // bad hex
         assert_eq!(decode("mpk_7b"), None); // valid hex "{" but not valid json object
         assert_eq!(decode("mpk_abc"), None); // odd length
+    }
+
+    #[test]
+    fn signed_keys_authenticate_scope_and_expiry() {
+        let secret = b"host secret";
+        let scope = AttributionScope {
+            scope: "worktree:/repo".into(),
+            ..Default::default()
+        };
+        let token = encode_signed(&scope, secret, 500);
+        assert_eq!(verify(&token, secret, 499).unwrap().scope, scope.scope);
+        assert_eq!(verify(&token, secret, 500), Err(AttrError::Expired));
+        assert_eq!(verify(&token, b"wrong", 1), Err(AttrError::BadSignature));
+        let edited = token.replacen("mpk2_", "mpk2_f", 1);
+        assert!(verify(&edited, secret, 1).is_err());
+        assert_eq!(
+            verify(&encode(&scope), secret, 1),
+            Err(AttrError::Malformed)
+        );
+        assert!(!verify_identity_proof(secret, "challenge", "zz"));
+        let proof = identity_proof(secret, "challenge");
+        assert!(verify_identity_proof(secret, "challenge", &proof));
+        assert!(!verify_identity_proof(secret, "other", &proof));
+
+        let body = hex_encode(br#"{"scope":"scope"}"#);
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).unwrap();
+        mac.update(ATTR_DOMAIN);
+        mac.update(body.as_bytes());
+        let no_expiry = format!(
+            "{SIGNED_PREFIX}{body}.{}",
+            hex_encode(&mac.finalize().into_bytes())
+        );
+        assert_eq!(verify(&no_expiry, secret, 1), Err(AttrError::Malformed));
+        assert_eq!(
+            verify("mpk2_not-hex.sig", secret, 1),
+            Err(AttrError::Malformed)
+        );
+        assert_eq!(verify("mpk2_ab", secret, 1), Err(AttrError::Malformed));
+        let invalid_body = "zz";
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).unwrap();
+        mac.update(ATTR_DOMAIN);
+        mac.update(invalid_body.as_bytes());
+        let invalid_body_token = format!(
+            "{SIGNED_PREFIX}{invalid_body}.{}",
+            hex_encode(&mac.finalize().into_bytes())
+        );
+        assert_eq!(
+            verify(&invalid_body_token, secret, 1),
+            Err(AttrError::Malformed)
+        );
+        let invalid_json = hex_encode(b"not json");
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).unwrap();
+        mac.update(ATTR_DOMAIN);
+        mac.update(invalid_json.as_bytes());
+        let invalid_json_token = format!(
+            "{SIGNED_PREFIX}{invalid_json}.{}",
+            hex_encode(&mac.finalize().into_bytes())
+        );
+        assert_eq!(
+            verify(&invalid_json_token, secret, 1),
+            Err(AttrError::Malformed)
+        );
     }
 }
