@@ -55,18 +55,27 @@ struct WorktreeDiffMemoKey {
     path: Vec<u8>,
     old_id: String,
     file: FileStatSignature,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorktreeDiffEnvironment {
     attributes: Option<FileStatSignature>,
     config: Option<FileStatSignature>,
 }
 
-// Nested .gitattributes are not included, so changing one can leave a cached
+#[derive(Default)]
+struct WorktreeDiffMemo {
+    entries: std::collections::HashMap<WorktreeDiffMemoKey, DiffEntry>,
+    environments: std::collections::HashMap<std::path::PathBuf, WorktreeDiffEnvironment>,
+}
+
+// Nested .gitattributes, .git/info/attributes, core.attributesFile, and global
+// or system git config are not included, so changing one can leave a cached
 // entry stale until the target file changes or the memo clears.
-static WORKTREE_DIFF_MEMO: LazyLock<
-    Mutex<std::collections::HashMap<WorktreeDiffMemoKey, DiffEntry>>,
-> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+static WORKTREE_DIFF_MEMO: LazyLock<Mutex<WorktreeDiffMemo>> =
+    LazyLock::new(|| Mutex::new(WorktreeDiffMemo::default()));
 
 fn worktree_diff_memo_key(
-    repo: &gix::Repository,
     workdir: &std::path::Path,
     path: &[u8],
     old_id: gix::ObjectId,
@@ -81,32 +90,49 @@ fn worktree_diff_memo_key(
         path: path.to_vec(),
         old_id: old_id.to_string(),
         file: file_stat_signature(&file_path)?,
-        attributes: file_stat_signature(&workdir.join(".gitattributes")),
-        config: file_stat_signature(&repo.git_dir().join("config")),
     })
 }
 
+fn worktree_diff_environment(
+    repo: &gix::Repository,
+    workdir: &std::path::Path,
+) -> WorktreeDiffEnvironment {
+    WorktreeDiffEnvironment {
+        attributes: file_stat_signature(&workdir.join(".gitattributes")),
+        config: file_stat_signature(&repo.git_dir().join("config")),
+    }
+}
+
+fn invalidate_worktree_diff_memo(workdir: &std::path::Path, environment: WorktreeDiffEnvironment) {
+    let Ok(mut memo) = WORKTREE_DIFF_MEMO.lock() else {
+        return;
+    };
+    if memo.environments.get(workdir) != Some(&environment) {
+        memo.entries
+            .retain(|existing, _| existing.workdir != workdir);
+        if memo.environments.len() >= WORKTREE_DIFF_MEMO_CAP {
+            memo.environments.clear();
+        }
+        memo.environments.insert(workdir.to_owned(), environment);
+    }
+}
+
 fn memoized_worktree_entry(key: &WorktreeDiffMemoKey) -> Option<DiffEntry> {
-    let mut memo = match WORKTREE_DIFF_MEMO.lock() {
+    let memo = match WORKTREE_DIFF_MEMO.lock() {
         Ok(memo) => memo,
         Err(_) => return None,
     };
-    // Root attributes/config changes invalidate all entries for this worktree.
-    memo.retain(|existing, _| {
-        existing.workdir != key.workdir
-            || (existing.attributes == key.attributes && existing.config == key.config)
-    });
-    memo.get(key).cloned()
+    memo.entries.get(key).cloned()
 }
 
 fn remember_worktree_entry(key: WorktreeDiffMemoKey, entry: DiffEntry) {
     let Ok(mut memo) = WORKTREE_DIFF_MEMO.lock() else {
         return;
     };
-    if memo.len() >= WORKTREE_DIFF_MEMO_CAP {
-        memo.clear();
+    if memo.entries.len() >= WORKTREE_DIFF_MEMO_CAP {
+        memo.entries.clear();
     }
-    memo.insert(key, entry);
+    memo.entries.insert(key, entry);
 }
 
 #[derive(Debug)]
@@ -476,6 +502,8 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
         .workdir()
         .context("bare repo has no worktree to diff")?
         .to_owned();
+    let environment = worktree_diff_environment(repo, &workdir);
+    invalidate_worktree_diff_memo(&workdir, environment);
     let old_tree = tree_of(repo, rev)?;
 
     let mut cache = new_cache(
@@ -526,7 +554,7 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
                 gix::object::tree::EntryKind::Blob,
             ),
         };
-        let memo_key = worktree_diff_memo_key(repo, &workdir, rela.as_ref(), old_id);
+        let memo_key = worktree_diff_memo_key(&workdir, rela.as_ref(), old_id);
         if let Some(key) = memo_key.as_ref() {
             let entry = memoized_worktree_entry(key);
             if key.file.modified < diff_started - WORKTREE_DIFF_RACY_MARGIN
@@ -694,11 +722,11 @@ mod tests {
         std::fs::write(&tracked, "new\ncontent\nwith\nfour\nlines\n").unwrap();
         backdate(&tracked, 11);
         let native = totals(&repo.dir, "HEAD").unwrap();
-        assert_eq!(native, cli_totals(&repo, "HEAD"));
+        assert_eq!(native, cli_totals_with_nonrequired_filter(&repo, "HEAD"));
         assert_eq!(
             clean_runs(&repo),
-            13,
-            "new content must run clean in native and CLI diffs"
+            8,
+            "rewritten content should run clean once for its five lines"
         );
     }
 
@@ -708,20 +736,20 @@ mod tests {
         let tracked = repo.dir.join("tracked.txt");
         for _ in 0..2 {
             let native = totals(&repo.dir, "HEAD").unwrap();
-            assert_eq!(native, cli_totals(&repo, "HEAD"));
+            assert_eq!(native, cli_totals_with_nonrequired_filter(&repo, "HEAD"));
         }
         assert_eq!(
             clean_runs(&repo),
-            12,
-            "fresh files should run once in each native/CLI diff"
+            6,
+            "each fresh native diff should run clean for the three-line file"
         );
 
         // Same byte length and a fresh timestamp: the stat signature changes,
         // while the racy window independently prevents lookup and insertion.
         std::fs::write(&tracked, "onelong\nthree\n").unwrap();
         let native = totals(&repo.dir, "HEAD").unwrap();
-        assert_eq!(native, cli_totals(&repo, "HEAD"));
-        assert_eq!(clean_runs(&repo), 16);
+        assert_eq!(native, cli_totals_with_nonrequired_filter(&repo, "HEAD"));
+        assert_eq!(clean_runs(&repo), 8);
     }
 
     /// Our own child processes as `(state, comm)` — naming them, because
@@ -872,6 +900,22 @@ mod tests {
     /// output the native path must reproduce.
     fn cli_totals(repo: &TestRepo, spec: &str) -> (u32, u32) {
         let out = repo.out(&["-c", "core.quotePath=false", "diff", "--numstat", spec]);
+        super::super::sum_numstat(&out).expect("numstat parses")
+    }
+
+    /// Git's process filter in `filtered_dirty_repo` intentionally is not a
+    /// protocol implementation. Make its required failure nonfatal so Git
+    /// leaves the identity-filtered content unchanged for a totals comparison.
+    fn cli_totals_with_nonrequired_filter(repo: &TestRepo, spec: &str) -> (u32, u32) {
+        let out = repo.out(&[
+            "-c",
+            "filter.tgtest.required=false",
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--numstat",
+            spec,
+        ]);
         super::super::sum_numstat(&out).expect("numstat parses")
     }
 
