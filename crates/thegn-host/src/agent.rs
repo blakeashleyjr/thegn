@@ -2933,26 +2933,38 @@ fn register_provider_sync(worktree: &str, env_name: &str) {
 }
 
 /// On worktree close, pull the sandbox fs back into the local worktree for a
-/// provider `data = "sync"` env. Best-effort; a no-op when nothing was synced.
+/// provider `data = "sync"` env. A failed pull is surfaced and retained in the
+/// in-process registry so a later close can retry it.
 pub(crate) fn deprovision_sync(path: &str) {
     let env_name = provider_sync_registry()
         .lock()
         .ok()
-        .and_then(|mut r| r.remove(path));
+        .and_then(|r| r.get(path).cloned());
     let Some(env_name) = env_name else {
         return;
     };
     let cfg = crate::config_startup::cleanup_config();
     let Some((provider, id, workdir)) = provider_sync_target(&cfg, &env_name) else {
+        tracing::warn!(target: "thegn::lifecycle", worktree = %path, environment = %env_name, "provider sync target unavailable during close; sync record retained");
         return;
     };
     let p = path.to_string();
-    let _ = block_on_provider(|| async {
-        // best-effort: documented best-effort contract (doc above): a no-op when nothing was synced; a failed pull just loses the sandbox-side changes at close
+    match block_on_provider(|| async {
         provider
             .download_dir(&id, &workdir, std::path::Path::new(&p))
             .await
-    });
+    }) {
+        Ok(()) => {
+            if let Ok(mut registry) = provider_sync_registry().lock() {
+                if registry.remove(path).is_none() {
+                    tracing::warn!(target: "thegn::lifecycle", worktree = %path, "provider sync record disappeared during close");
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(target: "thegn::lifecycle", worktree = %path, environment = %env_name, %error, "provider sync failed during close; sync record retained")
+        }
+    }
 }
 
 /// Launch inputs only the agent-spawn path supplies.
