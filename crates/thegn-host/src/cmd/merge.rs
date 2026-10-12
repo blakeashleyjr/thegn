@@ -349,17 +349,17 @@ fn rows_for_repo(root: &Path) -> Result<Vec<thegn_core::db::MergeQueueRow>> {
 
 pub(crate) fn queue_error_kind(err: &anyhow::Error) -> (&'static str, bool) {
     for cause in err.chain() {
-        if let Some(sqlite) = cause.downcast_ref::<rusqlite::Error>() {
-            if let rusqlite::Error::SqliteFailure(code, _) = sqlite {
-                match code.code {
-                    ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => {
-                        return ("queue_busy", true);
-                    }
-                    ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => {
-                        return ("queue_corrupt", false);
-                    }
-                    _ => {}
+        if let Some(rusqlite::Error::SqliteFailure(code, _)) =
+            cause.downcast_ref::<rusqlite::Error>()
+        {
+            match code.code {
+                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => {
+                    return ("queue_busy", true);
                 }
+                ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => {
+                    return ("queue_corrupt", false);
+                }
+                _ => {}
             }
         }
         if cause.is::<thegn_core::db::MigrationAccessError>() {
