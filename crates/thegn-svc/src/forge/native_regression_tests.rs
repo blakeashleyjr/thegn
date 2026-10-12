@@ -71,6 +71,10 @@ fn client_with_header(
     body: &str,
     header: (&'static str, &'static str),
 ) -> TrackerHttpClient {
+    client_with_headers(status, body, &[header])
+}
+
+fn client_with_headers(status: u16, body: &str, headers: &[(&str, &str)]) -> TrackerHttpClient {
     use axum::Router;
     use axum::body::Body;
     use axum::extract::Request;
@@ -79,15 +83,22 @@ fn client_with_header(
     use axum::routing::any;
 
     let body = body.to_owned();
+    let headers: Vec<(String, String)> = headers
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
     let app = Router::new().fallback(any(move |_: Request| {
         let body = body.clone();
+        let headers = headers.clone();
         async move {
             let mut response =
                 (StatusCode::from_u16(status).unwrap(), Body::from(body)).into_response();
-            response.headers_mut().insert(
-                HeaderName::from_static(header.0),
-                HeaderValue::from_static(header.1),
-            );
+            for (name, value) in headers {
+                response.headers_mut().insert(
+                    HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    HeaderValue::from_str(&value).unwrap(),
+                );
+            }
             response
         }
     }));
@@ -293,9 +304,10 @@ fn non_json_403_is_classified_and_retry_after_suppresses_the_next_call() {
 
         assert_eq!(
             graphql_request(&client, &body, "fixture", &health).await,
-            Err(ForgeError::NotAuthenticated)
+            Err(ForgeError::RateLimited)
         );
-        assert!(health.is_open());
+        assert!(!ForgeError::RateLimited.falls_through());
+        assert_eq!(health.active_error(), Some(ForgeError::RateLimited));
         assert_eq!(
             graphql_request(&client, &body, "fixture", &health).await,
             Err(ForgeError::RateLimited)
@@ -319,20 +331,29 @@ fn rate_limit_retry_headers_set_backoff_and_200_remains_successful() {
         .await
         .unwrap_err();
         assert_eq!(error, ForgeError::RateLimited);
-        assert!(health.is_open());
-        assert_eq!(
-            retry_delay(&reqwest::header::HeaderMap::from_iter([(
-                reqwest::header::HeaderName::from_static("x-ratelimit-reset"),
-                reqwest::header::HeaderValue::from_str(
-                    &(std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs()
-                        + 120)
-                        .to_string(),
-                )
-                .unwrap(),
-            )]))
+        assert_eq!(health.active_error(), Some(ForgeError::RateLimited));
+        assert!(
+            retry_delay(
+                &reqwest::header::HeaderMap::from_iter([
+                    (
+                        reqwest::header::HeaderName::from_static("x-ratelimit-reset"),
+                        reqwest::header::HeaderValue::from_str(
+                            &(std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs()
+                                + 120)
+                                .to_string(),
+                        )
+                        .unwrap(),
+                    ),
+                    (
+                        reqwest::header::HeaderName::from_static("x-ratelimit-remaining"),
+                        reqwest::header::HeaderValue::from_static("0"),
+                    ),
+                ]),
+                true
+            )
             .unwrap()
             .as_secs()
                 >= 119
@@ -348,6 +369,70 @@ fn rate_limit_retry_headers_set_backoff_and_200_remains_successful() {
         .unwrap();
         assert_eq!(success, serde_json::json!({"data":{"ok":true}}));
     });
+}
+
+#[test]
+fn reset_header_with_remaining_quota_does_not_open_circuit_on_first_403() {
+    let rt = runtime();
+    rt.block_on(async {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let reset = (now + 3600).to_string();
+        let remaining = "4999";
+        let headers = [
+            ("x-ratelimit-reset", reset.as_str()),
+            ("x-ratelimit-remaining", remaining),
+        ];
+        let client = client_with_headers(403, r#"{"message":"Resource not accessible"}"#, &headers);
+        let health = GhCircuit::new();
+        let error = graphql_request(
+            &client,
+            &serde_json::json!({"query":"fixture"}),
+            "fixture",
+            &health,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, ForgeError::NotAuthenticated);
+        assert_eq!(health.failures.load(Ordering::Relaxed), 1);
+        assert_eq!(health.active_error(), None);
+    });
+}
+
+#[test]
+fn gate_skips_token_resolution_for_open_status_circuit() {
+    let token = "gate-regression-token-unique";
+    let circuit = circuit_for(token);
+    circuit.record_backoff(Duration::from_secs(1), ForgeError::NotAuthenticated);
+
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        thegn_core::util::git_cmd(dir.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        thegn_core::util::git_cmd(dir.path())
+            .args(["remote", "add", "origin", "https://github.com/org/repo.git"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let calls = AtomicUsize::new(0);
+    let result = GithubNative::new().gate_with_token(&GitLoc::Local(dir.path().into()), || {
+        calls.fetch_add(1, Ordering::Relaxed);
+        Some(token.to_owned())
+    });
+    circuit.record_success();
+
+    let error = result.unwrap_err();
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    assert_eq!(error, ForgeError::NotAuthenticated);
+    assert!(!error.falls_through());
 }
 
 #[test]
