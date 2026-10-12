@@ -174,6 +174,60 @@ fn sandbox_json(cfg: &Config) -> serde_json::Value {
     })
 }
 
+/// Token-level warning heuristic for harnesses that offer a full-access mode.
+/// This does not interpret shell syntax; exact command tokens are used so a
+/// mention in a prompt or a longer option name cannot trigger the warning.
+fn has_full_access_token(command: &str) -> bool {
+    command.split_whitespace().any(|token| {
+        let token = token.trim_matches(['\'', '"']);
+        let value = token
+            .rsplit_once('=')
+            .map(|(_, value)| value)
+            .unwrap_or(token)
+            .trim_matches(['\'', '"']);
+        matches!(
+            token,
+            "--dangerously-skip-permissions"
+                | "--dangerously-bypass-approvals-and-sandbox"
+                | "--yolo"
+                | "danger-full-access"
+        ) || value == "danger-full-access"
+    })
+}
+
+fn unsafe_full_access_stages(cfg: &Config, backend: Backend) -> Vec<(String, String)> {
+    if cfg.sandbox.enabled && backend != Backend::None {
+        return Vec::new();
+    }
+    cfg.pipeline
+        .stages
+        .iter()
+        .filter_map(|stage| {
+            let agent =
+                thegn_core::agent_task::effective_agent(cfg, &stage.agent, Some(&stage.name))
+                    .ok()?;
+            let command = agent.interactive_command().ok()?;
+            has_full_access_token(&command).then(|| (stage.name.clone(), agent.name.clone()))
+        })
+        .collect()
+}
+
+fn stage_worker_access_report(cfg: &Config) {
+    let report = thegn_core::sandbox_support::support_report(
+        &shell_chain(cfg),
+        &Placement::Local,
+        cfg_oci_runtime(cfg),
+    );
+    let backend = thegn_core::sandbox_support::first_ready(&report)
+        .map(|row| row.backend)
+        .unwrap_or(Backend::None);
+    for (stage, agent) in unsafe_full_access_stages(cfg, backend) {
+        outln!(
+            "  UNSAFE        pipeline stage `{stage}` agent `{agent}` has a full-access command token while no containment is resolved (heuristic)"
+        );
+    }
+}
+
 fn devcontainer_json(cfg: &Config) -> serde_json::Value {
     let Some(root) = current_repo_root() else {
         return serde_json::json!({
@@ -497,11 +551,39 @@ fn home_json(cfg: &Config) -> serde_json::Value {
         .into_iter()
         .map(|(n, s)| (n.clone(), serde_json::Value::from(s)))
         .collect();
+    let xdg_omissions = current_xdg_omissions(cfg)
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "path": entry.path.to_string_lossy(),
+                "reason": entry.reason.as_str(),
+            })
+        })
+        .collect::<Vec<_>>();
     serde_json::json!({
         "strategy": cfg.sandbox.home.strategy.as_str(),
         "portable_dotfiles_only": cfg.sandbox.home.portable_dotfiles_only,
         "env_overrides": env_overrides,
+        "xdg_carveout_omissions": xdg_omissions,
     })
+}
+
+fn current_xdg_omissions(cfg: &Config) -> Vec<thegn_core::sandbox_mounts::XdgOmissionEntry> {
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return Vec::new();
+    };
+    let (_, omissions) =
+        thegn_core::sandbox_mounts::xdg_carveout_report_at(cfg.sandbox.profile, &home, &|key| {
+            std::env::var_os(key)
+        });
+    omissions
+}
+
+fn format_xdg_omissions(omissions: &[thegn_core::sandbox_mounts::XdgOmissionEntry]) -> Vec<String> {
+    omissions
+        .iter()
+        .map(|entry| format!("{} — {}", entry.path.display(), entry.reason.as_str()))
+        .collect()
 }
 
 /// Every provider the loaded config selects, with its probe (the
@@ -3145,6 +3227,7 @@ fn sandbox_report(cfg: &Config) {
     outln!("Sandbox boundary");
     if !cfg.sandbox.enabled {
         outln!("  enabled       no  (panes run as plain host processes \u{2014} no containment)");
+        stage_worker_access_report(cfg);
         return;
     }
     outln!("  enabled       yes");
@@ -3246,6 +3329,7 @@ fn sandbox_report(cfg: &Config) {
     }
     outln!("");
     enforcement_matrix_report(cfg);
+    stage_worker_access_report(cfg);
 }
 
 fn compiler_cache_report(cfg: &Config, config_path: &std::path::Path, cli_overrides: &[String]) {
@@ -3409,6 +3493,9 @@ fn home_report(cfg: &Config) {
         HomeView::Writable => "whole host $HOME readable AND writable",
     };
     outln!("  home          {} — {note}", view.as_str());
+    for line in format_xdg_omissions(&current_xdg_omissions(cfg)) {
+        outln!("                XDG carve-out omitted: {line}");
+    }
     if profile.hides_home() && !cfg.sandbox.enabled {
         outln!(
             "                NOT ENFORCED: [sandbox] enabled = false — profile `{}` is not applied, panes run on the host with the whole $HOME",
@@ -4133,6 +4220,70 @@ mod tests {
         assert!(j["env_overrides"].is_object());
         // sandbox_json embeds it too.
         assert_eq!(sandbox_json(&cfg)["home"]["strategy"], "portable");
+    }
+
+    #[test]
+    fn xdg_omission_formatter_reports_path_and_reason_only() {
+        let omissions = [thegn_core::sandbox_mounts::XdgOmissionEntry {
+            path: std::path::PathBuf::from("/private/state"),
+            reason: thegn_core::sandbox_mounts::XdgOmission::SymlinkedRoot,
+        }];
+        let lines = format_xdg_omissions(&omissions);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("/private/state"));
+        assert!(lines[0].contains("XDG root is a symlink"));
+    }
+
+    #[test]
+    fn full_access_command_classifier_matches_only_known_tokens() {
+        for token in [
+            "--dangerously-skip-permissions",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--yolo",
+            "danger-full-access",
+        ] {
+            assert!(
+                has_full_access_token(&format!("agent '{token}'")),
+                "{token}"
+            );
+        }
+        assert!(!has_full_access_token("agent --yolo-mode"));
+        assert!(!has_full_access_token(
+            "agent prompt-mentions-danger-full-access"
+        ));
+        assert!(has_full_access_token("codex --sandbox=danger-full-access"));
+        assert!(has_full_access_token(
+            "codex -c sandbox_mode=\"danger-full-access\""
+        ));
+    }
+
+    #[test]
+    fn pipeline_stage_warning_uses_effective_agent_command_and_containment() {
+        let mut cfg = Config {
+            agents: vec![
+                toml::from_str(
+                    r#"name = "unsafe"
+command = "claude --dangerously-skip-permissions"
+"#,
+                )
+                .unwrap(),
+            ],
+            ..Config::default()
+        };
+        cfg.pipeline.stages = vec![
+            toml::from_str(
+                r#"name = "coder"
+agent = "unsafe"
+"#,
+            )
+            .unwrap(),
+        ];
+
+        cfg.sandbox.enabled = false;
+        assert_eq!(unsafe_full_access_stages(&cfg, Backend::Bwrap).len(), 1);
+        cfg.sandbox.enabled = true;
+        assert!(unsafe_full_access_stages(&cfg, Backend::Bwrap).is_empty());
+        assert_eq!(unsafe_full_access_stages(&cfg, Backend::None).len(), 1);
     }
 
     #[test]

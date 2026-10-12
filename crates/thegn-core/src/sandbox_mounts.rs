@@ -229,13 +229,62 @@ pub fn default_writable_carveouts(profile: SandboxProfile) -> Vec<Mount> {
     default_writable_carveouts_at(profile, &home, &|key| std::env::var_os(key))
 }
 
-fn default_writable_carveouts_at(
+/// Why an approved XDG application carve-out was omitted. Paths are returned
+/// separately so callers can report the affected root or leaf without exposing
+/// file contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XdgOmission {
+    InvalidRoot,
+    RelativeRoot,
+    MissingRoot,
+    SymlinkedRoot,
+    NotDirectory,
+    UnresolvableRoot,
+    UnresolvableParent,
+    OverlappingRoots,
+    UnresolvableLeaf,
+    LeafEscapesRoot,
+    LeafNotDirectory,
+    ProtectedState,
+    ProtectedRuntime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XdgOmissionEntry {
+    pub path: PathBuf,
+    pub reason: XdgOmission,
+}
+
+impl XdgOmission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRoot => "invalid or non-UTF-8 XDG root",
+            Self::RelativeRoot => "XDG root is not absolute",
+            Self::MissingRoot => "explicit XDG root is missing or unreadable",
+            Self::SymlinkedRoot => "XDG root is a symlink",
+            Self::NotDirectory => "XDG root is not a directory",
+            Self::UnresolvableRoot => "XDG root cannot be canonicalized",
+            Self::UnresolvableParent => "XDG root parent cannot be canonicalized",
+            Self::OverlappingRoots => "XDG state and data roots overlap",
+            Self::UnresolvableLeaf => "approved XDG leaf cannot be canonicalized",
+            Self::LeafEscapesRoot => "approved XDG leaf escapes its root",
+            Self::LeafNotDirectory => "approved XDG leaf is not a directory",
+            Self::ProtectedState => "approved XDG leaf overlaps Thegn state",
+            Self::ProtectedRuntime => "approved XDG leaf overlaps Thegn runtime state",
+        }
+    }
+}
+
+/// Return approved writable XDG mounts together with every observable
+/// omission. Defaults absent from disk are ordinary and are not reported;
+/// explicitly configured roots that are unavailable are reported.
+pub fn xdg_carveout_report_at(
     profile: SandboxProfile,
     home: &Path,
     env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
-) -> Vec<Mount> {
+) -> (Vec<Mount>, Vec<XdgOmissionEntry>) {
     if !home.is_absolute() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     // Personal scratch + the XDG state/data dirs where shell history, zoxide,
     // and atuin keep their databases, plus the legacy `$HOME`-root history files
@@ -283,13 +332,31 @@ fn default_writable_carveouts_at(
             })
         })
         .collect();
-    let state_root = xdg_mount_root(home, "XDG_STATE_HOME", ".local/state", env);
-    let data_root = xdg_mount_root(home, "XDG_DATA_HOME", ".local/share", env);
+    let mut omissions = Vec::new();
+    let state_root = xdg_mount_root(home, "XDG_STATE_HOME", ".local/state", env, &mut omissions);
+    let data_root = xdg_mount_root(home, "XDG_DATA_HOME", ".local/share", env, &mut omissions);
     let overlap = state_root
         .as_ref()
         .zip(data_root.as_ref())
         .is_some_and(|((a, _), (b, _))| a == b || a.starts_with(b) || b.starts_with(a));
-    if !overlap {
+    if overlap {
+        if let Some((root, _)) = state_root.as_ref() {
+            omissions.push(XdgOmissionEntry {
+                path: root.clone(),
+                reason: XdgOmission::OverlappingRoots,
+            });
+        }
+        if let Some((root, _)) = data_root.as_ref() {
+            omissions.push(XdgOmissionEntry {
+                path: root.clone(),
+                reason: XdgOmission::OverlappingRoots,
+            });
+        }
+    } else {
+        let state_home = env("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/state"));
+        let protected_state = state_home.join("thegn");
         for (root, leaves) in [
             (state_root.as_ref(), &["bash", "zsh"][..]),
             (data_root.as_ref(), &["fish", "zoxide", "atuin"][..]),
@@ -307,15 +374,32 @@ fn default_writable_carveouts_at(
                     let destination = namespace_root.join(leaf);
                     let source_path = root.join(leaf);
                     let Ok(source) = source_path.canonicalize() else {
+                        omissions.push(XdgOmissionEntry {
+                            path: source_path,
+                            reason: XdgOmission::UnresolvableLeaf,
+                        });
                         continue;
                     };
-                    if !source.starts_with(root) || !source.is_dir() {
+                    if !source.starts_with(root) {
+                        omissions.push(XdgOmissionEntry {
+                            path: source_path,
+                            reason: XdgOmission::LeafEscapesRoot,
+                        });
                         continue;
                     }
-                    let protected_state = crate::util::xdg_state_home().join("thegn");
+                    if !source.is_dir() {
+                        omissions.push(XdgOmissionEntry {
+                            path: source_path,
+                            reason: XdgOmission::LeafNotDirectory,
+                        });
+                        continue;
+                    }
                     if source.starts_with(&protected_state) || protected_state.starts_with(&source)
                     {
-                        tracing::debug!(path = %destination.display(), "omitting XDG carve-out overlapping Thegn state/control paths");
+                        omissions.push(XdgOmissionEntry {
+                            path: source_path,
+                            reason: XdgOmission::ProtectedState,
+                        });
                         continue;
                     }
                     if (*leaf == "bash" || *leaf == "zsh")
@@ -324,6 +408,10 @@ fn default_writable_carveouts_at(
                             .canonicalize()
                             .is_ok_and(|p| p.starts_with(&source))
                     {
+                        omissions.push(XdgOmissionEntry {
+                            path: source_path,
+                            reason: XdgOmission::ProtectedRuntime,
+                        });
                         continue;
                     }
                     mounts.push(Mount {
@@ -361,6 +449,15 @@ fn default_writable_carveouts_at(
             }
         }
     }
+    (mounts, omissions)
+}
+
+fn default_writable_carveouts_at(
+    profile: SandboxProfile,
+    home: &Path,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<Mount> {
+    let (mounts, _) = xdg_carveout_report_at(profile, home, env);
     mounts
 }
 
@@ -369,12 +466,24 @@ fn xdg_mount_root(
     variable: &str,
     fallback: &str,
     env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    omissions: &mut Vec<XdgOmissionEntry>,
 ) -> Option<(PathBuf, PathBuf)> {
-    let root = match env(variable) {
+    let configured = env(variable);
+    let root = match configured.as_ref() {
         Some(value) => {
             let path = PathBuf::from(value);
-            if path.as_os_str().is_empty() || !path.is_absolute() || path.to_str().is_none() {
-                tracing::debug!(root = %path.display(), variable, "omitting invalid XDG root");
+            if path.as_os_str().is_empty() || path.to_str().is_none() {
+                omissions.push(XdgOmissionEntry {
+                    path,
+                    reason: XdgOmission::InvalidRoot,
+                });
+                return None;
+            }
+            if !path.is_absolute() {
+                omissions.push(XdgOmissionEntry {
+                    path,
+                    reason: XdgOmission::RelativeRoot,
+                });
                 return None;
             }
             path
@@ -383,30 +492,62 @@ fn xdg_mount_root(
     };
     let metadata = match std::fs::symlink_metadata(&root) {
         Ok(metadata) => metadata,
-        Err(error) => {
-            tracing::debug!(root = %root.display(), variable, %error, "omitting missing or unreadable XDG root");
+        Err(_) => {
+            if configured.is_some() {
+                omissions.push(XdgOmissionEntry {
+                    path: root,
+                    reason: XdgOmission::MissingRoot,
+                });
+            }
             return None;
         }
     };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() || root.to_str().is_none() {
-        tracing::debug!(root = %root.display(), variable, "omitting symlinked, non-directory, or non-UTF-8 XDG root");
+    if metadata.file_type().is_symlink() {
+        omissions.push(XdgOmissionEntry {
+            path: root,
+            reason: XdgOmission::SymlinkedRoot,
+        });
+        return None;
+    }
+    if !metadata.is_dir() {
+        omissions.push(XdgOmissionEntry {
+            path: root,
+            reason: XdgOmission::NotDirectory,
+        });
         return None;
     }
     let canonical = match root.canonicalize() {
         Ok(path) => path,
-        Err(error) => {
-            tracing::debug!(root = %root.display(), variable, %error, "omitting unresolvable XDG root");
+        Err(_) => {
+            omissions.push(XdgOmissionEntry {
+                path: root,
+                reason: XdgOmission::UnresolvableRoot,
+            });
             return None;
         }
     };
     let parent = match root.parent().and_then(|path| path.canonicalize().ok()) {
         Some(path) => path,
         None => {
-            tracing::debug!(root = %root.display(), variable, "omitting XDG root with unresolvable parent");
+            omissions.push(XdgOmissionEntry {
+                path: root,
+                reason: XdgOmission::UnresolvableParent,
+            });
             return None;
         }
     };
-    (canonical == parent.join(root.file_name()?)).then_some((canonical, root))
+    if !root
+        .file_name()
+        .is_some_and(|file_name| canonical == parent.join(file_name))
+    {
+        omissions.push(XdgOmissionEntry {
+            path: root,
+            reason: XdgOmission::UnresolvableRoot,
+        });
+        None
+    } else {
+        Some((canonical, root))
+    }
 }
 
 /// Decide whether a mount `m` should be added given the mounts already
@@ -998,6 +1139,210 @@ pub fn sealed_home_allowlist(home: &Path) -> Vec<Mount> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn private_tempdir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(td.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        td
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_report_exposes_invalid_roots_and_overlap() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let td = private_tempdir();
+        let home = td.path().join("home");
+        let state = td.path().join("state");
+        let data = td.path().join("data");
+        std::fs::create_dir_all(state.join("bash")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+
+        let symlink_root = td.path().join("state-link");
+        symlink(&state, &symlink_root).unwrap();
+        let symlink_env = |key: &str| match key {
+            "XDG_STATE_HOME" => Some(symlink_root.as_os_str().to_owned()),
+            _ => None,
+        };
+        let (mounts, omissions) =
+            xdg_carveout_report_at(SandboxProfile::Hardened, &home, &symlink_env);
+        assert!(mounts.iter().all(|mount| !mount.dest.ends_with("/bash")));
+        assert!(omissions.iter().any(|entry| {
+            entry.path == symlink_root && entry.reason == XdgOmission::SymlinkedRoot
+        }));
+
+        let non_utf8 = std::ffi::OsString::from_vec(vec![b'/', 0xff]);
+        let invalid_env = |key: &str| match key {
+            "XDG_STATE_HOME" => Some(non_utf8.clone()),
+            _ => None,
+        };
+        let (_, omissions) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &invalid_env);
+        assert!(
+            omissions
+                .iter()
+                .any(|entry| entry.reason == XdgOmission::InvalidRoot)
+        );
+
+        let relative_env = |key: &str| match key {
+            "XDG_STATE_HOME" => Some("relative".into()),
+            _ => None,
+        };
+        let (_, omissions) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &relative_env);
+        assert!(
+            omissions
+                .iter()
+                .any(|entry| entry.reason == XdgOmission::RelativeRoot)
+        );
+
+        let missing = td.path().join("missing-state");
+        let missing_env = |key: &str| match key {
+            "XDG_STATE_HOME" => Some(missing.as_os_str().to_owned()),
+            _ => None,
+        };
+        let (_, omissions) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &missing_env);
+        assert!(
+            omissions
+                .iter()
+                .any(|entry| { entry.path == missing && entry.reason == XdgOmission::MissingRoot })
+        );
+
+        let file_root = td.path().join("state-file");
+        std::fs::write(&file_root, "").unwrap();
+        let file_env = |key: &str| match key {
+            "XDG_STATE_HOME" => Some(file_root.as_os_str().to_owned()),
+            _ => None,
+        };
+        let (_, omissions) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &file_env);
+        assert!(
+            omissions
+                .iter()
+                .any(|entry| entry.path == file_root && entry.reason == XdgOmission::NotDirectory)
+        );
+
+        let root_env = |key: &str| match key {
+            "XDG_STATE_HOME" => Some(std::path::PathBuf::from("/").into_os_string()),
+            _ => None,
+        };
+        let (_, omissions) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &root_env);
+        assert!(
+            omissions
+                .iter()
+                .any(|entry| entry.reason == XdgOmission::UnresolvableParent)
+        );
+
+        let dotdot_root = state.join("..");
+        let dotdot_env = |key: &str| match key {
+            "XDG_STATE_HOME" => Some(dotdot_root.as_os_str().to_owned()),
+            _ => None,
+        };
+        let (_, omissions) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &dotdot_env);
+        assert!(
+            omissions
+                .iter()
+                .any(|entry| entry.reason == XdgOmission::UnresolvableRoot)
+        );
+
+        let nested = state.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let overlap_env = |key: &str| match key {
+            "XDG_STATE_HOME" => Some(state.as_os_str().to_owned()),
+            "XDG_DATA_HOME" => Some(nested.as_os_str().to_owned()),
+            _ => None,
+        };
+        let (_, omissions) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &overlap_env);
+        assert_eq!(
+            omissions
+                .iter()
+                .filter(|entry| entry.reason == XdgOmission::OverlappingRoots)
+                .count(),
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_report_exposes_unsafe_leaf_omissions_and_benign_defaults() {
+        use std::os::unix::fs::symlink;
+
+        let td = private_tempdir();
+        let home = td.path().join("home");
+        let state = td.path().join("state");
+        let data = td.path().join("data");
+        let outside = td.path().join("outside");
+        std::fs::create_dir_all(state.join("thegn/bash")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        symlink(state.join("thegn/bash"), state.join("bash")).unwrap();
+        symlink(&outside, data.join("fish")).unwrap();
+        symlink(td.path().join("missing-leaf"), data.join("atuin")).unwrap();
+        std::fs::write(data.join("zoxide"), "").unwrap();
+        let env = |key: &str| match key {
+            "XDG_STATE_HOME" => Some(state.as_os_str().to_owned()),
+            "XDG_DATA_HOME" => Some(data.as_os_str().to_owned()),
+            _ => None,
+        };
+        let (_, omissions) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &env);
+        assert!(
+            omissions
+                .iter()
+                .any(|entry| entry.reason == XdgOmission::ProtectedState)
+        );
+        assert!(
+            omissions
+                .iter()
+                .any(|entry| entry.reason == XdgOmission::LeafEscapesRoot)
+        );
+        assert!(
+            omissions
+                .iter()
+                .any(|entry| entry.reason == XdgOmission::LeafNotDirectory)
+        );
+        assert!(
+            omissions
+                .iter()
+                .any(|entry| entry.reason == XdgOmission::UnresolvableLeaf)
+        );
+
+        let runtime_state = td.path().join("runtime-state");
+        std::fs::create_dir_all(runtime_state.join("bash/run")).unwrap();
+        symlink(runtime_state.join("bash"), runtime_state.join("thegn")).unwrap();
+        let runtime_env = |key: &str| match key {
+            "XDG_STATE_HOME" => Some(runtime_state.as_os_str().to_owned()),
+            _ => None,
+        };
+        let (_, runtime_omissions) =
+            xdg_carveout_report_at(SandboxProfile::Hardened, &home, &runtime_env);
+        assert!(
+            runtime_omissions
+                .iter()
+                .any(|entry| entry.reason == XdgOmission::ProtectedRuntime)
+        );
+
+        let defaults = |_key: &str| None;
+        let (_, omissions) = xdg_carveout_report_at(SandboxProfile::Hardened, &home, &defaults);
+        assert!(omissions.is_empty(), "missing default roots are benign");
+
+        for reason in [
+            XdgOmission::InvalidRoot,
+            XdgOmission::RelativeRoot,
+            XdgOmission::MissingRoot,
+            XdgOmission::SymlinkedRoot,
+            XdgOmission::NotDirectory,
+            XdgOmission::UnresolvableRoot,
+            XdgOmission::UnresolvableParent,
+            XdgOmission::OverlappingRoots,
+            XdgOmission::UnresolvableLeaf,
+            XdgOmission::LeafEscapesRoot,
+            XdgOmission::LeafNotDirectory,
+            XdgOmission::ProtectedState,
+            XdgOmission::ProtectedRuntime,
+        ] {
+            assert!(!reason.as_str().is_empty());
+        }
+    }
 
     #[test]
     fn xdg_roots_mount_only_approved_existing_leaves_and_keep_destinations() {
