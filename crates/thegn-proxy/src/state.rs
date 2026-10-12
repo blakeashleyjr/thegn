@@ -11,11 +11,25 @@ use crate::model::ProxyConfig;
 use crate::shared::SharedDb;
 use crate::upstream::Upstreams;
 
-/// Upstream deadline policy: TCP connect is capped at 10s. Buffered dispatches
-/// have a 300s total deadline. Live streams have the configured first-byte
-/// deadline through the first usable event, then an idle deadline between
-/// events; their body is not subject to a client-wide total timeout.
-const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Deadlines applied to upstream operations. TCP connect is capped at 10s.
+/// Buffered dispatches have a 300s total deadline, including response headers
+/// and body. Live streams have the configured first-byte deadline through the
+/// first usable event, then an idle deadline between events; their body is not
+/// subject to a client-wide total timeout.
+#[derive(Debug, Clone, Copy)]
+pub struct UpstreamDeadlines {
+    pub connect: std::time::Duration,
+    pub buffered_total: std::time::Duration,
+}
+
+impl Default for UpstreamDeadlines {
+    fn default() -> Self {
+        Self {
+            connect: std::time::Duration::from_secs(10),
+            buffered_total: std::time::Duration::from_secs(300),
+        }
+    }
+}
 
 /// Process-wide proxy state. Cheap to clone (everything is `Arc`/shared).
 pub struct AppState {
@@ -25,6 +39,7 @@ pub struct AppState {
     pub inflight: Arc<InflightTracker>,
     pub metrics: Arc<Metrics>,
     pub client: reqwest::Client,
+    pub deadlines: UpstreamDeadlines,
     /// The upstream dispatch seam (adapters keyed by wire protocol).
     pub upstreams: Upstreams,
     pub db: SharedDb,
@@ -42,6 +57,15 @@ pub type SharedState = Arc<AppState>;
 
 impl AppState {
     pub fn new(config: ProxyConfig, db: SharedDb, now_ms: i64) -> Arc<Self> {
+        Self::with_deadlines(config, db, now_ms, UpstreamDeadlines::default())
+    }
+
+    pub fn with_deadlines(
+        config: ProxyConfig,
+        db: SharedDb,
+        now_ms: i64,
+        deadlines: UpstreamDeadlines,
+    ) -> Arc<Self> {
         Arc::new(Self {
             config,
             health: Arc::new(Health::new()),
@@ -49,9 +73,10 @@ impl AppState {
             inflight: Arc::new(InflightTracker::new()),
             metrics: Arc::new(Metrics::new()),
             client: reqwest::Client::builder()
-                .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+                .connect_timeout(deadlines.connect)
                 .build()
-                .expect("constant upstream timeout policy builds a reqwest client"),
+                .expect("upstream deadline policy builds a reqwest client"),
+            deadlines,
             upstreams: Upstreams::new(),
             db,
             resolved: Mutex::new(HashMap::new()),
