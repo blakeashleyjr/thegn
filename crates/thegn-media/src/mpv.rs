@@ -271,7 +271,7 @@ impl MediaBackend for MpvIpc {
             // there is somewhere to go (or playlist repeat wraps around).
             let pos = self.get("playlist-pos").await?.and_then(|v| v.as_i64());
             let count = self.get("playlist-count").await?.and_then(|v| v.as_i64());
-            let wraps = loop_playlist.as_ref().is_some_and(loop_on);
+            let wraps = loop_playlist.as_ref().and_then(loop_on) == Some(true);
             let (can_go_next, can_go_previous) = match (pos, count) {
                 (Some(p), Some(c)) if p >= 0 && c > 0 => (wraps || p + 1 < c, wraps || p > 0),
                 _ => (false, false),

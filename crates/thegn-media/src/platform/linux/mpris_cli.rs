@@ -294,6 +294,9 @@ fn unescape_markup(s: &str) -> Result<String, MediaError> {
             "apos" => '\'',
             "quot" => '"',
             numeric if numeric.starts_with("#x") || numeric.starts_with("#X") => {
+                if !numeric[2..].bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(malformed_escape());
+                }
                 let codepoint =
                     u32::from_str_radix(&numeric[2..], 16).map_err(|_| malformed_escape())?;
                 char::from_u32(codepoint)
@@ -301,6 +304,9 @@ fn unescape_markup(s: &str) -> Result<String, MediaError> {
                     .ok_or_else(malformed_escape)?
             }
             numeric if numeric.starts_with('#') => {
+                if !numeric[1..].bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(malformed_escape());
+                }
                 let codepoint = numeric[1..]
                     .parse::<u32>()
                     .map_err(|_| malformed_escape())?;
@@ -437,6 +443,26 @@ mod tests {
             "spotify",
             "Playing",
             "Title & no-semicolon",
+            "Artist",
+            "Album",
+            "1",
+            "0",
+            "false",
+            "None",
+            "0.5",
+            "",
+            "",
+            "",
+        ];
+        let line = encoded_record(fields);
+        assert!(
+            matches!(parse_line(&line), Err(MediaError::Backend(message)) if message == "malformed playerctl metadata escape")
+        );
+
+        let fields = [
+            "spotify",
+            "Playing",
+            "Title &#x+1f;",
             "Artist",
             "Album",
             "1",
