@@ -34,6 +34,11 @@ use crate::lsp::LspInner;
 /// sprawling change never balloons the LSP work).
 const MAX_CHANGED_FILES: usize = 50;
 
+type BlastInput = (
+    Vec<ChangedEntity>,
+    std::collections::BTreeMap<String, Vec<CallerRef>>,
+);
+
 /// A cheap, stable content hash for the source-changed skip check.
 fn source_hash(src: &str) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -123,30 +128,7 @@ struct FileParse {
 fn build_graph(root: &Path, lsp: &LspInner, db: &Db) -> Option<bool> {
     let loc = GitLoc::for_worktree(root);
     let root_s = root.to_string_lossy().into_owned();
-    // Same sanitized flags the semantic footer uses so the patch parses cleanly.
-    // `output()` (not `git_out`) so a CLEAN tree -- empty stdout -- is a completed
-    // pass with nothing to do, distinct from a git that could not be run.
-    // off-loop: this runs inside `spawn_graph_build`'s blocking task.
-    #[expect(clippy::disallowed_methods)]
-    let out = loc
-        .git_command(&[
-            "-c",
-            "diff.noprefix=false",
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-renames",
-            "-U3",
-            "HEAD",
-        ])
-        .output()
-        .ok()?;
-    let diff = if out.status.success() {
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    } else {
-        // e.g. an unborn HEAD: deterministic until the next commit (an event).
-        String::new()
-    };
+    let diff = head_diff_text(&loc)?;
     let files = thegn_core::patch::parse_patch(&diff);
     if files.is_empty() || files.len() > MAX_CHANGED_FILES {
         return Some(false);
@@ -273,6 +255,42 @@ fn build_graph(root: &Path, lsp: &LspInner, db: &Db) -> Option<bool> {
     Some(changed_any)
 }
 
+/// Read the semantic graph's diff. A failing diff is an empty completed pass
+/// only when HEAD is unborn; other failures must remain retryable.
+fn head_diff_text(loc: &GitLoc) -> Option<String> {
+    // Same sanitized flags the semantic footer uses so the patch parses cleanly.
+    // off-loop: this runs inside `spawn_graph_build`'s blocking task.
+    let out = crate::bounded_git_probe::capture(
+        loc.git_command(&[
+            "-c",
+            "diff.noprefix=false",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            "-U3",
+            "HEAD",
+        ]),
+        None,
+        "blast-radius diff",
+    );
+    if let Ok(stdout) = out {
+        return Some(String::from_utf8_lossy(&stdout).trim().to_string());
+    }
+
+    let head = crate::bounded_git_probe::capture_capability(
+        loc.git_command(&["rev-parse", "--verify", "-q", "HEAD^{commit}"]),
+        std::time::Duration::from_secs(5),
+        16 * 1024,
+    )
+    .ok()?;
+    if head.status.success() {
+        None
+    } else {
+        Some(String::new())
+    }
+}
+
 /// Ensure `abs` (an absolute path) is parsed into the cache. Best-effort: an
 /// unreadable / unsupported-language file simply leaves no entry.
 fn ensure_parsed(cache: &mut HashMap<String, FileParse>, abs: &str) {
@@ -299,7 +317,15 @@ fn ensure_parsed(cache: &mut HashMap<String, FileParse>, abs: &str) {
 /// yet built, or the change genuinely has no dependents). Shared by the footer
 /// (`build_panel`) and the `blast_radius` MCP tool's host-side callers.
 pub(crate) fn read_blast(root: &Path, summary: &EntitySummary, db: &Db) -> Option<BlastRadius> {
-    let (changed, callers_by) = collect_changed_and_callers(root, summary, db);
+    let (changed, callers_by) = match collect_changed_and_callers(root, summary, |id| {
+        db.callers_of(id)
+    }) {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::debug!(target: "thegn::blast_radius", %error, "semantic caller lookup failed");
+            return None;
+        }
+    };
     let total_callers: usize = callers_by.values().map(Vec::len).sum();
     if total_callers == 0 {
         return None;
@@ -313,11 +339,8 @@ pub(crate) fn read_blast(root: &Path, summary: &EntitySummary, db: &Db) -> Optio
 fn collect_changed_and_callers(
     root: &Path,
     summary: &EntitySummary,
-    db: &Db,
-) -> (
-    Vec<ChangedEntity>,
-    std::collections::BTreeMap<String, Vec<CallerRef>>,
-) {
+    mut caller_lookup: impl FnMut(&str) -> anyhow::Result<Vec<SemEntityRow>>,
+) -> anyhow::Result<BlastInput> {
     use std::collections::BTreeMap;
     let root_s = root.to_string_lossy().into_owned();
     let mut changed: Vec<ChangedEntity> = Vec::new();
@@ -326,9 +349,8 @@ fn collect_changed_and_callers(
         let abs = root.join(file).to_string_lossy().into_owned();
         for ch in changes {
             let id = entity_id(&root_s, &abs, &ch.name, ch.kind);
-            let callers: Vec<CallerRef> = db
-                .callers_of(&id)
-                .unwrap_or_default()
+            let callers: Vec<CallerRef> = caller_lookup(&id)
+                .map_err(|error| anyhow::anyhow!("semantic caller lookup failed: {error}"))?
                 .into_iter()
                 .map(|r| CallerRef {
                     id: r.id,
@@ -348,7 +370,7 @@ fn collect_changed_and_callers(
             });
         }
     }
-    (changed, callers_by)
+    Ok((changed, callers_by))
 }
 
 /// The detailed, serializable blast-radius report for a worktree's current
@@ -366,7 +388,15 @@ pub(crate) fn blast_report_for_worktree(
     let loc = GitLoc::for_worktree(root);
     let entries = crate::git_handle::get().diff_files(&loc, "HEAD").ok()?;
     let summary = crate::hydrate_semantic::compute_entity_summary(&loc, &entries)?;
-    let (changed, callers_by) = collect_changed_and_callers(root, &summary, db);
+    let (changed, callers_by) = match collect_changed_and_callers(root, &summary, |id| {
+        db.callers_of(id)
+    }) {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::debug!(target: "thegn::blast_radius", %error, "semantic caller lookup failed");
+            return None;
+        }
+    };
     let total_callers: usize = callers_by.values().map(Vec::len).sum();
     if total_callers == 0 {
         return None;
@@ -468,6 +498,74 @@ mod tests {
         assert_eq!(br.changed, 1);
         assert_eq!(br.callers, 1);
         assert_eq!(br.untested, 1); // no test caller
+    }
+
+    #[test]
+    fn caller_lookup_error_aborts_the_whole_blast_input() {
+        use thegn_core::semantic::{EntityChange, EntityKind, EntitySummary, Touch};
+
+        let summary = EntitySummary::new(vec![(
+            "src/lib.rs".to_string(),
+            ["first", "second"]
+                .into_iter()
+                .map(|name| EntityChange {
+                    kind: EntityKind::Function,
+                    name: name.to_string(),
+                    added: 1,
+                    deleted: 0,
+                    touch: Touch::Modified,
+                    start_line: 1,
+                })
+                .collect(),
+        )]);
+        let mut calls = 0;
+        let result = collect_changed_and_callers(Path::new("/wt"), &summary, |_| {
+            calls += 1;
+            if calls == 2 {
+                anyhow::bail!("injected lookup failure");
+            }
+            Ok(Vec::new())
+        });
+
+        assert!(
+            result.is_err(),
+            "a later DB error must abort the full report"
+        );
+        assert_eq!(calls, 2, "both changed entities must reach the lookup seam");
+    }
+
+    #[test]
+    fn head_diff_only_treats_an_unborn_head_as_an_empty_pass() {
+        fn git(root: &Path, args: &[&str]) {
+            let mut cmd = thegn_core::util::git_cmd(root);
+            cmd.args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null");
+            crate::bounded_git_probe::capture(cmd, None, "blast-radius test fixture")
+                .unwrap_or_else(|error| panic!("git {args:?} failed: {error}"));
+        }
+
+        let unborn = tempfile::tempdir().unwrap();
+        git(unborn.path(), &["init", "-q"]);
+        let loc = GitLoc::Local(unborn.path().to_path_buf());
+        assert_eq!(head_diff_text(&loc).as_deref(), Some(""));
+
+        let committed = tempfile::tempdir().unwrap();
+        git(committed.path(), &["init", "-q"]);
+        git(committed.path(), &["config", "user.name", "Test"]);
+        git(
+            committed.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        std::fs::write(committed.path().join("tracked.txt"), "tracked\n").unwrap();
+        git(committed.path(), &["add", "tracked.txt"]);
+        git(
+            committed.path(),
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "seed"],
+        );
+        std::fs::write(committed.path().join(".git/index"), b"not an index").unwrap();
+        let loc = GitLoc::Local(committed.path().to_path_buf());
+        assert_eq!(head_diff_text(&loc), None);
     }
 
     #[test]
