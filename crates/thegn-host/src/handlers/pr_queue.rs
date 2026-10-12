@@ -321,9 +321,7 @@ pub(crate) fn spawn_mutate(tx: &PrqTx, waker: &TerminalWaker, any_path: PathBuf,
                 let forges = crate::forge_handle::get();
                 let forge = forges.for_loc(&loc);
                 let fetched = forge.pr_status(&loc, thegn_core::forge::PrRef::Number(number));
-                let message =
-                    rewatch_row(&db, row, forge.id(), fetched).unwrap_or_else(|message| message);
-                send(PrqMsg::Note(message));
+                rewatch_row(&db, row, forge.id(), fetched).unwrap_or_else(|message| message)
             }
         };
         send(PrqMsg::Note(msg));
@@ -385,6 +383,7 @@ fn rewatch_row(
             "re-watch refused: fetched identity does not verify PR #{number}; use `thegn pr queue add --pr {number}` to rebind"
         ));
     }
+    // Validate fetched URL route and number when an unbound row has no identity to compare against.
     if let Err(reason) = thegn_core::pr_queue::attest_pr_identity(
         Some(&fetched.url),
         number,
