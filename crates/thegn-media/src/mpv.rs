@@ -20,16 +20,107 @@ pub struct MpvIpc {
     socket: String,
 }
 
+/// Longest player-supplied reason kept in an error message.
+const MAX_REASON: usize = 120;
+
+/// Per-request ceiling: a wedged mpv must not hang the poller.
+#[cfg(unix)]
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// mpv error strings that mean "this optional property has no value right
+/// now" (no file loaded, no video track, ...), not a failed command.
+fn is_absent_error(reason: &str) -> bool {
+    matches!(reason, "property unavailable" | "property not found")
+}
+
+/// Strip control characters and bound the length of a player-supplied reason.
+fn sanitize_reason(reason: &str) -> String {
+    reason
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_REASON)
+        .collect()
+}
+
+/// The decoded reply to one IPC request.
+#[derive(Debug)]
+enum Reply {
+    /// `error == "success"` with a `data` field.
+    Data(Value),
+    /// `error == "success"` and no `data` (a command that returns nothing).
+    NoData,
+    /// mpv rejected the request; carries the sanitized, bounded error string.
+    Rejected(String),
+}
+
+/// Decode a reply line already matched to our request id.
+fn decode_reply(msg: &Value) -> Result<Reply, MediaError> {
+    match msg.get("error").and_then(Value::as_str) {
+        Some("success") => Ok(match msg.get("data") {
+            Some(d) => Reply::Data(d.clone()),
+            None => Reply::NoData,
+        }),
+        Some(other) => Ok(Reply::Rejected(sanitize_reason(other))),
+        None => Err(MediaError::Backend(
+            "mpv reply carried no error field".into(),
+        )),
+    }
+}
+
+/// True when a loop property value means repeat is on (`inf`, `force`, a
+/// positive count, `true`); `no` / `false` / `0` mean off.
+fn loop_on(v: &Value) -> bool {
+    match v {
+        Value::Bool(b) => *b,
+        Value::String(s) => !matches!(s.as_str(), "" | "no" | "false" | "0"),
+        Value::Number(n) => n.as_i64().is_none_or(|n| n != 0),
+        _ => false,
+    }
+}
+
+/// Fold `loop-file` and `loop-playlist` into one mode (track repeat wins,
+/// as in mpv). `None` when neither property could be read.
+fn decode_loop(file: Option<&Value>, playlist: Option<&Value>) -> Option<LoopMode> {
+    if file.is_none() && playlist.is_none() {
+        return None;
+    }
+    Some(if file.is_some_and(loop_on) {
+        LoopMode::Track
+    } else if playlist.is_some_and(loop_on) {
+        LoopMode::Playlist
+    } else {
+        LoopMode::None
+    })
+}
+
+/// Opaque queue id: `<index>:<mpv entry id>` (or just `<index>` when mpv does
+/// not report entry ids), so a later play can detect a stale index.
+fn queue_id(idx: usize, entry: &Value) -> String {
+    match entry.get("id").and_then(Value::as_i64) {
+        Some(eid) => format!("{idx}:{eid}"),
+        None => idx.to_string(),
+    }
+}
+
 impl MpvIpc {
     pub fn new(socket: String) -> Self {
         Self { socket }
     }
 
-    /// Send one `{"command": ..., "request_id": 1}` and return its `data` (or
-    /// `None` when the property is unavailable / errored). Opens a fresh
-    /// connection per call — mpv's IPC is stateless and connections are cheap.
+    /// Send one `{"command": ..., "request_id": 1}` and decode its reply.
+    /// Opens a fresh connection per call — mpv's IPC is stateless and
+    /// connections are cheap. Transport, EOF, timeout, and malformed-reply
+    /// failures are `Err`; a player rejection is `Ok(Reply::Rejected)`.
     #[cfg(unix)]
-    async fn request(&self, command: Value) -> Result<Option<Value>, MediaError> {
+    async fn exchange(&self, command: Value) -> Result<Reply, MediaError> {
+        match tokio::time::timeout(REQUEST_TIMEOUT, self.exchange_inner(command)).await {
+            Ok(r) => r,
+            Err(_) => Err(MediaError::Backend("mpv request timed out".into())),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn exchange_inner(&self, command: Value) -> Result<Reply, MediaError> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixStream;
 
@@ -61,26 +152,39 @@ impl MpvIpc {
             };
             // Skip async event lines; wait for our reply.
             if msg.get("request_id") == Some(&json!(1)) {
-                if msg.get("error").and_then(|e| e.as_str()) == Some("success") {
-                    return Ok(msg.get("data").cloned());
-                }
-                return Ok(None); // property unavailable / command failed
+                return decode_reply(&msg);
             }
         }
     }
 
     #[cfg(not(unix))]
-    async fn request(&self, _command: Value) -> Result<Option<Value>, MediaError> {
+    async fn exchange(&self, _command: Value) -> Result<Reply, MediaError> {
         Err(MediaError::Unavailable(
             "mpv IPC requires a Unix socket".into(),
         ))
     }
 
-    async fn get(&self, prop: &str) -> Option<Value> {
-        self.request(json!(["get_property", prop]))
-            .await
-            .ok()
-            .flatten()
+    /// Run a mutation: success (with or without data) is `Ok`, a rejection is
+    /// a typed `Err` carrying mpv's reason.
+    async fn command(&self, command: Value) -> Result<(), MediaError> {
+        match self.exchange(command).await? {
+            Reply::Data(_) | Reply::NoData => Ok(()),
+            Reply::Rejected(reason) => Err(MediaError::Backend(format!("mpv rejected: {reason}"))),
+        }
+    }
+
+    /// Read an optional property. Only mpv's documented "no value" errors and
+    /// an empty success become `Ok(None)`; transport, EOF, and every other
+    /// rejection are `Err`.
+    async fn get(&self, prop: &str) -> Result<Option<Value>, MediaError> {
+        match self.exchange(json!(["get_property", prop])).await? {
+            Reply::Data(v) => Ok(Some(v)),
+            Reply::NoData => Ok(None),
+            Reply::Rejected(r) if is_absent_error(&r) => Ok(None),
+            Reply::Rejected(r) => Err(MediaError::Backend(format!(
+                "mpv rejected get_property {prop}: {r}"
+            ))),
+        }
     }
 }
 
@@ -88,15 +192,14 @@ impl MediaBackend for MpvIpc {
     fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
         Box::pin(async move {
             // Probe one property to confirm mpv is reachable; absence ⇒ no player.
-            let paused = match self.request(json!(["get_property", "pause"])).await {
-                Ok(Some(v)) => v.as_bool().unwrap_or(false),
-                Ok(None) => false,
+            let paused = match self.get("pause").await {
+                Ok(v) => v.and_then(|v| v.as_bool()).unwrap_or(false),
                 Err(MediaError::Unavailable(_)) => return Ok(None), // socket not there
                 Err(e) => return Err(e),
             };
             let idle = self
                 .get("idle-active")
-                .await
+                .await?
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let state = if idle {
@@ -107,35 +210,31 @@ impl MediaBackend for MpvIpc {
                 PlaybackState::Playing
             };
 
-            let meta = self.get("metadata").await;
+            let meta = self.get("metadata").await?;
             let title = self
                 .get("media-title")
-                .await
+                .await?
                 .and_then(|v| v.as_str().map(str::to_string))
                 .or_else(|| meta_field(&meta, &["title", "TITLE"]))
                 .unwrap_or_default();
             let artist = meta_field(&meta, &["artist", "ARTIST"]).unwrap_or_default();
             let album = meta_field(&meta, &["album", "ALBUM"]).unwrap_or_default();
 
-            let length = self.get("duration").await.and_then(secs);
-            let position = self.get("time-pos").await.and_then(secs);
+            let length = self.get("duration").await?.and_then(secs);
+            let position = self.get("time-pos").await?.and_then(secs);
             let volume = self
                 .get("volume")
-                .await
+                .await?
                 .and_then(|v| v.as_f64())
                 .map(|v| v.round().clamp(0.0, 100.0) as u8);
-            let loop_mode = self.get("loop-playlist").await.map(|v| {
-                if v.as_bool() == Some(false) {
-                    LoopMode::None
-                } else {
-                    LoopMode::Playlist
-                }
-            });
+            let loop_file = self.get("loop-file").await?;
+            let loop_playlist = self.get("loop-playlist").await?;
+            let loop_mode = decode_loop(loop_file.as_ref(), loop_playlist.as_ref());
             // A present, non-empty `video-format` means an actual video track is
             // decoding (mpv playing music has none) — the reliable audio/video split.
             let kind = if self
                 .get("video-format")
-                .await
+                .await?
                 .and_then(|v| v.as_str().map(|s| !s.is_empty()))
                 .unwrap_or(false)
             {
@@ -143,11 +242,21 @@ impl MediaBackend for MpvIpc {
             } else {
                 MediaKind::Audio
             };
+            // Conservative: an unreadable `seekable` is not seekable.
             let can_seek = self
                 .get("seekable")
-                .await
+                .await?
                 .and_then(|v| v.as_bool())
-                .unwrap_or(true);
+                .unwrap_or(false);
+            // Next/previous are offered only when the playlist position says
+            // there is somewhere to go (or playlist repeat wraps around).
+            let pos = self.get("playlist-pos").await?.and_then(|v| v.as_i64());
+            let count = self.get("playlist-count").await?.and_then(|v| v.as_i64());
+            let wraps = loop_playlist.as_ref().is_some_and(loop_on);
+            let (can_go_next, can_go_previous) = match (pos, count) {
+                (Some(p), Some(c)) if p >= 0 && c > 0 => (wraps || p + 1 < c, wraps || p > 0),
+                _ => (false, false),
+            };
 
             Ok(Some(MediaState {
                 player: "mpv".to_string(),
@@ -160,8 +269,8 @@ impl MediaBackend for MpvIpc {
                 shuffle: None, // mpv exposes no persistent shuffle state
                 loop_mode,
                 volume,
-                can_go_next: true,
-                can_go_previous: true,
+                can_go_next,
+                can_go_previous,
                 art_url: None, // mpv doesn't surface cover art over IPC
                 kind,
                 can_seek,
@@ -171,66 +280,58 @@ impl MediaBackend for MpvIpc {
     }
 
     fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>> {
-        Box::pin(async move { self.request(json!(["cycle", "pause"])).await.map(|_| ()) })
+        Box::pin(async move { self.command(json!(["cycle", "pause"])).await })
     }
     fn next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
-        Box::pin(async move { self.request(json!(["playlist-next"])).await.map(|_| ()) })
+        Box::pin(async move { self.command(json!(["playlist-next"])).await })
     }
     fn previous(&self) -> BoxFuture<'_, Result<(), MediaError>> {
-        Box::pin(async move { self.request(json!(["playlist-prev"])).await.map(|_| ()) })
+        Box::pin(async move { self.command(json!(["playlist-prev"])).await })
     }
     fn set_shuffle(&self, _on: bool) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
-            // mpv has no shuffle toggle — `playlist-shuffle` reorders once.
-            self.request(json!(["playlist-shuffle"])).await.map(|_| ())
+            // mpv only has the one-shot `playlist-shuffle` reorder, which is
+            // not an idempotent boolean setter, so shuffle is not offered.
+            Err(MediaError::Unsupported("mpv shuffle".into()))
         })
     }
     fn set_loop(&self, mode: LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
-            let val = match mode {
-                LoopMode::None => json!("no"),
-                LoopMode::Track => json!("inf"), // loop-file
-                LoopMode::Playlist => json!("inf"),
+            // Write both properties so exactly one repeat mode is active.
+            let (file, playlist) = match mode {
+                LoopMode::None => ("no", "no"),
+                LoopMode::Track => ("inf", "no"),
+                LoopMode::Playlist => ("no", "inf"),
             };
-            let prop = if matches!(mode, LoopMode::Track) {
-                "loop-file"
-            } else {
-                "loop-playlist"
-            };
-            self.request(json!(["set_property", prop, val]))
+            self.command(json!(["set_property", "loop-file", file]))
+                .await?;
+            self.command(json!(["set_property", "loop-playlist", playlist]))
                 .await
-                .map(|_| ())
         })
     }
     fn volume_step(&self, delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
             let cur = self
                 .get("volume")
-                .await
+                .await?
                 .and_then(|v| v.as_f64())
-                .unwrap_or(100.0);
+                .ok_or_else(|| MediaError::Backend("mpv volume unavailable".into()))?;
             let next = (cur + delta * 100.0).clamp(0.0, 130.0);
-            self.request(json!(["set_property", "volume", next]))
-                .await
-                .map(|_| ())
+            self.command(json!(["set_property", "volume", next])).await
         })
     }
 
     fn playlists(&self) -> BoxFuture<'_, Result<Vec<Playlist>, MediaError>> {
-        Box::pin(async move {
-            Ok(Vec::new()) // mpv has no MPRIS-style named playlists
-        })
+        Box::pin(async move { Err(MediaError::Unsupported("mpv playlists".into())) })
     }
     fn activate_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move { Err(MediaError::Unsupported("mpv playlists".into())) })
     }
 
     fn seek(&self, offset: Duration, forward: bool) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
             let secs = offset.as_secs_f64() * if forward { 1.0 } else { -1.0 };
-            self.request(json!(["seek", secs, "relative"]))
-                .await
-                .map(|_| ())
+            self.command(json!(["seek", secs, "relative"])).await
         })
     }
     fn set_position<'a>(
@@ -239,27 +340,26 @@ impl MediaBackend for MpvIpc {
         _track_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<(), MediaError>> {
         Box::pin(async move {
-            self.request(json!(["seek", pos.as_secs_f64(), "absolute"]))
+            self.command(json!(["seek", pos.as_secs_f64(), "absolute"]))
                 .await
-                .map(|_| ())
         })
     }
     fn set_volume(&self, level: u8) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
-            self.request(json!(["set_property", "volume", level.min(100) as f64]))
+            self.command(json!(["set_property", "volume", level.min(100) as f64]))
                 .await
-                .map(|_| ())
         })
     }
 
     fn queue(&self) -> BoxFuture<'_, Result<Vec<QueueItem>, MediaError>> {
         Box::pin(async move {
-            let Some(list) = self.get("playlist").await else {
-                return Ok(Vec::new());
-            };
-            let Some(arr) = list.as_array() else {
-                return Ok(Vec::new());
-            };
+            let list = self
+                .get("playlist")
+                .await?
+                .ok_or_else(|| MediaError::Backend("mpv playlist unavailable".into()))?;
+            let arr = list
+                .as_array()
+                .ok_or_else(|| MediaError::Backend("mpv playlist has unexpected shape".into()))?;
             Ok(arr
                 .iter()
                 .enumerate()
@@ -282,7 +382,7 @@ impl MediaBackend for MpvIpc {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     QueueItem {
-                        id: i.to_string(),
+                        id: queue_id(i, entry),
                         title,
                         artist: String::new(),
                         duration: None,
@@ -294,31 +394,43 @@ impl MediaBackend for MpvIpc {
     }
     fn play_queue_item<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
         Box::pin(async move {
-            let idx: i64 = id
-                .parse()
-                .map_err(|_| MediaError::Backend(format!("bad mpv playlist index {id:?}")))?;
-            self.request(json!(["set_property", "playlist-pos", idx]))
+            let bad = || MediaError::Backend(format!("bad mpv playlist index {id:?}"));
+            let (idx_s, eid_s) = match id.split_once(':') {
+                Some((i, e)) => (i, Some(e)),
+                None => (id, None),
+            };
+            let idx: usize = idx_s.parse().map_err(|_| bad())?;
+            if let Some(e) = eid_s {
+                // Bound to an entry identity: refuse if the list moved on.
+                let want: i64 = e.parse().map_err(|_| bad())?;
+                let list = self
+                    .get("playlist")
+                    .await?
+                    .ok_or_else(|| MediaError::Backend("mpv playlist unavailable".into()))?;
+                let have = list
+                    .as_array()
+                    .and_then(|a| a.get(idx))
+                    .and_then(|entry| entry.get("id"))
+                    .and_then(Value::as_i64);
+                if have != Some(want) {
+                    return Err(MediaError::Backend(
+                        "mpv playlist changed; stale queue selection".into(),
+                    ));
+                }
+            }
+            self.command(json!(["set_property", "playlist-pos", idx as i64]))
                 .await
-                .map(|_| ())
         })
     }
 
     fn chapter_next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
-        Box::pin(async move { self.request(json!(["add", "chapter", 1])).await.map(|_| ()) })
+        Box::pin(async move { self.command(json!(["add", "chapter", 1])).await })
     }
     fn chapter_prev(&self) -> BoxFuture<'_, Result<(), MediaError>> {
-        Box::pin(async move {
-            self.request(json!(["add", "chapter", -1]))
-                .await
-                .map(|_| ())
-        })
+        Box::pin(async move { self.command(json!(["add", "chapter", -1])).await })
     }
     fn toggle_fullscreen(&self) -> BoxFuture<'_, Result<(), MediaError>> {
-        Box::pin(async move {
-            self.request(json!(["cycle", "fullscreen"]))
-                .await
-                .map(|_| ())
-        })
+        Box::pin(async move { self.command(json!(["cycle", "fullscreen"])).await })
     }
 
     /// One mpv instance per socket; no push watcher (the host polls).
@@ -328,7 +440,8 @@ impl MediaBackend for MpvIpc {
 
     fn caps(&self) -> MediaCaps {
         MediaCaps {
-            shuffle: true,
+            // No idempotent boolean shuffle in mpv (only a one-shot reorder).
+            shuffle: false,
             loop_mode: true,
             volume: true,
             playlists: false,
@@ -391,5 +504,311 @@ mod tests {
         assert_eq!(secs(json!(248.5)), Some(Duration::from_secs_f64(248.5)));
         assert_eq!(secs(json!(-1.0)), None);
         assert_eq!(secs(json!("nope")), None);
+    }
+
+    #[test]
+    fn decode_loop_folds_both_properties() {
+        let no = json!("no");
+        let inf = json!("inf");
+        assert_eq!(decode_loop(None, None), None);
+        assert_eq!(decode_loop(Some(&no), Some(&no)), Some(LoopMode::None));
+        assert_eq!(
+            decode_loop(Some(&json!(false)), Some(&json!(false))),
+            Some(LoopMode::None)
+        );
+        assert_eq!(decode_loop(Some(&inf), Some(&no)), Some(LoopMode::Track));
+        assert_eq!(decode_loop(Some(&no), Some(&inf)), Some(LoopMode::Playlist));
+        assert_eq!(decode_loop(Some(&inf), Some(&inf)), Some(LoopMode::Track));
+        assert_eq!(decode_loop(None, Some(&json!(3))), Some(LoopMode::Playlist));
+    }
+
+    #[test]
+    fn sanitize_reason_bounds_and_strips() {
+        let long = format!("bad\n\u{1b}[31m{}", "x".repeat(500));
+        let s = sanitize_reason(&long);
+        assert!(s.chars().count() <= MAX_REASON);
+        assert!(!s.chars().any(char::is_control));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod socket_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    type Seen = Arc<Mutex<Vec<Value>>>;
+
+    /// Fake mpv: one request per connection. `handler` maps the command array
+    /// to the raw lines to send back, or `None` to drop the connection.
+    fn serve<F>(handler: F) -> (tempfile::TempDir, MpvIpc, Seen)
+    where
+        F: Fn(&Value) -> Option<Vec<String>> + Send + Sync + 'static,
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mpv.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let seen: Seen = Arc::default();
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (rd, mut wr) = stream.into_split();
+                let mut line = String::new();
+                if BufReader::new(rd).read_line(&mut line).await.unwrap_or(0) == 0 {
+                    continue;
+                }
+                let Ok(req) = serde_json::from_str::<Value>(line.trim()) else {
+                    continue;
+                };
+                let cmd = req["command"].clone();
+                seen2.lock().unwrap().push(cmd.clone());
+                if let Some(lines) = handler(&cmd) {
+                    for l in lines {
+                        if wr.write_all(format!("{l}\n").as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let mpv = MpvIpc::new(path.to_string_lossy().into_owned());
+        (dir, mpv, seen)
+    }
+
+    fn ok(data: Value) -> String {
+        json!({"request_id": 1, "error": "success", "data": data}).to_string()
+    }
+    fn ok_nodata() -> String {
+        json!({"request_id": 1, "error": "success"}).to_string()
+    }
+    fn err(reason: &str) -> String {
+        json!({"request_id": 1, "error": reason}).to_string()
+    }
+
+    #[tokio::test]
+    async fn success_without_data_is_ok() {
+        let (_d, mpv, seen) = serve(|_| Some(vec![ok_nodata()]));
+        mpv.play_pause().await.unwrap();
+        assert_eq!(seen.lock().unwrap()[0], json!(["cycle", "pause"]));
+    }
+
+    #[tokio::test]
+    async fn every_control_surfaces_a_rejection() {
+        let (_d, mpv, _s) = serve(|cmd| {
+            // volume read must succeed so volume_step reaches the write.
+            if cmd[0] == "get_property" {
+                Some(vec![ok(json!(50.0))])
+            } else {
+                Some(vec![err("property unavailable\u{7}")])
+            }
+        });
+        let one = Duration::from_secs(1);
+        let results = [
+            mpv.play_pause().await,
+            mpv.next().await,
+            mpv.previous().await,
+            mpv.set_loop(LoopMode::Track).await,
+            mpv.volume_step(0.05).await,
+            mpv.set_volume(40).await,
+            mpv.seek(one, true).await,
+            mpv.set_position(one, None).await,
+            mpv.chapter_next().await,
+            mpv.chapter_prev().await,
+            mpv.toggle_fullscreen().await,
+        ];
+        for r in results {
+            match r {
+                Err(MediaError::Backend(m)) => {
+                    assert!(m.contains("property unavailable"), "{m}");
+                    assert!(!m.chars().any(char::is_control));
+                }
+                other => panic!("expected Backend rejection, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn interleaved_events_and_garbage_are_skipped() {
+        let (_d, mpv, _s) = serve(|_| {
+            Some(vec![
+                "not json".into(),
+                json!({"event": "playback-restart"}).to_string(),
+                json!({"request_id": 7, "error": "success"}).to_string(),
+                ok_nodata(),
+            ])
+        });
+        mpv.next().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reply_without_error_field_is_malformed() {
+        let (_d, mpv, _s) = serve(|_| Some(vec![json!({"request_id": 1}).to_string()]));
+        assert!(matches!(mpv.next().await, Err(MediaError::Backend(_))));
+    }
+
+    #[tokio::test]
+    async fn disconnect_is_an_error_not_success() {
+        let (_d, mpv, _s) = serve(|_| None);
+        assert!(matches!(mpv.next().await, Err(MediaError::Backend(_))));
+        assert!(mpv.queue().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn snapshot_without_socket_is_no_player() {
+        let mpv = MpvIpc::new("/nonexistent/mpv.sock".into());
+        assert!(mpv.snapshot().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_disconnect_mid_read_is_error() {
+        // First property answers, the rest drop the connection.
+        let (_d, mpv, _s) = serve(|cmd| {
+            if cmd[1] == "pause" {
+                Some(vec![ok(json!(false))])
+            } else {
+                None
+            }
+        });
+        assert!(mpv.snapshot().await.is_err());
+    }
+
+    fn snapshot_handler(
+        loop_file: &'static str,
+        loop_pl: &'static str,
+    ) -> impl Fn(&Value) -> Option<Vec<String>> {
+        move |cmd| {
+            let prop = cmd[1].as_str().unwrap_or("");
+            Some(vec![match prop {
+                "pause" | "idle-active" => ok(json!(false)),
+                "media-title" => ok(json!("Song")),
+                "loop-file" => ok(json!(loop_file)),
+                "loop-playlist" => ok(json!(loop_pl)),
+                "playlist-pos" => ok(json!(1)),
+                "playlist-count" => ok(json!(2)),
+                "volume" => ok(json!(70.0)),
+                // seekable absent; everything else absent too.
+                _ => err("property unavailable"),
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_decodes_loop_and_is_conservative() {
+        let (_d, mpv, _s) = serve(snapshot_handler("inf", "no"));
+        let s = mpv.snapshot().await.unwrap().unwrap();
+        assert_eq!(s.loop_mode, Some(LoopMode::Track));
+        assert_eq!(s.title, "Song");
+        assert_eq!(s.volume, Some(70));
+        assert!(!s.can_seek, "unreadable seekable must not default to true");
+        assert!(!s.can_go_next, "last of two entries, no wrap");
+        assert!(s.can_go_previous);
+
+        let (_d2, mpv2, _s2) = serve(snapshot_handler("no", "inf"));
+        let s2 = mpv2.snapshot().await.unwrap().unwrap();
+        assert_eq!(s2.loop_mode, Some(LoopMode::Playlist));
+        assert!(s2.can_go_next, "playlist repeat wraps");
+    }
+
+    #[tokio::test]
+    async fn snapshot_hard_rejection_is_error() {
+        let (_d, mpv, _s) = serve(|cmd| {
+            if cmd[1] == "pause" {
+                Some(vec![ok(json!(false))])
+            } else {
+                Some(vec![err("invalid parameter")])
+            }
+        });
+        assert!(mpv.snapshot().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn set_loop_writes_both_properties() {
+        let (_d, mpv, seen) = serve(|_| Some(vec![ok_nodata()]));
+        mpv.set_loop(LoopMode::Track).await.unwrap();
+        mpv.set_loop(LoopMode::Playlist).await.unwrap();
+        mpv.set_loop(LoopMode::None).await.unwrap();
+        let s = seen.lock().unwrap().clone();
+        assert_eq!(s[0], json!(["set_property", "loop-file", "inf"]));
+        assert_eq!(s[1], json!(["set_property", "loop-playlist", "no"]));
+        assert_eq!(s[2], json!(["set_property", "loop-file", "no"]));
+        assert_eq!(s[3], json!(["set_property", "loop-playlist", "inf"]));
+        assert_eq!(s[4], json!(["set_property", "loop-file", "no"]));
+        assert_eq!(s[5], json!(["set_property", "loop-playlist", "no"]));
+    }
+
+    #[tokio::test]
+    async fn shuffle_and_playlists_are_unsupported_and_send_nothing() {
+        let (_d, mpv, seen) = serve(|_| Some(vec![ok_nodata()]));
+        assert!(!mpv.caps().shuffle);
+        assert!(!mpv.caps().playlists);
+        assert!(matches!(
+            mpv.set_shuffle(true).await,
+            Err(MediaError::Unsupported(_))
+        ));
+        assert!(matches!(
+            mpv.set_shuffle(false).await,
+            Err(MediaError::Unsupported(_))
+        ));
+        assert!(matches!(
+            mpv.activate_playlist("x").await,
+            Err(MediaError::Unsupported(_))
+        ));
+        assert!(matches!(
+            mpv.playlists().await,
+            Err(MediaError::Unsupported(_))
+        ));
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    fn playlist_json() -> Value {
+        json!([
+            {"filename": "/m/a.mp3", "id": 10},
+            {"filename": "/m/b.mp3", "id": 11, "current": true, "title": "B"},
+        ])
+    }
+
+    #[tokio::test]
+    async fn queue_reads_entries_and_errors_do_not_become_empty() {
+        let (_d, mpv, _s) = serve(|_| Some(vec![ok(playlist_json())]));
+        let q = mpv.queue().await.unwrap();
+        assert_eq!(q.len(), 2);
+        assert_eq!(q[0].title, "a.mp3");
+        assert_eq!(q[1].id, "1:11");
+        assert!(q[1].is_current);
+
+        let (_d2, mpv2, _s2) = serve(|_| Some(vec![err("property unavailable")]));
+        assert!(mpv2.queue().await.is_err());
+        let (_d3, mpv3, _s3) = serve(|_| Some(vec![ok(json!("oops"))]));
+        assert!(mpv3.queue().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stale_queue_selection_is_refused() {
+        let (_d, mpv, seen) = serve(|cmd| {
+            if cmd[0] == "get_property" {
+                Some(vec![ok(playlist_json())])
+            } else {
+                Some(vec![ok_nodata()])
+            }
+        });
+        // Entry 1 now has id 11, so "1:99" is stale and must not write.
+        assert!(mpv.play_queue_item("1:99").await.is_err());
+        assert!(seen.lock().unwrap().iter().all(|c| c[0] == "get_property"));
+        mpv.play_queue_item("1:11").await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap().last().unwrap(),
+            &json!(["set_property", "playlist-pos", 1])
+        );
+        assert!(mpv.play_queue_item("nope").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_queue_play_is_error() {
+        let (_d, mpv, _s) = serve(|_| Some(vec![err("property unavailable")]));
+        assert!(mpv.play_queue_item("3").await.is_err());
     }
 }
