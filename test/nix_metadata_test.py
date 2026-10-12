@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Keep the Nix package identity, license metadata, and license files in sync with Cargo."""
+"""Keep Nix and release package identity and license metadata in sync with Cargo."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import tomllib
@@ -12,6 +13,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SPDX_TO_NIX = {"MIT": "mit", "Apache-2.0": "asl20"}
 LICENSE_FILES = {"LICENSE-MIT", "LICENSE-APACHE"}
+RELEASE_TEMPLATES = {
+    "nfpm.yaml.tmpl": ("packaging/nfpm.yaml.tmpl", "@@VERSION@@", "MIT OR Apache-2.0"),
+    "scoop/thegn.json.tmpl": ("packaging/scoop/thegn.json.tmpl", "@@VERSION@@", "MIT OR Apache-2.0"),
+    "winget/thegn.yaml.tmpl": ("packaging/winget/thegn.yaml.tmpl", "@@VERSION@@", "MIT OR Apache-2.0"),
+    "homebrew/thegn.rb.tmpl": ("packaging/homebrew/thegn.rb.tmpl", "@@VERSION@@", 'any_of: ["MIT", "Apache-2.0"]'),
+    "aur/PKGBUILD.tmpl": ("packaging/aur/PKGBUILD.tmpl", "@@PKGVER@@", "('MIT' 'Apache-2.0')"),
+}
 
 
 def block_after(source: str, marker: str) -> str | None:
@@ -185,13 +193,95 @@ def validate_texts(
     return problems
 
 
+def validate_release_texts(
+    cargo_text: str,
+    release_yml: str,
+    release_json: str,
+    templates: dict[str, str],
+) -> list[str]:
+    problems: list[str] = []
+    try:
+        license_expr = tomllib.loads(cargo_text)["workspace"]["package"]["license"]
+        targets = json.loads(release_json)["targets"]
+        enabled_targets = {
+            target for target, metadata in targets.items() if metadata.get("enabled") is True
+        }
+        archive_files = set(json.loads(release_json)["archive"]["root_files"])
+    except (tomllib.TOMLDecodeError, json.JSONDecodeError, KeyError, TypeError, AttributeError) as exc:
+        return [f"release metadata is unreadable: {exc}"]
+
+    license_parts = [part.strip() for part in license_expr.split(" OR ")]
+    if not license_parts or any(part not in SPDX_TO_NIX for part in license_parts):
+        problems.append(f"unknown Cargo SPDX license expression for release templates: {license_expr!r}")
+    else:
+        spdx_text = " OR ".join(license_parts)
+        homebrew = "any_of: [" + ", ".join(f'"{part}"' for part in license_parts) + "]"
+        aur = "(" + " ".join(f"'{part}'" for part in license_parts) + ")"
+        expected_licenses = {
+            "nfpm.yaml.tmpl": spdx_text,
+            "scoop/thegn.json.tmpl": spdx_text,
+            "winget/thegn.yaml.tmpl": spdx_text,
+            "homebrew/thegn.rb.tmpl": homebrew,
+            "aur/PKGBUILD.tmpl": aur,
+        }
+        for name, expected in expected_licenses.items():
+            text = templates.get(name, "")
+            if expected not in text:
+                problems.append(f"{name} license spelling does not match Cargo license {license_expr!r}")
+
+    for name, (_, placeholder, _) in RELEASE_TEMPLATES.items():
+        text = templates.get(name, "")
+        if placeholder not in text:
+            problems.append(f"{name} is missing version placeholder {placeholder}")
+        if re.search(r"[\"']v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?[\"']", text):
+            problems.append(f"{name} contains a quoted semver literal")
+
+    matrix_targets = set(re.findall(r"^\s*-\s+target:\s*([A-Za-z0-9_-]+)\s*$", release_yml, re.MULTILINE))
+    if matrix_targets != enabled_targets:
+        problems.append(
+            "release.yml upload matrix targets differ from packaging/release.json enabled targets: "
+            f"matrix-only={sorted(matrix_targets - enabled_targets)}, "
+            f"manifest-only={sorted(enabled_targets - matrix_targets)}"
+        )
+
+    upload_step = re.search(r"^[ \t]*- id: upload[ \t]*$", release_yml, re.MULTILINE)
+    upload_config = release_yml[upload_step.end() :] if upload_step else ""
+    next_step = re.search(r"\n[ \t]*- (?:name:|id:|uses:)", upload_config)
+    if next_step:
+        upload_config = upload_config[: next_step.start()]
+    include_match = re.search(r"^\s*include:\s*([^\n#]+)", upload_config, re.MULTILINE)
+    include_files = (
+        {part.strip() for part in include_match.group(1).split(",") if part.strip()}
+        if include_match
+        else set()
+    )
+    missing_licenses = sorted(LICENSE_FILES - include_files)
+    if missing_licenses:
+        problems.append(f"release.yml upload include is missing license files: {missing_licenses}")
+    missing_archive = sorted(LICENSE_FILES - archive_files)
+    if missing_archive:
+        problems.append(f"packaging/release.json archive root_files is missing license files: {missing_archive}")
+    return problems
+
+
 def validate(root: Path = ROOT) -> list[str]:
-    return validate_texts(
-        (root / "Cargo.toml").read_text(),
+    cargo_text = (root / "Cargo.toml").read_text()
+    nix_problems = validate_texts(
+        cargo_text,
         (root / "flake.nix").read_text(),
         (root / "nix/package.nix").read_text(),
         (root / "nix/source.nix").read_text(),
         {name for name in LICENSE_FILES if (root / name).is_file()},
+    )
+    templates = {
+        name: (root / path).read_text()
+        for name, (path, _, _) in RELEASE_TEMPLATES.items()
+    }
+    return nix_problems + validate_release_texts(
+        cargo_text,
+        (root / ".github/workflows/release.yml").read_text(),
+        (root / "packaging/release.json").read_text(),
+        templates,
     )
 
 
@@ -202,7 +292,10 @@ def main(root: Path = ROOT) -> int:
         for problem in problems:
             print(f"  {problem}")
         return 1
-    print("OK: Nix package versions, licenses, and installed license files follow Cargo")
+    print(
+        "OK: Nix package metadata, release templates, upload matrix, and archive files "
+        "follow Cargo and packaging metadata"
+    )
     return 0
 
 
@@ -276,6 +369,35 @@ def fixture(version: str) -> tuple[str, str, str, str, set[str]]:
     return cargo, flake, package, source, set(LICENSE_FILES)
 
 
+def release_fixture() -> tuple[str, str, str, dict[str, str]]:
+    cargo = '[workspace.package]\nversion = "1.0.0"\nlicense = "MIT OR Apache-2.0"\n'
+    release_yml = '''
+        - target: x86_64-unknown-linux-gnu
+        - target: aarch64-apple-darwin
+        - id: upload
+        uses: taiki-e/upload-rust-binary-action
+        include: LICENSE-MIT,LICENSE-APACHE,README.md
+    '''
+    release_json = json.dumps(
+        {
+            "archive": {"root_files": ["thegn", "LICENSE-MIT", "LICENSE-APACHE", "README.md"]},
+            "targets": {
+                "x86_64-unknown-linux-gnu": {"enabled": True},
+                "aarch64-apple-darwin": {"enabled": True},
+                "x86_64-pc-windows-msvc": {"enabled": False},
+            },
+        }
+    )
+    templates = {
+        "nfpm.yaml.tmpl": 'version: "@@VERSION@@"\nlicense: MIT OR Apache-2.0\n',
+        "scoop/thegn.json.tmpl": '"version": "@@VERSION@@",\n"license": "MIT OR Apache-2.0"\n',
+        "winget/thegn.yaml.tmpl": 'PackageVersion: "@@VERSION@@"\nLicense: MIT OR Apache-2.0\n',
+        "homebrew/thegn.rb.tmpl": 'version "@@VERSION@@"\nlicense any_of: ["MIT", "Apache-2.0"]\n',
+        "aur/PKGBUILD.tmpl": 'pkgver=@@PKGVER@@\nlicense=(\'MIT\' \'Apache-2.0\')\n',
+    }
+    return cargo, release_yml, release_json, templates
+
+
 def self_test() -> int:
     cases = [fixture("1.0.0"), fixture("1.0.0-alpha.2")]
     for cargo, flake, package, source, files in cases:
@@ -304,6 +426,71 @@ def self_test() -> int:
             print(f"SELF-TEST FAIL: {label} drift was accepted")
             return 1
         print(f"SELF-TEST OK: rejected {label} drift")
+
+    release_good = release_fixture()
+    problems = validate_release_texts(*release_good)
+    if problems:
+        print(f"SELF-TEST FAIL: good release fixture rejected: {problems}")
+        return 1
+    spaced_include = release_good[1].replace(
+        "LICENSE-MIT,LICENSE-APACHE", "LICENSE-MIT, LICENSE-APACHE"
+    )
+    problems = validate_release_texts(
+        release_good[0], spaced_include, release_good[2], release_good[3]
+    )
+    if problems:
+        print(f"SELF-TEST FAIL: spaced include list rejected: {problems}")
+        return 1
+    blank_before_upload = release_good[1].replace(
+        "        - id: upload", "\n        - id: upload"
+    )
+    problems = validate_release_texts(
+        release_good[0], blank_before_upload, release_good[2], release_good[3]
+    )
+    if problems:
+        print(f"SELF-TEST FAIL: blank line before upload step rejected: {problems}")
+        return 1
+    malformed_targets = json.dumps(
+        {
+            "archive": {"root_files": ["LICENSE-MIT", "LICENSE-APACHE"]},
+            "targets": {"x86_64-unknown-linux-gnu": None},
+        }
+    )
+    problems = validate_release_texts(
+        release_good[0], release_good[1], malformed_targets, release_good[3]
+    )
+    if not any(problem.startswith("release metadata is unreadable:") for problem in problems):
+        print(f"SELF-TEST FAIL: malformed target metadata was not reported: {problems}")
+        return 1
+    bad_release_fixtures = (
+        (
+            release_good[3]
+            | {"scoop/thegn.json.tmpl": release_good[3]["scoop/thegn.json.tmpl"].replace(
+                "MIT OR Apache-2.0", "MIT"
+            )},
+            release_good[1],
+            release_good[2],
+            "MIT-only template license",
+        ),
+        (
+            release_good[3],
+            release_good[1].replace("aarch64-apple-darwin", "x86_64-unknown-linux-musl"),
+            release_good[2],
+            "matrix target missing from manifest",
+        ),
+        (
+            release_good[3],
+            release_good[1].replace(",LICENSE-APACHE", ""),
+            release_good[2],
+            "upload include missing LICENSE-APACHE",
+        ),
+    )
+    for templates, release_yml, release_json, label in bad_release_fixtures:
+        problems = validate_release_texts(release_good[0], release_yml, release_json, templates)
+        if not problems:
+            print(f"SELF-TEST FAIL: {label} drift was accepted")
+            return 1
+        print(f"SELF-TEST OK: rejected {label}")
 
     print("SELF-TEST OK: stable and prerelease identity fixtures")
     return 0
