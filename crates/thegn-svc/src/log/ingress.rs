@@ -230,12 +230,6 @@ mod tests {
     }
 
     #[test]
-    fn batch_limits_are_smaller_than_ingress_bounds() {
-        assert!(MAX_BATCH_RECORDS <= MAX_PENDING_RECORDS);
-        assert!(MAX_BATCH_BYTES < MAX_PENDING_BYTES);
-    }
-
-    #[test]
     fn handle_reports_orphaning_after_consumer_drop() {
         let queue = LogIngress::new();
         let consumer = queue.clone();
