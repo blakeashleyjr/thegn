@@ -161,7 +161,10 @@ const MAX_CONCURRENT_PANELS: usize = 4;
 /// Bound target fan-out and the amount of per-panel state retained by a refresh.
 const MAX_TARGETS_PER_PANEL: usize = 32;
 /// A panel that does not finish cannot hold the next refresh forever.
+#[cfg(not(test))]
 const PANEL_DEADLINE: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const PANEL_DEADLINE: Duration = Duration::from_millis(300);
 type PanelQueryJob = (
     u32,
     String,
@@ -245,10 +248,8 @@ impl QueryEngine {
                 // Disabled while hidden: the branch future is not polled, so a
                 // hidden tab holds no armed timer and takes no wakes.
                 _ = ticker.tick(), if !self.hidden => {
-                    if !self.paused {
-                        if !self.refresh_and_coalesce(&mut cmd_rx, &mut ticker).await {
-                            break;
-                        }
+                    if !self.paused && !self.refresh_and_coalesce(&mut cmd_rx, &mut ticker).await {
+                        break;
                     }
                 },
                 cmd = cmd_rx.recv() => match cmd {
@@ -800,6 +801,8 @@ mod tests {
         }
         release.add_permits(20);
         receive_updates(&mut updates, 4).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(updates.try_recv().is_err());
 
         assert_eq!(
             recorded_ranges(&queries).len(),
