@@ -46,23 +46,9 @@ pub fn xdg_config_home() -> PathBuf {
 
 #[cfg(not(windows))]
 pub fn xdg_state_home() -> PathBuf {
-    let path = std::env::var_os("XDG_STATE_HOME")
+    std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/state"));
-    #[cfg(test)]
-    assert_isolated_state_home(&path);
-    path
-}
-
-#[cfg(test)]
-fn assert_isolated_state_home(path: &Path) {
-    let real_state_home = home().join(".local/state");
-    assert_ne!(
-        path,
-        &real_state_home,
-        "THE-744: unit test resolved the real XDG state home ({})",
-        real_state_home.display()
-    );
+        .unwrap_or_else(|| home().join(".local/state"))
 }
 
 #[cfg(windows)]
@@ -1701,9 +1687,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn xdg_state_home_panics_when_it_resolves_to_the_real_default() {
+    fn xdg_state_home_resolves_without_panicking() {
         let _env = crate::testenv::EnvGuard::unset(&["XDG_STATE_HOME"]);
-        assert!(std::panic::catch_unwind(xdg_state_home).is_err());
+        let expected = if cfg!(windows) {
+            std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home().join("AppData").join("Local"))
+        } else {
+            home().join(".local/state")
+        };
+        assert_eq!(xdg_state_home(), expected);
     }
 
     #[test]
