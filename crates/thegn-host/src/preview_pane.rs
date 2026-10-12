@@ -282,11 +282,12 @@ pub(crate) fn bounded_lines(text: &str) -> Vec<String> {
             last.truncate(boundary);
         }
         if lines.len() == PREVIEW_MAX_LINES
-            && let Some(last) = lines.pop()
+            && let Some(last) = lines.last_mut()
         {
-            retained_bytes -= last.len();
+            *last = marker.to_string();
+        } else {
+            lines.push(marker.to_string());
         }
-        lines.push(marker.to_string());
         break;
     }
 
