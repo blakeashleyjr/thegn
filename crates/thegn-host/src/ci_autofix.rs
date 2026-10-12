@@ -258,6 +258,11 @@ fn consider_candidate_with_forge(
         return;
     }
 
+    if let Some(reason) = crate::agent_run::headless_unsupported() {
+        notify(format!("CI autofix for PR #{} held: {reason}", item.number));
+        return;
+    }
+
     let dispatch = crate::agent_run::agent_floor_gate(
         full,
         worktree,
@@ -597,6 +602,50 @@ mod authorship_tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn unsupported_platform_holds_automatic_and_human_ci_handoffs_without_claiming() {
+        for human_authorized in [false, true] {
+            let fixture = Fixture::new();
+            let path = fixture.dir.path().to_str().unwrap();
+            let db =
+                thegn_core::db::Db::open_at(&fixture.dir.path().join("unsupported.db")).unwrap();
+            db.enqueue_pr(path, 7, Some(path), "fixture", "main", "github")
+                .unwrap();
+            let sentinel = fixture.dir.path().join("agent-must-not-run");
+            let mut config = Config::default();
+            config.ci.autofix.mode = CiAutofixMode::Auto;
+            config.pr_queue.enabled = true;
+            config.pr_queue.own_prs_only = false;
+            config.pr_queue.agent_command = format!("touch {}", sentinel.display());
+            let mut forge = fixture.forge(vec![fixture.proof.clone()]);
+            forge.pr.status_check_rollup = vec![
+                serde_json::from_value(serde_json::json!({"name":"test", "conclusion":"FAILURE"}))
+                    .unwrap(),
+            ];
+            let entry = CiLogEntry {
+                worktree: path.into(),
+                head_sha: fixture.pr.head_ref_oid.clone(),
+                text: "fixture failure".into(),
+                run_id: "run".into(),
+                job_id: "job".into(),
+                ..Default::default()
+            };
+            let unsupported = crate::agent_run::force_headless_unsupported();
+            consider_candidate_with_forge(&config, &db, &entry, human_authorized, Some(&forge));
+            drop(unsupported);
+
+            assert!(db.claim_ci_autofix(&entry.candidate()).unwrap());
+            assert_eq!(db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+            assert!(!sentinel.exists());
+            assert!(
+                db.get_unread_notifications()
+                    .unwrap()
+                    .iter()
+                    .any(|notification| notification.message.contains("THE-235"))
+            );
         }
     }
 }

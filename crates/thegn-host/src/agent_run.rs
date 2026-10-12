@@ -21,6 +21,38 @@
 
 use thegn_core::agent_task::{TaskKind, TaskVars};
 
+#[cfg(test)]
+thread_local! {
+    static FORCE_HEADLESS_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Explain why the shared runner cannot execute on this platform. Callers use
+/// this before changing queue state or spending an attempt.
+pub(crate) fn headless_unsupported() -> Option<String> {
+    #[cfg(test)]
+    if FORCE_HEADLESS_UNSUPPORTED.with(std::cell::Cell::get) {
+        return Some("headless agent handoff is not supported on this platform (THE-235); held, no attempt spent".into());
+    }
+    #[cfg(not(unix))]
+    {
+        return Some("headless agent handoff is not supported on this platform (THE-235); held, no attempt spent".into());
+    }
+    #[cfg(unix)]
+    None
+}
+
+#[cfg(test)]
+pub(crate) fn force_headless_unsupported() -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FORCE_HEADLESS_UNSUPPORTED.with(|value| value.set(false));
+        }
+    }
+    FORCE_HEADLESS_UNSUPPORTED.with(|value| value.set(true));
+    Reset
+}
+
 const MAX_RENDERED_COMMAND_BYTES: usize = 100 * 1024;
 
 fn rendered_command_exceeds_limit(command: &str) -> bool {
