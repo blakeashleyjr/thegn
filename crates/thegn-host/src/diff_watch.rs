@@ -1844,7 +1844,7 @@ mod tests {
         let ignore = {
             let mut b = ignore::gitignore::GitignoreBuilder::new(&root);
             b.add_line(None, "target/").unwrap();
-            b.build().unwrap()
+            IgnoreRules::new(&root, b.build().unwrap())
         };
         let plan = vec![
             crate::git_watch::WatchPlanEntry {
