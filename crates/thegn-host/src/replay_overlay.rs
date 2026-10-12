@@ -1142,9 +1142,9 @@ mod tests {
         let truncated_text: String = truncated_surface
             .screen_cells()
             .iter()
-            .flatten()
-            .map(|cell| cell.str())
-            .collect();
+            .map(|row| row.iter().map(|cell| cell.str()).collect::<String>())
+            .collect::<Vec<_>>()
+            .concat();
         assert!(truncated_text.contains("partial history"));
         let track_cells = truncated_text
             .chars()
@@ -1168,9 +1168,9 @@ mod tests {
         let fresh_text: String = fresh_surface
             .screen_cells()
             .iter()
-            .flatten()
-            .map(|cell| cell.str())
-            .collect();
+            .map(|row| row.iter().map(|cell| cell.str()).collect::<String>())
+            .collect::<Vec<_>>()
+            .concat();
         assert!(!fresh_text.contains("partial history"));
     }
 
