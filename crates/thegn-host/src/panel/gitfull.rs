@@ -22,7 +22,7 @@ use crate::seg::{self, Line, Seg, Tok, seg, sp};
 
 use super::frame::PanelFrame;
 use super::gitui::{GitFlow, GitView, RebaseUi, context_keys};
-use super::sections::{PanelRow, filter_row, filtered_indices};
+use super::sections::{PanelRow, diff_count_label, filter_row, filtered_indices};
 use super::{PanelData, PanelHit, PanelUi, Section, Stage, graph, staging};
 
 /// Side column width including the vertical divider cell.
@@ -648,19 +648,26 @@ fn staging_region(
                 .get(GitView::Files)
                 .min(ix.len().saturating_sub(1));
             match ix.get(cur).map(|&s| &data.changes[s]) {
-                Some(c) => vec![
-                    PanelRow::plain(Line::segs(vec![
+                Some(c) => {
+                    let mut file_line = vec![
                         seg(d(), c.status.clone()),
                         sp(1),
                         seg(t(), c.path.clone()).bold(),
                         sp(2),
-                        seg(hue(Hue::Green), format!("+{}", c.added)),
-                        sp(1),
-                        seg(hue(Hue::Red), format!("−{}", c.deleted)),
-                    ])),
-                    PanelRow::blank(),
-                    PanelRow::plain(Line::segs(vec![seg(g2(), "enter to stage lines")])),
-                ],
+                    ];
+                    if let Some(label) = diff_count_label(c.count) {
+                        file_line.push(seg(hue(Hue::Amber), label));
+                    } else {
+                        file_line.push(seg(hue(Hue::Green), format!("+{}", c.added)));
+                        file_line.push(sp(1));
+                        file_line.push(seg(hue(Hue::Red), format!("−{}", c.deleted)));
+                    }
+                    vec![
+                        PanelRow::plain(Line::segs(file_line)),
+                        PanelRow::blank(),
+                        PanelRow::plain(Line::segs(vec![seg(g2(), "enter to stage lines")])),
+                    ]
+                }
                 // A clean tree has nothing to stage — the commit graph is a
                 // far better use of the main region than one dim line.
                 None => {
@@ -1265,6 +1272,7 @@ mod tests {
             path: path.into(),
             added: 5,
             deleted: 1,
+            count: thegn_svc::git::DiffCount::Exact(6),
             submodule: None,
             incoming: false,
         }
@@ -1492,6 +1500,19 @@ mod tests {
                 "{s:?} header hit missing"
             );
         }
+    }
+
+    #[test]
+    fn files_main_region_renders_typed_diff_count() {
+        let mut m = model();
+        m.panel.changes[0].count = thegn_svc::git::DiffCount::Binary;
+        let frame = build_git_full(&m, &ui(GitView::Files), 120, 40, true);
+        let all = all_text(&frame);
+        assert!(all.contains("bin"), "typed binary label: {all}");
+        assert!(
+            !all.contains("+5"),
+            "binary row has no numeric count: {all}"
+        );
     }
 
     #[test]
