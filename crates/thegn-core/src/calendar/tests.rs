@@ -905,12 +905,11 @@ fn time_format_auto_follows_the_locale_region() {
 
 #[test]
 fn auto_locale_handles_script_tags_extensions_and_cldr_regions() {
-    // en_GB is 24-hour, Monday-first; en_AU is 12-hour, Sunday-first;
-    // en_NZ is 12-hour, Monday-first.
+    // en_GB is 24-hour, Monday-first; en_AU and en_NZ are 12-hour, Monday-first.
     assert!(!resolve_time_format(None, Some("en_GB.UTF-8")));
     assert!(resolve_time_format(None, Some("en_AU")));
     assert!(resolve_time_format(None, Some("en_NZ")));
-    assert_eq!(resolve_week_start(None, Some("en_AU")), Weekday::Sun);
+    assert_eq!(resolve_week_start(None, Some("en_AU")), Weekday::Mon);
     assert_eq!(resolve_week_start(None, Some("en_NZ")), Weekday::Mon);
     // Script subtags are not regions.
     assert_eq!(resolve_week_start(None, Some("zh-Hant-TW")), Weekday::Sun);
@@ -935,6 +934,18 @@ fn auto_locale_handles_script_tags_extensions_and_cldr_regions() {
         assert_eq!(resolve_week_start(None, l), Weekday::Mon);
         assert!(!resolve_time_format(None, l));
     }
+}
+
+#[test]
+fn auto_locale_pins_cldr_48_icu_78_3_rows() {
+    assert_eq!(resolve_week_start(None, Some("en_AU")), Weekday::Mon);
+    assert_eq!(resolve_week_start(None, Some("en_US")), Weekday::Sun);
+    assert_eq!(resolve_week_start(None, Some("pt_PT")), Weekday::Sun);
+    assert_eq!(resolve_week_start(None, Some("ar_AE")), Weekday::Mon);
+    assert!(!resolve_time_format(None, Some("en_GB")));
+    assert!(resolve_time_format(None, Some("ko_KR")));
+    assert!(!resolve_time_format(None, Some("en_BZ")));
+    assert_eq!(resolve_week_start(None, Some("dv_MV")), Weekday::Fri);
 }
 
 // --- occurrences and day bucketing ------------------------------------------

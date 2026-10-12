@@ -4,37 +4,45 @@
 //! module reading `LC_TIME`, so the resolution is testable and the module stays
 //! substrate-agnostic.
 //!
-//! Normalisation is shared with weather via [`crate::locale_tag`]. Data source:
-//! the region tables below are a hand-copied snapshot of the Unicode CLDR
-//! `weekData/firstDay` and `timeData` territory preferences, not a live locale
-//! service, and they key on the territory only (language-specific exceptions
-//! are not modelled). Fallback when the locale is absent, `C`/`POSIX`,
-//! unparseable, or has no territory: Monday-first and 24-hour (ISO 8601). A
-//! Unicode extension in the locale (`-u-fw-`, `-u-hc-`) outranks the table;
-//! explicit configuration outranks everything.
+//! Normalisation is shared with weather via [`crate::locale_tag`]. Territory
+//! data is CLDR 48 (ICU 78.3), generated mechanically by querying ICU's
+//! first-day and default-hour-cycle APIs for every ISO region. The data keys on
+//! territory only (language-specific exceptions are not modelled). Fallback
+//! when the locale is absent, `C`/`POSIX`, unparseable, or has no territory:
+//! Monday-first and 24-hour (ISO 8601). A Unicode extension in the locale
+//! (`-u-fw-`, `-u-hc-`) outranks the table; explicit configuration outranks
+//! everything.
 
 use chrono::Weekday;
 
 use crate::locale_tag::{self, LocaleTag};
 
-/// CLDR territories whose first day is Sunday.
+/// CLDR 48 territories whose first day is Sunday.
 const SUNDAY_FIRST: &[&str] = &[
-    "AG", "AS", "AU", "BD", "BR", "BS", "BT", "BW", "BZ", "CA", "CO", "DM", "DO", "ET", "GT", "GU",
-    "HK", "HN", "ID", "IL", "IN", "JM", "JP", "KE", "KH", "KR", "LA", "MH", "MM", "MO", "MT", "MX",
-    "MZ", "NI", "NP", "PA", "PE", "PH", "PK", "PR", "PY", "SA", "SG", "SV", "TH", "TT", "TW", "UM",
-    "US", "VE", "VN", "WS", "YE", "ZA", "ZW",
+    "AG", "AS", "BD", "BR", "BS", "BT", "BW", "BZ", "CA", "CO", "DM", "DO", "ET", "GT", "GU", "HK",
+    "HN", "ID", "IL", "IN", "IS", "JM", "JP", "KE", "KH", "KR", "LA", "MH", "MM", "MO", "MT", "MX",
+    "MZ", "NI", "NP", "PA", "PE", "PH", "PK", "PR", "PT", "PY", "SA", "SG", "SV", "TH", "TT", "TW",
+    "UM", "US", "VE", "VI", "WS", "YE", "ZA", "ZW",
 ];
 
-/// CLDR territories whose first day is Saturday.
+/// CLDR 48 territories whose first day is Saturday.
 const SATURDAY_FIRST: &[&str] = &[
-    "AE", "AF", "BH", "DJ", "DZ", "EG", "IQ", "IR", "JO", "KW", "LY", "OM", "QA", "SD", "SY",
+    "AF", "BH", "DJ", "DZ", "EG", "IQ", "IR", "JO", "KW", "LY", "OM", "QA", "SD", "SY",
 ];
 
-/// CLDR territories whose preferred hour cycle is 12-hour.
+/// CLDR 48 territories whose preferred hour cycle is 12-hour (`h11` or `h12`).
 const TWELVE_HOUR: &[&str] = &[
-    "AS", "AU", "BD", "BZ", "CA", "CO", "DO", "EG", "GU", "HK", "HN", "IN", "JO", "KW", "MX", "MY",
-    "NG", "NI", "NZ", "PA", "PE", "PH", "PK", "PR", "QA", "SA", "SV", "TW", "US", "VE",
+    "AE", "AG", "AL", "AR", "AS", "AU", "BB", "BD", "BH", "BM", "BN", "BO", "BS", "BT", "CA", "CL",
+    "CO", "CR", "CU", "CY", "DJ", "DM", "DO", "DZ", "EC", "EG", "EH", "ER", "ET", "FJ", "FM", "GD",
+    "GH", "GM", "GR", "GT", "GU", "GY", "HK", "HN", "IN", "IQ", "JM", "JO", "KH", "KI", "KN", "KP",
+    "KR", "KW", "KY", "LB", "LC", "LR", "LS", "LY", "MH", "MO", "MP", "MR", "MW", "MX", "MY", "NA",
+    "NI", "NZ", "OM", "PA", "PE", "PG", "PH", "PK", "PR", "PS", "PW", "PY", "QA", "SA", "SB", "SD",
+    "SG", "SL", "SO", "SS", "SV", "SY", "SZ", "TC", "TD", "TN", "TO", "TT", "TW", "UM", "US", "UY",
+    "VC", "VE", "VG", "VI", "VU", "WS", "YE", "ZM",
 ];
+
+/// CLDR 48 territory whose first day is Friday.
+const FRIDAY_FIRST: &[&str] = &["MV"];
 
 /// Resolve `week_start`, where `None` means `"auto"`.
 ///
@@ -53,6 +61,7 @@ pub fn resolve_week_start(configured: Option<Weekday>, locale: Option<&str>) -> 
     match territory(&tag) {
         Some(r) if SUNDAY_FIRST.contains(&r) => Weekday::Sun,
         Some(r) if SATURDAY_FIRST.contains(&r) => Weekday::Sat,
+        Some(r) if FRIDAY_FIRST.contains(&r) => Weekday::Fri,
         _ => Weekday::Mon,
     }
 }
