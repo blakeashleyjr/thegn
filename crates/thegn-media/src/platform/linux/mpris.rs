@@ -548,15 +548,12 @@ fn toggled_fullscreen(current: Option<bool>) -> Result<bool, MediaError> {
         .ok_or_else(|| MediaError::Backend("Fullscreen state unreadable".to_string()))
 }
 
-fn is_missing_property_error(error: &zbus::Error) -> bool {
+fn is_missing_property_error(error: &zbus::fdo::Error) -> bool {
     match error {
-        zbus::Error::MethodError(name, _, _) => matches!(
+        zbus::fdo::Error::UnknownProperty(_) | zbus::fdo::Error::InvalidArgs(_) => true,
+        zbus::fdo::Error::ZBus(zbus::Error::MethodError(name, _, _)) => matches!(
             name.as_str(),
             "org.freedesktop.DBus.Error.UnknownProperty" | "org.freedesktop.DBus.Error.InvalidArgs"
-        ),
-        zbus::Error::FDO(error) => matches!(
-            error.as_ref(),
-            zbus::fdo::Error::UnknownProperty(_) | zbus::fdo::Error::InvalidArgs(_)
         ),
         _ => false,
     }
