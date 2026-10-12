@@ -1030,7 +1030,15 @@ fn teardown_runtime(
             failures.push(format!("SSH route credential: {error:#}"));
         }
     }
-    if !env.placement.is_local()
+    let sync_succeeded = match crate::agent::deprovision_sync(&path) {
+        Ok(()) => true,
+        Err(error) => {
+            failures.push(format!("provider sync {}: {error}", env.name));
+            false
+        }
+    };
+    if sync_succeeded
+        && !env.placement.is_local()
         && let Err(error) =
             crate::agent_teardown::destroy_provider_sandbox_with(cfg, &path, &env.name)
     {
@@ -1038,7 +1046,6 @@ fn teardown_runtime(
     }
     crate::agent::deregister_vpn(&path);
     crate::agent::deproject(&path);
-    crate::agent::deprovision_sync(&path);
     crate::agent::checkpoint_on_close(&path);
     crate::bridge_sup::disconnect_path(&path);
     thegn_core::sandbox::teardown_by_path(&path);
@@ -1342,6 +1349,7 @@ static REMOVED_WORKTREES: OnceLock<Mutex<std::collections::VecDeque<String>>> = 
 /// after the cleanup deleted them (THE-689 race 2). Per-process only: a removal
 /// made by another process (e.g. the CLI landing) is not covered.
 fn note_worktree_removed(worktree: &Path) {
+    crate::agent::forget_provider_sync(&worktree.to_string_lossy());
     // Resolve the canonical alias BEFORE taking the mutex (filesystem work).
     let raw = worktree.to_string_lossy().into_owned();
     let canonical = destroy_key(worktree).to_string_lossy().into_owned();
