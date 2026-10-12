@@ -11,6 +11,241 @@ fn config() -> MergeQueueConfig {
     }
 }
 
+#[test]
+fn repo_queue_read_failure_is_not_an_empty_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let db = Db::open_at(&path).unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE merge_queue")
+        .unwrap();
+    assert!(super::rows_for_repo(&db, Path::new("/repo")).is_err());
+}
+
+#[test]
+fn repo_membership_query_failure_is_not_local_git_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let db = Db::open_at(&path).unwrap();
+    db.enqueue_merge("/missing/worktree", "feature", "main")
+        .unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE worktrees")
+        .unwrap();
+    assert!(super::rows_for_repo(&db, Path::new("/repo")).is_err());
+}
+
+#[test]
+fn agent_blocked_status_survives_db_reopen_and_decodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    {
+        let db = Db::open_at(&path).unwrap();
+        db.enqueue_merge(WORKTREE, "feature", "main").unwrap();
+        db.update_merge_status(
+            WORKTREE,
+            thegn_core::attention::MqStatus::AgentBlocked.as_str(),
+            None,
+            None,
+            Some("isolation policy unavailable"),
+        )
+        .unwrap();
+    }
+    let db = Db::open_at(&path).unwrap();
+    let row = db.list_merge_queue().unwrap().remove(0);
+    assert_eq!(
+        thegn_core::attention::MqStatus::parse(&row.status),
+        Some(thegn_core::attention::MqStatus::AgentBlocked)
+    );
+    assert_eq!(
+        row.error_detail.as_deref(),
+        Some("isolation policy unavailable")
+    );
+}
+
+#[test]
+fn folding_write_failure_stops_before_git_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let db = Db::open_at(&path).unwrap();
+    let item = queued(&db, 0);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TRIGGER fail_folding BEFORE UPDATE OF status ON merge_queue WHEN NEW.status = 'folding' BEGIN SELECT RAISE(FAIL, 'injected status failure'); END;")
+        .unwrap();
+    let cfg = config();
+    let mut called = false;
+    let out = drive_queue_with(
+        &cfg,
+        &Config::default(),
+        Path::new(WORKTREE),
+        &db,
+        vec![item],
+        |_| {},
+        DriveActions {
+            attempt: |_: &str, _: &thegn_core::remote::GitLoc| {
+                called = true;
+                Ok(AttemptOutcome::Ready { tip: "tip".into() })
+            },
+            floor: |_: &str| panic!("notify-only"),
+            runner: unexpected_runner,
+        },
+    );
+    assert!(!called);
+    assert_eq!(out.persistence_errors.len(), 1);
+}
+
+#[test]
+fn landed_ref_with_terminal_write_failure_is_reported_as_degraded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let db = Db::open_at(&path).unwrap();
+    let item = queued(&db, 0);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TRIGGER fail_landed BEFORE UPDATE OF status ON merge_queue WHEN NEW.status = 'landed' BEGIN SELECT RAISE(FAIL, 'injected landed write failure'); END;")
+        .unwrap();
+    let new_oid = "1234567890123456789012345678901234567890";
+    let old_oid = "old-base-oid";
+    let out = drive_queue_with(
+        &config(),
+        &Config::default(),
+        Path::new(WORKTREE),
+        &db,
+        vec![item],
+        |_| {},
+        DriveActions {
+            attempt: |_: &str, _: &thegn_core::remote::GitLoc| {
+                Ok(AttemptOutcome::Landed {
+                    commit: new_oid.into(),
+                    old_oid: old_oid.into(),
+                    resyncs: Vec::new(),
+                })
+            },
+            floor: |_: &str| panic!("notify-only"),
+            runner: unexpected_runner,
+        },
+    );
+    assert_eq!(out.bookkeeping_failed.len(), 1);
+    assert_eq!(out.bookkeeping_failed[0].old_oid, old_oid);
+    assert_eq!(out.bookkeeping_failed[0].new_oid, new_oid);
+}
+
+#[test]
+fn failed_attempt_reservation_prevents_agent_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let db = Db::open_at(&path).unwrap();
+    let item = queued(&db, 0);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TRIGGER fail_attempt BEFORE UPDATE OF agent_attempts ON merge_queue BEGIN SELECT RAISE(FAIL, 'injected attempt write failure'); END;")
+        .unwrap();
+    let mut cfg = config();
+    cfg.conflict_handoff = ConflictHandoff::Agent;
+    cfg.agent_command = "test-agent".into();
+    let mut dispatched = false;
+    let out = drive_queue_with(
+        &cfg,
+        &Config::default(),
+        Path::new(WORKTREE),
+        &db,
+        vec![item],
+        |_| {},
+        DriveActions {
+            attempt: |_: &str, _: &thegn_core::remote::GitLoc| {
+                Ok(AttemptOutcome::GateFailed {
+                    log: "failure".into(),
+                })
+            },
+            floor: |_: &str| crate::agent_run::AgentDispatch::Run(None),
+            runner: |_: &str,
+                     _: &str,
+                     _: &str,
+                     _: &str,
+                     _: &super::Failure,
+                     _: Option<thegn_core::sandbox::SandboxSpec>| {
+                dispatched = true;
+                true
+            },
+        },
+    );
+    assert!(!dispatched);
+    assert_eq!(out.persistence_errors.len(), 1);
+    let saved = db
+        .list_merge_queue()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.branch == "feature")
+        .unwrap();
+    assert_eq!(saved.status, "gate_error");
+    assert!(
+        saved
+            .error_detail
+            .as_deref()
+            .unwrap()
+            .contains("could not reserve agent attempt: injected attempt write failure")
+    );
+}
+
+#[test]
+fn failed_conflict_write_falls_back_to_gate_error_and_stops_drain() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let db = Db::open_at(&path).unwrap();
+    let item = queued(&db, 0);
+    db.enqueue_merge("/later/worktree", "later", "main")
+        .unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TRIGGER fail_deferred BEFORE UPDATE OF status ON merge_queue WHEN NEW.status = 'deferred' BEGIN SELECT RAISE(FAIL, 'injected conflict write failure'); END;")
+        .unwrap();
+    let out = drive_queue_with(
+        &config(),
+        &Config::default(),
+        Path::new(WORKTREE),
+        &db,
+        vec![
+            item,
+            QueueItem {
+                worktree: "/later/worktree".into(),
+                branch: "later".into(),
+                location: String::new(),
+                agent_attempts: 0,
+            },
+        ],
+        |_| {},
+        DriveActions {
+            attempt: |branch: &str, _: &thegn_core::remote::GitLoc| {
+                assert_eq!(branch, "feature", "persistence failure aborts later rows");
+                Ok(AttemptOutcome::Conflict {
+                    paths: vec!["src/a.rs".into()],
+                    submodule_conflicts: Vec::new(),
+                })
+            },
+            floor: |_: &str| panic!("notify-only"),
+            runner: unexpected_runner,
+        },
+    );
+    assert_eq!(out.persistence_errors.len(), 1);
+    let saved = db
+        .list_merge_queue()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.branch == "feature")
+        .unwrap();
+    assert_eq!(saved.status, "gate_error");
+    assert!(
+        saved
+            .error_detail
+            .as_deref()
+            .unwrap()
+            .contains("could not persist conflict outcome")
+    );
+}
+
 fn queued(db: &Db, attempts: u32) -> QueueItem {
     db.enqueue_merge(WORKTREE, "feature", "main").unwrap();
     db.set_merge_agent_attempts(WORKTREE, attempts).unwrap();
@@ -178,6 +413,7 @@ fn success_projects_full_oid_and_does_not_fabricate_oid_from_progress_text() {
     let (landed, _) = one_outcome(
         Ok(AttemptOutcome::Landed {
             commit: oid.into(),
+            old_oid: "old-oid".into(),
             resyncs: Vec::new(),
         }),
         0,
@@ -241,7 +477,8 @@ fn infrastructure_hold_stops_after_one_attempt_and_admission_without_spending_bu
     );
     assert_eq!((attempts, admissions), (1, 1));
     assert_eq!(steps, ["folding", "agent_blocked"]);
-    assert_eq!(out.deferred, ["feature"]);
+    assert_eq!(out.agent_blocked, ["feature"]);
+    assert!(out.deferred.is_empty());
     assert!(
         out.landed.is_empty()
             && out.ready.is_empty()
@@ -586,7 +823,8 @@ fn hold_then_recover(failure: RetryFailure) {
         },
     );
     assert_eq!((held_attempts, next_attempts, floors), (1, 1, 1));
-    assert_only(&out, &["next"], &["held"], &[], &[]);
+    assert_only(&out, &["next"], &[], &[], &[]);
+    assert_eq!(out.agent_blocked, ["held"]);
     fixture.assert_audit(
         &before,
         &observed,
