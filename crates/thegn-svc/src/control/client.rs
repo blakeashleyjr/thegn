@@ -2292,7 +2292,13 @@ mod tests {
             EventFrame::PaneSnapshot { bytes, .. } => bytes.len(),
             _ => unreachable!(),
         };
-        assert_eq!(largest.encode().len(), MAX_WIRE_FRAME - 1);
+        let largest_encoded_len = largest.encode().len();
+        assert!(largest_encoded_len < MAX_WIRE_FRAME);
+        let mut one_byte_larger = largest.clone();
+        if let EventFrame::PaneSnapshot { bytes, .. } = &mut one_byte_larger {
+            bytes.push(b'x');
+        }
+        assert!(one_byte_larger.encode().len() >= MAX_WIRE_FRAME);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
