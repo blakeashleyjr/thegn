@@ -85,11 +85,11 @@ fn folding_write_failure_stops_before_git_attempt() {
         vec![item],
         |_| {},
         DriveActions {
-            attempt: |_, _| {
+            attempt: |_: &str, _: &thegn_core::remote::GitLoc| {
                 called = true;
                 Ok(AttemptOutcome::Ready { tip: "tip".into() })
             },
-            floor: |_| panic!("notify-only"),
+            floor: |_: &str| panic!("notify-only"),
             runner: unexpected_runner,
         },
     );
@@ -117,14 +117,14 @@ fn landed_ref_with_terminal_write_failure_is_reported_as_degraded() {
         vec![item],
         |_| {},
         DriveActions {
-            attempt: |_, _| {
+            attempt: |_: &str, _: &thegn_core::remote::GitLoc| {
                 Ok(AttemptOutcome::Landed {
                     commit: new_oid.into(),
                     old_oid: old_oid.into(),
                     resyncs: Vec::new(),
                 })
             },
-            floor: |_| panic!("notify-only"),
+            floor: |_: &str| panic!("notify-only"),
             runner: unexpected_runner,
         },
     );
@@ -155,13 +155,18 @@ fn failed_attempt_reservation_prevents_agent_dispatch() {
         vec![item],
         |_| {},
         DriveActions {
-            attempt: |_, _| {
+            attempt: |_: &str, _: &thegn_core::remote::GitLoc| {
                 Ok(AttemptOutcome::GateFailed {
                     log: "failure".into(),
                 })
             },
-            floor: |_| crate::agent_run::AgentDispatch::Run(None),
-            runner: |_, _, _, _, _, _| {
+            floor: |_: &str| crate::agent_run::AgentDispatch::Run(None),
+            runner: |_: &str,
+                     _: &str,
+                     _: &str,
+                     _: &str,
+                     _: &super::Failure,
+                     _: Option<thegn_core::sandbox::SandboxSpec>| {
                 dispatched = true;
                 true
             },
@@ -213,14 +218,14 @@ fn failed_conflict_write_falls_back_to_gate_error_and_stops_drain() {
         ],
         |_| {},
         DriveActions {
-            attempt: |branch, _| {
+            attempt: |branch: &str, _: &thegn_core::remote::GitLoc| {
                 assert_eq!(branch, "feature", "persistence failure aborts later rows");
                 Ok(AttemptOutcome::Conflict {
                     paths: vec!["src/a.rs".into()],
                     submodule_conflicts: Vec::new(),
                 })
             },
-            floor: |_| panic!("notify-only"),
+            floor: |_: &str| panic!("notify-only"),
             runner: unexpected_runner,
         },
     );
