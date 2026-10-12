@@ -132,7 +132,7 @@ pub fn resolve_server_command(cmd: &str, path: Option<&OsStr>) -> Result<PathBuf
         let Ok(metadata) = canonical.metadata() else {
             continue;
         };
-        if metadata.is_file() && is_executable_file(&metadata) {
+        if metadata.is_file() && crate::plugin::platform::is_executable_file(&metadata) {
             tracing::debug!(
                 target: "thegn::lsp",
                 command = %candidate.display(),
@@ -147,18 +147,6 @@ pub fn resolve_server_command(cmd: &str, path: Option<&OsStr>) -> Result<PathBuf
     Err(LspError::Spawn(format!(
         "{cmd} not found on absolute PATH entries"
     )))
-}
-
-#[cfg(unix)]
-fn is_executable_file(metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    metadata.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_executable_file(_metadata: &std::fs::Metadata) -> bool {
-    true
 }
 
 /// The LSP resource contract.  These are protocol safety limits, not user
@@ -2308,13 +2296,13 @@ mod tests {
         let executable = absolute.join("srv");
         std::fs::write(&shadow_executable, "relative shadow").unwrap();
         std::fs::write(&executable, "absolute executable").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            std::fs::set_permissions(&shadow_executable, std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for fixture in [&shadow_executable, &executable] {
+            if let Err(error) = thegn_core::fsperm::make_executable_for_test(fixture) {
+                if error.kind() == std::io::ErrorKind::Unsupported {
+                    continue;
+                }
+                panic!("make server fixture executable: {error}");
+            }
         }
         let relative_shadow = shadow.strip_prefix(&cwd).unwrap();
         let path = std::env::join_paths([
@@ -2337,7 +2325,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn non_executable_path_candidate_does_not_shadow_executable() {
         let dir = tempfile::tempdir().unwrap();
         let blocked = dir.path().join("blocked");
@@ -2348,10 +2335,12 @@ mod tests {
         let executable = allowed.join("srv");
         std::fs::write(&non_executable, "not executable").unwrap();
         std::fs::write(&executable, "executable").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if let Err(error) = thegn_core::fsperm::make_executable_for_test(&executable) {
+            if error.kind() == std::io::ErrorKind::Unsupported {
+                return;
+            }
+            panic!("make server fixture executable: {error}");
+        }
         let path = std::env::join_paths([blocked, allowed]).unwrap();
 
         assert_eq!(

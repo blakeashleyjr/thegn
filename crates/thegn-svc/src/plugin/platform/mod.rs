@@ -10,5 +10,12 @@ mod windows;
 #[cfg(windows)]
 pub(crate) use windows::*;
 
+/// Whether metadata describes a file the current platform can execute.
+/// Unix checks execute mode bits; Windows applies its normal process lookup
+/// rules after regular-file validation.
+pub(crate) fn is_executable_file(metadata: &std::fs::Metadata) -> bool {
+    platform_is_executable_file(metadata)
+}
+
 #[cfg(test)]
 mod native_tests;
