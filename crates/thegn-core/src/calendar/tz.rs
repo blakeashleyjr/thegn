@@ -5,7 +5,7 @@
 //! (+10:30) and every DST shoulder season correct for free instead of needing
 //! special cases.
 
-use chrono::{DateTime, Datelike, LocalResult, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc, Weekday};
 use chrono_tz::{OffsetComponents, Tz};
 use serde::{Deserialize, Serialize};
 
@@ -447,6 +447,273 @@ pub fn read_clocks(clocks: &[ResolvedClock], now: DateTime<Utc>, home: Tz) -> Ve
 pub fn total_offset_secs(zone: Tz, at: DateTime<Utc>) -> i32 {
     let c = zone.offset_from_utc_datetime(&at.naive_utc());
     (c.base_utc_offset() + c.dst_offset()).num_seconds() as i32
+}
+
+/// One bounded STANDARD/DAYLIGHT observance from an embedded VTIMEZONE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VtzObservance {
+    onset_local: NaiveDateTime,
+    offset_from: i32,
+    offset_to: i32,
+    yearly: Option<(u32, i8, Weekday, Option<NaiveDateTime>)>,
+}
+
+/// The small, deliberately conservative subset of VTIMEZONE rules we can
+/// compare against the bundled IANA database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VtzRules {
+    observances: Vec<VtzObservance>,
+}
+
+impl VtzRules {
+    pub(crate) fn new(observances: Vec<VtzObservance>) -> Option<Self> {
+        (!observances.is_empty() && observances.len() <= 8).then_some(Self { observances })
+    }
+
+    /// Parse a single observance. Unsupported fields/rule forms refuse the
+    /// entire definition rather than silently changing its meaning.
+    pub(crate) fn observance(
+        dtstart: &str,
+        offset_from: &str,
+        offset_to: &str,
+        rrule: Option<&str>,
+        has_rdate: bool,
+    ) -> Option<VtzObservance> {
+        if has_rdate {
+            return None;
+        }
+        let onset_local = super::recur::parse_ics_datetime(dtstart)?;
+        let offset_from = parse_vtz_offset(offset_from)?;
+        let offset_to = parse_vtz_offset(offset_to)?;
+        let yearly = match rrule {
+            None => None,
+            Some(rule) => Some(parse_vtz_yearly_rule(rule)?),
+        };
+        Some(VtzObservance {
+            onset_local,
+            offset_from,
+            offset_to,
+            yearly,
+        })
+    }
+
+    /// Return the deterministic IANA zone whose offsets match these rules in
+    /// the requested event year.
+    pub(crate) fn match_zone(&self, year: i32, preferred: Option<Tz>) -> Option<Tz> {
+        let probes = self.probes(year)?;
+        let mut candidates = Vec::new();
+        if let Some(zone) = preferred {
+            candidates.push(zone);
+        }
+        let offsets: std::collections::BTreeSet<i32> = self
+            .observances
+            .iter()
+            .flat_map(|o| [o.offset_from, o.offset_to])
+            .collect();
+        if offsets.len() == 1
+            && let Some(offset) = offsets.first()
+            && offset % 3600 == 0
+        {
+            let hours = offset / 3600;
+            let name = if hours == 0 {
+                "Etc/GMT".to_string()
+            } else if hours > 0 {
+                format!("Etc/GMT-{hours}")
+            } else {
+                format!("Etc/GMT+{}", hours.abs())
+            };
+            if let Some(zone) = resolve_zone(&name) {
+                candidates.push(zone);
+            }
+        }
+        candidates.extend(chrono_tz::TZ_VARIANTS.iter().copied());
+        let mut seen = std::collections::BTreeSet::new();
+        candidates.into_iter().find(|zone| {
+            seen.insert(zone.name())
+                && probes
+                    .iter()
+                    .all(|(at, expected)| total_offset_secs(*zone, *at) == *expected)
+        })
+    }
+
+    fn probes(&self, year: i32) -> Option<Vec<(DateTime<Utc>, i32)>> {
+        let mut instants = Vec::new();
+        for month in 1..=12 {
+            for day in [1, 15] {
+                let date = NaiveDate::from_ymd_opt(year, month, day)?;
+                instants.push(date.and_hms_opt(12, 0, 0)?.and_utc());
+            }
+        }
+        for onset in self.onsets_for_year(year)? {
+            let instant = onset.instant();
+            if instant.year() == year {
+                instants.push(instant - chrono::Duration::seconds(1));
+                instants.push(instant);
+            }
+        }
+        instants.sort();
+        instants.dedup();
+        Some(
+            instants
+                .into_iter()
+                .map(|at| (at, self.offset_at(at)))
+                .collect(),
+        )
+    }
+
+    fn onsets_for_year(&self, year: i32) -> Option<Vec<Onset>> {
+        let mut onsets = Vec::new();
+        for observance in &self.observances {
+            if observance.yearly.is_none() {
+                // A one-shot observance remains in effect in all later years.
+                onsets.push(Onset {
+                    local: observance.onset_local,
+                    offset_from: observance.offset_from,
+                    offset_to: observance.offset_to,
+                });
+            } else {
+                for y in [year.checked_sub(1)?, year] {
+                    if y < observance.onset_local.year() {
+                        continue;
+                    }
+                    let Some((month, nth, weekday, until)) = observance.yearly else {
+                        continue;
+                    };
+                    let date = nth_weekday(y, month, nth, weekday)?;
+                    let local = date.and_time(observance.onset_local.time());
+                    if until.is_none_or(|bound| local <= bound) {
+                        onsets.push(Onset {
+                            local,
+                            offset_from: observance.offset_from,
+                            offset_to: observance.offset_to,
+                        });
+                    }
+                }
+            }
+        }
+        Some(onsets)
+    }
+
+    fn offset_at(&self, at: DateTime<Utc>) -> i32 {
+        let onsets = self.onsets_for_year(at.year()).unwrap_or_default();
+        onsets
+            .iter()
+            .copied()
+            .filter(|onset| onset.instant() <= at)
+            .max_by_key(|onset| onset.instant())
+            .map(|onset| onset.offset_to)
+            .or_else(|| {
+                onsets
+                    .iter()
+                    .copied()
+                    .min_by_key(|onset| onset.instant())
+                    .map(|onset| onset.offset_from)
+            })
+            .unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Onset {
+    local: NaiveDateTime,
+    offset_from: i32,
+    offset_to: i32,
+}
+
+impl Onset {
+    fn instant(self) -> DateTime<Utc> {
+        (self.local - chrono::Duration::seconds(i64::from(self.offset_from))).and_utc()
+    }
+}
+
+fn parse_vtz_offset(value: &str) -> Option<i32> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 5
+        || !matches!(bytes[0], b'+' | b'-')
+        || !bytes[1..].iter().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let hours = i32::from(value[1..3].parse::<u8>().ok()?);
+    let minutes = i32::from(value[3..5].parse::<u8>().ok()?);
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    let sign = if bytes[0] == b'-' { -1 } else { 1 };
+    Some(sign * (hours * 3600 + minutes * 60))
+}
+
+fn parse_vtz_yearly_rule(value: &str) -> Option<(u32, i8, Weekday, Option<NaiveDateTime>)> {
+    let mut freq = None;
+    let mut month = None;
+    let mut byday = None;
+    let mut until = None;
+    for part in value
+        .trim()
+        .strip_prefix("RRULE:")
+        .unwrap_or(value.trim())
+        .split(';')
+    {
+        let (key, val) = part.split_once('=')?;
+        match key.to_ascii_uppercase().as_str() {
+            "FREQ" if freq.is_none() => freq = Some(val.to_ascii_uppercase()),
+            "BYMONTH" if month.is_none() => month = Some(val.parse::<u32>().ok()?),
+            "BYDAY" if byday.is_none() => byday = Some(parse_vtz_byday(val)?),
+            "UNTIL" if until.is_none() => until = Some(super::recur::parse_ics_datetime(val)?),
+            _ => return None,
+        }
+    }
+    if freq.as_deref() != Some("YEARLY") {
+        return None;
+    }
+    let (nth, weekday) = byday?;
+    let month = month?;
+    (1..=12)
+        .contains(&month)
+        .then_some((month, nth, weekday, until))
+}
+
+fn parse_vtz_byday(value: &str) -> Option<(i8, Weekday)> {
+    let split = value.find(|ch: char| !ch.is_ascii_digit() && ch != '-')?;
+    let nth: i8 = value[..split].parse().ok()?;
+    if !(-5..=5).contains(&nth) || nth == 0 {
+        return None;
+    }
+    let weekday = match &value[split..].to_ascii_uppercase()[..] {
+        "MO" => Weekday::Mon,
+        "TU" => Weekday::Tue,
+        "WE" => Weekday::Wed,
+        "TH" => Weekday::Thu,
+        "FR" => Weekday::Fri,
+        "SA" => Weekday::Sat,
+        "SU" => Weekday::Sun,
+        _ => return None,
+    };
+    Some((nth, weekday))
+}
+
+fn nth_weekday(year: i32, month: u32, nth: i8, weekday: Weekday) -> Option<NaiveDate> {
+    let first = NaiveDate::from_ymd_opt(year, month, 1)?;
+    if nth > 0 {
+        let delta = (weekday.num_days_from_monday() as i32
+            - first.weekday().num_days_from_monday() as i32)
+            .rem_euclid(7);
+        let day = 1 + delta + (i32::from(nth) - 1) * 7;
+        NaiveDate::from_ymd_opt(year, month, u32::try_from(day).ok()?)
+    } else {
+        let days = match month {
+            2 if NaiveDate::from_ymd_opt(year, 2, 29).is_some() => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        let last_day = first.with_day(days)?;
+        let delta = (last_day.weekday().num_days_from_monday() as i32
+            - weekday.num_days_from_monday() as i32)
+            .rem_euclid(7);
+        let day = last_day.day() as i32 - (i32::from(nth.abs()) - 1) * 7 - delta;
+        NaiveDate::from_ymd_opt(year, month, u32::try_from(day).ok()?)
+    }
 }
 
 /// The zone abbreviation, falling back to a numeric `+HH:MM` for zones whose
