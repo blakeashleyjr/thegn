@@ -1284,6 +1284,11 @@ pub fn build_change_rows(
         .iter()
         .map(|d| (d.path.as_str(), (d.added, d.deleted)))
         .collect();
+    let binary_paths: std::collections::HashSet<&str> = diff
+        .iter()
+        .filter(|d| d.binary)
+        .map(|d| d.path.as_str())
+        .collect();
     let mut rows: Vec<ChangeRow> = status
         .iter()
         .map(|f| {
@@ -1307,10 +1312,13 @@ pub fn build_change_rows(
                 })
                 .to_string(),
             };
-            let (dir, name) = match f.path.rsplit_once('/') {
+            let (dir, mut name) = match f.path.rsplit_once('/') {
                 Some((d, n)) => (format!("{d}/"), n.to_string()),
                 None => (String::new(), f.path.clone()),
             };
+            if binary_paths.contains(f.path.as_str()) {
+                name.push_str(" [binary]");
+            }
             let (added, deleted) = counts.get(f.path.as_str()).copied().unwrap_or((0, 0));
             ChangeRow {
                 status: status_str,
@@ -1709,11 +1717,13 @@ mod tests {
                 path: "host/src/tabs.rs".into(),
                 added: 84,
                 deleted: 21,
+                binary: false,
             },
             thegn_svc::git::DiffEntry {
                 path: "Cargo.toml".into(),
                 added: 3,
                 deleted: 1,
+                binary: false,
             },
         ];
         let rows = build_change_rows(&status, &diff, &std::collections::HashSet::new());
@@ -1742,6 +1752,19 @@ mod tests {
         let root = rows.iter().find(|r| r.name == "Cargo.toml").unwrap();
         assert_eq!(root.dir, "");
         assert!(build_change_rows(&[], &[], &std::collections::HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn binary_change_rows_show_binary_marker() {
+        let status = [fstat('M', ' ', "assets/logo.png")];
+        let diff = [thegn_svc::git::DiffEntry {
+            path: "assets/logo.png".into(),
+            added: 0,
+            deleted: 0,
+            binary: true,
+        }];
+        let rows = build_change_rows(&status, &diff, &std::collections::HashSet::new());
+        assert_eq!(rows[0].name, "logo.png [binary]");
     }
 
     #[test]
