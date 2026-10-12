@@ -5,8 +5,8 @@
 
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,11 +16,50 @@ use thegn_core::config::Config;
 const QUEUE_COMMANDS: usize = 64;
 const MAX_CHUNK_BYTES: usize = 16 * 1024;
 const FINISH_TIMEOUT: Duration = Duration::from_secs(2);
+const GLOBAL_INFLIGHT_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Debug)]
+static RECORDING_INFLIGHT: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+
+fn global_inflight() -> Arc<AtomicUsize> {
+    Arc::clone(RECORDING_INFLIGHT.get_or_init(|| Arc::new(AtomicUsize::new(0))))
+}
+
+struct BytePermit {
+    budget: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl BytePermit {
+    fn reserve(budget: &Arc<AtomicUsize>, bytes: usize, limit: usize) -> Option<Self> {
+        match budget.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            used.checked_add(bytes).filter(|next| *next <= limit)
+        }) {
+            Ok(_) => Some(Self {
+                budget: Arc::clone(budget),
+                bytes,
+            }),
+            Err(_) => None,
+        }
+    }
+}
+
+impl Drop for BytePermit {
+    fn drop(&mut self) {
+        self.budget.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
 enum Command {
-    Output { at: f64, bytes: Vec<u8> },
-    Resize { at: f64, cols: u16, rows: u16 },
+    Output {
+        at: f64,
+        bytes: Vec<u8>,
+        _permit: BytePermit,
+    },
+    Resize {
+        at: f64,
+        cols: u16,
+        rows: u16,
+    },
 }
 
 struct WorkerState {
@@ -63,6 +102,8 @@ pub(crate) struct Recorder {
     worker: Option<JoinHandle<()>>,
     result: mpsc::Receiver<Finished>,
     state: Arc<WorkerState>,
+    inflight: Arc<AtomicUsize>,
+    inflight_limit: usize,
     path: PathBuf,
     start: Instant,
 }
@@ -99,6 +140,7 @@ impl Recorder {
         let (tx, rx) = mpsc::sync_channel(QUEUE_COMMANDS);
         let (result_tx, result) = mpsc::channel();
         let state = Arc::new(WorkerState::new());
+        let inflight = global_inflight();
         let worker_state = Arc::clone(&state);
         let worker_path = path.clone();
         let worker = thread::Builder::new()
@@ -123,6 +165,8 @@ impl Recorder {
             worker: Some(worker),
             result,
             state,
+            inflight,
+            inflight_limit: GLOBAL_INFLIGHT_BYTES,
             path,
             start: Instant::now(),
         })
@@ -135,9 +179,18 @@ impl Recorder {
         }
         let at = self.elapsed();
         for chunk in bytes.chunks(MAX_CHUNK_BYTES) {
+            let Some(permit) =
+                BytePermit::reserve(&self.inflight, chunk.len(), self.inflight_limit)
+            else {
+                self.state.fail(
+                    "recording truncated: global recording buffer budget exhausted".to_string(),
+                );
+                break;
+            };
             self.try_enqueue(Command::Output {
                 at,
                 bytes: chunk.to_vec(),
+                _permit: permit,
             });
             if self.done() {
                 break;
@@ -302,6 +355,15 @@ fn open_cast_writer(
 
 #[cfg(test)]
 fn start_with_writer<W: Write + Send + 'static>(writer: CastWriter<W>) -> Recorder {
+    start_with_writer_budget(writer, Arc::new(AtomicUsize::new(0)), GLOBAL_INFLIGHT_BYTES)
+}
+
+#[cfg(test)]
+fn start_with_writer_budget<W: Write + Send + 'static>(
+    writer: CastWriter<W>,
+    inflight: Arc<AtomicUsize>,
+    inflight_limit: usize,
+) -> Recorder {
     let (tx, rx) = mpsc::sync_channel(QUEUE_COMMANDS);
     let (result_tx, result) = mpsc::channel();
     let state = Arc::new(WorkerState::new());
@@ -319,6 +381,8 @@ fn start_with_writer<W: Write + Send + 'static>(writer: CastWriter<W>) -> Record
         worker: Some(worker),
         result,
         state,
+        inflight,
+        inflight_limit,
         path,
         start: Instant::now(),
     }
@@ -336,7 +400,7 @@ fn run_writer<W: Write>(
     let mut failure = None;
     while let Ok(command) = rx.recv() {
         let result = match command {
-            Command::Output { at, bytes } => {
+            Command::Output { at, bytes, .. } => {
                 last_at = at;
                 let text = carry.push(&bytes);
                 if text.is_empty() {
@@ -417,9 +481,9 @@ mod tests {
 
     #[test]
     fn feed_and_finish_write_a_parseable_cast() {
-        let tmp = std::env::temp_dir().join(format!("thegn-rec-test-{}", now_ms()));
+        let tmp = tempfile::tempdir().unwrap();
         let mut cfg = Config::default();
-        cfg.recording.dir = tmp.to_string_lossy().into_owned();
+        cfg.recording.dir = tmp.path().to_string_lossy().into_owned();
         let mut rec = Recorder::start("sess-1", 80, 24, &cfg).expect("start");
         rec.feed(b"hello ");
         rec.resize(120, 40);
@@ -436,14 +500,13 @@ mod tests {
             .collect();
         assert_eq!(events.len(), 3, "output, resize, output retain queue order");
         assert_eq!(events[1][1], "r");
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
     fn feed_splits_a_64k_chunk_and_recording_continues() {
-        let tmp = std::env::temp_dir().join(format!("thegn-rec-large-{}", now_ms()));
+        let tmp = tempfile::tempdir().unwrap();
         let mut cfg = Config::default();
-        cfg.recording.dir = tmp.to_string_lossy().into_owned();
+        cfg.recording.dir = tmp.path().to_string_lossy().into_owned();
         let mut rec = Recorder::start("sess-large", 80, 24, &cfg).expect("start");
         rec.feed(&vec![b'a'; 64 * 1024]);
         assert!(
@@ -459,12 +522,12 @@ mod tests {
             6,
             "header, four chunks, and later output"
         );
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
     fn asynchronous_start_failure_marks_recorder_done() {
-        let blocker = std::env::temp_dir().join(format!("thegn-rec-file-{}", now_ms()));
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("not-a-directory");
         std::fs::write(&blocker, b"not a directory").unwrap();
         let mut cfg = Config::default();
         cfg.recording.dir = blocker.to_string_lossy().into_owned();
@@ -484,7 +547,6 @@ mod tests {
         );
         let finished = rec.finish();
         assert!(finished.truncated.is_some());
-        std::fs::remove_file(blocker).unwrap();
     }
 
     #[test]
@@ -548,6 +610,74 @@ mod tests {
     }
 
     #[test]
+    fn recorders_share_a_global_inflight_byte_budget() {
+        struct SlowWriter {
+            started: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Write for SlowWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.started
+                    .send(())
+                    .map_err(|_| io::Error::other("test observer dropped"))?;
+                self.release
+                    .recv()
+                    .map_err(|_| io::Error::other("test stall released"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        fn slow_recorder(
+            budget: &Arc<AtomicUsize>,
+            started: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        ) -> Recorder {
+            let mut header = Header::new(80, 24);
+            header.timestamp = Some(0);
+            let writer = CastWriter::new(BufWriter::new(SlowWriter { started, release }), &header)
+                .expect("buffered header");
+            start_with_writer_budget(writer, Arc::clone(budget), MAX_CHUNK_BYTES)
+        }
+
+        let budget = Arc::new(AtomicUsize::new(0));
+        let (first_started_tx, first_started_rx) = mpsc::channel();
+        let (first_release_tx, first_release_rx) = mpsc::channel();
+        let (second_started_tx, _second_started_rx) = mpsc::channel();
+        let (second_release_tx, second_release_rx) = mpsc::channel();
+        let mut first = slow_recorder(&budget, first_started_tx, first_release_rx);
+        let mut second = slow_recorder(&budget, second_started_tx, second_release_rx);
+
+        first.feed(&vec![b'a'; MAX_CHUNK_BYTES]);
+        first_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first slow sink entered");
+        second.feed(b"second recorder still has queue slots");
+        assert!(second.done());
+        assert!(
+            second
+                .failure()
+                .as_deref()
+                .is_some_and(|reason| reason.contains("global recording buffer budget"))
+        );
+        assert_eq!(budget.load(Ordering::Acquire), MAX_CHUNK_BYTES);
+
+        first_release_tx.send(()).unwrap();
+        second_release_tx.send(()).unwrap();
+        let first_finished = first.finish();
+        let second_finished = second.finish();
+        assert!(first_finished.truncated.is_none());
+        assert!(
+            second_finished
+                .truncated
+                .as_deref()
+                .is_some_and(|reason| reason.contains("global recording buffer budget"))
+        );
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn finish_timeout_reports_truncation() {
         struct StalledWriter(mpsc::Receiver<()>);
         impl Write for StalledWriter {
@@ -599,25 +729,32 @@ mod tests {
         let writer =
             CastWriter::new(BufWriter::new(FailingWriter), &header).expect("header is buffered");
         let state = WorkerState::new();
-        let (tx, rx) = mpsc::sync_channel(1);
-        tx.send(Command::Output {
-            at: 0.1,
-            bytes: b"fail".to_vec(),
-        })
-        .unwrap();
+        let budget = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::sync_channel(2);
+        for bytes in [b"fail".as_slice(), b"queued".as_slice()] {
+            let permit = BytePermit::reserve(&budget, bytes.len(), 64).unwrap();
+            tx.send(Command::Output {
+                at: 0.1,
+                bytes: bytes.to_vec(),
+                _permit: permit,
+            })
+            .unwrap();
+        }
+        assert_eq!(budget.load(Ordering::Acquire), 10);
         drop(tx);
         let fin = run_writer(rx, &path, 0, &state, writer);
         assert!(
             fin.truncated.is_some(),
             "sink failure must not report a clean save"
         );
+        assert_eq!(budget.load(Ordering::Acquire), 0);
     }
 
     #[test]
     fn size_cap_finalizes_rather_than_growing() {
-        let tmp = std::env::temp_dir().join(format!("thegn-rec-cap-{}", now_ms()));
+        let tmp = tempfile::tempdir().unwrap();
         let mut cfg = Config::default();
-        cfg.recording.dir = tmp.to_string_lossy().into_owned();
+        cfg.recording.dir = tmp.path().to_string_lossy().into_owned();
         cfg.recording.max_bytes = 200;
         let mut rec = Recorder::start("sess-cap", 80, 24, &cfg).expect("start");
         for _ in 0..100 {
@@ -640,6 +777,5 @@ mod tests {
         let text = std::fs::read_to_string(&fin.path).unwrap();
         let header: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         assert_eq!(header["version"], 2);
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 }
