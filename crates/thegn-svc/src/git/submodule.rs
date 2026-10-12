@@ -16,6 +16,21 @@ use thegn_core::submodule::{
 
 use super::{FileStatus, parse_status_porcelain, run, run_w};
 
+/// Recursive initialization is blocked until the complete nested metadata
+/// closure can be pinned and approved at the executing repository authority.
+#[derive(Debug)]
+pub(crate) struct RecursiveSubmoduleInitRefused;
+
+impl std::fmt::Display for RecursiveSubmoduleInitRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "recursive submodule initialization requires approval of the pinned nested closure",
+        )
+    }
+}
+
+impl std::error::Error for RecursiveSubmoduleInitRefused {}
+
 /// Parse the mode-160000 entries from git diff --raw -z output.
 ///
 /// With `-z`, Git terminates the header and pathname with NULs rather than
@@ -272,11 +287,16 @@ pub(crate) fn summary(
 }
 
 pub(crate) fn init(loc: &GitLoc, recursive: bool) -> Result<()> {
-    let args: Vec<&str> = if recursive {
-        vec!["submodule", "update", "--init", "--recursive"]
-    } else {
-        vec!["submodule", "update", "--init"]
-    };
+    if recursive {
+        return Err(RecursiveSubmoduleInitRefused.into());
+    }
+    let args = [
+        "-c",
+        "submodule.recurse=false",
+        "submodule",
+        "update",
+        "--init",
+    ];
     run_w(loc, &[], &args).map(|_| ())
 }
 
@@ -446,6 +466,17 @@ mod tests {
     use super::*;
     use crate::git::PlumbingOps;
     use crate::git::testutil::{TestRepo, git_in};
+
+    #[test]
+    fn recursive_initialization_is_refused_with_a_typed_reason() {
+        let repo = TestRepo::new("submodule-recursive-refused");
+        let error = init(&repo.loc(), true).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<RecursiveSubmoduleInitRefused>()
+                .is_some()
+        );
+    }
 
     #[test]
     fn raw_parser_keeps_only_gitlinks_and_classifies_add_delete() {
