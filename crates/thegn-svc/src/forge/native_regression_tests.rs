@@ -332,32 +332,22 @@ fn rate_limit_retry_headers_set_backoff_and_200_remains_successful() {
         .unwrap_err();
         assert_eq!(error, ForgeError::RateLimited);
         assert_eq!(health.active_error(), Some(ForgeError::RateLimited));
-        assert!(
-            retry_delay(
-                &reqwest::header::HeaderMap::from_iter([
-                    (
-                        reqwest::header::HeaderName::from_static("x-ratelimit-reset"),
-                        reqwest::header::HeaderValue::from_str(
-                            &(std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs()
-                                + 120)
-                                .to_string(),
-                        )
-                        .unwrap(),
-                    ),
-                    (
-                        reqwest::header::HeaderName::from_static("x-ratelimit-remaining"),
-                        reqwest::header::HeaderValue::from_static("0"),
-                    ),
-                ]),
-                true
-            )
+        let mut reset_headers = reqwest::header::HeaderMap::new();
+        let reset_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
-                >= 119
+            + 120;
+        reset_headers.insert(
+            reqwest::header::HeaderName::from_static("x-ratelimit-reset"),
+            reqwest::header::HeaderValue::from_str(&reset_epoch.to_string()).unwrap(),
         );
+        reset_headers.insert(
+            reqwest::header::HeaderName::from_static("x-ratelimit-remaining"),
+            reqwest::header::HeaderValue::from_static("0"),
+        );
+        let reset_delay = retry_delay(&reset_headers, true).unwrap();
+        assert!(reset_delay.as_secs() >= 119);
 
         let success = graphql_request(
             &client(200, r#"{"data":{"ok":true}}"#),
