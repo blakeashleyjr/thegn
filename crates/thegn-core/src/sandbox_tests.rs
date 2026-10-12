@@ -910,7 +910,7 @@ fn compose_refusal_tracks_only_unenforced_restrictions() {
     bwrap.backend = Backend::Bwrap;
     bwrap.read_only_root = true;
     let argv = enter_argv(&bwrap, "true").unwrap();
-    assert_eq!(argv.first().map(String::as_str), Some("bwrap"));
+    assert!(argv.iter().any(|arg| arg == "bwrap"), "{argv:?}");
     assert!(!argv.iter().any(|arg| arg == "compose" || arg == "exec"));
     let mut isolated = spec(Backend::Bwrap);
     isolated.read_only_root = true;

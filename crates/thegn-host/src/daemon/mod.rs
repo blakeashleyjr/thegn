@@ -996,7 +996,7 @@ mod tests {
             None,
         );
         assert_eq!(socket, private_tmp_socket_path(state, 4242));
-        assert!(socket.starts_with("/tmp/thegn-4242-"));
+        assert!(socket.to_string_lossy().starts_with("/tmp/thegn-4242-"));
         assert!(!socket.starts_with(state));
     }
 

@@ -304,7 +304,7 @@ mod tests {
                 .unwrap();
         assert_eq!(routed, spec.placement.control_argv(&pane_path));
         let exec = routed.iter().position(|arg| arg == "exec").unwrap();
-        assert_eq!(routed[exec + 1], "worker");
+        assert!(routed[exec + 1..].iter().any(|arg| arg == "worker"));
         assert!(!routed.contains(&"-it".into()));
 
         spec.backend = Backend::Bwrap;

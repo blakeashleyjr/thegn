@@ -1084,6 +1084,7 @@ mod tests {
                     .as_ref()
         }));
 
+        std::fs::create_dir_all(state.join("nested")).unwrap();
         let overlap = |key: &str| match key {
             "XDG_STATE_HOME" => Some(state.as_os_str().to_owned()),
             "XDG_DATA_HOME" => Some(state.join("nested").into_os_string()),
