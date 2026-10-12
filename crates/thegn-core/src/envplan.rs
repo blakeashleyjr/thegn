@@ -2725,6 +2725,7 @@ mod tests {
             Some("http://127.0.0.1:8484"),
         );
         assert!(hc.contains("extra-substituters = http://127.0.0.1:8484"));
+        assert!(!hc.contains("require-sigs = false"));
         assert!(hc.contains("require-sigs = true"));
         assert!(hc.contains("extra-substituters = https://cache.example.org"));
         // Host cache ⇒ graceful-degradation trio so a not-yet-up tunnel or a desynced
