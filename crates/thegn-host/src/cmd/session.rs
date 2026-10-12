@@ -1165,6 +1165,12 @@ fn fail_reserved_row(db: &Db, row_id: i64, note: &str) -> Result<Option<String>>
     Ok(db.get_dispatch(row_id)?.and_then(|row| row.session_id))
 }
 
+/// Fail a finisher reservation whose prompt could not be rendered. Keep a
+/// concurrent verdict intact and record why this reservation was closed.
+fn close_unrendered_finisher(db: &Db, row_id: i64) -> Result<()> {
+    fail_reserved_row(db, row_id, "finisher prompt render failed").map(|_| ())
+}
+
 /// Publish an already-opened daemon session on its roster row. The daemon and
 /// SQLite cannot share one transaction, so every missing/stale/error outcome is
 /// compensated immediately by killing the new session. A concurrent roster
@@ -1497,7 +1503,14 @@ async fn resume_work(
     }) {
         Ok(prompt) => prompt,
         Err(error) => {
-            let _ = db.update_dispatch_status(new_row, AgentDispatchStatus::Failed);
+            if let Err(close_error) = close_unrendered_finisher(&db, new_row) {
+                tracing::warn!(
+                    target: "thegn::dispatch",
+                    row = new_row,
+                    %close_error,
+                    "failed to close finisher reservation after prompt render failure"
+                );
+            }
             return Err(error).with_context(|| format!("dispatch {new_row} failed"));
         }
     };
@@ -2230,7 +2243,7 @@ mod catalog_tests {
 
 #[cfg(test)]
 mod fail_reserved_row_tests {
-    use super::fail_reserved_row;
+    use super::{close_unrendered_finisher, fail_reserved_row};
     use thegn_core::db::Db;
     use thegn_core::issue::{AgentDispatchStatus, NewDispatch};
     use thegn_core::store::NotificationStore;
@@ -2289,6 +2302,45 @@ mod fail_reserved_row_tests {
         assert_eq!(
             db.get_dispatch(row).expect("read row").unwrap().status,
             AgentDispatchStatus::Failed
+        );
+    }
+
+    #[test]
+    fn unrenderable_finisher_does_not_overwrite_a_concurrent_abandonment() {
+        let db = Db::open_memory().expect("memory db");
+        let row = staged_row(&db);
+        db.set_dispatch_status_checked(
+            row,
+            AgentDispatchStatus::Queued,
+            AgentDispatchStatus::Abandoned,
+            None,
+        )
+        .expect("concurrent abandonment");
+
+        close_unrendered_finisher(&db, row).expect("close finisher");
+
+        assert_eq!(
+            db.get_dispatch(row).expect("read row").unwrap().status,
+            AgentDispatchStatus::Abandoned
+        );
+    }
+
+    #[test]
+    fn unrenderable_queued_finisher_fails_with_reason_note() {
+        let db = Db::open_memory().expect("memory db");
+        let row = staged_row(&db);
+
+        close_unrendered_finisher(&db, row).expect("close finisher");
+
+        assert_eq!(
+            db.get_dispatch(row).expect("read row").unwrap().status,
+            AgentDispatchStatus::Failed
+        );
+        let notes = db.dispatch_notes(row, None, 0).expect("read notes");
+        assert!(
+            notes
+                .iter()
+                .any(|note| { note.text == "finisher prompt render failed" })
         );
     }
 }
