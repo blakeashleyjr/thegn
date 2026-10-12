@@ -1088,7 +1088,7 @@ mod tests {
     #[test]
     fn feed_bridge_claim_is_limited_to_one_per_entry() {
         let mut entry = build_entry(loaded_state(seg_spec("p")));
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) = std::sync::mpsc::channel::<()>();
         entry.feed_bridge = Some(std::thread::spawn(move || {
             receiver.recv().unwrap();
         }));
