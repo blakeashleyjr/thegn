@@ -661,7 +661,6 @@ mod unix_tests {
         worker.join().unwrap();
         let error = received
             .expect("background commit must return while the lock remains held")
-            .unwrap()
             .unwrap_err();
         assert!(
             matches!(

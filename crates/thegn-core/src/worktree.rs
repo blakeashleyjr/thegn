@@ -1134,7 +1134,6 @@ mod tests {
         worker.join().unwrap();
         let error = received
             .expect("worktree removal must return while the lock remains held")
-            .unwrap()
             .unwrap_err();
         assert!(error.contains("mutation lock"), "{error}");
         assert!(error.contains("timed out"), "{error}");
@@ -1175,7 +1174,6 @@ mod tests {
         worker.join().unwrap();
         let error = received
             .expect("worktree creation must return while the lock remains held")
-            .unwrap()
             .unwrap_err();
         assert!(error.lock_unavailable);
         assert!(error.message.contains("timed out"), "{}", error.message);
