@@ -280,11 +280,23 @@ mod tests {
             IssueProviderKind::Kaneo => IssueCaps {
                 comments: true,
                 labels: true,
+                patch_status: true,
+                patch_title: true,
+                patch_priority: true,
+                ..Default::default()
             },
-            IssueProviderKind::None
-            | IssueProviderKind::Linear
-            | IssueProviderKind::Github
-            | IssueProviderKind::Jira => IssueCaps::default(),
+            IssueProviderKind::Linear => IssueCaps {
+                patch_status: true,
+                patch_title: true,
+                patch_priority: true,
+                ..Default::default()
+            },
+            IssueProviderKind::Github | IssueProviderKind::Jira => IssueCaps {
+                patch_status: true,
+                patch_title: true,
+                ..Default::default()
+            },
+            IssueProviderKind::None => IssueCaps::default(),
         }
     }
 
@@ -468,6 +480,7 @@ mod tests {
             declared: IssueCaps {
                 comments: true,
                 labels: false,
+                ..Default::default()
             },
             implemented: IssueCaps::default(),
         };
@@ -478,6 +491,7 @@ mod tests {
             implemented: IssueCaps {
                 comments: true,
                 labels: false,
+                ..Default::default()
             },
         };
         assert!(std::panic::catch_unwind(|| assert_optional_contract(&underclaim, &rt)).is_err());
