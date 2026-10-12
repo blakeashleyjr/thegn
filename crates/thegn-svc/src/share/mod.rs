@@ -31,6 +31,8 @@ use thegn_core::share::{ShareParams, ShareSpec};
 
 use crate::vpn::{OciRuntime, exec_in};
 
+pub type ConflictHook = Box<dyn FnOnce() + Send>;
+
 #[cfg(test)]
 mod tests;
 
@@ -922,7 +924,7 @@ impl RunningShare {
 
     /// Run `hook` once when a changed endpoint announcement is observed.
     /// Installing after the conflict was observed still runs it immediately.
-    pub fn on_endpoint_conflict(&self, hook: Box<dyn FnOnce() + Send>) {
+    pub fn on_endpoint_conflict(&self, hook: ConflictHook) {
         let mut hook_slot = self.endpoint_tracker.conflict_hook.lock().unwrap();
         *hook_slot = Some(hook);
         if self.endpoint_tracker.conflict.load(Ordering::Acquire)
@@ -958,7 +960,7 @@ impl RunningShare {
 struct EndpointTracker {
     accepted: Arc<OnceLock<String>>,
     conflict: Arc<AtomicBool>,
-    conflict_hook: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+    conflict_hook: Arc<Mutex<Option<ConflictHook>>>,
 }
 
 impl EndpointTracker {

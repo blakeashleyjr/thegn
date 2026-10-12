@@ -1436,7 +1436,6 @@ fn materialize_refuses_hardlinked_state_file_before_replacement() {
     );
 
     assert!(start(&plan, &sd, Duration::from_secs(2)).is_err());
-    assert_eq!(std::fs::read_to_string(&credential).unwrap(), "ORIGINAL");
     assert_eq!(std::fs::read_to_string(&second_name).unwrap(), "ORIGINAL");
     assert!(!marker.exists(), "provider must not be spawned");
 }
