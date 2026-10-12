@@ -1145,7 +1145,7 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
             return None;
         }
     };
-    let mut probe_failed = false;
+    let probe_failed = std::cell::Cell::new(false);
     let base = base_from_probe(origin_head.as_deref(), |b| {
         match run_status(
             loc,
@@ -1159,12 +1159,12 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
             Ok((0, _)) => true,
             Ok((1, _)) => false, // candidate branch absent
             _ => {
-                probe_failed = true;
+                probe_failed.set(true);
                 false
             }
         }
     });
-    if probe_failed {
+    if probe_failed.get() {
         record_base_probe_failure(key);
         return None;
     }
