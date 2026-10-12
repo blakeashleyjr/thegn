@@ -124,6 +124,7 @@ impl KittyRelay {
     /// Emit pieces as they complete instead of accumulating an input-sized
     /// output vector. At most one 4 MiB APC and one 8 KiB text slice are owned
     /// by the parser; the consumer owns each emitted piece immediately.
+    #[cfg(test)]
     pub fn feed_with(&mut self, input: &[u8], emit: impl FnMut(Piece)) {
         self.feed_with_rect(input, (u16::MAX as usize, u16::MAX as usize), emit);
     }
