@@ -1590,6 +1590,14 @@ mod tests {
         assert!(message.contains("gate unavailable"));
         assert!(!message.contains("é"));
         assert!(message.chars().count() <= 270);
+
+        let (kind, message) =
+            step_notification(MqStatus::AgentBlocked, "feature", &"é".repeat(5_000))
+                .expect("agent blocks notify the inbox");
+
+        assert_eq!(kind, NotificationKind::QueueNeedsHuman);
+        assert!(message.chars().count() <= 270);
+        assert!(message.ends_with('…'));
     }
 
     /// THE-515 fixture: a real git repo named `acme` plus an isolated state
