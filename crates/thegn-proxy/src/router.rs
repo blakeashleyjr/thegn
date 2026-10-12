@@ -1053,6 +1053,7 @@ mod tests {
             );
             socket.write_all(response.as_bytes()).await.unwrap();
             socket.write_all(body).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
         });
         format!("http://{addr}")
     }
