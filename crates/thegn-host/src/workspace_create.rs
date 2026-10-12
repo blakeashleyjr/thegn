@@ -571,6 +571,7 @@ fn remove_partial_clone_dest(dest: &std::path::Path, dest_existed: bool) {
 /// Read `git`'s progress stream, calling `on_line` with each finished segment.
 /// git rewrites its progress counter in place with a carriage return, so we
 /// break on `\r` *and* `\n` (trimming, dropping empties) rather than by line.
+#[cfg(test)]
 pub(crate) fn stream_progress_lines<R: std::io::BufRead>(reader: R, on_line: impl FnMut(String)) {
     stream_progress_lines_with_activity(reader, on_line, || {});
 }
@@ -602,9 +603,8 @@ fn stream_progress_lines_with_activity<R: std::io::BufRead>(
             first_segment = false;
         } else if buf.len() < MAX_PROGRESS_SEGMENT {
             buf.push(b);
-            if !first_segment {
-                on_activity();
-            } else if !CLONE_BANNER.starts_with(&buf) && !buf.starts_with(CLONE_BANNER) {
+            if !first_segment || (!CLONE_BANNER.starts_with(&buf) && !buf.starts_with(CLONE_BANNER))
+            {
                 on_activity();
             }
         }
