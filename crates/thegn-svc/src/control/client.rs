@@ -1751,6 +1751,54 @@ mod tests {
     use thegn_core::db::Db;
 
     #[tokio::test]
+    async fn start_attach_publishes_hello_before_buffered_snapshot() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let hello = EventFrame::Hello(Hello {
+                proto: PROTO_VERSION,
+                server: "test daemon".into(),
+                scopes: vec![],
+            });
+            let snapshot = EventFrame::PaneSnapshot {
+                session: "session-1".into(),
+                seq: 0,
+                cols: 80,
+                rows: 24,
+                bytes: Vec::new(),
+            };
+            ws.send(Message::Binary(hello.encode().into()))
+                .await
+                .unwrap();
+            ws.send(Message::Binary(snapshot.encode().into()))
+                .await
+                .unwrap();
+            matches!(ws.next().await, Some(Ok(Message::Close(_))))
+        });
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let (frames, mut receiver) = tokio_mpsc::channel(1);
+        let (control, ctrl) = tokio_mpsc::channel(1);
+
+        start_attach(ws, frames, ctrl).await.unwrap();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap();
+        assert!(matches!(first, Some(EventFrame::Hello(_))));
+        control.send(AttachControl::Close).await.unwrap();
+        assert!(
+            server.await.unwrap(),
+            "the attach pump must close its socket"
+        );
+    }
+
+    #[tokio::test]
     async fn attach_greeting_occupies_single_slot_before_publisher_starts() {
         let (frames, mut receiver) = tokio_mpsc::channel(1);
         let hello = Hello {
