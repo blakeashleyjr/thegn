@@ -502,7 +502,7 @@ impl Db {
         if !(MIN_LEASE_TTL_SECS..=MAX_LEASE_TTL_SECS).contains(&ttl_secs) {
             return Err(anyhow::Error::new(LeaseInputError {
                 field: "ttl",
-                reason: "must be between 5 and 86400 seconds",
+                reason: "outside the admitted lease TTL range",
             }));
         }
         let now = util::now_ms();
