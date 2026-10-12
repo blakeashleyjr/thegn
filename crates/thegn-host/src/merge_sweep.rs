@@ -682,11 +682,11 @@ mod tests {
         rusqlite::Connection::open(&db_path)
             .unwrap()
             .execute(
-                    "UPDATE merge_queue SET worktree=?1, result_oid=NULL, queued_at=1, updated_at=1 WHERE worktree=?2",
-                    rusqlite::params![
-                        missing.to_string_lossy().into_owned(),
-                        wt.to_string_lossy().into_owned()
-                    ],
+                "UPDATE merge_queue SET worktree=?1, result_oid=NULL, queued_at=1, updated_at=1 WHERE worktree=?2",
+                rusqlite::params![
+                    missing.to_string_lossy().into_owned(),
+                    wt.to_string_lossy().into_owned()
+                ],
             )
             .unwrap();
 
