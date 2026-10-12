@@ -75,9 +75,9 @@ pub(crate) struct ChangesActivateCtx<'a> {
     pub need_relayout: &'a mut bool,
     pub center: Rect,
     pub cfg: &'a thegn_core::config::Config,
-    pub hunk_inflight: &'a mut std::collections::HashSet<String>,
-    pub hunk_tx: &'a tokio::sync::mpsc::UnboundedSender<(u64, String, Vec<thegn_svc::git::Hunk>)>,
-    pub submodule_inflight: &'a mut std::collections::HashSet<String>,
+    pub hunk_inflight: &'a mut PreviewOwners,
+    pub hunk_tx: &'a tokio::sync::mpsc::UnboundedSender<crate::run::HunkMsg>,
+    pub submodule_inflight: &'a mut PreviewOwners,
     pub submodule_tx: &'a tokio::sync::mpsc::UnboundedSender<SubmodulePreviewMsg>,
     pub waker: &'a termwiz::terminal::TerminalWaker,
     pub hydration_gen: u64,
@@ -182,9 +182,9 @@ pub(crate) fn toggle_change_selection(
     panel_ui: &mut crate::panel::PanelUi,
     model: &FrameModel,
     session: &crate::session::Session,
-    hunk_inflight: &mut std::collections::HashSet<String>,
-    hunk_tx: &tokio::sync::mpsc::UnboundedSender<(u64, String, Vec<thegn_svc::git::Hunk>)>,
-    submodule_inflight: &mut std::collections::HashSet<String>,
+    hunk_inflight: &mut PreviewOwners,
+    hunk_tx: &tokio::sync::mpsc::UnboundedSender<crate::run::HunkMsg>,
+    submodule_inflight: &mut PreviewOwners,
     submodule_tx: &tokio::sync::mpsc::UnboundedSender<SubmodulePreviewMsg>,
     waker: &termwiz::terminal::TerminalWaker,
     generation: u64,
@@ -238,7 +238,41 @@ pub(crate) fn toggle_change_selection(
     }
 }
 
-pub(crate) type SubmodulePreviewMsg = (u64, String, thegn_core::submodule::SubmoduleSummary);
+/// Monotonic ownership tokens prevent late workers from clearing a replacement
+/// job for the same path after a refresh or worktree switch.
+#[derive(Debug, Default)]
+pub(crate) struct PreviewOwners {
+    next: u64,
+    owners: std::collections::HashMap<String, u64>,
+}
+
+impl PreviewOwners {
+    pub(crate) fn begin(&mut self, key: &str) -> Option<u64> {
+        if self.owners.contains_key(key) {
+            return None;
+        }
+        self.next = self
+            .next
+            .checked_add(1)
+            .expect("preview owner token exhausted");
+        self.owners.insert(key.to_owned(), self.next);
+        Some(self.next)
+    }
+
+    pub(crate) fn finish(&mut self, key: &str, token: u64) -> bool {
+        if self.owners.get(key) != Some(&token) {
+            return false;
+        }
+        self.owners.remove(key);
+        true
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.owners.clear();
+    }
+}
+
+pub(crate) type SubmodulePreviewMsg = (u64, u64, String, thegn_core::submodule::SubmoduleSummary);
 
 /// Fetch a bounded, local-object-only gitlink summary off the event loop.
 /// Failures become an explicit unavailable summary so the preview keeps the
@@ -246,7 +280,7 @@ pub(crate) type SubmodulePreviewMsg = (u64, String, thegn_core::submodule::Submo
 fn spawn_submodule_preview(
     row: &crate::panel::ChangeRow,
     session: &crate::session::Session,
-    inflight: &mut std::collections::HashSet<String>,
+    inflight: &mut PreviewOwners,
     tx: &tokio::sync::mpsc::UnboundedSender<SubmodulePreviewMsg>,
     waker: &termwiz::terminal::TerminalWaker,
     generation: u64,
@@ -259,9 +293,9 @@ fn spawn_submodule_preview(
     else {
         return;
     };
-    if !inflight.insert(row.path.clone()) {
+    let Some(token) = inflight.begin(&row.path) else {
         return;
-    }
+    };
     let wt = crate::hydrate::active_tab_path(session);
     let path = row.path.clone();
     let old = submodule.diff.old_sha.clone();
@@ -281,7 +315,7 @@ fn spawn_submodule_preview(
                     true,
                 )
             });
-        if tx.send((generation, path, summary)).is_ok() && waker.wake().is_err() {
+        if tx.send((generation, token, path, summary)).is_ok() && waker.wake().is_err() {
             tracing::debug!("submodule preview wake dropped during shutdown");
         }
     });
@@ -308,5 +342,30 @@ fn submodule_loc(
             control_prefix,
             path: format!("{}/{}", path.trim_end_matches('/'), submodule_path),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PreviewOwners;
+
+    #[test]
+    fn duplicate_path_owner_is_refused_until_completed() {
+        let mut owners = PreviewOwners::default();
+        let first = owners.begin("src/lib.rs").unwrap();
+        assert_eq!(owners.begin("src/lib.rs"), None);
+        assert!(owners.finish("src/lib.rs", first));
+    }
+
+    #[test]
+    fn stale_completion_cannot_remove_a_replacement_owner() {
+        let mut owners = PreviewOwners::default();
+        let stale = owners.begin("src/lib.rs").unwrap();
+        owners.clear();
+        let current = owners.begin("src/lib.rs").unwrap();
+
+        assert!(!owners.finish("src/lib.rs", stale));
+        assert_eq!(owners.begin("src/lib.rs"), None);
+        assert!(owners.finish("src/lib.rs", current));
     }
 }
