@@ -93,6 +93,7 @@ fn claim_command(slug: &str) -> String {
          elif [ -d \"$d\" ] && [ ! -L \"$d\" ] && [ ! -e \"$marker\" ] && \
               [ -e \"$d/.git\" ] && top=$(git -C \"$d\" rev-parse --show-cdup 2>/dev/null) && [ -z \"$top\" ] && \
               : > \"$marker\" 2>/dev/null; then \
+              rm -f \"$d.bundle\"; \
               printf 'REUSED:%s' \"$d\"; \
          else printf '%s' 'remote destination exists but is incomplete or not a Git checkout; retained for reconciliation' >&2; exit 1; fi",
         slug = q(slug),
@@ -135,10 +136,13 @@ fn restore_command(dir: &str, branch: &str, recursive_submodules: bool) -> Strin
 
 fn refresh_command(dir: &str, branch: &str, recursive_submodules: bool) -> String {
     let checkout = if branch.is_empty() || branch == "HEAD" {
-        format!("git -C {d} checkout -q --detach FETCH_HEAD; ", d = q(dir))
+        format!(
+            "git -C {d} checkout -q -f --detach FETCH_HEAD; ",
+            d = q(dir)
+        )
     } else {
         format!(
-            "git -C {d} checkout -qB {b} FETCH_HEAD; ",
+            "git -C {d} checkout -q -f -B {b} FETCH_HEAD; ",
             d = q(dir),
             b = q(branch)
         )
@@ -152,7 +156,7 @@ fn refresh_command(dir: &str, branch: &str, recursive_submodules: bool) -> Strin
         String::new()
     };
     format!(
-        "set -e; git -C {d} fetch -q {bundle} HEAD; {checkout}{init}rm -f {bundle}",
+        "set -e; git -C {d} fetch -q {bundle} HEAD; git -C {d} reset -q --hard; git -C {d} clean -ffdq; {checkout}{init}rm -f {bundle}",
         d = q(dir),
         bundle = q(&format!("{dir}.bundle")),
     )
@@ -493,8 +497,10 @@ mod tests {
         let complete = home.join("thegn-worktrees/complete");
         run_git(&complete, &["init", "-q"]);
         std::fs::remove_file(home.join("thegn-worktrees/complete.thegn-incomplete")).unwrap();
+        std::fs::write(home.join("thegn-worktrees/complete.bundle"), b"stale").unwrap();
         let reuse = run_sh(&home, &command);
         assert!(reuse.status.success());
+        assert!(!home.join("thegn-worktrees/complete.bundle").exists());
         assert_eq!(
             String::from_utf8_lossy(&reuse.stdout),
             format!("REUSED:{}", complete.display())
@@ -569,6 +575,63 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(checkout.join("tracked.txt")).unwrap(),
             "second commit\n"
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn reused_checkout_refresh_discards_prior_tracked_diff_before_reapplying_it() {
+        let home = temp_home("refresh-dirty");
+        let source = home.join("source");
+        let checkout = home.join("checkout");
+        std::fs::create_dir_all(&source).unwrap();
+        run_git(&source, &["init", "-q"]);
+        run_git(&source, &["config", "user.email", "thegn@example.invalid"]);
+        run_git(&source, &["config", "user.name", "thegn test"]);
+        let tracked = source.join("tracked.txt");
+        std::fs::write(&tracked, "committed\n").unwrap();
+        run_git(&source, &["add", "tracked.txt"]);
+        run_git(&source, &["commit", "-qm", "initial"]);
+        run_git(
+            &source,
+            &[
+                "clone",
+                "-q",
+                source.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+
+        std::fs::write(&tracked, "dirty local state\n").unwrap();
+        let patch = Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["diff", "--binary", "HEAD"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(patch.status.success());
+        let patch_path = home.join("tracked.patch");
+        std::fs::write(&patch_path, patch.stdout).unwrap();
+        run_git(&checkout, &["apply", patch_path.to_str().unwrap()]);
+
+        let bundle = format!("{}.bundle", checkout.display());
+        run_git(&source, &["bundle", "create", &bundle, "HEAD"]);
+        let branch = run_git_output(&source, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let result = run_sh(
+            &home,
+            &refresh_command(checkout.to_str().unwrap(), &branch, false),
+        );
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        run_git(&checkout, &["apply", patch_path.to_str().unwrap()]);
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("tracked.txt")).unwrap(),
+            "dirty local state\n"
         );
         std::fs::remove_dir_all(home).unwrap();
     }
