@@ -173,7 +173,8 @@ impl CiFlight {
             self.running = Some(request);
             return true;
         };
-        if running.key != request.key {
+        let different_key = running.key != request.key;
+        if different_key {
             running.cancel.store(true, Ordering::Relaxed);
         }
         let force = self
@@ -183,7 +184,7 @@ impl CiFlight {
             .is_some_and(|queued| queued.force)
             || request.force;
         self.queued = Some(FlightToken { force, ..request });
-        false
+        different_key
     }
 
     fn finish(&mut self) -> Option<FlightToken> {
@@ -420,7 +421,8 @@ pub(crate) fn spawn_ci_cache_refresh_with_generation(
             force: request.token.force,
             cancel: Arc::clone(&request.token.cancel),
         };
-        let start = coordinator.flight.submit(token);
+        let start = coordinator.flight.running.is_none();
+        coordinator.flight.submit(token);
         if !start {
             coordinator.queued = Some(request.clone());
         }
@@ -1468,14 +1470,15 @@ mod tests {
         let first = flight_token("/wt-a", Some(4), false);
         let cancel = Arc::clone(&first.cancel);
         assert!(flight.submit(first));
-        assert!(!flight.submit(flight_token("/wt-b", Some(4), false)));
+        assert!(flight.submit(flight_token("/wt-b", Some(4), false)));
         assert!(cancel.load(Ordering::Relaxed));
-        assert!(flight.finish().is_some());
+        let queued = flight.finish().expect("changed path refresh is queued");
+        assert_eq!(queued.key.active_path.as_deref(), Some("/wt-b"));
 
         let second = flight_token("/wt-a", Some(4), false);
         let cancel = Arc::clone(&second.cancel);
         assert!(flight.submit(second));
-        assert!(!flight.submit(flight_token("/wt-a", Some(5), false)));
+        assert!(flight.submit(flight_token("/wt-a", Some(5), false)));
         assert!(cancel.load(Ordering::Relaxed));
     }
 
