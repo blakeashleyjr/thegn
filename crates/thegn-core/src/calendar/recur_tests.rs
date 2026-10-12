@@ -1291,6 +1291,66 @@ fn a_utc_until_compares_a_gap_occurrence_by_its_realized_instant() {
 }
 
 #[test]
+fn a_subdaily_utc_until_keeps_a_later_candidate_after_a_dst_gap() {
+    // 01:45 CST is 07:45Z, 02:30 shifts to 08:30Z, then 03:15 CDT is 08:15Z.
+    // The shifted gap candidate is past UNTIL, but the following candidate is
+    // still inside it and must not be lost to an early break.
+    let start = EventTime::Zoned {
+        local: dt(2026, 3, 8, 1, 45),
+        zone: TzRef::new("America/Chicago"),
+    };
+    let rec = Recurrence {
+        rules: vec![RRule::parse("FREQ=MINUTELY;INTERVAL=45;UNTIL=20260308T082000Z").unwrap()],
+        ..Default::default()
+    };
+    let got = occurrences(
+        &rec,
+        &start,
+        d(2026, 3, 8),
+        d(2026, 3, 8),
+        chrono_tz::Tz::UTC,
+        GapPolicy::ShiftForward,
+    );
+    let locals: Vec<NaiveDateTime> = got
+        .iter()
+        .map(|t| match t {
+            EventTime::Zoned { local, .. } => *local,
+            other => panic!("expected zoned, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(locals, vec![dt(2026, 3, 8, 1, 45), dt(2026, 3, 8, 3, 15)]);
+}
+
+#[test]
+fn skipped_gap_candidates_are_not_compared_or_excluded_as_utc() {
+    let gap_candidate = dt(2026, 3, 8, 2, 30);
+    let rule = RRule::parse("FREQ=MINUTELY;UNTIL=20260308T020000Z").unwrap();
+    assert!(!past_until(
+        &rule,
+        gap_candidate,
+        Some(chrono_tz::Tz::America__Chicago),
+        GapPolicy::Skip,
+    ));
+
+    let rec = Recurrence {
+        rules: vec![RRule::parse("FREQ=MINUTELY").unwrap()],
+        exdates: vec![utc(2026, 3, 8, 2, 30)],
+        ..Default::default()
+    };
+    let got = expand_local_with_gap(
+        &rec,
+        gap_candidate,
+        Some(chrono_tz::Tz::America__Chicago),
+        d(2026, 3, 8),
+        d(2026, 3, 8),
+        &mut ExpansionBudget::default(),
+        GapPolicy::Skip,
+    )
+    .unwrap();
+    assert!(got.contains(&gap_candidate));
+}
+
+#[test]
 fn a_utc_until_keeps_a_fold_occurrence_before_its_instant_bound() {
     // At the fall-back transition 01:30 CDT is 06:30Z. The UTC bound at
     // 07:00Z is later, despite converting to the nominal local time 01:00 CST.

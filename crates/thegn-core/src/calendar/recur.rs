@@ -632,11 +632,10 @@ pub(crate) fn expand_local_with_gap(
         .filter(|d| {
             !ex.contains(d)
                 && !ex_days.contains(&d.date())
-                && !ex_instants.contains(
-                    &zone
-                        .and_then(|z| super::tz::resolve_local(*d, z, gap))
-                        .unwrap_or_else(|| d.and_utc()),
-                )
+                && !zone
+                    .map(|z| super::tz::resolve_local(*d, z, gap))
+                    .unwrap_or_else(|| Some(d.and_utc()))
+                    .is_some_and(|instant| ex_instants.contains(&instant))
         })
         .collect())
 }
@@ -677,12 +676,10 @@ fn past_until(
         UntilForm::Date | UntilForm::Floating => {
             until_bound(r, zone).is_some_and(|bound| candidate > bound)
         }
-        UntilForm::Utc => {
-            let instant = zone
-                .and_then(|z| super::tz::resolve_local(candidate, z, gap))
-                .unwrap_or_else(|| candidate.and_utc());
-            instant > until.and_utc()
-        }
+        UntilForm::Utc => zone
+            .map(|z| super::tz::resolve_local(candidate, z, gap))
+            .unwrap_or_else(|| Some(candidate.and_utc()))
+            .is_some_and(|instant| instant > until.and_utc()),
     }
 }
 
@@ -861,18 +858,19 @@ fn initial_period(r: &RRule, start: NaiveDate, from: NaiveDate) -> NaiveDate {
     jumped.unwrap_or(start)
 }
 
-/// Expand a SECONDLY/MINUTELY/HOURLY rule.
-///
-/// These step the clock rather than the calendar, so the loop walks instants
-/// from DTSTART (fast-forwarded to the window when there is no COUNT) and
-/// every `BY*` part acts as a **filter** (RFC 5545: a part finer than the
-/// frequency limits, it does not expand).
+/// The inclusive date window used to bound recurrence expansion.
 #[derive(Clone, Copy)]
 struct DateWindow {
     from: NaiveDate,
     to: NaiveDate,
 }
 
+/// Expand a SECONDLY/MINUTELY/HOURLY rule.
+///
+/// These step the clock rather than the calendar, so the loop walks instants
+/// from DTSTART (fast-forwarded to the window when there is no COUNT) and
+/// every `BY*` part acts as a **filter** (RFC 5545: a part finer than the
+/// frequency limits, it does not expand).
 fn expand_subdaily(
     r: &RRule,
     start: NaiveDateTime,
@@ -916,7 +914,20 @@ fn expand_subdaily(
         steps += 1;
         budget.recurrence_work(cost.filter)?;
         if past_until(r, cur, zone, gap) {
-            break;
+            // Resolved instants can move backwards around a DST gap for
+            // sub-hour intervals. Keep scanning until the nominal wall time
+            // is safely beyond the projected bound.
+            if until_bound(r, zone)
+                .and_then(|bound| bound.checked_add_signed(chrono::Duration::days(1)))
+                .is_some_and(|safe_end| cur > safe_end)
+            {
+                break;
+            }
+            let Some(next) = cur.checked_add_signed(step) else {
+                break;
+            };
+            cur = next;
+            continue;
         }
         if cur.date() > window.to {
             break;
