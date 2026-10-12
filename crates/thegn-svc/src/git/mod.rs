@@ -183,17 +183,16 @@ pub fn is_conflict(f: &FileStatus) -> bool {
     )
 }
 
-/// Parse `git log --graph --format=%x1f%h%x1f%s%x1f%D` output. Lines without
+/// Parse `git log --graph --format=%x1f%h%x1f%D%x1f%s` output. Lines without
 /// the unit separator are pure graph connectors.
 pub fn parse_log_graph(out: &str) -> Vec<LogRow> {
     out.lines()
         .map(|line| match line.split_once('\u{1f}') {
             Some((graph, rest)) => {
-                let mut it = rest.split('\u{1f}');
+                let mut it = rest.splitn(3, '\u{1f}');
                 LogRow {
                     graph: graph.trim_end().to_string(),
                     sha: it.next().unwrap_or_default().to_string(),
-                    subject: it.next().unwrap_or_default().to_string(),
                     refs: it
                         .next()
                         .unwrap_or_default()
@@ -201,6 +200,7 @@ pub fn parse_log_graph(out: &str) -> Vec<LogRow> {
                         .trim_start_matches('(')
                         .trim_end_matches(')')
                         .to_string(),
+                    subject: it.next().unwrap_or_default().to_string(),
                 }
             }
             None => LogRow {
@@ -405,7 +405,7 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
         let n = n.to_string();
         let out = run(
             loc,
-            &["log", "--graph", "--format=%x1f%h%x1f%s%x1f%D", "-n", &n],
+            &["log", "--graph", "--format=%x1f%h%x1f%D%x1f%s", "-n", &n],
         )?;
         Ok(parse_log_graph(&out))
     }
@@ -466,12 +466,13 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
             loc,
             &[
                 "log",
-                "--format=%x1f%H%x1f%h%x1f%an%x1f%ae%x1f%ct%x1f%P%x1f%D%x1f%s",
+                "-z",
+                "--format=%H%x00%h%x00%an%x00%ae%x00%ct%x00%P%x00%D%x00%s",
                 "-n",
                 &n,
             ],
         )?;
-        Ok(thegn_core::gitrefs::parse_commits(&out))
+        Ok(thegn_core::gitrefs::parse_commits(&out)?)
     }
 
     /// The last `n` commits reachable from `refname` — the branches pane's
@@ -484,13 +485,14 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
             loc,
             &[
                 "log",
-                "--format=%x1f%H%x1f%h%x1f%an%x1f%ae%x1f%ct%x1f%P%x1f%D%x1f%s",
+                "-z",
+                "--format=%H%x00%h%x00%an%x00%ae%x00%ct%x00%P%x00%D%x00%s",
                 "-n",
                 &n,
                 refname,
             ],
         )?;
-        Ok(thegn_core::gitrefs::parse_commits(&out))
+        Ok(thegn_core::gitrefs::parse_commits(&out)?)
     }
 
     /// All local branches with upstream/divergence detail, newest first.
@@ -507,7 +509,7 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
                 "--format=%(HEAD)\u{1f}%(refname:short)\u{1f}%(upstream:short)\u{1f}%(upstream:track)\u{1f}%(objectname)\u{1f}%(committerdate:unix)\u{1f}%(contents:subject)",
             ],
         )?;
-        Ok(thegn_core::gitrefs::parse_branches(&out))
+        Ok(thegn_core::gitrefs::parse_branches(&out)?)
     }
 
     /// The stash as structured entries (empty on a stash-less repo). Routes
@@ -515,17 +517,15 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
     /// and is bounded by the read timeout — a wedged git can't pin the hydration
     /// batch forever (matches `stash_count` directly above).
     fn stash_list(&self, loc: &GitLoc) -> Result<Vec<StashEntry>> {
-        let (exit, out) = match run_status(
+        let (exit, out) = run_status(
             loc,
             &["stash", "list", "--format=%gd\u{1f}%H\u{1f}%ct\u{1f}%gs"],
-        ) {
-            Ok(v) => v,
-            Err(_) => return Ok(Vec::new()),
-        };
+        )
+        .context("reading git stash list")?;
         if exit != 0 {
-            return Ok(Vec::new());
+            anyhow::bail!("git stash list exited with status {exit}");
         }
-        Ok(thegn_core::gitrefs::parse_stashes(&out))
+        Ok(thegn_core::gitrefs::parse_stashes(&out)?)
     }
 
     /// The last `n` HEAD reflog entries (the undo planner's feed).
@@ -979,11 +979,12 @@ pub(crate) fn parse_numstat(out: &str) -> Result<Vec<DiffEntry>> {
         if p.is_empty() {
             anyhow::bail!("malformed numstat record: empty path");
         }
+        let path = decode_numstat_path(p);
         if a == "-" && d == "-" {
             v.push(DiffEntry {
                 added: 0,
                 deleted: 0,
-                path: p.to_string(),
+                path,
                 binary: true,
             });
             continue;
@@ -994,11 +995,62 @@ pub(crate) fn parse_numstat(out: &str) -> Result<Vec<DiffEntry>> {
         v.push(DiffEntry {
             added,
             deleted,
-            path: p.to_string(),
+            path,
             binary: false,
         });
     }
     Ok(v)
+}
+
+/// Decode a Git C-quoted numstat path when it is representable as UTF-8.
+/// Invalid byte paths retain Git's quoted ASCII spelling, avoiding lossy
+/// replacement-character aliases in the string-based panel protocol.
+fn decode_numstat_path(path: &str) -> String {
+    unquote_c_path(path)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| path.to_owned())
+}
+
+fn unquote_c_path(path: &str) -> Option<Vec<u8>> {
+    let bytes = path.as_bytes();
+    if !(bytes.len() >= 2 && bytes.first() == Some(&b'"') && bytes.last() == Some(&b'"')) {
+        return Some(bytes.to_vec());
+    }
+    let mut decoded = Vec::with_capacity(bytes.len() - 2);
+    let mut i = 1;
+    while i + 1 < bytes.len() {
+        if bytes[i] != b'\\' {
+            decoded.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let escaped = *bytes.get(i)?;
+        match escaped {
+            b'"' | b'\\' => decoded.push(escaped),
+            b't' => decoded.push(b'\t'),
+            b'n' => decoded.push(b'\n'),
+            b'r' => decoded.push(b'\r'),
+            b'a' => decoded.push(0x07),
+            b'b' => decoded.push(0x08),
+            b'v' => decoded.push(0x0b),
+            b'f' => decoded.push(0x0c),
+            b'0'..=b'7' => {
+                let mut value = u16::from(escaped - b'0');
+                let mut digits = 1;
+                while digits < 3 && i + 1 < bytes.len() - 1 && (b'0'..=b'7').contains(&bytes[i + 1])
+                {
+                    i += 1;
+                    value = value * 8 + u16::from(bytes[i] - b'0');
+                    digits += 1;
+                }
+                decoded.push(u8::try_from(value).ok()?);
+            }
+            _ => return None,
+        }
+        i += 1;
+    }
+    Some(decoded)
 }
 
 /// A typed line-count observation for a diff total.
@@ -1104,6 +1156,7 @@ fn parse_ahead_behind(out: &str) -> Option<(usize, usize)> {
 const GLYPH_BASE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 const GLYPH_BASE_FAILURE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
 const GLYPH_BASE_CACHE_CAPACITY: usize = 256;
+const GLYPH_BASE_PRINT_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Process-global cache of [`glyph_base`]'s resolution, keyed by full execution
 /// authority and placement path (with sensitive remote fields hashed).
@@ -1251,6 +1304,7 @@ fn base_from_probe(origin_head: Option<&str>, has_local: impl Fn(&str) -> bool) 
 /// locally. Cached per loc ([`GLYPH_BASE_TTL`]) — the probes are cheap but the
 /// scan is hot.
 fn glyph_base(loc: &GitLoc) -> Option<String> {
+    purge_glyph_base_caches(std::time::Instant::now());
     let key = repo_execution_identity(loc);
     // A plain local worktree is validated by what the probe reads (the
     // `origin/HEAD` symref, the candidate loose heads, packed-refs) instead of a
@@ -1343,6 +1397,77 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
         .unwrap_or_else(|e| e.into_inner())
         .remove(&key);
     base
+}
+
+/// Amortised cleanup keeps the bounded caches from retaining unreachable
+/// identities indefinitely. The full scan is limited to once per TTL and each
+/// cache is capped at 256 entries.
+fn purge_glyph_base_caches(now: std::time::Instant) {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static LAST_PURGE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let origin = ORIGIN.get_or_init(|| now);
+    let elapsed_ms = now
+        .saturating_duration_since(*origin)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let ttl_ms = GLYPH_BASE_TTL.as_millis() as u64;
+    let mut previous = LAST_PURGE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        if elapsed_ms.saturating_sub(previous) < ttl_ms {
+            return;
+        }
+        match LAST_PURGE_MS.compare_exchange_weak(
+            previous,
+            elapsed_ms,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(current) => previous = current,
+        }
+    }
+
+    let mut bases = base_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let mut failures = failed_base_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    purge_expired_glyph_bases(&mut bases, &mut failures, now);
+}
+
+fn purge_expired_glyph_bases(
+    bases: &mut std::collections::HashMap<
+        RepoExecutionIdentity,
+        (Option<String>, std::time::Instant, BaseKey),
+    >,
+    failures: &mut std::collections::HashMap<RepoExecutionIdentity, std::time::Instant>,
+    now: std::time::Instant,
+) {
+    bases.retain(|_, (_, at, print)| {
+        let max_age = if print.is_some() {
+            GLYPH_BASE_PRINT_IDLE_TTL
+        } else {
+            GLYPH_BASE_TTL
+        };
+        now.saturating_duration_since(*at) < max_age
+    });
+    failures.retain(|_, at| now.saturating_duration_since(*at) < GLYPH_BASE_FAILURE_BACKOFF);
+}
+
+/// Invalidate a repository's cached glyph base after a successful location or
+/// repository mutation. The key is opaque and contains no raw authority data.
+pub fn invalidate_glyph_base(loc: &GitLoc) {
+    invalidate_glyph_base_identity(repo_execution_identity(loc));
+}
+
+fn invalidate_glyph_base_identity(key: RepoExecutionIdentity) {
+    base_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    failed_base_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
 }
 
 fn record_base_probe_failure(key: RepoExecutionIdentity) {
@@ -1709,14 +1834,13 @@ impl GitBackend for CliGit {
     }
 
     fn diff_files(&self, loc: &GitLoc, base: &str) -> Result<Vec<DiffEntry>> {
-        // `-c core.quotePath=false`: with the default (true), numstat emits
-        // non-ASCII / special-char paths OCTAL-QUOTED (`"docs/caf\303\251.md"`)
-        // while `status -z` (the join partner in the panel) emits them raw, so
-        // the exact-string join missed and the row rendered `+0 −0`.
+        // Keep Git's C-quoted spelling so invalid UTF-8 paths remain distinct
+        // without passing through String::from_utf8_lossy. Valid UTF-8 quoted
+        // paths are decoded by `parse_numstat` for the status join.
         let base = op::revision(base)?;
         let out = run(
             loc,
-            &["-c", "core.quotePath=false", "diff", "--numstat", base],
+            &["-c", "core.quotePath=true", "diff", "--numstat", base],
         )?;
         parse_numstat(&out)
     }
@@ -1822,8 +1946,12 @@ impl GitBackend for CliGit {
                 })
             })
             .flatten();
+        // Compute before removal: after the directory disappears, local
+        // identity resolution can no longer follow its `.git` pointer.
+        let removed_identity = repo_execution_identity(&GitLoc::Local(path.to_path_buf()));
         let p = path.to_string_lossy();
         run_root(root, &["worktree", "remove", "--force", &p])?;
+        invalidate_glyph_base_identity(removed_identity);
         if let Some(branch) = branch {
             // Best-effort: the branch may still be checked out elsewhere.
             // A dash-named branch is refused by the validator, not reinterpreted.
@@ -2019,9 +2147,9 @@ impl GitBackend for GixGit {
                 tracing::debug!(
                     target: "thegn::forge",
                     fallback = "unsupported-path",
-                    "native diff cannot represent a non-UTF-8 path in the current result protocol"
+                    "native diff cannot represent a non-UTF-8 path; using the coherent CLI result"
                 );
-                Err(e)
+                self.fallback.diff_files(loc, base)
             }
             Err(_e) => {
                 // Keep the path-bearing error out of ordinary diagnostics: git
@@ -2580,6 +2708,44 @@ mod tests {
     }
 
     #[test]
+    fn glyph_base_purge_evicts_expired_success_and_failure_entries() {
+        let now = std::time::Instant::now();
+        let old = |age| now.checked_sub(age).unwrap();
+        let print = Some(thegn_core::git_memo::base_refs_print(&repo_root()).unwrap());
+        let mut bases = std::collections::HashMap::from([
+            (
+                RepoExecutionIdentity("no-print-old".into()),
+                (Some("main".into()), old(GLYPH_BASE_TTL), None),
+            ),
+            (
+                RepoExecutionIdentity("print-old".into()),
+                (
+                    Some("main".into()),
+                    old(GLYPH_BASE_PRINT_IDLE_TTL),
+                    print.clone(),
+                ),
+            ),
+            (
+                RepoExecutionIdentity("print-recent".into()),
+                (None, now, print),
+            ),
+        ]);
+        let mut failures = std::collections::HashMap::from([
+            (
+                RepoExecutionIdentity("failure-old".into()),
+                old(GLYPH_BASE_FAILURE_BACKOFF),
+            ),
+            (RepoExecutionIdentity("failure-recent".into()), now),
+        ]);
+        purge_expired_glyph_bases(&mut bases, &mut failures, now);
+        assert!(!bases.contains_key(&RepoExecutionIdentity("no-print-old".into())));
+        assert!(!bases.contains_key(&RepoExecutionIdentity("print-old".into())));
+        assert!(bases.contains_key(&RepoExecutionIdentity("print-recent".into())));
+        assert!(!failures.contains_key(&RepoExecutionIdentity("failure-old".into())));
+        assert!(failures.contains_key(&RepoExecutionIdentity("failure-recent".into())));
+    }
+
+    #[test]
     fn execution_identity_separates_placements_without_retaining_authority_secrets() {
         let a = GitLoc::provider(
             vec!["sprite".into(), "exec".into(), "-s".into(), "alpha".into()],
@@ -2594,40 +2760,57 @@ mod tests {
         assert!(!key_a.0.contains("alpha"));
         assert!(!key_a.0.contains("workspace"));
 
-        let ssh_a = GitLoc::from_db(
-            "/ignored",
-            Some(&GitLoc::remote_db_string_for(
-                &thegn_core::remote::SshTarget {
-                    host: "same-host".into(),
-                    port: 22,
-                    forward_agent: false,
-                    ssh_config: None,
-                    jump_host: None,
-                    identity: Some("/secret/key-a".into()),
-                    extra_args: Vec::new(),
-                },
-                "/workspace",
-            )),
-        );
-        let ssh_b = GitLoc::from_db(
-            "/ignored",
-            Some(&GitLoc::remote_db_string_for(
-                &thegn_core::remote::SshTarget {
-                    host: "same-host".into(),
-                    port: 22,
-                    forward_agent: false,
-                    ssh_config: None,
-                    jump_host: None,
-                    identity: Some("/secret/key-b".into()),
-                    extra_args: Vec::new(),
-                },
-                "/workspace",
-            )),
-        );
-        let ssh_key = repo_execution_identity(&ssh_a);
-        assert_ne!(ssh_key, repo_execution_identity(&ssh_b));
-        assert!(!ssh_key.0.contains("secret"));
-        assert!(!ssh_key.0.contains("key-a"));
+        let target = thegn_core::remote::SshTarget {
+            host: "same-host-secret".into(),
+            port: 22,
+            forward_agent: false,
+            ssh_config: Some("/secret/config".into()),
+            jump_host: Some("secret-jump".into()),
+            identity: Some("/secret/key".into()),
+            extra_args: vec!["secret-arg".into()],
+        };
+        let ssh_loc = |target: &thegn_core::remote::SshTarget| {
+            GitLoc::from_db(
+                "/ignored",
+                Some(&GitLoc::remote_db_string_for(target, "/workspace")),
+            )
+        };
+        let original = repo_execution_identity(&ssh_loc(&target));
+        let mut variants = Vec::new();
+        let mut changed = target.clone();
+        changed.host = "other-host".into();
+        variants.push(changed);
+        let mut changed = target.clone();
+        changed.port = 2200;
+        variants.push(changed);
+        let mut changed = target.clone();
+        changed.forward_agent = true;
+        variants.push(changed);
+        let mut changed = target.clone();
+        changed.ssh_config = Some("other-config".into());
+        variants.push(changed);
+        let mut changed = target.clone();
+        changed.jump_host = Some("other-jump".into());
+        variants.push(changed);
+        let mut changed = target.clone();
+        changed.identity = Some("other-key".into());
+        variants.push(changed);
+        let mut changed = target;
+        changed.extra_args = vec!["other-arg".into()];
+        variants.push(changed);
+        for variant in variants {
+            let key = repo_execution_identity(&ssh_loc(&variant));
+            assert_ne!(original, key);
+            for secret in [
+                "same-host-secret",
+                "/secret/config",
+                "secret-jump",
+                "/secret/key",
+                "secret-arg",
+            ] {
+                assert!(!key.0.contains(secret));
+            }
+        }
     }
 
     #[test]
@@ -2773,6 +2956,15 @@ mod tests {
 
         // Add a worktree on a fresh branch, then remove it deleting the branch.
         CliGit.add_worktree(root, "feature-x", "main", &wt).unwrap();
+        let wt_identity = repo_execution_identity(&GitLoc::Local(wt.clone()));
+        base_cache().lock().unwrap().insert(
+            wt_identity.clone(),
+            (Some("main".into()), std::time::Instant::now(), None),
+        );
+        failed_base_cache()
+            .lock()
+            .unwrap()
+            .insert(wt_identity.clone(), std::time::Instant::now());
         assert!(
             repo.out(&["branch", "--list", "feature-x"])
                 .contains("feature-x"),
@@ -2780,6 +2972,13 @@ mod tests {
         );
 
         CliGit.remove_worktree(root, &wt, true).unwrap();
+        assert!(!base_cache().lock().unwrap().contains_key(&wt_identity));
+        assert!(
+            !failed_base_cache()
+                .lock()
+                .unwrap()
+                .contains_key(&wt_identity)
+        );
 
         assert!(!wt.exists(), "worktree dir should be gone");
         assert!(
@@ -2814,6 +3013,8 @@ mod tests {
         testutil::git_in(&repo.dir, &["stash", "-q"]);
         let entries = CliGit.stash_list(&loc).unwrap();
         assert_eq!(entries.len(), 1, "one stash entry expected: {entries:?}");
+        let outside = GitLoc::Local(repo.dir.join("not-a-repository"));
+        assert!(CliGit.stash_list(&outside).is_err());
     }
 
     /// Run `git` in `dir`, panicking on failure (test setup helper).
@@ -2921,12 +3122,12 @@ mod tests {
 
     #[test]
     fn parse_log_graph_splits_commit_and_connector_rows() {
-        let out = "* \u{1f}a3f81c2\u{1f}merge origin/main\u{1f}HEAD -> main, origin/main\n\
+        let out = "* \u{1f}a3f81c2\u{1f}HEAD -> main, origin/main\u{1f}merge origin/main\n\
                    |\\  \n\
-                   | * \u{1f}9c2d11e\u{1f}panel: focus follows zoom\u{1f}\n\
-                   * | \u{1f}f44a09b\u{1f}tabs: dedup titles\u{1f}tag: v0.1\n\
+                   | * \u{1f}9c2d11e\u{1f}\u{1f}panel: focus follows zoom\n\
+                   * | \u{1f}f44a09b\u{1f}tag: v0.1\u{1f}tabs: dedup titles\n\
                    |/  \n\
-                   * \u{1f}77a1f2c\u{1f}host: panel split math\u{1f}\n";
+                   * \u{1f}77a1f2c\u{1f}\u{1f}host: panel split math\n";
         let rows = parse_log_graph(out);
         assert_eq!(rows.len(), 6);
         assert_eq!(rows[0].graph, "*");
@@ -2938,7 +3139,107 @@ mod tests {
         assert_eq!(rows[2].graph, "| *");
         assert!(!rows[2].is_head());
         assert_eq!(rows[3].refs, "tag: v0.1");
+        let spoof = parse_log_graph("* \u{1f}abc123\u{1f}\u{1f}x\u{1f}HEAD -> main");
+        assert_eq!(spoof[0].refs, "");
+        assert_eq!(spoof[0].subject, "x\u{1f}HEAD -> main");
+        assert!(!spoof[0].is_head());
         assert_eq!(parse_log_graph(""), Vec::<LogRow>::new());
+    }
+
+    #[test]
+    fn numstat_c_quoted_paths_decode_utf8_and_preserve_invalid_bytes() {
+        assert_eq!(unquote_c_path(r#""a\"b""#).unwrap(), b"a\"b");
+        assert_eq!(unquote_c_path(r#""a\\b""#).unwrap(), b"a\\b");
+        assert_eq!(unquote_c_path(r#""a\tb\n""#).unwrap(), b"a\tb\n");
+        assert_eq!(
+            unquote_c_path(r#""\a\b\v\f\r""#).unwrap(),
+            b"\x07\x08\x0b\x0c\r"
+        );
+        assert_eq!(unquote_c_path(r#""caf\303\251""#).unwrap(), b"caf\xc3\xa9");
+        assert_eq!(decode_numstat_path(r#""caf\303\251.md""#), "café.md");
+        assert_eq!(decode_numstat_path(r#""bad\377""#), r#""bad\377""#);
+        assert!(unquote_c_path(r#""bad\q""#).is_none());
+    }
+
+    #[test]
+    fn commit_log_nul_protocol_preserves_unit_separator_in_real_author() {
+        let repo = testutil::TestRepo::new("control-author");
+        repo.commit_file("first.txt", "one", "first");
+        std::fs::write(repo.dir.join("second.txt"), "two").unwrap();
+        testutil::git_in(&repo.dir, &["add", "second.txt"]);
+        let output = thegn_core::util::git_cmd(&repo.dir)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "control author",
+            ])
+            .env("GIT_AUTHOR_NAME", "A\u{1f}B")
+            .env("GIT_AUTHOR_EMAIL", "control@example.test")
+            .env("GIT_COMMITTER_NAME", "Committer")
+            .env("GIT_COMMITTER_EMAIL", "committer@example.test")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let commits = CliGit.log_commits(&repo.loc(), 10).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].author, "A\u{1f}B");
+        assert_eq!(commits[0].email, "control@example.test");
+        assert!(commits[0].date > 0);
+        assert_eq!(commits[1].subject, "first");
+    }
+
+    #[test]
+    fn gix_diff_falls_back_for_invalid_utf8_path_without_lossy_aliasing() {
+        let repo = testutil::TestRepo::new("invalid-path-diff");
+        repo.commit_file("café.md", "before\n", "initial");
+        let object = thegn_core::util::git_cmd(&repo.dir)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut object = object;
+        use std::io::Write as _;
+        object
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"invalid path contents\n")
+            .unwrap();
+        let object = object.wait_with_output().unwrap();
+        assert!(object.status.success());
+        let oid = String::from_utf8(object.stdout).unwrap().trim().to_owned();
+        let mut index_info = format!("100644 {oid}\t").into_bytes();
+        index_info.extend_from_slice(b"name\xff\n");
+        let update = thegn_core::util::git_cmd(&repo.dir)
+            .args(["update-index", "--add", "--index-info"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut update = update;
+        update.stdin.take().unwrap().write_all(&index_info).unwrap();
+        let update = update.wait_with_output().unwrap();
+        assert!(
+            update.status.success(),
+            "update-index failed: {}",
+            String::from_utf8_lossy(&update.stderr)
+        );
+        testutil::git_in(&repo.dir, &["commit", "-q", "-m", "invalid path"]);
+        std::fs::write(repo.dir.join("café.md"), "after\n").unwrap();
+
+        let entries = GixGit::new().diff_files(&repo.loc(), "HEAD").unwrap();
+        assert!(entries.iter().any(|entry| entry.path == "café.md"));
+        assert!(entries.iter().any(|entry| entry.path.contains(r"name\377")));
+        assert!(entries.iter().all(|entry| !entry.path.contains('\u{fffd}')));
     }
 
     #[test]
