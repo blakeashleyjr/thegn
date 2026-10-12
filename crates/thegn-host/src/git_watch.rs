@@ -133,7 +133,7 @@ pub(crate) fn watch_canonical(p: &std::path::Path) -> std::path::PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// How deep [`plan_watches`] will descend to prune before giving up and taking
+/// How deep the watch planner will descend to prune before giving up and taking
 /// one recursive watch on the remainder.
 ///
 /// Shallow on purpose. Descending costs correctness, not just time: a directory
@@ -145,6 +145,10 @@ pub(crate) fn watch_canonical(p: &std::path::Path) -> std::path::PathBuf {
 /// captures effectively all of the win.
 const MAX_PRUNE_DEPTH: usize = 4;
 
+/// Bound per-worktree diff watcher registration. Above this, the existing
+/// ticker provides refreshes without consuming an unbounded inotify quota.
+pub(crate) const MAX_DIFF_WATCHES: usize = 32_768;
+
 /// One entry of the diff watcher's registration plan: a directory, and whether
 /// `notify` should recurse into it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,11 +159,16 @@ pub(crate) struct WatchPlanEntry {
 
 /// Whether a directory must be kept out of the watch registration entirely.
 ///
-/// Two sources, both of which the *event* filter already discards:
-/// gitignored build output (case 2 of [`watcher_path_triggers_refresh`]), and
-/// the object store, which [`is_git_state_path`]'s allowlist never matches and
-/// which floods on every commit/gc.
-pub(crate) fn prune_dir(p: &std::path::Path, ignore: &ignore::gitignore::Gitignore) -> bool {
+/// Gitignored build output, nested repositories/worktrees, and the object
+/// store. The event filter also discards gitignored paths and object-store
+/// churn, while nested repositories have their own watcher lifecycle.
+pub(crate) fn prune_dir(p: &std::path::Path, ignore: &crate::diff_watch::IgnoreRules) -> bool {
+    // A nested repository or linked worktree has its own git state and watcher
+    // lifecycle. `.gitmodules` withholds the diff claim until submodule watches
+    // are added; keep that guard if this pruning rule changes.
+    if p.join(".git").exists() {
+        return true;
+    }
     // `.git/objects` — the same subtree the linked-worktree gitdir watches
     // already refuse to descend into, applied to the main checkout too.
     if p.file_name().and_then(|s| s.to_str()) == Some("objects") && in_dot_git(p) {
@@ -169,10 +178,7 @@ pub(crate) fn prune_dir(p: &std::path::Path, ignore: &ignore::gitignore::Gitigno
     // (see `watcher_path_triggers_refresh` for the full note). Registration runs
     // on a background thread where a panic would leave the panel with no
     // watcher at all, so check the precondition and decline to prune instead.
-    if ignore.is_empty() || !p.starts_with(ignore.path()) {
-        return false;
-    }
-    ignore.matched_path_or_any_parents(p, true).is_ignore()
+    ignore.is_ignored(p)
 }
 
 /// Plan the diff watcher's registration over `root`, pruning gitignored
@@ -193,18 +199,72 @@ pub(crate) fn prune_dir(p: &std::path::Path, ignore: &ignore::gitignore::Gitigno
 ///
 /// Reads the filesystem (so not pure), but deterministic given a tree — the
 /// pruning precedence is unit-tested against real temp dirs.
+#[cfg(test)]
 pub(crate) fn plan_watches(
     root: &std::path::Path,
-    ignore: &ignore::gitignore::Gitignore,
+    ignore: &crate::diff_watch::IgnoreRules,
 ) -> Vec<WatchPlanEntry> {
     let mut out = Vec::new();
     plan_descend(root, ignore, MAX_PRUNE_DEPTH, &mut out);
     out
 }
 
+/// Refuses plans whose recursive entries would exceed `cap` actual directory
+/// watches. `None` means use ticker/polling.
+pub(crate) fn plan_watches_with_cap(
+    root: &std::path::Path,
+    ignore: &crate::diff_watch::IgnoreRules,
+    cap: usize,
+) -> Option<Vec<WatchPlanEntry>> {
+    let mut plan = Vec::new();
+    let mut visited = 1usize; // include the plan root in the bounded walk
+    if !plan_descend_capped(root, ignore, MAX_PRUNE_DEPTH, &mut plan, &mut visited, cap) {
+        return None;
+    }
+    let mut count = 0usize;
+    for entry in &plan {
+        let additional = if entry.recursive {
+            count_recursive_watches(&entry.path, cap.saturating_sub(count))?
+        } else {
+            1
+        };
+        count = count.checked_add(additional)?;
+        if count > cap {
+            return None;
+        }
+    }
+    Some(plan)
+}
+
+pub(crate) fn count_recursive_watches(dir: &std::path::Path, remaining: usize) -> Option<usize> {
+    let mut count = 1usize;
+    if count > remaining {
+        return None;
+    }
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            if !entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let path = entry.path();
+            // RecursiveMode::Recursive registers every real directory below
+            // this entry, including paths pruned from the explicit plan.
+            count = count.checked_add(count_recursive_watches(
+                &path,
+                remaining.saturating_sub(count),
+            )?)?;
+            if count > remaining {
+                return None;
+            }
+        }
+    }
+    Some(count)
+}
+
+#[cfg(test)]
 fn plan_descend(
     dir: &std::path::Path,
-    ignore: &ignore::gitignore::Gitignore,
+    ignore: &crate::diff_watch::IgnoreRules,
     depth: usize,
     out: &mut Vec<WatchPlanEntry>,
 ) {
@@ -245,6 +305,52 @@ fn plan_descend(
     }
 }
 
+fn plan_descend_capped(
+    dir: &std::path::Path,
+    ignore: &crate::diff_watch::IgnoreRules,
+    depth: usize,
+    out: &mut Vec<WatchPlanEntry>,
+    visited: &mut usize,
+    cap: usize,
+) -> bool {
+    let mut keep = Vec::new();
+    let mut pruned_any = false;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            if !entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let path = entry.path();
+            *visited += 1;
+            if *visited > cap {
+                return false;
+            }
+            if prune_dir(&path, ignore) {
+                pruned_any = true;
+            } else {
+                keep.push(path);
+            }
+        }
+    }
+    if !pruned_any || depth == 0 {
+        out.push(WatchPlanEntry {
+            path: dir.to_path_buf(),
+            recursive: true,
+        });
+        return true;
+    }
+    out.push(WatchPlanEntry {
+        path: dir.to_path_buf(),
+        recursive: false,
+    });
+    for child in keep {
+        if !plan_descend_capped(&child, ignore, depth - 1, out, visited, cap) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Whether a single diff-watcher event path should drive a model re-hydration.
 /// Three cases, in precedence order:
 /// 1. `.git`-internal paths (inside a `.git` component, or under the resolved
@@ -260,7 +366,7 @@ fn plan_descend(
 pub(crate) fn watcher_path_triggers_refresh(
     p: &std::path::Path,
     roots: &[std::path::PathBuf],
-    ignore: &ignore::gitignore::Gitignore,
+    ignore: &crate::diff_watch::IgnoreRules,
 ) -> bool {
     if in_dot_git(p) || roots.iter().any(|r| p.starts_with(r)) {
         is_git_state_path(p)
@@ -272,14 +378,12 @@ pub(crate) fn watcher_path_triggers_refresh(
         // canonicalized root (see `watch_canonical`) so the precondition holds,
         // but a filter is the wrong place to bet a thread on that: check it, and
         // treat an out-of-root path as a plain edit — the pre-filter behavior.
-        if !ignore.is_empty() && !p.starts_with(ignore.path()) {
+        if !p.starts_with(&ignore.root) {
             return true;
         }
         // Case 2 vs 3: gitignored build churn is dropped; everything else (real
         // source edits) refreshes.
-        !ignore
-            .matched_path_or_any_parents(p, p.is_dir())
-            .is_ignore()
+        !ignore.is_ignored(p)
     }
 }
 
@@ -416,7 +520,7 @@ mod tests {
         // the fix hinges on the anchored pattern matching via parent lookup.
         b.add_line(None, "/target").unwrap();
         b.add_line(None, "*.log").unwrap();
-        let ig = b.build().unwrap();
+        let ig = crate::diff_watch::IgnoreRules::new(Path::new("/repo"), b.build().unwrap());
         let roots: Vec<PathBuf> = vec![PathBuf::from("/repo/.git")];
         let fires = |p: &str| watcher_path_triggers_refresh(Path::new(p), &roots, &ig);
 
@@ -454,12 +558,12 @@ mod tests {
         (tmp, root)
     }
 
-    fn plan_matcher(root: &std::path::Path) -> ignore::gitignore::Gitignore {
+    fn plan_matcher(root: &std::path::Path) -> crate::diff_watch::IgnoreRules {
         let mut b = ignore::gitignore::GitignoreBuilder::new(root);
         // The root-anchored forms this repo's own `.gitignore` uses.
         b.add_line(None, "/target").unwrap();
         b.add_line(None, ".claude/*").unwrap();
-        b.build().unwrap()
+        crate::diff_watch::IgnoreRules::new(root, b.build().unwrap())
     }
 
     #[test]
@@ -522,10 +626,89 @@ mod tests {
         // No `.gitignore` (remote/provider worktrees) => nothing to prune =>
         // exactly the pre-existing behavior: one recursive watch on the root.
         let (_tmp, root) = plan_fixture();
-        let plan = plan_watches(&root, &ignore::gitignore::Gitignore::empty());
+        let empty =
+            crate::diff_watch::IgnoreRules::new(&root, ignore::gitignore::Gitignore::empty());
+        let plan = plan_watches(&root, &empty);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].path, root);
         assert!(plan[0].recursive);
+    }
+
+    #[test]
+    fn prune_predicate_catches_nested_repositories_and_git_ignore_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let worktree = root.join(".claude/worktrees/agent");
+        let nested_repo = root.join("vendor/nested-repo");
+        let linked_worktree = root.join("linked-worktree");
+        std::fs::create_dir_all(worktree.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(&nested_repo).unwrap();
+        std::fs::create_dir_all(&linked_worktree).unwrap();
+        std::fs::create_dir_all(root.join("vendor/nested-ignore")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/nested-repo/.git")).unwrap();
+        std::fs::write(
+            linked_worktree.join(".git"),
+            "gitdir: /repo/.git/worktrees/linked\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("vendor/.gitignore"), "nested-ignore/\n").unwrap();
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(&root);
+        assert!(builder.add_line(None, "/.claude/worktrees/").is_ok());
+        let matcher = crate::diff_watch::IgnoreRules::new(&root, builder.build().unwrap());
+        let mut nested_builder = ignore::gitignore::GitignoreBuilder::new(root.join("vendor"));
+        assert!(nested_builder.add(root.join("vendor/.gitignore")).is_none());
+        let nested = nested_builder.build().unwrap();
+        let mut matcher = matcher;
+        matcher.add_nested(root.join("vendor"), nested);
+
+        assert!(
+            prune_dir(&worktree, &matcher),
+            "ignore pattern prunes worktrees"
+        );
+        assert!(prune_dir(&root.join("vendor/nested-ignore"), &matcher));
+        assert!(
+            prune_dir(
+                &nested_repo,
+                &crate::diff_watch::IgnoreRules::new(&root, ignore::gitignore::Gitignore::empty())
+            ),
+            "a directory containing a .git directory is a nested repository"
+        );
+        assert!(
+            prune_dir(&linked_worktree, &matcher),
+            "a directory containing a .git file is a linked worktree"
+        );
+    }
+
+    #[test]
+    fn watch_plan_returns_ticker_fallback_when_directory_cap_is_exceeded() {
+        let (_tmp, root) = plan_fixture();
+        let empty =
+            crate::diff_watch::IgnoreRules::new(&root, ignore::gitignore::Gitignore::empty());
+        let plan = plan_watches_with_cap(&root, &empty, 2);
+        assert!(
+            plan.is_none(),
+            "more watched directories than the cap uses polling"
+        );
+
+        let plan = plan_watches_with_cap(&root, &empty, 32);
+        assert!(plan.is_some(), "a plan within the cap remains watchable");
+    }
+
+    #[test]
+    fn recursive_watch_count_includes_pruned_descendants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let recursive = root.join("src");
+        std::fs::create_dir_all(recursive.join("a/node_modules/x")).unwrap();
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(&root);
+        builder.add_line(None, "src/a/node_modules/").unwrap();
+        let rules = crate::diff_watch::IgnoreRules::new(&root, builder.build().unwrap());
+        assert!(prune_dir(&recursive.join("a/node_modules"), &rules));
+        assert_eq!(
+            count_recursive_watches(&recursive, 16),
+            Some(4),
+            "RecursiveMode::Recursive registers src, a, node_modules, and x"
+        );
     }
 
     #[cfg(unix)]
@@ -554,7 +737,7 @@ mod tests {
         let roots: Vec<PathBuf> = vec![watch_canonical(&link.join(".git"))];
         let mut b = ignore::gitignore::GitignoreBuilder::new(&root);
         b.add_line(None, "/target").unwrap();
-        let ig = b.build().unwrap();
+        let ig = crate::diff_watch::IgnoreRules::new(&root, b.build().unwrap());
 
         // Event paths as the watcher delivers them: resolved through the link.
         let ev = |rel: &str| root.join(rel);
@@ -581,7 +764,7 @@ mod tests {
         // safety-net tick. It must now degrade to "this is an edit" instead.
         let mut b2 = ignore::gitignore::GitignoreBuilder::new(&link);
         b2.add_line(None, "/target").unwrap();
-        let stale_ig = b2.build().unwrap();
+        let stale_ig = crate::diff_watch::IgnoreRules::new(&link, b2.build().unwrap());
         let stale_roots: Vec<PathBuf> = vec![link.join(".git")];
         assert!(
             watcher_path_triggers_refresh(&ev("target/debug/thegn"), &stale_roots, &stale_ig),
@@ -594,7 +777,10 @@ mod tests {
         // Remote/provider worktrees (no local `.gitignore`) build an empty
         // matcher; it must not drop any edit — unchanged pre-filter behavior.
         use std::path::{Path, PathBuf};
-        let ig = ignore::gitignore::Gitignore::empty();
+        let ig = crate::diff_watch::IgnoreRules::new(
+            Path::new("/wt"),
+            ignore::gitignore::Gitignore::empty(),
+        );
         let roots: Vec<PathBuf> = vec![];
         assert!(watcher_path_triggers_refresh(
             Path::new("/wt/target/x"),

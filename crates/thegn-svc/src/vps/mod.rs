@@ -457,10 +457,20 @@ impl VpsProvider {
     }
 
     async fn get_json(&self, url: &str) -> Result<serde_json::Value> {
+        self.get_json_timeout(url, crate::provider::CONTROL_TIMEOUT)
+            .await
+    }
+
+    async fn get_json_timeout(
+        &self,
+        url: &str,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value> {
         let resp = self
             .client
             .get(url)
             .bearer_auth(&self.spec.token)
+            .timeout(timeout)
             .send()
             .await
             .map_err(|error| crate::provider::redacted_transport_error("vps", "GET", &error))?;
@@ -469,15 +479,26 @@ impl VpsProvider {
             // The remote error body is neither read nor echoed.
             return Err(anyhow!("vps GET request failed ({status})"));
         }
-        Ok(resp.json().await.unwrap_or(serde_json::Value::Null))
+        crate::provider::response_json(resp, "vps", "GET").await
     }
 
     async fn post_json(&self, url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.post_json_timeout(url, body, crate::provider::CONTROL_TIMEOUT)
+            .await
+    }
+
+    async fn post_json_timeout(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value> {
         let resp = self
             .client
             .post(url)
             .bearer_auth(&self.spec.token)
             .json(body)
+            .timeout(timeout)
             .send()
             .await
             .map_err(|error| crate::provider::redacted_transport_error("vps", "POST", &error))?;
@@ -485,7 +506,7 @@ impl VpsProvider {
         if !status.is_success() {
             return Err(anyhow!("vps POST request failed ({status})"));
         }
-        Ok(resp.json().await.unwrap_or(serde_json::Value::Null))
+        crate::provider::response_json(resp, "vps", "POST").await
     }
 
     /// All thegn-managed instances (label-filtered server-side), with
@@ -585,7 +606,18 @@ impl VpsProvider {
         let base = self.spec.api_base();
         let start = std::time::Instant::now();
         loop {
-            let body = self.get_json(&self.shaper().server_url(&base, id)).await?;
+            let remaining = BUDGET.saturating_sub(start.elapsed());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "vps: instance {id} not running after {}s",
+                BUDGET.as_secs()
+            );
+            let body = self
+                .get_json_timeout(
+                    &self.shaper().server_url(&base, id),
+                    remaining.min(crate::provider::CONTROL_TIMEOUT),
+                )
+                .await?;
             if let Some(s) = self.shaper().parse_get(&body)
                 && s.running
                 && s.ip.is_some()
@@ -656,15 +688,26 @@ impl VpsProvider {
             .ok_or_else(|| anyhow!("vps: instance {name} not found"))?;
         let base = self.spec.api_base();
         let shaper = self.shaper();
-        self.post_json(
-            &shaper.shutdown_url(&base, &inst.id),
-            &shaper.shutdown_body(),
-        )
-        .await?;
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
         let start = std::time::Instant::now();
+        self.post_json_timeout(
+            &shaper.shutdown_url(&base, &inst.id),
+            &shaper.shutdown_body(),
+            crate::provider::CONTROL_TIMEOUT,
+        )
+        .await?;
         loop {
-            let body = self.get_json(&shaper.server_url(&base, &inst.id)).await?;
+            let remaining = BUDGET.saturating_sub(start.elapsed());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "vps: {name} still running after shutdown"
+            );
+            let body = self
+                .get_json_timeout(
+                    &shaper.server_url(&base, &inst.id),
+                    remaining.min(crate::provider::CONTROL_TIMEOUT),
+                )
+                .await?;
             let running = shaper.parse_get(&body).map(|s| s.running).unwrap_or(false);
             if !running {
                 return Ok(());
@@ -705,17 +748,18 @@ impl VpsProvider {
     /// DigitalOcean snapshots are asynchronous: POST the snapshot action, poll it
     /// to completion, then read the newest `snapshot_ids` off the Droplet.
     async fn snapshot_do(&self, base: &str, id: &str, name: &str) -> Result<String> {
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
+        let start = std::time::Instant::now();
         let action = self
-            .post_json(
+            .post_json_timeout(
                 &digitalocean::droplet_actions_url(base, id),
                 &digitalocean::snapshot_body(name),
+                BUDGET.min(crate::provider::CONTROL_TIMEOUT),
             )
             .await?;
         let (action_id, mut status) = digitalocean::parse_action(&action)
             .ok_or_else(|| anyhow!("vps: no action in DO snapshot response"))?;
         // Snapshotting a fresh dev image takes minutes; poll bounded.
-        const BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
-        let start = std::time::Instant::now();
         while status != "completed" {
             if status == "errored" {
                 return Err(anyhow!("vps: DO snapshot action {action_id} errored"));
@@ -726,15 +770,34 @@ impl VpsProvider {
                     BUDGET.as_secs()
                 ));
             }
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(
+                std::time::Duration::from_secs(5).min(BUDGET.saturating_sub(start.elapsed())),
+            )
+            .await;
             let a = self
-                .get_json(&digitalocean::action_url(base, &action_id))
+                .get_json_timeout(
+                    &digitalocean::action_url(base, &action_id),
+                    BUDGET
+                        .saturating_sub(start.elapsed())
+                        .min(crate::provider::CONTROL_TIMEOUT),
+                )
                 .await?;
             status = digitalocean::parse_action(&a)
                 .map(|(_, s)| s)
                 .unwrap_or(status);
         }
-        let droplet = self.get_json(&digitalocean::droplet_url(base, id)).await?;
+        let remaining = BUDGET.saturating_sub(start.elapsed());
+        anyhow::ensure!(
+            !remaining.is_zero(),
+            "vps: DO snapshot action {action_id} not complete after {}s",
+            BUDGET.as_secs()
+        );
+        let droplet = self
+            .get_json_timeout(
+                &digitalocean::droplet_url(base, id),
+                remaining.min(crate::provider::CONTROL_TIMEOUT),
+            )
+            .await?;
         digitalocean::parse_latest_snapshot_id(&droplet)
             .ok_or_else(|| anyhow!("vps: no snapshot id on droplet {id} after snapshot"))
     }
@@ -873,6 +936,7 @@ impl RemoteProvider for VpsProvider {
                     .client
                     .delete(&url)
                     .bearer_auth(&self.spec.token)
+                    .timeout(crate::provider::CONTROL_TIMEOUT)
                     .send()
                     .await
                     .map_err(|error| {

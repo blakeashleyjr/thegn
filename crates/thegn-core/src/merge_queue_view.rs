@@ -31,6 +31,7 @@ pub fn rollup(statuses: impl IntoIterator<Item = MqStatus>) -> Option<MqRollup> 
             MqStatus::Deferred
             | MqStatus::GateFailed
             | MqStatus::GateError
+            | MqStatus::AgentBlocked
             | MqStatus::NeedsHuman => MqTier::Blocked,
             MqStatus::Folding | MqStatus::Verifying | MqStatus::AgentRunning => MqTier::Working,
             MqStatus::Queued | MqStatus::Ready => MqTier::Populated,
@@ -86,6 +87,7 @@ mod tests {
             MqStatus::Deferred,
             MqStatus::GateFailed,
             MqStatus::GateError,
+            MqStatus::AgentBlocked,
             MqStatus::NeedsHuman,
         ];
         for status in blocked {

@@ -87,20 +87,28 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         // only the headline's first line is shown (the log tail is in the row).
         if matches!(
             r.status.as_str(),
-            "deferred" | "gate_failed" | "gate_error" | "needs_human"
+            "deferred" | "gate_failed" | "gate_error" | "agent_blocked" | "needs_human"
         ) {
             let reason = if let Some(d) = r.error_detail.as_deref().filter(|s| !s.is_empty()) {
-                d.lines().next().unwrap_or(d).to_string()
+                let reason = d.lines().next().unwrap_or(d);
+                if r.status == "agent_blocked" {
+                    format!("environment/policy blocked — {reason}")
+                } else {
+                    reason.to_string()
+                }
             } else {
                 match r.conflict_paths.as_deref() {
                     Some(p) if !p.is_empty() => p.replace('\n', ", "),
                     _ if r.status == "gate_failed" => "breaks build".to_string(),
                     _ if r.status == "gate_error" => "gate could not run".to_string(),
+                    _ if r.status == "agent_blocked" => {
+                        "agent blocked by environment or isolation policy".to_string()
+                    }
                     _ => "conflict".to_string(),
                 }
             };
             // Amber for an environment failure: nothing is wrong with the branch.
-            let tone = if r.status == "gate_error" {
+            let tone = if matches!(r.status.as_str(), "gate_error" | "agent_blocked") {
                 Hue::Amber
             } else {
                 Hue::Red

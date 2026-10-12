@@ -2397,7 +2397,13 @@ fn mq_row(r: &thegn_core::db::MergeQueueRow, gl: &thegn_core::termcaps::GlyphSet
         .unwrap_or((gl.dot_hollow, Hue::Blue));
     // Blocked rows show their reason; the rest show the status word.
     let note = match r.status.as_str() {
-        "deferred" | "gate_failed" | "needs_human" => r
+        "agent_blocked" => Some(format!(
+            "environment/policy blocked — {}",
+            r.error_detail
+                .as_deref()
+                .unwrap_or("agent isolation floor not met")
+        )),
+        "deferred" | "gate_failed" | "gate_error" | "needs_human" => r
             .error_detail
             .as_deref()
             .or(r.conflict_paths.as_deref())
@@ -2419,7 +2425,7 @@ fn mq_row(r: &thegn_core::db::MergeQueueRow, gl: &thegn_core::termcaps::GlyphSet
                 },
             );
         }
-        "deferred" | "gate_failed" | "needs_human" => {
+        "deferred" | "gate_failed" | "gate_error" | "agent_blocked" | "needs_human" => {
             row = row.action(
                 'r',
                 DetailAction::MergeQueueAction {

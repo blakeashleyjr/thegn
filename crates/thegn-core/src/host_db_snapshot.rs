@@ -187,7 +187,7 @@ fn read_with_snapshot_hook(
     transaction.commit().map_err(sql_error)?;
     // Decode captured bytes after closing the read transaction, not while
     // holding a database read lock. Later writers cannot change these bytes.
-    HostDefinitionsSnapshot::from_raw(version, copied)
+    HostDefinitionsSnapshot::from_captured_rows(version, copied)
 }
 
 #[cfg(test)]

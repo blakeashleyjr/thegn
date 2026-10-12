@@ -569,7 +569,18 @@ pub(crate) fn spawn_ci_detail(
                     Some(entry)
                 })
             };
-            if let Some(entry) = entry {
+            if let Some(mut entry) = entry {
+                let redacted = thegn_core::ci_log::redact(&entry.text);
+                let (text, truncated) = thegn_core::ci_log::bounded_tail(
+                    &redacted,
+                    cfg.log_tail_lines
+                        .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
+                    cfg.log_max_bytes
+                        .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
+                );
+                entry.text = text;
+                entry.truncated |= truncated;
+                entry.redacted = true;
                 log_tail.push(format!(
                     "\u{2500}\u{2500} {} \u{2500}\u{2500}",
                     entry.job_name
@@ -1582,7 +1593,7 @@ impl CiActionCtx<'_> {
         from: chrono::NaiveDate,
         to: chrono::NaiveDate,
     ) {
-        crate::hydrate_calendar::spawn_month_fetch(
+        crate::sched::report_required_result(crate::hydrate_calendar::spawn_month_fetch(
             self.cfg.calendar.clone(),
             year,
             month,
@@ -1590,7 +1601,7 @@ impl CiActionCtx<'_> {
             to,
             self.refresh_tx.clone(),
             self.waker.clone(),
-        );
+        ));
     }
 
     /// Fire a CI mutation off the loop after posting an in-progress status.

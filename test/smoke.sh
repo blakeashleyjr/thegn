@@ -1194,7 +1194,7 @@ done
 check "share frp derives the per-worktree https URL" \
   "grep -q 'https://feature-3000.share.example.com' '$TMP/frp.out'"
 check "share frp materializes frpc.toml in the state dir" \
-  "ls $XDG_STATE_HOME/thegn/share/*-3000/frpc.toml >/dev/null 2>&1"
+  "ls $XDG_STATE_HOME/thegn/share/*/frpc.toml >/dev/null 2>&1"
 kill "$FRP_PID" 2>/dev/null || true
 wait "$FRP_PID" 2>/dev/null || true
 

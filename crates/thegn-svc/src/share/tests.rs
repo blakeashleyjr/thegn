@@ -103,7 +103,9 @@ fn url_rule_extracts_bore_listening_line() {
     let plan = process_plan(&spec);
     let line = "2026-06-26T00:00:00Z  INFO bore_cli::client: listening at bore.pub:41234";
     assert_eq!(
-        plan.match_url(line).as_deref(),
+        plan.match_url(line)
+            .map(|endpoint| endpoint.canonical())
+            .as_deref(),
         Some("http://bore.pub:41234")
     );
 }
@@ -115,7 +117,9 @@ fn url_rule_trims_trailing_punctuation() {
         scheme: "http".into(),
     };
     assert_eq!(
-        rule.apply("listening at relay:8000.").as_deref(),
+        rule.apply("listening at relay:8000.")
+            .map(|endpoint| endpoint.canonical())
+            .as_deref(),
         Some("http://relay:8000")
     );
 }
@@ -131,6 +135,200 @@ fn url_rule_ignores_non_matching_lines() {
     assert!(rule.apply("listening at soon").is_none());
     // non-numeric port
     assert!(rule.apply("listening at host:abc").is_none());
+}
+
+#[test]
+fn public_endpoint_parsing_canonicalizes_and_rejects_ambiguous_input() {
+    assert_eq!(
+        PublicEndpoint::parse_url("http://127.0.0.1:8080")
+            .unwrap()
+            .canonical(),
+        "http://127.0.0.1:8080"
+    );
+    assert_eq!(
+        PublicEndpoint::parse_url("https://EXAMPLE.test:443/path")
+            .unwrap()
+            .canonical(),
+        "https://example.test/path"
+    );
+    assert_eq!(
+        PublicEndpoint::parse_url("http://[2001:0db8::1]:8080")
+            .unwrap()
+            .canonical(),
+        "http://[2001:db8::1]:8080"
+    );
+    assert!(PublicEndpoint::parse_url("https://xn--bcher-kva.example").is_some());
+    for bad in [
+        "https://user@example.test",
+        "https://example.test/#fragment",
+        "https://example.test:0",
+        "https://example.test:99999",
+        "https://example.test/path with space",
+        "https://example.test/%zz",
+        "https://example.test\u{1b}]0;evil",
+        "https://example.test:80;evil",
+        "https://-bad.example",
+        "https://例え.テスト",
+    ] {
+        assert!(PublicEndpoint::parse_url(bad).is_none(), "accepted {bad:?}");
+    }
+    assert!(
+        PublicEndpoint::parse_ticket(&"x".repeat(PublicEndpoint::MAX_TICKET_BYTES + 1)).is_none()
+    );
+    assert!(PublicEndpoint::parse_ticket("ticket\u{1b}[31m").is_none());
+    let ticket = PublicEndpoint::parse_ticket("safe-ticket").expect("valid opaque ticket");
+    assert!(ticket.as_url().is_none());
+    assert_eq!(ticket.kind(), PublicEndpointKind::Ticket);
+    assert!(!format!("{ticket:?}").contains("safe-ticket"));
+}
+
+#[test]
+fn announcements_reject_repeated_markers_and_ticket_delimiters() {
+    let rule = UrlRule::AfterMarker {
+        marker: "public: ".into(),
+        scheme: "https".into(),
+    };
+    assert!(rule.apply("public: one public: two.example").is_none());
+    let ticket = UrlRule::AfterMarkerRaw {
+        marker: "connect-tcp".into(),
+    };
+    assert!(ticket.apply("connect-tcp good-ticket;rm").is_none());
+    assert_eq!(
+        ticket.apply("connect-tcp safe-ticket").unwrap().canonical(),
+        "safe-ticket"
+    );
+}
+
+#[test]
+fn startup_rejects_two_provider_endpoint_announcements() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    let first = PublicEndpoint::parse_url("https://first.test").expect("valid URL");
+    tx.send(first.clone()).expect("first announcement");
+    tx.send(PublicEndpoint::parse_url("https://second.test").expect("valid URL"))
+        .expect("second announcement");
+    assert!(reject_duplicate_announcement(&rx, &first).is_err());
+}
+
+#[test]
+fn startup_accepts_byte_identical_endpoint_announcements() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    let first = PublicEndpoint::parse_url("https://first.test").expect("valid URL");
+    tx.send(first.clone()).expect("repeat announcement");
+    tx.send(first.clone())
+        .expect("byte-identical repeated announcement");
+    drop(tx);
+    assert!(
+        reject_duplicate_announcement(&rx, &first).is_ok(),
+        "a byte-identical repeated announcement must not fail startup"
+    );
+}
+
+#[test]
+fn share_state_identity_is_bounded_canonical_and_manifest_owned() {
+    let temp = tempfile::tempdir().expect("temporary root");
+    let base = temp.path().join("state");
+    let repo = temp.path().join("repo");
+    for path in [
+        repo.join("a/b"),
+        repo.join("a-b"),
+        repo.join("a_b"),
+        repo.join("renamed"),
+    ] {
+        std::fs::create_dir_all(path).expect("worktree fixture");
+    }
+    let nested = repo.join("a/b");
+    let a = share_state_dir_at(&base, &nested, "bore", 3000, 1).expect("first identity");
+    let b = share_state_dir_at(&base, &repo.join("a-b"), "bore", 3000, 1).expect("second identity");
+    let c = share_state_dir_at(&base, &repo.join("a_b"), "bore", 3000, 1).expect("third identity");
+    assert_ne!(a, b);
+    assert_ne!(a, c);
+    assert_ne!(b, c);
+    assert_ne!(
+        a,
+        share_state_dir_at(&base, &nested, "frp", 3000, 1).expect("provider identity")
+    );
+    assert_ne!(
+        a,
+        share_state_dir_at(&base, &nested, "bore", 3000, 2).expect("generation identity")
+    );
+    assert_eq!(
+        a,
+        share_state_dir_at(&base, &nested.join("."), "bore", 3000, 1).expect("canonical alias")
+    );
+    assert!(a.file_name().expect("component").to_string_lossy().len() < 100);
+
+    let moved = repo.join("renamed");
+    let before_rename = share_state_dir_at(&base, &moved, "bore", 3001, 1).expect("before rename");
+    let renamed = repo.join("renamed-again");
+    std::fs::rename(&moved, &renamed).expect("rename worktree fixture");
+    let after_rename = share_state_dir_at(&base, &renamed, "bore", 3001, 1).expect("after rename");
+    assert_ne!(before_rename, after_rename);
+
+    let missing_worktree = repo.join("remote-or-deleted-worktree");
+    assert!(
+        share_state_dir_at(&base, &missing_worktree, "bore", 3002, 1).is_ok(),
+        "missing worktree paths retain their raw identity"
+    );
+
+    std::fs::write(a.join("owner.manifest"), b"foreign owner").expect("tamper manifest");
+    assert!(share_state_dir_at(&base, &nested, "bore", 3000, 1).is_err());
+}
+
+#[test]
+fn failed_start_removes_materialized_provider_credentials() {
+    let state = tempfile::tempdir().expect("temporary state");
+    let plan = SharePlan {
+        program: "thegn-share-test-command-that-does-not-exist".into(),
+        args: Vec::new(),
+        env: Vec::new(),
+        files: vec![SharePlanFile {
+            dest: "frpc.toml".into(),
+            contents: "token = \"secret\"".into(),
+        }],
+        url_rule: UrlRule::Fixed("https://share.example".into()),
+    };
+    let error = start(&plan, state.path(), Duration::from_millis(1)).expect_err("missing command");
+    assert!(error.to_string().contains("failed to spawn"));
+    assert!(!state.path().join("frpc.toml").exists());
+}
+
+#[test]
+fn start_then_stop_removes_share_state_directory() {
+    let temp = tempfile::tempdir().expect("temporary root");
+    let base = temp.path().join("state");
+    let worktree = temp.path().join("repo");
+    std::fs::create_dir_all(&worktree).expect("worktree fixture");
+    let statedir =
+        share_state_dir_at(&base, &worktree, "bore", 3000, 42).expect("share state directory");
+    let plan = SharePlan {
+        program: "sh".into(),
+        args: vec!["-c".into(), "sleep 10".into()],
+        env: Vec::new(),
+        files: Vec::new(),
+        url_rule: UrlRule::Fixed("https://share.example".into()),
+    };
+    let running = start(&plan, &statedir, Duration::from_secs(1)).expect("start share");
+    running.stop();
+    assert!(
+        !statedir.exists(),
+        "stop must remove the owned state directory"
+    );
+}
+
+#[test]
+fn concurrent_share_state_creation_agrees_on_one_manifest() {
+    let temp = tempfile::tempdir().expect("temporary root");
+    let base = temp.path().join("state");
+    let worktree = temp.path().join("worktree");
+    std::fs::create_dir_all(&worktree).expect("worktree fixture");
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| share_state_dir_at(&base, &worktree, "bore", 3000, 7));
+        let b = scope.spawn(|| share_state_dir_at(&base, &worktree, "bore", 3000, 7));
+        assert_eq!(
+            a.join().expect("first worker").expect("first create"),
+            b.join().expect("second worker").expect("second create")
+        );
+    });
 }
 
 // ── frp ─────────────────────────────────────────────────────────────────────
@@ -151,7 +349,10 @@ fn frp_https_materializes_toml_and_derives_subdomain_url() {
     assert_eq!(plan.args, vec!["-c", "{statedir}/frpc.toml"]);
     // URL derived from config (default subdomain = <label>-<port>).
     assert_eq!(
-        plan.url_rule.fixed(),
+        plan.url_rule
+            .fixed()
+            .map(|endpoint| endpoint.canonical())
+            .as_deref(),
         Some("https://app-feat-3000.share.example.com")
     );
 
@@ -176,7 +377,13 @@ fn frp_token_and_explicit_subdomain_and_vhost_port() {
     };
     let spec = frp_spec(frp, "wt", 8080);
     let plan = process_plan(&spec);
-    assert_eq!(plan.url_rule.fixed(), Some("https://demo.ex.com:8443"));
+    assert_eq!(
+        plan.url_rule
+            .fixed()
+            .map(|endpoint| endpoint.canonical())
+            .as_deref(),
+        Some("https://demo.ex.com:8443")
+    );
     let toml = &plan.files[0].contents;
     assert!(toml.contains("[auth]"));
     assert!(toml.contains("token = \"literal-token\""));
@@ -194,7 +401,13 @@ fn frp_tcp_derives_host_port_and_no_subdomain() {
     };
     let spec = frp_spec(frp, "wt", 5432);
     let plan = process_plan(&spec);
-    assert_eq!(plan.url_rule.fixed(), Some("frps.example.com:6000"));
+    assert_eq!(
+        plan.url_rule
+            .fixed()
+            .map(|endpoint| endpoint.canonical())
+            .as_deref(),
+        Some("frps.example.com:6000")
+    );
     let toml = &plan.files[0].contents;
     assert!(toml.contains("type = \"tcp\""));
     assert!(toml.contains("remotePort = 6000"));
@@ -224,7 +437,13 @@ fn frp_http_https_and_udp_keep_their_explicit_wire_shapes() {
             ..FrpConfig::default()
         };
         let plan = process_plan(&frp_spec(frp, "wt", 3000));
-        assert_eq!(plan.url_rule.fixed(), Some(expected_url));
+        assert_eq!(
+            plan.url_rule
+                .fixed()
+                .map(|endpoint| endpoint.canonical())
+                .as_deref(),
+            Some(expected_url)
+        );
         assert!(
             plan.files[0]
                 .contents
@@ -240,7 +459,13 @@ fn frp_http_https_and_udp_keep_their_explicit_wire_shapes() {
         ..FrpConfig::default()
     };
     let plan = process_plan(&frp_spec(frp, "wt", 3000));
-    assert_eq!(plan.url_rule.fixed(), Some("frps.example.com:6001"));
+    assert_eq!(
+        plan.url_rule
+            .fixed()
+            .map(|endpoint| endpoint.canonical())
+            .as_deref(),
+        Some("frps.example.com:6001")
+    );
     assert!(plan.files[0].contents.contains("type = \"udp\""));
     assert!(plan.files[0].contents.contains("remotePort = 6001"));
 }
@@ -388,7 +613,13 @@ fn frp_ipv6_is_unbracketed_in_toml_and_bracketed_in_url() {
     };
     let spec = frp_spec(frp, "wt", 5432);
     let plan = process_plan(&spec);
-    assert_eq!(plan.url_rule.fixed(), Some("[2001:db8::7]:6000"));
+    assert_eq!(
+        plan.url_rule
+            .fixed()
+            .map(|endpoint| endpoint.canonical())
+            .as_deref(),
+        Some("[2001:db8::7]:6000")
+    );
     assert!(
         plan.files[0]
             .contents
@@ -546,8 +777,10 @@ fn iroh_listens_and_scrapes_ticket_into_connect_command() {
     // The ticket is opaque (not host:port); the address is the connect command.
     let line = "to connect, use: dumbpipe connect-tcp blobAbCdEf123ticket";
     assert_eq!(
-        plan.match_url(line).as_deref(),
-        Some("dumbpipe connect-tcp blobAbCdEf123ticket")
+        plan.match_url(line)
+            .map(|endpoint| endpoint.canonical())
+            .as_deref(),
+        Some("blobAbCdEf123ticket")
     );
     // Visibility is private (peer-to-peer).
     assert_eq!(
@@ -583,7 +816,7 @@ fn start_keeps_draining_so_child_survives_post_return() {
     let _ = std::fs::create_dir_all(&tmp); // best-effort: test setup; later asserts fail loudly if missing
 
     let mut running = start(&plan, &tmp, Duration::from_secs(5)).expect("start");
-    assert_eq!(running.public_url, "http://fixed.example");
+    assert_eq!(running.public_url.canonical(), "http://fixed.example");
 
     // Give the child time to emit several post-return lines: under the old
     // break-on-send-fail behavior it would SIGPIPE and exit here.
@@ -629,7 +862,10 @@ fn bounded_reader_retries_interrupted_and_emits_eof_url() {
         },
     );
     assert_eq!(
-        url_rx.recv().expect("URL after interrupted read"),
+        url_rx
+            .recv()
+            .expect("URL after interrupted read")
+            .canonical(),
         "http://interrupted.example:4123"
     );
     assert_eq!(
@@ -654,7 +890,7 @@ fn bounded_reader_discards_oversized_line_but_keeps_following_url() {
         },
     );
     assert_eq!(
-        url_rx.recv().expect("URL after oversized line"),
+        url_rx.recv().expect("URL after oversized line").canonical(),
         "http://bounded.example:4123"
     );
     assert_eq!(
@@ -680,7 +916,8 @@ fn bounded_reader_keeps_url_when_diagnostics_receiver_is_gone() {
     assert_eq!(
         url_rx
             .recv()
-            .expect("priority URL after diagnostic disconnect"),
+            .expect("priority URL after diagnostic disconnect")
+            .canonical(),
         "http://disconnected.example:4123"
     );
 }
@@ -717,7 +954,7 @@ fn start_returns_url_from_unterminated_provider_line() {
     };
     let running = start(&plan, state.path(), Duration::from_secs(1)).expect("EOF URL");
     assert!(!format!("{running:?}").contains("eof.example"));
-    assert_eq!(running.public_url, "http://eof.example:4123");
+    assert_eq!(running.public_url.canonical(), "http://eof.example:4123");
     running.stop();
 }
 
@@ -782,7 +1019,7 @@ fn bounded_reader_prioritizes_late_url_over_full_diagnostic_queue() {
         },
     );
     assert_eq!(
-        url_rx.recv().expect("late URL signal"),
+        url_rx.recv().expect("late URL signal").canonical(),
         "http://late.example:4123"
     );
     drop(rx);

@@ -894,6 +894,56 @@ fn merge_queue_enqueue_update_list_and_remove() {
 }
 
 #[test]
+fn pr_ci_rerun_reservation_is_atomic_and_head_changes_rearm_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pr-rerun.db");
+    {
+        let db = Db::open_at(&path).unwrap();
+        db.enqueue_pr("/repo", 7, None, "feat", "main", "github")
+            .unwrap();
+    }
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let db = Db::open_at(&path).unwrap();
+                barrier.wait();
+                db.reserve_pr_ci_rerun("/repo#7", None, "head-a").unwrap()
+            })
+        })
+        .collect();
+    let reservations = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .filter(|reserved| *reserved)
+        .count();
+    assert_eq!(
+        reservations, 1,
+        "only one concurrent worker reserves the head"
+    );
+
+    let db = Db::open_at(&path).unwrap();
+    assert!(
+        !db.reserve_pr_ci_rerun("/repo#7", Some("head-a"), "head-a")
+            .unwrap()
+    );
+    db.update_pr_status("/repo#7", "blocked_ci", None, None, Some("head-b"))
+        .unwrap();
+    let row = db.list_pr_queue().unwrap().remove(0);
+    assert_eq!(
+        row.ci_rerun_head, None,
+        "observing a new head clears the old reservation"
+    );
+    assert!(
+        db.reserve_pr_ci_rerun("/repo#7", Some("head-b"), "head-b")
+            .unwrap()
+    );
+}
+
+#[test]
 fn pr_queue_enqueue_update_list_and_remove() {
     let db = db();
     assert!(db.list_pr_queue().unwrap().is_empty());
@@ -4074,6 +4124,52 @@ fn chunk_claim_fails_closed_for_unreadable_active_scope_and_leaves_no_row() {
         1,
         "refused admission must not insert a row"
     );
+}
+
+#[test]
+fn chunk_claim_fails_closed_when_scope_overlap_cannot_be_proven() {
+    let db = Db::open_memory().unwrap();
+    let sibling = db
+        .put_agent_dispatch(crate::issue::NewDispatch {
+            chunk_path: Some("sibling.md"),
+            ..crate::issue::NewDispatch::new("linear:A-1", "/wt/shared", "code")
+        })
+        .unwrap();
+    let prepared = crate::pipeline_chunk::PreparedChunkAdmission {
+        path: "incoming.md".into(),
+        scope: crate::pipeline_chunk::ChunkScope {
+            files: vec!["src/new.rs".into()],
+            ..Default::default()
+        },
+        siblings: vec![crate::pipeline_chunk::PreparedSiblingScope {
+            row: sibling,
+            path: "sibling.md".into(),
+            scope: Some(Ok(crate::pipeline_chunk::ChunkScope {
+                files: vec!["src/../unknown.rs".into()],
+                ..Default::default()
+            })),
+        }],
+    };
+    let refusal = db
+        .claim_dispatch_admitted(
+            crate::issue::NewDispatch {
+                chunk_path: Some("incoming.md"),
+                ..claim_new("linear:A-1", "/wt/shared", "code", "incoming.md")
+            },
+            3,
+            None,
+            Some(&prepared),
+            None,
+        )
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(
+        refusal,
+        crate::db_dispatch::DispatchAdmissionDecision::ScopeRefused(_)
+    ));
+    let reason = format!("{refusal:?}");
+    assert!(reason.contains("could not be proven"), "{reason}");
+    assert_eq!(db.list_dispatches().unwrap().len(), 1);
 }
 
 #[test]

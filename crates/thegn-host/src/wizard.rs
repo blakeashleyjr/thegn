@@ -301,6 +301,22 @@ impl NewWorktreeWizard {
         }
     }
 
+    /// Construct a wizard in tests without persisting its repo slug to the
+    /// user's state database. The slug lookup happens during construction, so
+    /// the isolated state home only needs to live for this call.
+    #[cfg(test)]
+    pub(crate) fn new_isolated_for_test(repo_root: PathBuf, cfg: &Config) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let state_home = dir.path().join("state");
+        let state_home = state_home.to_string_lossy().into_owned();
+        let _env = crate::testenv::EnvVarGuard::set(&[
+            ("XDG_STATE_HOME", &state_home),
+            ("LOCALAPPDATA", &state_home),
+        ]);
+        assert_eq!(thegn_core::util::xdg_state_home(), Path::new(&state_home));
+        Self::new(repo_root, cfg)
+    }
+
     /// The repo root this wizard creates worktrees under.
     pub fn root(&self) -> &PathBuf {
         &self.root
@@ -1228,7 +1244,7 @@ pub fn run_worker(
     // slug (the tab key) is resolved later from the worker's own DB handle:
     // opening a second connection here would make an unrelated busy/locked
     // state abandon a checkout that is otherwise fine (THE-516 review).
-    let hook_workspace = repo::repo_slug(root);
+    let hook_workspace = hook_workspace_slug(root, ctx.db_path.as_deref());
     let pre = crate::worktree_lifecycle::run_event(
         cfg,
         root,
@@ -1615,6 +1631,13 @@ pub fn run_worker(
     });
 }
 
+fn hook_workspace_slug(root: &Path, db_path: Option<&Path>) -> String {
+    match db_path {
+        Some(db_path) => repo::repo_slug_at(root, db_path),
+        None => repo::repo_slug(root),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1630,6 +1653,38 @@ mod tests {
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
         cfg.worktree_mode = WorktreeMode::InRepo;
         cfg
+    }
+
+    #[test]
+    fn hook_workspace_slug_uses_worker_database_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("same-name");
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = dir.path().join("isolated/thegn.db");
+        let db = Db::open_at(&db_path).unwrap();
+        db.slug_for_repo("/another/same-name", "same-name").unwrap();
+
+        assert_eq!(hook_workspace_slug(&root, Some(&db_path)), "same-name-2");
+        assert_eq!(
+            db.slug_for_repo(&root.to_string_lossy(), "same-name")
+                .unwrap(),
+            "same-name-2"
+        );
+    }
+
+    #[test]
+    fn hook_workspace_slug_without_worker_path_uses_isolated_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let state = state.to_str().unwrap();
+        let _env =
+            crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state), ("LOCALAPPDATA", state)]);
+        let root = dir.path().join("same-name");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = Db::open().unwrap();
+        db.slug_for_repo("/another/same-name", "same-name").unwrap();
+
+        assert_eq!(hook_workspace_slug(&root, None), "same-name-2");
     }
 
     #[test]
@@ -1693,6 +1748,12 @@ mod tests {
         cmds: Vec<WizardCmd>,
         db_path: &Path,
     ) -> Vec<CreateEvent> {
+        let state_home = repo.join("state");
+        let state_home = state_home.to_string_lossy().into_owned();
+        let _env = crate::testenv::EnvVarGuard::set(&[
+            ("XDG_STATE_HOME", &state_home),
+            ("LOCALAPPDATA", &state_home),
+        ]);
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         for c in cmds {
             cmd_tx.send(c).unwrap();
@@ -1751,7 +1812,7 @@ mod tests {
     #[test]
     fn wizard_walkthrough_generated_name() {
         let cfg = test_cfg();
-        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
         assert!(w.candidate().starts_with(&cfg.branch_prefix));
         assert!(w.candidate().len() > cfg.branch_prefix.len());
 
@@ -1770,7 +1831,7 @@ mod tests {
     #[test]
     fn enter_advances_on_edit_fields_and_creates_only_on_program() {
         let cfg = test_cfg();
-        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
 
         // Walk up to the Name field (Program → Sandbox → Host → Name).
         key(&mut w, KeyCode::UpArrow);
@@ -1800,7 +1861,7 @@ mod tests {
     #[test]
     fn typing_marks_edited_and_blocks_suggestion() {
         let cfg = test_cfg();
-        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
         // Focus starts on Program; walk up to the Name field (Sandbox, Host,
         // Name — a local default host keeps the Sandbox row in the ring).
         key(&mut w, KeyCode::UpArrow);
@@ -1830,7 +1891,7 @@ mod tests {
     #[test]
     fn pristine_field_adopts_suggestion() {
         let cfg = test_cfg();
-        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
         w.apply_name_suggestion("tg/calm-otter-3");
         assert_eq!(w.candidate(), "tg/calm-otter-3");
     }
@@ -1838,7 +1899,7 @@ mod tests {
     #[test]
     fn empty_name_refuses_to_advance() {
         let cfg = test_cfg();
-        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
         // Walk up to the Name field.
         key(&mut w, KeyCode::UpArrow);
         key(&mut w, KeyCode::UpArrow);
@@ -1862,7 +1923,7 @@ mod tests {
         let cfg = test_cfg();
         // Escape cancels from every field along the focus ring.
         for ups in 0..=3 {
-            let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+            let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
             for _ in 0..ups {
                 key(&mut w, KeyCode::UpArrow);
             }
@@ -1870,7 +1931,7 @@ mod tests {
         }
 
         // Ctrl+c cancels regardless of focus.
-        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
         assert_eq!(
             w.handle_key(&KeyCode::Char('c'), Modifiers::CTRL),
             WizardOutcome::Cancel
@@ -1880,7 +1941,7 @@ mod tests {
     #[test]
     fn host_defaults_and_cycles() {
         let cfg = test_cfg();
-        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
         // No named envs ⇒ the default host is the implicit "default".
         assert_eq!(w.host_key(), "default");
         assert!(w.host_is_local());
@@ -1910,7 +1971,7 @@ mod tests {
             },
         );
 
-        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
         assert_eq!(w.host_key(), "host");
         assert_eq!(w.sandbox_key(), "host");
 
@@ -1943,7 +2004,7 @@ mod tests {
         // Make the ssh env the default host so it opens selected.
         cfg.sandbox.default_env = "remote".into();
 
-        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
         assert_eq!(w.host_key(), "remote");
         assert!(!w.host_is_local(), "ssh host is non-local");
         // Program → up skips Sandbox and lands on Host directly.
@@ -1980,7 +2041,7 @@ mod tests {
 
     #[test]
     fn failed_wizard_stays_visible_and_cannot_submit_or_prepare() {
-        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &test_cfg());
+        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &test_cfg());
         w.focus = Field::Name;
         let candidate = w.candidate();
         w.set_failure("resolve base: \x1b[31mfatal: Needed a single revision\x1b[0m");
@@ -2150,6 +2211,10 @@ mod tests {
         let p = expect_done(&events);
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "done");
         assert!(Path::new(&p.path).is_dir());
+        assert!(
+            repo.join("state/thegn/hooks").is_dir(),
+            "post-create hook log should use the worker's isolated state home"
+        );
         let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
@@ -2344,7 +2409,7 @@ mod tests {
                 .join("\n")
         };
 
-        let w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        let w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
         let mut s = Surface::new(80, 24);
         w.render(&mut s, screen);
         let frame = text(&mut s);
@@ -2359,7 +2424,7 @@ mod tests {
         // Host-readiness badge (hosts-as-resources): rendered dim after the
         // selected env's label when the launcher provided one; absent otherwise.
         assert!(!frame.contains("✓ ready"), "no badge without a map");
-        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
         w.set_host_badges(std::collections::HashMap::from([(
             w.host_key(),
             "✓ ready".to_string(),

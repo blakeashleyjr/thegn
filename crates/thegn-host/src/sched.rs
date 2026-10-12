@@ -1,78 +1,240 @@
-//! Background-work scheduling gate.
+//! Background-work admission for the shared Tokio blocking pool.
 //!
-//! The whole app shares one `spawn_blocking` pool (`max_blocking_threads`).
-//! Without a cap, background refreshes — disk `du`, PR/issue/CI/my-work network
-//! fetches — can occupy every pool thread and delay the *interactive* model
-//! hydration a worktree switch is waiting on (the "usable performance is always
-//! first" invariant). Background tasks reserve a permit from a small semaphore
-//! before doing their blocking work; interactive tasks (model hydration, panel
-//! prefetch) never do, so they always find pool headroom. A background task that
-//! can't get a permit simply skips this round — its periodic trigger retries.
+//! The eight permits bound admitted background closures, including closures
+//! waiting in Tokio's blocking queue. They do not reserve pool threads: direct
+//! `spawn_blocking` calls and `std::thread` workers are outside this budget.
+//! Admission is non-blocking, so interactive callers never wait for a permit.
+//!
+//! Caller policy matrix (all ordinary refresh callers use a periodic or
+//! event-driven trigger to retry after refusal):
+//!
+//! | Caller | Work class / marker | Completion | Refusal |
+//! | --- | --- | --- | --- |
+//! | `hydrate_tracker::spawn_issue_cache_refresh` | replaceable cache refresh; no latch | cache write + waker | skip; periodic trigger retries |
+//! | `hydrate::spawn_panel_prefetch` | replaceable cache prefetch; run-loop path latch | result channel | return admission; caller clears path latch |
+//! | `hydrate::spawn_pr_cache_refresh` | replaceable cache refresh; generation fence only | cache + waker | skip; switch/ticker retries |
+//! | sibling PR branch cache refresh | replaceable cache refresh; generation fence only | cache | skip; next refresh retries |
+//! | `hydrate::spawn_my_work_refresh` | replaceable cache refresh; no latch | cache + waker | skip; periodic trigger retries |
+//! | `remote_poll::poll` | replaceable remote refresh; no latch | model refresh + waker | skip; poll tick retries |
+//! | `ci_refresh::spawn_ci_cache_refresh` | replaceable cache refresh; generation fence only | cache + waker | skip; ticker/switch retries |
+//! | `measure::disk::spawn_scan` | replaceable cache scan; worker-owned round flag | cache + waker | skip; planner/ticker retries |
+//! | `measure::loc::spawn_scan` | replaceable cache scan; worker-owned round flag | cache + waker | skip; planner/ticker retries |
+//! | `hydrate_calendar::spawn_month_fetch` | user-visible cache read; popup awaits payload | month result channel | send typed unavailable payload |
+//! | `hydrate_calendar::spawn_periodic_sync` | replaceable cache refresh; generation fence only | refresh channel | skip; periodic trigger retries |
+//! | `hydrate_calendar::spawn_reminder_check` | required reminder evaluation; cursor window | typed acknowledgment | abandon window; ticker retries |
+//! | `autopilot_driver` | durable side effect; DB claim happens in admitted closure | durable run row | leave issue unclaimed |
+//!
+//! Must-complete work uses `bg_permit` before claiming durable state and then
+//! transfers that same permit to `spawn_bg_reserved`.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Concurrency cap for background `spawn_blocking` work — a quarter of the
-/// runtime's blocking pool (`max_blocking_threads(32)` in `main.rs`), leaving the
-/// large majority for interactive hydration and user-initiated git actions.
+/// Concurrency and queued-admission cap for background closures.
 const BG_PERMITS: usize = 8;
+
+/// Result of a non-blocking background submission attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "background admission outcomes must be handled"]
+pub enum Admission {
+    /// A permit was reserved and the closure was submitted.
+    Admitted,
+    /// All background permits are held; the closure was not submitted.
+    Saturated,
+    /// No Tokio runtime was available; the closure was not submitted.
+    Unavailable,
+}
 
 fn bg_sem() -> &'static Arc<Semaphore> {
     static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
     SEM.get_or_init(|| Arc::new(Semaphore::new(BG_PERMITS)))
 }
 
-/// Try to reserve a background slot. `Some(permit)` → run the work, holding the
-/// permit until it drops (end of the task). `None` → the background lane is full;
-/// skip this round (periodic refreshes self-heal on the next tick). Non-blocking
-/// and safe from any thread — meant as the first line of a background
-/// `spawn_blocking` closure: `let Some(_permit) = crate::sched::bg_permit() else { return; };`.
+/// Try to reserve a background slot without waiting.
 pub fn bg_permit() -> Option<OwnedSemaphorePermit> {
     bg_sem().clone().try_acquire_owned().ok()
 }
 
-/// Run `f` on the blocking pool **through the background lane**: a drop-in for
-/// `tokio::task::spawn_blocking` for non-interactive work. Reserves a
-/// [`bg_permit`] first; if the lane is full the closure is skipped this round
-/// (periodic refreshes retry). Interactive work (model hydration, panel prefetch)
-/// keeps calling `spawn_blocking` directly so it always has pool headroom.
-pub fn spawn_bg<F: FnOnce() + Send + 'static>(f: F) {
-    tokio::task::spawn_blocking(move || {
-        let Some(_permit) = bg_permit() else {
-            return; // background lane full — periodic trigger retries next tick
-        };
-        f();
-    });
+/// Report an intentionally replaceable request. Refusal is counted with
+/// bounded-cardinality telemetry; its existing trigger is responsible for a
+/// later retry. Callers with latches or required results must handle
+/// [`Admission`] themselves instead.
+pub fn report_replaceable(admission: Admission) {
+    match admission {
+        Admission::Admitted => {}
+        Admission::Saturated => {
+            let count = REFUSED.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+            tracing::debug!(target: "thegn::sched", count, "replaceable background work refused at capacity");
+        }
+        Admission::Unavailable => {
+            tracing::debug!(target: "thegn::sched", "replaceable background work unavailable without a runtime");
+        }
+    }
 }
 
-/// Run a closure with a permit reserved by the caller. This is for producers
-/// that must acquire capacity before committing durable work; otherwise a
-/// later `spawn_bg` drop could leave that work permanently orphaned.
-pub fn spawn_bg_reserved<F: FnOnce() + Send + 'static>(permit: OwnedSemaphorePermit, f: F) {
-    tokio::task::spawn_blocking(move || {
+/// Report a refused user-visible request whose caller has already emitted its
+/// terminal result.
+pub fn report_required_result(admission: Admission) {
+    if admission != Admission::Admitted {
+        tracing::debug!(target: "thegn::sched", ?admission, "background request completed with an unavailable result");
+    }
+}
+
+/// Submit replaceable periodic work and account for admission refusal.
+pub fn spawn_bg_replaceable(f: impl FnOnce() + Send + 'static) {
+    report_replaceable(spawn_bg(f));
+}
+
+/// Report an impossible-to-run durable submission. The caller must arrange
+/// recovery for the already claimed work; the permit is released by the
+/// unavailable branch in `spawn_bg_reserved`.
+pub fn report_reserved(admission: Admission) {
+    if admission != Admission::Admitted {
+        tracing::error!(target: "thegn::sched", ?admission, "reserved background work could not be submitted");
+    }
+}
+
+static REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Submit `f` only after reserving a permit. The permit remains alive for the
+/// complete closure and is released on return or unwind.
+pub fn spawn_bg<F: FnOnce() + Send + 'static>(f: F) -> Admission {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return Admission::Unavailable;
+    };
+    admit_and_submit(f, bg_permit, move |job| {
+        drop(handle.spawn_blocking(job));
+    })
+}
+
+fn admit_and_submit<F, R, S>(f: F, reserve: R, submit: S) -> Admission
+where
+    F: FnOnce() + Send + 'static,
+    R: FnOnce() -> Option<OwnedSemaphorePermit>,
+    S: FnOnce(Box<dyn FnOnce() + Send + 'static>),
+{
+    let Some(permit) = reserve() else {
+        return Admission::Saturated;
+    };
+    submit(Box::new(move || {
         let _permit = permit;
         f();
-    });
+    }));
+    Admission::Admitted
+}
+
+/// Transfer a permit already reserved before durable state is claimed.
+pub fn spawn_bg_reserved(
+    permit: OwnedSemaphorePermit,
+    f: impl FnOnce() + Send + 'static,
+) -> Admission {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        drop(permit);
+        return Admission::Unavailable;
+    };
+    submit_reserved(permit, f, move |job| drop(handle.spawn_blocking(job)))
+}
+
+fn submit_reserved<F, S>(permit: OwnedSemaphorePermit, f: F, submit: S) -> Admission
+where
+    F: FnOnce() + Send + 'static,
+    S: FnOnce(Box<dyn FnOnce() + Send + 'static>),
+{
+    submit(Box::new(move || {
+        let _permit = permit;
+        f();
+    }));
+    Admission::Admitted
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    type QueuedJob = Box<dyn FnOnce() + Send>;
+    type QueuedJobs = Arc<std::sync::Mutex<Vec<QueuedJob>>>;
+    type QueuedJobSlot = Arc<std::sync::Mutex<Option<QueuedJob>>>;
 
     #[test]
-    fn permits_are_bounded_and_released_on_drop() {
-        // Exhaust the lane, confirm the next reservation is refused, then release
-        // one and confirm a slot frees up.
-        let held: Vec<_> = (0..BG_PERMITS).map(|_| bg_permit()).collect();
-        assert!(
-            held.iter().all(Option::is_some),
-            "all {BG_PERMITS} permits granted"
+    fn admission_bound_includes_queued_work_and_refuses_submission_at_capacity() {
+        let sem = Arc::new(Semaphore::new(BG_PERMITS));
+        let submitted = Arc::new(AtomicUsize::new(0));
+        let queued: QueuedJobs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for _ in 0..BG_PERMITS {
+            let queued_submit = queued.clone();
+            let submitted_count = submitted.clone();
+            let result = admit_and_submit(
+                || {},
+                || sem.clone().try_acquire_owned().ok(),
+                move |job| {
+                    queued_submit.lock().unwrap().push(job);
+                    submitted_count.fetch_add(1, Ordering::Relaxed);
+                },
+            );
+            assert_eq!(result, Admission::Admitted);
+        }
+        let result = admit_and_submit(
+            || {},
+            || sem.clone().try_acquire_owned().ok(),
+            |_| panic!("saturated closure must never be submitted"),
         );
-        assert!(
-            bg_permit().is_none(),
-            "lane is full — further reservations refused"
+        assert_eq!(result, Admission::Saturated);
+        assert_eq!(submitted.load(Ordering::Relaxed), BG_PERMITS);
+        assert_eq!(queued.lock().unwrap().len(), BG_PERMITS);
+    }
+
+    #[test]
+    fn missing_runtime_returns_unavailable_without_running_work() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_worker = ran.clone();
+        let result = spawn_bg(move || {
+            ran_worker.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(result, Admission::Unavailable);
+        assert_eq!(ran.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn permit_covers_queued_and_running_work_and_releases_after_panic() {
+        let sem = Arc::new(Semaphore::new(1));
+        let queued: QueuedJobSlot = Arc::new(std::sync::Mutex::new(None));
+        let queued_submit = queued.clone();
+        let result = admit_and_submit(
+            || panic!("worker panic"),
+            || sem.clone().try_acquire_owned().ok(),
+            move |job| *queued_submit.lock().unwrap() = Some(job),
         );
-        drop(held);
-        assert!(bg_permit().is_some(), "a released permit frees a slot");
+        assert_eq!(result, Admission::Admitted);
+        assert!(
+            sem.try_acquire().is_err(),
+            "queued work holds its reservation"
+        );
+        let job = queued.lock().unwrap().take().unwrap();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err());
+        assert!(sem.try_acquire().is_ok(), "unwind releases the reservation");
+    }
+
+    #[test]
+    fn reserved_permit_is_transferred_without_second_acquisition() {
+        let sem = Arc::new(Semaphore::new(1));
+        let permit = sem.clone().try_acquire_owned().unwrap();
+        let queued: QueuedJobSlot = Arc::new(std::sync::Mutex::new(None));
+        let queued_submit = queued.clone();
+        let result = submit_reserved(
+            permit,
+            || {},
+            move |job| *queued_submit.lock().unwrap() = Some(job),
+        );
+        assert_eq!(result, Admission::Admitted);
+        assert!(
+            sem.try_acquire().is_err(),
+            "transferred permit stays held in queue"
+        );
+        queued.lock().unwrap().take().unwrap()();
+        assert!(sem.try_acquire().is_ok());
     }
 }

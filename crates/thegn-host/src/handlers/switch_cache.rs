@@ -109,9 +109,11 @@ impl WorktreeSlice {
 /// next full hydration lands.
 pub(crate) struct PrefetchResult {
     pub path: std::path::PathBuf,
+    pub generation: Option<u64>,
     pub panel: crate::panel::PanelData,
     pub loc: Option<thegn_core::loc::LocReport>,
     pub disk: Option<u64>,
+    pub successful: bool,
 }
 
 /// The two cached measurements for `cwd`, as cheap indexed reads. Both scans own
@@ -181,9 +183,11 @@ pub(crate) fn clear_and_fill(
         if tx
             .send(PrefetchResult {
                 path: cwd,
+                generation: None,
                 panel,
                 loc,
                 disk,
+                successful: true,
             })
             .is_ok()
         {
@@ -209,13 +213,26 @@ pub(crate) fn drain_prefetch_results(
     while let Ok(res) = rx.try_recv() {
         let PrefetchResult {
             path,
+            generation,
             panel,
             loc,
             disk,
+            successful,
         } = res;
         loop_perf.tick(crate::perf::WakeSource::Prefetch);
-        // Release the dedupe guard: this path may warm again after its TTL.
-        inflight.finish(&path);
+        if !successful {
+            // Failed workers release only their own generation; a replacement
+            // request remains protected from an older completion.
+            if let Some(generation) = generation {
+                inflight.finish(&path, generation);
+            }
+            continue;
+        }
+        // A stale generation still carries a freshly built slice worth
+        // retaining. It cannot release the replacement request's latch or
+        // paint the live frame, but it may seed the path cache.
+        let current_generation =
+            generation.is_none_or(|generation| inflight.finish(&path, generation));
         // Keyed like the switch detection: a terminal never matches a dir's
         // prefetch, so the launch-dir worktree's panel can't paint onto it.
         let is_active = path == crate::hydrate::active_slice_key(session);
@@ -225,6 +242,9 @@ pub(crate) fn drain_prefetch_results(
         slice.disk = disk;
         // A prefetched panel is fresh — stamps the re-warm TTL.
         slice.seeded_at = Some(std::time::Instant::now());
+        if !current_generation {
+            continue;
+        }
         // A fast-fill for the worktree the user just cold-switched to (still
         // active + pending) paints the live frame: preserve loop-owned
         // now-playing media and re-merge this worktree's LSP diags (the fresh

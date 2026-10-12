@@ -8,7 +8,11 @@ use std::pin::Pin;
 use gtui_core::datasource::{DataSource, Query, QueryError};
 use gtui_core::frame::Frame;
 
+use crate::http::read_limited;
 use crate::loki_parser::parse_loki_response;
+
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct LokiSource {
     base_url: String,
@@ -22,7 +26,11 @@ impl LokiSource {
         Self {
             base_url: base_url.into(),
             token: token.into(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(TOTAL_TIMEOUT)
+                .build()
+                .expect("valid Loki HTTP client settings"),
         }
     }
 }
@@ -57,10 +65,13 @@ impl DataSource for LokiSource {
                     .send()
                     .await
                     .map_err(|e| QueryError::Network(e.to_string()))?;
-                let body = resp
-                    .text()
-                    .await
-                    .map_err(|e| QueryError::Network(e.to_string()))?;
+                if !resp.status().is_success() {
+                    return Err(QueryError::Network(format!(
+                        "Loki HTTP status {}",
+                        resp.status()
+                    )));
+                }
+                let body = read_limited(resp, "Loki").await?;
                 frames.extend(parse_loki_response(&body)?);
             }
             Ok(frames)

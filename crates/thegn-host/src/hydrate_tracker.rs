@@ -25,7 +25,7 @@ pub(crate) fn spawn_issue_cache_refresh(
     app_cfg: thegn_core::config::Config,
     waker: Option<TerminalWaker>,
 ) {
-    crate::sched::spawn_bg(move || {
+    crate::sched::spawn_bg_replaceable(move || {
         use thegn_core::issue::IssueFilter;
         use thegn_svc::issue::IssueRouter;
 

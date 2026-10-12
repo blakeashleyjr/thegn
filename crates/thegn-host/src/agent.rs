@@ -2919,40 +2919,85 @@ where
 
 /// In-process registry of worktrees with a live provider file-sync (path →
 /// env name), so the close thread can pull changes back without re-resolving.
-fn provider_sync_registry() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>>
-{
-    static REG: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
-        std::sync::OnceLock::new();
+#[derive(Clone)]
+struct ProviderSyncRecord {
+    env_name: String,
+    in_flight: bool,
+}
+
+fn provider_sync_registry()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, ProviderSyncRecord>> {
+    static REG: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ProviderSyncRecord>>,
+    > = std::sync::OnceLock::new();
     REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 fn register_provider_sync(worktree: &str, env_name: &str) {
     if let Ok(mut r) = provider_sync_registry().lock() {
-        r.insert(worktree.to_string(), env_name.to_string());
+        r.insert(
+            worktree.to_string(),
+            ProviderSyncRecord {
+                env_name: env_name.to_string(),
+                in_flight: false,
+            },
+        );
+    }
+}
+
+pub(crate) fn forget_provider_sync(worktree: &str) {
+    if let Ok(mut registry) = provider_sync_registry().lock() {
+        registry.remove(worktree);
     }
 }
 
 /// On worktree close, pull the sandbox fs back into the local worktree for a
-/// provider `data = "sync"` env. Best-effort; a no-op when nothing was synced.
-pub(crate) fn deprovision_sync(path: &str) {
-    let env_name = provider_sync_registry()
-        .lock()
-        .ok()
-        .and_then(|mut r| r.remove(path));
-    let Some(env_name) = env_name else {
-        return;
+/// provider `data = "sync"` env. A failed pull is surfaced and retained in the
+/// in-process registry so a later close can retry it.
+pub(crate) fn deprovision_sync(path: &str) -> Result<(), String> {
+    let env_name = {
+        let mut registry = provider_sync_registry()
+            .lock()
+            .map_err(|_| "provider sync registry unavailable".to_string())?;
+        let Some(record) = registry.get_mut(path) else {
+            return Ok(());
+        };
+        if record.in_flight {
+            return Err("provider sync is already in progress".into());
+        }
+        record.in_flight = true;
+        record.env_name.clone()
     };
     let cfg = crate::config_startup::cleanup_config();
-    let Some((provider, id, workdir)) = provider_sync_target(&cfg, &env_name) else {
-        return;
+    let result = if let Some((provider, id, workdir)) = provider_sync_target(&cfg, &env_name) {
+        let p = path.to_string();
+        block_on_provider(|| async {
+            provider
+                .download_dir(&id, &workdir, std::path::Path::new(&p))
+                .await
+        })
+        .map_err(|error| format!("{error:#}"))
+    } else {
+        Err(format!(
+            "provider sync target unavailable for environment {env_name}"
+        ))
     };
-    let p = path.to_string();
-    let _ = block_on_provider(|| async {
-        // best-effort: documented best-effort contract (doc above): a no-op when nothing was synced; a failed pull just loses the sandbox-side changes at close
-        provider
-            .download_dir(&id, &workdir, std::path::Path::new(&p))
-            .await
-    });
+    let mut registry = provider_sync_registry()
+        .lock()
+        .map_err(|_| "provider sync registry unavailable after pull".to_string())?;
+    match result {
+        Ok(()) => {
+            registry.remove(path);
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(record) = registry.get_mut(path) {
+                record.in_flight = false;
+            }
+            tracing::warn!(target: "thegn::lifecycle", worktree = %path, environment = %env_name, %error, "provider sync failed during close; sync record retained");
+            Err(error)
+        }
+    }
 }
 
 /// Launch inputs only the agent-spawn path supplies.

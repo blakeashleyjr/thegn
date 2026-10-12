@@ -58,17 +58,6 @@ pub(crate) fn begin(flag: &'static AtomicBool, what: &'static str) -> Option<Rou
     }
 }
 
-/// Reserve a background-lane permit, logging the refusal. The bare
-/// [`crate::sched::spawn_bg`] drops its closure silently when the lane is full,
-/// which made a starved scanner indistinguishable from a broken one.
-pub(crate) fn permit(what: &'static str) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    let p = crate::sched::bg_permit();
-    if p.is_none() {
-        tracing::debug!(target: LOG, scan = what, "background lane full — deferring round");
-    }
-    p
-}
-
 /// Kick both scans now: startup, a worktree created, a workspace added, a
 /// worktree switched to.
 ///

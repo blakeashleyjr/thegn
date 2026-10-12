@@ -149,7 +149,7 @@ pub(crate) fn spawn_ci_cache_refresh_with_generation(
     force: bool,
     generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
 ) {
-    crate::sched::spawn_bg(move || {
+    crate::sched::spawn_bg_replaceable(move || {
         let cfg = full.ci.clone();
         let cwd = crate::hydrate::active_tab_path(&session);
         if cwd.is_dir() {
@@ -267,35 +267,44 @@ fn refresh_ci_cache_for(
         Ok(result) => {
             let runs = result.runs;
             if result.discarded_rows > 0 {
-                tracing::warn!(target: "thegn::ci", discarded_rows = result.discarded_rows, "CI provider returned an incomplete run list");
+                let message = format!(
+                    "CI provider returned an incomplete run list ({} malformed row(s)); keeping stale cache",
+                    result.discarded_rows
+                );
+                tracing::warn!(target: "thegn::ci", discarded_rows = result.discarded_rows, "{message}");
+                if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                    return false;
+                }
+                record_failure(&key, &message, now, cfg.poll_interval_secs);
+            } else {
+                if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                    return false;
+                }
+                record_success(&key);
+                // A CI round trip got through — online evidence for the app-wide holder.
+                if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                    return false;
+                }
+                thegn_core::connectivity::report_success();
+                if let Ok(json) = serde_json::to_string(&thegn_core::ci::CiRunCache {
+                    runs: runs.clone(),
+                    discarded_rows: result.discarded_rows,
+                }) && crate::hydrate_schedule::generation_is_current(generation.as_ref())
+                {
+                    let _ = db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                }
+                ingest_failed_logs(
+                    host_path,
+                    loc,
+                    cfg,
+                    full,
+                    &db,
+                    &runs,
+                    &old_runs,
+                    waker,
+                    generation.clone(),
+                );
             }
-            if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
-                return false;
-            }
-            record_success(&key);
-            // A CI round trip got through — online evidence for the app-wide holder.
-            if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
-                return false;
-            }
-            thegn_core::connectivity::report_success();
-            if let Ok(json) = serde_json::to_string(&thegn_core::ci::CiRunCache {
-                runs: runs.clone(),
-                discarded_rows: result.discarded_rows,
-            }) && crate::hydrate_schedule::generation_is_current(generation.as_ref())
-            {
-                let _ = db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-            }
-            ingest_failed_logs(
-                host_path,
-                loc,
-                cfg,
-                full,
-                &db,
-                &runs,
-                &old_runs,
-                waker,
-                generation.clone(),
-            );
         }
         Err(e) => {
             if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
@@ -371,6 +380,8 @@ fn ingest_failed_logs(
         };
         if detail.discarded_jobs > 0 {
             tracing::warn!(target: "thegn::ci", discarded_rows = detail.discarded_jobs, "CI detail omitted malformed job rows");
+            // A partial matrix is not enough evidence for log ingestion or an autofix handoff.
+            continue;
         }
         // A run first seen on this refresh gets priority, while a previously
         // seen run is still expanded when its cache is cold or its head moved.

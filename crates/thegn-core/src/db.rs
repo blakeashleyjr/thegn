@@ -191,7 +191,9 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 /// v73: `agent_dispatches.status_changed_at_ms`, stamped by a trigger on every
 /// `status` write so a stale `spawning` row (daemon crash mid-relaunch) is
 /// recognisable without a per-call-site stamp (additive nullable column).
-pub const SCHEMA_VERSION: i64 = 73;
+/// v74: `pr_queue.ci_rerun_head`, the head OID whose one automatic CI rerun
+/// allowance has been reserved (additive nullable column).
+pub const SCHEMA_VERSION: i64 = 74;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -972,6 +974,9 @@ pub struct PrQueueRow {
     /// Human-readable detail for the current status (failing checks, an error).
     pub detail: Option<String>,
     pub agent_attempts: u32,
+    /// Head OID whose bounded automatic CI rerun was reserved. Cleared only
+    /// when `last_head_oid` changes; provider errors keep the allowance spent.
+    pub ci_rerun_head: Option<String>,
     /// The head commit thegn last observed. A change it did not cause means a
     /// teammate pushed — see [`crate::pr_queue::foreign_push`].
     pub last_head_oid: Option<String>,
@@ -1163,7 +1168,44 @@ impl Db {
         // open after a migration is an idempotent no-op.)
         static PRUNE_ONCE: std::sync::Once = std::sync::Once::new();
         if db.schema_mismatch.is_none() {
-            PRUNE_ONCE.call_once(|| db.startup_prune());
+            PRUNE_ONCE.call_once(|| {
+                db.startup_prune();
+                // Semantic-file checks perform filesystem metadata I/O. Run
+                // the bounded-delete sweep on its own worker so opening the
+                // DB from the event loop never waits for that walk.
+                let sweep_path = path.clone();
+                if let Err(error) = std::thread::Builder::new()
+                    .name("thegn-sem-prune".to_string())
+                    .spawn(move || {
+                        let Ok(conn) = Db::open_connection(&sweep_path) else {
+                            return;
+                        };
+                        if conn
+                            .busy_timeout(std::time::Duration::from_millis(5000))
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let sweep_db = Db {
+                            conn,
+                            schema_mismatch: None,
+                        };
+                        let mut after_rowid = 0;
+                        // The sweep is idempotent; killing it mid-run is safe and
+                        // the next process can clean the remaining rows.
+                        loop {
+                            match sweep_db.prune_missing_semantic_files(after_rowid, 512) {
+                                Ok((scanned, next_rowid)) if scanned > 0 => {
+                                    after_rowid = next_rowid;
+                                }
+                                Ok(_) | Err(_) => break,
+                            }
+                        }
+                    })
+                {
+                    tracing::debug!(%error, "could not start semantic entity prune worker");
+                }
+            });
         }
         Ok(db)
     }
@@ -1879,10 +1921,12 @@ impl Db {
             -- status (the full vocabulary; MqStatus::parse is the one decoder):
             --   queued | folding | verifying | agent_running
             --   landed | ready
-            --   deferred | gate_failed | gate_error | needs_human
+            --   deferred | gate_failed | gate_error | agent_blocked | needs_human
             -- gate_failed = the gate RAN and went red (a verdict about the code);
             -- gate_error  = the gate could not RUN (an environment fact). They are
-            -- separate because only the former may wake the fixing agent.
+            --               separate because only the former may wake the fixing agent.
+            -- agent_blocked = agent isolation/environment policy prevented dispatch;
+            --                 this is not a code verdict and consumes no attempt.
             CREATE TABLE IF NOT EXISTS merge_queue (
               worktree       TEXT PRIMARY KEY,
               branch         TEXT NOT NULL,
@@ -2081,6 +2125,7 @@ impl Db {
         crate::db_migrate::migrate_v71(&conn)?;
         crate::db_migrate::migrate_v72(&conn)?;
         crate::db_migrate::migrate_v73(&conn)?;
+        crate::db_migrate::migrate_v74(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2092,6 +2137,7 @@ impl Db {
             crate::db_migrate::verify_v71_schema(&conn)?;
             crate::db_migrate::verify_v72_schema(&conn)?;
             crate::db_migrate::verify_v73_schema(&conn)?;
+            crate::db_migrate::verify_v74_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can

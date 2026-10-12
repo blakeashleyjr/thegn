@@ -6,6 +6,39 @@
 use super::*;
 use thegn_core::calendar::{CalEvent, EventTime, TzRef};
 
+#[test]
+fn dropped_month_completion_sends_cache_unavailable_payload() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let completion = MonthFetchCompletion {
+        tx,
+        waker: None,
+        year: 2026,
+        month: 10,
+        sent: false,
+    };
+    drop(completion);
+
+    let result = rx.try_recv().unwrap();
+    let RefreshKind::CalendarMonth(payload) = result else {
+        panic!("completion should send a calendar month payload");
+    };
+    assert_eq!(payload.month, (2026, 10));
+    assert_eq!(payload.error, Some(CalendarViewError::CacheUnavailable));
+}
+
+#[test]
+fn refused_month_fetch_sends_cache_unavailable_payload() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    deliver_unavailable_if_refused(crate::sched::Admission::Saturated, &tx, None, 2026, 10);
+
+    let result = rx.try_recv().unwrap();
+    let RefreshKind::CalendarMonth(payload) = result else {
+        panic!("refused fetch should send a calendar month payload");
+    };
+    assert_eq!(payload.month, (2026, 10));
+    assert_eq!(payload.error, Some(CalendarViewError::CacheUnavailable));
+}
+
 /// An isolated DB. `Db::open` reads `XDG_STATE_HOME`, and this shell often runs
 /// *inside* a live thegn, so tests must never touch the real one.
 struct TmpDb {

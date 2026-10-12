@@ -384,15 +384,18 @@ enum Case {
     Conflict,
     RedGate,
 }
-fn assert_summary(doc: &Value, ready: &[&str], deferred: &[&str]) {
+fn assert_summary(doc: &Value, ready: &[&str], deferred: &[&str], agent_blocked: &[&str]) {
     assert_eq!(doc["target"], "main");
     assert_eq!(doc["ready"], json!(ready));
     assert_eq!(doc["deferred"], json!(deferred));
+    assert_eq!(doc["agent_blocked"], json!(agent_blocked));
     for field in [
         "landed",
         "gate_error",
         "needs_human",
         "warnings",
+        "persistence_errors",
+        "bookkeeping_failed",
         "stale_checkouts",
     ] {
         assert_eq!(doc[field], json!([]), "{field}: {doc}");
@@ -400,9 +403,12 @@ fn assert_summary(doc: &Value, ready: &[&str], deferred: &[&str]) {
     for (field, count) in [
         ("ready", ready.len()),
         ("deferred", deferred.len()),
+        ("agent_blocked", agent_blocked.len()),
         ("landed", 0),
         ("gate_error", 0),
         ("needs_human", 0),
+        ("persistence_errors", 0),
+        ("bookkeeping_failed", 0),
     ] {
         assert_eq!(doc["counts"][field], count);
     }
@@ -514,7 +520,7 @@ fn exercise(case: Case) {
         json!({"snapshot":before,"rows":rows_before}),
     );
     let first = f.json(&["merge", "drain", "--json"]);
-    assert_summary(&first, &["clean"], &["held"]);
+    assert_summary(&first, &["clean"], &[], &["held"]);
     let after = f.snapshot();
     assert_eq!(after, before);
     let rows = f.rows();
@@ -637,7 +643,7 @@ fn exercise(case: Case) {
         json!({"old_tip":old_tip,"new_tip":new_tip,"changed_paths":delta,"snapshot":second_before}),
     );
     let second = f.json(&["merge", "drain", "--json"]);
-    assert_summary(&second, &["held"], &[]);
+    assert_summary(&second, &["held"], &[], &[]);
     let second_after = f.snapshot();
     assert_eq!(second_after, second_before);
     let final_rows = f.rows();

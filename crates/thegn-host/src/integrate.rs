@@ -1537,6 +1537,7 @@ pub(crate) enum AttemptOutcome {
     /// live checkout of the target branch (see `util::resync_branch_checkouts`).
     Landed {
         commit: String,
+        old_oid: String,
         resyncs: Vec<util::CheckoutResync>,
     },
     /// Merged clean and gated green, but `auto_land` is off — held for a manual
@@ -1710,6 +1711,7 @@ fn attempt_land_admitted(
                     util::resync_branch_checkouts(repo_root, &target_branch, &base, &folded_tip);
                 return Ok(AttemptOutcome::Landed {
                     commit: folded_tip,
+                    old_oid: base,
                     resyncs,
                 });
             }

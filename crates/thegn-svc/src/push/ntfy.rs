@@ -17,7 +17,7 @@ use thegn_core::seam::{Availability, BoxFuture, ProbeReport};
 use super::{PushError, PushMessage, PushProvider};
 
 /// Per-publish deadline. Bounds a hung POST so a stalled server can't wedge the
-/// publisher worker (the shared client already bounds connection setup).
+/// publisher worker; this overrides the shared client's default deadline.
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Total attempts (1 initial + up to 2 retries), then the message is dropped.
 const MAX_ATTEMPTS: u32 = 3;

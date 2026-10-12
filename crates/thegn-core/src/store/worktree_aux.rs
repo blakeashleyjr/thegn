@@ -250,6 +250,16 @@ pub trait WorktreeAuxStore {
     /// pull request rather than to one drain.
     fn set_pr_agent_attempts(&self, key: &str, attempts: u32) -> Result<()>;
 
+    /// Atomically reserve the one automatic CI rerun for `head`. The
+    /// `expected_head` fence prevents a stale driver from reverting a newer
+    /// observed head. Returns true only for the worker that reserved it.
+    fn reserve_pr_ci_rerun(
+        &self,
+        key: &str,
+        expected_head: Option<&str>,
+        head: &str,
+    ) -> Result<bool>;
+
     /// Drop one queued pull request.
     fn remove_pr_entry(&self, key: &str) -> Result<()>;
 
