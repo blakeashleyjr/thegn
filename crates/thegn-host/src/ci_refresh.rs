@@ -20,6 +20,8 @@ struct IngestMemoKey {
     run: String,
     job: String,
     sha: String,
+    started_at: Option<String>,
+    finished_at: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -110,22 +112,16 @@ impl IngestMemo {
 #[derive(Debug)]
 struct CallBudget {
     remaining: usize,
-    attempts_remaining: usize,
 }
 
 impl CallBudget {
     fn take(&mut self) -> bool {
-        if self.remaining == 0 || self.attempts_remaining == 0 {
+        if self.remaining == 0 {
             false
         } else {
             self.remaining -= 1;
-            self.attempts_remaining -= 1;
             true
         }
-    }
-
-    fn refund(&mut self) {
-        self.remaining = self.remaining.saturating_add(1).min(MAX_LOG_INGEST_CALLS);
     }
 }
 
@@ -360,21 +356,6 @@ fn refresh_ci_cache_for(
             return false;
         }
     }
-    let old_cache = db
-        .get_ci_cache(&key)
-        .ok()
-        .flatten()
-        .and_then(|(json, _)| thegn_core::ci::decode_run_cache(&json))
-        .unwrap_or_default();
-    let discarded_cached_runs = old_cache.discarded_rows
-        + old_cache
-            .runs
-            .iter()
-            .filter(|run| thegn_svc::ci::validate_ci_id(&run.id).is_err())
-            .count();
-    if discarded_cached_runs > 0 {
-        tracing::warn!(target: "thegn::ci", discarded_rows = discarded_cached_runs, "discarded malformed cached CI run rows");
-    }
     let Some(client) = thegn_svc::ci::provider_for(loc, cfg) else {
         return false;
     };
@@ -421,7 +402,6 @@ fn refresh_ci_cache_for(
                 }
                 let mut ingest_budget = CallBudget {
                     remaining: MAX_LOG_INGEST_CALLS,
-                    attempts_remaining: MAX_LOG_INGEST_CALLS,
                 };
                 ingest_failed_logs_with(IngestArgs {
                     host_path,
@@ -522,14 +502,20 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
             run: run.id.clone(),
             job: String::new(),
             sha: run.sha.clone(),
+            started_at: run.started_at.clone(),
+            finished_at: run.finished_at.clone(),
         };
         let memo = ingest_memo().lock().ok();
         if memo.as_ref().is_some_and(|m| m.complete(&run_key)) {
             (2_u8, 0_i64)
         } else if memo.as_ref().is_some_and(|m| {
-            m.entries
-                .keys()
-                .any(|k| k.worktree == key && k.run == run.id && k.sha == run.sha)
+            m.entries.keys().any(|k| {
+                k.worktree == key
+                    && k.run == run.id
+                    && k.sha == run.sha
+                    && k.started_at == run.started_at
+                    && k.finished_at == run.finished_at
+            })
         }) {
             (1_u8, 0_i64)
         } else {
@@ -545,6 +531,8 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
             run: run.id.clone(),
             job: String::new(),
             sha: run.sha.clone(),
+            started_at: run.started_at.clone(),
+            finished_at: run.finished_at.clone(),
         };
         if ingest_memo()
             .lock()
@@ -558,6 +546,8 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
                 memo_key.worktree == key
                     && memo_key.run == run.id
                     && memo_key.sha == run.sha
+                    && memo_key.started_at == run.started_at
+                    && memo_key.finished_at == run.finished_at
                     && !entry.complete
                     && now < entry.backoff_until
             })
@@ -571,7 +561,6 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
         let detail = match client.run_detail(loc, &run.id) {
             Ok(detail) => detail,
             Err(_) => {
-                call_budget.refund();
                 if let Ok(mut memo) = ingest_memo().lock() {
                     memo.touch(run_key, now, cfg.poll_interval_secs, true);
                 }
@@ -603,6 +592,8 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
                 run: run.id.clone(),
                 job: job.id.clone(),
                 sha: run.sha.clone(),
+                started_at: run.started_at.clone(),
+                finished_at: run.finished_at.clone(),
             };
             if ingest_memo()
                 .lock()
@@ -627,7 +618,6 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
             let log = match client.logs(loc, &run.id, &job.id) {
                 Ok(log) => log,
                 Err(_) => {
-                    call_budget.refund();
                     run_complete = false;
                     if let Ok(mut memo) = ingest_memo().lock() {
                         memo.touch(job_key, now, cfg.poll_interval_secs, true);
@@ -839,6 +829,12 @@ mod tests {
         }
     }
 
+    fn ci_detail_with_job(run_id: &str, sha: &str, job_id: &str) -> thegn_svc::ci::CiRunDetail {
+        let mut detail = ci_detail(run_id, sha);
+        detail.run.jobs[0].id = job_id.to_string();
+        detail
+    }
+
     fn ingest_test(
         temp: &tempfile::TempDir,
         client: &FakeCi,
@@ -852,7 +848,6 @@ mod tests {
         let full = thegn_core::config::Config::default();
         let mut budget = CallBudget {
             remaining: budget_size,
-            attempts_remaining: budget_size,
         };
         ingest_failed_logs_with(IngestArgs {
             host_path: temp.path(),
@@ -908,6 +903,39 @@ mod tests {
     }
 
     #[test]
+    fn completed_run_attempt_does_not_skip_provider_rerun() {
+        let temp = private_tempdir();
+        let mut provider = FakeCi::new(&[]).with_detail("run", "sha");
+        let mut first = ci_run("run", "sha");
+        first.finished_at = Some("2026-10-12T10:00:00Z".to_string());
+        ingest_test(
+            &temp,
+            &provider,
+            &[first.clone()],
+            MAX_LOG_INGEST_CALLS,
+            20_500,
+        );
+
+        provider.details.insert(
+            "run".to_string(),
+            ci_detail_with_job("run", "sha", "job-rerun"),
+        );
+        let mut rerun = first;
+        rerun.finished_at = Some("2026-10-12T10:05:00Z".to_string());
+        ingest_test(&temp, &provider, &[rerun], MAX_LOG_INGEST_CALLS, 20_500);
+
+        assert_eq!(provider.detail_calls.load(Ordering::Relaxed), 2);
+        assert!(
+            provider
+                .log_calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .any(|(_, job)| job == "job-rerun")
+        );
+    }
+
+    #[test]
     fn untouched_older_run_gets_budget_before_backed_off_newer_run() {
         let temp = private_tempdir();
         let provider = FakeCi::new(&["newest"])
@@ -957,10 +985,7 @@ mod tests {
 
     #[test]
     fn log_ingestion_call_budget_stops_at_its_cap() {
-        let mut budget = CallBudget {
-            remaining: 2,
-            attempts_remaining: 2,
-        };
+        let mut budget = CallBudget { remaining: 2 };
         assert!(budget.take());
         assert!(budget.take());
         assert!(!budget.take());
