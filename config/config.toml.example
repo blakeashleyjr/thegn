@@ -859,6 +859,7 @@ open_in = "auto"       # auto | pane | external — where the launch runs
 # argv = ["git", "push", "--force-with-lease", "origin", "{{.SelectedBranch.Name}}"]
 # description = "force-push selected branch"
 # output = "popup"             # none | popup | terminal
+# timeout_secs = 300            # popup/none only; 1..=86400; terminal output is not timed
 # prompts = [{ type = "input", title = "Confirm branch", key = "Branch" }]
 #
 # # A separate shell-template entry; do not also set argv on this entry.
@@ -869,6 +870,7 @@ open_in = "auto"       # auto | pane | external — where the launch runs
 # template_policy = "safe"     # required for shell placeholders; complete unquoted args
 # description = "show selected commit"
 # output = "popup"
+# timeout_secs = 300            # popup/none only; 1..=86400; terminal output is not timed
 
 # Tracing diagnostics. CLI tracing can go to level-gated, branded stderr; the
 # compositor and pane daemon use their own rotating file sinks when tracing is

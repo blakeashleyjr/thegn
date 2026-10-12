@@ -3,6 +3,10 @@
 
 use super::{TemplateCtx, TemplateError, resolve};
 use crate::config::GitCommand;
+use std::time::Duration;
+
+pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+pub const MAX_TIMEOUT_SECS: u64 = 86_400;
 
 #[derive(Clone)]
 enum Program {
@@ -13,7 +17,10 @@ enum Program {
 /// Only compile can construct this type. Debug never prints repository text
 /// or prompt responses; the executable projection is made at the last edge.
 #[derive(Clone)]
-pub struct ExpandedCommand(Program);
+pub struct ExpandedCommand {
+    program: Program,
+    timeout_secs: u64,
+}
 
 impl std::fmt::Debug for ExpandedCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -25,21 +32,21 @@ impl ExpandedCommand {
     /// Terminal execution must not reinterpret POSIX quoting with an arbitrary
     /// user shell (fish, PowerShell or cmd). Argv needs no shell at all.
     pub fn terminal_argv(&self) -> Vec<String> {
-        match &self.0 {
+        match &self.program {
             Program::Argv(argv) => argv.clone(),
             Program::Shell(script) => vec!["sh".into(), "-c".into(), script.clone()],
         }
     }
 
     pub fn shell_script(&self) -> String {
-        match &self.0 {
+        match &self.program {
             Program::Argv(argv) => crate::util::sh_join(argv),
             Program::Shell(script) => script.clone(),
         }
     }
 
     pub fn command(&self, loc: &crate::remote::GitLoc) -> std::process::Command {
-        let mut command = match &self.0 {
+        let mut command = match &self.program {
             Program::Argv(argv) => {
                 let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
                 loc.cli_command(&argv[0], &args)
@@ -50,6 +57,10 @@ impl ExpandedCommand {
             command.env_remove(var);
         }
         command
+    }
+
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs)
     }
 }
 
@@ -279,6 +290,9 @@ fn validate_shell(template: &str) -> Result<(), TemplateError> {
 }
 
 fn validate(cmd: &GitCommand) -> Result<Mode, TemplateError> {
+    if cmd.timeout_secs == 0 || cmd.timeout_secs > MAX_TIMEOUT_SECS {
+        return Err(err("timeout_secs must be between 1 and 86400"));
+    }
     let mode = mode(cmd)?;
     let templates: Vec<&str> = if mode == Mode::Argv {
         cmd.argv.iter().map(String::as_str).collect()
@@ -354,5 +368,8 @@ pub fn compile(cmd: &GitCommand, ctx: &TemplateCtx) -> Result<ExpandedCommand, T
     } else {
         Program::Shell(substitute(&cmd.command, mode, Some(ctx), MAX_EXPANDED)?)
     };
-    Ok(ExpandedCommand(program))
+    Ok(ExpandedCommand {
+        program,
+        timeout_secs: cmd.timeout_secs,
+    })
 }
