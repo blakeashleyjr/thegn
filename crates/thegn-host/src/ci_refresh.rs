@@ -7,12 +7,16 @@
 //! the event loop.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use termwiz::terminal::TerminalWaker;
 
 const MAX_LOG_INGEST_CALLS: usize = 32;
+const MAX_LOG_INGEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOG_INGEST_WALL: Duration = Duration::from_secs(120);
 const MAX_INGEST_MEMO_ENTRIES: usize = 512;
 
@@ -114,6 +118,7 @@ impl IngestMemo {
 #[derive(Debug)]
 struct CallBudget {
     remaining: usize,
+    bytes_remaining: usize,
     deadline: Option<Instant>,
 }
 
@@ -130,6 +135,121 @@ impl CallBudget {
         } else {
             self.remaining -= 1;
             true
+        }
+    }
+
+    fn charge_bytes(&mut self, bytes: usize) -> bool {
+        if bytes > self.bytes_remaining {
+            self.bytes_remaining = 0;
+            return false;
+        }
+        self.bytes_remaining -= bytes;
+        true
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FlightKey {
+    active_path: Option<String>,
+    generation: Option<u64>,
+}
+
+#[derive(Clone)]
+struct FlightToken {
+    key: FlightKey,
+    force: bool,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct CiFlight {
+    running: Option<FlightToken>,
+    queued: Option<FlightToken>,
+}
+
+impl CiFlight {
+    fn submit(&mut self, request: FlightToken) -> bool {
+        let Some(running) = self.running.as_ref() else {
+            self.running = Some(request);
+            return true;
+        };
+        if running.key != request.key {
+            running.cancel.store(true, Ordering::Relaxed);
+        }
+        let force = self
+            .queued
+            .as_ref()
+            .filter(|queued| queued.key == request.key)
+            .is_some_and(|queued| queued.force)
+            || request.force;
+        self.queued = Some(FlightToken { force, ..request });
+        false
+    }
+
+    fn finish(&mut self) -> Option<FlightToken> {
+        let next = self.queued.take();
+        self.running = next.as_ref().map(|token| FlightToken {
+            key: token.key.clone(),
+            force: token.force,
+            cancel: Arc::clone(&token.cancel),
+        });
+        next
+    }
+
+    fn clear(&mut self) {
+        self.running = None;
+        self.queued = None;
+    }
+}
+
+#[derive(Clone)]
+struct RefreshRequest {
+    session: crate::session::Session,
+    full: thegn_core::config::Config,
+    waker: Option<TerminalWaker>,
+    token: FlightToken,
+    generation: Option<(Arc<std::sync::atomic::AtomicU64>, u64)>,
+}
+
+struct RefreshContext {
+    generation: Option<(Arc<std::sync::atomic::AtomicU64>, u64)>,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct CiRefreshCoordinator {
+    flight: CiFlight,
+    queued: Option<RefreshRequest>,
+}
+
+fn ci_refresh_coordinator() -> &'static Mutex<CiRefreshCoordinator> {
+    static COORDINATOR: std::sync::OnceLock<Mutex<CiRefreshCoordinator>> =
+        std::sync::OnceLock::new();
+    COORDINATOR.get_or_init(|| Mutex::new(CiRefreshCoordinator::default()))
+}
+
+fn clear_ci_refresh_flight() {
+    if let Ok(mut coordinator) = ci_refresh_coordinator().lock() {
+        coordinator.flight.clear();
+        coordinator.queued = None;
+    }
+}
+
+struct FlightGuard {
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut coordinator) = ci_refresh_coordinator().lock()
+            && coordinator
+                .flight
+                .running
+                .as_ref()
+                .is_some_and(|running| Arc::ptr_eq(&running.cancel, &self.cancel))
+        {
+            coordinator.flight.clear();
+            coordinator.queued = None;
         }
     }
 }
@@ -272,26 +392,110 @@ pub(crate) fn spawn_ci_cache_refresh_with_generation(
     force: bool,
     generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
 ) {
-    crate::sched::spawn_bg_replaceable(move || {
-        let cfg = full.ci.clone();
-        let cwd = crate::hydrate::active_tab_path(&session);
-        if cwd.is_dir() {
-            let loc = thegn_core::remote::GitLoc::for_worktree(&cwd);
-            refresh_ci_cache_for(
-                &cwd,
-                &loc,
-                &cfg,
-                &full,
-                waker.as_ref(),
-                force,
-                generation.clone(),
-            );
+    let key = FlightKey {
+        active_path: session.active_group().map(|group| group.path.clone()),
+        generation: generation.as_ref().map(|(_, value)| *value),
+    };
+    let token = FlightToken {
+        key,
+        force,
+        cancel: Arc::new(AtomicBool::new(false)),
+    };
+    let request = RefreshRequest {
+        session,
+        full,
+        waker,
+        token,
+        generation,
+    };
+    let should_spawn = match ci_refresh_coordinator().lock() {
+        Ok(mut coordinator) => {
+            let token = FlightToken {
+                key: request.token.key.clone(),
+                force: request.token.force,
+                cancel: Arc::clone(&request.token.cancel),
+            };
+            let start = coordinator.flight.submit(token);
+            if !start {
+                coordinator.queued = Some(request.clone());
+            }
+            start
         }
-        // The sweep rides the same bg task so provider subprocesses stay
-        // serialized (kind to rate limits) and the loop-side call stays one
-        // spawn. Sweeping is never forced — the ttl guard is its rate limiter.
-        sweep_one_background(&session, &cwd, &cfg, &full, waker.as_ref(), generation);
-    });
+        Err(error) => {
+            tracing::debug!(target: "thegn::ci", %error, "could not admit CI cache refresh");
+            return;
+        }
+    };
+    if !should_spawn {
+        return;
+    }
+    let admission = crate::sched::spawn_bg(move || run_ci_refresh_worker(request));
+    if admission != crate::sched::Admission::Admitted {
+        clear_ci_refresh_flight();
+        tracing::debug!(target: "thegn::ci", ?admission, "CI cache refresh admission refused");
+    }
+}
+
+fn run_ci_refresh_worker(mut request: RefreshRequest) {
+    let mut guard = FlightGuard {
+        cancel: Arc::clone(&request.token.cancel),
+    };
+    loop {
+        guard.cancel = Arc::clone(&request.token.cancel);
+        run_ci_refresh_request(&request);
+        let next = match ci_refresh_coordinator().lock() {
+            Ok(mut coordinator) => {
+                let token = coordinator.flight.finish();
+                match token {
+                    Some(token) => coordinator.queued.take().map(|mut next| {
+                        next.token = token;
+                        next
+                    }),
+                    None => None,
+                }
+            }
+            Err(error) => {
+                tracing::debug!(target: "thegn::ci", %error, "could not finish CI cache refresh flight");
+                None
+            }
+        };
+        let Some(next) = next else {
+            return;
+        };
+        request = next;
+    }
+}
+
+fn run_ci_refresh_request(request: &RefreshRequest) {
+    let cfg = request.full.ci.clone();
+    let Some(path) = request.token.key.active_path.as_deref() else {
+        return;
+    };
+    let cwd = std::path::Path::new(path);
+    if cwd.is_dir() {
+        let loc = thegn_core::remote::GitLoc::for_worktree(cwd);
+        refresh_ci_cache_for(
+            cwd,
+            &loc,
+            &cfg,
+            &request.full,
+            request.waker.as_ref(),
+            request.token.force,
+            RefreshContext {
+                generation: request.generation.clone(),
+                cancel: Arc::clone(&request.token.cancel),
+            },
+        );
+    }
+    sweep_one_background(
+        &request.session,
+        cwd,
+        &cfg,
+        &request.full,
+        request.waker.as_ref(),
+        request.generation.clone(),
+        Arc::clone(&request.token.cancel),
+    );
 }
 
 /// Round-robin cursor over background worktrees, advanced once per sweep so
@@ -308,6 +512,7 @@ fn sweep_one_background(
     full: &thegn_core::config::Config,
     waker: Option<&TerminalWaker>,
     generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
+    cancel: Arc<AtomicBool>,
 ) {
     let others: Vec<&str> = session
         .worktrees
@@ -327,7 +532,21 @@ fn sweep_one_background(
         let loc = thegn_core::remote::GitLoc::for_worktree(p);
         // First worktree that actually fetched (fresh ones are skipped by the
         // guard) ends the sweep — one provider subprocess per tick, max.
-        if refresh_ci_cache_for(p, &loc, cfg, full, waker, false, generation.clone()) {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        if refresh_ci_cache_for(
+            p,
+            &loc,
+            cfg,
+            full,
+            waker,
+            false,
+            RefreshContext {
+                generation: generation.clone(),
+                cancel: Arc::clone(&cancel),
+            },
+        ) {
             return;
         }
     }
@@ -349,8 +568,9 @@ fn refresh_ci_cache_for(
     full: &thegn_core::config::Config,
     waker: Option<&TerminalWaker>,
     force: bool,
-    generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
+    context: RefreshContext,
 ) -> bool {
+    let RefreshContext { generation, cancel } = context;
     use thegn_core::store::CacheStore;
     let Ok(db) = thegn_core::db::Db::open() else {
         return false;
@@ -365,7 +585,11 @@ fn refresh_ci_cache_for(
             return false;
         }
     }
-    let Some(client) = thegn_svc::ci::provider_for(loc, cfg) else {
+    if cancel.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some(client) = thegn_svc::ci::provider_for_cancellable(loc, cfg, Arc::clone(&cancel))
+    else {
         return false;
     };
     let branch = loc
@@ -376,6 +600,7 @@ fn refresh_ci_cache_for(
         branch.as_deref(),
         cfg.max_runs.min(thegn_core::config_ci::MAX_CI_RUNS),
     ) {
+        Ok(_) if cancel.load(Ordering::Relaxed) => return false,
         Ok(result) => {
             let runs = result.runs;
             if result.discarded_rows > 0 {
@@ -409,6 +634,7 @@ fn refresh_ci_cache_for(
                 }
                 let mut ingest_budget = CallBudget {
                     remaining: MAX_LOG_INGEST_CALLS,
+                    bytes_remaining: MAX_LOG_INGEST_BYTES,
                     deadline: Some(Instant::now() + MAX_LOG_INGEST_WALL),
                 };
                 ingest_failed_logs_with(IngestArgs {
@@ -423,9 +649,11 @@ fn refresh_ci_cache_for(
                     waker,
                     generation: generation.clone(),
                     now: thegn_core::util::now(),
+                    cancel: Arc::clone(&cancel),
                 });
             }
         }
+        Err(e) if cancel.load(Ordering::Relaxed) => return false,
         Err(e) => {
             if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
                 return false;
@@ -467,6 +695,7 @@ struct IngestArgs<'a> {
     waker: Option<&'a TerminalWaker>,
     generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
     now: i64,
+    cancel: Arc<AtomicBool>,
 }
 
 fn ingest_failed_logs_with(args: IngestArgs<'_>) {
@@ -484,6 +713,7 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
         waker,
         generation,
         now,
+        cancel,
     } = args;
     let log_cache_runs = cfg
         .log_cache_runs
@@ -536,7 +766,9 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
         }
     });
     'runs: for run in ordered {
-        if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+        if cancel.load(Ordering::Relaxed)
+            || !crate::hydrate_schedule::generation_is_current(generation.as_ref())
+        {
             return;
         }
         let run_key = IngestMemoKey {
@@ -571,15 +803,24 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
             tracing::debug!(target: "thegn::ci", budget = MAX_LOG_INGEST_CALLS, "CI log ingestion provider-call budget exhausted");
             break;
         }
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let detail = match client.run_detail(loc, &run.id) {
             Ok(detail) => detail,
             Err(_) => {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
                 if let Ok(mut memo) = ingest_memo().lock() {
                     memo.touch(run_key, now, cfg.poll_interval_secs, true);
                 }
                 continue;
             }
         };
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         if detail.discarded_jobs > 0 {
             tracing::warn!(target: "thegn::ci", discarded_rows = detail.discarded_jobs, "CI detail omitted malformed job rows");
             // A partial matrix is not enough evidence for log ingestion or an autofix handoff.
@@ -600,6 +841,9 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
             .collect();
         let mut run_complete = true;
         for job in failed_jobs {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
             let job_key = IngestMemoKey {
                 worktree: key.clone(),
                 run: run.id.clone(),
@@ -623,6 +867,10 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
                 }
                 continue;
             }
+            if call_budget.bytes_remaining == 0 {
+                tracing::debug!(target: "thegn::ci", budget = MAX_LOG_INGEST_BYTES, "CI log ingestion byte budget exhausted");
+                break 'runs;
+            }
             if !call_budget.take() {
                 tracing::debug!(target: "thegn::ci", budget = MAX_LOG_INGEST_CALLS, "CI log ingestion provider-call budget exhausted");
                 break 'runs;
@@ -630,6 +878,9 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
             let log = match client.logs(loc, &run.id, &job.id) {
                 Ok(log) => log,
                 Err(_) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
                     run_complete = false;
                     if let Ok(mut memo) = ingest_memo().lock() {
                         memo.touch(job_key, now, cfg.poll_interval_secs, true);
@@ -637,6 +888,13 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
                     continue;
                 }
             };
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            if !call_budget.charge_bytes(log.text.len()) {
+                tracing::debug!(target: "thegn::ci", budget = MAX_LOG_INGEST_BYTES, "CI log ingestion byte budget exhausted");
+                break 'runs;
+            }
             let mut entry = thegn_core::ci_log::CiLogEntry::new(
                 &key,
                 &run.id,
@@ -669,11 +927,16 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
                 }
             }
         }
-        if run_complete && let Ok(mut memo) = ingest_memo().lock() {
+        if run_complete
+            && !cancel.load(Ordering::Relaxed)
+            && let Ok(mut memo) = ingest_memo().lock()
+        {
             memo.mark_complete(run_key);
         }
     }
-    if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+    if cancel.load(Ordering::Relaxed)
+        || !crate::hydrate_schedule::generation_is_current(generation.as_ref())
+    {
         return;
     }
     let keep: Vec<String> = retained.into_iter().collect();
@@ -693,12 +956,15 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    static FLIGHT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     struct FakeCi {
         log_failures: HashSet<String>,
         detail_failures: HashSet<String>,
         details: HashMap<String, thegn_svc::ci::CiRunDetail>,
         detail_calls: AtomicUsize,
         log_calls: Mutex<Vec<(String, String)>>,
+        log_text: String,
     }
 
     impl FakeCi {
@@ -709,12 +975,18 @@ mod tests {
                 details: HashMap::new(),
                 detail_calls: AtomicUsize::new(0),
                 log_calls: Mutex::new(Vec::new()),
+                log_text: String::new(),
             }
         }
 
         fn with_detail(mut self, run_id: &str, sha: &str) -> Self {
             self.details
                 .insert(run_id.to_string(), ci_detail(run_id, sha));
+            self
+        }
+
+        fn with_log_text(mut self, text: String) -> Self {
+            self.log_text = text;
             self
         }
 
@@ -769,7 +1041,10 @@ mod tests {
             if self.log_failures.contains(run_id) {
                 Err(thegn_core::ci::CiError::Offline)
             } else {
-                Ok(thegn_core::ci::CiLog::default())
+                Ok(thegn_core::ci::CiLog {
+                    text: self.log_text.clone(),
+                    truncated: false,
+                })
             }
         }
 
@@ -871,6 +1146,7 @@ mod tests {
         let full = thegn_core::config::Config::default();
         let mut budget = CallBudget {
             remaining: budget_size,
+            bytes_remaining: MAX_LOG_INGEST_BYTES,
             deadline,
         };
         ingest_failed_logs_with(IngestArgs {
@@ -885,6 +1161,7 @@ mod tests {
             waker: None,
             generation: None,
             now,
+            cancel: Arc::new(AtomicBool::new(false)),
         });
     }
 
@@ -1010,6 +1287,7 @@ mod tests {
     fn log_ingestion_call_budget_stops_at_its_cap() {
         let mut budget = CallBudget {
             remaining: 2,
+            bytes_remaining: MAX_LOG_INGEST_BYTES,
             deadline: None,
         };
         assert!(budget.take());
@@ -1019,9 +1297,63 @@ mod tests {
     }
 
     #[test]
+    fn log_ingestion_byte_budget_stops_before_fetching_later_runs() {
+        let temp = private_tempdir();
+        let provider = FakeCi::new(&[])
+            .with_detail("run-a", "sha-a")
+            .with_detail("run-b", "sha-b")
+            .with_log_text("x".repeat(MAX_LOG_INGEST_BYTES + 1));
+        let runs = [ci_run("run-a", "sha-a"), ci_run("run-b", "sha-b")];
+        ingest_test(&temp, &provider, &runs, MAX_LOG_INGEST_CALLS, 60_000);
+        assert_eq!(provider.log_calls.lock().expect("calls").len(), 1);
+    }
+
+    #[test]
+    fn cancelled_ingestion_makes_no_provider_calls_or_failure_memo() {
+        let temp = private_tempdir();
+        let provider = FakeCi::new(&[]).with_detail("cancelled-run", "sha");
+        let runs = [ci_run("cancelled-run", "sha")];
+        let db = thegn_core::db::Db::open_at(&temp.path().join("ci.db")).expect("temp DB");
+        let loc = thegn_core::remote::GitLoc::for_worktree(temp.path());
+        let cfg = thegn_core::config::CiConfig::default();
+        let full = thegn_core::config::Config::default();
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut budget = CallBudget {
+            remaining: MAX_LOG_INGEST_CALLS,
+            bytes_remaining: MAX_LOG_INGEST_BYTES,
+            deadline: None,
+        };
+        ingest_failed_logs_with(IngestArgs {
+            host_path: temp.path(),
+            loc: &loc,
+            client: &provider,
+            cfg: &cfg,
+            full: &full,
+            db: &db,
+            runs: &runs,
+            budget: &mut budget,
+            waker: None,
+            generation: None,
+            now: 70_000,
+            cancel,
+        });
+        assert_eq!(provider.detail_calls.load(Ordering::Relaxed), 0);
+        let worktree = thegn_core::remote::GitLoc::worktree_cache_key(temp.path());
+        assert!(
+            !ingest_memo()
+                .lock()
+                .expect("memo")
+                .entries
+                .keys()
+                .any(|key| { key.worktree == worktree && key.run == "cancelled-run" })
+        );
+    }
+
+    #[test]
     fn log_ingestion_budget_rejects_expired_deadline() {
         let mut budget = CallBudget {
             remaining: 2,
+            bytes_remaining: MAX_LOG_INGEST_BYTES,
             deadline: Some(Instant::now() - Duration::from_secs(1)),
         };
         assert!(!budget.take());
@@ -1096,5 +1428,94 @@ mod tests {
         record_success(&wt);
         assert_eq!(note_for(&wt), None);
         assert!(!backoff_active(&wt, 2001));
+    }
+
+    fn flight_token(path: &str, generation: Option<u64>, force: bool) -> FlightToken {
+        FlightToken {
+            key: FlightKey {
+                active_path: Some(path.to_string()),
+                generation,
+            },
+            force,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn ci_flight_coalesces_same_key_and_keeps_force_sticky() {
+        let mut flight = CiFlight::default();
+        assert!(flight.submit(flight_token("/wt", Some(4), false)));
+        assert!(!flight.submit(flight_token("/wt", Some(4), true)));
+        let queued = flight.finish().expect("coalesced queued refresh");
+        assert!(queued.force);
+        assert_eq!(
+            queued.key,
+            FlightKey {
+                active_path: Some("/wt".into()),
+                generation: Some(4)
+            }
+        );
+        assert!(flight.finish().is_none());
+    }
+
+    #[test]
+    fn ci_flight_cancels_running_request_when_path_or_generation_changes() {
+        let mut flight = CiFlight::default();
+        let first = flight_token("/wt-a", Some(4), false);
+        let cancel = Arc::clone(&first.cancel);
+        assert!(flight.submit(first));
+        assert!(!flight.submit(flight_token("/wt-b", Some(4), false)));
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(flight.finish().is_some());
+
+        let second = flight_token("/wt-a", Some(4), false);
+        let cancel = Arc::clone(&second.cancel);
+        assert!(flight.submit(second));
+        assert!(!flight.submit(flight_token("/wt-a", Some(5), false)));
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn ci_refresh_latch_clears_after_refused_admission() {
+        let _lock = FLIGHT_TEST_LOCK.lock().expect("flight test lock");
+        {
+            let mut coordinator = ci_refresh_coordinator().lock().expect("coordinator");
+            coordinator
+                .flight
+                .submit(flight_token("/refused", None, false));
+        }
+        clear_ci_refresh_flight();
+        assert!(
+            ci_refresh_coordinator()
+                .lock()
+                .expect("coordinator")
+                .flight
+                .running
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ci_refresh_latch_clears_when_worker_unwinds() {
+        let _lock = FLIGHT_TEST_LOCK.lock().expect("flight test lock");
+        let token = flight_token("/panic", None, false);
+        let cancel = Arc::clone(&token.cancel);
+        {
+            let mut coordinator = ci_refresh_coordinator().lock().expect("coordinator");
+            coordinator.flight.submit(token);
+        }
+        let panic = std::panic::catch_unwind(|| {
+            let _guard = FlightGuard { cancel };
+            panic!("fixture worker panic");
+        });
+        assert!(panic.is_err());
+        assert!(
+            ci_refresh_coordinator()
+                .lock()
+                .expect("coordinator")
+                .flight
+                .running
+                .is_none()
+        );
     }
 }
