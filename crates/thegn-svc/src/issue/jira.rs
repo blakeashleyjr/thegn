@@ -179,13 +179,23 @@ struct JiraUser {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct JiraCommentSection {
+    #[serde(default)]
+    start_at: usize,
+    #[serde(default)]
+    #[allow(dead_code)]
+    max_results: usize,
+    #[serde(default)]
+    total: Option<usize>,
+    #[serde(default)]
     comments: Vec<JiraComment>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JiraComment {
+    id: Option<String>,
     body: Option<serde_json::Value>,
     author: Option<JiraUser>,
     created: Option<String>,
@@ -383,12 +393,24 @@ fn project_filter_jql(project: &str) -> Result<String, IssueError> {
 
 fn jira_path(key: &str, suffix: &str) -> Result<String, IssueError> {
     checked_jira_key(key)?;
-    if !matches!(suffix, "" | "/transitions") {
+    if !matches!(suffix, "" | "/transitions" | "/comment") {
         return Err(IssueError::Parse(
             "Jira path suffix contains an unstructured delimiter".into(),
         ));
     }
     Ok(format!("issue/{key}{suffix}"))
+}
+
+fn append_jira_comments(existing: &mut Vec<JiraComment>, incoming: Vec<JiraComment>) {
+    let mut ids: std::collections::HashSet<String> = existing
+        .iter()
+        .filter_map(|comment| comment.id.clone())
+        .collect();
+    for comment in incoming {
+        if comment.id.as_ref().is_none_or(|id| ids.insert(id.clone())) {
+            existing.push(comment);
+        }
+    }
 }
 
 const JIRA_FIELDS: &str =
@@ -513,18 +535,51 @@ impl IssueBackend for JiraBackend {
             op.prepare().await?;
             let key = id.strip_prefix("jira:").unwrap_or(id);
             checked_jira_key(key)?;
-            let ji: JiraIssue = Self::get(
+            let mut ji: JiraIssue = Self::get(
                 &mut op,
                 &format!("{}?fields={JIRA_FIELDS}", jira_path(key, "")?),
             )
             .await?;
-            let comments = ji
-                .fields
-                .comment
-                .as_ref()
-                .map(|cs| &cs.comments)
+            let mut comment_section = ji.fields.comment.take().unwrap_or(JiraCommentSection {
+                start_at: 0,
+                max_results: 0,
+                total: None,
+                comments: Vec::new(),
+            });
+            let embedded_count = comment_section.comments.len();
+            let embedded = std::mem::take(&mut comment_section.comments);
+            append_jira_comments(&mut comment_section.comments, embedded);
+            if let Some(total) = comment_section.total
+                && total > embedded_count
+            {
+                let mut start_at = comment_section.start_at + embedded_count;
+                for page in 0..MAX_LIST_PAGES {
+                    let path = format!(
+                        "{}?startAt={start_at}&maxResults=100&orderBy=created",
+                        jira_path(key, "/comment")?
+                    );
+                    let page_result: JiraCommentSection = Self::get(&mut op, &path).await?;
+                    let received = page_result.comments.len();
+                    if received == 0 {
+                        return Err(IssueError::Parse(
+                            "Jira comment pagination incomplete: empty page before total".into(),
+                        ));
+                    }
+                    append_jira_comments(&mut comment_section.comments, page_result.comments);
+                    start_at += received;
+                    if start_at >= total {
+                        break;
+                    }
+                    if page + 1 == MAX_LIST_PAGES {
+                        return Err(IssueError::Parse(
+                            "Jira comment pagination incomplete: page cap reached".into(),
+                        ));
+                    }
+                }
+            }
+            let comments = comment_section
+                .comments
                 .into_iter()
-                .flatten()
                 .map(|c| IssueComment {
                     author: c
                         .author
@@ -1283,6 +1338,157 @@ mod tests {
         assert!(server.await.unwrap_err().is_cancelled());
         let calls = calls.lock().unwrap().clone();
         (result, calls)
+    }
+
+    async fn run_get(
+        responses: Vec<FixtureResponse>,
+    ) -> (Result<IssueDetail, IssueError>, Vec<String>) {
+        use std::sync::Mutex;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let route_calls = Arc::clone(&calls);
+        let route_responses = Arc::new(responses);
+        let response_fixture = Arc::clone(&route_responses);
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |request: Request| {
+                let route_calls = Arc::clone(&route_calls);
+                let response_fixture = Arc::clone(&response_fixture);
+                async move {
+                    let mut recorded = route_calls.lock().unwrap();
+                    let index = recorded.len();
+                    recorded.push(request.uri().to_string());
+                    drop(recorded);
+                    let response = response_fixture
+                        .get(index)
+                        .or_else(|| response_fixture.last())
+                        .expect("at least one Jira fixture response")
+                        .clone();
+                    let mut result = (response.status, Body::from(response.body)).into_response();
+                    result.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    result
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend = JiraBackend::new_with_budget(
+            format!("http://{address}"),
+            "user@example.test".into(),
+            "jira-secret".into(),
+            None,
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+        );
+        let result = backend.get_issue("jira:PROJ-1").await;
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        let requests = calls.lock().unwrap().clone();
+        (result, requests)
+    }
+
+    fn jira_comment(id: usize) -> serde_json::Value {
+        json!({
+            "id": id.to_string(),
+            "body": format!("comment-{id}"),
+            "created": "1970-01-01T00:00:00Z"
+        })
+    }
+
+    fn jira_detail_with_comments(total: usize, start_at: usize, count: usize) -> FixtureResponse {
+        let comments: Vec<_> = (start_at..start_at + count).map(jira_comment).collect();
+        FixtureResponse::new(
+            StatusCode::OK,
+            json!({
+                "id": "10001",
+                "key": "PROJ-1",
+                "self": "http://jira.example/rest/api/3/issue/10001",
+                "fields": {
+                    "summary": "Issue",
+                    "comment": {
+                        "startAt": start_at,
+                        "maxResults": 100,
+                        "total": total,
+                        "comments": comments
+                    }
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn get_issue_paginates_embedded_comments_to_total() {
+        let embedded = jira_detail_with_comments(150, 0, 100);
+        let page = FixtureResponse::new(
+            StatusCode::OK,
+            json!({
+                "startAt": 100,
+                "maxResults": 100,
+                "total": 150,
+                "comments": (100..150).map(jira_comment).collect::<Vec<_>>()
+            })
+            .to_string(),
+        );
+        let (result, requests) = run_get(vec![embedded, page]).await;
+        let comments = result.unwrap().comments;
+        assert_eq!(comments.len(), 150);
+        for (index, comment) in comments.iter().enumerate() {
+            assert_eq!(comment.body, format!("comment-{index}"));
+        }
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].contains("issue/PROJ-1/comment"),
+            "{}",
+            requests[1]
+        );
+        assert!(requests[1].contains("startAt=100"), "{}", requests[1]);
+    }
+
+    #[tokio::test]
+    async fn get_issue_deduplicates_comment_ids_in_first_seen_order() {
+        let embedded = jira_detail_with_comments(3, 0, 2);
+        let page = FixtureResponse::new(
+            StatusCode::OK,
+            json!({
+                "startAt": 2,
+                "maxResults": 100,
+                "total": 3,
+                "comments": [jira_comment(1), jira_comment(2)]
+            })
+            .to_string(),
+        );
+        let (result, requests) = run_get(vec![embedded, page]).await;
+        let comments = result.unwrap().comments;
+        assert_eq!(comments.len(), 3);
+        assert_eq!(comments[0].body, "comment-0");
+        assert_eq!(comments[1].body, "comment-1");
+        assert_eq!(comments[2].body, "comment-2");
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_issue_fails_closed_on_empty_comment_page_before_total() {
+        let embedded = jira_detail_with_comments(3, 0, 2);
+        let empty = FixtureResponse::new(
+            StatusCode::OK,
+            json!({"startAt": 2, "maxResults": 100, "total": 3, "comments": []}).to_string(),
+        );
+        let (result, requests) = run_get(vec![embedded, empty]).await;
+        assert!(
+            matches!(result, Err(IssueError::Parse(message)) if message.contains("comment pagination incomplete"))
+        );
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_issue_does_not_request_comments_when_embedded_total_is_satisfied() {
+        let embedded = jira_detail_with_comments(2, 0, 2);
+        let (result, requests) = run_get(vec![embedded]).await;
+        assert_eq!(result.unwrap().comments.len(), 2);
+        assert_eq!(requests.len(), 1);
     }
 
     fn jira_search_page(start_at: usize, total: usize, count: usize) -> FixtureResponse {
