@@ -74,6 +74,7 @@ struct Q {
     oob_bytes: usize,
     status: WriterStatus,
     consec_errs: u32,
+    parser_reset_pending: bool,
     shutdown: bool,
     worker_done: bool,
     metrics: WriterMetrics,
@@ -97,6 +98,9 @@ pub(crate) struct FrameWriter {
 
 /// Max frames in flight before `frame_slot_free` reports Busy.
 const FRAME_QUEUE_DEPTH: usize = 2;
+// CAN aborts a partial control sequence; ST closes an OSC/APC string. Both
+// are harmless when the terminal parser is already in ground state.
+const PARSER_RESET: &[u8] = b"\x18\x1b\\";
 const OOB_QUEUE_COUNT: usize = 128;
 const OOB_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 const WRITER_SHUTDOWN_BOUND: std::time::Duration = if cfg!(test) {
@@ -120,6 +124,7 @@ impl FrameWriter {
                 oob_bytes: 0,
                 status: WriterStatus::Ok,
                 consec_errs: 0,
+                parser_reset_pending: false,
                 shutdown: false,
                 worker_done: sync,
                 metrics: WriterMetrics::default(),
@@ -288,7 +293,27 @@ impl FrameWriter {
     /// Sync-mode write on the caller thread, with the same classification.
     fn write_inline(&self, bytes: &[u8], stamp: Option<FrameStamp>) {
         let started = stamp.map(|_| Instant::now());
-        let result = write_and_flush(bytes);
+        let reset_pending = self
+            .inner
+            .q
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .parser_reset_pending;
+        let result = if reset_pending {
+            match write_and_flush(PARSER_RESET) {
+                Ok(()) => {
+                    self.inner
+                        .q
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .parser_reset_pending = false;
+                    write_and_flush(bytes)
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            write_and_flush(bytes)
+        };
         let finished = started.map(|_| Instant::now());
         let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
         if let (Some(stamp), Some(started), Some(finished)) = (stamp, started, finished) {
@@ -450,7 +475,7 @@ fn oob_capacity_wake_requested(inner: &Inner, released_oob: bool) -> bool {
 fn write_message(
     inner: &Inner,
     msg: Msg,
-    write: impl FnOnce(&[u8]) -> std::io::Result<()>,
+    mut write: impl FnMut(&[u8]) -> std::io::Result<()>,
 ) -> (bool, bool) {
     let bytes = match &msg {
         Msg::Frame(b, _) | Msg::Oob(b) | Msg::Clipboard(b) => b,
@@ -476,7 +501,26 @@ fn write_message(
         Msg::Oob(_) | Msg::Clipboard(_) => None,
     };
     let started = stamp.map(|_| Instant::now());
-    let result = write(bytes);
+    let reset_pending = inner
+        .q
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .parser_reset_pending;
+    let result = if reset_pending {
+        match write(PARSER_RESET) {
+            Ok(()) => {
+                inner
+                    .q
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .parser_reset_pending = false;
+                write(bytes)
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        write(bytes)
+    };
     let finished = started.map(|_| Instant::now());
     let errored = result.is_err();
     let released_oob = matches!(&msg, Msg::Oob(_));
@@ -520,6 +564,7 @@ fn apply_write_result(q: &mut Q, result: std::io::Result<()>) {
             if matches!(q.status, WriterStatus::Fatal(_)) {
                 return;
             }
+            q.parser_reset_pending = true;
             let transient = crate::frame_write::is_transient_io(&e);
             q.consec_errs += 1;
             if !transient || q.consec_errs > crate::frame_write::RETRY_MAX {
@@ -548,6 +593,7 @@ mod tests {
             oob_bytes: 0,
             status: WriterStatus::Ok,
             consec_errs: 0,
+            parser_reset_pending: false,
             shutdown: false,
             worker_done: false,
             metrics: WriterMetrics::default(),
@@ -673,6 +719,78 @@ mod tests {
         assert_eq!(metrics.failed_frames, 1);
         assert_eq!(metrics.completion_us.count(), 0);
         assert_eq!(metrics.input_completion_us.count(), 0);
+    }
+
+    #[test]
+    fn next_message_starts_with_parser_reset_after_a_failed_write() {
+        let writer = test_writer();
+        apply_write_result(
+            &mut writer.inner.q.lock().unwrap(),
+            Err(std::io::ErrorKind::Interrupted.into()),
+        );
+        assert!(writer.inner.q.lock().unwrap().parser_reset_pending);
+
+        let mut calls = Vec::new();
+        let (errored, _) = write_message(&writer.inner, Msg::Frame(vec![7], None), |bytes| {
+            calls.push(bytes.to_vec());
+            Ok(())
+        });
+        assert!(!errored);
+        assert_eq!(calls, vec![PARSER_RESET.to_vec(), vec![7]]);
+        assert!(!writer.inner.q.lock().unwrap().parser_reset_pending);
+        let (errored, _) = write_message(&writer.inner, Msg::Frame(vec![8], None), |bytes| {
+            calls.push(bytes.to_vec());
+            Ok(())
+        });
+        assert!(!errored);
+        assert_eq!(calls, vec![PARSER_RESET.to_vec(), vec![7], vec![8]]);
+    }
+
+    #[test]
+    fn initial_success_does_not_emit_parser_reset() {
+        let writer = test_writer();
+        let mut calls = Vec::new();
+        let (errored, _) = write_message(&writer.inner, Msg::Frame(vec![8], None), |bytes| {
+            calls.push(bytes.to_vec());
+            Ok(())
+        });
+        assert!(!errored);
+        assert_eq!(calls, vec![vec![8]]);
+    }
+
+    #[test]
+    fn failed_parser_reset_keeps_flag_and_does_not_write_message() {
+        let writer = test_writer();
+        apply_write_result(
+            &mut writer.inner.q.lock().unwrap(),
+            Err(std::io::ErrorKind::Interrupted.into()),
+        );
+        let mut calls = Vec::new();
+        let (errored, _) = write_message(&writer.inner, Msg::Frame(vec![9], None), |bytes| {
+            calls.push(bytes.to_vec());
+            Err(std::io::ErrorKind::Interrupted.into())
+        });
+        assert!(errored);
+        assert_eq!(calls, vec![PARSER_RESET.to_vec()]);
+        assert!(writer.inner.q.lock().unwrap().parser_reset_pending);
+    }
+
+    #[test]
+    fn fatal_writer_does_not_emit_parser_reset_or_message() {
+        let writer = test_writer();
+        {
+            let mut q = writer.inner.q.lock().unwrap();
+            q.status = WriterStatus::Fatal("test fatal".into());
+            q.parser_reset_pending = true;
+        }
+        let mut calls = 0;
+        let (errored, _) = write_message(&writer.inner, Msg::Frame(vec![1], None), |_| {
+            calls += 1;
+            Ok(())
+        });
+        assert!(!errored);
+        assert_eq!(calls, 0);
+        assert!(writer.inner.q.lock().unwrap().parser_reset_pending);
     }
 
     #[test]

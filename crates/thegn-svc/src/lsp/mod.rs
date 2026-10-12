@@ -122,6 +122,8 @@ pub mod limits {
     pub const MAX_OUTBOUND_BODY_BYTES: usize = super::framing::MAX_FRAME_LEN;
     pub const MAX_OUTBOUND_QUEUED_BYTES: usize = 64 * 1024 * 1024;
     pub const MAX_PENDING_REQUESTS: usize = 64;
+    pub const START_BACKOFF_INITIAL_SECS: u64 = 1;
+    pub const START_BACKOFF_MAX_SECS: u64 = 60;
     pub const MAX_OUTBOUND_MESSAGES: usize = 64;
     pub const MAX_CODE_SOURCE_BYTES: usize = 4 * 1024;
     pub const MAX_PROJECTED_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -1474,22 +1476,52 @@ fn writer_loop(
     rx: Receiver<WriterCommand>,
     queued_bytes: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
+    pending: Pending,
 ) {
-    for command in rx {
+    while let Ok(command) = rx.recv() {
         match command {
             WriterCommand::Message(bytes, byte_len, done) => {
                 let result = writer
                     .write_all(&bytes)
                     .and_then(|()| writer.flush())
                     .map_err(|error| LspError::Protocol(error.to_string()));
+                let failed = result.is_err();
                 queued_bytes.fetch_sub(byte_len, Ordering::SeqCst);
-                if result.is_err() {
+                if failed {
+                    let mut requests = pending.lock().unwrap();
                     closed.store(true, Ordering::SeqCst);
+                    for (_, tx) in requests.drain() {
+                        if let Err(error) =
+                            tx.send(Err(LspError::Protocol("server stream closed".into())))
+                        {
+                            // best-effort: requester may have timed out
+                            drop(error);
+                        }
+                    }
                 }
+                let completion = if failed {
+                    Err(LspError::Protocol("server stream closed".into()))
+                } else {
+                    result
+                };
                 if let Some(done) = done
-                    && done.send(result).is_err()
+                    && done.send(completion).is_err()
                 {
                     // The caller timed out or closed before write completion.
+                }
+                if failed {
+                    while let Ok(WriterCommand::Message(_, queued_len, queued_done)) = rx.try_recv()
+                    {
+                        queued_bytes.fetch_sub(queued_len, Ordering::SeqCst);
+                        if let Some(queued_done) = queued_done
+                            && queued_done
+                                .send(Err(LspError::Protocol("server stream closed".into())))
+                                .is_err()
+                        {
+                            // The queued caller timed out or closed first.
+                        }
+                    }
+                    break;
                 }
             }
         }
@@ -1672,15 +1704,24 @@ impl LspClient {
         let (writer_tx, writer_rx) = mpsc::sync_channel(limits::MAX_OUTBOUND_MESSAGES);
         let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let closed = Arc::new(AtomicBool::new(false));
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let writer_pending = pending.clone();
         let _writer_thread = thread::Builder::new()
             .name("thegn-lsp-writer".into())
             .spawn({
                 let writer_queued_bytes = queued_bytes.clone();
                 let writer_closed = closed.clone();
-                move || writer_loop(writer, writer_rx, writer_queued_bytes, writer_closed)
+                move || {
+                    writer_loop(
+                        writer,
+                        writer_rx,
+                        writer_queued_bytes,
+                        writer_closed,
+                        writer_pending,
+                    )
+                }
             })
             .expect("LSP writer thread spawn");
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let reader_thread = {
             let ctx = ReaderContext {
                 pending: pending.clone(),
@@ -1722,6 +1763,11 @@ impl LspClient {
     /// The supervisor-minted generation this connection publishes under.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Whether the reader or writer observed a terminal transport failure.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 
     /// The server's negotiated capabilities (all-`false` until `initialize`).
@@ -2478,6 +2524,51 @@ mod tests {
         assert!(matches!(client.ensure_open(), Err(LspError::Protocol(_))));
     }
 
+    #[test]
+    fn writer_io_error_fails_registered_requests_promptly() {
+        struct SucceedsOnceThenBreaks(AtomicUsize);
+        impl Write for SucceedsOnceThenBreaks {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(bytes.len())
+                } else {
+                    Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (reader, _server_writer) = std::io::pipe().unwrap();
+        let (diag_tx, _) = diagnostics_channel();
+        let mut client = LspClient::from_io(
+            Box::new(reader),
+            Box::new(SucceedsOnceThenBreaks(AtomicUsize::new(0))),
+            "fixture",
+            Path::new("/fixture"),
+            diag_tx,
+        )
+        .unwrap();
+        client.timeout = Duration::from_secs(30);
+        let client = Arc::new(client);
+        let result = start_blocked_request(&client);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while client.pending.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(
+            client.pending.lock().unwrap().len(),
+            1,
+            "request reached pending table"
+        );
+        client.notify("trigger-write-error", Value::Null).unwrap();
+        assert!(matches!(
+            result.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(LspError::Protocol(message)) if message == "server stream closed"
+        ));
+    }
+
     fn fixture_ctx(
         pending: Pending,
         diag_tx: DiagnosticsSender,
@@ -2493,7 +2584,18 @@ mod tests {
         let _writer = thread::spawn({
             let writer_queued_bytes = queued_bytes.clone();
             let writer_closed = closed.clone();
-            move || writer_loop(writer_obj, reader, writer_queued_bytes, writer_closed)
+            {
+                let pending = pending.clone();
+                move || {
+                    writer_loop(
+                        writer_obj,
+                        reader,
+                        writer_queued_bytes,
+                        writer_closed,
+                        pending,
+                    )
+                }
+            }
         });
         ReaderContext {
             pending,

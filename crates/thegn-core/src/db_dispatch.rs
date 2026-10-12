@@ -104,7 +104,7 @@ impl Db {
             return Ok(false);
         }
         let changed = self.conn().execute(
-            "UPDATE agent_dispatches SET session_id=?1, run_gen=run_gen+1, native_session_id=NULL \
+            "UPDATE agent_dispatches SET session_id=?1, run_gen=run_gen+1, native_session_id=NULL, report_head_oid=NULL \
              WHERE id=?2 AND status=?3 AND COALESCE(session_id,'')=''",
             rusqlite::params![session_id, id, status],
         )?;
@@ -126,7 +126,7 @@ impl Db {
         let tx = conn.unchecked_transaction()?;
         let changed = tx.execute(
             "UPDATE agent_dispatches SET session_id=?1, artifact_path=?2, status=?3, \
-             run_gen=run_gen+1, exit_code=NULL, exited_at_ms=NULL, native_session_id=NULL \
+             run_gen=run_gen+1, exit_code=NULL, exited_at_ms=NULL, native_session_id=NULL, report_head_oid=NULL \
              WHERE id=?4 AND status IN (?5, ?6)",
             rusqlite::params![
                 session_id,
@@ -316,7 +316,7 @@ impl Db {
     ) -> Result<bool> {
         Ok(self.conn().execute(
             "UPDATE agent_dispatches SET status=?1, session_id=?2, artifact_path=?3, \
-             exit_code=NULL, exited_at_ms=NULL, run_gen=run_gen+1, native_session_id=NULL \
+             exit_code=NULL, exited_at_ms=NULL, run_gen=run_gen+1, native_session_id=NULL, report_head_oid=NULL \
              WHERE id=?4 AND status=?5",
             rusqlite::params![
                 AgentDispatchStatus::Running.as_str(),
@@ -332,16 +332,39 @@ impl Db {
     /// nullable `report` column. Errors when the row does not exist (checks
     /// `get_dispatch` first, naming the id).
     pub fn set_dispatch_report(&self, id: i64, text: &str) -> Result<()> {
+        self.set_dispatch_report_bound(id, text, None)
+    }
+
+    /// Store a report and the worktree HEAD observed when it was filed.
+    pub fn set_dispatch_report_bound(
+        &self,
+        id: i64,
+        text: &str,
+        head_oid: Option<&str>,
+    ) -> Result<()> {
         let text = crate::pipeline_report::report_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
         // Existence check: a silent UPDATE on a missing row is silently wrong.
         if self.get_dispatch(id)?.is_none() {
             anyhow::bail!("roster row {id} does not exist");
         }
         self.conn().execute(
-            "UPDATE agent_dispatches SET report=?1 WHERE id=?2",
-            rusqlite::params![text, id],
+            "UPDATE agent_dispatches SET report=?1, report_head_oid=?2 WHERE id=?3",
+            rusqlite::params![text, head_oid, id],
         )?;
         Ok(())
+    }
+
+    /// Read the HEAD binding for the currently filed report.
+    pub fn dispatch_report_head(&self, id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT report_head_oid FROM agent_dispatches WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Take (or renew) the named pipeline lease for `owner`, for `ttl_secs`.
@@ -1067,6 +1090,24 @@ mod tests {
             row.report.as_deref(),
             Some("verdict: done\ncommits: abc\nunverified: ci\nnext: review")
         );
+    }
+
+    #[test]
+    fn report_head_binding_round_trips_and_run_publication_clears_it() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:X-HEAD", "/wt/x");
+        db.set_dispatch_report_bound(id, "PASS", Some("commit-1"))
+            .unwrap();
+        assert_eq!(
+            db.dispatch_report_head(id).unwrap().as_deref(),
+            Some("commit-1")
+        );
+        assert_eq!(
+            db.publish_dispatch_run(id, "session-new", "artifact.md")
+                .unwrap(),
+            DispatchRunPublishOutcome::Published
+        );
+        assert_eq!(db.dispatch_report_head(id).unwrap(), None);
     }
 
     #[test]

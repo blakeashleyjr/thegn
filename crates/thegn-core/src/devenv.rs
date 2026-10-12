@@ -14,6 +14,7 @@
 //! gets exactly today's environment.
 
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -94,7 +95,84 @@ const DENY: &[&str] = &[
 
 /// Should this exported var be skipped when injecting into a pane?
 fn is_noise(name: &str) -> bool {
-    DENY.contains(&name) || name.starts_with("NIX_") || name.starts_with("BASH_FUNC_")
+    DENY.contains(&name)
+        || name.starts_with("NIX_")
+        || name.starts_with("BASH_FUNC_")
+        || name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+        || name.starts_with("GIT_")
+        || name.starts_with("SSH_")
+        || name.starts_with("GPG_")
+        || name.ends_with("_PROXY")
+        || name.ends_with("_proxy")
+        || name.starts_with("CARGO_TARGET_")
+        || matches!(
+            name,
+            "RUSTC_WRAPPER"
+                | "RUSTC_WORKSPACE_WRAPPER"
+                | "RUSTC"
+                | "CARGO_HOME"
+                | "CARGO_BUILD_RUSTC_WRAPPER"
+                | "CARGO_BUILD_RUSTC"
+                | "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"
+                | "RUSTFLAGS"
+                | "CARGO_ENCODED_RUSTFLAGS"
+                | "PYTHONSTARTUP"
+                | "PYTHONPATH"
+                | "PYTHONHOME"
+                | "PERL5OPT"
+                | "PERL5LIB"
+                | "NODE_OPTIONS"
+                | "NODE_PATH"
+                | "RUBYOPT"
+                | "RUBYLIB"
+                | "JAVA_TOOL_OPTIONS"
+                | "_JAVA_OPTIONS"
+                | "BASH_ENV"
+                | "ENV"
+                | "PROMPT_COMMAND"
+                | "ZDOTDIR"
+                | "XDG_CONFIG_HOME"
+        )
+        || crate::bundle::is_credential_key(name)
+}
+
+fn valid_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn sanitize(dev: Devshell) -> Devshell {
+    const MAX_ENV_VALUE_BYTES: usize = 64 * 1024;
+    let path = dev.path.and_then(|path| {
+        if path.len() > MAX_ENV_VALUE_BYTES {
+            return None;
+        }
+        let entries: Vec<_> = path
+            .split(':')
+            .filter(|entry| {
+                let path = Path::new(entry);
+                path.is_absolute()
+                    && path
+                        .strip_prefix("/nix/store")
+                        .is_ok_and(|rest| !rest.as_os_str().is_empty())
+                    && !path
+                        .components()
+                        .any(|part| part == std::path::Component::ParentDir)
+            })
+            .collect();
+        (!entries.is_empty()).then(|| entries.join(":"))
+    });
+    let mut vars: Vec<_> = dev
+        .vars
+        .into_iter()
+        .filter(|(name, value)| {
+            valid_name(name) && !is_noise(name) && value.len() <= MAX_ENV_VALUE_BYTES
+        })
+        .collect();
+    vars.sort();
+    Devshell { path, vars }
 }
 
 /// Parse `nix print-dev-env --json` output into the injectable [`Devshell`].
@@ -123,7 +201,7 @@ pub fn parse_print_dev_env(json: &str) -> Devshell {
         }
     }
     out.vars.sort();
-    out
+    sanitize(out)
 }
 
 /// Content-addressed cache key for a repo's flake inputs: a hash of the repo
@@ -156,9 +234,23 @@ fn cache_path(key: &str) -> PathBuf {
 /// path. A cold cache remains cold; this function never evaluates or writes it.
 pub fn cached(repo_root: &Path) -> Option<Devshell> {
     let key = cache_key(repo_root)?;
-    let raw = std::fs::read_to_string(cache_path(&key)).ok()?;
-    serde_json::from_str::<Devshell>(&raw)
+    read_cache(&cache_path(&key))
+}
+
+fn read_cache(path: &Path) -> Option<Devshell> {
+    const MAX_CACHE_BYTES: u64 = 1024 * 1024;
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_CACHE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_CACHE_BYTES {
+        return None;
+    }
+    let raw = std::str::from_utf8(&bytes).ok()?;
+    serde_json::from_str::<Devshell>(raw)
         .ok()
+        .map(sanitize)
         .filter(|d| !d.is_empty())
 }
 
@@ -237,5 +329,107 @@ mod tests {
         };
         let json = serde_json::to_string(&dev).unwrap();
         assert_eq!(serde_json::from_str::<Devshell>(&json).unwrap(), dev);
+    }
+
+    #[test]
+    fn parser_rejects_process_control_and_credential_variables_and_filters_path() {
+        let mut variables = serde_json::Map::new();
+        for name in [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "RUSTC",
+            "CARGO_HOME",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER",
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "GIT_CONFIG_GLOBAL",
+            "SSH_AUTH_SOCK",
+            "GPG_TTY",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "PYTHONSTARTUP",
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "PERL5OPT",
+            "PERL5LIB",
+            "NODE_OPTIONS",
+            "NODE_PATH",
+            "RUBYOPT",
+            "RUBYLIB",
+            "JAVA_TOOL_OPTIONS",
+            "_JAVA_OPTIONS",
+            "BASH_ENV",
+            "ENV",
+            "PROMPT_COMMAND",
+            "ZDOTDIR",
+            "XDG_CONFIG_HOME",
+            "GH_TOKEN",
+            "BAD=NAME",
+        ] {
+            variables.insert(
+                name.into(),
+                serde_json::json!({"type":"exported", "value":"bad"}),
+            );
+        }
+        variables.insert("PATH".into(), serde_json::json!({
+            "type":"exported", "value":"/usr/bin:/nix/store/abc/bin:relative:/nix/storeevil/bin:/nix/store/def/bin"
+        }));
+        let parsed = parse_print_dev_env(&serde_json::json!({"variables": variables}).to_string());
+        assert_eq!(parsed.vars, Vec::<(String, String)>::new());
+        assert_eq!(
+            parsed.path.as_deref(),
+            Some("/nix/store/abc/bin:/nix/store/def/bin")
+        );
+
+        let no_store = parse_print_dev_env(
+            r#"{"variables":{"PATH":{"type":"exported","value":"/usr/bin:relative"}}}"#,
+        );
+        assert_eq!(no_store.path, None);
+
+        let oversized_path = serde_json::json!({
+            "variables": {
+                "PATH": {"type":"exported", "value":format!("/nix/store/{}", "x".repeat(64 * 1024))}
+            }
+        });
+        assert_eq!(parse_print_dev_env(&oversized_path.to_string()).path, None);
+
+        let oversized = serde_json::json!({
+            "variables": {
+                "TOO_LARGE": {"type":"exported", "value":"x".repeat(64 * 1024 + 1)}
+            }
+        });
+        assert!(parse_print_dev_env(&oversized.to_string()).is_empty());
+    }
+
+    #[test]
+    fn cache_reader_sanitizes_hostile_entries_and_rejects_oversize() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        let hostile = Devshell {
+            path: Some("/tmp/evil:/nix/store/abc/bin".into()),
+            vars: vec![
+                ("LD_PRELOAD".into(), "/tmp/payload.so".into()),
+                ("SSH_AUTH_SOCK".into(), "/tmp/agent.sock".into()),
+                ("GH_TOKEN".into(), "secret".into()),
+                ("SAFE_PROJECT_FLAG".into(), "yes".into()),
+            ],
+        };
+        std::fs::write(&path, serde_json::to_vec(&hostile).unwrap()).unwrap();
+        assert_eq!(
+            read_cache(&path).unwrap(),
+            Devshell {
+                path: Some("/nix/store/abc/bin".into()),
+                vars: vec![("SAFE_PROJECT_FLAG".into(), "yes".into())],
+            }
+        );
+        std::fs::write(&path, vec![b' '; 1024 * 1024 + 1]).unwrap();
+        assert!(read_cache(&path).is_none());
     }
 }
