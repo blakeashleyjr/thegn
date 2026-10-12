@@ -1478,7 +1478,7 @@ fn writer_loop(
     closed: Arc<AtomicBool>,
     pending: Pending,
 ) {
-    for command in rx {
+    while let Ok(command) = rx.recv() {
         match command {
             WriterCommand::Message(bytes, byte_len, done) => {
                 let result = writer
