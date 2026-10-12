@@ -599,7 +599,7 @@ impl Db {
         let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
         let mut values = status_params
             .iter()
-            .map(|status| *status as &dyn rusqlite::ToSql)
+            .map(|status| status as &dyn rusqlite::ToSql)
             .collect::<Vec<_>>();
         values.push(&fetch_limit);
         let conn = self.conn();
