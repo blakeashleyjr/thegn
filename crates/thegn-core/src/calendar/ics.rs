@@ -1105,6 +1105,7 @@ impl Builder {
         let home = default_zone
             .parse::<chrono_tz::Tz>()
             .unwrap_or(chrono_tz::UTC);
+        // ICS admission quarantines unknown TZIDs before this window heuristic runs.
         let zone = self
             .start
             .as_ref()

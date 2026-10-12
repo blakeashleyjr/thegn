@@ -1563,22 +1563,17 @@ pub fn occurrences(
     let Some(seed) = seed_of(start) else {
         return Vec::new();
     };
-    expand_local_with_gap(
-        rec,
-        seed,
-        Some(series_zone(start, home)?),
-        from,
-        to,
-        &mut budget,
-        gap,
-    )
-    .unwrap_or_default()
-    .into_iter()
-    .map(|local| instance_time(local, start))
-    // Under `GapPolicy::Skip` an occurrence that falls in a spring-forward
-    // gap genuinely does not happen, so it is dropped rather than nudged.
-    .filter(|t| t.is_all_day() || t.instant_in(home, gap).is_some())
-    .collect()
+    let Some(zone) = series_zone(start, home) else {
+        return Vec::new();
+    };
+    expand_local_with_gap(rec, seed, Some(zone), from, to, &mut budget, gap)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|local| instance_time(local, start))
+        // Under `GapPolicy::Skip` an occurrence that falls in a spring-forward
+        // gap genuinely does not happen, so it is dropped rather than nudged.
+        .filter(|t| t.is_all_day() || t.instant_in(home, gap).is_some())
+        .collect()
 }
 
 #[cfg(test)]
