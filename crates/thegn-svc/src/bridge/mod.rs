@@ -94,6 +94,7 @@ enum AdmissionError {
 }
 
 impl AdmissionLimiter {
+    #[cfg(test)]
     fn submit(
         self: &Arc<Self>,
         cancel: Arc<AtomicBool>,
@@ -3063,7 +3064,7 @@ mod tests {
         });
         let sock = TcpStream::connect(addr).unwrap();
         let c = BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap();
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(PROC_EVENT_DEPTH);
         c.procs.lock().unwrap().insert(1, tx);
         go_tx.send(()).unwrap();
         // Only the valid frame arrives; the corrupt one was dropped.
@@ -3107,7 +3108,7 @@ mod tests {
         });
         let sock = TcpStream::connect(addr).unwrap();
         let c = BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap();
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(PROC_EVENT_DEPTH);
         c.procs.lock().unwrap().insert(1, tx);
         go_tx.send(()).unwrap();
         (c, rx)
@@ -3175,7 +3176,7 @@ mod tests {
         let c = BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap();
         // Register a proc subscriber directly (no real proc.spawn round-trip; the
         // server here never answers).
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(PROC_EVENT_DEPTH);
         c.procs.lock().unwrap().insert(7, tx);
         let start = Instant::now();
         match rx.recv_timeout(Duration::from_secs(10)) {
