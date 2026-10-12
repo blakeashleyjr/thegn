@@ -364,7 +364,101 @@ pub fn implemented_caps() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thegn_core::capability::{Surface, coverage_problems};
+    use thegn_core::capability::{Surface, coverage_problems, lookup, scope_of};
+
+    #[test]
+    fn control_api_doc_routes_match_registry() {
+        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/superpowers/specs/control-api.md");
+        let doc = std::fs::read_to_string(&doc_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", doc_path.display()));
+        let routes_section = doc
+            .split("## Routes")
+            .nth(1)
+            .expect("control API docs have a Routes section")
+            .split("\n## ")
+            .next()
+            .expect("Routes section has a boundary");
+
+        let mut documented = std::collections::HashSet::new();
+        let mut all_rows = std::collections::HashSet::new();
+        for line in routes_section
+            .lines()
+            .filter(|line| line.trim_start().starts_with('|'))
+        {
+            let cells: Vec<_> = line.split('|').map(str::trim).collect();
+            if cells.len() < 6 || !cells[1].starts_with('`') {
+                continue;
+            }
+            let route = cells[1].trim_matches('`');
+            let (method, path) = route
+                .split_once(' ')
+                .unwrap_or_else(|| panic!("route cell must contain method and path: {route}"));
+            let cap_cell = cells[2].trim_matches('`');
+            let scope = cells[3].trim_matches('`');
+            let cap = if cap_cell == "—" { "" } else { cap_cell };
+            let row = (method.to_owned(), path.to_owned(), cap.to_owned());
+            assert!(
+                all_rows.insert(row.clone()),
+                "duplicate route row: {route} ({cap})"
+            );
+
+            if cells[4..].join("|").contains("**reserved**") {
+                assert!(
+                    ROUTES.iter().all(|registered| registered.path != path),
+                    "reserved route {path} is present in ROUTES"
+                );
+                continue;
+            }
+
+            if !cap.is_empty() {
+                let capability = lookup(cap)
+                    .unwrap_or_else(|| panic!("documented capability {cap} is not in the catalog"));
+                assert_eq!(
+                    scope,
+                    scope_of(capability).as_str(),
+                    "wrong scope for {method} {path} ({cap})"
+                );
+            }
+            assert!(
+                documented.insert(row),
+                "duplicate documented route: {route} ({cap})"
+            );
+        }
+
+        let mut expected: std::collections::HashSet<(String, String, String)> = API_CALLS
+            .iter()
+            .map(|(cap, method, path)| {
+                (
+                    if *method == "WS" { "GET" } else { *method }.to_owned(),
+                    (*path).to_owned(),
+                    (*cap).to_owned(),
+                )
+            })
+            .collect();
+        expected.extend([(
+            "GET".to_owned(),
+            "/v1/events/sse".to_owned(),
+            "events.subscribe".to_owned(),
+        )]);
+        expected.extend(
+            ROUTES
+                .iter()
+                .filter(|route| route.caps.is_empty())
+                .map(|route| {
+                    let method = match route.path {
+                        "/health" | "/pair" => "GET",
+                        "/v1/pair" => "POST",
+                        path => panic!("unexpected unauthenticated route: {path}"),
+                    };
+                    (method.to_owned(), route.path.to_owned(), String::new())
+                }),
+        );
+        assert_eq!(
+            documented, expected,
+            "control-api.md Routes table does not match API_CALLS and open routes"
+        );
+    }
 
     #[test]
     fn routes_cover_catalog() {
