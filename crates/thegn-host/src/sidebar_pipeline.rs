@@ -96,7 +96,9 @@ pub(crate) fn lanes(dispatches: &[AgentDispatch]) -> Vec<Lane> {
                 } else {
                     seen.push(LaneWorktree {
                         path: path.to_string(),
-                        name: thegn_core::util::basename(path).to_string(),
+                        name: thegn_core::pipeline_report::display_cell(
+                            thegn_core::util::basename(path),
+                        ),
                         at_ms: d.dispatched_at_ms,
                     });
                 }
@@ -106,7 +108,7 @@ pub(crate) fn lanes(dispatches: &[AgentDispatch]) -> Vec<Lane> {
             Some((
                 earliest,
                 Lane {
-                    label: key.clone(),
+                    label: thegn_core::pipeline_report::display_cell(&key),
                     key,
                     worktrees: seen,
                 },
@@ -211,6 +213,45 @@ mod tests {
         let out = lanes(&rows);
         assert_eq!(out[0].key, "linear:T-99");
         assert_eq!(out[0].label, "linear:T-99");
+    }
+
+    #[test]
+    fn hostile_lane_labels_are_safe_while_identities_stay_raw() {
+        let issue = "THE-1\r\n\x1b]52;c;QQ==\x07\u{202e}";
+        let worktree = "/wt/a\nb\u{2028}";
+        let out = lanes(&[dispatch(
+            1,
+            issue,
+            worktree,
+            AgentDispatchStatus::Running,
+            1_000,
+        )]);
+        assert_eq!(out[0].key, issue.trim());
+        assert_eq!(out[0].worktrees[0].path, worktree);
+        assert_safe_cell(&out[0].label);
+        assert_safe_cell(&out[0].worktrees[0].name);
+
+        let fallback_path = "/wt/a\nb\u{2028}";
+        let fallback = lanes(&[dispatch(
+            2,
+            "  ",
+            fallback_path,
+            AgentDispatchStatus::Running,
+            2_000,
+        )]);
+        assert_eq!(fallback[0].key, "a\nb\u{2028}");
+        assert_eq!(fallback[0].worktrees[0].path, fallback_path);
+        assert_safe_cell(&fallback[0].label);
+        assert_safe_cell(&fallback[0].worktrees[0].name);
+    }
+
+    fn assert_safe_cell(value: &str) {
+        assert!(
+            value
+                .chars()
+                .all(|c| !c.is_control() && !thegn_core::pipeline_report::is_format_control(c)),
+            "unsafe display cell: {value:?}"
+        );
     }
 
     #[test]
