@@ -420,6 +420,7 @@ mod tests {
         let source = HostSource::try_new().unwrap();
         source.set_active(false);
         wait_for("worker parked", || source.in_park.load(Ordering::Acquire));
+        source.ring.lock().unwrap().clear();
         let range = TimeRange {
             from: chrono::DateTime::from_timestamp(900, 0).unwrap(),
             to: chrono::DateTime::from_timestamp(1000, 0).unwrap(),
