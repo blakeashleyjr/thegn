@@ -11,6 +11,7 @@
 
 use super::*;
 use crate::telemetry::TelemetryHistory;
+use thegn_core::config_pipeline::PipelineStage;
 use thegn_core::issue::{AgentDispatch, AgentDispatchStatus};
 
 const NOW_MS: i64 = 1_000_000;
