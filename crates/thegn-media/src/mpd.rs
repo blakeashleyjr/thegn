@@ -510,25 +510,59 @@ fn quote_into(out: &mut String, s: &str) -> Result<(), MediaError> {
 /// The native MPD backend. Owns one credential-bearing endpoint and dials per read.
 pub struct Mpd {
     ep: MpdEndpoint,
+    caps: MediaCaps,
+    commands: Vec<String>,
 }
 
 impl Mpd {
-    /// Connect once to verify the daemon answers (so a dead endpoint doesn't sit
-    /// in the aggregator), then keep the endpoint for per-call dials.
+    /// Connect once to verify the daemon and discover its authenticated command
+    /// set, then keep the endpoint for per-call dials.
     pub async fn connect(ep: MpdEndpoint) -> Result<Mpd, MediaError> {
-        // Probe: a successful dial (greeting + optional password) is enough.
-        MpdConn::dial(&ep).await?;
-        Ok(Mpd { ep })
+        let mut conn = MpdConn::dial(&ep).await?;
+        let commands = conn.command("commands").await?;
+        let caps = caps_from_commands(&commands);
+        let commands = commands
+            .iter()
+            .filter(|(key, _)| key == "command")
+            .map(|(_, value)| value.clone())
+            .collect();
+        Ok(Mpd { ep, caps, commands })
     }
 
     async fn conn(&self) -> Result<MpdConn, MediaError> {
         MpdConn::dial(&self.ep).await
     }
 
+    fn caps_from_command(&self, name: &str) -> bool {
+        self.commands.iter().any(|command| command == name)
+    }
+
     /// Open a push watcher on its own connection.
     pub async fn watch(&self) -> Result<MpdWatch, MediaError> {
         let conn = self.conn().await?;
         Ok(MpdWatch { conn: Some(conn) })
+    }
+}
+
+fn caps_from_commands(commands: &[Pair]) -> MediaCaps {
+    let has = |name: &str| {
+        commands
+            .iter()
+            .any(|(key, value)| key == "command" && value == name)
+    };
+    let repeat_single = has("repeat") && has("single");
+    MediaCaps {
+        shuffle: has("random"),
+        loop_mode: repeat_single,
+        volume: has("status") && has("setvol"),
+        playlists: false,
+        signals: has("idle"),
+        seek: has("seekcur"),
+        art: false,
+        queue: false,
+        abs_volume: has("setvol"),
+        chapters: false,
+        fullscreen: false,
     }
 }
 
@@ -555,18 +589,26 @@ fn relative_volume(cur: u8, delta: f64) -> u8 {
 impl MediaBackend for Mpd {
     fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
         Box::pin(async move {
-            let mut c = match self.conn().await {
-                Ok(c) => c,
-                // Daemon went away — show nothing rather than erroring the watcher.
-                Err(MediaError::Unavailable(_)) => return Ok(None),
-                Err(e) => return Err(e),
-            };
+            let mut c = self.conn().await?;
             let status = c.command("status").await?;
+            match mpd_parse::field(&status, "state") {
+                Some("play" | "pause" | "stop") => {}
+                other => {
+                    return Err(MediaError::Backend(format!(
+                        "mpd status has an unknown state {:?}",
+                        other.map(sanitize_diag)
+                    )));
+                }
+            }
             // Nothing loaded (`state: stop` with no song) still yields a valid
             // stopped state; the badge hides it. A failed `currentsong` is an
             // error, not an empty song.
             let song = c.command("currentsong").await?;
-            Ok(Some(mpd_parse::to_state(&status, &song)))
+            let mut state = mpd_parse::to_state(&status, &song);
+            state.can_go_next &= self.caps_from_command("next");
+            state.can_go_previous &= self.caps_from_command("previous");
+            state.can_seek &= self.caps.seek;
+            Ok(Some(state))
         })
     }
 
@@ -635,8 +677,10 @@ impl MediaBackend for Mpd {
     }
 
     fn playlists(&self) -> BoxFuture<'_, Result<Vec<crate::model::Playlist>, MediaError>> {
-        Box::pin(async move {
-            Ok(Vec::new()) // stored playlists deferred
+        Box::pin(async {
+            Err(MediaError::Unsupported(
+                "mpd playlists are not implemented".into(),
+            ))
         })
     }
     fn activate_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
@@ -699,19 +743,7 @@ impl MediaBackend for Mpd {
     }
 
     fn caps(&self) -> MediaCaps {
-        MediaCaps {
-            shuffle: true,
-            loop_mode: true,
-            volume: true,
-            playlists: false,
-            signals: true, // push via `idle`
-            seek: true,
-            art: false, // readpicture/albumart deferred
-            queue: false,
-            abs_volume: true,
-            chapters: false,
-            fullscreen: false,
-        }
+        self.caps
     }
 }
 
@@ -1044,6 +1076,26 @@ mod tests {
         assert_eq!(relative_volume(98, 0.05), 100);
     }
 
+    #[test]
+    fn command_capabilities_require_each_advertised_command() {
+        let pairs = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| ("command".to_string(), (*name).to_string()))
+                .collect::<Vec<_>>()
+        };
+        let caps = caps_from_commands(&pairs(&[
+            "status", "setvol", "random", "repeat", "single", "seekcur", "idle",
+        ]));
+        assert!(caps.volume && caps.abs_volume);
+        assert!(caps.shuffle && caps.loop_mode && caps.seek && caps.signals);
+        assert!(!caps.playlists && !caps.queue && !caps.art);
+        let caps = caps_from_commands(&pairs(&["status", "play", "repeat", "seekcur"]));
+        assert!(!caps.volume && !caps.abs_volume);
+        assert!(!caps.loop_mode && !caps.shuffle && !caps.signals);
+        assert!(caps.seek);
+    }
+
     /// Fake server that answers every command with `reply` and records them.
     async fn recording_server(
         reply: &'static str,
@@ -1077,7 +1129,11 @@ mod tests {
     #[tokio::test]
     async fn volume_step_without_observed_volume_writes_nothing() {
         let (ep, seen) = recording_server("volume: -1\nstate: play\nOK\n").await;
-        let m = Mpd { ep };
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
         let err = m.volume_step(0.05).await.unwrap_err();
         assert!(matches!(err, MediaError::Unsupported(_)), "{err:?}");
         let cmds = seen.lock().unwrap().clone();
@@ -1087,7 +1143,11 @@ mod tests {
     #[tokio::test]
     async fn volume_step_writes_relative_to_observed_on_one_connection() {
         let (ep, seen) = recording_server("volume: 40\nstate: play\nOK\n").await;
-        let m = Mpd { ep };
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
         m.volume_step(0.05).await.unwrap();
         let cmds = seen.lock().unwrap().clone();
         assert_eq!(cmds, vec!["status".to_string(), "setvol 45".to_string()]);
@@ -1096,7 +1156,11 @@ mod tests {
     #[tokio::test]
     async fn play_pause_with_missing_state_does_not_mutate() {
         let (ep, seen) = recording_server("volume: 40\nOK\n").await;
-        let m = Mpd { ep };
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
         assert!(m.play_pause().await.is_err());
         assert_eq!(seen.lock().unwrap().clone(), vec!["status".to_string()]);
     }
@@ -1104,10 +1168,55 @@ mod tests {
     #[tokio::test]
     async fn activate_playlist_is_unsupported() {
         let (ep, _seen) = recording_server("OK\n").await;
-        let m = Mpd { ep };
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
+        assert!(matches!(
+            m.playlists().await,
+            Err(MediaError::Unsupported(_))
+        ));
         assert!(matches!(
             m.activate_playlist("x").await,
             Err(MediaError::Unsupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn connect_discovers_conservative_command_capabilities() {
+        let (ep, _seen) = recording_server("command: status\ncommand: play\nOK\n").await;
+        let m = Mpd::connect(ep).await.unwrap();
+        assert!(!m.caps().volume);
+        assert!(!m.caps().seek);
+        assert!(!m.caps().signals);
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_unknown_state() {
+        let (ep, _seen) = recording_server("volume: 40\nOK\n").await;
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
+        assert!(matches!(m.snapshot().await, Err(MediaError::Backend(_))));
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_daemon_disappearance() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let ep = MpdEndpoint::resolve(&format!("127.0.0.1:{port}"), None).unwrap();
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
+        assert!(matches!(
+            m.snapshot().await,
+            Err(MediaError::Unavailable(_))
         ));
     }
 }

@@ -18,12 +18,12 @@ use serde::{Deserialize, Serialize};
 pub struct ObserveConfig {
     /// Show the "Observe" tab in the top-level app-tab strip. Off by default.
     pub enabled: bool,
-    /// Panel auto-refresh cadence, in seconds.
+    /// Panel auto-refresh cadence, in seconds. Clamped at runtime to 1..=3600 seconds.
     #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub refresh_interval_secs: u64,
     /// Dashboard source: empty ⇒ the built-in host-metrics dashboard; otherwise a
     /// path to a dashboard TOML (tilde-expanded), loaded via `gtui_core::dashboard`.
-    /// A parse/read error falls back to the built-in dashboard (never fails the tab).
+    /// Load errors fail the Observe tab visibly; they do not select the built-in dashboard.
     pub dashboard_path: String,
     pub prometheus: PrometheusSourceConfig,
     pub loki: LokiSourceConfig,

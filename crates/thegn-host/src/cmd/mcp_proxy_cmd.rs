@@ -341,7 +341,7 @@ pub fn secret(action: SecretAction) -> Result<()> {
             Ok(())
         }
         SecretAction::List => {
-            let names = crate::secret::mcp_secret_list();
+            let names = crate::secret::mcp_secret_list().map_err(|e| anyhow::anyhow!("{e}"))?;
             if names.is_empty() {
                 outln!("no thegn-managed keyring entries");
             } else {

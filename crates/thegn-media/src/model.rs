@@ -142,24 +142,62 @@ impl MediaKind {
 /// Return the final path segment's extension without consulting a URL's host,
 /// query, or fragment. Bare paths are kept intact because providers such as MPD
 /// commonly supply relative filenames rather than URLs.
-fn url_extension(value: &str) -> Option<&str> {
+fn url_extension(value: &str) -> Option<String> {
     let path = if let Some((_, after_scheme)) = value.split_once("://") {
         let boundary = after_scheme.find(['/', '?', '#'])?;
         if after_scheme.as_bytes()[boundary] != b'/' {
             return None;
         }
-        &after_scheme[boundary..]
+        let path = after_scheme[boundary..]
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(&after_scheme[boundary..]);
+        percent_decode(path).unwrap_or_else(|| path.to_string())
     } else {
-        value
-    };
-    let path = if value.contains("://") {
-        path.split(['?', '#']).next().unwrap_or(path)
-    } else {
-        path
+        value.to_string()
     };
     let filename = path.rsplit('/').next()?;
     let (_, extension) = filename.rsplit_once('.')?;
-    (!extension.is_empty()).then_some(extension)
+    if extension.is_empty() {
+        return None;
+    }
+    Some(extension.to_string())
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// Normalize provider-controlled text before it is displayed in terminal UI.
+/// C0/C1 controls become spaces; bidi and zero-width formatting controls drop.
+pub fn display_text(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|ch| match ch {
+            '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200b}'..='\u{200d}'
+            | '\u{feff}' => None,
+            ch if ch.is_control() => Some(' '),
+            ch => Some(ch),
+        })
+        .collect()
 }
 
 /// Repeat mode, normalized across backends (MPRIS `LoopStatus`: None/Track/
@@ -253,12 +291,13 @@ impl MediaState {
     /// `"Artist — Title"`, falling back gracefully when fields are missing.
     /// Used by both the statusbar badge and the panel header.
     pub fn now_playing(&self) -> String {
-        match (self.artist.trim(), self.title.trim()) {
+        let raw = match (self.artist.trim(), self.title.trim()) {
             ("", "") => self.player.clone(),
             ("", t) => t.to_string(),
             (a, "") => a.to_string(),
             (a, t) => format!("{a} \u{2014} {t}"), // em dash
-        }
+        };
+        display_text(&raw)
     }
 
     /// The full badge text — transport glyph + now-playing — e.g. `▶ Daft Punk
@@ -308,11 +347,12 @@ pub struct QueueItem {
 impl QueueItem {
     /// `"Artist — Title"`, falling back to the title/id when fields are missing.
     pub fn label(&self) -> String {
-        match (self.artist.trim(), self.title.trim()) {
+        let raw = match (self.artist.trim(), self.title.trim()) {
             ("", "") => self.id.clone(),
             ("", t) => t.to_string(),
             (a, t) => format!("{a} \u{2014} {t}"),
-        }
+        };
+        display_text(&raw)
     }
 }
 
@@ -371,6 +411,22 @@ mod tests {
     }
 
     #[test]
+    fn display_text_removes_terminal_and_bidi_controls() {
+        let normalized = display_text("a\x1b[31mb\nc\u{202e}d");
+        assert_eq!(normalized, "a [31mb cd");
+        assert!(
+            !normalized
+                .chars()
+                .any(|ch| ch.is_control() || matches!(ch, '\u{202e}'))
+        );
+        let state = MediaState {
+            title: "a\x1b\nb".into(),
+            ..Default::default()
+        };
+        assert_eq!(state.now_playing(), "a  b");
+    }
+
+    #[test]
     fn badge_hidden_when_stopped() {
         let mut s = MediaState {
             title: "X".into(),
@@ -421,8 +477,20 @@ mod tests {
             MediaKind::Audio
         );
         assert_eq!(
+            MediaKind::from_hints("x", None, Some("100% Hits.flac")),
+            MediaKind::Audio
+        );
+        assert_eq!(
             MediaKind::from_hints("x", None, Some("https://h/watch?v=abc")),
             MediaKind::Unknown
+        );
+        assert_eq!(
+            MediaKind::from_hints("x", None, Some("https://h/a%2Emp4")),
+            MediaKind::Video
+        );
+        assert_eq!(
+            MediaKind::from_hints("x", None, Some("https://h/a%ZZ.mp3")),
+            MediaKind::Audio
         );
         assert_eq!(
             MediaKind::from_hints("x", None, Some("https://h?x=/a.mp4")),
@@ -459,6 +527,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(q.label(), "Untitled");
+        let q = QueueItem {
+            artist: "A\u{202e}rtist".into(),
+            title: "Track\nName".into(),
+            ..Default::default()
+        };
+        assert_eq!(q.label(), "Artist \u{2014} Track Name");
     }
 
     #[test]

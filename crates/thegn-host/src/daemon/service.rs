@@ -18,7 +18,7 @@ use thegn_core::control_wire::{EventFrame, LeaseEventKind, PairingState};
 use thegn_core::db::Db;
 use thegn_core::editor::EditorTarget;
 use thegn_core::graveyard::Graveyard;
-use thegn_core::store::{ControlStore, IntentStore, LeaseRow};
+use thegn_core::store::{ControlStore, IntentStore, LeaseRow, NotificationStore};
 use thegn_svc::control::{
     AttachKind, AttachReply, ControlApi, ControlError, ControlResult, ForkSpec, GitFileStatus,
     OpenSpec, PreviewFetchReply, PreviewFetchRequest, RecordSpec, RecordStatus,
@@ -877,11 +877,32 @@ impl ControlApi for DaemonService {
                 .and_then(|(_, v)| v.parse::<i64>().ok())
             {
                 let sid = id.clone();
-                if let Err(e) = self
-                    .with_db(move |db| db.bind_dispatch_session(row, &sid))
+                match self
+                    .with_db(move |db| {
+                        if db.bind_dispatch_session(row, &sid)? {
+                            return Ok(false);
+                        }
+                        // Tracker rows have no stage and retain their historic
+                        // best-effort binding behaviour. A pipeline row must
+                        // refuse a second or late worker once binding fails.
+                        let stored = db.get_dispatch(row)?;
+                        Ok(stored.is_none_or(|dispatch| dispatch.stage.is_some()))
+                    })
                     .await
                 {
-                    tracing::warn!(target: "thegn::dispatch", "bind dispatch row {row}: {e}");
+                    Ok(true) => {
+                        let detail = match self.kill(&id).await {
+                            Ok(()) => "stop requested for the unbound worker".to_string(),
+                            Err(error) => format!("stopping the unbound worker failed: {error}"),
+                        };
+                        return Err(ControlError::Conflict(format!(
+                            "dispatch row {row} is no longer launchable; {detail}"
+                        )));
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(target: "thegn::dispatch", "bind dispatch row {row}: {e}");
+                    }
                 }
             }
 
@@ -2867,6 +2888,132 @@ mod tests {
             endpoint: "/run/test.sock".into(),
         };
         (svc, rx)
+    }
+
+    fn dispatch_open_spec(row: i64) -> OpenSpec {
+        let sh = thegn_core::util::which_path("sh").unwrap_or_else(|| "/bin/sh".into());
+        OpenSpec {
+            argv: vec![sh, "-c".into(), "sleep 30".into()],
+            env: vec![(thegn_core::issue::DISPATCH_ROW_ENV.into(), row.to_string())],
+            worktree: None,
+            rows: 24,
+            cols: 80,
+            ..Default::default()
+        }
+    }
+
+    fn isolated_state() -> (tempfile::TempDir, crate::testenv::EnvVarGuard) {
+        let state = tempfile::tempdir().expect("private isolated state dir");
+        let env = crate::testenv::EnvVarGuard::set(&[(
+            "XDG_STATE_HOME",
+            state.path().to_str().expect("state path"),
+        )]);
+        (state, env)
+    }
+
+    fn staged_dispatch(db: &Db, stage: Option<&str>) -> i64 {
+        db.put_agent_dispatch(thegn_core::issue::NewDispatch {
+            stage,
+            ..thegn_core::issue::NewDispatch::new(
+                "linear:THE-272",
+                "/tmp/thegn-stage-launch-idem",
+                "sh",
+            )
+        })
+        .expect("insert dispatch")
+    }
+
+    async fn wait_for_live_sessions(
+        svc: &DaemonService,
+        expected: impl Fn(&[SessionInfo]) -> bool,
+    ) -> Vec<SessionInfo> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let sessions = svc.list_sessions().await.expect("list sessions");
+            let live: Vec<_> = sessions
+                .into_iter()
+                .filter(|session| session.exited_at_ms.is_none())
+                .collect();
+            if expected(&live) {
+                return live;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "live session set did not reach the expected state: {:?}",
+                live.iter().map(|session| &session.id).collect::<Vec<_>>()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_pipeline_row_refuses_and_stops_a_late_open() {
+        let (_state, _env) = isolated_state();
+        let (svc, _) = service(0);
+        let row = svc
+            .with_db(move |db| {
+                let row = staged_dispatch(db, Some("code"));
+                db.update_dispatch_status(row, thegn_core::issue::AgentDispatchStatus::Failed)?;
+                Ok(row)
+            })
+            .await
+            .expect("prepare terminal pipeline row");
+
+        let error = svc
+            .open(dispatch_open_spec(row))
+            .await
+            .expect_err("terminal pipeline row must refuse launch");
+        assert!(matches!(&error, ControlError::Conflict(_)), "{error}");
+        let live = wait_for_live_sessions(&svc, |sessions| sessions.is_empty()).await;
+        assert!(live.is_empty(), "the refused worker has stopped");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn already_bound_pipeline_row_refuses_a_second_live_worker() {
+        let (_state, _env) = isolated_state();
+        let (svc, _) = service(0);
+        let row = svc
+            .with_db(|db| Ok(staged_dispatch(db, Some("code"))))
+            .await
+            .expect("prepare pipeline row");
+        let first = svc
+            .open(dispatch_open_spec(row))
+            .await
+            .expect("first launch");
+
+        let error = svc
+            .open(dispatch_open_spec(row))
+            .await
+            .expect_err("duplicate row launch must refuse");
+        assert!(matches!(&error, ControlError::Conflict(_)), "{error}");
+        let sessions = wait_for_live_sessions(&svc, |sessions| {
+            sessions.len() == 1 && sessions[0].id == first.id
+        })
+        .await;
+        assert_eq!(sessions.len(), 1, "only the original worker remains live");
+        assert_eq!(sessions[0].id, first.id);
+        svc.kill(&first.id).await.expect("stop first worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_tracker_row_keeps_its_best_effort_open_behavior() {
+        let (_state, _env) = isolated_state();
+        let (svc, _) = service(0);
+        let row = svc
+            .with_db(move |db| {
+                let row = staged_dispatch(db, None);
+                db.update_dispatch_status(row, thegn_core::issue::AgentDispatchStatus::Failed)?;
+                Ok(row)
+            })
+            .await
+            .expect("prepare terminal tracker row");
+
+        let opened = svc
+            .open(dispatch_open_spec(row))
+            .await
+            .expect("tracker row retains best-effort open behavior");
+        assert_eq!(svc.list_sessions().await.expect("list sessions").len(), 1);
+        svc.kill(&opened.id).await.expect("stop tracker worker");
     }
 
     fn folder_req(

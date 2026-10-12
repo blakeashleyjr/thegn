@@ -1231,6 +1231,25 @@ pub(crate) fn verify_v76_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v77: persist the admitted chunk file scope on each dispatch row.
+pub(crate) fn migrate_v77(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "chunk_scope") {
+        conn.execute(
+            "ALTER TABLE agent_dispatches ADD COLUMN chunk_scope TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Verify the v77 admitted scope snapshot column.
+pub(crate) fn verify_v77_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "chunk_scope") {
+        bail!("schema v77 migration did not add agent_dispatches.chunk_scope");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -1873,6 +1892,32 @@ mod tests {
         assert_eq!(
             (issue.as_str(), report.as_str(), head),
             ("linear:H-76", "PASS", None)
+        );
+    }
+
+    #[test]
+    fn v77_adds_chunk_scope_snapshot_idempotently_and_preserves_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_dispatches (
+                 id INTEGER PRIMARY KEY, issue_id TEXT NOT NULL, report TEXT);
+             INSERT INTO agent_dispatches(issue_id, report) VALUES ('linear:THE-214', 'PASS');",
+        )
+        .unwrap();
+        assert!(super::verify_v77_schema(&conn).is_err());
+        super::migrate_v77(&conn).unwrap();
+        super::migrate_v77(&conn).unwrap();
+        super::verify_v77_schema(&conn).unwrap();
+        let (issue, report, scope): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT issue_id, report, chunk_scope FROM agent_dispatches",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (issue.as_str(), report.as_str(), scope),
+            ("linear:THE-214", "PASS", None)
         );
     }
 

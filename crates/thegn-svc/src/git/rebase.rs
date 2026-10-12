@@ -25,25 +25,10 @@ use thegn_core::util::sh_quote;
 /// Thegn processes and the counter separates concurrent operations in one.
 static TODO_SCRATCH_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Read sequencer markers without conflating local read failures with absence.
-/// Remote `GitLoc` reads expose only `Option`, so they retain that API's limit.
+/// Read sequencer markers without conflating read failures with absence.
 fn read_rebase_marker(loc: &GitLoc, rel: &str) -> Result<Option<Vec<u8>>> {
-    if let GitLoc::Local(path) = loc {
-        let resolved = loc
-            .git_out(&["rev-parse", "--git-path", rel])
-            .ok_or_else(|| anyhow!("cannot resolve sequencer marker {rel}"))?;
-        let resolved = if resolved.starts_with('/') {
-            std::path::PathBuf::from(resolved)
-        } else {
-            path.join(resolved)
-        };
-        return match std::fs::read(&resolved) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).with_context(|| format!("read sequencer marker {rel}")),
-        };
-    }
-    Ok(loc.read_git_path(rel))
+    loc.read_git_path_checked(rel)
+        .with_context(|| format!("read sequencer marker {rel}"))
 }
 
 /// Run a read-only git probe without taking the mutation lock or advancing the
@@ -524,7 +509,7 @@ pub trait RebaseOps: GitBackend {
     /// mid-flight). Only safe because the host serializes mutations — git
     /// must not be running against this worktree.
     fn rewrite_pending_todo(&self, loc: &GitLoc, todo: &[TodoEntry]) -> Result<()> {
-        if loc.read_git_path("rebase-merge/git-rebase-todo").is_none() {
+        if read_rebase_marker(loc, "rebase-merge/git-rebase-todo")?.is_none() {
             bail!("no interactive rebase in progress");
         }
         loc.write_git_path(
@@ -546,7 +531,7 @@ pub trait RebaseOps: GitBackend {
         todo: &[TodoEntry],
         baseline: &[TodoEntry],
     ) -> Result<()> {
-        let Some(disk) = loc.read_git_path("rebase-merge/git-rebase-todo") else {
+        let Some(disk) = read_rebase_marker(loc, "rebase-merge/git-rebase-todo")? else {
             bail!("no interactive rebase in progress");
         };
         let disk = parse_todo(&String::from_utf8_lossy(&disk));
@@ -720,6 +705,22 @@ mod tests {
         let error = read_rebase_marker(&r.loc(), "rebase-merge/onto")
             .expect_err("a directory at the marker path is unreadable, not absent");
         assert!(error.to_string().contains("read sequencer marker"));
+    }
+
+    #[test]
+    fn unreadable_remote_rebase_marker_is_an_error_not_absence() {
+        let r = repo("unreadable-remote-rebase-marker");
+        let loc = GitLoc::provider(vec!["env".into()], r.dir.to_string_lossy());
+        assert_eq!(
+            read_rebase_marker(&loc, "rebase-merge/onto").unwrap(),
+            None,
+            "a missing marker is absent"
+        );
+        std::fs::create_dir_all(r.dir.join(".git/rebase-merge/onto")).unwrap();
+        let error = read_rebase_marker(&loc, "rebase-merge/onto")
+            .expect_err("a directory at the marker path is unreadable, not absent");
+        assert!(error.to_string().contains("read sequencer marker"));
+        assert!(CliGit.rebase_status(&loc).is_err());
     }
 
     #[test]
@@ -951,6 +952,36 @@ mod tests {
         // Outside a rebase the live-todo rewrite is refused.
         let err = CliGit.rewrite_pending_todo(&r.loc(), &kept).unwrap_err();
         assert!(err.to_string().contains("no interactive rebase"), "{err}");
+    }
+
+    #[test]
+    fn unreadable_pending_todo_is_not_reported_as_no_rebase() {
+        let r = linear("edit-unreadable-todo");
+        let c2 = r.sha_of("c2");
+        let out = CliGit
+            .rebase_retag(&r.loc(), &c2, &[&c2], TodoAction::Edit, &opts())
+            .unwrap();
+        assert_eq!(out, RebaseOutcome::Paused);
+
+        let todo_path = r.dir.join(".git/rebase-merge/git-rebase-todo");
+        std::fs::remove_file(&todo_path).unwrap();
+        std::fs::create_dir(&todo_path).unwrap();
+        let todo = Vec::new();
+
+        let error = CliGit
+            .rewrite_pending_todo(&r.loc(), &todo)
+            .expect_err("unreadable todo must fail");
+        assert!(
+            !error.to_string().contains("no interactive rebase"),
+            "{error}"
+        );
+        let error = CliGit
+            .rewrite_pending_todo_checked(&r.loc(), &todo, &todo)
+            .expect_err("unreadable todo must fail");
+        assert!(
+            !error.to_string().contains("no interactive rebase"),
+            "{error}"
+        );
     }
 
     #[test]

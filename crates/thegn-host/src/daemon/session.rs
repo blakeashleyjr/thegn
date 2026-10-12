@@ -493,6 +493,36 @@ impl SessionActor {
             self.recording_completed(finished);
         }
 
+        // A Stop (or a cap/failure folded by the loop) may already have
+        // detached its finalization task. Close the actor's sender, then fold
+        // any completion it has queued before building the tombstone.
+        drop(self.recording_done_tx.take());
+        let completion_drain = tokio::time::timeout(
+            super::record::FINISH_TIMEOUT + std::time::Duration::from_millis(500),
+            async {
+                while let Some(finished) = recording_done_rx.recv().await {
+                    self.recording_completed(finished);
+                }
+            },
+        )
+        .await;
+        if completion_drain.is_err() {
+            let reason = "recording completion still running at session shutdown timeout";
+            let path = self
+                .record_last_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
+            tracing::warn!(
+                target: "thegn::daemon",
+                session = %self.meta.id,
+                path = %path,
+                reason = %reason,
+                "recording could not be finalized — the .cast file is truncated"
+            );
+            self.record_truncated = Some(reason.to_string());
+        }
+
         // Bury the corpse BEFORE anything observable. The ordering is the whole
         // fix for a real, reproduced bug: a `wait` woken by the exit event
         // re-queries the session table, and if the entry has already been
@@ -1502,6 +1532,67 @@ mod tests {
             tombs,
             feed,
             db,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stopped_recording_is_finalized_before_session_tombstone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.recording.dir = tmp.path().to_string_lossy().into_owned();
+        let mut h = spawn_actor_cfg("sleep 0.2; printf finished; exit 0", None, "sh", cfg);
+
+        let (start_tx, start_rx) = oneshot::channel();
+        h.msg_tx
+            .send(SessionMsg::Record {
+                spec: RecordSpec::Start,
+                reply: start_tx,
+            })
+            .await
+            .expect("actor accepts recording start");
+        let started = tokio::time::timeout(std::time::Duration::from_secs(2), start_rx)
+            .await
+            .expect("recording start reply")
+            .expect("actor replies")
+            .expect("recording starts");
+        let cast_path = started.path.expect("recording path");
+
+        let (stop_tx, stop_rx) = oneshot::channel();
+        h.msg_tx
+            .send(SessionMsg::Record {
+                spec: RecordSpec::Stop,
+                reply: stop_tx,
+            })
+            .await
+            .expect("actor accepts recording stop");
+        stop_rx
+            .await
+            .expect("actor replies")
+            .expect("recording stops");
+
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                if matches!(h.feed.recv().await, Ok(frame) if matches!(frame.as_ref(), EventFrame::SessionExit { session, .. } if session == "s1")) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("actor reaches session teardown");
+        let tombs = h.tombs.lock().await;
+        let tomb = tombs.get("s1", now_ms()).expect("session tombstone");
+        assert_eq!(
+            tomb.recording
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            Some(cast_path.clone())
+        );
+        let cast = std::fs::read_to_string(cast_path).expect("finalized cast exists");
+        let mut lines = cast.lines();
+        let header: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(header["version"], 2);
+        for line in lines {
+            serde_json::from_str::<serde_json::Value>(line).unwrap();
         }
     }
 

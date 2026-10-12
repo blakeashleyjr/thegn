@@ -48,6 +48,44 @@ fn path_is_executable_file(path: &std::path::Path) -> bool {
     path.is_file()
 }
 
+/// Remove the compatibility wrapper used to scrub inherited Git selectors
+/// before custom Git commands. Pane PTYs start from `env_clear()` and add only
+/// `host_base_env()`'s allowlist (which excludes these names); `main` also
+/// scrubs the process environment before threads start. Removing the wrapper
+/// here preserves the actual program name shown by the pane.
+fn strip_git_scrub_prefix(argv: &[String]) -> Option<&[String]> {
+    if argv.first().map(String::as_str) != Some("env") {
+        return None;
+    }
+    let vars = &thegn_core::util::GIT_ENV_VARS;
+    let mut index = 1;
+    let mut count = 0;
+    while argv.get(index).map(String::as_str) == Some("-u") {
+        let var = argv.get(index + 1)?.as_str();
+        if !vars.contains(&var) {
+            return None;
+        }
+        count += 1;
+        index += 2;
+    }
+    if count == 0 || argv.get(index).map(String::as_str) != Some("--") {
+        return None;
+    }
+    let tail = &argv[index + 1..];
+    (!tail.is_empty()).then_some(tail)
+}
+
+fn spawn_failure_line(err: &anyhow::Error) -> String {
+    thegn_core::log_redact::redact_text_line(&format!("{err:#}"))
+}
+
+fn git_scrubbed_env(env: &[(String, String)]) -> Vec<(String, String)> {
+    env.iter()
+        .filter(|(key, _)| !thegn_core::util::GIT_ENV_VARS.contains(&key.as_str()))
+        .cloned()
+        .collect()
+}
+
 #[cfg(not(windows))] // the windows resolver delegates to util::shell()
 fn command_on_path(name: &str) -> Option<String> {
     let path_var = std::env::var_os("PATH")?;
@@ -544,10 +582,12 @@ impl Panes {
         env: &[(String, String)],
         center: Rect,
     ) -> Result<u32> {
+        let argv = strip_git_scrub_prefix(argv).unwrap_or(argv);
+        let env = git_scrubbed_env(env);
         let _admission =
             crate::worktree_admission::admit_pane_open(root).map_err(|why| anyhow::anyhow!(why))?;
         if self.daemon_cfg.is_some() {
-            match self.spawn_daemon_backed(argv, cwd, env, center, None, None) {
+            match self.spawn_daemon_backed(argv, cwd, &env, center, None, None) {
                 Ok(id) => return Ok(id),
                 Err(e) => {
                     tracing::warn!(
@@ -557,7 +597,7 @@ impl Panes {
                 }
             }
         }
-        self.spawn_in_process(argv, cwd, env, center)
+        self.spawn_in_process(argv, cwd, &env, center)
     }
 
     /// As [`Panes::spawn_argv_env`], but ALWAYS in-process — never
@@ -572,9 +612,11 @@ impl Panes {
         env: &[(String, String)],
         center: Rect,
     ) -> Result<u32> {
+        let argv = strip_git_scrub_prefix(argv).unwrap_or(argv);
+        let env = git_scrubbed_env(env);
         let _admission =
             crate::worktree_admission::admit_pane_open(cwd).map_err(|why| anyhow::anyhow!(why))?;
-        self.spawn_in_process(argv, cwd, env, center)
+        self.spawn_in_process(argv, cwd, &env, center)
     }
 
     /// The in-process PTY spawn shared by the chokepoint's fallback and the
@@ -1075,10 +1117,12 @@ impl Panes {
                     map.insert(*old, fresh);
                 }
                 Err(e) => {
-                    let _ = std::fs::write(
-                        // best-effort: debug trace: the real error is returned right below
-                        "/tmp/thegn-spawn-err.log",
-                        format!("Materialize spawn failed: {e:?}"),
+                    let line = spawn_failure_line(&e);
+                    tracing::warn!(
+                        target: "thegn::startup",
+                        leaf = old,
+                        backend = %spec.backend,
+                        "materialize spawn failed: {line}"
                     );
                     return Err(e);
                 }
@@ -1798,6 +1842,50 @@ mod tests {
     }
 
     #[test]
+    fn git_scrub_prefix_is_removed_only_for_exact_git_env_wrapper() {
+        let wrapped = [
+            "env",
+            "-u",
+            "GIT_DIR",
+            "-u",
+            "GIT_WORK_TREE",
+            "--",
+            "git",
+            "status",
+        ]
+        .map(str::to_owned);
+        assert_eq!(strip_git_scrub_prefix(&wrapped), Some(&wrapped[6..]));
+        assert_eq!(
+            git_scrubbed_env(&[
+                ("GIT_DIR".into(), "/wrong/repository".into()),
+                ("SAFE_VALUE".into(), "kept".into()),
+            ]),
+            vec![("SAFE_VALUE".into(), "kept".into())]
+        );
+
+        for malformed in [
+            vec!["env", "-u", "FOO", "--", "git"],
+            vec!["env", "-u", "GIT_DIR", "GIT_WORK_TREE=x", "--", "git"],
+            vec!["env", "-u", "GIT_DIR", "git"],
+            vec!["env", "-u", "GIT_DIR", "--"],
+        ] {
+            let malformed = malformed.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(
+                strip_git_scrub_prefix(&malformed).is_none(),
+                "malformed wrapper must remain untouched: {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_failure_line_redacts_sensitive_assignments() {
+        let err = anyhow::anyhow!("spawn child").context("GH_TOKEN=ghp_secret exec failed");
+        let line = spawn_failure_line(&err);
+        assert!(!line.contains("ghp_secret"));
+        assert!(line.contains("spawn child"));
+    }
+
+    #[test]
     fn spawn_records_time_and_forget_clears_it() {
         // Spawned panes read SHELL; pin it to one that exists, restored on drop.
         let _env = crate::testenv::EnvVarGuard::set(&[("SHELL", "/bin/sh")]);
@@ -1859,5 +1947,40 @@ mod tests {
             !panes.table.get(&id).unwrap().is_daemon_backed(),
             "ephemeral panes must stay in-process with the daemon enabled"
         );
+    }
+
+    #[test]
+    fn scrubbed_git_command_pane_label_is_the_program() {
+        let program = std::env::var("SHELL")
+            .ok()
+            .into_iter()
+            .chain(std::env::var("ComSpec"))
+            .chain(["/usr/bin/git".to_owned(), "/bin/sh".to_owned()])
+            .find(|candidate| std::path::Path::new(candidate).is_file())
+            .expect("an existing shell or git executable");
+        let argv = [
+            "env".to_string(),
+            "-u".to_string(),
+            "GIT_DIR".to_string(),
+            "-u".to_string(),
+            "GIT_WORK_TREE".to_string(),
+            "--".to_string(),
+            program.clone(),
+        ];
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = Panes::new(tx);
+        let id = panes
+            .spawn_argv_env_local(
+                &argv,
+                None,
+                &[],
+                layout::compute(80, 24, false, false).center,
+            )
+            .expect("wrapped program spawn");
+        let expected = std::path::Path::new(&program)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
+        assert_eq!(panes.table.get(&id).unwrap().program(), expected);
     }
 }

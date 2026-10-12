@@ -10,6 +10,7 @@
 //! nothing here executes.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 use crate::config::{config_enum, config_warn};
@@ -263,39 +264,60 @@ pub fn synth_flake(packages: &[String]) -> String {
     flake
 }
 
-/// The stable synth directory for this package set (12-char [`crate::util::short_hash`]
-/// of the joined list): `$HOME/.thegn/synth/<hash>`. A literal sh string —
-/// `$HOME` expands in the sandbox (used verbatim by the pane-entry hook).
-/// Hashes the same bounded, validated package list that [`synth_flake`] renders.
+/// The stable synth directory for this generated flake: a versioned SHA-256
+/// digest of its exact bytes at `$HOME/.thegn/synth/v2-<digest>`. A literal sh
+/// string — `$HOME` expands in the sandbox (used verbatim by the pane-entry
+/// hook). The flake bytes include the nixpkgs input and system matrix.
 pub fn synth_dir(packages: &[String]) -> String {
     let admitted = admit_synth_packages(packages);
     format!("$HOME/.thegn/synth/{}", synth_hash(&admitted))
 }
 
 fn synth_hash(packages: &[String]) -> String {
-    crate::util::short_hash(&packages.join("\n"), 12)
+    let flake = synth_flake(packages);
+    let mut digest = Sha256::new();
+    digest.update(b"thegn-synth-v2\0");
+    digest.update(flake.as_bytes());
+    format!("v2-{:x}", digest.finalize())
 }
 
 /// The in-sandbox `/bin/sh` script that materializes + warms the synthesized
 /// devShell: write the flake to [`synth_dir`] (skipped via `cmp` when an
 /// identical one already exists — idempotent, and a content change invalidates
 /// the stale `flake.lock`), `nix flake lock` it if needed, then warm with
-/// `nix develop path:<dir> --command true`. Best-effort like the other warm
-/// scripts: the shell still comes up if the warm fails (it builds lazily).
+/// `nix develop path:<dir> --command true`. Materialization and warm failures
+/// are returned to the provisioning caller as nonzero script outcomes.
 pub fn synth_dir_script(packages: &[String]) -> String {
     let dir = synth_dir(packages);
     let flake = synth_flake(packages);
+    let digest = synth_hash(&admit_synth_packages(packages));
     format!(
         "{prelude}[ -r \"$HOME/.nix-profile/etc/profile.d/nix.sh\" ] && . \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
          [ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh 2>/dev/null || true; \
          export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\"; \
-         d=\"{dir}\"; mkdir -p \"$d\"; \
-         tmp=\"$d/.flake.nix.tmp\"; \
-         cat > \"$tmp\" <<'THEGN_SYNTH_FLAKE'\n{flake}THEGN_SYNTH_FLAKE\n\
-         if [ -f \"$d/flake.nix\" ] && cmp -s \"$tmp\" \"$d/flake.nix\"; then rm -f \"$tmp\"; \
-         else mv \"$tmp\" \"$d/flake.nix\"; rm -f \"$d/flake.lock\"; fi; \
-         [ -f \"$d/flake.lock\" ] || nix flake lock \"$d\" 2>/dev/null || true; \
-         nix develop \"path:$d\" --command true 2>/dev/null || true; true",
+         fail() {{ echo \"$1\"; echo \"$1\" >&2; exit 1; }}; \
+         d=\"{dir}\"; digest=\"{digest}\"; \
+         [ ! -L \"$HOME/.thegn\" ] && [ ! -L \"$HOME/.thegn/synth\" ] && [ ! -L \"$d\" ] || fail 'thegn-synth: symlinked cache path'; \
+         mkdir -p \"$d\" || fail 'thegn-synth: mkdir failed'; \
+         [ ! -L \"$HOME/.thegn\" ] && [ ! -L \"$HOME/.thegn/synth\" ] && [ ! -L \"$d\" ] || fail 'thegn-synth: cache path changed'; \
+         manifest=\"$d/thegn-synth.digest\"; \
+         if [ -e \"$manifest\" ] || [ -L \"$manifest\" ]; then \
+           [ ! -L \"$manifest\" ] && [ -f \"$manifest\" ] && [ \"$(cat \"$manifest\")\" = \"$digest\" ] || fail 'thegn-synth: manifest mismatch'; \
+         fi; \
+         tmp=$(mktemp \"$d/.flake.nix.XXXXXX\") || fail 'thegn-synth: staging failed'; \
+         cat > \"$tmp\" <<'THEGN_SYNTH_FLAKE' || fail 'thegn-synth: flake write failed'\n{flake}THEGN_SYNTH_FLAKE\n\
+         if [ -f \"$d/flake.nix\" ] && cmp -s \"$tmp\" \"$d/flake.nix\"; then \
+           rm -f \"$tmp\" || fail 'thegn-synth: staging cleanup failed'; \
+         else \
+           mv \"$tmp\" \"$d/flake.nix\" || fail 'thegn-synth: flake publish failed'; \
+           rm -f \"$d/flake.lock\" || fail 'thegn-synth: stale lock removal failed'; \
+         fi; \
+         [ -f \"$d/flake.lock\" ] || nix flake lock \"$d\" 2>/dev/null || fail 'thegn-synth: lock failed'; \
+         manifest_tmp=$(mktemp \"$d/.thegn-synth.digest.XXXXXX\") || fail 'thegn-synth: manifest staging failed'; \
+         printf '%s' \"$digest\" > \"$manifest_tmp\" || fail 'thegn-synth: manifest write failed'; \
+         mv \"$manifest_tmp\" \"$manifest\" || fail 'thegn-synth: manifest publish failed'; \
+         nix develop \"path:$d\" --command true 2>/dev/null || fail 'thegn-synth: warm failed'",
+        digest = digest,
         prelude = crate::envplan::nix_runtime_prelude(),
     )
 }
@@ -578,12 +600,22 @@ mod tests {
     }
 
     #[test]
-    fn synth_dir_is_stable_hash_of_package_list() {
+    fn synth_dir_is_versioned_sha256_of_exact_flake_bytes() {
         let pkgs = v(&["python3", "uv"]);
         let dir = synth_dir(&pkgs);
-        let hash = crate::util::short_hash("python3\nuv", 12);
-        assert_eq!(dir, format!("$HOME/.thegn/synth/{hash}"));
-        assert_eq!(hash.len(), 12);
+        let mut hasher = Sha256::new();
+        hasher.update(b"thegn-synth-v2\0");
+        hasher.update(synth_flake(&pkgs).as_bytes());
+        let expected = format!("v2-{:x}", hasher.finalize());
+        assert_eq!(dir, format!("$HOME/.thegn/synth/{expected}"));
+        let digest = dir.rsplit('/').next().unwrap();
+        assert_eq!(digest.len(), 67);
+        assert!(digest.starts_with("v2-"));
+        assert!(
+            digest[3..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
         // A different set lands in a different dir.
         assert_ne!(dir, synth_dir(&v(&["go"])));
     }
@@ -601,18 +633,45 @@ mod tests {
         // replaces the flake AND drops the stale lock.
         assert!(s.contains("cmp -s"), "{s}");
         assert!(s.contains("rm -f \"$d/flake.lock\""), "{s}");
-        // Lock only when needed, then warm the devShell.
+        // Lock only when needed, then warm the devShell; failures are visible.
         assert!(
             s.contains("[ -f \"$d/flake.lock\" ] || nix flake lock"),
             "{s}"
         );
         assert!(s.contains("nix develop \"path:$d\" --command true"), "{s}");
+        assert!(s.contains("mktemp \"$d/.flake.nix.XXXXXX\""), "{s}");
+        assert!(s.contains("thegn-synth.digest"), "{s}");
+        assert!(s.contains("echo \"$1\"; echo \"$1\" >&2"), "{s}");
+        assert!(s.contains("[ ! -L \"$HOME/.thegn\" ]"), "{s}");
+        assert!(s.contains("[ ! -L \"$HOME/.thegn/synth\" ]"), "{s}");
+        assert!(s.contains("[ ! -L \"$d\" ]"), "{s}");
+        assert!(
+            s.contains("thegn-synth: mkdir failed") && s.contains("exit 1"),
+            "{s}"
+        );
+        assert!(
+            s.contains("thegn-synth: lock failed") && s.contains("exit 1"),
+            "{s}"
+        );
+        assert!(s.contains("thegn-synth: manifest mismatch"), "{s}");
+        assert!(
+            s.find("nix flake lock").unwrap()
+                < s.find("mv \"$manifest_tmp\" \"$manifest\"").unwrap(),
+            "{s}"
+        );
+        assert!(
+            s.contains("thegn-synth: warm failed") && s.contains("exit 1"),
+            "{s}"
+        );
+        assert!(
+            !s.contains("nix develop \"path:$d\" --command true 2>/dev/null || true"),
+            "{s}"
+        );
+        assert!(!s.trim_end().ends_with("true"), "{s}");
         // Carries the nix runtime prelude (private-input tokens + shelter purge).
         assert!(
             s.contains("NIX_CONFIG") && s.contains("/homeless-shelter"),
             "{s}"
         );
-        // Best-effort: the step never hard-fails provisioning.
-        assert!(s.trim_end().ends_with("true"), "{s}");
     }
 }
