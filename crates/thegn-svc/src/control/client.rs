@@ -374,7 +374,118 @@ pub enum AttachControl {
 pub struct AttachStream {
     pub frames: tokio_mpsc::Receiver<EventFrame>,
     pub control: tokio_mpsc::Sender<AttachControl>,
+    pub end: tokio::sync::oneshot::Receiver<StreamEnd>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamEnd {
+    CleanClose,
+    TransportLost(String),
+    LivenessTimeout,
+    Protocol(String),
+    IdentityMismatch { expected: String, got: String },
+    SequenceGap { expected: u64, got: u64 },
+    ConsumerGone,
+}
+
+impl StreamEnd {
+    pub fn reconnects(&self) -> bool {
+        matches!(
+            self,
+            Self::TransportLost(_) | Self::LivenessTimeout | Self::SequenceGap { .. }
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+enum StreamMode {
+    Events,
+    Attach { session: String },
+}
+
+struct StreamGuard {
+    mode: StreamMode,
+    last_seq: Option<u64>,
+}
+
+impl StreamGuard {
+    fn new(mode: StreamMode) -> Self {
+        Self {
+            mode,
+            last_seq: None,
+        }
+    }
+
+    fn admit(&mut self, frame: &EventFrame) -> Result<(), StreamEnd> {
+        let mode = &self.mode;
+        if matches!(frame, EventFrame::Hello(_)) {
+            return Err(StreamEnd::Protocol("duplicate Hello".into()));
+        }
+        match (mode, frame) {
+            (
+                StreamMode::Events,
+                EventFrame::PaneSnapshot { .. } | EventFrame::PaneDelta { .. },
+            ) => Err(StreamEnd::Protocol("pane frame on events stream".into())),
+            (StreamMode::Events, _) => Ok(()),
+            (StreamMode::Attach { .. }, EventFrame::PaneSnapshot { session, seq, .. }) => {
+                self.check_identity(session)?;
+                self.last_seq = Some(*seq);
+                Ok(())
+            }
+            (StreamMode::Attach { .. }, EventFrame::PaneDelta { session, seq, .. }) => {
+                self.check_identity(session)?;
+                let Some(last_seq) = self.last_seq else {
+                    return Err(StreamEnd::Protocol("delta before snapshot".into()));
+                };
+                let expected = last_seq.saturating_add(1);
+                if *seq != expected {
+                    return Err(StreamEnd::SequenceGap {
+                        expected,
+                        got: *seq,
+                    });
+                }
+                self.last_seq = Some(*seq);
+                Ok(())
+            }
+            (StreamMode::Attach { .. }, EventFrame::SessionExit { session, .. }) => {
+                self.check_identity(session)?;
+                if self.last_seq.is_none() {
+                    Err(StreamEnd::Protocol("session exit before snapshot".into()))
+                } else {
+                    Ok(())
+                }
+            }
+            (StreamMode::Attach { .. }, _) => Err(StreamEnd::Protocol(
+                "non-pane vocabulary on attach stream".into(),
+            )),
+        }
+    }
+
+    fn check_identity(&self, got: &str) -> Result<(), StreamEnd> {
+        if let StreamMode::Attach { session: expected } = &self.mode
+            && got != expected
+        {
+            return Err(StreamEnd::IdentityMismatch {
+                expected: expected.clone(),
+                got: got.to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Liveness {
+    ping_every: Duration,
+    read_idle: Duration,
+}
+
+/// Remote peers are pinged every 15 seconds and must produce inbound traffic
+/// (including Pong) within 45 seconds. Local Unix sockets use EOF instead.
+const REMOTE_LIVENESS: Liveness = Liveness {
+    ping_every: Duration::from_secs(15),
+    read_idle: Duration::from_secs(45),
+};
 
 /// The JSON envelope shared by SSE, plugin consumers, and CLI-facing client
 /// code. The frame kind comes from [`EventFrame::kind`], so formatters cannot
@@ -1100,6 +1211,12 @@ impl ControlClient {
         let connect = self.limits.connect_timeout;
         let (frame_tx, frame_rx) = tokio_mpsc::channel::<EventFrame>(256);
         let (ctrl_tx, ctrl_rx) = tokio_mpsc::channel::<AttachControl>(1);
+        let mode = StreamMode::Events;
+        let liveness = match &self.addr {
+            ControlAddr::Unix(_) => None,
+            _ => Some(REMOTE_LIVENESS),
+        };
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
         match &self.addr {
             ControlAddr::Unix(sock) => {
                 let ep = crate::ipc::IpcEndpoint::for_socket_path(sock);
@@ -1117,7 +1234,7 @@ impl ControlClient {
                     Ok(ws)
                 })
                 .await?;
-                start_attach(ws, frame_tx, ctrl_rx).await?;
+                start_attach(ws, frame_tx, ctrl_rx, mode.clone(), liveness, end_tx).await?;
             }
             ControlAddr::Tcp { addr, .. } => {
                 let ws = bounded(connect, ControlBoundError::ConnectTimeout, async {
@@ -1134,7 +1251,7 @@ impl ControlClient {
                     Ok(ws)
                 })
                 .await?;
-                start_attach(ws, frame_tx, ctrl_rx).await?;
+                start_attach(ws, frame_tx, ctrl_rx, mode.clone(), liveness, end_tx).await?;
             }
             ControlAddr::HttpOrigin { .. } => {
                 let ws = bounded(connect, ControlBoundError::ConnectTimeout, async {
@@ -1148,12 +1265,13 @@ impl ControlClient {
                     Ok(ws)
                 })
                 .await?;
-                start_attach(ws, frame_tx, ctrl_rx).await?;
+                start_attach(ws, frame_tx, ctrl_rx, mode.clone(), liveness, end_tx).await?;
             }
         }
         Ok(AttachStream {
             frames: frame_rx,
             control: ctrl_tx,
+            end: end_rx,
         })
     }
 
@@ -1232,6 +1350,14 @@ impl ControlClient {
         let connect = self.limits.connect_timeout;
         let (frame_tx, frame_rx) = tokio_mpsc::channel::<EventFrame>(256);
         let (ctrl_tx, ctrl_rx) = tokio_mpsc::channel::<AttachControl>(64);
+        let mode = StreamMode::Attach {
+            session: session.to_owned(),
+        };
+        let liveness = match &self.addr {
+            ControlAddr::Unix(_) => None,
+            _ => Some(REMOTE_LIVENESS),
+        };
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
         match &self.addr {
             ControlAddr::Unix(sock) => {
                 let ep = crate::ipc::IpcEndpoint::for_socket_path(sock);
@@ -1249,7 +1375,7 @@ impl ControlClient {
                     Ok(ws)
                 })
                 .await?;
-                start_attach(ws, frame_tx, ctrl_rx).await?;
+                start_attach(ws, frame_tx, ctrl_rx, mode.clone(), liveness, end_tx).await?;
             }
             ControlAddr::Tcp { addr, .. } => {
                 let ws = bounded(connect, ControlBoundError::ConnectTimeout, async {
@@ -1266,7 +1392,7 @@ impl ControlClient {
                     Ok(ws)
                 })
                 .await?;
-                start_attach(ws, frame_tx, ctrl_rx).await?;
+                start_attach(ws, frame_tx, ctrl_rx, mode.clone(), liveness, end_tx).await?;
             }
             ControlAddr::HttpOrigin { .. } => {
                 let ws = bounded(connect, ControlBoundError::ConnectTimeout, async {
@@ -1280,12 +1406,13 @@ impl ControlClient {
                     Ok(ws)
                 })
                 .await?;
-                start_attach(ws, frame_tx, ctrl_rx).await?;
+                start_attach(ws, frame_tx, ctrl_rx, mode, liveness, end_tx).await?;
             }
         }
         Ok(AttachStream {
             frames: frame_rx,
             control: ctrl_tx,
+            end: end_rx,
         })
     }
 }
@@ -1374,6 +1501,9 @@ async fn start_attach<S>(
     mut ws: Ws<S>,
     frames: tokio_mpsc::Sender<EventFrame>,
     ctrl: tokio_mpsc::Receiver<AttachControl>,
+    mode: StreamMode,
+    liveness: Option<Liveness>,
+    end_tx: tokio::sync::oneshot::Sender<StreamEnd>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1424,8 +1554,12 @@ where
     // Queue the greeting before starting the data pump: Hello is the first
     // client-visible attach frame, even if the daemon has already sent a
     // snapshot while we were validating its greeting.
-    queue_hello_before_pump(&frames, hello, || {
-        tokio::spawn(pump_attach_inner(ws, frames.clone(), ctrl));
+    let pump_frames = frames.clone();
+    queue_hello_before_pump(&frames, hello, move || {
+        tokio::spawn(async move {
+            let end = pump_attach_inner(ws, &pump_frames, ctrl, mode, liveness).await;
+            Result::ok(end_tx.send(end));
+        });
     })
     .await;
     Ok(())
@@ -1446,40 +1580,83 @@ async fn queue_hello_before_pump(
 
 async fn pump_attach_inner<S>(
     mut ws: Ws<S>,
-    frames: tokio_mpsc::Sender<EventFrame>,
+    frames: &tokio_mpsc::Sender<EventFrame>,
     mut ctrl: tokio_mpsc::Receiver<AttachControl>,
-) where
+    mode: StreamMode,
+    liveness: Option<Liveness>,
+) -> StreamEnd
+where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     use tokio_tungstenite::tungstenite::Message;
+    let mut guard = StreamGuard::new(mode);
+    let mut idle_deadline = liveness.map(|l| tokio::time::Instant::now() + l.read_idle);
+    let mut ping = liveness.map(|l| tokio::time::interval(l.ping_every));
+    if let Some(interval) = &mut ping {
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+    }
     loop {
         tokio::select! {
             msg = ws.next() => match msg {
                 Some(Ok(Message::Binary(bytes))) => {
                     match EventDecoder::decode_message(&bytes) {
                         Ok(frame) => {
-                            if !send_frame_while_servicing_control(&frames, frame, &mut ws, &mut ctrl).await {
-                                return; // consumer gone
+                            if let Err(end) = guard.admit(&frame) { return end; }
+                            match send_frame_while_servicing_control(
+                                frames,
+                                frame,
+                                &mut ws,
+                                &mut ctrl,
+                                liveness,
+                            )
+                            .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => return StreamEnd::ConsumerGone,
+                                Err(end) => return end,
                             }
+                            idle_deadline = liveness.map(|l| tokio::time::Instant::now() + l.read_idle);
                         }
                         Err(e) => {
                             tracing::warn!(target: "thegn::control", "attach stream decode error: {e}");
-                            return;
+                            return StreamEnd::Protocol(e.to_string());
                         }
                     }
                 }
-                Some(Ok(Message::Close(_))) | None => return,
-                Some(Ok(_)) => {} // text/ping/pong
+                Some(Ok(Message::Close(_))) => return StreamEnd::CleanClose,
+                None => return StreamEnd::TransportLost("websocket ended without a close frame".into()),
+                Some(Ok(Message::Text(_))) => return StreamEnd::Protocol("text message on control stream".into()),
+                Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {
+                    idle_deadline = liveness.map(|l| tokio::time::Instant::now() + l.read_idle);
+                }
                 Some(Err(e)) => {
                     tracing::debug!(target: "thegn::control", "attach websocket error: {e}");
-                    return;
+                    return StreamEnd::TransportLost(e.to_string());
                 }
             },
             c = ctrl.recv() => {
-                if !send_attach_control(&mut ws, c).await {
-                    return;
+                let sent = match idle_deadline {
+                    Some(deadline) => match tokio::time::timeout_at(deadline, send_attach_control(&mut ws, c)).await {
+                        Ok(sent) => sent,
+                        Err(_) => return StreamEnd::LivenessTimeout,
+                    },
+                    None => send_attach_control(&mut ws, c).await,
+                };
+                if !sent {
+                    return StreamEnd::ConsumerGone;
                 }
-            }
+            },
+            _ = async { tokio::time::sleep_until(idle_deadline.expect("enabled with liveness")).await }, if liveness.is_some() => return StreamEnd::LivenessTimeout,
+            _ = async { if let Some(interval) = &mut ping { interval.tick().await; } }, if liveness.is_some() => {
+                let send = ws.send(Message::Ping(Vec::new().into()));
+                let result = tokio::time::timeout_at(idle_deadline.expect("enabled with liveness"), send).await;
+                match result {
+                    Err(_) => return StreamEnd::LivenessTimeout,
+                    Ok(Err(_)) => return StreamEnd::TransportLost("failed to send websocket ping".into()),
+                    Ok(Ok(())) => {}
+                }
+            },
         }
     }
 }
@@ -1492,7 +1669,8 @@ async fn send_frame_while_servicing_control<S>(
     frame: EventFrame,
     ws: &mut Ws<S>,
     ctrl: &mut tokio_mpsc::Receiver<AttachControl>,
-) -> bool
+    liveness: Option<Liveness>,
+) -> Result<bool, StreamEnd>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1501,13 +1679,23 @@ where
             permit = frames.reserve() => match permit {
                 Ok(permit) => {
                     permit.send(frame);
-                    return true;
+                    return Ok(true);
                 }
-                Err(_) => return false,
+                Err(_) => return Ok(false),
             },
             control = ctrl.recv() => {
-                if !send_attach_control(ws, control).await {
-                    return false;
+                let sent = match liveness {
+                    Some(liveness) => {
+                        let deadline = tokio::time::Instant::now() + liveness.read_idle;
+                        match tokio::time::timeout_at(deadline, send_attach_control(ws, control)).await {
+                            Ok(sent) => sent,
+                            Err(_) => return Err(StreamEnd::LivenessTimeout),
+                        }
+                    }
+                    None => send_attach_control(ws, control).await,
+                };
+                if !sent {
+                    return Ok(false);
                 }
             }
         }
@@ -1785,7 +1973,19 @@ mod tests {
         let (frames, mut receiver) = tokio_mpsc::channel(1);
         let (control, ctrl) = tokio_mpsc::channel(1);
 
-        start_attach(ws, frames, ctrl).await.unwrap();
+        let (end_tx, _end_rx) = tokio::sync::oneshot::channel();
+        start_attach(
+            ws,
+            frames,
+            ctrl,
+            StreamMode::Attach {
+                session: "session-1".into(),
+            },
+            None,
+            end_tx,
+        )
+        .await
+        .unwrap();
 
         let first = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
             .await
@@ -1852,14 +2052,238 @@ mod tests {
             EventFrame::Sessions,
             &mut ws,
             &mut ctrl_rx,
+            None,
         )
         .await;
 
         assert!(
-            !delivered,
+            matches!(delivered, Ok(false)),
             "Close ends the pump without waiting for capacity"
         );
         assert!(server.await.unwrap(), "the peer must receive Close");
+    }
+
+    #[test]
+    fn stream_guard_enforces_vocabulary_identity_and_sequence() {
+        let snapshot = EventFrame::PaneSnapshot {
+            session: "s1".into(),
+            seq: 4,
+            cols: 80,
+            rows: 24,
+            bytes: vec![],
+        };
+        let mut attach = StreamGuard::new(StreamMode::Attach {
+            session: "s1".into(),
+        });
+        assert!(matches!(
+            attach.admit(&EventFrame::Hello(Hello {
+                proto: PROTO_VERSION,
+                server: "d".into(),
+                scopes: vec![]
+            })),
+            Err(StreamEnd::Protocol(_))
+        ));
+        assert!(attach.admit(&snapshot).is_ok());
+        assert!(
+            attach
+                .admit(&EventFrame::PaneSnapshot {
+                    session: "s1".into(),
+                    seq: 1,
+                    cols: 80,
+                    rows: 24,
+                    bytes: vec![]
+                })
+                .is_ok(),
+            "snapshot resets sequence"
+        );
+
+        let mut guard = StreamGuard::new(StreamMode::Attach {
+            session: "s1".into(),
+        });
+        assert!(matches!(
+            guard.admit(&EventFrame::Activity { json: "{}".into() }),
+            Err(StreamEnd::Protocol(_))
+        ));
+        assert!(matches!(
+            guard.admit(&EventFrame::PaneSnapshot {
+                session: "s2".into(),
+                seq: 0,
+                cols: 80,
+                rows: 24,
+                bytes: vec![]
+            }),
+            Err(StreamEnd::IdentityMismatch { .. })
+        ));
+        assert!(matches!(
+            guard.admit(&EventFrame::PaneDelta {
+                session: "s1".into(),
+                seq: 1,
+                bytes: vec![]
+            }),
+            Err(StreamEnd::Protocol(_))
+        ));
+        guard.admit(&snapshot).unwrap();
+        assert!(matches!(
+            guard.admit(&EventFrame::PaneDelta {
+                session: "s1".into(),
+                seq: 6,
+                bytes: vec![]
+            }),
+            Err(StreamEnd::SequenceGap {
+                expected: 5,
+                got: 6
+            })
+        ));
+
+        let mut events = StreamGuard::new(StreamMode::Events);
+        assert!(matches!(
+            events.admit(&snapshot),
+            Err(StreamEnd::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn stream_end_reconnect_classification_is_explicit() {
+        assert!(StreamEnd::TransportLost("eof".into()).reconnects());
+        assert!(StreamEnd::LivenessTimeout.reconnects());
+        assert!(
+            StreamEnd::SequenceGap {
+                expected: 2,
+                got: 4
+            }
+            .reconnects()
+        );
+        assert!(!StreamEnd::CleanClose.reconnects());
+        assert!(!StreamEnd::Protocol("bad".into()).reconnects());
+        assert!(
+            !StreamEnd::IdentityMismatch {
+                expected: "a".into(),
+                got: "b".into()
+            }
+            .reconnects()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_liveness_timeout_ends_stream() {
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let hello = EventFrame::Hello(Hello {
+                proto: PROTO_VERSION,
+                server: "daemon".into(),
+                scopes: vec![],
+            });
+            ws.send(Message::Binary(hello.encode().into()))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        });
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let (frames, mut rx) = tokio_mpsc::channel(2);
+        let (ctrl_tx, ctrl_rx) = tokio_mpsc::channel(1);
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+        start_attach(
+            ws,
+            frames,
+            ctrl_rx,
+            StreamMode::Events,
+            Some(Liveness {
+                ping_every: Duration::from_millis(50),
+                read_idle: Duration::from_millis(150),
+            }),
+            end_tx,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(rx.recv().await, Some(EventFrame::Hello(_))));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), end_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            StreamEnd::LivenessTimeout
+        ));
+        drop(ctrl_tx);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sequence_gap_is_terminal_before_the_bad_delta_is_delivered() {
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let frames = [
+                EventFrame::Hello(Hello {
+                    proto: PROTO_VERSION,
+                    server: "daemon".into(),
+                    scopes: vec![],
+                }),
+                EventFrame::PaneSnapshot {
+                    session: "s1".into(),
+                    seq: 0,
+                    cols: 80,
+                    rows: 24,
+                    bytes: vec![],
+                },
+                EventFrame::PaneDelta {
+                    session: "s1".into(),
+                    seq: 2,
+                    bytes: b"bad".to_vec(),
+                },
+            ];
+            for frame in frames {
+                ws.send(Message::Binary(frame.encode().into()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let (frames, mut rx) = tokio_mpsc::channel(4);
+        let (_ctrl_tx, ctrl_rx) = tokio_mpsc::channel(1);
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+        start_attach(
+            ws,
+            frames,
+            ctrl_rx,
+            StreamMode::Attach {
+                session: "s1".into(),
+            },
+            None,
+            end_tx,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(rx.recv().await, Some(EventFrame::Hello(_))));
+        assert!(matches!(
+            rx.recv().await,
+            Some(EventFrame::PaneSnapshot { .. })
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), end_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            StreamEnd::SequenceGap {
+                expected: 1,
+                got: 2
+            }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "the invalid delta must never reach the consumer"
+        );
+        server.await.unwrap();
     }
 
     #[test]
