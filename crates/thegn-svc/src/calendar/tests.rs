@@ -619,7 +619,11 @@ async fn every_redirect_status_is_refused_without_following_or_replaying_auth() 
             adm(),
         );
         let error = backend
-            .list_events(window().0, window().1, "sync-secret")
+            .list_events(
+                window().0,
+                window().1,
+                &ics_url::stored_cursor("UTC", "sync-secret"),
+            )
             .await
             .unwrap_err();
         assert!(matches!(
@@ -810,7 +814,11 @@ async fn redirect_locations_are_never_followed_across_origins_or_schemes() {
         );
         assert!(matches!(
             backend
-                .list_events(window().0, window().1, "sync-secret")
+                .list_events(
+                    window().0,
+                    window().1,
+                    &ics_url::stored_cursor("UTC", "sync-secret"),
+                )
                 .await
                 .unwrap_err(),
             CalendarError::Policy("calendar redirect refused")
@@ -1223,7 +1231,11 @@ async fn declared_oversized_error_body_is_refused_without_waiting_for_payload() 
                 match provider {
                     CalendarProviderKind::IcsUrl => {
                         ics_url::IcsUrlBackend::new(&cfg, adm())
-                            .list_events(window().0, window().1, "prior-token")
+                            .list_events(
+                                window().0,
+                                window().1,
+                                &ics_url::stored_cursor("UTC", "prior-token"),
+                            )
                             .await
                     }
                     _ => {
@@ -1585,6 +1597,7 @@ async fn media_encoding_and_shared_pool_policies_apply_to_real_backends() {
     });
 
     let config = |first_query: &str, second_query: &str| CalendarConfig {
+        home_zone: "UTC".into(),
         accounts: vec![
             CalendarAccount {
                 name: "first".into(),
@@ -1608,8 +1621,14 @@ async fn media_encoding_and_shared_pool_policies_apply_to_real_backends() {
         ..Default::default()
     };
     let tokens = std::collections::BTreeMap::from([
-        ("first".to_owned(), "first-validator".to_owned()),
-        ("second".to_owned(), "second-validator".to_owned()),
+        (
+            "first".to_owned(),
+            ics_url::stored_cursor("UTC", "first-validator"),
+        ),
+        (
+            "second".to_owned(),
+            ics_url::stored_cursor("UTC", "second-validator"),
+        ),
     ]);
     router(&config("first-query", "second-query"))
         .list_events(window().0, window().1, &tokens)
@@ -2567,6 +2586,8 @@ fn multistatus(events: usize, deletions: usize) -> String {
 #[tokio::test]
 async fn caldav_events_and_deletions_share_the_budget() {
     use thegn_core::calendar::AdmissionLimit;
+    let zone = thegn_core::calendar::Tz::UTC;
+    let zone_name = zone.name();
     let (address, _hits, server) = serve_fixed(
         axum::http::StatusCode::MULTI_STATUS,
         "application/xml",
@@ -2579,23 +2600,37 @@ async fn caldav_events_and_deletions_share_the_budget() {
         ..account("dav", CalendarProviderKind::CalDav)
     };
     let (from, to) = window();
-    let err = caldav::CalDavBackend::new(&acct, budget_of(4))
-        .list_events(from, to, &caldav::scope_token(&[], "UTC", "tok-prev"))
-        .await
-        .unwrap_err();
+    let err = caldav::CalDavBackend::new(
+        &acct,
+        AccountAdmission::isolated(AdmissionBudget::new(4).unwrap(), zone),
+    )
+    .list_events(
+        from,
+        to,
+        &caldav::scope_token(&acct.calendar_ids, zone_name, "tok-prev"),
+    )
+    .await
+    .unwrap_err();
     assert!(
         is_admission(&err, AdmissionLimit::AccountRecords),
         "{err:?}"
     );
-    let page = caldav::CalDavBackend::new(&acct, budget_of(5))
-        .list_events(from, to, &caldav::scope_token(&[], "UTC", "tok-prev"))
-        .await
-        .unwrap();
+    let page = caldav::CalDavBackend::new(
+        &acct,
+        AccountAdmission::isolated(AdmissionBudget::new(5).unwrap(), zone),
+    )
+    .list_events(
+        from,
+        to,
+        &caldav::scope_token(&acct.calendar_ids, zone_name, "tok-prev"),
+    )
+    .await
+    .unwrap();
     assert_eq!(page.events().len(), 2);
     assert_eq!(page.deleted().len(), 3);
     assert_eq!(
         page.sync_token(),
-        caldav::scope_token(&[], "UTC", "tok-next")
+        caldav::scope_token(&acct.calendar_ids, zone_name, "tok-next")
     );
     server.abort();
 }
@@ -2603,6 +2638,8 @@ async fn caldav_events_and_deletions_share_the_budget() {
 #[tokio::test]
 async fn caldav_many_deletions_are_refused_at_the_cap() {
     use thegn_core::calendar::AdmissionLimit;
+    let zone = thegn_core::calendar::Tz::UTC;
+    let zone_name = zone.name();
     let (address, _hits, server) = serve_fixed(
         axum::http::StatusCode::MULTI_STATUS,
         "application/xml",
@@ -2615,10 +2652,17 @@ async fn caldav_many_deletions_are_refused_at_the_cap() {
         ..account("dav", CalendarProviderKind::CalDav)
     };
     let (from, to) = window();
-    let err = caldav::CalDavBackend::new(&acct, budget_of(100))
-        .list_events(from, to, &caldav::scope_token(&[], "UTC", "tok-prev"))
-        .await
-        .unwrap_err();
+    let err = caldav::CalDavBackend::new(
+        &acct,
+        AccountAdmission::isolated(AdmissionBudget::new(100).unwrap(), zone),
+    )
+    .list_events(
+        from,
+        to,
+        &caldav::scope_token(&acct.calendar_ids, zone_name, "tok-prev"),
+    )
+    .await
+    .unwrap_err();
     assert!(
         is_admission(&err, AdmissionLimit::AccountRecords),
         "{err:?}"
