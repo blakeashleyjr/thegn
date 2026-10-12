@@ -949,20 +949,101 @@ fn parse_ahead_behind(out: &str) -> Option<(usize, usize)> {
 /// fallback.
 const GLYPH_BASE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Process-global cache of [`glyph_base`]'s resolution, keyed by worktree path.
+/// Process-global cache of [`glyph_base`]'s resolution, keyed by full execution
+/// authority and placement path (with sensitive remote fields hashed).
 /// The glyph scan re-runs for the active worktree on every hydration, so probing
 /// per scan would put a subprocess — and, for a bridged loc, a whole round trip —
 /// on the hot path. Mirrors the shape of the host's `branch_cache`.
 #[allow(clippy::type_complexity)]
 fn base_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<String, (Option<String>, std::time::Instant, BaseKey)>,
+    std::collections::HashMap<RepoExecutionIdentity, (Option<String>, std::time::Instant, BaseKey)>,
 > {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<
-            std::collections::HashMap<String, (Option<String>, std::time::Instant, BaseKey)>,
+            std::collections::HashMap<
+                RepoExecutionIdentity,
+                (Option<String>, std::time::Instant, BaseKey),
+            >,
         >,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Opaque key for one repository execution placement. The digest prevents SSH
+/// identity/config and provider control arguments from reaching cache storage.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RepoExecutionIdentity(String);
+
+fn repo_execution_identity(loc: &GitLoc) -> RepoExecutionIdentity {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    let mut feed = |part: &[u8]| {
+        hash.update((part.len() as u64).to_be_bytes());
+        hash.update(part);
+    };
+    match loc {
+        GitLoc::Local(path) => {
+            feed(b"local");
+            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            feed(canonical.as_os_str().as_encoded_bytes());
+            // Cheap replacement fence: include the .git entry's stable path and
+            // filesystem metadata when available. This also distinguishes a
+            // replaced gitdir at the same worktree path on common filesystems.
+            let git_entry = canonical.join(".git");
+            let git_entry = std::fs::read_to_string(&git_entry)
+                .ok()
+                .and_then(|contents| {
+                    contents
+                        .strip_prefix("gitdir: ")
+                        .map(|path| path.trim().to_owned())
+                })
+                .map(std::path::PathBuf::from)
+                .map(|path| {
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        canonical.join(path)
+                    }
+                })
+                .unwrap_or(git_entry);
+            let git_entry = std::fs::canonicalize(&git_entry).unwrap_or(git_entry);
+            feed(git_entry.as_os_str().as_encoded_bytes());
+            if let Ok(meta) = std::fs::metadata(&git_entry) {
+                feed(&meta.len().to_be_bytes());
+                if let Ok(modified) = meta.modified()
+                    && let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH)
+                {
+                    feed(&since_epoch.as_nanos().to_be_bytes());
+                }
+            }
+        }
+        GitLoc::Remote { ssh, path } => {
+            feed(b"ssh");
+            feed(ssh.host.as_bytes());
+            feed(&ssh.port.to_be_bytes());
+            feed(&[u8::from(ssh.forward_agent)]);
+            feed(ssh.ssh_config.as_deref().unwrap_or("").as_bytes());
+            feed(ssh.jump_host.as_deref().unwrap_or("").as_bytes());
+            feed(ssh.identity.as_deref().unwrap_or("").as_bytes());
+            feed(&(ssh.extra_args.len() as u64).to_be_bytes());
+            for arg in &ssh.extra_args {
+                feed(arg.as_bytes());
+            }
+            feed(path.as_bytes());
+        }
+        GitLoc::Provider {
+            control_prefix,
+            path,
+        } => {
+            feed(b"provider");
+            feed(&(control_prefix.len() as u64).to_be_bytes());
+            for arg in control_prefix {
+                feed(arg.as_bytes());
+            }
+            feed(path.as_bytes());
+        }
+    }
+    RepoExecutionIdentity(format!("{:x}", hash.finalize()))
 }
 
 /// Whether the cached base must be re-probed now, or can be served as-is. Pure,
@@ -1011,7 +1092,7 @@ fn base_from_probe(origin_head: Option<&str>, has_local: impl Fn(&str) -> bool) 
 /// locally. Cached per loc ([`GLYPH_BASE_TTL`]) — the probes are cheap but the
 /// scan is hot.
 fn glyph_base(loc: &GitLoc) -> Option<String> {
-    let key = loc.path();
+    let key = repo_execution_identity(loc);
     // A plain local worktree is validated by what the probe reads (the
     // `origin/HEAD` symref, the candidate loose heads, packed-refs) instead of a
     // clock: an unchanged print means the probe answers the same, so the 60 s
@@ -1031,7 +1112,7 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
             return base.clone();
         }
     }
-    let origin_head = run_status(
+    let origin_result = run_status(
         loc,
         &[
             "symbolic-ref",
@@ -1039,11 +1120,15 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
             "--short",
             "refs/remotes/origin/HEAD",
         ],
-    )
-    .ok()
-    .and_then(|(exit, out)| (exit == 0).then(|| out.trim().to_string()));
+    );
+    let origin_head = match origin_result {
+        Ok((0, out)) => Some(out.trim().to_string()),
+        Ok((1, _)) => None, // no origin/HEAD is an expected observation
+        _ => return None,
+    };
+    let mut probe_failed = false;
     let base = base_from_probe(origin_head.as_deref(), |b| {
-        run_status(
+        match run_status(
             loc,
             &[
                 "show-ref",
@@ -1051,13 +1136,25 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
                 "--quiet",
                 &format!("refs/heads/{b}"),
             ],
-        )
-        .is_ok_and(|(exit, _)| exit == 0)
+        ) {
+            Ok((0, _)) => true,
+            Ok((1, _)) => false, // candidate branch absent
+            _ => {
+                probe_failed = true;
+                false
+            }
+        }
     });
-    base_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(key, (base.clone(), std::time::Instant::now(), print));
+    if probe_failed {
+        return None;
+    }
+    let mut cache = base_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= 256 && !cache.contains_key(&key) {
+        if let Some(evict) = cache.keys().next().cloned() {
+            cache.remove(&evict);
+        }
+    }
+    cache.insert(key, (base.clone(), std::time::Instant::now(), print));
     base
 }
 
@@ -1711,11 +1808,20 @@ impl GitBackend for GixGit {
         }
         match native_diff::diff_entries(loc.path(), base) {
             Ok(v) => Ok(v),
-            Err(e) => {
+            Err(e) if native_diff::is_unsupported_path(&e) => {
                 tracing::debug!(
                     target: "thegn::forge",
-                    base,
-                    error = %e,
+                    fallback = "unsupported-path",
+                    "native diff cannot represent a non-UTF-8 path in the current result protocol"
+                );
+                Err(e)
+            }
+            Err(_e) => {
+                // Keep the path-bearing error out of ordinary diagnostics: git
+                // paths and ref names can contain private repository data.
+                tracing::debug!(
+                    target: "thegn::forge",
+                    fallback = "cli",
                     "native diff unavailable — falling back to the git CLI"
                 );
                 self.fallback.diff_files(loc, base)
@@ -2177,6 +2283,57 @@ mod tests {
             GLYPH_BASE_TTL
         ));
         assert!(should_reprobe_base(Some(GLYPH_BASE_TTL), GLYPH_BASE_TTL));
+    }
+
+    #[test]
+    fn execution_identity_separates_placements_without_retaining_authority_secrets() {
+        let a = GitLoc::provider(
+            vec!["sprite".into(), "exec".into(), "-s".into(), "alpha".into()],
+            "/workspace",
+        );
+        let b = GitLoc::provider(
+            vec!["sprite".into(), "exec".into(), "-s".into(), "beta".into()],
+            "/workspace",
+        );
+        let key_a = repo_execution_identity(&a);
+        assert_ne!(key_a, repo_execution_identity(&b));
+        assert!(!key_a.0.contains("alpha"));
+        assert!(!key_a.0.contains("workspace"));
+
+        let ssh_a = GitLoc::from_db(
+            "/ignored",
+            Some(&GitLoc::remote_db_string_for(
+                &thegn_core::remote::SshTarget {
+                    host: "same-host".into(),
+                    port: 22,
+                    forward_agent: false,
+                    ssh_config: None,
+                    jump_host: None,
+                    identity: Some("/secret/key-a".into()),
+                    extra_args: Vec::new(),
+                },
+                "/workspace",
+            )),
+        );
+        let ssh_b = GitLoc::from_db(
+            "/ignored",
+            Some(&GitLoc::remote_db_string_for(
+                &thegn_core::remote::SshTarget {
+                    host: "same-host".into(),
+                    port: 22,
+                    forward_agent: false,
+                    ssh_config: None,
+                    jump_host: None,
+                    identity: Some("/secret/key-b".into()),
+                    extra_args: Vec::new(),
+                },
+                "/workspace",
+            )),
+        );
+        let ssh_key = repo_execution_identity(&ssh_a);
+        assert_ne!(ssh_key, repo_execution_identity(&ssh_b));
+        assert!(!ssh_key.0.contains("secret"));
+        assert!(!ssh_key.0.contains("key-a"));
     }
 
     fn repo_root() -> std::path::PathBuf {
