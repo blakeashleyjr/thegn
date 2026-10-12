@@ -1105,6 +1105,7 @@ mod tests {
                 note: Some("SECRET_NOTE".into()),
                 chunk_path: Some("SECRET_CHUNK".into()),
                 report: Some("SECRET_REPORT".into()),
+                chunk_scope: Some("SECRET_SCOPE".into()),
             }],
             notes: Vec::new(),
             pin_state: Some("SECRET_PIN".into()),
@@ -1124,6 +1125,7 @@ mod tests {
             "SECRET_NOTE",
             "SECRET_CHUNK",
             "SECRET_REPORT",
+            "SECRET_SCOPE",
             "SECRET_PIN",
         ] {
             assert!(!encoded.contains(secret), "audit leaked {secret}");
