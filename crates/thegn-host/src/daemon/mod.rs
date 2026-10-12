@@ -52,6 +52,10 @@ pub(crate) const SESSION_MIGRATION_FENCE_VERSION_SUFFIX: &str = "+session-migrat
 /// [`thegn_svc::control::client::DAEMON_HEARTBEAT_TTL_MS`] as live.
 const HEARTBEAT_SECS: u64 = 15;
 
+/// Local-only endpoint used to confirm that a Unix socket belongs to this
+/// state directory. This is intentionally absent from the TCP control API.
+pub(crate) const SCOPE_PATH: &str = "/daemon/scope";
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -80,6 +84,16 @@ pub(crate) fn scope_aliases() -> Vec<String> {
 
 fn scope_key_for(state_dir: &std::path::Path) -> String {
     thegn_core::config_daemon::state_scope_identity(state_dir)
+}
+
+fn scope_router(scope: String) -> axum::Router {
+    axum::Router::new().route(
+        SCOPE_PATH,
+        axum::routing::get(move || {
+            let scope = scope.clone();
+            async move { axum::Json(serde_json::json!({ "scope": scope })) }
+        }),
+    )
 }
 
 /// Resolve the control-socket path from config + env (the pure helper lives in
@@ -792,10 +806,12 @@ async fn run(
         daemon_euid: thegn_svc::ipc::effective_uid(),
         server_label: format!("{} thegn {}", hostname(), env!("CARGO_PKG_VERSION")),
     };
-    let app = thegn_svc::control::http::router(state).merge(
-        tonic::service::Routes::new(thegn_svc::control::grpc::ControlServer::new(local_grpc))
-            .into_axum_router(),
-    );
+    let app = thegn_svc::control::http::router(state)
+        .merge(scope_router(scope_key()))
+        .merge(
+            tonic::service::Routes::new(thegn_svc::control::grpc::ControlServer::new(local_grpc))
+                .into_axum_router(),
+        );
 
     // Serve mode: one policy-controlled TCP listener for HTTP/WS/SSE + gRPC,
     // with bearer tokens REQUIRED (never local_admin on TCP). Native transport
@@ -1081,6 +1097,72 @@ async fn idle_exit_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_scope_endpoint_matches_and_refuses_foreign_state_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use thegn_svc::control::client::{ControlAddr, ControlClient};
+
+        let temp = tempfile::Builder::new()
+            .prefix("thegn-daemon-scope-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let socket = temp.path().join("daemon.sock");
+        let listener =
+            thegn_svc::ipc::IpcListener::Unix(tokio::net::UnixListener::bind(&socket).unwrap());
+        let app = scope_router("v1-aaa".into());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<thegn_svc::ipc::IpcConnectInfo>(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = ControlClient::new(ControlAddr::Unix(socket));
+
+        assert_eq!(
+            client::check_daemon_scope(&client, &["v1-aaa".into()]).await,
+            client::ScopeCheck::Match
+        );
+        assert_eq!(
+            client::check_daemon_scope(&client, &["v1-bbb".into()]).await,
+            client::ScopeCheck::Mismatch("v1-aaa".into())
+        );
+
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+
+        // The real Unix app merges the HTTP router with tonic's router. Its
+        // fallback returns HTTP 200 with an empty gRPC response for an
+        // unknown path, so an older daemon reports a protocol parse error,
+        // not an HTTP 404.
+        let legacy_socket = temp.path().join("legacy-daemon.sock");
+        let legacy_listener = thegn_svc::ipc::IpcListener::Unix(
+            tokio::net::UnixListener::bind(&legacy_socket).unwrap(),
+        );
+        let legacy_app =
+            axum::Router::new().merge(tonic::service::Routes::default().into_axum_router());
+        let legacy_server = tokio::spawn(async move {
+            axum::serve(
+                legacy_listener,
+                legacy_app.into_make_service_with_connect_info::<thegn_svc::ipc::IpcConnectInfo>(),
+            )
+            .await
+            .unwrap();
+        });
+        let legacy_client = ControlClient::new(ControlAddr::Unix(legacy_socket));
+
+        assert_eq!(
+            client::check_daemon_scope(&legacy_client, &["v1-aaa".into()]).await,
+            client::ScopeCheck::Unknown
+        );
+
+        legacy_server.abort();
+        assert!(legacy_server.await.unwrap_err().is_cancelled());
+    }
 
     #[cfg(unix)]
     #[test]
