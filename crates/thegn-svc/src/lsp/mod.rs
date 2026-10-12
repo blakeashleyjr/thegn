@@ -2235,10 +2235,13 @@ impl LspClient {
             self.closed.store(true, Ordering::SeqCst);
         }
 
-        if let Ok(mut child) = self.child.lock()
-            && let Some(child) = child.as_mut()
-        {
-            terminate_tree(child, Some(std::time::Instant::now() + grace));
+        let child = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut child) = child {
+            terminate_tree(&mut child, Some(std::time::Instant::now() + grace));
         }
     }
 }
@@ -2254,6 +2257,14 @@ fn spawn_lsp_thread(
 }
 
 fn terminate_tree(child: &mut Child, deadline: Option<std::time::Instant>) {
+    terminate_tree_with(child, deadline, crate::plugin::proc::leader_exited_nowait);
+}
+
+fn terminate_tree_with(
+    child: &mut Child,
+    deadline: Option<std::time::Instant>,
+    observe: fn(u32) -> std::io::Result<bool>,
+) {
     if !crate::plugin::proc::bounded_group_termination_supported() {
         if let Err(error) = child.kill() {
             tracing::debug!(target: "thegn::lsp", %error, "LSP child kill failed");
@@ -2268,7 +2279,7 @@ fn terminate_tree(child: &mut Child, deadline: Option<std::time::Instant>) {
     let mut pinned = true;
     if let Some(deadline) = deadline {
         loop {
-            match crate::plugin::proc::leader_exited_nowait(pid) {
+            match observe(pid) {
                 Ok(true) => break,
                 Ok(false) if std::time::Instant::now() < deadline => {
                     thread::sleep(Duration::from_millis(10));
@@ -2282,13 +2293,26 @@ fn terminate_tree(child: &mut Child, deadline: Option<std::time::Instant>) {
                 }
             }
         }
-    } else if let Err(error) = crate::plugin::proc::leader_exited_nowait(pid) {
-        tracing::debug!(target: "thegn::lsp", %error, "could not observe LSP child before group termination");
-        pinned = false;
+    } else {
+        loop {
+            match observe(pid) {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    tracing::debug!(target: "thegn::lsp", %error, "could not observe LSP child before group termination");
+                    pinned = false;
+                    break;
+                }
+            }
+        }
     }
 
     if pinned {
         crate::plugin::proc::kill_group(pid);
+    } else if let Err(error) = child.kill()
+        && error.kind() != std::io::ErrorKind::InvalidInput
+    {
+        tracing::debug!(target: "thegn::lsp", %error, "LSP child kill failed after group pinning failed");
     }
     if let Err(error) = child.wait() {
         tracing::debug!(target: "thegn::lsp", %error, "LSP child wait failed");
@@ -2304,10 +2328,13 @@ impl Drop for LspClient {
         {
             tracing::debug!(target: "thegn::lsp", %error, "LSP exit notification was not sent during drop");
         }
-        if let Ok(mut child) = self.child.lock()
-            && let Some(c) = child.as_mut()
-        {
-            terminate_tree(c, None);
+        let child = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut child) = child {
+            terminate_tree(&mut child, None);
         }
         // Idempotent: only retires this exact generation, never a successor.
         let _ = self
@@ -3020,6 +3047,87 @@ mod tests {
         drop(client);
 
         assert_heartbeat_stopped(&heartbeat);
+    }
+
+    #[test]
+    fn shutdown_takes_child_so_drop_cannot_resignal() {
+        if !Path::new("/bin/sh").is_file() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (client, heartbeat) = spawned_server_with_heartbeat(root.path());
+        wait_for_heartbeat(&heartbeat);
+
+        client.shutdown(Duration::from_millis(200));
+
+        assert!(client.child.lock().unwrap().is_none());
+        drop(client);
+        assert_heartbeat_stopped(&heartbeat);
+    }
+
+    #[test]
+    fn drop_with_poisoned_child_lock_still_kills_server() {
+        if !Path::new("/bin/sh").is_file() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (client, heartbeat) = spawned_server_with_heartbeat(root.path());
+        wait_for_heartbeat(&heartbeat);
+        thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _guard = client.child.lock().unwrap();
+                panic!("poison child lock for regression test");
+            });
+            assert!(poisoner.join().is_err());
+        });
+
+        drop(client);
+        assert_heartbeat_stopped(&heartbeat);
+    }
+
+    #[test]
+    fn shutdown_with_poisoned_child_lock_still_kills_server() {
+        if !Path::new("/bin/sh").is_file() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (client, heartbeat) = spawned_server_with_heartbeat(root.path());
+        wait_for_heartbeat(&heartbeat);
+        thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _guard = client.child.lock().unwrap();
+                panic!("poison child lock for regression test");
+            });
+            assert!(poisoner.join().is_err());
+        });
+
+        client.shutdown(Duration::from_millis(200));
+        drop(client);
+        assert_heartbeat_stopped(&heartbeat);
+    }
+
+    #[test]
+    fn unpinned_terminate_is_bounded() {
+        if !Path::new("/bin/sh").is_file() {
+            return;
+        }
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 30"]);
+        crate::plugin::proc::set_process_group(&mut command);
+        let child = command.spawn().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut child = child;
+            terminate_tree_with(&mut child, None, |_| {
+                Err(std::io::Error::other("injected observe failure"))
+            });
+            done_tx.send(child).unwrap();
+        });
+
+        let child = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("unpinned termination waited on a live direct child");
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[test]
