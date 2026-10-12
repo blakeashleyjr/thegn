@@ -124,9 +124,10 @@ pub struct Reap {
     pub verdict: ReapVerdict,
 }
 
-/// How long a row may sit in `spawning` before the daemon reaper treats the
-/// relaunch as abandoned (the daemon crashed between reserving the row and
-/// publishing the new run). Generous: a real relaunch publishes in seconds.
+/// Secondary age threshold for a `spawning` reservation with no in-process
+/// relaunch guard. The guard protects a slow open in the current daemon; after
+/// a crash it is empty, and this threshold gives startup and scheduling delays
+/// room before the reaper surfaces the row to a supervisor.
 pub const SPAWNING_STALE_MS: i64 = 10 * 60 * 1000;
 
 /// Whether a row last status-changed at `changed_at_ms` has sat in `spawning`

@@ -1604,7 +1604,9 @@ mod tests {
     };
     use crate::autopilot::AutopilotIssueKey;
     use crate::db::Db;
-    use crate::store::{AutopilotStore, ClaimOutcome, SessionForkStore, WorkspaceStore};
+    use crate::store::{
+        AutopilotStore, ClaimOutcome, NotificationStore, SessionForkStore, WorkspaceStore,
+    };
     use rusqlite::{Connection, params};
 
     #[test]
@@ -1696,6 +1698,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stamp(&conn), Some(5), "an explicit stamp wins");
+    }
+
+    #[test]
+    fn opening_pre_v73_db_migrates_stamp_and_stale_query_falls_back_to_dispatch_time() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("thegn.db");
+        let id;
+        let dispatched_at_ms;
+        {
+            let db = Db::open_at(&path).unwrap();
+            let wt = dir.path().join("wt");
+            std::fs::create_dir(&wt).unwrap();
+            id = db
+                .put_agent_dispatch(crate::issue::NewDispatch {
+                    issue_id: "linear:THE-739",
+                    worktree_path: wt.to_str().unwrap(),
+                    agent_name: "worker",
+                    stage: Some("code"),
+                    parent_id: None,
+                    session_id: Some("dead-session"),
+                    artifact_path: Some("handoff.md"),
+                    chunk_path: None,
+                })
+                .unwrap();
+            db.update_dispatch_status(id, crate::issue::AgentDispatchStatus::Spawning)
+                .unwrap();
+            dispatched_at_ms = db
+                .conn()
+                .query_row(
+                    "SELECT dispatched_at_ms FROM agent_dispatches WHERE id=?1",
+                    [id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap();
+            // Model a v72 on-disk schema and version stamp. Reopening below
+            // exercises Db::open_at's actual migration ladder.
+            db.conn()
+                .execute_batch(
+                    "DROP TRIGGER agent_dispatches_status_stamp;
+                 ALTER TABLE agent_dispatches DROP COLUMN status_changed_at_ms;
+                 PRAGMA user_version=72;",
+                )
+                .unwrap();
+        }
+
+        let db = Db::open_at(&path).unwrap();
+        super::verify_v73_schema(db.conn()).unwrap();
+        let stamp: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT status_changed_at_ms FROM agent_dispatches WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamp, None, "migration leaves old rows unstamped");
+        let candidates = db.spawning_run_refs(dispatched_at_ms + 1).unwrap();
+        let (run, changed_at_ms) = candidates
+            .iter()
+            .find(|(run, _)| run.id == id)
+            .expect("NULL status stamp falls back to dispatched_at_ms");
+        assert_eq!(changed_at_ms, &dispatched_at_ms);
+        assert_eq!(run.session_id, "dead-session");
     }
 
     #[test]

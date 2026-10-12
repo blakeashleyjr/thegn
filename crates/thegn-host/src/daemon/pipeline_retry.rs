@@ -454,6 +454,9 @@ pub(crate) async fn handle_exit(
             // exact run that was parked: a re-drive during the backoff replaced
             // the session and bumped `run_gen`, so this matches nothing and the
             // newer run is never relaunched over.
+            // Register before the DB CAS so the reaper cannot observe the
+            // newly-spawning row in the gap before this daemon marks it live.
+            let _spawning_guard = svc.track_spawning_relaunch(row.id);
             let reserved = {
                 let run = run.clone();
                 svc.with_db(move |db| {
