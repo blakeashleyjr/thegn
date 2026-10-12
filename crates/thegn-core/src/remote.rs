@@ -932,8 +932,8 @@ mod tests {
     #[test]
     fn ssh_tagged_read_script_is_explicitly_run_by_posix_shell() {
         let command = tagged_git_path_read_ssh_command("/work tree/marker");
-        assert!(command.starts_with("sh -c "), "{command}");
-        assert!(command.contains("[ -e '/work tree/marker' ]"), "{command}");
+        let script = "if [ -e '/work tree/marker' ] || [ -L '/work tree/marker' ]; then printf P; exec cat -- '/work tree/marker'; else printf A; fi";
+        assert_eq!(command, format!("sh -c {}", util::sh_quote(script)));
     }
 
     #[test]
