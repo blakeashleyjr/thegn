@@ -369,10 +369,13 @@ mod tests {
 
         let dropped = Arc::new(AtomicBool::new(false));
         let task_dropped = dropped.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let previous = tokio::spawn(async move {
             let _guard = DropFlag(task_dropped);
+            started_tx.send(()).unwrap();
             std::future::pending::<()>().await;
         });
+        started_rx.await.unwrap();
         abort_and_join(Some(previous)).await;
 
         // This is the first operation the replacement watcher performs after
