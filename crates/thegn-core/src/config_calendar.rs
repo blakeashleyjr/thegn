@@ -230,6 +230,15 @@ impl CalendarConfig {
         }
     }
 
+    /// The zone every calendar consumer anchors floating times and date
+    /// bucketing to: the configured home zone, else the system zone. The one
+    /// resolution shared by backend parsing, the command environment, the sync
+    /// window, recurrence expansion and reminders (THE-464).
+    pub fn effective_home_zone(&self) -> chrono_tz::Tz {
+        self.home_zone()
+            .unwrap_or_else(crate::calendar::tz::system_zone)
+    }
+
     /// Seconds between calendar syncs, or `None` when nothing is configured —
     /// in which case the ticker emits no calendar slot at all and a user
     /// without a calendar pays nothing.
@@ -535,6 +544,14 @@ pub fn validate_calendar(cfg: &CalendarConfig) -> Vec<String> {
     let probe = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap_or_default();
     if let Err(problem) = cfg.sync_horizon(probe) {
         out.push(problem);
+    }
+    for (i, m) in cfg.reminder_default_mins.iter().enumerate() {
+        if *m > crate::calendar::reminders::MAX_LEAD_MINS {
+            out.push(format!(
+                "calendar.reminder_default_mins[{i}]: {m} minutes is beyond the supported lead of {} minutes (28 days) and could never fire",
+                crate::calendar::reminders::MAX_LEAD_MINS
+            ));
+        }
     }
     if !cfg.home_zone.trim().is_empty() && resolve_zone(&cfg.home_zone).is_none() {
         out.push(format!(

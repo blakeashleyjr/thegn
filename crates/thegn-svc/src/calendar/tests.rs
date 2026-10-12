@@ -32,7 +32,7 @@ impl axum::serve::Listener for CountingListener {
 /// A default budget over a private pool, so parallel tests never contend for
 /// the process-wide one.
 fn adm() -> AccountAdmission {
-    AccountAdmission::isolated(AdmissionBudget::default())
+    AccountAdmission::isolated(AdmissionBudget::default(), thegn_core::calendar::Tz::UTC)
 }
 
 /// A router over a private pool.
@@ -120,7 +120,7 @@ impl CalendarBackend for MutationSpy {
         self.calls
             .list
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Box::pin(async { EventPage::try_new(vec![], vec![], "", &adm()) })
+        Box::pin(async { EventPage::try_new(PageMode::Snapshot, vec![], vec![], "", &adm()) })
     }
 
     fn create_event<'a>(
@@ -619,7 +619,11 @@ async fn every_redirect_status_is_refused_without_following_or_replaying_auth() 
             adm(),
         );
         let error = backend
-            .list_events(window().0, window().1, "sync-secret")
+            .list_events(
+                window().0,
+                window().1,
+                &ics_url::stored_cursor("UTC", "sync-secret"),
+            )
             .await
             .unwrap_err();
         assert!(matches!(
@@ -711,7 +715,7 @@ async fn caldav_redirect_never_replays_a_sync_token_body_for_any_status() {
             .list_events(
                 window().0,
                 window().1,
-                &caldav::scope_token(&[], "sync-secret"),
+                &caldav::scope_token(&[], "UTC", "sync-secret"),
             )
             .await
             .unwrap_err();
@@ -810,7 +814,11 @@ async fn redirect_locations_are_never_followed_across_origins_or_schemes() {
         );
         assert!(matches!(
             backend
-                .list_events(window().0, window().1, "sync-secret")
+                .list_events(
+                    window().0,
+                    window().1,
+                    &ics_url::stored_cursor("UTC", "sync-secret"),
+                )
                 .await
                 .unwrap_err(),
             CalendarError::Policy("calendar redirect refused")
@@ -945,11 +953,17 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
             .list_events(
                 window().0,
                 window().1,
-                &caldav::scope_token(&[], "expired-token"),
+                &caldav::scope_token(&[], "UTC", "expired-token"),
             )
             .await
             .unwrap();
-        assert_eq!(page.sync_token(), caldav::scope_token(&[], "new-token"));
+        assert_eq!(
+            page.sync_token(),
+            caldav::scope_token(&[], "UTC", "new-token")
+        );
+        // Expired-token recovery is an authoritative snapshot even though the
+        // server handed back a fresh token (THE-452).
+        assert_eq!(page.mode(), PageMode::Snapshot);
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         {
             let bodies = bodies.lock().unwrap();
@@ -1004,7 +1018,7 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
             .list_events(
                 window().0,
                 window().1,
-                &caldav::scope_token(&[], "expired-token"),
+                &caldav::scope_token(&[], "UTC", "expired-token"),
             )
             .await
             .unwrap_err();
@@ -1217,7 +1231,11 @@ async fn declared_oversized_error_body_is_refused_without_waiting_for_payload() 
                 match provider {
                     CalendarProviderKind::IcsUrl => {
                         ics_url::IcsUrlBackend::new(&cfg, adm())
-                            .list_events(window().0, window().1, "prior-token")
+                            .list_events(
+                                window().0,
+                                window().1,
+                                &ics_url::stored_cursor("UTC", "prior-token"),
+                            )
                             .await
                     }
                     _ => {
@@ -1225,7 +1243,7 @@ async fn declared_oversized_error_body_is_refused_without_waiting_for_payload() 
                             .list_events(
                                 window().0,
                                 window().1,
-                                &caldav::scope_token(&[], "prior-token"),
+                                &caldav::scope_token(&[], "UTC", "prior-token"),
                             )
                             .await
                     }
@@ -1579,6 +1597,7 @@ async fn media_encoding_and_shared_pool_policies_apply_to_real_backends() {
     });
 
     let config = |first_query: &str, second_query: &str| CalendarConfig {
+        home_zone: "UTC".into(),
         accounts: vec![
             CalendarAccount {
                 name: "first".into(),
@@ -1602,8 +1621,14 @@ async fn media_encoding_and_shared_pool_policies_apply_to_real_backends() {
         ..Default::default()
     };
     let tokens = std::collections::BTreeMap::from([
-        ("first".to_owned(), "first-validator".to_owned()),
-        ("second".to_owned(), "second-validator".to_owned()),
+        (
+            "first".to_owned(),
+            ics_url::stored_cursor("UTC", "first-validator"),
+        ),
+        (
+            "second".to_owned(),
+            ics_url::stored_cursor("UTC", "second-validator"),
+        ),
     ]);
     router(&config("first-query", "second-query"))
         .list_events(window().0, window().1, &tokens)
@@ -1627,7 +1652,7 @@ async fn media_encoding_and_shared_pool_policies_apply_to_real_backends() {
     dav.list_events(
         window().0,
         window().1,
-        &caldav::scope_token(&[], "dav-sync-secret"),
+        &caldav::scope_token(&[], "UTC", "dav-sync-secret"),
     )
     .await
     .unwrap();
@@ -2090,7 +2115,47 @@ fn the_query_window_reaches_the_plugin_as_environment() {
         r#"echo "{\"method\":\"events\",\"params\":{\"sync_token\":\"$THEGN_CAL_FROM..$THEGN_CAL_TO\"}}""#,
     )
     .unwrap();
-    assert_eq!(page.sync_token(), "2026-08-01..2026-08-31");
+    assert_eq!(
+        page.sync_token(),
+        ics_url::stored_cursor("UTC", "2026-08-01..2026-08-31")
+    );
+}
+
+#[tokio::test]
+async fn changing_home_zone_sends_an_empty_cursor_to_a_command_plugin() {
+    let tmp = Tmp::new("command-zone-cursor");
+    let seen = tmp.0.join("seen-tokens");
+    let script = format!(
+        "echo \"$THEGN_CAL_SYNC_TOKEN\" >> '{}'; echo '{{\"method\":\"events\",\"params\":{{\"sync_token\":\"plugin-cursor\"}}}}'",
+        seen.display()
+    );
+    let acct = command_account(&script);
+    let (from, to) = window();
+    let kolkata = AccountAdmission::isolated(
+        AdmissionBudget::default(),
+        thegn_core::calendar::Tz::Asia__Kolkata,
+    );
+    let first = command::CommandBackend::new(&acct, kolkata);
+    let one = first.list_events(from, to, "").await.unwrap();
+    assert_eq!(
+        one.sync_token(),
+        ics_url::stored_cursor("Asia/Kolkata", "plugin-cursor")
+    );
+
+    let los_angeles = AccountAdmission::isolated(
+        AdmissionBudget::default(),
+        thegn_core::calendar::Tz::America__Los_Angeles,
+    );
+    let second = command::CommandBackend::new(&acct, los_angeles);
+    let two = second
+        .list_events(from, to, one.sync_token())
+        .await
+        .unwrap();
+    assert_eq!(
+        two.sync_token(),
+        ics_url::stored_cursor("America/Los_Angeles", "plugin-cursor")
+    );
+    assert_eq!(std::fs::read_to_string(seen).unwrap(), "\n\n");
 }
 
 #[test]
@@ -2101,7 +2166,11 @@ fn several_event_messages_accumulate() {
     )
     .unwrap();
     assert_eq!(page.events().len(), 2, "pages accumulate");
-    assert_eq!(page.sync_token(), "t2", "the last token wins");
+    assert_eq!(
+        page.sync_token(),
+        ics_url::stored_cursor("UTC", "t2"),
+        "the last token wins"
+    );
 }
 
 #[test]
@@ -2195,7 +2264,10 @@ fn webcal_urls_are_fetched_over_https() {
 // --- admission budget --------------------------------------------------------
 
 fn budget_of(n: usize) -> AccountAdmission {
-    AccountAdmission::isolated(AdmissionBudget::new(n).unwrap())
+    AccountAdmission::isolated(
+        AdmissionBudget::new(n).unwrap(),
+        thegn_core::calendar::Tz::UTC,
+    )
 }
 
 fn ics_feed(n: usize) -> String {
@@ -2287,7 +2359,11 @@ fn a_page_owns_its_reservation_until_dropped() {
     };
     let backend = ics::IcsBackend::new(
         &acct,
-        AccountAdmission::new(AdmissionBudget::default(), pool.clone()),
+        AccountAdmission::new(
+            AdmissionBudget::default(),
+            pool.clone(),
+            thegn_core::calendar::Tz::UTC,
+        ),
     );
     let (from, to) = window();
     let page = block_on(backend.list_events(from, to, "")).unwrap();
@@ -2411,6 +2487,60 @@ async fn serve_fixed(
     (address, hits, server)
 }
 
+async fn serve_caldav_delta_then_snapshot(
+    delta: String,
+    snapshot: String,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::body::to_bytes;
+    use axum::extract::Request;
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_requests = requests.clone();
+    let count = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen_count = count.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().fallback(axum::routing::any(move |request: Request| {
+                let requests = seen_requests.clone();
+                let count = seen_count.clone();
+                let delta = delta.clone();
+                let snapshot = snapshot.clone();
+                async move {
+                    let method = request.method().to_string();
+                    let body = to_bytes(request.into_body(), 1 << 20).await.unwrap();
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push((method, String::from_utf8(body.to_vec()).unwrap()));
+                    let response_body = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        delta
+                    } else {
+                        snapshot
+                    };
+                    (
+                        axum::http::StatusCode::MULTI_STATUS,
+                        [("content-type", "application/xml")],
+                        response_body,
+                    )
+                        .into_response()
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+    (address, requests, server)
+}
+
 #[tokio::test]
 async fn a_remote_feed_over_the_budget_never_advances_its_etag() {
     use thegn_core::calendar::AdmissionLimit;
@@ -2424,7 +2554,11 @@ async fn a_remote_feed_over_the_budget_never_advances_its_etag() {
     let pool = AdmissionPool::new(1_000, 128 << 20);
     let b = ics_url::IcsUrlBackend::new(
         &acct,
-        AccountAdmission::new(AdmissionBudget::new(10).unwrap(), pool.clone()),
+        AccountAdmission::new(
+            AdmissionBudget::new(10).unwrap(),
+            pool.clone(),
+            thegn_core::calendar::Tz::UTC,
+        ),
     );
     let (from, to) = window();
     let err = b.list_events(from, to, "").await.unwrap_err();
@@ -2437,7 +2571,11 @@ async fn a_remote_feed_over_the_budget_never_advances_its_etag() {
 
     let b = ics_url::IcsUrlBackend::new(
         &acct,
-        AccountAdmission::new(AdmissionBudget::new(50).unwrap(), pool.clone()),
+        AccountAdmission::new(
+            AdmissionBudget::new(50).unwrap(),
+            pool.clone(),
+            thegn_core::calendar::Tz::UTC,
+        ),
     );
     let page = b.list_events(from, to, "").await.unwrap();
     assert_eq!(page.events().len(), 50);
@@ -2461,7 +2599,11 @@ async fn a_saturated_global_budget_refuses_before_any_request() {
             allow_private_network: true,
             ..account("r", provider)
         };
-        let admission = AccountAdmission::new(AdmissionBudget::default(), pool.clone());
+        let admission = AccountAdmission::new(
+            AdmissionBudget::default(),
+            pool.clone(),
+            thegn_core::calendar::Tz::UTC,
+        );
         let backend: Box<dyn CalendarBackend> = match provider {
             CalendarProviderKind::IcsUrl => Box::new(ics_url::IcsUrlBackend::new(&acct, admission)),
             _ => Box::new(caldav::CalDavBackend::new(&acct, admission)),
@@ -2496,12 +2638,14 @@ fn multistatus(events: usize, deletions: usize) -> String {
 }
 
 #[tokio::test]
-async fn caldav_events_and_deletions_share_the_budget() {
-    use thegn_core::calendar::AdmissionLimit;
-    let (address, _hits, server) = serve_fixed(
-        axum::http::StatusCode::MULTI_STATUS,
-        "application/xml",
+async fn caldav_over_budget_delta_falls_back_to_one_snapshot_query() {
+    let zone = thegn_core::calendar::Tz::UTC;
+    // A real calendar-query contains current resources, never delta tombstones.
+    // The first response proves deletions make the sync delta exceed its budget;
+    // the fallback snapshot is the authoritative current state.
+    let (address, requests, server) = serve_caldav_delta_then_snapshot(
         multistatus(2, 3),
+        multistatus(2, 0).replace("<d:sync-token>tok-next</d:sync-token>", ""),
     )
     .await;
     let acct = CalendarAccount {
@@ -2510,31 +2654,37 @@ async fn caldav_events_and_deletions_share_the_budget() {
         ..account("dav", CalendarProviderKind::CalDav)
     };
     let (from, to) = window();
-    let err = caldav::CalDavBackend::new(&acct, budget_of(4))
-        .list_events(from, to, &caldav::scope_token(&[], "tok-prev"))
-        .await
-        .unwrap_err();
-    assert!(
-        is_admission(&err, AdmissionLimit::AccountRecords),
-        "{err:?}"
+    let backend = caldav::CalDavBackend::new(
+        &acct,
+        AccountAdmission::isolated(AdmissionBudget::new(4).unwrap(), zone),
     );
-    let page = caldav::CalDavBackend::new(&acct, budget_of(5))
-        .list_events(from, to, &caldav::scope_token(&[], "tok-prev"))
-        .await
-        .unwrap();
+    let cursor = backend.stored_cursor_for_test("tok-prev");
+    let page = backend.list_events(from, to, &cursor).await.unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].0, "REPORT");
+    assert!(requests[0].1.contains("<d:sync-collection"));
+    assert!(
+        requests[0]
+            .1
+            .contains("<d:sync-token>tok-prev</d:sync-token>")
+    );
+    assert_eq!(requests[1].0, "REPORT");
+    assert!(requests[1].1.contains("<c:calendar-query"));
+    assert_eq!(page.mode(), PageMode::Snapshot);
     assert_eq!(page.events().len(), 2);
-    assert_eq!(page.deleted().len(), 3);
-    assert_eq!(page.sync_token(), caldav::scope_token(&[], "tok-next"));
+    assert!(page.deleted().is_empty());
+    assert!(page.sync_token().is_empty());
+    drop(requests);
     server.abort();
 }
 
 #[tokio::test]
-async fn caldav_many_deletions_are_refused_at_the_cap() {
-    use thegn_core::calendar::AdmissionLimit;
-    let (address, _hits, server) = serve_fixed(
-        axum::http::StatusCode::MULTI_STATUS,
-        "application/xml",
+async fn caldav_many_deletions_trigger_snapshot_fallback() {
+    let zone = thegn_core::calendar::Tz::UTC;
+    let (address, requests, server) = serve_caldav_delta_then_snapshot(
         multistatus(0, 5_000),
+        multistatus(0, 0).replace("<d:sync-token>tok-next</d:sync-token>", ""),
     )
     .await;
     let acct = CalendarAccount {
@@ -2543,14 +2693,26 @@ async fn caldav_many_deletions_are_refused_at_the_cap() {
         ..account("dav", CalendarProviderKind::CalDav)
     };
     let (from, to) = window();
-    let err = caldav::CalDavBackend::new(&acct, budget_of(100))
-        .list_events(from, to, &caldav::scope_token(&[], "tok-prev"))
-        .await
-        .unwrap_err();
-    assert!(
-        is_admission(&err, AdmissionLimit::AccountRecords),
-        "{err:?}"
+    let backend = caldav::CalDavBackend::new(
+        &acct,
+        AccountAdmission::isolated(AdmissionBudget::new(100).unwrap(), zone),
     );
+    let cursor = backend.stored_cursor_for_test("tok-prev");
+    let page = backend.list_events(from, to, &cursor).await.unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].0, "REPORT");
+    assert!(requests[0].1.contains("<d:sync-collection"));
+    assert!(
+        requests[0]
+            .1
+            .contains("<d:sync-token>tok-prev</d:sync-token>")
+    );
+    assert_eq!(requests[1].0, "REPORT");
+    assert!(requests[1].1.contains("<c:calendar-query"));
+    assert_eq!(page.mode(), PageMode::Snapshot);
+    assert!(page.deleted().is_empty());
+    drop(requests);
     server.abort();
 }
 
@@ -2607,7 +2769,7 @@ fn the_plugin_sees_the_real_budget() {
         r#"echo "{\"method\":\"events\",\"params\":{\"sync_token\":\"$THEGN_CAL_MAX_EVENTS\"}}""#,
     )
     .unwrap();
-    assert_eq!(page.sync_token(), "7");
+    assert_eq!(page.sync_token(), ics_url::stored_cursor("UTC", "7"));
 }
 
 #[test]
@@ -2685,10 +2847,11 @@ fn an_over_budget_plugin_delta_falls_back_to_a_full_fetch() {
     );
     let b = command::CommandBackend::new(&command_account(&script), budget_of(3));
     let (from, to) = window();
-    let page = block_on(b.list_events(from, to, "t1")).unwrap();
+    let page = block_on(b.list_events(from, to, &ics_url::stored_cursor("UTC", "t1"))).unwrap();
     assert_eq!(page.events().len(), 1);
     assert!(page.deleted().is_empty());
-    assert_eq!(page.sync_token(), "full");
+    assert_eq!(page.sync_token(), ics_url::stored_cursor("UTC", "full"));
+    assert_eq!(page.mode(), PageMode::Snapshot);
 }
 
 #[tokio::test]
@@ -2732,11 +2895,15 @@ async fn an_over_budget_caldav_delta_falls_back_to_a_full_fetch() {
     let pool = AdmissionPool::new(1_000, 128 << 20);
     let backend = caldav::CalDavBackend::new(
         &acct,
-        AccountAdmission::new(AdmissionBudget::new(10).unwrap(), pool.clone()),
+        AccountAdmission::new(
+            AdmissionBudget::new(10).unwrap(),
+            pool.clone(),
+            thegn_core::calendar::Tz::UTC,
+        ),
     );
     let (from, to) = window();
     let page = backend
-        .list_events(from, to, &caldav::scope_token(&[], "tok-prev"))
+        .list_events(from, to, &caldav::scope_token(&[], "UTC", "tok-prev"))
         .await
         .unwrap();
     assert_eq!(
@@ -2791,11 +2958,15 @@ async fn caldav_token_recovery_releases_every_reservation() {
     let pool = AdmissionPool::new(1_000, 128 << 20);
     let backend = caldav::CalDavBackend::new(
         &acct,
-        AccountAdmission::new(AdmissionBudget::default(), pool.clone()),
+        AccountAdmission::new(
+            AdmissionBudget::default(),
+            pool.clone(),
+            thegn_core::calendar::Tz::UTC,
+        ),
     );
     let (from, to) = window();
     let page = backend
-        .list_events(from, to, &caldav::scope_token(&[], "expired"))
+        .list_events(from, to, &caldav::scope_token(&[], "UTC", "expired"))
         .await
         .unwrap();
     assert_eq!(page.events().len(), 3);
@@ -2847,4 +3018,298 @@ fn caldav_unescaping_is_single_pass_and_sized_before_it_runs() {
         "x".repeat(crate::http::MAX_REQUEST_BYTES)
     );
     assert!(caldav::parse_multistatus(&huge).0.is_empty());
+}
+
+// --- home zone reaches every backend (THE-464) ------------------------------
+
+const FLOATING_AND_EXPLICIT: &str = "\
+BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:float
+SUMMARY:Floating
+DTSTART:20260821T093000
+DTEND:20260821T103000
+END:VEVENT
+BEGIN:VEVENT
+UID:utc
+SUMMARY:Explicit UTC
+DTSTART:20260821T093000Z
+DTEND:20260821T103000Z
+END:VEVENT
+BEGIN:VEVENT
+UID:tzid
+SUMMARY:Explicit TZID
+DTSTART;TZID=America/New_York:20260821T093000
+DTEND;TZID=America/New_York:20260821T103000
+END:VEVENT
+END:VCALENDAR";
+
+fn start_zone_of(page: &EventPage, uid: &str) -> Option<String> {
+    let e = page.events().iter().find(|e| e.title == uid)?;
+    match &e.start {
+        thegn_core::calendar::EventTime::Zoned { zone, .. } => Some(zone.as_str().to_string()),
+        // A trailing `Z` parses to an absolute instant, which no zone touches.
+        thegn_core::calendar::EventTime::Instant { .. } => Some("UTC".to_string()),
+        _ => None,
+    }
+}
+
+#[test]
+fn the_router_anchors_floating_times_to_the_configured_home_zone() {
+    let t = Tmp::new("home-zone");
+    std::fs::write(t.0.join("a.ics"), FLOATING_AND_EXPLICIT).unwrap();
+    for zone in ["Asia/Kolkata", "America/Los_Angeles", "Pacific/Auckland"] {
+        let cfg = CalendarConfig {
+            home_zone: zone.into(),
+            accounts: vec![CalendarAccount {
+                path: t.0.join("a.ics").display().to_string(),
+                ..account("a", CalendarProviderKind::Ics)
+            }],
+            ..CalendarConfig::default()
+        };
+        let (from, to) = window();
+        let results = block_on(router(&cfg).list_events(from, to, &BTreeMap::new()));
+        let page = results[0].result.as_ref().unwrap();
+        assert_eq!(start_zone_of(page, "Floating").as_deref(), Some(zone));
+        // Explicit zones are never rewritten by the home zone.
+        assert_eq!(start_zone_of(page, "Explicit UTC").as_deref(), Some("UTC"));
+        assert_eq!(
+            start_zone_of(page, "Explicit TZID").as_deref(),
+            Some("America/New_York")
+        );
+    }
+}
+
+#[tokio::test]
+async fn changing_home_zone_discards_the_ics_cursor_and_reanchors_cached_floating_events() {
+    use axum::{http::HeaderMap, response::IntoResponse};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let validators = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let seen = validators.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().fallback(axum::routing::any(move |headers: HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(
+                        headers
+                            .get(axum::http::header::IF_NONE_MATCH)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned),
+                    );
+                    (
+                        axum::http::StatusCode::OK,
+                        [("content-type", "text/calendar"), ("etag", "rev-1")],
+                        FLOATING_AND_EXPLICIT,
+                    )
+                        .into_response()
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+
+    let acct = CalendarAccount {
+        url: format!("http://{address}/feed.ics"),
+        allow_private_network: true,
+        ..account("feed", CalendarProviderKind::IcsUrl)
+    };
+    let (from, to) = window();
+    let make_cfg = |zone: &str| CalendarConfig {
+        home_zone: zone.into(),
+        accounts: vec![acct.clone()],
+        ..CalendarConfig::default()
+    };
+    let first = router(&make_cfg("Asia/Kolkata"));
+    let one = first.list_events(from, to, &BTreeMap::new()).await;
+    let page = one[0].result.as_ref().unwrap();
+    let token = page.sync_token().to_owned();
+    assert_eq!(page.mode(), PageMode::Snapshot);
+    assert_eq!(
+        start_zone_of(page, "Floating").as_deref(),
+        Some("Asia/Kolkata")
+    );
+
+    let second = router(&make_cfg("America/Los_Angeles"));
+    let two = second
+        .list_events(from, to, &BTreeMap::from([("feed".to_string(), token)]))
+        .await;
+    let page = two[0].result.as_ref().unwrap();
+    assert_eq!(page.mode(), PageMode::Snapshot);
+    assert_eq!(
+        start_zone_of(page, "Floating").as_deref(),
+        Some("America/Los_Angeles")
+    );
+    assert_eq!(*validators.lock().unwrap(), vec![None, None]);
+    server.abort();
+}
+
+#[test]
+fn every_backend_is_built_with_the_zone_it_was_given() {
+    let kolkata = AccountAdmission::isolated(
+        AdmissionBudget::default(),
+        thegn_core::calendar::Tz::Asia__Kolkata,
+    );
+    assert_eq!(kolkata.zone(), thegn_core::calendar::Tz::Asia__Kolkata);
+    // The plugin sees the same zone in its environment.
+    let b = command::CommandBackend::new(&command_account("true"), kolkata);
+    let (from, to) = window();
+    let env = b.query_env(from, to, "");
+    assert_eq!(env["THEGN_CAL_HOME_ZONE"], "Asia/Kolkata");
+}
+
+// --- page mode is independent of the returned cursor (THE-452) --------------
+
+fn caldav_acct(address: std::net::SocketAddr) -> CalendarAccount {
+    CalendarAccount {
+        url: format!("http://{address}/cal/"),
+        allow_private_network: true,
+        ..account("dav", CalendarProviderKind::CalDav)
+    }
+}
+
+#[tokio::test]
+async fn a_full_caldav_snapshot_that_returns_a_token_is_still_a_snapshot() {
+    let (address, _hits, server) = serve_fixed(
+        axum::http::StatusCode::MULTI_STATUS,
+        "application/xml",
+        multistatus(2, 1),
+    )
+    .await;
+    let (from, to) = window();
+    let page = caldav::CalDavBackend::new(&caldav_acct(address), adm())
+        .list_events(from, to, "")
+        .await
+        .unwrap();
+    assert_eq!(page.mode(), PageMode::Snapshot);
+    assert_eq!(
+        page.sync_token(),
+        caldav::scope_token(&[], "UTC", "tok-next")
+    );
+    assert!(
+        page.deleted().is_empty(),
+        "a snapshot carries no tombstones"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_caldav_delta_without_a_next_token_stays_a_delta() {
+    let body = multistatus(1, 2).replace("<d:sync-token>tok-next</d:sync-token>", "");
+    let (address, _hits, server) = serve_fixed(
+        axum::http::StatusCode::MULTI_STATUS,
+        "application/xml",
+        body,
+    )
+    .await;
+    let (from, to) = window();
+    let page = caldav::CalDavBackend::new(&caldav_acct(address), adm())
+        .list_events(from, to, &caldav::scope_token(&[], "UTC", "tok-prev"))
+        .await
+        .unwrap();
+    assert_eq!(page.mode(), PageMode::Delta);
+    assert!(page.sync_token().is_empty());
+    assert_eq!(page.deleted().len(), 2);
+    server.abort();
+}
+
+#[test]
+fn page_construction_rejects_contradictory_modes() {
+    let ev = |mode, deleted: Vec<String>| EventPage::try_new(mode, vec![], deleted, "t", &adm());
+    assert!(ev(PageMode::Delta, vec!["a".into()]).is_ok());
+    assert!(ev(PageMode::Snapshot, vec!["a".into()]).is_err());
+    assert!(ev(PageMode::Reset, vec!["a".into()]).is_err());
+    assert!(ev(PageMode::Unchanged, vec![]).is_err());
+    assert!(EventPage::unchanged("t").is_unchanged());
+}
+
+#[test]
+fn a_plugin_declares_its_page_mode() {
+    // A snapshot may carry a cursor; the request had one, and the mode still wins.
+    let run = |script: &str, token: &str| {
+        let b = command::CommandBackend::new(&command_account(script), adm());
+        let (from, to) = window();
+        block_on(b.list_events(from, to, &ics_url::stored_cursor("UTC", token)))
+    };
+    let snap = run(
+        r#"echo '{"method":"events","params":{"mode":"snapshot","sync_token":"c2"}}'"#,
+        "c1",
+    )
+    .unwrap();
+    assert_eq!(
+        (snap.mode(), snap.sync_token()),
+        (
+            PageMode::Snapshot,
+            ics_url::stored_cursor("UTC", "c2").as_str()
+        )
+    );
+    let delta = run(
+        r#"echo '{"method":"events","params":{"mode":"delta"}}'"#,
+        "c1",
+    )
+    .unwrap();
+    assert_eq!(delta.mode(), PageMode::Delta);
+    assert!(delta.sync_token().is_empty());
+    let reset = run(
+        r#"echo '{"method":"events","params":{"mode":"reset"}}'"#,
+        "c1",
+    )
+    .unwrap();
+    assert_eq!(reset.mode(), PageMode::Reset);
+    let same = run(
+        r#"echo '{"method":"events","params":{"mode":"unchanged"}}'"#,
+        "c1",
+    )
+    .unwrap();
+    assert!(same.is_unchanged());
+    assert_eq!(
+        same.sync_token(),
+        ics_url::stored_cursor("UTC", "c1"),
+        "the request cursor is kept"
+    );
+    // Contradictions fail closed instead of guessing.
+    assert!(
+        run(
+            r#"echo '{"method":"events","params":{"mode":"delta"}}'"#,
+            ""
+        )
+        .is_err()
+    );
+    assert!(
+        run(
+            r#"echo '{"method":"events","params":{"mode":"unchanged"}}'"#,
+            ""
+        )
+        .is_err()
+    );
+    assert!(
+        run(
+            r#"echo '{"method":"events","params":{"mode":"bogus"}}'"#,
+            "c1"
+        )
+        .is_err()
+    );
+    assert!(
+        run(
+            r#"echo '{"method":"events","params":{"mode":"snapshot","deleted":["a"]}}'"#,
+            "c1"
+        )
+        .is_err()
+    );
+    // A plugin that predates `mode` keeps the old reading.
+    let legacy = run(
+        r#"echo '{"method":"events","params":{"sync_token":"t"}}'"#,
+        "",
+    )
+    .unwrap();
+    assert_eq!(legacy.mode(), PageMode::Snapshot);
+    let legacy = run(
+        r#"echo '{"method":"events","params":{"sync_token":"t"}}'"#,
+        "c1",
+    )
+    .unwrap();
+    assert_eq!(legacy.mode(), PageMode::Delta);
 }

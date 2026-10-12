@@ -11,6 +11,40 @@ use std::sync::Arc;
 
 use super::{CalEvent, GapPolicy};
 
+/// The longest reminder lead that can fire: 28 days, in minutes.
+///
+/// A bounded horizon keeps the periodic check bounded — the host only widens
+/// its candidate scan as far as the leads actually in play, and never past this.
+/// Configured and imported leads beyond it are refused (`validate_calendar`) or
+/// ignored by [`due`], never silently half-honoured.
+pub const MAX_LEAD_MINS: u32 = 28 * 24 * 60;
+
+/// The longest supported lead any of `events` (or, for an event with none of its
+/// own, `default_reminders`) asks for, in minutes. Leads over [`MAX_LEAD_MINS`]
+/// are excluded because [`due`] ignores them: the scan only has to reach as far
+/// as a reminder that can actually fire.
+pub fn max_lead_mins(events: &[CalEvent], default_reminders: &[super::Reminder]) -> u32 {
+    let longest = |rs: &[super::Reminder]| {
+        rs.iter()
+            .map(|r| r.minutes_before)
+            .filter(|m| *m <= MAX_LEAD_MINS)
+            .max()
+            .unwrap_or(0)
+    };
+    let defaults = longest(default_reminders);
+    events
+        .iter()
+        .map(|e| {
+            if e.reminders.is_empty() {
+                defaults
+            } else {
+                longest(&e.reminders)
+            }
+        })
+        .max()
+        .unwrap_or(defaults)
+}
+
 /// A reminder that should fire now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueReminder {
@@ -115,6 +149,12 @@ where
             &e.reminders[..]
         };
         for r in reminders {
+            // Beyond the supported horizon the host never even loads the
+            // occurrence, so honouring it only when it happens to be cached
+            // would make it fire intermittently.
+            if r.minutes_before > MAX_LEAD_MINS {
+                continue;
+            }
             let trigger = start_ms.saturating_sub(i64::from(r.minutes_before) * 60_000);
             if trigger > since && trigger <= now_ms {
                 out.push(DueReminder {

@@ -86,7 +86,7 @@ fn a_one_mib_events_line_is_walked_not_materialized() {
             command: vec!["sh".into(), "-c".into(), script],
             ..Default::default()
         },
-        AccountAdmission::isolated(AdmissionBudget::default()),
+        AccountAdmission::isolated(AdmissionBudget::default(), thegn_core::calendar::Tz::UTC),
     )
     .expect("command account builds a backend");
     let from = chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();

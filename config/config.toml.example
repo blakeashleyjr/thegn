@@ -369,6 +369,7 @@ horizon_past_days = 90      # how far back to fetch and keep
 horizon_future_days = 365   # how far ahead to fetch
 reminders_enabled = true    # raise notifications ahead of events
 # Reminder offsets (minutes before start) for events whose source supplies none.
+# At most 40320 (28 days); a larger lead could never fire and fails validation.
 # Delivery is the ordinary notification path, so [[notifications.rules]] can
 # route, mute, or re-prioritize kind = "calendar_reminder" like anything else.
 reminder_default_mins = [10]

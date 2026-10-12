@@ -265,3 +265,51 @@ fn next_event_skips_the_past_and_the_cancelled() {
     assert!(next_event(&events, UTC, late).is_none());
     assert!(next_event(&[], UTC, now).is_none());
 }
+
+#[test]
+fn a_week_long_lead_fires_when_its_trigger_is_in_the_window() {
+    let week = 7 * 24 * 60;
+    let events = [ev("trip", 9, 30, &[week])];
+    // Trigger is 2026-08-14 09:30, a week before the event.
+    let hit = due(
+        &events,
+        UTC,
+        &[],
+        at(2026, 8, 14, 9, 29),
+        at(2026, 8, 14, 9, 31),
+    );
+    assert_eq!(hit.len(), 1);
+    assert_eq!(hit[0].trigger_mins, week);
+}
+
+#[test]
+fn a_lead_past_the_horizon_never_fires() {
+    let over = MAX_LEAD_MINS + 1;
+    let events = [ev("far", 9, 30, &[over])];
+    let trigger = at(2026, 8, 21, 9, 30) - i64::from(over) * 60_000;
+    assert!(due(&events, UTC, &[], trigger - 60_000, trigger + 60_000).is_empty());
+    // The boundary itself is supported.
+    let events = [ev("edge", 9, 30, &[MAX_LEAD_MINS])];
+    let trigger = at(2026, 8, 21, 9, 30) - i64::from(MAX_LEAD_MINS) * 60_000;
+    assert_eq!(
+        due(&events, UTC, &[], trigger - 60_000, trigger + 60_000).len(),
+        1
+    );
+}
+
+#[test]
+fn the_scan_reaches_exactly_as_far_as_the_longest_supported_lead() {
+    let ten = [Reminder { minutes_before: 10 }];
+    assert_eq!(max_lead_mins(&[], &ten), 10);
+    assert_eq!(max_lead_mins(&[], &[]), 0);
+    // An event with its own reminders ignores the defaults.
+    let own = ev("own", 9, 0, &[60]);
+    assert_eq!(max_lead_mins(&[own], &ten), 60);
+    // An event with none uses them.
+    let plain = ev("plain", 9, 0, &[]);
+    assert_eq!(max_lead_mins(&[plain], &ten), 10);
+    // The longest across events wins; unsupported leads do not widen the scan.
+    let week = ev("week", 9, 0, &[7 * 24 * 60]);
+    let huge = ev("huge", 9, 0, &[MAX_LEAD_MINS + 1]);
+    assert_eq!(max_lead_mins(&[week, huge], &ten), 7 * 24 * 60);
+}
