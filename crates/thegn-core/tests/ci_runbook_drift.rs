@@ -6,7 +6,7 @@ use serde_yaml::Value;
 const RUNNER_EXPRESSION: &str = "${{ fromJSON(vars.CI_RUNS_ON || '[\"ubuntu-latest\"]') }}";
 
 fn mapping_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
-    value.as_mapping()?.get(&Value::String(key.to_string()))
+    value.as_mapping()?.get(Value::String(key.to_string()))
 }
 
 fn normalized(text: &str) -> String {
@@ -29,7 +29,7 @@ fn self_hosted_ci_runbook_matches_workflow_policy() {
     // YAML 1.1 parsers may resolve the unquoted GitHub Actions key `on` as a
     // boolean. Accept either representation while still inspecting parsed YAML.
     let triggers =
-        mapping_value(&workflow, "on").or_else(|| workflow.as_mapping()?.get(&Value::Bool(true)));
+        mapping_value(&workflow, "on").or_else(|| workflow.as_mapping()?.get(Value::Bool(true)));
     let triggers = triggers.expect("workflow must declare an `on` mapping");
     let trigger_names: Vec<&str> = triggers
         .as_mapping()
