@@ -269,6 +269,7 @@ fn stderr_wait_after_input(
     }
 }
 
+#[cfg(test)]
 fn redact_stderr(mut stderr: String, secrets: &[String]) -> String {
     for secret in secrets {
         if secret.len() >= 8 {
