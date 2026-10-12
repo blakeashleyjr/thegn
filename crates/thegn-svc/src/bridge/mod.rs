@@ -2109,10 +2109,7 @@ mod tests {
         let mut pid = None;
         while pid.is_none() && start.elapsed() < Duration::from_secs(3) {
             pid = match std::fs::read_to_string(&marker) {
-                Ok(contents) => match contents.trim().parse::<i32>() {
-                    Ok(pid) => Some(pid),
-                    Err(_) => None,
-                },
+                Ok(contents) => contents.trim().parse::<i32>().ok(),
                 Err(_) => None,
             };
             if pid.is_some() {
