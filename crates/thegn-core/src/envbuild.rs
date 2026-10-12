@@ -29,9 +29,11 @@ const MAX_PROVIDER_ID: usize = 50;
 ///
 /// An **empty** id uses the conflict-free default `"{repo}-{worktree}-{hash}"`.
 /// A configured id with no token is returned as-is (a static, shared sandbox —
-/// back-compat). The result is dash-collapsed and constrained to a DNS-safe
-/// length. Long valid expansions preserve the path-hash suffix; invalid
-/// expansions are slugged with a short hash of the expanded value. The id flows
+/// back-compat) when it is a valid DNS name. Previously accepted literals with
+/// `_` or other non-DNS characters now resolve to a different provider id.
+/// The result is dash-collapsed and constrained to a DNS-safe length. Long
+/// valid expansions preserve the path-hash suffix; invalid expansions are
+/// slugged with a short hash of the expanded value. The id flows
 /// into `ProviderPlacement.id` + `{id}` command templates,
 /// so it MUST be derived identically everywhere — all callers resolve it through
 /// this one function (the host reads `ProviderPlacement.id` rather than
@@ -337,6 +339,7 @@ mod tests {
             "../x".to_string(),
             "a\0b".to_string(),
             "{worktree}/../x".to_string(),
+            "my_sprite".to_string(),
             "é".repeat(40),
         ];
         for input in inputs {

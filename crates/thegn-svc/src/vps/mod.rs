@@ -1192,7 +1192,7 @@ mod tests {
 
     #[test]
     fn malformed_shutdown_poll_is_not_treated_as_stopped() {
-        let parsed_running = hetzner::HetznerShaper.parse_get(&serde_json::json!({}));
+        let parsed_running = hetzner::parse_get(&serde_json::json!({}));
         assert!(!poll_stopped(parsed_running.map(|server| server.running)));
     }
 

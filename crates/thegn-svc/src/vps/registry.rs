@@ -195,16 +195,14 @@ mod tests {
         let d = tmp.path().join("registry");
         std::fs::create_dir_all(d.join("a")).unwrap();
         let absolute = tmp.path().join("absolute");
+        let absolute_json = absolute.with_extension("json");
         let parent = tmp.path().join("x.json");
-        std::fs::write(&absolute.with_extension("json"), b"untouched").unwrap();
+        std::fs::write(absolute_json.as_path(), b"untouched").unwrap();
         std::fs::write(&parent, b"untouched").unwrap();
         for name in [absolute.to_str().unwrap(), "../x", "a/b", "", "."] {
             assert!(write_at(&d, &rec(name, "creating")).is_err(), "{name:?}");
         }
-        assert_eq!(
-            std::fs::read(absolute.with_extension("json")).unwrap(),
-            b"untouched"
-        );
+        assert_eq!(std::fs::read(absolute_json).unwrap(), b"untouched");
         assert_eq!(std::fs::read(parent).unwrap(), b"untouched");
         assert!(std::fs::read_dir(d).unwrap().all(|entry| {
             let entry = entry.unwrap();
