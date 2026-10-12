@@ -431,13 +431,31 @@ fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Opt
 
 /// Run the one real merge while retaining only a bounded tail from each pipe.
 /// Reader workers drain the complete pipes so a verbose driver cannot block Git.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "waits for the merge child off the event loop"
-)]
 fn run_driver_merge(
     dir: &Path,
     args: &[&str],
+) -> std::io::Result<(std::process::ExitStatus, String, String)> {
+    use std::process::Stdio;
+
+    let mut command = util::git_cmd(dir);
+    command
+        .args(args)
+        // `git -C` changes Git's repository context but leaves the process
+        // working directory unchanged. Merge drivers inherit that directory,
+        // so pin it to the scratch worktree to contain relative side effects.
+        .current_dir(dir)
+        .stdin(Stdio::null());
+    run_bounded_output(&mut command)
+}
+
+/// Run a subprocess with null stdin and retain only a 4 KiB tail from each
+/// output stream while draining both pipes completely.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "waits for the child off the event loop"
+)]
+fn run_bounded_output(
+    command: &mut std::process::Command,
 ) -> std::io::Result<(std::process::ExitStatus, String, String)> {
     use std::io::Read;
     use std::process::Stdio;
@@ -464,18 +482,15 @@ fn run_driver_merge(
         })
     }
 
-    let mut child = util::git_cmd(dir)
-        .args(args)
-        // `git -C` changes Git's repository context but leaves the process
-        // working directory unchanged. Merge drivers inherit that directory,
-        // so pin it to the scratch worktree to contain relative side effects.
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let stdout = reader(child.stdout.take().expect("piped merge stdout"));
-    let stderr = reader(child.stderr.take().expect("piped merge stderr"));
+    // This helper owns both output pipes. Set them here, beside the takes,
+    // so no caller can spawn a child whose missing stream would return early
+    // without reaping it.
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().expect("piped child stdout");
+    let stderr = child.stderr.take().expect("piped child stderr");
+    let stdout = reader(stdout);
+    let stderr = reader(stderr);
     let status = child.wait()?;
     let stdout = stdout
         .join()
@@ -528,12 +543,44 @@ fn regenerate_merge(
     }
     let tree = (|| -> Option<String> {
         scratch.verify().ok()?;
-        // Merge theirs in (conflicts on the lockfiles are expected → ignore the
-        // exit status; we resolve them next).
-        util::git_cmd(&tmp)
-            .args(["merge", "--no-commit", "--no-ff", theirs])
-            .output()
-            .ok()?;
+        // Regeneration only applies to an actual conflicted merge. A clean
+        // merge or an infrastructure failure must not be mistaken for a
+        // regenerated result based on ours.
+        let args = [
+            "-c",
+            "commit.gpgSign=false",
+            "merge",
+            "--no-commit",
+            "--no-ff",
+            theirs,
+        ];
+        let (status, stdout, stderr) = match run_driver_merge(&tmp, &args) {
+            Ok(output) => output,
+            Err(error) => {
+                warn_driver_merge_failure("could not start regeneration merge", &error.to_string());
+                return None;
+            }
+        };
+        if status.code() != Some(1) {
+            let diagnostics = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+            warn_driver_merge_failure(
+                &format!(
+                    "regeneration merge did not report conflicts (status {:?})",
+                    status.code()
+                ),
+                &diagnostics,
+            );
+            return None;
+        }
+        scratch.verify().ok()?;
+        let merge_head = util::git_out_allow_empty(&tmp, &["rev-parse", "--verify", "MERGE_HEAD"]);
+        if merge_head.as_deref() != Some(theirs) {
+            warn_driver_merge_failure(
+                "regeneration merge did not establish the expected MERGE_HEAD",
+                &format!("expected {theirs}; observed {merge_head:?}"),
+            );
+            return None;
+        }
         // Take the incoming version of each regenerate path so it's a valid file
         // (not conflict-marked), then the regen command reconciles it.
         for p in conflict_paths {
@@ -557,14 +604,31 @@ fn regenerate_merge(
         let baseline_tree = util::git_out(&tmp, &["write-tree"])?;
         // Rebuild the regenerate artifacts from the merged manifests.
         scratch.verify().ok()?;
-        let ok = std::process::Command::new("sh")
+        use std::process::Stdio;
+        let mut command = std::process::Command::new("sh");
+        command
             .arg("-c")
             .arg(regenerate_command)
             .current_dir(&tmp)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
+            .stdin(Stdio::null());
+        let (status, stdout, stderr) = match run_bounded_output(&mut command) {
+            Ok(output) => output,
+            Err(error) => {
+                warn_driver_merge_failure(
+                    "could not start regeneration command",
+                    &error.to_string(),
+                );
+                return None;
+            }
+        };
+        if !status.success() {
+            warn_driver_merge_failure(
+                &format!(
+                    "regeneration command failed with status {:?}",
+                    status.code()
+                ),
+                &format!("stdout:\n{stdout}\nstderr:\n{stderr}"),
+            );
             return None;
         }
         scratch.verify().ok()?;
@@ -3552,6 +3616,53 @@ mod tests {
         git(&repo.dir, &["checkout", "-q", "main"]);
         repo.commit("Cargo.lock", "mainline\n", "main lock"); // diverge the lockfile
         repo
+    }
+
+    #[test]
+    fn bounded_output_owns_and_captures_both_pipes() {
+        use std::process::Stdio;
+
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", "printf stdout-marker; printf stderr-marker >&2"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let result = run_bounded_output(&mut command);
+        assert!(result.is_ok(), "bounded output must establish both pipes");
+        let (status, stdout, stderr) = result.unwrap();
+        assert!(status.success());
+        assert_eq!(stdout, "stdout-marker");
+        assert_eq!(stderr, "stderr-marker");
+    }
+
+    #[test]
+    fn regeneration_rejects_an_unrelated_history_merge_and_cleans_up() {
+        let repo = Repo::new("regen-unrelated");
+        repo.commit("Cargo.lock", "main lock\n", "main lock");
+        let main_oid = repo.out(&["rev-parse", "main"]);
+
+        git(&repo.dir, &["checkout", "--orphan", "other"]);
+        repo.commit("Cargo.lock", "other lock\n", "other lock");
+        let other_oid = repo.out(&["rev-parse", "HEAD"]);
+
+        let tree = regenerate_merge(
+            &repo.dir,
+            &main_oid,
+            &other_oid,
+            &["Cargo.lock".into()],
+            "true",
+        );
+        assert!(
+            tree.is_none(),
+            "unrelated histories must not return ours' tree"
+        );
+        let worktrees = repo.out(&["worktree", "list", "--porcelain"]);
+        assert!(
+            !worktrees.contains("tg-foldregen-"),
+            "regeneration scratch worktree leaked: {worktrees}"
+        );
     }
 
     #[test]

@@ -9,6 +9,46 @@ use crate::util;
 use anyhow::Result;
 use rusqlite::OptionalExtension as _;
 
+pub const MIN_LEASE_TTL_SECS: i64 = 5;
+pub const MAX_LEASE_TTL_SECS: i64 = 86_400;
+
+/// A pipeline lease identity or lifetime violates the admission contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseInputError {
+    pub field: &'static str,
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for LeaseInputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid lease {}: {}", self.field, self.reason)
+    }
+}
+
+impl std::error::Error for LeaseInputError {}
+
+fn validate_lease_text(field: &'static str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(anyhow::Error::new(LeaseInputError {
+            field,
+            reason: "must not be empty",
+        }));
+    }
+    if value.len() > 128 {
+        return Err(anyhow::Error::new(LeaseInputError {
+            field,
+            reason: "must be at most 128 bytes",
+        }));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(anyhow::Error::new(LeaseInputError {
+            field,
+            reason: "must not contain control characters",
+        }));
+    }
+    Ok(())
+}
+
 fn encode_chunk_scope(files: &[String]) -> Result<String> {
     Ok(serde_json::json!({ "v": 1, "files": files }).to_string())
 }
@@ -102,6 +142,38 @@ impl std::fmt::Display for ParentDispatchConflict {
 impl std::error::Error for ParentDispatchConflict {}
 
 impl Db {
+    /// Validate and insert a non-claim dispatch row under one write lock.
+    pub fn put_dispatch_with_parent_check(
+        &self,
+        new: crate::issue::NewDispatch<'_>,
+    ) -> Result<i64> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<i64> {
+            if let Some(parent_id) = new.parent_id {
+                let parent_exists: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agent_dispatches WHERE id=?1)",
+                    [parent_id],
+                    |row| row.get(0),
+                )?;
+                if !parent_exists {
+                    return Err(anyhow::Error::new(ParentDispatchConflict { parent_id }));
+                }
+            }
+            self.put_agent_dispatch(new)
+        })();
+        match result {
+            Ok(id) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(id)
+            }
+            Err(err) => {
+                conn.execute_batch("ROLLBACK")?;
+                Err(err)
+            }
+        }
+    }
+
     /// The immutable file list admitted for a dispatch, if one was recorded.
     /// A malformed stored value is an error; callers must never interpret it
     /// as an empty ownership scope.
@@ -415,44 +487,87 @@ impl Db {
     ///
     /// One `INSERT … ON CONFLICT DO UPDATE … WHERE` statement, so acquisition is
     /// atomic: the `WHERE` decides, inside the write lock, whether the existing
-    /// row may be taken over. Two monitors racing therefore cannot both win.
+    /// row may be taken over. Each acquisition also deletes at most 256 expired
+    /// rows, bounding cleanup work while the expiry index avoids a table scan.
+    /// Lease names and owners are each capped at 128 bytes, so valid rows add
+    /// at most 64 KiB of identity text to one cleanup batch.
     pub fn acquire_pipeline_lease(
         &self,
         name: &str,
         owner: &str,
         ttl_secs: i64,
     ) -> Result<std::result::Result<(), String>> {
-        let now = util::now_ms();
-        let expires = now.saturating_add(ttl_secs.saturating_mul(1000));
-        let changed = self.conn().execute(
-            "INSERT INTO pipeline_leases (name, owner, acquired_at_ms, expires_at_ms)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(name) DO UPDATE SET
-               owner=excluded.owner,
-               acquired_at_ms=excluded.acquired_at_ms,
-               expires_at_ms=excluded.expires_at_ms
-             WHERE pipeline_leases.owner = excluded.owner
-                OR pipeline_leases.expires_at_ms <= ?3",
-            rusqlite::params![name, owner, now, expires],
-        )?;
-        if changed > 0 {
-            return Ok(Ok(()));
+        validate_lease_text("name", name)?;
+        validate_lease_text("owner", owner)?;
+        if !(MIN_LEASE_TTL_SECS..=MAX_LEASE_TTL_SECS).contains(&ttl_secs) {
+            return Err(anyhow::Error::new(LeaseInputError {
+                field: "ttl",
+                reason: "outside the admitted lease TTL range",
+            }));
         }
-        // The upsert was refused, so someone else holds a live lease.
-        let holder: String = self
-            .conn()
-            .query_row(
-                "SELECT owner FROM pipeline_leases WHERE name=?1",
-                rusqlite::params![name],
-                |r| r.get(0),
-            )
-            .unwrap_or_else(|_| "<unknown>".into());
-        Ok(Err(holder))
+        let now = util::now_ms();
+        let expires = ttl_secs
+            .checked_mul(1000)
+            .and_then(|ttl_ms| now.checked_add(ttl_ms))
+            .ok_or_else(|| {
+                anyhow::Error::new(LeaseInputError {
+                    field: "ttl",
+                    reason: "expiry is outside the supported timestamp range",
+                })
+            })?;
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<std::result::Result<(), String>> {
+            conn.execute(
+                "DELETE FROM pipeline_leases
+                 WHERE rowid IN (
+                   SELECT rowid FROM pipeline_leases
+                   WHERE expires_at_ms <= ?1 AND name <> ?2
+                   ORDER BY expires_at_ms LIMIT 256
+                 )",
+                rusqlite::params![now, name],
+            )?;
+            let changed = conn.execute(
+                "INSERT INTO pipeline_leases (name, owner, acquired_at_ms, expires_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(name) DO UPDATE SET
+                   owner=excluded.owner,
+                   acquired_at_ms=excluded.acquired_at_ms,
+                   expires_at_ms=excluded.expires_at_ms
+                 WHERE pipeline_leases.owner = excluded.owner
+                    OR pipeline_leases.expires_at_ms <= ?3",
+                rusqlite::params![name, owner, now, expires],
+            )?;
+            if changed > 0 {
+                return Ok(Ok(()));
+            }
+            let holder = conn
+                .query_row(
+                    "SELECT owner FROM pipeline_leases WHERE name=?1",
+                    [name],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| anyhow::anyhow!("lease row disappeared during acquisition"))?;
+            Ok(Err(holder))
+        })();
+        match result {
+            Ok(outcome) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(outcome)
+            }
+            Err(err) => {
+                conn.execute_batch("ROLLBACK")?;
+                Err(err)
+            }
+        }
     }
 
     /// Release a lease this owner holds. A no-op when someone else holds it —
     /// releasing another process's lease is never correct.
     pub fn release_pipeline_lease(&self, name: &str, owner: &str) -> Result<bool> {
+        validate_lease_text("name", name)?;
+        validate_lease_text("owner", owner)?;
         let n = self.conn().execute(
             "DELETE FROM pipeline_leases WHERE name=?1 AND owner=?2",
             rusqlite::params![name, owner],
@@ -463,6 +578,7 @@ impl Db {
     /// The current holder of a lease and its remaining life in ms, if it is
     /// live. An expired lease reads as `None` — it is nobody's.
     pub fn pipeline_lease_holder(&self, name: &str) -> Result<Option<(String, i64)>> {
+        validate_lease_text("name", name)?;
         let now = util::now_ms();
         // `.optional()` (not `.ok()`): "no such lease" is a legitimate answer,
         // but a genuine query failure must propagate rather than read as free.
@@ -1145,6 +1261,97 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let db = Db::open_at(&dir.path().join("thegn.db")).unwrap();
         (db, dir)
+    }
+
+    #[test]
+    fn lease_admission_rejects_invalid_identity_and_ttl_before_writing() {
+        let db = Db::open_memory().unwrap();
+        for ttl in [
+            MIN_LEASE_TTL_SECS - 1,
+            0,
+            -1,
+            i64::MAX,
+            MAX_LEASE_TTL_SECS + 1,
+        ] {
+            let err = db
+                .acquire_pipeline_lease("valid", "owner", ttl)
+                .unwrap_err();
+            assert!(err.downcast_ref::<LeaseInputError>().is_some());
+        }
+        let oversized_name = "é".repeat(65);
+        let oversized_owner = "界".repeat(44);
+        for (name, owner) in [
+            ("", "owner"),
+            ("valid", "  "),
+            (oversized_name.as_str(), "owner"),
+            ("valid", oversized_owner.as_str()),
+            ("bad\nname", "owner"),
+            ("valid", "bad\towner"),
+        ] {
+            let err = db
+                .acquire_pipeline_lease(name, owner, MIN_LEASE_TTL_SECS)
+                .unwrap_err();
+            assert!(err.downcast_ref::<LeaseInputError>().is_some());
+        }
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM pipeline_leases", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "invalid lease admission must not write");
+    }
+
+    #[test]
+    fn lease_acquisition_prunes_expired_foreign_rows() {
+        let db = Db::open_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO pipeline_leases (name, owner, acquired_at_ms, expires_at_ms)
+                 VALUES ('abandoned', 'old-owner', 1, 1)",
+                [],
+            )
+            .unwrap();
+        db.acquire_pipeline_lease("active", "new-owner", MIN_LEASE_TTL_SECS)
+            .unwrap()
+            .unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM pipeline_leases WHERE name='abandoned'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "expired abandoned names are pruned on acquire");
+    }
+
+    #[test]
+    fn put_dispatch_parent_check_is_atomic_and_accepts_existing_parent() {
+        let db = Db::open_memory().unwrap();
+        let mut missing = crate::issue::NewDispatch::new("linear:A-1", "/wt/child", "coder");
+        missing.parent_id = Some(4242);
+        let err = db.put_dispatch_with_parent_check(missing).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ParentDispatchConflict>(),
+            Some(&ParentDispatchConflict { parent_id: 4242 })
+        );
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM agent_dispatches", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "a missing parent must not leave a child row");
+
+        let parent = db
+            .put_agent_dispatch(crate::issue::NewDispatch::new(
+                "linear:A-1",
+                "/wt/parent",
+                "lead",
+            ))
+            .unwrap();
+        let mut child = crate::issue::NewDispatch::new("linear:A-1", "/wt/child", "coder");
+        child.parent_id = Some(parent);
+        assert!(db.put_dispatch_with_parent_check(child).is_ok());
     }
 
     fn put_row(db: &Db, issue_id: &str, wt: &str) -> i64 {

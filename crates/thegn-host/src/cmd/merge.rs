@@ -7,6 +7,7 @@
 //! The batch, fold-everything-at-once path is still `thegn integrate`.
 
 use anyhow::{Context, Result};
+use rusqlite::ErrorCode;
 use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
@@ -346,6 +347,53 @@ fn rows_for_repo(root: &Path) -> Result<Vec<thegn_core::db::MergeQueueRow>> {
     merge_driver::rows_for_repo(&db, root)
 }
 
+pub(crate) fn queue_error_kind(err: &anyhow::Error) -> (&'static str, bool) {
+    for cause in err.chain() {
+        if let Some(rusqlite::Error::SqliteFailure(code, _)) =
+            cause.downcast_ref::<rusqlite::Error>()
+        {
+            match code.code {
+                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => {
+                    return ("queue_busy", true);
+                }
+                ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => {
+                    return ("queue_corrupt", false);
+                }
+                _ => {}
+            }
+        }
+        if cause.is::<thegn_core::db::MigrationAccessError>() {
+            return ("queue_incompatible", false);
+        }
+    }
+    ("queue_unavailable", false)
+}
+
+fn queue_error_hint(err: &anyhow::Error) -> &'static str {
+    match queue_error_kind(err).0 {
+        "queue_busy" => "database busy, retry",
+        "queue_corrupt" => "database corrupt or not a SQLite database",
+        "queue_incompatible" => "database incompatible: upgrade thegn",
+        _ => "database unavailable",
+    }
+}
+
+fn queue_error_context(err: anyhow::Error) -> anyhow::Error {
+    let hint = queue_error_hint(&err);
+    err.context(format!("merge queue unavailable ({hint})"))
+}
+
+fn queue_error_json(err: &anyhow::Error) -> serde_json::Value {
+    let (kind, retryable) = queue_error_kind(err);
+    serde_json::json!({
+        "error": {
+            "kind": kind,
+            "message": err.to_string(),
+            "retryable": retryable,
+        }
+    })
+}
+
 fn list(json: bool) -> Result<()> {
     // Scope to the current repo (same membership rule as `drain`) so a shared
     // state DB holding several repos' queues doesn't leak other repos' rows into
@@ -354,12 +402,10 @@ fn list(json: bool) -> Result<()> {
     let rows = match rows_for_repo(&root) {
         Ok(rows) => rows,
         Err(error) if json => {
-            super::emit_json(&serde_json::json!({
-                "error": { "kind": "queue_unavailable", "message": error.to_string() }
-            }))?;
+            super::emit_json(&queue_error_json(&error))?;
             return Err(error.context("merge queue unreadable"));
         }
-        Err(error) => return Err(error.context("merge queue unreadable")),
+        Err(error) => return Err(queue_error_context(error)),
     };
     if json {
         return super::emit_json(&rows);
@@ -547,8 +593,8 @@ fn rm(cfg: &Config, worktree: Option<String>) -> Result<()> {
 
 fn clear(cfg: &Config) -> Result<()> {
     let root = repo_root()?;
-    let db = Db::open()?;
-    let n = crate::merge_ops::clear_repo(cfg, &db, &root)?;
+    let db = Db::open().map_err(queue_error_context)?;
+    let n = crate::merge_ops::clear_repo(cfg, &db, &root).map_err(queue_error_context)?;
     outln!("Queue cleared ({n} removed).");
     Ok(())
 }
@@ -620,22 +666,18 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
         let db = match Db::open().context("remote-target guard database unavailable") {
             Ok(db) => db,
             Err(error) if json => {
-                super::emit_json(&serde_json::json!({
-                    "error": { "kind": "queue_unavailable", "message": error.to_string() }
-                }))?;
+                super::emit_json(&queue_error_json(&error))?;
                 return Err(error);
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(queue_error_context(error)),
         };
         let guard = match crate::merge_ops::remote_target_guard(&db, &root) {
             Ok(guard) => guard,
             Err(error) if json => {
-                super::emit_json(&serde_json::json!({
-                    "error": { "kind": "queue_unavailable", "message": error.to_string() }
-                }))?;
+                super::emit_json(&queue_error_json(&error))?;
                 return Err(error);
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(queue_error_context(error)),
         };
         if let Some(msg) = guard {
             // Guard refusal: bail so the exit code is non-zero for scripting/CI.
@@ -654,12 +696,10 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     let rows = match rows_for_repo(&root) {
         Ok(rows) => rows,
         Err(error) if json => {
-            super::emit_json(&serde_json::json!({
-                "error": { "kind": "queue_unavailable", "message": error.to_string() }
-            }))?;
+            super::emit_json(&queue_error_json(&error))?;
             return Err(error.context("merge queue unreadable"));
         }
-        Err(error) => return Err(error.context("merge queue unreadable")),
+        Err(error) => return Err(queue_error_context(error)),
     };
     let items: Vec<QueueItem> = rows
         .into_iter()
@@ -1080,5 +1120,59 @@ mod routing_tests {
             thegn_core::config::MergeRemoteMode::RouteToHost,
             "credential is the authority hint only when no repo can be resolved"
         );
+    }
+}
+
+#[cfg(test)]
+mod queue_error_tests {
+    use super::queue_error_kind;
+    use std::time::Duration;
+
+    #[test]
+    fn classifies_busy_database_through_anyhow_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        let first = rusqlite::Connection::open(&path).unwrap();
+        first
+            .execute_batch("CREATE TABLE held (value INTEGER);")
+            .unwrap();
+        first.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let second = rusqlite::Connection::open(&path).unwrap();
+        second.busy_timeout(Duration::ZERO).unwrap();
+        let error = second
+            .query_row("SELECT value FROM held", [], |row| row.get::<_, i64>(0))
+            .unwrap_err();
+        let error = anyhow::Error::from(error).context("merge queue unreadable");
+        assert_eq!(queue_error_kind(&error), ("queue_busy", true));
+    }
+
+    #[test]
+    fn classifies_corrupt_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.sqlite");
+        std::fs::write(&path, b"not a sqlite database").unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let error = conn
+            .query_row("SELECT value FROM held", [], |row| row.get::<_, i64>(0))
+            .unwrap_err();
+        assert_eq!(
+            queue_error_kind(&anyhow::Error::from(error)),
+            ("queue_corrupt", false)
+        );
+    }
+
+    #[test]
+    fn classifies_incompatible_schema_access() {
+        let error = anyhow::Error::new(thegn_core::db::MigrationAccessError::NewerSchema {
+            observed: 99,
+            supported: 1,
+        });
+        assert_eq!(queue_error_kind(&error), ("queue_incompatible", false));
+    }
+
+    #[test]
+    fn unknown_database_failures_remain_unavailable() {
+        let error = anyhow::anyhow!("unspecified queue failure");
+        assert_eq!(queue_error_kind(&error), ("queue_unavailable", false));
     }
 }

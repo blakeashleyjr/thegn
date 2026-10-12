@@ -49,6 +49,7 @@ use chrono::NaiveDate;
 use futures_util::future::BoxFuture;
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use thegn_core::calendar::admission::AdmissionLimit;
+use thegn_core::calendar::validate::{EventDefect, validate_event};
 use thegn_core::calendar::{AdmissionError, AdmissionMeter, CalEvent};
 use thegn_core::config_calendar::CalendarAccount;
 use thegn_core::plugin_api::{Capability, ExtensionPoint, HostContract, PluginManifest};
@@ -70,6 +71,8 @@ struct Admitted {
     /// Set when a visitor stopped on the budget, so the serde error it had to
     /// raise to stop is reported as the admission refusal it really is.
     refusal: Option<AdmissionError>,
+    /// Set when an event decoded but failed domain validation.
+    invalid_event: Option<(usize, EventDefect)>,
 }
 
 impl Admitted {
@@ -215,6 +218,7 @@ impl<'de> Visitor<'de> for EventList<'_> {
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
         let sink = self.0;
+        let mut index = 0;
         loop {
             if !sink.meter.has_record_room() {
                 // Full: find out without allocating whether another exists.
@@ -228,10 +232,15 @@ impl<'de> Visitor<'de> for EventList<'_> {
             let Some(e) = seq.next_element::<CalEvent>()? else {
                 return Ok(());
             };
+            if let Err(defect) = validate_event(&e) {
+                sink.invalid_event = Some((index, defect));
+                return Err(<A::Error as de::Error>::custom("invalid event"));
+            }
             if let Err(a) = sink.meter.admit_materialized(&e) {
                 return Err(sink.refuse(a));
             }
             sink.events.push(e);
+            index += 1;
         }
     }
 }
@@ -281,13 +290,18 @@ impl AdmittingSink {
             .and_then(|()| de.end());
         match result {
             Ok(()) => Ok(()),
-            Err(e) => Err(match self.admitted.refusal.take() {
-                Some(a) => a.into(),
-                // Position only: a serde message can quote plugin data.
-                None => CalendarError::Parse(format!(
-                    "plugin sent a malformed events message (column {})",
-                    e.column()
+            Err(e) => Err(match self.admitted.invalid_event.take() {
+                Some((index, defect)) => CalendarError::Parse(format!(
+                    "plugin sent an invalid event (element {index}: {defect})"
                 )),
+                None => match self.admitted.refusal.take() {
+                    Some(a) => a.into(),
+                    // Position only: a serde message can quote plugin data.
+                    None => CalendarError::Parse(format!(
+                        "plugin sent a malformed events message (column {})",
+                        e.column()
+                    )),
+                },
             }),
         }
     }
@@ -508,6 +522,7 @@ impl CommandBackend {
                 sync_token: String::new(),
                 mode: None,
                 refusal: None,
+                invalid_event: None,
             },
             granted: self.granted.clone(),
             junk: Vec::new(),
@@ -598,3 +613,7 @@ impl CommandBackend {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "command_tests.rs"]
+mod tests;

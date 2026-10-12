@@ -69,7 +69,6 @@ crates/thegn-core/src/config_resolve.rs
 crates/thegn-core/src/config.rs
 crates/thegn-core/src/config_tests_coverage.rs
 crates/thegn-core/src/config_tests.rs
-crates/thegn-core/src/config_write.rs
 crates/thegn-core/src/connectivity.rs
 crates/thegn-core/src/control_wire.rs
 crates/thegn-core/src/db_aux.rs
@@ -119,7 +118,6 @@ crates/thegn-core/src/repo.rs
 crates/thegn-core/src/retry.rs
 crates/thegn-core/src/sandbox_mounts.rs
 crates/thegn-core/src/sandbox_prefetch.rs
-crates/thegn-core/src/sandbox_preflight.rs
 crates/thegn-core/src/sandbox.rs
 crates/thegn-core/src/sandbox_tests.rs
 crates/thegn-core/src/semantic.rs

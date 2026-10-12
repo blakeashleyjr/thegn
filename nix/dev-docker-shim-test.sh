@@ -84,4 +84,38 @@ if [ ! -w "$tmp/readonly" ]; then
   test ! -e "$tmp/readonly/.docker"
 fi
 
+# Concurrent shell entries use symlink(2)'s atomic no-clobber behavior: exactly
+# one owned-compatible link appears and losing invocations stay quiet.
+mkdir -p "$tmp/concurrent/.docker"
+pids=()
+for n in 1 2 3 4 5 6 7 8; do
+  run_shim "$tmp/concurrent" >"$tmp/concurrent-$n.out" 2>&1 &
+  pids+=("$!")
+done
+for pid in "${pids[@]}"; do
+  wait "$pid"
+done
+for n in 1 2 3 4 5 6 7 8; do
+  test ! -s "$tmp/concurrent-$n.out"
+done
+test "$(find "$tmp/concurrent/.docker" -mindepth 1 -maxdepth 1 -name docker.sock | wc -l)" -eq 1
+test -L "$tmp/concurrent/.docker/docker.sock"
+test "$(readlink "$tmp/concurrent/.docker/docker.sock")" = "$runtime/podman/podman.sock"
+
+# The same mkdir race also succeeds when every invocation starts without a
+# .docker directory; exactly one directory/link is installed and all jobs pass.
+for n in 1 2 3 4 5 6 7 8; do
+  run_shim "$tmp/concurrent-missing" >"$tmp/concurrent-missing-$n.out" 2>&1 &
+  pids+=("$!")
+done
+for pid in "${pids[@]:8}"; do
+  wait "$pid"
+done
+for n in 1 2 3 4 5 6 7 8; do
+  test ! -s "$tmp/concurrent-missing-$n.out"
+done
+test "$(find "$tmp/concurrent-missing/.docker" -mindepth 1 -maxdepth 1 -name docker.sock | wc -l)" -eq 1
+test -L "$tmp/concurrent-missing/.docker/docker.sock"
+test "$(readlink "$tmp/concurrent-missing/.docker/docker.sock")" = "$runtime/podman/podman.sock"
+
 echo 'dev-docker-shim checks passed'

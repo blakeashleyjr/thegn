@@ -172,6 +172,13 @@ type PanelQueryJob = (
     Vec<(String, Query)>,
 );
 
+enum QueryOutcome {
+    Complete(bool),
+    Refresh,
+    Hidden,
+    Disconnected,
+}
+
 impl QueryEngine {
     /// Spawn the engine on `rt` and return the command sender + result receiver.
     /// The task lives until the command sender is dropped (tab closed).
@@ -274,9 +281,14 @@ impl QueryEngine {
         cmd_rx: &mut mpsc::UnboundedReceiver<EngineCmd>,
         ticker: &mut tokio::time::Interval,
     ) -> bool {
-        self.query_all().await;
+        let mut outcome = self.query_all(cmd_rx, ticker).await;
         loop {
-            let mut refresh = false;
+            let mut refresh = match outcome {
+                QueryOutcome::Complete(refresh) => refresh,
+                QueryOutcome::Refresh => true,
+                QueryOutcome::Hidden => false,
+                QueryOutcome::Disconnected => return false,
+            };
             loop {
                 match cmd_rx.try_recv() {
                     Ok(cmd) => refresh |= self.apply_command(cmd, ticker),
@@ -287,7 +299,7 @@ impl QueryEngine {
             if !refresh || self.hidden {
                 return true;
             }
-            self.query_all().await;
+            outcome = self.query_all(cmd_rx, ticker).await;
         }
     }
 
@@ -335,7 +347,11 @@ impl QueryEngine {
 
     /// Query panels with a sliding concurrency window, emitting each result as it completes.
     /// The UI thread is never involved in the waits and fan-out is capped.
-    async fn query_all(&mut self) {
+    async fn query_all(
+        &mut self,
+        cmd_rx: &mut mpsc::UnboundedReceiver<EngineCmd>,
+        ticker: &mut tokio::time::Interval,
+    ) -> QueryOutcome {
         // Resolve once so every panel in a refresh sees an identical window.
         let time_range = self.resolve_window();
         let jobs: Vec<_> = self
@@ -412,12 +428,18 @@ impl QueryEngine {
         for job in jobs.by_ref().take(MAX_CONCURRENT_PANELS) {
             spawn_job(&mut pending, &mut job_ids, job);
         }
-        while let Some(joined) = pending.join_next_with_id().await {
-            match joined {
+        let mut refresh = false;
+        while !pending.is_empty() {
+            tokio::select! {
+                joined = pending.join_next_with_id() => {
+                    let Some(joined) = joined else { break };
+                    match joined {
                 Ok((id, (panel_id, targets))) => {
                     drop(job_ids.remove(&id));
                     // Best-effort: the UI may be gone during shutdown.
-                    let _ = self.frames_tx.send(PanelUpdate { panel_id, targets });
+                    match self.frames_tx.send(PanelUpdate { panel_id, targets }) {
+                        Ok(()) | Err(_) => {}
+                    }
                     self.gate.wake(&self.waker);
                 }
                 Err(join_error) => {
@@ -430,15 +452,37 @@ impl QueryEngine {
                                 result: Err(message.clone()),
                             })
                             .collect();
-                        let _ = self.frames_tx.send(PanelUpdate { panel_id, targets });
+                        match self.frames_tx.send(PanelUpdate { panel_id, targets }) {
+                            Ok(()) | Err(_) => {}
+                        }
                         self.gate.wake(&self.waker);
                     }
                 }
-            }
-            if let Some(job) = jobs.next() {
-                spawn_job(&mut pending, &mut job_ids, job);
+                    }
+                    if let Some(job) = jobs.next() {
+                        spawn_job(&mut pending, &mut job_ids, job);
+                    }
+                },
+                command = cmd_rx.recv() => match command {
+                    None => {
+                        pending.abort_all();
+                        return QueryOutcome::Disconnected;
+                    }
+                    Some(EngineCmd::Visible(false)) => {
+                        self.apply_command(EngineCmd::Visible(false), ticker);
+                        pending.abort_all();
+                        return QueryOutcome::Hidden;
+                    }
+                    Some(command @ EngineCmd::SetTimeRange(_)) => {
+                        self.apply_command(command, ticker);
+                        pending.abort_all();
+                        return QueryOutcome::Refresh;
+                    }
+                    Some(command) => refresh |= self.apply_command(command, ticker),
+                }
             }
         }
+        QueryOutcome::Complete(refresh)
     }
 
     fn resolve_window(&mut self) -> TimeRange {
@@ -672,6 +716,104 @@ mod tests {
                 Box::pin(async { Ok(Vec::new()) })
             }
         }
+    }
+
+    struct DropObservedSource {
+        entered: Arc<tokio::sync::Notify>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct DropObserved(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropObserved {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl DataSource for DropObservedSource {
+        fn query(
+            &self,
+            _queries: Vec<Query>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>, QueryError>> + Send>> {
+            let entered = self.entered.clone();
+            let dropped = self.dropped.clone();
+            Box::pin(async move {
+                let _guard = DropObserved(dropped);
+                entered.notify_one();
+                std::future::pending::<Result<Vec<Frame>, QueryError>>().await
+            })
+        }
+    }
+
+    fn spawn_drop_observed_engine() -> (
+        mpsc::UnboundedSender<EngineCmd>,
+        mpsc::UnboundedReceiver<PanelUpdate>,
+        Arc<tokio::sync::Notify>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sources = HashMap::from([(
+            "test".to_string(),
+            Arc::new(DropObservedSource {
+                entered: entered.clone(),
+                dropped: dropped.clone(),
+            }) as Arc<dyn DataSource>,
+        )]);
+        let (cmd, updates) = QueryEngine::spawn_with_window(
+            Handle::current(),
+            dashboard(1),
+            sources,
+            RelativeWindow::new(std::time::Duration::from_secs(60)),
+            Duration::from_secs(3600),
+            Arc::new(Utc::now),
+            Arc::new(|| {}),
+            WakeGate::new(true),
+        );
+        (cmd, updates, entered, dropped)
+    }
+
+    #[tokio::test]
+    async fn dropping_command_sender_cancels_hung_panel_immediately() {
+        let (cmd, mut updates, entered, dropped) = spawn_drop_observed_engine();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("hung query was never polled");
+        drop(cmd);
+
+        tokio::time::timeout(PANEL_DEADLINE / 2, async {
+            assert!(updates.recv().await.is_none(), "engine remained alive");
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect did not cancel the query before its deadline");
+    }
+
+    #[tokio::test]
+    async fn hiding_during_hung_panel_cancels_without_publishing() {
+        let (cmd, mut updates, entered, dropped) = spawn_drop_observed_engine();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("hung query was never polled");
+        cmd.send(EngineCmd::Visible(false)).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hidden panel query was not cancelled");
+        assert!(
+            tokio::time::timeout(PANEL_DEADLINE + Duration::from_millis(200), updates.recv())
+                .await
+                .is_err(),
+            "hidden panel published an update"
+        );
+        drop(cmd);
     }
 
     #[tokio::test]

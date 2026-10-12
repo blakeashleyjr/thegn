@@ -1250,6 +1250,49 @@ pub(crate) fn verify_v77_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v78: discard never-live leases, bound legacy expiry, and index cleanup.
+pub(crate) fn migrate_v78(conn: &Connection) -> Result<()> {
+    let max_ttl_ms = crate::db::MAX_LEASE_TTL_SECS * 1000;
+    let now = crate::util::now_ms();
+    conn.execute(
+        "DELETE FROM pipeline_leases WHERE expires_at_ms <= acquired_at_ms",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE pipeline_leases
+         SET expires_at_ms = MIN(expires_at_ms, MAX(acquired_at_ms, ?1) + ?2)
+         WHERE expires_at_ms > MAX(acquired_at_ms, ?1) + ?2",
+        rusqlite::params![now, max_ttl_ms],
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_pipeline_leases_expiry
+         ON pipeline_leases(expires_at_ms);",
+    )?;
+    Ok(())
+}
+
+/// Verify the v78 expiry index used by bounded lease cleanup.
+pub(crate) fn verify_v78_schema(conn: &Connection) -> Result<()> {
+    let table: Option<String> = conn
+        .query_row(
+            "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name='idx_pipeline_leases_expiry'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if table.as_deref() != Some("pipeline_leases") {
+        bail!("schema v78 migration did not add idx_pipeline_leases_expiry to pipeline_leases");
+    }
+    let mut stmt = conn.prepare("PRAGMA index_info('idx_pipeline_leases_expiry')")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(2))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns.len() != 1 || columns.first().map(String::as_str) != Some("expires_at_ms") {
+        bail!("schema v78 expiry index must contain only pipeline_leases.expires_at_ms");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -1919,6 +1962,83 @@ mod tests {
             (issue.as_str(), report.as_str(), scope),
             ("linear:THE-214", "PASS", None)
         );
+    }
+
+    #[test]
+    fn v78_bounds_legacy_lease_expiry_and_indexes_cleanup_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        let now = crate::util::now_ms();
+        let acquired_48h_ago = now - 172_800_000;
+        conn.execute_batch(
+            "CREATE TABLE pipeline_leases (
+                 name TEXT PRIMARY KEY, owner TEXT NOT NULL,
+                 acquired_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL);
+             INSERT INTO pipeline_leases VALUES ('long','monitor',1000,9223372036854775807);
+             INSERT INTO pipeline_leases VALUES ('dead','monitor',2000,2000);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pipeline_leases VALUES ('recent','monitor',?1,9223372036854775807)",
+            [acquired_48h_ago],
+        )
+        .unwrap();
+        assert!(super::verify_v78_schema(&conn).is_err());
+        super::migrate_v78(&conn).unwrap();
+        super::migrate_v78(&conn).unwrap();
+        super::verify_v78_schema(&conn).unwrap();
+        let expiry: i64 = conn
+            .query_row(
+                "SELECT expires_at_ms FROM pipeline_leases WHERE name='long'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let max_ttl_ms = crate::db::MAX_LEASE_TTL_SECS * 1000;
+        assert!(expiry > now, "a live legacy lease must remain live");
+        assert!(
+            expiry <= now + max_ttl_ms + 5_000,
+            "a migrated lease must be bounded relative to migration time"
+        );
+        let recent_expiry: i64 = conn
+            .query_row(
+                "SELECT expires_at_ms FROM pipeline_leases WHERE name='recent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(recent_expiry > now, "a live legacy lease must remain live");
+        assert!(
+            recent_expiry <= now + max_ttl_ms + 5_000,
+            "a migrated lease must be bounded relative to migration time"
+        );
+        let dead_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pipeline_leases WHERE name='dead'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dead_count, 0);
+    }
+
+    #[test]
+    fn v78_verification_rejects_same_named_index_on_wrong_table_or_column() {
+        for (table_sql, index_sql) in [
+            (
+                "CREATE TABLE pipeline_leases (expires_at_ms INTEGER);
+                 CREATE TABLE other (expires_at_ms INTEGER);",
+                "CREATE INDEX idx_pipeline_leases_expiry ON other(expires_at_ms);",
+            ),
+            (
+                "CREATE TABLE pipeline_leases (owner TEXT);",
+                "CREATE INDEX idx_pipeline_leases_expiry ON pipeline_leases(owner);",
+            ),
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(table_sql).unwrap();
+            conn.execute_batch(index_sql).unwrap();
+            assert!(super::verify_v78_schema(&conn).is_err());
+        }
     }
 
     #[test]

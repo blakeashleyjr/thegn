@@ -142,6 +142,7 @@ impl Db {
         let registered = {
             let mut stmt = conn.prepare(
                 "SELECT worktree FROM worktrees WHERE worktree != '' \
+                 UNION SELECT repo_path FROM worktrees WHERE repo_path != '' \
                  UNION SELECT repo_path FROM workspaces WHERE repo_path != ''",
             )?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -160,6 +161,41 @@ impl Db {
             .collect();
         for key in &orphan_keys {
             delete_worktree_cache_rows(self, key)?;
+        }
+
+        // Issue tracker rows are keyed by repo root rather than worktree, but
+        // use the same registrations, ancestor, and on-disk protections. Share
+        // the sweep's key budget so this pass cannot make one terminal slice
+        // unbounded. The return value remains the number of worktree-cache keys
+        // removed, preserving the existing caller contract.
+        let remaining_budget = max_keys.saturating_sub(orphan_keys.len());
+        if remaining_budget > 0 {
+            let issue_roots = {
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT repo_root FROM issue_cache \
+                     WHERE repo_root IS NOT NULL AND repo_root != '' \
+                     ORDER BY repo_root",
+                )?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let orphan_issue_roots: Vec<String> = issue_roots
+                .into_iter()
+                .filter(|key| {
+                    !registered.contains(key)
+                        && !registered.iter().any(|root| {
+                            std::path::Path::new(root).starts_with(std::path::Path::new(key))
+                        })
+                        && !std::path::Path::new(key).exists()
+                })
+                .take(remaining_budget)
+                .collect();
+            for repo_root in orphan_issue_roots {
+                conn.execute(
+                    "DELETE FROM issue_cache WHERE repo_root=?1",
+                    params![repo_root],
+                )?;
+            }
         }
         Ok(orphan_keys.len())
     }
@@ -2003,6 +2039,52 @@ mod tests {
         for key in ["/live", "/remote/wt", existing_path.as_str(), "/gone/wt2"] {
             assert!(glyphs.contains(key), "registered/existing {key} was pruned");
         }
+    }
+
+    #[test]
+    fn orphan_cache_sweep_prunes_issue_cache_for_missing_unregistered_repos() {
+        use crate::store::{CacheStore, WorkspaceStore};
+
+        let db = Db::open_memory().unwrap();
+        let existing = tempfile::tempdir().unwrap();
+        let existing_path = existing.path().to_string_lossy().into_owned();
+        db.put_worktree("tab", "/repo", "/live", "main", None, None)
+            .unwrap();
+        for repo_root in ["/gone/repo", "/repo", "/live", existing_path.as_str()] {
+            db.put_issue_cache(repo_root, "linear", "default", "{}")
+                .unwrap();
+        }
+
+        db.prune_orphan_worktree_caches(ORPHAN_CACHE_SWEEP_MAX_KEYS)
+            .unwrap();
+
+        assert!(db.get_all_issue_cache("/gone/repo").unwrap().is_empty());
+        for repo_root in ["/repo", "/live", existing_path.as_str()] {
+            assert_eq!(
+                db.get_all_issue_cache(repo_root).unwrap().len(),
+                1,
+                "issue cache for registered or existing repo {repo_root} was pruned"
+            );
+        }
+    }
+
+    #[test]
+    fn orphan_cache_sweep_bounds_issue_cache_keys() {
+        use crate::store::CacheStore;
+
+        let db = Db::open_memory().unwrap();
+        for repo_root in ["/gone/repo-a", "/gone/repo-b"] {
+            db.put_issue_cache(repo_root, "linear", "default", "{}")
+                .unwrap();
+        }
+
+        assert_eq!(db.prune_orphan_worktree_caches(1).unwrap(), 0);
+        assert_eq!(
+            db.get_all_issue_cache("/gone/repo-a").unwrap().len()
+                + db.get_all_issue_cache("/gone/repo-b").unwrap().len(),
+            1,
+            "one issue-cache root must remain after a one-key sweep"
+        );
     }
 
     #[test]

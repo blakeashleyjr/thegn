@@ -363,6 +363,10 @@ impl VpsSpec {
         }
     }
 
+    fn validated_api_base(&self) -> Result<String> {
+        crate::provider::validate_api_base(&self.api_base())
+    }
+
     fn max_instances(&self) -> usize {
         if self.max_instances == 0 {
             5
@@ -375,6 +379,7 @@ impl VpsSpec {
     /// resolve the vendor defaults for absent optional fields. This runs before
     /// any ledger read/write, SSH-key lookup/registration, or server request.
     fn admit_resolved(&self, labels: &BTreeMap<String, String>) -> Result<ResolvedVpsSpec> {
+        self.validated_api_base()?;
         let key_path = self
             .key_path
             .to_str()
@@ -466,6 +471,9 @@ impl VpsProvider {
         url: &str,
         timeout: std::time::Duration,
     ) -> Result<serde_json::Value> {
+        let base = self.spec.validated_api_base()?;
+        let authority = crate::provider::authority_key(&base)?;
+        let _permit = crate::provider::CONTROL_GATE.acquire(&authority).await?;
         let resp = self
             .client
             .get(url)
@@ -493,6 +501,9 @@ impl VpsProvider {
         body: &serde_json::Value,
         timeout: std::time::Duration,
     ) -> Result<serde_json::Value> {
+        let base = self.spec.validated_api_base()?;
+        let authority = crate::provider::authority_key(&base)?;
+        let _permit = crate::provider::CONTROL_GATE.acquire(&authority).await?;
         let resp = self
             .client
             .post(url)
@@ -513,7 +524,7 @@ impl VpsProvider {
     /// ips/creation times — the reaper's view.
     pub async fn list_detailed(&self) -> Result<Vec<VpsInstance>> {
         let body = self
-            .get_json(&self.shaper().list_url(&self.spec.api_base()))
+            .get_json(&self.shaper().list_url(&self.spec.validated_api_base()?))
             .await?;
         Ok(self.shaper().parse_server_list(&body))
     }
@@ -529,7 +540,7 @@ impl VpsProvider {
 
     /// Ensure the managed public key is registered, returning its vendor id.
     async fn ensure_ssh_key(&self) -> Result<i64> {
-        let base = self.spec.api_base();
+        let base = self.spec.validated_api_base()?;
         let shaper = self.shaper();
         let listed = self.get_json(&shaper.ssh_keys_url(&base)).await?;
         if let Some((id, _)) = shaper
@@ -603,7 +614,7 @@ impl VpsProvider {
     /// instance. 2s poll, bounded.
     async fn wait_running(&self, id: &str) -> Result<VpsInstance> {
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
-        let base = self.spec.api_base();
+        let base = self.spec.validated_api_base()?;
         let start = std::time::Instant::now();
         loop {
             let remaining = BUDGET.saturating_sub(start.elapsed());
@@ -686,7 +697,7 @@ impl VpsProvider {
             .find_by_name(name)
             .await?
             .ok_or_else(|| anyhow!("vps: instance {name} not found"))?;
-        let base = self.spec.api_base();
+        let base = self.spec.validated_api_base()?;
         let shaper = self.shaper();
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
         let start = std::time::Instant::now();
@@ -728,7 +739,7 @@ impl VpsProvider {
             .find_by_name(name)
             .await?
             .ok_or_else(|| anyhow!("vps: instance {name} not found"))?;
-        let base = self.spec.api_base();
+        let base = self.spec.validated_api_base()?;
         match self.spec.kind {
             VpsKind::Hetzner => {
                 let body = self
@@ -839,7 +850,7 @@ impl RemoteProvider for VpsProvider {
                 created_at: thegn_core::util::now(),
             })?;
 
-            let base = self.spec.api_base();
+            let base = self.spec.validated_api_base()?;
             let shaper = self.shaper();
             let body = shaper.create_body(
                 &name,
@@ -933,21 +944,24 @@ impl RemoteProvider for VpsProvider {
             // Retry transient statuses: a leaked VPS bills forever (same policy as
             // the sprites destroy).
             const ATTEMPTS: u32 = 3;
-            let base = self.spec.api_base();
+            let base = self.spec.validated_api_base()?;
+            let authority = crate::provider::authority_key(&base)?;
             let url = self.shaper().server_url(&base, &iid);
             let mut last_status = None;
             for attempt in 0..ATTEMPTS {
-                let resp = self
-                    .client
-                    .delete(&url)
-                    .bearer_auth(&self.spec.token)
-                    .timeout(crate::provider::CONTROL_TIMEOUT)
-                    .send()
-                    .await
-                    .map_err(|error| {
-                        crate::provider::redacted_transport_error("vps", "DELETE", &error)
-                    })?;
-                let status = resp.status();
+                let status = {
+                    let _permit = crate::provider::CONTROL_GATE.acquire(&authority).await?;
+                    self.client
+                        .delete(&url)
+                        .bearer_auth(&self.spec.token)
+                        .timeout(crate::provider::CONTROL_TIMEOUT)
+                        .send()
+                        .await
+                        .map_err(|error| {
+                            crate::provider::redacted_transport_error("vps", "DELETE", &error)
+                        })?
+                        .status()
+                };
                 if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
                     registry::remove(id);
                     thegn_core::managed_ssh::record_revoked(
@@ -1214,5 +1228,65 @@ mod tests {
         });
         let error = provider.destroy("../x").await.unwrap_err();
         assert!(error.to_string().contains("invalid provider name"));
+    }
+
+    #[tokio::test]
+    async fn vps_rejects_non_loopback_http_before_connecting() {
+        let provider = VpsProvider::new(VpsSpec {
+            kind: VpsKind::Hetzner,
+            api_base: "http://203.0.113.5".into(),
+            token: "unused".into(),
+            name: "safe-name".into(),
+            region: String::new(),
+            size: String::new(),
+            image: String::new(),
+            max_instances: 0,
+            max_lifetime_secs: 0,
+            key_path: "/tmp/nonexistent-managed-key".into(),
+            pubkey: TEST_PUBKEY.into(),
+            skip_ready_wait: true,
+        });
+        let error = provider.list().await.unwrap_err();
+        assert!(error.to_string().contains("must use https"));
+    }
+
+    #[tokio::test]
+    async fn vps_waits_for_control_gate_before_opening_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let authority = crate::provider::authority_key(&base).unwrap();
+        let permits: Vec<_> = (0..crate::provider::CONTROL_PER_AUTHORITY_CONCURRENCY)
+            .map(|_| {
+                crate::provider::CONTROL_GATE
+                    .try_acquire(&authority)
+                    .unwrap()
+            })
+            .collect();
+        let provider = VpsProvider::new(VpsSpec {
+            kind: VpsKind::Hetzner,
+            api_base: base,
+            token: "unused".into(),
+            name: "safe-name".into(),
+            region: String::new(),
+            size: String::new(),
+            image: String::new(),
+            max_instances: 0,
+            max_lifetime_secs: 0,
+            key_path: "/tmp/nonexistent-managed-key".into(),
+            pubkey: TEST_PUBKEY.into(),
+            skip_ready_wait: true,
+        });
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(300), provider.list()).await;
+        assert!(
+            result.is_err(),
+            "request should wait for an available permit"
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(permits);
     }
 }
