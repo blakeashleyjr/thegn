@@ -32,6 +32,10 @@ pub(crate) struct PluginEntry {
     /// `Some` while a resident session is alive; `None` for one-shot plugins
     /// and dead residents.
     pub writer: Option<SessionWriter>,
+    /// A live feed bridge, if one was started for this resident generation.
+    pub feed_bridge: Option<std::thread::JoinHandle<()>>,
+    /// Set between claiming a bridge and storing its thread handle.
+    feed_bridge_starting: bool,
     /// Contributions currently in effect, selected during manifest negotiation.
     /// Runtime `register` messages confirm these declarations but cannot add to them.
     pub contributions: Vec<Contribution>,
@@ -202,6 +206,8 @@ fn build_entry(st: LoadedState) -> PluginEntry {
         runtime: PluginRuntime::new(negotiated),
         plugin: st.plugin,
         writer: st.writer,
+        feed_bridge: None,
+        feed_bridge_starting: false,
         contributions,
         restarts: 0,
         disabled: false,
@@ -454,6 +460,8 @@ pub(crate) fn drain(
                 match writer {
                     Some(w) => {
                         let entry = state.plugins.get_mut(&plugin).expect("checked above");
+                        entry.feed_bridge = None;
+                        entry.feed_bridge_starting = false;
                         if entry
                             .contributions
                             .iter()
@@ -500,6 +508,8 @@ fn handle_exit(
         return PluginDamage::None;
     };
     entry.writer = None;
+    entry.feed_bridge = None;
+    entry.feed_bridge_starting = false;
     entry.bridge = None;
     sync_provider_registry(state);
     let entry = state.plugins.get_mut(plugin).expect("looked up above");
@@ -794,7 +804,10 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
     // starts an off-loop bridge that forwards feed frames as `on_event`
     // notifications, and the host.call itself is acknowledged immediately.
     if cap == "events.subscribe" {
-        spawn_feed_bridge(state.cfg.clone(), writer.clone());
+        if claim_feed_bridge(entry) {
+            entry.feed_bridge = spawn_feed_bridge(state.cfg.clone(), writer.clone());
+            entry.feed_bridge_starting = false;
+        }
         respond(
             entry,
             RpcResponse::ok(id, serde_json::json!({ "subscribed": true })),
@@ -809,6 +822,23 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
     PluginDamage::None
 }
 
+/// Claim the per-session feed bridge slot, reclaiming a completed bridge.
+fn claim_feed_bridge(entry: &mut PluginEntry) -> bool {
+    if entry.feed_bridge_starting {
+        return false;
+    }
+    if entry
+        .feed_bridge
+        .as_ref()
+        .is_some_and(|bridge| !bridge.is_finished())
+    {
+        return false;
+    }
+    entry.feed_bridge = None;
+    entry.feed_bridge_starting = true;
+    true
+}
+
 /// Start an off-loop bridge that forwards the daemon control event feed to a
 /// resident plugin as `on_event` notifications (the plugin declared a feed
 /// subscription via `host.call events.subscribe`, read-scoped). A dedicated
@@ -816,7 +846,10 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
 /// straight to the plugin's [`SessionWriter`] — it never re-enters the
 /// compositor loop, so a subscribing plugin costs the idle render loop nothing.
 /// The bridge ends when the feed closes or the plugin's session goes away.
-fn spawn_feed_bridge(cfg: thegn_core::config::Config, writer: SessionWriter) {
+fn spawn_feed_bridge(
+    cfg: thegn_core::config::Config,
+    writer: SessionWriter,
+) -> Option<std::thread::JoinHandle<()>> {
     let spawn = std::thread::Builder::new()
         .name("thegn-plugin-feed".into())
         .spawn(move || {
@@ -878,8 +911,12 @@ fn spawn_feed_bridge(cfg: thegn_core::config::Config, writer: SessionWriter) {
                 }
             });
         });
-    if let Err(e) = spawn {
-        tracing::warn!(target: "thegn::plugin", error = %e, "feed-bridge thread failed to start");
+    match spawn {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            tracing::warn!(target: "thegn::plugin", error = %e, "feed-bridge thread failed to start");
+            None
+        }
     }
 }
 
@@ -1058,6 +1095,13 @@ mod tests {
             )],
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn feed_bridge_claim_is_limited_to_one_per_entry() {
+        let mut entry = build_entry(loaded_state(seg_spec("p")));
+        assert!(claim_feed_bridge(&mut entry));
+        assert!(!claim_feed_bridge(&mut entry));
     }
 
     fn msg(method: &str, params: serde_json::Value) -> RpcMessage {
