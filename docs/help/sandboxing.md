@@ -121,8 +121,9 @@ state instead of dying on a read-only filesystem.
 > so a writable copy from a sealed sandbox would be a persistence vector.
 
 The daemon socket normally lives under `$XDG_RUNTIME_DIR/thegn`. With that
-variable unset, the daemon uses a vetted private per-user runtime directory or
-refuses to start; it does not place a new control socket under sandbox state.
+variable unset, it uses a vetted private runtime directory, then a private
+`/tmp/thegn-<uid>-<state-hash>/` directory if needed. If neither can be secured,
+panes run in-process. It does not place a new control socket under sandbox state.
 A custom `[daemon] socket` path is the operator's responsibility. On bwrap,
 `file_access = "all"` or `"host"` exposes the host filesystem by design,
 including runtime paths; those modes do not hide the control socket.

@@ -683,7 +683,9 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
     };
     let mut canonical_view = view.into_owned();
     for mount in &mut canonical_view.mounts {
-        if let Ok(source) = std::path::Path::new(&mount.host).canonicalize() {
+        if spec.placement.is_local()
+            && let Ok(source) = std::path::Path::new(&mount.host).canonicalize()
+        {
             // Validate and emit the same host identity while preserving the
             // path-visible destination used by bwrap, OCI, and systemd.
             mount.host = source.to_string_lossy().into_owned();
@@ -717,8 +719,10 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
 pub fn compose_policy_refusal(spec: &SandboxSpec) -> Option<String> {
     (spec.backend.is_oci() && spec.compose_spec().is_some() && compose_cannot_enforce(spec)).then(
         || {
-            "Compose cannot enforce or verify the requested sandbox policy on OCI backends; \
-         remove the Compose config or use an open profile for Compose"
+            "Compose cannot enforce the requested sandbox restrictions on OCI backends: \
+         read_only_root, no_new_privileges, pids_limit, dropped capabilities, sealed home, \
+         network-none or network filters, oci_runtime, per-pane CPU/memory limits, and VPN. \
+         Remove the conflicting restriction or Compose config."
                 .to_string()
         },
     )
@@ -2481,11 +2485,16 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
         script,
         SandboxArgvEnv {
             resolver_dir: None,
-            runtime_dir: std::env::var_os("XDG_RUNTIME_DIR")
-                .map(std::path::PathBuf::from)
-                .or_else(|| Some(std::path::PathBuf::from("/run/user"))),
+            runtime_dir: systemd_runtime_dir(std::env::var_os("XDG_RUNTIME_DIR")),
         },
     )
+}
+
+fn systemd_runtime_dir(value: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    value
+        .map(std::path::PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| Some(std::path::PathBuf::from("/run/user")))
 }
 
 /// Build backend argv with an optional injected resolver directory for tests.

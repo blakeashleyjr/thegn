@@ -899,7 +899,14 @@ fn compose_refusal_tracks_only_unenforced_restrictions() {
             "{field} is not a refusal"
         );
     }
+    let compose_worker = crate::sandbox_compose::ComposeSpec {
+        files: vec!["compose.yml".into()],
+        service: Some("worker".into()),
+        run_services: vec![],
+    }
+    .encode();
     let mut bwrap = base;
+    bwrap.compose = Some(compose_worker.clone());
     bwrap.backend = Backend::Bwrap;
     bwrap.read_only_root = true;
     let argv = enter_argv(&bwrap, "true").unwrap();
@@ -941,6 +948,14 @@ fn compose_refusal_tracks_only_unenforced_restrictions() {
 }
 
 #[test]
+fn empty_xdg_runtime_dir_uses_run_user_for_systemd_hardening() {
+    assert_eq!(
+        systemd_runtime_dir(Some(std::ffi::OsString::new())),
+        Some(std::path::PathBuf::from("/run/user"))
+    );
+}
+
+#[test]
 fn canonical_mount_sources_preserve_visible_destinations_for_every_backend_family() {
     #[cfg(unix)]
     {
@@ -967,6 +982,26 @@ fn canonical_mount_sources_preserve_visible_destinations_for_every_backend_famil
             assert_eq!(mount.host, target.to_string_lossy().as_ref());
             assert_eq!(mount.dest, "/work/cache-through-alias");
         }
+        let mut remote = spec(Backend::Bwrap);
+        remote.placement = crate::placement::Placement::Ssh(crate::placement::SshPlacement::plain(
+            "example.test".into(),
+            22,
+            false,
+            crate::placement::TransportKind::Ssh,
+        ));
+        remote.mounts.push(Mount {
+            host: alias.to_string_lossy().into_owned(),
+            dest: "/remote/cache".into(),
+            ro: false,
+            cache: false,
+        });
+        let planned = launchable(&remote).unwrap();
+        let mount = planned
+            .mounts
+            .iter()
+            .find(|mount| mount.dest == "/remote/cache")
+            .unwrap();
+        assert_eq!(mount.host, alias.to_string_lossy().as_ref());
     }
 }
 
