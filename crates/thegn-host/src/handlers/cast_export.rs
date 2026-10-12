@@ -3,10 +3,11 @@
 //! [`export_pane_cast`], which reuses the pure [`thegn_core::asciicast`] writer
 //! (via [`crate::replay::Recording::export_cast`]) and writes owner-only under
 //! the same per-profile recordings dir the daemon recorder uses. The export is
-//! honestly a *tail* — only what the `[replay]` budget still holds — so the
-//! returned message reports the covered span.
+//! a *tail* — only what the `[replay]` budget still holds. When earlier history
+//! has been evicted or truncated, the returned message calls that out as partial.
 
 use std::io::BufWriter;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use thegn_core::config::Config;
@@ -34,12 +35,24 @@ pub(crate) fn export_pane_cast(panes: &Panes, pane_id: u32, cfg: &Config) -> Str
         Err(e) => return format!("Export failed: {e}"),
     };
     match rec.export_cast(BufWriter::new(file)) {
-        Ok(span_ms) => format!(
+        Ok(span_ms) => export_message(span_ms, rec.history_truncated(), &path),
+        Err(e) => format!("Export failed: {e}"),
+    }
+}
+
+fn export_message(span_ms: u64, truncated: bool, path: &Path) -> String {
+    if truncated {
+        format!(
+            "Exported {} of partial history (earlier output evicted) → {}",
+            fmt_span(span_ms),
+            path.display()
+        )
+    } else {
+        format!(
             "Exported {} of history → {}",
             fmt_span(span_ms),
             path.display()
-        ),
-        Err(e) => format!("Export failed: {e}"),
+        )
     }
 }
 
@@ -64,12 +77,51 @@ fn fmt_span(ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::fmt_span;
+    use std::time::Duration;
+
+    use super::{export_message, fmt_span};
+    use crate::replay::Recording;
+    use thegn_core::config::ReplayConfig;
 
     #[test]
     fn fmt_span_reads_naturally() {
         assert_eq!(fmt_span(340), "340ms");
         assert_eq!(fmt_span(12_000), "12s");
         assert_eq!(fmt_span(123_000), "2m03s");
+    }
+
+    #[test]
+    fn export_message_preserves_complete_wording_and_labels_partial_history() {
+        let path = std::path::Path::new("recordings/pane1.cast");
+        assert_eq!(
+            export_message(12_000, false, path),
+            "Exported 12s of history → recordings/pane1.cast"
+        );
+        assert!(export_message(12_000, true, path).contains("partial history"));
+    }
+
+    #[test]
+    fn export_message_uses_recording_truncation_state() {
+        let cfg = ReplayConfig {
+            max_bytes_per_pane: 140,
+            max_duration_secs: 0,
+            keyframe_interval_ms: u64::MAX,
+            keyframe_interval_bytes: u64::MAX,
+            ..ReplayConfig::default()
+        };
+        let mut recording = Recording::from_config(&cfg, 24, 80);
+        let epoch = recording.epoch();
+        recording.push_bytes(b"\x1b[2;3H  ", epoch);
+        recording.push_bytes(b"X", epoch + Duration::from_millis(1));
+
+        assert!(recording.history_truncated());
+        assert!(
+            export_message(
+                1,
+                recording.history_truncated(),
+                std::path::Path::new("recordings/pane1.cast")
+            )
+            .contains("partial history")
+        );
     }
 }
