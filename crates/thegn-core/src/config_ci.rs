@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{config_enum, config_warn};
 
+/// Maximum number of CI runs accepted from config or the CLI.
+pub const MAX_CI_RUNS: usize = 200;
+/// Maximum number of terminal runs whose failed logs may be cached.
+pub const MAX_CI_LOG_CACHE_RUNS: usize = 20;
+
 config_enum! {
     /// Active CI provider for the CI panel/view (AV group). `"auto"` picks the
     /// provider from the worktree's CI-config files + git remote; `"none"`
@@ -129,6 +134,16 @@ impl CiConfig {
         if self.poll_interval_secs < 5 {
             errors.push("ci.poll_interval_secs: must be at least 5 seconds".into());
         }
+        if self.max_runs == 0 {
+            errors.push("ci.max_runs: must be greater than zero".into());
+        } else if self.max_runs > MAX_CI_RUNS {
+            errors.push(format!("ci.max_runs: must not exceed {MAX_CI_RUNS}"));
+        }
+        if self.log_cache_runs > MAX_CI_LOG_CACHE_RUNS {
+            errors.push(format!(
+                "ci.log_cache_runs: must not exceed {MAX_CI_LOG_CACHE_RUNS}"
+            ));
+        }
         if self.log_tail_lines == 0 {
             errors.push("ci.log_tail_lines: must be greater than zero".into());
         }
@@ -160,5 +175,47 @@ impl Default for GitLabCiConfig {
             host: String::new(),
             token: "env:GITLAB_TOKEN".into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ci_run_and_log_cache_bounds_validate() {
+        assert!(CiConfig::default().validate().is_empty());
+
+        assert!(
+            CiConfig {
+                max_runs: 0,
+                ..CiConfig::default()
+            }
+            .validate()
+            .iter()
+            .any(|error| error == "ci.max_runs: must be greater than zero")
+        );
+
+        assert!(
+            CiConfig {
+                max_runs: MAX_CI_RUNS + 1,
+                ..CiConfig::default()
+            }
+            .validate()
+            .iter()
+            .any(|error| error == &format!("ci.max_runs: must not exceed {MAX_CI_RUNS}"))
+        );
+
+        assert!(
+            CiConfig {
+                log_cache_runs: MAX_CI_LOG_CACHE_RUNS + 1,
+                ..CiConfig::default()
+            }
+            .validate()
+            .iter()
+            .any(|error| {
+                error == &format!("ci.log_cache_runs: must not exceed {MAX_CI_LOG_CACHE_RUNS}")
+            })
+        );
     }
 }
