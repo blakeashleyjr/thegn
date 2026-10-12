@@ -2152,23 +2152,7 @@ pub fn teardown_by_path(worktree: &str) {
     let placement = Placement::Local;
     for b in Backend::oci_runtimes() {
         if available(&placement, b) == RuntimeProbe::Present {
-            for argv in teardown_argvs(b, None, &name) {
-                let timeout = if argv.iter().any(|arg| arg == "down") {
-                    crate::sandbox_compose::COMPOSE_DOWN_TIMEOUT
-                } else {
-                    PROBE_TIMEOUT
-                };
-                match run_control_t_owned(&placement, &argv, timeout) {
-                    Some(true) => {}
-                    Some(false) => {
-                        tracing::debug!(backend = b.label(), "sandbox teardown command failed")
-                    }
-                    None => tracing::debug!(
-                        backend = b.label(),
-                        "sandbox teardown command unavailable or timed out"
-                    ),
-                }
-            }
+            run_teardown_argvs(&placement, b, teardown_argvs(b, None, &name));
         }
     }
 }
@@ -2187,23 +2171,27 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
     // Try whichever OCI runtimes are available; the container only exists under one.
     for b in Backend::oci_runtimes() {
         if available(&placement, b) == RuntimeProbe::Present {
-            for argv in teardown_argvs(b, oci_host, name) {
-                let timeout = if argv.iter().any(|arg| arg == "down") {
-                    crate::sandbox_compose::COMPOSE_DOWN_TIMEOUT
-                } else {
-                    PROBE_TIMEOUT
-                };
-                match run_control_t_owned(&placement, &argv, timeout) {
-                    Some(true) => {}
-                    Some(false) => {
-                        tracing::debug!(backend = b.label(), "sandbox teardown command failed")
-                    }
-                    None => tracing::debug!(
-                        backend = b.label(),
-                        "sandbox teardown command unavailable or timed out"
-                    ),
-                }
+            run_teardown_argvs(&placement, b, teardown_argvs(b, oci_host, name));
+        }
+    }
+}
+
+fn run_teardown_argvs(placement: &Placement, backend: Backend, argvs: Vec<Vec<String>>) {
+    for argv in argvs {
+        let timeout = if argv.iter().any(|arg| arg == "down") {
+            crate::sandbox_compose::COMPOSE_DOWN_TIMEOUT
+        } else {
+            PROBE_TIMEOUT
+        };
+        match run_control_t_owned(placement, &argv, timeout) {
+            Some(true) => {}
+            Some(false) => {
+                tracing::debug!(backend = backend.label(), "sandbox teardown command failed")
             }
+            None => tracing::debug!(
+                backend = backend.label(),
+                "sandbox teardown command unavailable or timed out"
+            ),
         }
     }
 }
@@ -3665,6 +3653,8 @@ pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> V
                 let Some((service, replica)) = service_and_replica.rsplit_once(separator) else {
                     return false;
                 };
+                // Known fail-closed over-keep: dead `wt-feat-fix-2` can look
+                // like service `fix` replica 2 while live `wt-feat` exists.
                 !service.is_empty()
                     && !replica.is_empty()
                     && replica.bytes().all(|byte| byte.is_ascii_digit())

@@ -322,7 +322,15 @@ impl PrivateDir {
         now: std::time::SystemTime,
         max_age: std::time::Duration,
     ) -> usize {
-        let entries = match std::fs::read_dir(&self.path) {
+        #[cfg(unix)]
+        let entries = {
+            use std::os::fd::AsRawFd;
+
+            std::fs::read_dir(format!("/dev/fd/{}", self.fd.as_raw_fd()))
+        };
+        #[cfg(not(unix))]
+        let entries = std::fs::read_dir(&self.path);
+        let entries = match entries {
             Ok(entries) => entries,
             Err(error) => {
                 tracing::debug!(%error, "unable to list pinned private directory entries");
@@ -357,10 +365,10 @@ impl PrivateDir {
                         continue;
                     }
                 };
-                let kind = SFlag::from_bits_truncate(stat.st_mode);
-                if kind.contains(SFlag::S_IFLNK) {
+                let kind = SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT;
+                if kind == SFlag::S_IFLNK {
                     true
-                } else if !kind.contains(SFlag::S_IFREG) || stat.st_mtime < 0 {
+                } else if kind != SFlag::S_IFREG || stat.st_mtime < 0 {
                     false
                 } else {
                     let modified = std::time::SystemTime::UNIX_EPOCH.checked_add(
@@ -895,7 +903,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let dir = ensure_private_dir_beneath(anchor.path(), Path::new("secrets")).unwrap();
         std::fs::write(anchor.path().join("secrets/old.env"), b"pinned").unwrap();
-        std::fs::write(outside.path().join("old.env"), b"outside").unwrap();
+        std::fs::write(outside.path().join("different.env"), b"outside").unwrap();
         let moved = anchor.path().join("secrets_moved");
         std::fs::rename(anchor.path().join("secrets"), &moved).unwrap();
         std::os::unix::fs::symlink(outside.path(), anchor.path().join("secrets")).unwrap();
@@ -910,9 +918,32 @@ mod tests {
         );
         assert!(!moved.join("old.env").exists());
         assert_eq!(
-            std::fs::read(outside.path().join("old.env")).unwrap(),
+            std::fs::read(outside.path().join("different.env")).unwrap(),
             b"outside"
         );
+    }
+
+    #[test]
+    fn private_dir_stale_sweep_keeps_unix_socket() {
+        use std::os::unix::net::UnixListener;
+
+        let parent = tempfile::tempdir().unwrap();
+        let dir_path = parent.path().join("private");
+        std::fs::create_dir(&dir_path).unwrap();
+        std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = ensure_private_dir_beneath(parent.path(), Path::new("private")).unwrap();
+        let socket_path = dir_path.join("sock.env");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+
+        assert_eq!(
+            dir.remove_stale_files(
+                "env",
+                std::time::SystemTime::now(),
+                std::time::Duration::ZERO,
+            ),
+            0
+        );
+        assert!(socket_path.exists());
     }
 
     #[test]
