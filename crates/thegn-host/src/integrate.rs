@@ -2994,10 +2994,22 @@ mod tests {
         );
         repo.commit(".gitattributes", "data.txt merge=stage-stray\n", "attrs");
         repo.commit("data.txt", "base\n", "seed");
-        repo.feature("feat", "data.txt", "feature\n");
+        git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
+        repo.commit("data.txt", "feature\n", "feature edit");
+        git(&repo.dir, &["checkout", "-q", "main"]);
         repo.commit("data.txt", "mainline\n", "main edit");
         let ours = repo.out(&["rev-parse", "main"]);
         let theirs = repo.out(&["rev-parse", "feat"]);
+        let merge_tree = util::git_cmd(&repo.dir)
+            .args(["merge-tree", "--write-tree", &ours, &theirs])
+            .output()
+            .unwrap();
+        assert_eq!(
+            merge_tree.status.code(),
+            Some(1),
+            "fixture must produce a merge-tree conflict: {}",
+            String::from_utf8_lossy(&merge_tree.stderr)
+        );
         let MergeTreeOutcome::Conflict { tree, paths } = CliGit
             .merge_tree(&GitLoc::Local(repo.dir.clone()), &ours, &theirs)
             .unwrap()
@@ -3089,6 +3101,16 @@ mod tests {
         let ours = repo.out(&["rev-parse", "main"]);
         let theirs = repo.out(&["rev-parse", "feat"]);
         let started = Instant::now();
+        let merge_tree = util::git_cmd(&repo.dir)
+            .args(["merge-tree", "--write-tree", &ours, &theirs])
+            .output()
+            .unwrap();
+        assert_eq!(
+            merge_tree.status.code(),
+            Some(1),
+            "fixture must produce a merge-tree conflict: {}",
+            String::from_utf8_lossy(&merge_tree.stderr)
+        );
         let MergeTreeOutcome::Conflict { tree, paths } = CliGit
             .merge_tree(&GitLoc::Local(repo.dir.clone()), &ours, &theirs)
             .unwrap()
