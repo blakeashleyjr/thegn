@@ -1806,7 +1806,7 @@ mod tests {
         if !waiter_parked {
             release_tx.send(()).unwrap();
             first.join().unwrap().unwrap();
-            waiter.join().unwrap();
+            drop(waiter.join().unwrap().unwrap());
             panic!("same-key caller did not enter StartCell::wait before release");
         }
         release_tx.send(()).unwrap();

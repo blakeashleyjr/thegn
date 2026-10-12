@@ -1499,8 +1499,13 @@ fn writer_loop(
                         }
                     }
                 }
+                let completion = if failed {
+                    Err(LspError::Protocol("server stream closed".into()))
+                } else {
+                    result
+                };
                 if let Some(done) = done
-                    && done.send(result).is_err()
+                    && done.send(completion).is_err()
                 {
                     // The caller timed out or closed before write completion.
                 }
