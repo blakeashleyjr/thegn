@@ -33,6 +33,8 @@ pub(crate) const PREVIEW_MAX_LINES: usize = 50_000;
 /// Maximum UTF-8 bytes retained for a rendered preview line, including its
 /// truncation marker when present.
 pub(crate) const PREVIEW_MAX_LINE_BYTES: usize = 4096;
+/// Maximum UTF-8 bytes retained across all rendered preview lines.
+pub(crate) const PREVIEW_MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 
 /// Read a file off the loop for the inline Files preview and route it by
 /// content type, sending text lines (always) and — when `kitty` and the route
@@ -232,12 +234,63 @@ pub fn prepare_preview(bytes: &[u8]) -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
-/// Split text lazily under the shared line-count and rendered-line limits.
+/// Split text lazily under the shared line-count, rendered-line, and total
+/// rendered-byte limits.
 pub(crate) fn bounded_lines(text: &str) -> Vec<String> {
-    text.split('\n')
-        .take(PREVIEW_MAX_LINES)
-        .map(bounded_line)
-        .collect()
+    let mut lines = Vec::new();
+    let mut retained_bytes = 0;
+    for line in text.split('\n') {
+        if lines.len() == PREVIEW_MAX_LINES {
+            break;
+        }
+
+        let mut rendered = bounded_line(line);
+        let remaining = PREVIEW_MAX_TOTAL_BYTES.saturating_sub(retained_bytes);
+        if rendered.len() <= remaining {
+            retained_bytes += rendered.len();
+            lines.push(rendered);
+            continue;
+        }
+
+        let marker = crate::caps::active_glyphs().ellipsis;
+        let marker_bytes = marker.len();
+        let mut content_limit = remaining.saturating_sub(marker_bytes).min(rendered.len());
+        while !rendered.is_char_boundary(content_limit) {
+            content_limit -= 1;
+        }
+        rendered.truncate(content_limit);
+        retained_bytes += rendered.len();
+        lines.push(rendered);
+
+        // If the limit lands exactly on a line boundary, make room for the
+        // marker by trimming retained content from the end.
+        while retained_bytes.saturating_add(marker_bytes) > PREVIEW_MAX_TOTAL_BYTES {
+            let Some(last) = lines.last_mut() else {
+                break;
+            };
+            if last.is_empty() {
+                lines.pop();
+                continue;
+            }
+            let excess = retained_bytes + marker_bytes - PREVIEW_MAX_TOTAL_BYTES;
+            let target = last.len().saturating_sub(excess);
+            let boundary = (0..=target)
+                .rev()
+                .find(|index| last.is_char_boundary(*index))
+                .unwrap_or(0);
+            retained_bytes -= last.len() - boundary;
+            last.truncate(boundary);
+        }
+        if lines.len() == PREVIEW_MAX_LINES
+            && let Some(last) = lines.pop()
+        {
+            retained_bytes -= last.len();
+        }
+        lines.push(marker.to_string());
+        break;
+    }
+
+    lines
 }
 
 /// Normalize and cap one line, keeping UTF-8 intact and reserving room for the
@@ -305,6 +358,21 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].len() <= PREVIEW_MAX_LINE_BYTES);
         assert!(lines[0].ends_with(crate::caps::active_glyphs().ellipsis));
+    }
+
+    #[test]
+    fn bounded_lines_caps_total_bytes_after_expanding_tabs() {
+        let tab_line = "\t".repeat(1024);
+        let input = std::iter::repeat_n(tab_line.as_str(), 1100)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let lines = bounded_lines(&input);
+        assert!(lines.iter().map(String::len).sum::<usize>() <= PREVIEW_MAX_TOTAL_BYTES);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(crate::caps::active_glyphs().ellipsis)
+        );
     }
 
     #[test]
