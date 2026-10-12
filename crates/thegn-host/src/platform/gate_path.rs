@@ -8,7 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 pub(crate) struct Directory {
     path: PathBuf,
@@ -39,10 +39,14 @@ impl ScratchDirectory {
             }
             let parent = std::fs::canonicalize(std::env::temp_dir())?;
             let temporary = tempfile::Builder::new().prefix(prefix).tempdir_in(parent)?;
+            #[cfg(unix)]
+            std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700))?;
             let directory = Directory::open(temporary.path(), Some(temporary.path()))?;
+            let scratch = Self(directory);
+            scratch.verify()?;
             // Keep only after the no-follow descriptor and identity checks succeed.
             drop(temporary.keep());
-            Ok(Self(directory))
+            Ok(scratch)
         })();
         if result
             .as_ref()
@@ -64,7 +68,15 @@ impl ScratchDirectory {
     }
 
     pub(crate) fn verify(&self) -> io::Result<()> {
-        self.0.verify()
+        self.0.verify()?;
+        #[cfg(unix)]
+        {
+            let metadata = self.0.pins.last().unwrap().1.metadata()?;
+            if metadata.mode() & 0o777 != 0o700 {
+                return Err(refused("scratch directory permissions are not owner-only"));
+            }
+        }
+        Ok(())
     }
 
     /// Remove an empty scratch directory by identity. A populated worktree is
