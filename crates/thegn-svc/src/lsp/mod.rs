@@ -27,6 +27,7 @@ pub use diagnostics_queue::{
 pub use registry::{Registry, RegistryEntry, Resolution, binary_on_path};
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -82,13 +83,18 @@ const SERVER_ENV_ALLOWLIST: &[&str] = &[
     "COMSPEC",
 ];
 
-fn server_env<I>(vars: I) -> Vec<(String, String)>
+fn server_env<I>(vars: I) -> Vec<(OsString, OsString)>
 where
-    I: IntoIterator<Item = (String, String)>,
+    I: IntoIterator<Item = (OsString, OsString)>,
 {
     vars.into_iter()
         .filter(|(name, _)| {
-            SERVER_ENV_ALLOWLIST.contains(&name.as_str()) || name.starts_with("LC_")
+            name.to_str().is_some_and(|name| {
+                SERVER_ENV_ALLOWLIST
+                    .iter()
+                    .any(|allowed| name.eq_ignore_ascii_case(allowed))
+                    || name.starts_with("LC_")
+            })
         })
         .collect()
 }
@@ -1548,7 +1554,7 @@ impl LspClient {
             .args(rest)
             .current_dir(root)
             .env_clear()
-            .envs(server_env(std::env::vars()))
+            .envs(server_env(std::env::vars_os()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -2179,40 +2185,74 @@ mod tests {
     #[test]
     fn server_environment_keeps_process_and_toolchain_basics() {
         let env = server_env([
-            ("PATH".to_string(), "/bin".to_string()),
-            ("HOME".to_string(), "/home/test".to_string()),
-            ("XDG_RUNTIME_DIR".to_string(), "/run/user/1".to_string()),
-            ("LC_CTYPE".to_string(), "C.UTF-8".to_string()),
-            ("CARGO_HOME".to_string(), "/home/test/.cargo".to_string()),
+            (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from("HOME"), OsString::from("/home/test")),
+            (
+                OsString::from("XDG_RUNTIME_DIR"),
+                OsString::from("/run/user/1"),
+            ),
+            (OsString::from("LC_CTYPE"), OsString::from("C.UTF-8")),
+            (
+                OsString::from("CARGO_HOME"),
+                OsString::from("/home/test/.cargo"),
+            ),
         ]);
 
         assert_eq!(
-            env.iter()
-                .map(|(name, _)| name.as_str())
-                .collect::<Vec<_>>(),
-            ["PATH", "HOME", "XDG_RUNTIME_DIR", "LC_CTYPE", "CARGO_HOME"]
+            env,
+            vec![
+                (OsString::from("PATH"), OsString::from("/bin")),
+                (OsString::from("HOME"), OsString::from("/home/test")),
+                (
+                    OsString::from("XDG_RUNTIME_DIR"),
+                    OsString::from("/run/user/1"),
+                ),
+                (OsString::from("LC_CTYPE"), OsString::from("C.UTF-8")),
+                (
+                    OsString::from("CARGO_HOME"),
+                    OsString::from("/home/test/.cargo"),
+                ),
+            ]
         );
     }
 
     #[test]
     fn server_environment_drops_credentials_targeting_and_injection() {
         let env = server_env([
-            ("GH_TOKEN".to_string(), "secret".to_string()),
-            ("ANTHROPIC_API_KEY".to_string(), "secret".to_string()),
-            ("AWS_SECRET_ACCESS_KEY".to_string(), "secret".to_string()),
-            ("SSH_AUTH_SOCK".to_string(), "/agent.sock".to_string()),
-            ("GIT_DIR".to_string(), "/private/repo".to_string()),
-            ("GIT_INDEX_FILE".to_string(), "/private/index".to_string()),
-            ("LD_PRELOAD".to_string(), "/tmp/inject.so".to_string()),
+            (OsString::from("GH_TOKEN"), OsString::from("secret")),
             (
-                "DYLD_INSERT_LIBRARIES".to_string(),
-                "/tmp/inject.dylib".to_string(),
+                OsString::from("ANTHROPIC_API_KEY"),
+                OsString::from("secret"),
             ),
             (
-                "NODE_OPTIONS".to_string(),
-                "--require=/tmp/hook.js".to_string(),
+                OsString::from("AWS_SECRET_ACCESS_KEY"),
+                OsString::from("secret"),
             ),
-            ("THEGN_CONTROL_TOKEN".to_string(), "secret".to_string()),
+            (
+                OsString::from("SSH_AUTH_SOCK"),
+                OsString::from("/agent.sock"),
+            ),
+            (OsString::from("GIT_DIR"), OsString::from("/private/repo")),
+            (
+                OsString::from("GIT_INDEX_FILE"),
+                OsString::from("/private/index"),
+            ),
+            (
+                OsString::from("LD_PRELOAD"),
+                OsString::from("/tmp/inject.so"),
+            ),
+            (
+                OsString::from("DYLD_INSERT_LIBRARIES"),
+                OsString::from("/tmp/inject.dylib"),
+            ),
+            (
+                OsString::from("NODE_OPTIONS"),
+                OsString::from("--require=/tmp/hook.js"),
+            ),
+            (
+                OsString::from("THEGN_CONTROL_TOKEN"),
+                OsString::from("secret"),
+            ),
         ]);
 
         assert!(env.is_empty());
@@ -2221,15 +2261,24 @@ mod tests {
     #[test]
     fn server_environment_requires_exact_names_except_lc_prefix() {
         let env = server_env([
-            ("PATHX".to_string(), "/tmp/shadow".to_string()),
+            (OsString::from("Path"), OsString::from("/bin")),
+            (OsString::from("ComSpec"), OsString::from("cmd.exe")),
+            (OsString::from("PATHX"), OsString::from("/tmp/shadow")),
             (
-                "HOMEBREW_GITHUB_API_TOKEN".to_string(),
-                "secret".to_string(),
+                OsString::from("HOMEBREW_GITHUB_API_TOKEN"),
+                OsString::from("secret"),
             ),
-            ("LC_CTYPE".to_string(), "C.UTF-8".to_string()),
+            (OsString::from("LC_CTYPE"), OsString::from("C.UTF-8")),
         ]);
 
-        assert_eq!(env, vec![("LC_CTYPE".to_string(), "C.UTF-8".to_string())]);
+        assert_eq!(
+            env,
+            vec![
+                (OsString::from("Path"), OsString::from("/bin")),
+                (OsString::from("ComSpec"), OsString::from("cmd.exe")),
+                (OsString::from("LC_CTYPE"), OsString::from("C.UTF-8")),
+            ]
+        );
     }
 
     struct BlockingWriter {
