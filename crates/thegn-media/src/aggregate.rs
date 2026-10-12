@@ -13,10 +13,15 @@
 
 use std::sync::Mutex;
 
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, join_all};
 
 use crate::model::{MediaState, PlaybackState};
 use crate::{MediaBackend, MediaCaps, MediaClient, MediaError, MediaWatch};
+
+/// A child that does not answer a snapshot cannot hold the aggregate hostage.
+/// Child futures are polled concurrently, while results are consumed in child
+/// order so source priority remains deterministic.
+const SNAPSHOT_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A set of media sources presented as one backend.
 pub struct Aggregate {
@@ -44,10 +49,16 @@ impl Aggregate {
 impl MediaBackend for Aggregate {
     fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
         Box::pin(async move {
-            // Gather each child's best snapshot (skip failures/empties).
+            // Gather independently under the same deadline. `join_all` retains
+            // child order even when completions arrive out of order.
+            let snapshots = join_all(self.children.iter().enumerate().map(|(i, c)| async move {
+                let result = tokio::time::timeout(SNAPSHOT_BUDGET, c.snapshot()).await;
+                (i, result)
+            }))
+            .await;
             let mut cands: Vec<(usize, MediaState)> = Vec::new();
-            for (i, c) in self.children.iter().enumerate() {
-                if let Ok(Some(s)) = c.snapshot().await {
+            for (i, result) in snapshots {
+                if let Ok(Ok(Some(s))) = result {
                     cands.push((i, s));
                 }
             }
@@ -129,9 +140,17 @@ impl MediaBackend for Aggregate {
     /// Union of every child's controllable players (for the picker).
     fn players(&self) -> BoxFuture<'_, Vec<String>> {
         Box::pin(async move {
+            let players =
+                join_all(self.children.iter().map(|c| async move {
+                    tokio::time::timeout(SNAPSHOT_BUDGET, c.players()).await
+                }))
+                .await;
             let mut out = Vec::new();
-            for c in &self.children {
-                for p in c.players().await {
+            for result in players {
+                let Ok(source_players) = result else {
+                    continue;
+                };
+                for p in source_players {
                     if !out.contains(&p) {
                         out.push(p);
                     }
@@ -145,25 +164,25 @@ impl MediaBackend for Aggregate {
     /// child pushes (the host then falls back to its poll ticker).
     fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
         Box::pin(async move {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
             let mut any = false;
+            let mut tasks = Vec::new();
             for c in &self.children {
                 if let Some(mut w) = c.watch().await {
                     any = true;
                     let tx = tx.clone();
-                    // Each child's watcher is driven on its own task; a tick on any
-                    // of them wakes the aggregate. Tasks end when their stream ends
-                    // or the receiver drops.
-                    tokio::spawn(async move {
+                    // A notification means “refresh current state”; while one
+                    // refresh is pending, more notifications carry no information.
+                    tasks.push(tokio::spawn(async move {
                         while w.changed().await {
-                            if tx.send(()).is_err() {
+                            if !signal_refresh(&tx) {
                                 break;
                             }
                         }
-                    });
+                    }));
                 }
             }
-            any.then(|| Box::new(AggregateWatch { rx }) as Box<dyn MediaWatch + Send>)
+            any.then(|| Box::new(AggregateWatch { rx, tasks }) as Box<dyn MediaWatch + Send>)
         })
     }
 
@@ -254,7 +273,23 @@ pub fn choose_state(
 /// A merged push stream: fires whenever any child's watcher fires. Ends when
 /// every child stream has ended (all sender tasks dropped).
 pub struct AggregateWatch {
-    rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    rx: tokio::sync::mpsc::Receiver<()>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+fn signal_refresh(tx: &tokio::sync::mpsc::Sender<()>) -> bool {
+    !matches!(
+        tx.try_send(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+    )
+}
+
+impl Drop for AggregateWatch {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
 }
 
 impl MediaWatch for AggregateWatch {
@@ -305,5 +340,26 @@ mod tests {
         let c = [("mpd", STOPPED), ("spotify", STOPPED)];
         assert_eq!(choose_state(&c, &[], None), Some(0));
         assert_eq!(choose_state(&[], &[], None), None);
+    }
+
+    #[tokio::test]
+    async fn aggregate_refresh_signals_coalesce_and_drop_cancels_children() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        assert!(signal_refresh(&tx));
+        assert!(signal_refresh(&tx));
+        assert_eq!(rx.len(), 1);
+
+        let task = tokio::spawn(std::future::pending::<()>());
+        let task_abort = task.abort_handle();
+        let watch = AggregateWatch {
+            rx,
+            tasks: vec![task],
+        };
+        drop(watch);
+        tokio::task::yield_now().await;
+        assert!(
+            task_abort.is_finished(),
+            "dropping the aggregate must abort its child tasks"
+        );
     }
 }
