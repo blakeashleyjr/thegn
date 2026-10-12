@@ -4015,9 +4015,12 @@ fn only_one_monitor_can_hold_the_pipeline_lease() {
 fn an_expired_lease_is_taken_over_without_a_human() {
     // A crashed monitor must not wedge the pipeline forever: its claim lapses.
     let db = Db::open_memory().unwrap();
-    // A zero TTL is already expired by the time the next call reads it.
-    db.acquire_pipeline_lease("lead", "crashed-monitor", 0)
-        .unwrap()
+    db.conn
+        .execute(
+            "INSERT INTO pipeline_leases (name, owner, acquired_at_ms, expires_at_ms)
+             VALUES ('lead', 'crashed-monitor', 1, 1)",
+            [],
+        )
         .unwrap();
     assert!(
         db.pipeline_lease_holder("lead").unwrap().is_none(),

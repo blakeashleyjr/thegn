@@ -1250,6 +1250,44 @@ pub(crate) fn verify_v77_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v78: discard never-live leases, bound legacy expiry, and index cleanup.
+pub(crate) fn migrate_v78(conn: &Connection) -> Result<()> {
+    let max_ttl_ms = crate::db::MAX_LEASE_TTL_SECS * 1000;
+    conn.execute(
+        "DELETE FROM pipeline_leases WHERE expires_at_ms <= acquired_at_ms",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE pipeline_leases
+         SET expires_at_ms = CASE
+             WHEN acquired_at_ms > ?1 THEN 9223372036854775807
+             ELSE acquired_at_ms + ?2
+         END
+         WHERE expires_at_ms > acquired_at_ms + ?2",
+        rusqlite::params![i64::MAX - max_ttl_ms, max_ttl_ms],
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_pipeline_leases_expiry
+         ON pipeline_leases(expires_at_ms);",
+    )?;
+    Ok(())
+}
+
+/// Verify the v78 expiry index used by bounded lease cleanup.
+pub(crate) fn verify_v78_schema(conn: &Connection) -> Result<()> {
+    let index: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_pipeline_leases_expiry'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if index.is_none() {
+        bail!("schema v78 migration did not add idx_pipeline_leases_expiry");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -1919,6 +1957,39 @@ mod tests {
             (issue.as_str(), report.as_str(), scope),
             ("linear:THE-214", "PASS", None)
         );
+    }
+
+    #[test]
+    fn v78_bounds_legacy_lease_expiry_and_indexes_cleanup_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pipeline_leases (
+                 name TEXT PRIMARY KEY, owner TEXT NOT NULL,
+                 acquired_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL);
+             INSERT INTO pipeline_leases VALUES ('long','monitor',1000,9223372036854775807);
+             INSERT INTO pipeline_leases VALUES ('dead','monitor',2000,2000);",
+        )
+        .unwrap();
+        assert!(super::verify_v78_schema(&conn).is_err());
+        super::migrate_v78(&conn).unwrap();
+        super::migrate_v78(&conn).unwrap();
+        super::verify_v78_schema(&conn).unwrap();
+        let expiry: i64 = conn
+            .query_row(
+                "SELECT expires_at_ms FROM pipeline_leases WHERE name='long'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(expiry, 1000 + crate::db::MAX_LEASE_TTL_SECS * 1000);
+        let dead_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pipeline_leases WHERE name='dead'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dead_count, 0);
     }
 
     #[test]
