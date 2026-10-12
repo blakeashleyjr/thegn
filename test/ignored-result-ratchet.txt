@@ -190,7 +190,6 @@ crates/thegn-host/src/daemon/fork.rs
 # moving off `running`, which is the whole point of the pass.
 crates/thegn-host/src/daemon/pipeline_reaper.rs
 crates/thegn-host/src/daemon/mod.rs
-crates/thegn-host/src/daemon/record.rs
 crates/thegn-host/src/daemon/service.rs
 crates/thegn-host/src/daemon/session.rs
 crates/thegn-host/src/db_task.rs
