@@ -46,15 +46,16 @@ pub(crate) const RAIL_ROWS: usize = 2;
 /// Truncate to `max` display cells with the capability-resolved ellipsis.
 /// Width-correct (`seg::cells`/`seg::take_cols`), never a byte slice.
 fn trunc(s: &str, max: usize) -> String {
+    let safe = thegn_core::pipeline_report::display_cell(s);
     let gl = crate::caps::active_glyphs();
-    if crate::seg::cells(s) <= max {
-        return s.to_string();
+    if crate::seg::cells(&safe) <= max {
+        return safe;
     }
     let dots = crate::seg::cells(gl.ellipsis);
     if max <= dots {
-        return crate::seg::take_cols(s, max).to_string();
+        return crate::seg::take_cols(&safe, max).to_string();
     }
-    let mut out = crate::seg::take_cols(s, max - dots).to_string();
+    let mut out = crate::seg::take_cols(&safe, max - dots).to_string();
     out.push_str(gl.ellipsis);
     out
 }
@@ -684,6 +685,48 @@ mod tests {
         let t = text(&lines);
         for stage in ["architect", "code", "unstaged"] {
             assert!(t.contains(stage), "stage `{stage}` missing: {t}");
+        }
+    }
+
+    #[test]
+    fn roster_text_is_sanitized_before_board_truncation() {
+        let hostile = "evil\r\nTHE-9 ✓ done\u{202e}\u{200b}";
+        let inbound_parent = "parent\r\nTHE-8\u{202e}\u{200b}";
+        let stages = [stage(inbound_parent, Some("child")), stage("child", None)];
+        let names: Vec<String> = stages.iter().map(|s| s.name.clone()).collect();
+        let rows = ordered_rows(
+            &[
+                d(1, Some(inbound_parent), None, 0),
+                d(2, Some("child"), Some(1), 10),
+                d(3, Some(hostile), None, 20),
+            ],
+            &names,
+            120_000,
+        );
+
+        for (width, expected_mode) in [(160, Mode::Columns), (40, Mode::Stacked)] {
+            let board = super::super::layout::board(&rows, &config(&stages), width, 120_000, false);
+            assert_eq!(board.mode, expected_mode);
+            let rail = rail(&board, 0, width);
+            let body = body(&board, 0, Some(2), width);
+            let emitted: Vec<String> = rail
+                .iter()
+                .map(line_text)
+                .chain(body.iter().map(|line| line_text(&line.line)))
+                .collect();
+            for text in &emitted {
+                assert!(
+                    text.chars().all(|c| {
+                        !matches!(c, '\r' | '\n' | '\u{1b}' | '\u{202e}' | '\u{200b}')
+                    }),
+                    "unsafe board text: {text:?}"
+                );
+            }
+            let all = emitted.join("\n");
+            assert!(
+                all.contains('\u{fffd}'),
+                "hostile characters should be visibly replaced: {all:?}"
+            );
         }
     }
 
