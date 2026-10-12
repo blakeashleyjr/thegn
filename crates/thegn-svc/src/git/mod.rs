@@ -1793,12 +1793,16 @@ pub(crate) fn run_w(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Resul
         env.extend(envs.iter().map(|(k, v)| (k.to_string(), v.to_string())));
         return run_bridge(&b, loc, args, &env, false);
     }
-    // Serialize this mutation against other thegn/agent processes on the same
-    // repo (held for the subprocess's lifetime). Remote locs lock on their own
-    // machine, so skip locally. Best-effort — `None` degrades to unlocked.
-    let _lock = (!loc.is_remote())
-        .then(|| thegn_core::util::lock_git_mutations(std::path::Path::new(&loc.path())))
-        .flatten();
+    // Remote locs do not have a local repository lock; local mutations must
+    // fail closed when the advisory lock cannot be acquired.
+    let _lock = if loc.is_remote() {
+        None
+    } else {
+        Some(require_mutation_lock(
+            std::path::Path::new(&loc.path()),
+            args,
+        )?)
+    };
     // Marks the write for snapshot caches of git reads (THE-718); dropped
     // (advancing the epoch) after the subprocess and its lock are done.
     let _epoch = thegn_core::util::GitWriteScope::begin();
@@ -1831,9 +1835,14 @@ pub(crate) fn run_stdin(
     args: &[&str],
     stdin: &[u8],
 ) -> Result<String> {
-    let _lock = (!loc.is_remote())
-        .then(|| thegn_core::util::lock_git_mutations(std::path::Path::new(&loc.path())))
-        .flatten();
+    let _lock = if loc.is_remote() {
+        None
+    } else {
+        Some(require_mutation_lock(
+            std::path::Path::new(&loc.path()),
+            args,
+        )?)
+    };
     let _epoch = thegn_core::util::GitWriteScope::begin();
     let mut env: Vec<(&str, &str)> = vec![("GIT_TERMINAL_PROMPT", "0")];
     env.extend_from_slice(envs);
@@ -1868,13 +1877,22 @@ pub(crate) fn gpg_args(override_gpg: bool) -> &'static [&'static str] {
 }
 
 fn run_root(root: &Path, args: &[&str]) -> Result<()> {
-    // `root` is the main checkout; lock the repo's shared `.git` for the op.
-    let _lock = thegn_core::util::lock_git_mutations(root);
+    let _lock = require_mutation_lock(root, args)?;
     if thegn_core::util::git_ok(root, args) {
         Ok(())
     } else {
         anyhow::bail!("git {} failed in {}", args.join(" "), root.display())
     }
+}
+
+fn require_mutation_lock(worktree: &Path, args: &[&str]) -> Result<thegn_core::util::GitLock> {
+    thegn_core::util::lock_git_mutations(worktree).ok_or_else(|| {
+        anyhow::anyhow!(
+            "refusing git {}: repository mutation lock is unavailable for {} (see thegn log)",
+            args.join(" "),
+            worktree.display()
+        )
+    })
 }
 
 fn parse_commit_times(out: &str) -> Result<Vec<i64>> {
@@ -2018,8 +2036,10 @@ impl GitBackend for CliGit {
         if let Some(branch) = branch {
             // Best-effort: the branch may still be checked out elsewhere.
             // A dash-named branch is refused by the validator, not reinterpreted.
-            if let Ok(b) = op::branch_name(&branch) {
-                let _ = run_root(root, &["branch", "-D", b]); // best-effort: delete failure leaves the branch for later cleanup
+            if let Ok(b) = op::branch_name(&branch)
+                && let Err(error) = run_root(root, &["branch", "-D", b])
+            {
+                tracing::debug!(target: "thegn::git", %error, "branch delete after worktree removal failed");
             }
         }
         Ok(())
@@ -2364,6 +2384,64 @@ pub(crate) mod testutil {
 
 #[cfg(test)]
 mod tests {
+    fn repo_with_unavailable_mutation_lock() -> (tempfile::TempDir, GitLoc) {
+        let dir = tempfile::tempdir().unwrap();
+        testutil::git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("tracked.txt"), "before\n").unwrap();
+        testutil::git_in(dir.path(), &["add", "--", "tracked.txt"]);
+        testutil::git_in(dir.path(), &["commit", "-q", "-m", "initial"]);
+        let lock_path = thegn_core::util::git_common_dir(dir.path()).join("thegn-git.lock");
+        std::fs::create_dir(lock_path).unwrap();
+        let loc = GitLoc::for_worktree(dir.path());
+        (dir, loc)
+    }
+
+    #[test]
+    fn run_w_refuses_when_the_mutation_lock_is_unavailable() {
+        let (dir, loc) = repo_with_unavailable_mutation_lock();
+        std::fs::write(dir.path().join("new.txt"), "new\n").unwrap();
+
+        let error = super::run_w(&loc, &[], &["add", "--", "new.txt"]).unwrap_err();
+
+        assert!(error.to_string().contains("mutation lock"));
+        assert!(error.to_string().contains("see thegn log"));
+        assert!(!error.to_string().contains("retry"));
+        assert!(
+            super::run(&loc, &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn run_stdin_refuses_when_the_mutation_lock_is_unavailable() {
+        let (_dir, loc) = repo_with_unavailable_mutation_lock();
+        let patch = b"diff --git a/tracked.txt b/tracked.txt\n--- a/tracked.txt\n+++ b/tracked.txt\n@@ -1 +1 @@\n-before\n+after\n";
+
+        let error = super::run_stdin(&loc, &[], &["apply", "--cached", "-"], patch).unwrap_err();
+
+        assert!(error.to_string().contains("mutation lock"));
+        assert!(
+            super::run(&loc, &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn run_root_refuses_when_the_mutation_lock_is_unavailable() {
+        let (dir, loc) = repo_with_unavailable_mutation_lock();
+
+        let error = super::run_root(dir.path(), &["branch", "new-branch"]).unwrap_err();
+
+        assert!(error.to_string().contains("mutation lock"));
+        assert!(
+            super::run(&loc, &["branch", "--list", "new-branch"])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn read_deadline_raises_flag_for_a_blocked_read() {
         use std::sync::atomic::Ordering;
