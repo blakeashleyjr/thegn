@@ -15,6 +15,10 @@ use thegn_core::issue::{
 use super::{IssueBackend, IssueError};
 use futures_util::future::BoxFuture;
 
+fn effective_issue_limit(limit: usize) -> usize {
+    if limit == 0 { 100 } else { limit }
+}
+
 pub struct GitHubIssuesBackend {
     extra_flags: Vec<String>,
     /// Working directory for `gh` invocations. Without it, any call that lacks
@@ -384,7 +388,7 @@ impl IssueBackend for GitHubIssuesBackend {
     ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
         Box::pin(async move {
             let expected_host = self.effective_host(filter.repo.as_deref())?;
-            let limit_str = filter.limit.to_string();
+            let limit_str = effective_issue_limit(filter.limit).to_string();
             let mut args: Vec<&str> = vec![
                 "issue",
                 "list",
@@ -646,7 +650,7 @@ impl IssueBackend for GitHubIssuesBackend {
     ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
         Box::pin(async move {
             let expected_host = self.effective_host(None)?;
-            let limit_str = limit.to_string();
+            let limit_str = effective_issue_limit(limit).to_string();
             let mut args: Vec<&str> = vec![
                 "issue",
                 "list",
