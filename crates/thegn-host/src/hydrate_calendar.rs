@@ -18,12 +18,12 @@
 //!    cursor both survive, so a blip degrades to stale data, not no data.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{Datelike, NaiveDate};
 use termwiz::terminal::TerminalWaker;
 use thegn_core::calendar::{CalEvent, CalendarWindow, ExpansionError};
-use thegn_core::config_calendar::CalendarConfig;
+use thegn_core::config_calendar::{CalendarAccount, CalendarConfig};
 use thegn_core::db::Db;
 use thegn_core::store::{CalendarRow, CalendarStore};
 use thegn_svc::calendar::{CalendarError, CalendarRouter, EventPage, PageMode};
@@ -37,6 +37,105 @@ use crate::hydrate::RefreshKind;
 /// The grid shows leading and trailing days from the neighbouring months, so an
 /// event on Jan 31 has to be in February's answer.
 const GRID_SLACK_DAYS: u64 = 7;
+
+#[derive(Default)]
+struct CalendarRequests {
+    next: u64,
+    latest: BTreeMap<(i32, u32), u64>,
+}
+
+fn calendar_requests() -> &'static Mutex<CalendarRequests> {
+    static REQUESTS: OnceLock<Mutex<CalendarRequests>> = OnceLock::new();
+    REQUESTS.get_or_init(|| Mutex::new(CalendarRequests::default()))
+}
+
+pub(crate) fn register_month_request(month: (i32, u32)) -> u64 {
+    let mut requests = calendar_requests()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    requests.next = requests
+        .next
+        .checked_add(1)
+        .expect("calendar request id overflow");
+    let request = requests.next;
+    requests.latest.insert(month, request);
+    request
+}
+
+fn request_is_latest(latest: &BTreeMap<(i32, u32), u64>, month: (i32, u32), request: u64) -> bool {
+    latest.get(&month) == Some(&request)
+}
+
+pub(crate) fn calendar_payload_is_current(payload: &crate::detail::CalendarPayload) -> bool {
+    let Some(request) = payload.request else {
+        return true;
+    };
+    let requests = calendar_requests()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    request_is_latest(&requests.latest, payload.month, request)
+}
+
+fn connectivity_evidence(
+    network_backed: bool,
+    result: &Result<EventPage, CalendarError>,
+) -> Option<bool> {
+    if !network_backed {
+        return None;
+    }
+    match result {
+        Ok(_) => Some(true),
+        Err(error) if error.is_transient() => Some(false),
+        Err(_) => None,
+    }
+}
+
+#[derive(Default)]
+struct ConnectivityEvidenceBatch {
+    saw_success: bool,
+    failures: u32,
+}
+
+impl ConnectivityEvidenceBatch {
+    fn observe(&mut self, evidence: Option<bool>) {
+        match evidence {
+            Some(true) => self.saw_success = true,
+            Some(false) => self.failures = self.failures.saturating_add(1),
+            None => {}
+        }
+    }
+
+    fn outcome(self) -> Option<ConnEvidence> {
+        if self.saw_success {
+            Some(ConnEvidence::Reachable)
+        } else if self.failures > 0 {
+            Some(ConnEvidence::Unreachable(self.failures))
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnEvidence {
+    Reachable,
+    Unreachable(u32),
+}
+
+fn network_account_names(accounts: &[CalendarAccount]) -> std::collections::BTreeSet<&str> {
+    accounts
+        .iter()
+        .filter(|account| account.is_network_backed())
+        .map(|account| account.name.as_str())
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+struct MonthCoverage {
+    year: i32,
+    month: u32,
+    covered: (NaiveDate, NaiveDate),
+}
 
 /// Fetch one month's events for the open popup.
 ///
@@ -53,17 +152,23 @@ pub(crate) fn spawn_month_fetch(
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: TerminalWaker,
 ) -> crate::sched::Admission {
+    let request = register_month_request((year, month));
     let worker_tx = tx.clone();
     let worker_waker = waker.clone();
     let admission = crate::sched::spawn_bg(move || {
+        let coverage = MonthCoverage {
+            year,
+            month,
+            covered: widen(from, to),
+        };
         let mut completion = MonthFetchCompletion {
             tx: worker_tx.clone(),
             waker: Some(worker_waker.clone()),
-            year,
-            month,
+            coverage,
+            request,
             sent: false,
         };
-        let (wide_from, wide_to) = widen(from, to);
+        let (wide_from, wide_to) = coverage.covered;
         let home = home_zone(&cfg);
         let db = Db::open().ok(); // best-effort: cache: the popup falls back to the provider fetch when the DB is out
 
@@ -101,14 +206,24 @@ pub(crate) fn spawn_month_fetch(
         deliver(
             &worker_tx,
             Some(&worker_waker),
-            year,
-            month,
+            coverage,
             month_view,
             None,
+            Some(request),
         );
         completion.sent = true;
     });
-    deliver_unavailable_if_refused(admission, &tx, Some(&waker), year, month);
+    deliver_unavailable_if_refused(
+        admission,
+        &tx,
+        Some(&waker),
+        MonthCoverage {
+            year,
+            month,
+            covered: widen(from, to),
+        },
+        Some(request),
+    );
     admission
 }
 
@@ -116,17 +231,17 @@ fn deliver_unavailable_if_refused(
     admission: crate::sched::Admission,
     tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: Option<&TerminalWaker>,
-    year: i32,
-    month: u32,
+    coverage: MonthCoverage,
+    request: Option<u64>,
 ) {
     if admission != crate::sched::Admission::Admitted {
         deliver(
             tx,
             waker,
-            year,
-            month,
+            coverage,
             MonthView::failed(CalendarViewError::CacheUnavailable),
             None,
+            request,
         );
     }
 }
@@ -136,8 +251,8 @@ fn deliver_unavailable_if_refused(
 struct MonthFetchCompletion {
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: Option<TerminalWaker>,
-    year: i32,
-    month: u32,
+    coverage: MonthCoverage,
+    request: u64,
     sent: bool,
 }
 
@@ -147,10 +262,10 @@ impl Drop for MonthFetchCompletion {
             deliver(
                 &self.tx,
                 self.waker.as_ref(),
-                self.year,
-                self.month,
+                self.coverage,
                 MonthView::failed(CalendarViewError::CacheUnavailable),
                 None,
+                Some(self.request),
             );
         }
     }
@@ -249,10 +364,14 @@ pub(crate) fn spawn_periodic_sync_with_generation(
         deliver(
             &tx,
             Some(&waker),
-            today.year(),
-            today.month(),
+            MonthCoverage {
+                year: today.year(),
+                month: today.month(),
+                covered: (wide_from, wide_to),
+            },
             month_view,
             generation.as_ref(),
+            None,
         );
     });
 }
@@ -415,16 +534,16 @@ fn sync_accounts_with_generation(
     // Each account's page is applied and dropped inside the sink, releasing its
     // share of the global admission budget before the next account is fetched.
     let mut changed = false;
+    let network_accounts = network_account_names(&accounts);
+    let mut connectivity = ConnectivityEvidenceBatch::default();
     rt.block_on(router.list_events_each(window, &tokens, |r| {
+        connectivity.observe(connectivity_evidence(
+            network_accounts.contains(r.account.as_str()),
+            &r.result,
+        ));
         let mut page = match r.result {
-            Ok(p) => {
-                thegn_core::connectivity::report_success();
-                p
-            }
+            Ok(p) => p,
             Err(e) => {
-                if e.is_transient() {
-                    thegn_core::connectivity::report_failure();
-                }
                 record_failure(
                     db,
                     &r.account,
@@ -456,6 +575,17 @@ fn sync_accounts_with_generation(
             changed = true;
         }
     }));
+    if crate::hydrate_schedule::generation_is_current(generation) {
+        match connectivity.outcome() {
+            Some(ConnEvidence::Reachable) => thegn_core::connectivity::report_success(),
+            Some(ConnEvidence::Unreachable(failures)) => {
+                for _ in 0..failures {
+                    thegn_core::connectivity::report_failure();
+                }
+            }
+            None => {}
+        }
+    }
     changed
 }
 
@@ -1001,7 +1131,7 @@ fn reminder_cache_window(
     CalendarWindow::new(first, last, home)
 }
 
-fn widen(from: NaiveDate, to: NaiveDate) -> (NaiveDate, NaiveDate) {
+pub(crate) fn widen(from: NaiveDate, to: NaiveDate) -> (NaiveDate, NaiveDate) {
     (
         from.checked_sub_days(chrono::Days::new(GRID_SLACK_DAYS))
             .unwrap_or(from),
@@ -1034,10 +1164,10 @@ fn home_zone(cfg: &CalendarConfig) -> chrono_tz::Tz {
 fn deliver(
     tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: Option<&TerminalWaker>,
-    year: i32,
-    month: u32,
+    coverage: MonthCoverage,
     view: MonthView,
     generation: Option<&crate::hydrate_schedule::ScheduleFence>,
+    request: Option<u64>,
 ) {
     if !crate::hydrate_schedule::generation_is_current(generation) {
         return;
@@ -1047,13 +1177,15 @@ fn deliver(
         tracing::warn!(
             target: "thegn::calendar",
             error = %error,
-            year,
-            month,
+            year = coverage.year,
+            month = coverage.month,
             "calendar month is unavailable or incomplete"
         );
     }
     let payload = crate::detail::CalendarPayload {
-        month: (year, month),
+        month: (coverage.year, coverage.month),
+        covered: coverage.covered,
+        request,
         events: view.events,
         error: view.error,
     };

@@ -104,11 +104,11 @@ impl std::fmt::Display for CalendarMutation {
 impl CalendarError {
     /// Whether retrying later might work.
     ///
-    /// Narrow on purpose. A **missing** `.ics` file is a configuration mistake,
-    /// not a blip — reporting it as transient would both suppress the error and
-    /// wrongly mark the whole app as offline.
+    /// Retryable failures preserve the cache and may work on a later attempt.
+    /// Connectivity evidence is classified separately by the transport that
+    /// produced the result; a local command timeout is retryable too.
     pub fn is_transient(&self) -> bool {
-        matches!(self, CalendarError::Network(_))
+        matches!(self, CalendarError::Network(_) | CalendarError::Timeout(_))
     }
 }
 
