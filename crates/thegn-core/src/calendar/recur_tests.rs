@@ -1039,6 +1039,47 @@ fn a_part_without_an_equals_sign_is_ignored() {
 }
 
 #[test]
+fn bare_known_rule_parts_are_rejected_but_empty_and_unknown_parts_are_ignored() {
+    assert_eq!(
+        RRule::parse("FREQ=DAILY;COUNT"),
+        Err(RecurError::BadValue("COUNT".to_string()))
+    );
+    assert_eq!(
+        RRule::parse("FREQ=WEEKLY;UNTIL"),
+        Err(RecurError::BadValue("UNTIL".to_string()))
+    );
+    assert_eq!(
+        RRule::parse("FREQ=DAILY;;X-NAME=1").unwrap().freq,
+        Freq::Daily
+    );
+}
+
+#[test]
+fn duplicate_known_rule_parts_are_rejected() {
+    assert_eq!(
+        RRule::parse("FREQ=DAILY;COUNT=2;COUNT=500"),
+        Err(RecurError::BadValue("duplicate COUNT".to_string()))
+    );
+    assert_eq!(
+        RRule::parse("FREQ=DAILY;FREQ=WEEKLY"),
+        Err(RecurError::BadValue("duplicate FREQ".to_string()))
+    );
+}
+
+#[test]
+fn count_and_until_cannot_appear_together() {
+    assert_eq!(
+        RRule::parse("FREQ=DAILY;COUNT=3;UNTIL=20261231T000000Z"),
+        Err(RecurError::BadValue("COUNT with UNTIL".to_string()))
+    );
+}
+
+#[test]
+fn serde_rejects_duplicate_rule_parts() {
+    assert!(serde_json::from_str::<RRule>("\"FREQ=DAILY;COUNT=2;COUNT=500\"").is_err());
+}
+
+#[test]
 fn to_rrule_emits_only_the_parts_that_were_set() {
     // A minimal rule must not round-trip into a wall of defaults.
     assert_eq!(RRule::parse("FREQ=DAILY").unwrap().to_rrule(), "FREQ=DAILY");
