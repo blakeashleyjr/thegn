@@ -211,12 +211,16 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
                         let _ = waker2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                         return;
                     }
+                    let wake_on_busy = waker2.clone();
                     if crate::hydrate_tracker::request_issue_refresh(cwd2, full_cfg, Some(waker2))
                         == crate::hydrate_tracker::RefreshStart::Busy
                     {
                         thegn_core::msg::warn(
                             "Issue refresh busy after assignment; try again shortly",
                         );
+                        if let Err(error) = wake_on_busy.wake() {
+                            tracing::debug!(%error, "failed to wake after busy issue refresh");
+                        }
                     }
                 });
                 ctx.model.status = format!("Assigning {} to you…", issue.number);
