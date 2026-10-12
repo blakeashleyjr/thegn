@@ -130,6 +130,29 @@ fn output_is_capped_rather_than_buffered_without_limit() {
 }
 
 #[test]
+fn collected_output_has_a_total_retained_byte_cap() {
+    let line = format!(r#"{{"method":"x","params":"{}"}}"#, "a".repeat(64 * 1024));
+    let mut collect = Collect {
+        run: PluginRun::default(),
+        retained_bytes: 0,
+    };
+    let mut accepted = 0usize;
+    loop {
+        if !collect.line(&line) {
+            break;
+        }
+        accepted += 1;
+    }
+
+    assert!(
+        collect.run.truncated,
+        "byte-cap rejection must be observable"
+    );
+    assert!(accepted > 0);
+    assert!(collect.retained_bytes <= MAX_RUN_BYTES + line.len());
+}
+
+#[test]
 fn an_oversized_frame_is_discarded_as_one_frame() {
     let oversized_bytes = MAX_LINE_BYTES * 5 / 2;
     let script = format!(

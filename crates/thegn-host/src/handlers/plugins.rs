@@ -25,6 +25,9 @@ use crate::chrome::FrameModel;
 use crate::plugin_damage::PluginDamage;
 use crate::plugins::{LoadedState, PluginMsg, PluginsHost};
 
+const MAX_PENDING_ALERTS_PER_PLUGIN: usize = 16;
+const MAX_ALERT_MESSAGE_BYTES: usize = 1024;
+
 /// One live (or dead-but-remembered) plugin on the loop side.
 pub(crate) struct PluginEntry {
     pub plugin: LoadedPlugin,
@@ -53,6 +56,8 @@ pub(crate) struct PluginsState {
     /// Notifications raised via the `notify` verb this drain, recorded to the
     /// inbox off-loop by [`flush_alerts`]. `(plugin id, alert)`.
     pub pending_alerts: Vec<(String, Alert)>,
+    /// Number of alerts dropped per plugin in the current outbox batch.
+    pending_alert_drops: BTreeMap<String, usize>,
     /// Lazily started `host.call` dispatcher (a thread is only spawned once a
     /// plugin actually calls).
     dispatcher: Option<Dispatcher>,
@@ -65,6 +70,7 @@ impl PluginsState {
         Self {
             plugins: BTreeMap::new(),
             pending_alerts: Vec::new(),
+            pending_alert_drops: BTreeMap::new(),
             dispatcher: None,
             cfg,
         }
@@ -376,21 +382,29 @@ pub(crate) fn invoke_palette_action(
 /// Record this drain's raised alerts to the notification inbox, off-loop.
 /// Call after [`drain`] from the event loop (requires a tokio runtime).
 pub(crate) fn flush_alerts(state: &mut PluginsState) {
-    for (plugin, alert) in state.pending_alerts.drain(..) {
-        tokio::task::spawn_blocking(move || {
-            let Ok(db) = thegn_core::db::Db::open() else {
-                return;
-            };
-            // best-effort: the inbox is a cache; the audit log has the record.
-            let _ = crate::automation_events::emit(
+    let alerts = std::mem::take(&mut state.pending_alerts);
+    for (plugin, dropped) in std::mem::take(&mut state.pending_alert_drops) {
+        tracing::warn!(target: "thegn::plugin", plugin = %plugin, dropped, cap = MAX_PENDING_ALERTS_PER_PLUGIN, "plugin alerts dropped: per-drain outbox cap reached");
+    }
+    if alerts.is_empty() {
+        return;
+    }
+    drop(tokio::task::spawn_blocking(move || {
+        let Ok(db) = thegn_core::db::Db::open() else {
+            return;
+        };
+        for (plugin, alert) in alerts {
+            if let Err(error) = crate::automation_events::emit(
                 &db,
                 "plugin",
                 &plugin,
                 &format!("{}: {}", alert.source, alert.message),
                 "",
-            );
-        });
-    }
+            ) {
+                tracing::debug!(target: "thegn::plugin", plugin = %plugin, error = %error, "plugin alert persistence failed");
+            }
+        }
+    }));
 }
 
 /// Apply every queued [`PluginMsg`]. Returns the narrowest aggregate render
@@ -414,7 +428,12 @@ pub(crate) fn drain(
                     let id = st.plugin.spec.manifest.id.as_str().to_string();
                     let entry = build_entry(st);
                     send_activate(&entry);
-                    state.plugins.insert(id, entry);
+                    let failed_resident_start =
+                        entry.plugin.spec.mode == PluginMode::Resident && entry.writer.is_none();
+                    state.plugins.insert(id.clone(), entry);
+                    if failed_resident_start {
+                        damage.merge(handle_exit(state, model, host, &id, None));
+                    }
                 }
                 sync_provider_registry(state);
                 damage.merge(PluginDamage::Structural);
@@ -708,14 +727,33 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> Plu
             }),
         HostVerb::Notify => serde_json::from_value::<Alert>(params)
             .map_err(|e| RpcError::new(RpcErrorCode::Invalid, format!("bad alert: {e}")))
-            .and_then(|alert| {
+            .and_then(|mut alert| {
+                if alert.message.len() > MAX_ALERT_MESSAGE_BYTES {
+                    let mut end = MAX_ALERT_MESSAGE_BYTES;
+                    while !alert.message.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    alert.message.truncate(end);
+                }
                 entry
                     .runtime
                     .notify(pid.clone(), alert.clone())
                     .map_err(rpc_error_of)?;
                 // Route through the same inbox other producers use; the DB
                 // write happens off-loop in `flush_alerts`.
-                state.pending_alerts.push((plugin.to_string(), alert));
+                let queued = state
+                    .pending_alerts
+                    .iter()
+                    .filter(|(queued_plugin, _)| queued_plugin == plugin)
+                    .count();
+                if queued < MAX_PENDING_ALERTS_PER_PLUGIN {
+                    state.pending_alerts.push((plugin.to_string(), alert));
+                } else {
+                    *state
+                        .pending_alert_drops
+                        .entry(plugin.to_string())
+                        .or_default() += 1;
+                }
                 Ok(serde_json::Value::Null)
             }),
         HostVerb::StateSet => {
@@ -1277,6 +1315,68 @@ mod tests {
             entry.runtime.audit_log().last().map(|e| e.decision),
             Some(thegn_core::plugin_api::AuditDecision::Granted)
         ));
+    }
+
+    #[test]
+    fn alert_outbox_caps_each_plugin_without_starving_other_plugins() {
+        let source = |id: &str| {
+            spec(
+                id,
+                vec![contribution(
+                    "src",
+                    ExtensionPoint::NotificationSource,
+                    &format!("{id}/alerts"),
+                    id,
+                )],
+                Vec::new(),
+            )
+        };
+        let mut state = state_with(vec![source("n"), source("m")]);
+        let mut model = FrameModel::default();
+        let notify = |plugin: &str| PluginMsg::Event {
+            plugin: plugin.into(),
+            event: SessionEvent::Message(msg(
+                "notify",
+                serde_json::json!({"source": plugin, "message": "界".repeat(500)}),
+            )),
+        };
+
+        drain_messages(
+            &mut state,
+            &mut model,
+            (0..100).map(|_| notify("n")).chain([notify("m")]),
+        );
+
+        let n_alerts = state
+            .pending_alerts
+            .iter()
+            .filter(|(plugin, _)| plugin == "n")
+            .count();
+        assert_eq!(n_alerts, MAX_PENDING_ALERTS_PER_PLUGIN);
+        assert!(state.pending_alerts.iter().any(|(plugin, alert)| {
+            plugin == "m" && alert.message.len() == MAX_ALERT_MESSAGE_BYTES - 1
+        }));
+        assert!(
+            state
+                .pending_alerts
+                .iter()
+                .all(|(_, alert)| alert.message.len() <= MAX_ALERT_MESSAGE_BYTES)
+        );
+    }
+
+    #[test]
+    fn initial_resident_spawn_failure_enters_restart_backoff() {
+        let mut state = PluginsState::new(thegn_core::config::Config::default());
+        let mut model = FrameModel::default();
+
+        drain_one(
+            &mut state,
+            &mut model,
+            PluginMsg::Loaded(vec![loaded_state(seg_spec("p"))]),
+        );
+
+        assert_eq!(state.plugins["p"].restarts, 1);
+        assert!(state.plugins["p"].writer.is_none());
     }
 
     #[test]
