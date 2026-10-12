@@ -79,6 +79,18 @@ fn spawn_failure_line(err: &anyhow::Error) -> String {
     thegn_core::log_redact::redact_text_line(&format!("{err:#}"))
 }
 
+fn materialize_fallback_cwd(
+    worktree: &str,
+    current: Option<std::path::PathBuf>,
+    home: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    if !worktree.is_empty() {
+        let path = std::path::PathBuf::from(worktree);
+        return if path.is_dir() { Some(path) } else { home };
+    }
+    current.or(home)
+}
+
 fn git_scrubbed_env(env: &[(String, String)]) -> Vec<(String, String)> {
     env.iter()
         .filter(|(key, _)| !thegn_core::util::GIT_ENV_VARS.contains(&key.as_str()))
@@ -590,9 +602,10 @@ impl Panes {
             match self.spawn_daemon_backed(argv, cwd, &env, center, None, None) {
                 Ok(id) => return Ok(id),
                 Err(e) => {
+                    let line = spawn_failure_line(&e);
                     tracing::warn!(
                         target: "thegn::daemon",
-                        "daemon-backed spawn unavailable; using in-process PTY: {e}"
+                        "daemon-backed spawn unavailable; using in-process PTY: {line}"
                     );
                 }
             }
@@ -921,10 +934,18 @@ impl Panes {
         center: Rect,
         attach: &[(u32, crate::handlers::worktree_attach::AttachTarget)],
     ) -> Result<()> {
-        let cwd = (!worktree.is_empty() && std::path::Path::new(worktree).is_dir())
-            .then(|| std::path::PathBuf::from(worktree))
-            .or_else(|| std::env::current_dir().ok())
-            .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from));
+        let worktree_missing = !worktree.is_empty() && !std::path::Path::new(worktree).is_dir();
+        if worktree_missing {
+            tracing::warn!(
+                target: "thegn::startup",
+                "selected worktree directory is unavailable; falling back to home directory"
+            );
+        }
+        let cwd = materialize_fallback_cwd(
+            worktree,
+            std::env::current_dir().ok(),
+            std::env::var_os("HOME").map(std::path::PathBuf::from),
+        );
 
         let spawn_t0 = std::time::Instant::now();
         let mut map = std::collections::HashMap::new();
@@ -1068,7 +1089,8 @@ impl Panes {
                         continue;
                     }
                     Err(e) => {
-                        tracing::warn!(target: "thegn::startup", "native exec spawn failed, falling back: {e}");
+                        let line = spawn_failure_line(&e);
+                        tracing::warn!(target: "thegn::startup", "native exec spawn failed, falling back: {line}");
                     }
                 }
             }
@@ -1883,6 +1905,39 @@ mod tests {
         let line = spawn_failure_line(&err);
         assert!(!line.contains("ghp_secret"));
         assert!(line.contains("spawn child"));
+    }
+
+    #[test]
+    fn materialize_fallback_cwd_uses_existing_worktree_and_never_missing_worktree_host_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let existing = root.path().join("worktree");
+        std::fs::create_dir(&existing).unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let missing = root.path().join("missing-worktree");
+        let current = root.path().join("current");
+
+        assert_eq!(
+            materialize_fallback_cwd(
+                existing.to_str().unwrap(),
+                Some(current.clone()),
+                Some(home.clone()),
+            ),
+            Some(existing)
+        );
+        assert_eq!(
+            materialize_fallback_cwd(
+                missing.to_str().unwrap(),
+                Some(current.clone()),
+                Some(home.clone()),
+            ),
+            Some(home.clone()),
+            "a missing selected worktree must skip the process cwd"
+        );
+        assert_eq!(
+            materialize_fallback_cwd("", Some(current.clone()), Some(home.clone())),
+            Some(current)
+        );
     }
 
     #[test]

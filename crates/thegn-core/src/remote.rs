@@ -329,6 +329,7 @@ impl GitLoc {
                 if program.is_empty() {
                     return Err("custom terminal command is empty".into());
                 }
+                let host = checked_ssh_destination(&ssh.host)?;
                 let remote = format!(
                     "{} cd {} && exec {}",
                     util::GIT_ENV_VARS
@@ -341,7 +342,7 @@ impl GitLoc {
                 );
                 let mut argv = ssh.ssh_base(false);
                 argv.push("-t".into());
-                argv.push(ssh.host.clone());
+                argv.push(host.to_string());
                 argv.push("--".into());
                 argv.push(util::sh_join(&["/bin/sh".into(), "-lc".into(), remote]));
                 Ok((argv, None))
@@ -796,6 +797,24 @@ impl GitLoc {
     }
 }
 
+fn checked_ssh_destination(host: &str) -> Result<&str, String> {
+    if host.is_empty() {
+        return Err("SSH destination is empty; refusing terminal launch".into());
+    }
+    if host.starts_with('-') {
+        return Err("SSH destination may not start with '-'; refusing terminal launch".into());
+    }
+    if host
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(
+            "SSH destination contains whitespace or control bytes; refusing terminal launch".into(),
+        );
+    }
+    Ok(host)
+}
+
 /// The idempotent provisioning script for a fresh provider env (8-A.3): clone the
 /// repo into the worktree dir on first open, no-op once it's a git repo. Designed
 /// to run via [`GitLoc::sh_command`], which already `cd`s into the workdir — so
@@ -967,6 +986,20 @@ mod tests {
         assert_eq!(argv, expected);
         assert!(!argv.contains(&"BatchMode=yes".into()));
         assert_eq!(cwd, None);
+    }
+
+    #[test]
+    fn interactive_remote_argv_refuses_unsafe_ssh_destinations() {
+        for host in ["", "-oProxyCommand=touch x", "a b", "host\nname"] {
+            let loc = GitLoc::Remote {
+                ssh: SshTarget::plain(host.into(), 22, false),
+                path: "/w".into(),
+            };
+            assert!(
+                loc.interactive_argv(&["git".into()]).is_err(),
+                "unsafe SSH destination should be refused: {host:?}"
+            );
+        }
     }
 
     #[test]
