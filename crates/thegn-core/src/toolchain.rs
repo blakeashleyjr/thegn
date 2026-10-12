@@ -91,12 +91,12 @@ const MAX_SYNTH_FLAKE_BYTES: usize = 40_000;
 
 /// Parse one bounded nixpkgs attribute path, returning its trimmed form.
 pub fn parse_nix_attr_path(raw: &str) -> Result<String, String> {
-    if raw.len() > MAX_NIX_ATTR_PATH_BYTES {
+    let path = raw.trim();
+    if path.len() > MAX_NIX_ATTR_PATH_BYTES {
         return Err(format!(
             "package path exceeds {MAX_NIX_ATTR_PATH_BYTES} bytes"
         ));
     }
-    let path = raw.trim();
     if path.is_empty() {
         return Err("empty package path".to_string());
     }
@@ -136,6 +136,9 @@ fn push_package_list(
 ) {
     let mut warning_sent = false;
     for raw in values.iter().take(MAX_SYNTH_PACKAGE_SCAN) {
+        if raw.trim().is_empty() {
+            continue;
+        }
         match parse_nix_attr_path(raw) {
             Ok(package) => {
                 if !seen.contains(&package) && out.len() == MAX_SYNTH_PACKAGES {
@@ -144,6 +147,7 @@ fn push_package_list(
                             "toolchain.{name}: package limit of {MAX_SYNTH_PACKAGES} reached; remaining entries ignored"
                         ));
                     }
+                    warning_sent = true;
                     break;
                 }
                 if seen.insert(package.clone()) {
@@ -184,12 +188,12 @@ fn admit_synth_packages(packages: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(packages.len().min(MAX_SYNTH_PACKAGES));
     let mut seen = HashSet::with_capacity(packages.len().min(MAX_SYNTH_PACKAGES));
     for raw in packages.iter().take(MAX_SYNTH_PACKAGE_SCAN) {
-        if let Ok(package) = parse_nix_attr_path(raw) {
-            if seen.insert(package.clone()) {
-                out.push(package);
-                if out.len() == MAX_SYNTH_PACKAGES {
-                    break;
-                }
+        if let Ok(package) = parse_nix_attr_path(raw)
+            && seen.insert(package.clone())
+        {
+            out.push(package);
+            if out.len() == MAX_SYNTH_PACKAGES {
+                break;
             }
         }
     }
@@ -416,7 +420,10 @@ mod tests {
             extra: v(&["", "  ", "just"]),
             ..Default::default()
         };
-        assert_eq!(packages_for(&[], &tc), v(&["just"]));
+        let (packages, warnings, _) =
+            crate::config_diagnostics::capture_quiet(|| packages_for(&[], &tc));
+        assert_eq!(packages, v(&["just"]));
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -439,6 +446,8 @@ mod tests {
         assert!(parse_nix_attr_path("a.b.c.d.e.f.g.h.i").is_err());
         assert!(parse_nix_attr_path(&"a".repeat(MAX_NIX_ATTR_PATH_BYTES)).is_ok());
         assert!(parse_nix_attr_path(&"a".repeat(MAX_NIX_ATTR_PATH_BYTES + 1)).is_err());
+        let padded = format!("{}a{}", " ".repeat(MAX_NIX_ATTR_PATH_BYTES), " ");
+        assert_eq!(parse_nix_attr_path(&padded).unwrap(), "a");
         for keyword in [
             "if", "then", "else", "assert", "with", "let", "in", "rec", "inherit", "or",
         ] {
@@ -517,17 +526,22 @@ mod tests {
         };
         assert!(packages_for(&[], &config).is_empty());
         assert!(!synth_flake(&items).contains("pkgs.after_scan_limit"));
+    }
 
-        let bounded = (0..=MAX_SYNTH_PACKAGE_SCAN)
+    #[test]
+    fn package_limit_warning_suppresses_scan_warning() {
+        let items = (0..=MAX_SYNTH_PACKAGE_SCAN)
             .map(|i| format!("scan_pkg_{i}"))
             .collect::<Vec<_>>();
         let config = ToolchainConfig {
-            extra: bounded,
+            extra: items,
             ..Default::default()
         };
-        let admitted = packages_for(&[], &config);
-        assert_eq!(admitted.len(), MAX_SYNTH_PACKAGE_SCAN);
-        assert!(!admitted.contains(&"scan_pkg_512".to_string()));
+        let (admitted, warnings, _) =
+            crate::config_diagnostics::capture_quiet(|| packages_for(&[], &config));
+        assert_eq!(admitted.len(), MAX_SYNTH_PACKAGES);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("package limit"));
     }
 
     #[test]
