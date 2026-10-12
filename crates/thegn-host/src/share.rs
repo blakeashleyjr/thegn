@@ -379,25 +379,26 @@ impl ShareSupervisor {
     /// the supervisor's own state, never a possibly-stale render mirror.
     pub fn stop(&mut self, worktree: &str, port: Option<u16>) -> Vec<u16> {
         let mut stopped = Vec::new();
+        // Failed instances already received a terminal event and have no
+        // worker left to await. Remove them before mutating the live records.
         self.instances.retain(|i| {
             let matched = i.worktree == worktree && port.is_none_or(|p| p == i.port);
-            if matched {
-                // A failed generation already received its terminal event and
-                // its worker has exited, so there is nothing left to await.
-                if matches!(i.state, ShareState::Failed(_)) {
-                    stopped.push(i.port);
-                    return false;
-                }
-                if matches!(i.state, ShareState::Stopping) {
-                    return true;
-                }
+            if matched && matches!(i.state, ShareState::Failed(_)) {
+                stopped.push(i.port);
+                false
+            } else {
+                true
+            }
+        });
+        for i in &mut self.instances {
+            let matched = i.worktree == worktree && port.is_none_or(|p| p == i.port);
+            if matched && !matches!(i.state, ShareState::Stopping) {
                 stopped.push(i.port);
                 i.kill();
                 // Retain this generation until its worker acknowledges teardown.
                 i.state = ShareState::Stopping;
             }
-            true
-        });
+        }
         stopped
     }
 

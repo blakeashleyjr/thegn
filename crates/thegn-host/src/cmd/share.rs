@@ -9,7 +9,7 @@
 //! The in-process host supervisor (live respawn on restart, badge, panel) builds
 //! on the same `[share]` config + `thegn_svc::share` seam this CLI uses.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::outln;

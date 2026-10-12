@@ -1068,14 +1068,20 @@ fn repository_identity(worktree: &std::path::Path) -> Vec<u8> {
     let git_dir = if metadata.is_dir() {
         match std::fs::canonicalize(&dot_git) {
             Ok(path) => Some(path),
-            Err(_) => None,
+            Err(error) => {
+                tracing::trace!(%error, "could not canonicalize worktree .git directory");
+                None
+            }
         }
     } else {
         match std::fs::read_to_string(&dot_git) {
             Ok(contents) => match contents.trim().strip_prefix("gitdir:") {
                 Some(raw) => match std::fs::canonicalize(worktree.join(raw.trim())) {
                     Ok(path) => Some(path),
-                    Err(_) => None,
+                    Err(error) => {
+                        tracing::trace!(%error, "could not canonicalize worktree git directory");
+                        None
+                    }
                 },
                 None => None,
             },
