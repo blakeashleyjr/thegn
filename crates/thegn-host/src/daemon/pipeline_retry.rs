@@ -280,52 +280,68 @@ pub(crate) async fn stamp_dispatch_exit(
     const LOOKUP_ATTEMPTS: usize = 20;
     const LOOKUP_RETRY: Duration = Duration::from_millis(25);
     const LOOKUP_DEADLINE: Duration = Duration::from_millis(500);
+    enum Association {
+        Miss,
+        Terminal,
+        Stamped(
+            thegn_core::issue::DispatchRunRef,
+            thegn_core::issue::ExitStamp,
+        ),
+    }
     let deadline = tokio::time::Instant::now() + LOOKUP_DEADLINE;
 
     for attempt in 0..LOOKUP_ATTEMPTS {
         let sid = session.clone();
-        // Session identity only (THE-238): a miss is Stale, usually the
-        // publication race this bounded loop exists to close.
-        let attribution = match tokio::time::timeout_at(
+        // Resolve, check the verdict, and stamp under the same DB lock. A
+        // terminal verdict that races session publication must win before the
+        // exit can persist its stamp.
+        let association = match tokio::time::timeout_at(
             deadline,
-            svc.with_db(move |db| db.dispatch_for_exit("", Some(&sid))),
+            svc.with_db(move |db| {
+                use thegn_core::issue::ExitAttribution;
+
+                let attribution = db.dispatch_for_exit("", Some(&sid))?;
+                let ExitAttribution::Exact(run) = attribution else {
+                    return Ok(Association::Miss);
+                };
+                let row = db.get_dispatch(run.id)?;
+                if row.as_ref().is_some_and(|row| row.status.is_terminal()) {
+                    return Ok(Association::Terminal);
+                }
+                let outcome = db.stamp_dispatch_exit(&run, code.map(i64::from))?;
+                Ok(Association::Stamped(run, outcome))
+            }),
         )
         .await
         {
             Ok(result) => result?,
             Err(_) => break,
         };
-        if let thegn_core::issue::ExitAttribution::Exact(run) = attribution {
-            let outcome = match tokio::time::timeout_at(
-                deadline,
-                svc.with_db({
-                    let run = run.clone();
-                    move |db| db.stamp_dispatch_exit(&run, code.map(i64::from))
-                }),
-            )
-            .await
-            {
-                Ok(result) => result?,
-                Err(_) => break,
-            };
-            if matches!(
-                outcome,
-                thegn_core::issue::ExitStamp::Stamped
-                    | thegn_core::issue::ExitStamp::AlreadyStamped
-            ) {
-                return Ok(Some(run));
+        match association {
+            Association::Stamped(run, outcome) => {
+                if matches!(
+                    outcome,
+                    thegn_core::issue::ExitStamp::Stamped
+                        | thegn_core::issue::ExitStamp::AlreadyStamped
+                ) {
+                    return Ok(Some(run));
+                }
+                tracing::warn!(
+                    target: "thegn::daemon",
+                    session = %session,
+                    ?outcome,
+                    "session exit did not stamp its run"
+                );
+                return Ok(None);
             }
-            tracing::warn!(
-                target: "thegn::daemon",
-                session = %session,
-                ?outcome,
-                "session exit did not stamp its run"
-            );
-            return Ok(None);
-        }
-        if attempt + 1 < LOOKUP_ATTEMPTS {
-            tokio::time::sleep_until((tokio::time::Instant::now() + LOOKUP_RETRY).min(deadline))
+            Association::Terminal => return Ok(None),
+            Association::Miss if attempt + 1 < LOOKUP_ATTEMPTS => {
+                tokio::time::sleep_until(
+                    (tokio::time::Instant::now() + LOOKUP_RETRY).min(deadline),
+                )
                 .await;
+            }
+            Association::Miss => {}
         }
     }
     tracing::warn!(
@@ -908,12 +924,13 @@ mod tests {
             assert_eq!(row.exit_code, None, "exit has not been stamped yet");
         }
         tokio::time::sleep(Duration::from_millis(60)).await;
-        let db = svc.db.lock().unwrap();
-        assert!(
-            db.bind_dispatch_session(row_id, session)
-                .expect("publish session")
-        );
-        drop(db);
+        {
+            let db = svc.db.lock().unwrap();
+            assert!(
+                db.bind_dispatch_session(row_id, session)
+                    .expect("publish session")
+            );
+        }
         task.await.expect("exit task").expect("handle exit");
     }
 
