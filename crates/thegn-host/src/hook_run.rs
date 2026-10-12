@@ -483,6 +483,8 @@ fn collect_direct_logs(root: &Path) -> Vec<RetainedHookLog> {
             let (Some(slug), Some(name)) = (slug_path.file_name(), path.file_name()) else {
                 continue;
             };
+            let slug = slug.to_owned();
+            let name = name.to_owned();
             let mtime_secs = meta
                 .modified()
                 .ok()
@@ -490,8 +492,8 @@ fn collect_direct_logs(root: &Path) -> Vec<RetainedHookLog> {
                 .map_or(0, |age| age.as_secs());
             logs.push(RetainedHookLog {
                 path,
-                slug: slug.to_owned(),
-                name: name.to_owned(),
+                slug,
+                name,
                 mtime_secs,
                 bytes: meta.len(),
             });
