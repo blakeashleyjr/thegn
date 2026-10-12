@@ -10,7 +10,34 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::MediaError;
 use crate::model::{MediaKind, MediaState, PlaybackState};
+
+/// Decode one `get` response, preserving empty-session and malformed-response
+/// outcomes separately.
+pub fn decode_get(out: &str) -> Result<Option<MediaState>, MediaError> {
+    let trimmed = out.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(None);
+    }
+    let value: Value = serde_json::from_str(trimmed)
+        .map_err(|error| MediaError::Backend(format!("mediaremote json: {error}")))?;
+    let Some(object) = value.as_object() else {
+        return Err(MediaError::Backend(
+            "mediaremote response must be a JSON object or null".into(),
+        ));
+    };
+    for key in ["payload", "info"] {
+        if let Some(wrapper) = object.get(key) {
+            if !wrapper.is_object() {
+                return Err(MediaError::Backend(format!(
+                    "mediaremote {key} wrapper must be an object"
+                )));
+            }
+        }
+    }
+    Ok(to_state(&value))
+}
 
 /// First string value present under any of `keys`.
 fn s<'a>(obj: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -166,5 +193,23 @@ mod tests {
         let s = to_state(&v).unwrap();
         assert_eq!(s.length, Some(Duration::from_secs(90)));
         assert!(!s.can_seek);
+    }
+
+    #[test]
+    fn decode_get_rejects_malformed_or_non_object_responses() {
+        for out in ["\"hi\"", "[1]", "{\"payload\":3}", "not json"] {
+            assert!(decode_get(out).is_err(), "accepted {out:?}");
+        }
+    }
+
+    #[test]
+    fn decode_get_preserves_empty_and_valid_responses() {
+        assert!(decode_get("").unwrap().is_none());
+        assert!(decode_get("null").unwrap().is_none());
+        let state = decode_get(r#"{"title":"Get Lucky","artist":"Daft Punk","playing":true}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.title, "Get Lucky");
+        assert_eq!(state.artist, "Daft Punk");
     }
 }
