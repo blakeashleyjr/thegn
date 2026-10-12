@@ -498,9 +498,7 @@ mod tests {
 
     #[expect(clippy::disallowed_methods, reason = "create a local Git fixture")]
     fn run_git(dir: &std::path::Path, args: &[&str]) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(dir)
+        let output = thegn_core::util::git_cmd(dir)
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -515,9 +513,7 @@ mod tests {
 
     #[expect(clippy::disallowed_methods, reason = "inspect a local Git fixture")]
     fn run_git_output(dir: &std::path::Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(dir)
+        let output = thegn_core::util::git_cmd(dir)
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -661,6 +657,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "test fixture")]
     fn reused_checkout_refresh_discards_prior_tracked_diff_before_reapplying_it() {
         let home = temp_home("refresh-dirty");
         let source = home.join("source");
@@ -684,9 +681,7 @@ mod tests {
         );
 
         std::fs::write(&tracked, "dirty local state\n").unwrap();
-        let patch = Command::new("git")
-            .arg("-C")
-            .arg(&source)
+        let patch = thegn_core::util::git_cmd(&source)
             .args(["diff", "--binary", "HEAD"])
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
