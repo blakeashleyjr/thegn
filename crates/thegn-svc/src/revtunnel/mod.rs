@@ -1001,7 +1001,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(rejection_total() >= before + 1);
+        assert!(rejection_total() > before);
         drop(peer);
         tokio::time::timeout(std::time::Duration::from_secs(2), task)
             .await
