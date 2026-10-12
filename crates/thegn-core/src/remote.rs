@@ -231,6 +231,36 @@ pub enum GitLoc {
 }
 
 impl GitLoc {
+    /// Resolve a worktree location without treating a DB failure as local.
+    /// A genuinely absent row still means a local worktree.
+    pub fn for_worktree_checked(path: &Path) -> Result<GitLoc, String> {
+        let p = path
+            .to_str()
+            .ok_or_else(|| "worktree path is not valid UTF-8".to_string())?;
+        let db = crate::db::Db::open().map_err(|e| format!("open worktree location DB: {e}"))?;
+        let loc = db
+            .location_for(p)
+            .map_err(|e| format!("read worktree location: {e}"));
+        Self::from_checked_lookup(p, loc)
+    }
+
+    fn from_checked_lookup(
+        path: &str,
+        location: Result<Option<String>, String>,
+    ) -> Result<GitLoc, String> {
+        match location {
+            Ok(Some(location)) if !location.trim().is_empty() && location.trim() != "local" => {
+                let parsed = Self::from_db(path, Some(location.as_str()));
+                if matches!(&parsed, GitLoc::Local(_)) {
+                    return Err("unrecognised worktree location; refusing terminal launch".into());
+                }
+                Ok(parsed)
+            }
+            Ok(location) => Ok(Self::from_db(path, location.as_deref())),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Resolve a worktree path's location from the DB. Local on any miss, so
     /// existing/local worktrees behave exactly as before.
     pub fn for_worktree(path: &Path) -> GitLoc {
@@ -274,6 +304,52 @@ impl GitLoc {
                 path: r.path,
             },
             Err(_) => GitLoc::Local(PathBuf::from(path)),
+        }
+    }
+
+    /// Build an interactive terminal process projection for this location.
+    /// Remote commands use ssh's interactive authentication mode and a single
+    /// quoted remote shell command. Providers have no interactive prefix in
+    /// their persisted location record and must fail closed.
+    pub fn interactive_argv(
+        &self,
+        program: &[String],
+    ) -> Result<(Vec<String>, Option<PathBuf>), String> {
+        match self {
+            GitLoc::Local(path) => {
+                if !path.is_dir() {
+                    return Err(format!(
+                        "worktree directory is unavailable: {}",
+                        path.display()
+                    ));
+                }
+                Ok((program.to_vec(), Some(path.clone())))
+            }
+            GitLoc::Remote { ssh, path } => {
+                if program.is_empty() {
+                    return Err("custom terminal command is empty".into());
+                }
+                let remote = format!(
+                    "{} cd {} && exec {}",
+                    util::GIT_ENV_VARS
+                        .iter()
+                        .map(|var| format!("unset {var};"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    util::sh_quote(path),
+                    util::sh_join(program),
+                );
+                let mut argv = ssh.ssh_base(false);
+                argv.push("-t".into());
+                argv.push(ssh.host.clone());
+                argv.push("--".into());
+                argv.push(util::sh_join(&["/bin/sh".into(), "-lc".into(), remote]));
+                Ok((argv, None))
+            }
+            GitLoc::Provider { .. } => Err(
+                "terminal output is not supported for provider worktrees; use output = \"popup\""
+                    .into(),
+            ),
         }
     }
 
@@ -783,6 +859,80 @@ mod tests {
         let loc = GitLoc::from_db("/wt/x", None);
         assert!(!loc.is_remote());
         assert_eq!(loc.path(), "/wt/x");
+    }
+
+    #[test]
+    fn interactive_remote_argv_uses_tty_quoted_cwd_and_scrubbed_shell() {
+        let ssh = SshTarget::plain("dev@example.test".into(), 2222, false);
+        let loc = GitLoc::Remote {
+            ssh: ssh.clone(),
+            path: "/srv/work tree/it's-here".into(),
+        };
+        let program = vec!["git".into(), "status".into(), "--short".into()];
+        let (argv, cwd) = loc.interactive_argv(&program).unwrap();
+        let mut expected = ssh.ssh_base(false);
+        expected.extend([
+            "-t".into(),
+            "dev@example.test".into(),
+            "--".into(),
+            util::sh_join(&[
+                "/bin/sh".into(),
+                "-lc".into(),
+                format!(
+                    "{} cd {} && exec git status --short",
+                    util::GIT_ENV_VARS
+                        .iter()
+                        .map(|var| format!("unset {var};"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    util::sh_quote("/srv/work tree/it's-here")
+                ),
+            ]),
+        ]);
+        assert_eq!(argv, expected);
+        assert!(!argv.contains(&"BatchMode=yes".into()));
+        assert_eq!(cwd, None);
+    }
+
+    #[test]
+    fn interactive_local_missing_directory_and_provider_fail_closed() {
+        let missing =
+            std::env::temp_dir().join(format!("tg-terminal-missing-{}", std::process::id()));
+        assert!(
+            GitLoc::Local(missing)
+                .interactive_argv(&["git".into()])
+                .is_err()
+        );
+        let provider = GitLoc::Provider {
+            control_prefix: vec!["sprite".into(), "exec".into()],
+            path: "/workspace".into(),
+        };
+        assert!(
+            provider
+                .interactive_argv(&["git".into()])
+                .unwrap_err()
+                .contains("not supported")
+        );
+    }
+
+    #[test]
+    fn checked_lookup_preserves_database_errors_while_absence_means_local() {
+        assert!(matches!(
+            GitLoc::from_checked_lookup("/wt/local", Ok(None)).unwrap(),
+            GitLoc::Local(path) if path == Path::new("/wt/local")
+        ));
+        assert!(
+            GitLoc::from_checked_lookup("/wt/local", Err("database unavailable".into())).is_err()
+        );
+        assert!(
+            GitLoc::from_checked_lookup("/wt/local", Ok(Some("garbage".into())))
+                .unwrap_err()
+                .contains("unrecognised worktree location")
+        );
+        assert!(matches!(
+            GitLoc::from_db("/wt/local", None),
+            GitLoc::Local(_)
+        ));
     }
 
     #[test]

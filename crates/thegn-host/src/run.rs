@@ -3282,11 +3282,73 @@ enum GitAfter {
     NewWorktree,
     /// Spawn this command into a fresh center tab (custom-command
     /// `output = "terminal"`).
-    Terminal(thegn_core::custom_cmd::ExpandedCommand),
+    Terminal {
+        command: thegn_core::custom_cmd::ExpandedCommand,
+        generation: u64,
+        worktree: std::path::PathBuf,
+    },
     /// Open a file in the configured editor in a new center tab (used for
     /// conflict-file resolution — the user resolves markers, saves, then
     /// stages the file normally).
     OpenEditor(String),
+}
+
+struct TerminalLaunchDone {
+    generation: u64,
+    worktree: std::path::PathBuf,
+    result: Result<(Vec<String>, Option<std::path::PathBuf>), String>,
+}
+
+fn queue_terminal_launch(
+    after: GitAfter,
+    tx: &tokio_mpsc::UnboundedSender<TerminalLaunchDone>,
+    waker: &TerminalWaker,
+    status: &mut String,
+) {
+    let GitAfter::Terminal {
+        command,
+        generation,
+        worktree,
+    } = after
+    else {
+        return;
+    };
+    *status = "Resolving custom command worktree…".into();
+    let tx = tx.clone();
+    let wk = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = thegn_core::remote::GitLoc::for_worktree_checked(&worktree)
+            .and_then(|loc| loc.interactive_argv(&command.terminal_argv()));
+        if tx
+            .send(TerminalLaunchDone {
+                generation,
+                worktree,
+                result,
+            })
+            .is_ok()
+        {
+            let _ = wk.wake(); // best-effort: a completion wake must not fail the command path
+        }
+    });
+}
+
+fn terminal_launch_is_current(
+    generation: u64,
+    worktree: &std::path::Path,
+    current_generation: u64,
+    current_worktree: &std::path::Path,
+) -> bool {
+    generation == current_generation && worktree == current_worktree
+}
+
+fn terminal_worktree_path(session: &crate::session::Session) -> Result<std::path::PathBuf, String> {
+    let Some(group) = session.active_group() else {
+        return Err("there is no active worktree".into());
+    };
+    if group.path.is_empty() {
+        return Err("the active worktree path is empty".into());
+    }
+    Ok(std::path::PathBuf::from(&group.path))
 }
 
 fn short_sha(sha: &str) -> String {
@@ -3359,6 +3421,7 @@ fn git_template_ctx(
     panel_ui: &crate::panel::PanelUi,
     model: &FrameModel,
     session: &crate::session::Session,
+    terminal_worktree: Option<&std::path::Path>,
     prompts: std::collections::BTreeMap<String, String>,
 ) -> thegn_core::custom_cmd::TemplateCtx {
     use thegn_core::custom_cmd::{BranchVars, CommitVars, StashVars, TemplateCtx};
@@ -3382,7 +3445,13 @@ fn git_template_ctx(
             index: s.index,
             message: s.message,
         }),
-        worktree_path: Some(active_tab_path(session).to_string_lossy().into_owned()),
+        worktree_path: Some(
+            terminal_worktree
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| active_tab_path(session))
+                .to_string_lossy()
+                .into_owned(),
+        ),
         prompt_responses: prompts,
     }
 }
@@ -3399,10 +3468,31 @@ fn run_custom_command(
     let Some(cmd) = wires.cfg.git_commands.get(idx) else {
         return GitAfter::None;
     };
-    let ctx = git_template_ctx(panel_ui, model, wires.session, prompts);
+    let terminal_worktree = if matches!(&cmd.output, GitCmdOutput::Terminal) {
+        match terminal_worktree_path(wires.session) {
+            Ok(path) => Some(path),
+            Err(reason) => {
+                model.status = format!("custom command terminal refused: {reason}");
+                return GitAfter::None;
+            }
+        }
+    } else {
+        None
+    };
+    let ctx = git_template_ctx(
+        panel_ui,
+        model,
+        wires.session,
+        terminal_worktree.as_deref(),
+        prompts,
+    );
     match thegn_core::custom_cmd::compile(cmd, &ctx) {
         Ok(line) => match cmd.output {
-            GitCmdOutput::Terminal => GitAfter::Terminal(line),
+            GitCmdOutput::Terminal => GitAfter::Terminal {
+                command: line,
+                generation: panel_ui.git.op_gen,
+                worktree: terminal_worktree.expect("terminal worktree captured above"),
+            },
             out => {
                 enqueue_git_op(
                     GitOp::CustomTemplate {
@@ -6292,6 +6382,8 @@ async fn event_loop<T: Terminal>(
     // diff, drilled-commit files, patch doc). Results are tagged with
     // `panel_ui.git.op_gen` so a worktree switch kills strays on arrival.
     let (gitop_tx, mut gitop_rx) = tokio_mpsc::unbounded_channel::<GitOpDone>();
+    let (terminal_launch_tx, mut terminal_launch_rx) =
+        tokio_mpsc::unbounded_channel::<TerminalLaunchDone>();
     let (gitdoc_tx, mut gitdoc_rx) = tokio_mpsc::unbounded_channel::<(u64, GitDoc)>();
     // The open git option/confirm menu and text-input overlay — held like
     // the palette (Option, keys first, painted last).
@@ -9848,6 +9940,42 @@ async fn event_loop<T: Terminal>(
             {
                 rebase_sync_inflight = true;
                 spawn_rebase_status_fetch(panel_ui.git.op_gen, &session, &gitdoc_tx, &waker);
+            }
+            dirty = true;
+        }
+
+        while let Ok(done) = terminal_launch_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::GitOp);
+            let current_worktree = terminal_worktree_path(&session);
+            if !terminal_launch_is_current(
+                done.generation,
+                &done.worktree,
+                panel_ui.git.op_gen,
+                current_worktree
+                    .as_deref()
+                    .unwrap_or_else(|_| std::path::Path::new("")),
+            ) {
+                model.status = "custom command cancelled: worktree changed".into();
+                dirty = true;
+                continue;
+            }
+            match done.result {
+                Ok((argv, cwd)) => {
+                    if !crate::actions::open_custom_git_argv_tab(
+                        &mut session,
+                        &mut panes,
+                        &argv,
+                        cwd.as_deref(),
+                        chrome.center,
+                    ) {
+                        model.status = "could not open custom command terminal".into();
+                    } else {
+                        focus.zone = crate::focus::Zone::Center;
+                        refresh_tab_model(&mut model, &session, &mut sb);
+                        need_relayout = true;
+                    }
+                }
+                Err(reason) => model.status = format!("custom command terminal refused: {reason}"),
             }
             dirty = true;
         }
@@ -17269,19 +17397,13 @@ async fn event_loop<T: Terminal>(
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     need_relayout = true;
                                 }
-                                GitAfter::Terminal(cmd) => {
-                                    let argv = cmd.terminal_argv();
-                                    let cwd = active_cwd(&session);
-                                    crate::actions::open_argv_tab(
-                                        &mut session,
-                                        &mut panes,
-                                        &argv,
-                                        cwd.as_deref(),
-                                        chrome.center,
+                                terminal @ GitAfter::Terminal { .. } => {
+                                    queue_terminal_launch(
+                                        terminal,
+                                        &terminal_launch_tx,
+                                        &waker,
+                                        &mut model.status,
                                     );
-                                    focus.zone = crate::focus::Zone::Center;
-                                    refresh_tab_model(&mut model, &session, &mut sb);
-                                    need_relayout = true;
                                 }
                             }
                         }
@@ -17353,19 +17475,13 @@ async fn event_loop<T: Terminal>(
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         need_relayout = true;
                                     }
-                                    GitAfter::Terminal(cmd) => {
-                                        let argv = cmd.terminal_argv();
-                                        let cwd = active_cwd(&session);
-                                        crate::actions::open_argv_tab(
-                                            &mut session,
-                                            &mut panes,
-                                            &argv,
-                                            cwd.as_deref(),
-                                            chrome.center,
+                                    terminal @ GitAfter::Terminal { .. } => {
+                                        queue_terminal_launch(
+                                            terminal,
+                                            &terminal_launch_tx,
+                                            &waker,
+                                            &mut model.status,
                                         );
-                                        focus.zone = crate::focus::Zone::Center;
-                                        refresh_tab_model(&mut model, &session, &mut sb);
-                                        need_relayout = true;
                                     }
                                 }
                             }
@@ -18768,19 +18884,13 @@ async fn event_loop<T: Terminal>(
                         GitAfter::NewWorktree => {
                             forced_palette_action = Some(crate::keymap::Action::NewWorktree);
                         }
-                        GitAfter::Terminal(cmd) => {
-                            let argv = cmd.terminal_argv();
-                            let cwd = active_cwd(&session);
-                            crate::actions::open_argv_tab(
-                                &mut session,
-                                &mut panes,
-                                &argv,
-                                cwd.as_deref(),
-                                chrome.center,
+                        terminal @ GitAfter::Terminal { .. } => {
+                            queue_terminal_launch(
+                                terminal,
+                                &terminal_launch_tx,
+                                &waker,
+                                &mut model.status,
                             );
-                            focus.zone = crate::focus::Zone::Center;
-                            refresh_tab_model(&mut model, &session, &mut sb);
-                            need_relayout = true;
                         }
                         GitAfter::OpenEditor(path) => {
                             let cwd = active_cwd(&session);
@@ -24368,3 +24478,7 @@ fn action_allowed_during_schema_refusal(action: &crate::keymap::Action) -> bool 
 #[cfg(test)]
 #[path = "run_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "run_terminal_tests.rs"]
+mod terminal_tests;
