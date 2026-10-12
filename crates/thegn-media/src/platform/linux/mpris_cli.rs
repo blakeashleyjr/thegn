@@ -45,8 +45,7 @@ impl MprisCli {
         }
     }
 
-    /// Run `playerctl <args>`, returning trimmed stdout. A non-zero exit (no
-    /// player, unsupported op) maps to [`MediaError::NoPlayer`].
+    /// Run `playerctl <args>`, returning trimmed stdout.
     async fn run(&self, args: &[&str]) -> Result<String, MediaError> {
         let mut cmd = Command::new("playerctl");
         if let Some(p) = self.player_arg() {
@@ -59,14 +58,12 @@ impl MprisCli {
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
         } else {
-            // playerctl reports "No players found" etc. on stderr; keep it
-            // in the debug log so a NoPlayer is diagnosable.
             tracing::debug!(
                 target: "thegn::media",
                 stderr = %String::from_utf8_lossy(&out.stderr).trim(),
                 "playerctl {args:?} failed"
             );
-            Err(MediaError::NoPlayer)
+            Err(classify_failure(&out.stderr))
         }
     }
 
@@ -78,7 +75,10 @@ impl MprisCli {
             .await
             .map_err(|e| e.into_media("playerctl"))?;
         if !out.status.success() {
-            return Ok(Vec::new());
+            return match classify_failure(&out.stderr) {
+                MediaError::NoPlayer => Ok(Vec::new()),
+                error => Err(error),
+            };
         }
         Ok(String::from_utf8_lossy(&out.stdout)
             .lines()
@@ -128,13 +128,17 @@ impl MediaBackend for MprisCli {
     }
 
     fn playlists(&self) -> BoxFuture<'_, Result<Vec<Playlist>, MediaError>> {
-        Box::pin(async move {
-            Ok(Vec::new()) // playerctl exposes no Playlists interface
+        Box::pin(async {
+            Err(MediaError::Unsupported(
+                "playerctl playlists are not implemented".into(),
+            ))
         })
     }
     fn activate_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
-        Box::pin(async move {
-            Ok(()) // no-op; caps().playlists == false so the UI never calls this
+        Box::pin(async {
+            Err(MediaError::Unsupported(
+                "playerctl playlist activation is not implemented".into(),
+            ))
         })
     }
 
@@ -187,6 +191,22 @@ impl MediaBackend for MprisCli {
             fullscreen: false,
         }
     }
+}
+
+fn classify_failure(stderr: &[u8]) -> MediaError {
+    let text = String::from_utf8_lossy(stderr);
+    if text.contains("No players found") {
+        return MediaError::NoPlayer;
+    }
+    let mut message: String = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .take(200)
+        .collect();
+    if message.trim().is_empty() {
+        message = "playerctl exited unsuccessfully".into();
+    }
+    MediaError::Backend(message.trim().to_string())
 }
 
 /// Parse the `\x1f`-delimited `metadata --format` line into a [`MediaState`].
@@ -310,5 +330,35 @@ mod tests {
     fn volume_step_arg_format() {
         assert_eq!(format!("{:.3}{}", 0.05f64.abs(), "+"), "0.050+");
         assert_eq!(format!("{:.3}{}", (-0.05f64).abs(), "-"), "0.050-");
+    }
+
+    #[test]
+    fn classifies_playerctl_failures_without_hiding_provider_errors() {
+        assert_eq!(classify_failure(b"No players found"), MediaError::NoPlayer);
+        assert_eq!(
+            classify_failure(b"Cannot play: not supported\n"),
+            MediaError::Backend("Cannot play: not supported".into())
+        );
+        let long = vec![b'x'; 300];
+        assert!(
+            matches!(classify_failure(&long), MediaError::Backend(message) if message.len() <= 200)
+        );
+        assert!(matches!(
+            classify_failure(b"bad\x1b[31merror"),
+            MediaError::Backend(message) if !message.chars().any(char::is_control)
+        ));
+    }
+
+    #[tokio::test]
+    async fn playlist_methods_are_unsupported() {
+        let cli = MprisCli::new(vec![]);
+        assert!(matches!(
+            cli.playlists().await,
+            Err(MediaError::Unsupported(_))
+        ));
+        assert!(matches!(
+            cli.activate_playlist("x").await,
+            Err(MediaError::Unsupported(_))
+        ));
     }
 }
