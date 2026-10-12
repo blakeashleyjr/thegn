@@ -18,20 +18,47 @@ pub struct SnapshotKey {
 
 impl SnapshotKey {
     /// The store path/key prefix for this worktree's snapshots. Each segment
-    /// is sanitized to `[A-Za-z0-9._-]` (everything else → `-`) so the result
-    /// is safe as both a filesystem path and an S3 key; empty segments become
-    /// `"_"` so the prefix always has exactly three levels.
+    /// is encoded losslessly while keeping `[A-Za-z0-9._-]` bytes unchanged,
+    /// so the result is safe as both a filesystem path and an S3 key.
     pub fn prefix(&self) -> String {
         format!(
             "{}/{}/{}",
-            sanitize_segment(&self.repo_slug),
-            sanitize_segment(&self.worktree_slug),
-            sanitize_segment(&self.env)
+            encode_segment(&self.repo_slug),
+            encode_segment(&self.worktree_slug),
+            encode_segment(&self.env)
         )
+    }
+
+    /// The pre-encoder key used by snapshots created before lossless prefixes.
+    pub fn legacy(&self) -> SnapshotKey {
+        SnapshotKey {
+            repo_slug: legacy_segment(&self.repo_slug),
+            worktree_slug: legacy_segment(&self.worktree_slug),
+            env: legacy_segment(&self.env),
+        }
     }
 }
 
-fn sanitize_segment(s: &str) -> String {
+fn encode_segment(s: &str) -> String {
+    if s.is_empty() {
+        return "~".into();
+    }
+    if s.bytes().all(|b| b == b'.') {
+        return "~2E".repeat(s.len());
+    }
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') {
+            out.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            write!(out, "~{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    out
+}
+
+fn legacy_segment(s: &str) -> String {
     let out: String = s
         .trim()
         .chars()
@@ -66,7 +93,7 @@ pub struct ArtifactMeta {
 /// capture order across store backends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotManifest {
-    /// `<created_at:020>-<head8|nohead>`.
+    /// `<created_at:020>-<head8|nohead>[-<generation>]`.
     pub id: String,
     /// HEAD of the sandbox worktree at capture time (empty for unborn).
     pub head: String,
@@ -102,6 +129,19 @@ impl SnapshotManifest {
 
     pub fn artifact(&self, name: &str) -> Option<&ArtifactMeta> {
         self.artifacts.iter().find(|a| a.name == name)
+    }
+
+    /// Add a lowercase hexadecimal capture generation to the chronological id.
+    pub fn with_generation(mut self, generation: &str) -> Self {
+        debug_assert!(
+            generation
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "snapshot generation must be lowercase hexadecimal"
+        );
+        self.id.push('-');
+        self.id.push_str(generation);
+        self
     }
 
     /// Verify a set of `(name, bytes, sha256)` observations (e.g. re-hashed
@@ -160,20 +200,59 @@ mod tests {
     }
 
     #[test]
-    fn key_prefix_sanitizes_each_segment() {
+    fn key_prefix_encodes_each_segment_losslessly() {
         let k = SnapshotKey {
             repo_slug: "my repo".into(),
             worktree_slug: "tg/brisk-fox".into(),
             env: "hetzner:prod".into(),
         };
-        assert_eq!(k.prefix(), "my-repo/tg-brisk-fox/hetzner-prod");
-        // Path-traversal / empty segments can't escape or collapse the tree.
+        assert_eq!(k.prefix(), "my~20repo/tg~2Fbrisk-fox/hetzner~3Aprod");
+        assert_eq!(encode_segment("~é"), "~7E~C3~A9");
+        let colliding = ["my repo", "my-repo", "my/repo"].map(|repo_slug| SnapshotKey {
+            repo_slug: repo_slug.into(),
+            ..k.clone()
+        });
+        assert_ne!(colliding[0].prefix(), colliding[1].prefix());
+        assert_ne!(colliding[0].prefix(), colliding[2].prefix());
+        assert_ne!(colliding[1].prefix(), colliding[2].prefix());
+
+        // Traversal, empty, all-dot, and ordinary underscore segments stay
+        // distinct and pass the filesystem store's component contract.
         let evil = SnapshotKey {
             repo_slug: "..".into(),
             worktree_slug: "".into(),
             env: "ok".into(),
         };
-        assert_eq!(evil.prefix(), "_/_/ok");
+        let encoded = evil.prefix();
+        assert_eq!(encoded, "~2E~2E/~/ok");
+        for segment in encoded.split('/') {
+            assert!(!segment.is_empty());
+            assert!(!segment.contains(['/', '\\']));
+            assert_ne!(segment, ".");
+            assert_ne!(segment, "..");
+        }
+        let underscore = SnapshotKey {
+            repo_slug: "_".into(),
+            ..evil.clone()
+        };
+        assert_ne!(evil.prefix(), underscore.prefix());
+        let empty = SnapshotKey {
+            repo_slug: "".into(),
+            ..evil.clone()
+        };
+        assert_ne!(empty.prefix(), underscore.prefix());
+        let dots = SnapshotKey {
+            repo_slug: "..".into(),
+            ..evil.clone()
+        };
+        assert_ne!(empty.prefix(), dots.prefix());
+        assert_eq!(k.legacy().prefix(), "my-repo/tg-brisk-fox/hetzner-prod");
+        let legacy_empty = SnapshotKey {
+            repo_slug: "".into(),
+            worktree_slug: "..".into(),
+            env: "ok".into(),
+        };
+        assert_eq!(legacy_empty.legacy().prefix(), "_/_/ok");
     }
 
     #[test]
@@ -185,6 +264,14 @@ mod tests {
         let unborn = SnapshotManifest::new(None, "HEAD", 7, Vec::new());
         assert!(unborn.id.ends_with("-nohead"));
         assert_eq!(unborn.head, "");
+    }
+
+    #[test]
+    fn generation_makes_same_second_same_head_ids_distinct() {
+        let first = m(42, "abcdef1234567890").with_generation("0123456789abcdef");
+        let second = m(42, "abcdef1234567890").with_generation("fedcba9876543210");
+        assert_ne!(first.id, second.id);
+        assert!(first.id.starts_with("00000000000000000042-abcdef12-"));
     }
 
     #[test]

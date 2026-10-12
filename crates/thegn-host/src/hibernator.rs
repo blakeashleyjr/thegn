@@ -22,6 +22,7 @@
 //! without a verified snapshot — never happens.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -464,11 +465,19 @@ fn restore_into_sandbox(
         .ok_or_else(|| anyhow::anyhow!("no hibernation row for {worktree}"))?;
     let key = snapshot_key(Path::new(&row.repo_path), worktree, &row.env_name);
     let store = open_store(&cfg.lifecycle.snapshot)?;
-    let manifest = store.get_manifest(&key, snapshot_id)?;
+    let legacy_key = key.legacy();
+    let (restore_key, manifest) = match store.get_manifest(&key, snapshot_id) {
+        Ok(manifest) => (&key, manifest),
+        Err(_) if legacy_key != key => {
+            let manifest = store.get_manifest(&legacy_key, snapshot_id)?;
+            (&legacy_key, manifest)
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     let mut bundle_data: Option<Vec<u8>> = None;
     for a in &manifest.artifacts {
-        let data = store.get(&key, snapshot_id, &a.name)?;
+        let data = store.get(restore_key, snapshot_id, &a.name)?;
         // Same integrity bar as capture: what the store returns must be what
         // the manifest published.
         if data.len() as u64 != a.bytes || !hex_sha256(&data).eq_ignore_ascii_case(&a.sha256) {
@@ -531,17 +540,22 @@ fn restore_into_sandbox(
 // off-loop: provision worker thread only.
 #[expect(clippy::disallowed_methods)]
 fn backup_bundle_to_host(worktree: &str, snapshot_id: &str, data: &[u8]) {
-    let tmp = std::env::temp_dir().join(format!("tg-hib-restore-{}.bundle", std::process::id()));
-    if std::fs::write(&tmp, data).is_ok() {
+    let Ok(mut tmp) = tempfile::Builder::new()
+        .prefix("tg-hib-restore-")
+        .suffix(".bundle")
+        .tempfile()
+    else {
+        return;
+    };
+    if tmp.write_all(data).is_ok() {
         let refname = format!("HEAD:refs/thegn/hibernate/{snapshot_id}");
         // best-effort: the snapshot store keeps the authoritative copy.
         let _ = thegn_core::util::git_cmd(Path::new(worktree))
             .args(["fetch", "--quiet"])
-            .arg(&tmp)
+            .arg(tmp.path())
             .arg(&refname)
             .output();
     }
-    let _ = std::fs::remove_file(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
 }
 
 /// Run `script` in the sandbox and return its combined output; non-zero exit
@@ -605,9 +619,13 @@ fn capture_to_store(
 
     let created_at = thegn_core::util::now();
     let head = report.head.as_deref();
-    // The id is a pure function of (created_at, head): compute it up front so
-    // artifacts land under it before the manifest publishes them.
-    let id_probe = SnapshotManifest::new(head, &report.branch, created_at, Vec::new());
+    // Artifacts land under one random generation before its manifest publishes.
+    let mut generation = [0_u8; 8];
+    getrandom::fill(&mut generation)
+        .map_err(|error| anyhow::anyhow!("generate snapshot generation: {error}"))?;
+    let generation = generation_hex(generation);
+    let id_probe = SnapshotManifest::new(head, &report.branch, created_at, Vec::new())
+        .with_generation(&generation);
 
     let mut metas: Vec<ArtifactMeta> = Vec::new();
     for a in &report.artifacts {
@@ -640,7 +658,8 @@ fn capture_to_store(
         });
     }
 
-    let manifest = SnapshotManifest::new(head, &report.branch, created_at, metas);
+    let manifest =
+        SnapshotManifest::new(head, &report.branch, created_at, metas).with_generation(&generation);
     store.put_manifest(key, &manifest)?;
 
     // Retention: prune older snapshots now that this one is published.
@@ -671,21 +690,33 @@ fn hex_sha256(data: &[u8]) -> String {
     s
 }
 
+fn generation_hex(bytes: [u8; 8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(16);
+    for byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
 /// Structural sanity for a downloaded bundle: `git bundle list-heads` reads
 /// the header without needing a repository (a prerequisite check would need
 /// the SANDBOX's remote tips, which the host may not have).
 // off-loop: hibernator worker thread only.
 #[expect(clippy::disallowed_methods)]
 fn verify_bundle_shape(data: &[u8]) -> anyhow::Result<()> {
-    let tmp = std::env::temp_dir().join(format!("tg-hib-verify-{}.bundle", std::process::id()));
-    std::fs::write(&tmp, data)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix("tg-hib-verify-")
+        .suffix(".bundle")
+        .tempfile()?;
+    tmp.write_all(data)?;
     let ok = thegn_core::util::git_cmd(&std::env::temp_dir())
         .args(["bundle", "list-heads"])
-        .arg(&tmp)
+        .arg(tmp.path())
         .output()
         .map(|o| o.status.success() && !o.stdout.is_empty())
         .unwrap_or(false);
-    let _ = std::fs::remove_file(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     if !ok {
         anyhow::bail!("captured bundle failed list-heads verification");
     }
@@ -714,5 +745,45 @@ mod tests {
             hex_sha256(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn generation_hex_is_sixteen_lowercase_hex_digits() {
+        let generation = generation_hex([0x00, 0x01, 0x0a, 0x10, 0x7f, 0x80, 0xfe, 0xff]);
+        assert_eq!(generation, "00010a107f80feff");
+        assert_eq!(generation.len(), 16);
+        assert!(
+            generation
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+    }
+
+    #[test]
+    fn verify_bundle_shape_does_not_follow_legacy_temp_path_symlink() {
+        let temp_dir = std::env::temp_dir();
+        let link = temp_dir.join(format!("tg-hib-verify-{}.bundle", std::process::id()));
+        let mut victim = tempfile::NamedTempFile::new().unwrap();
+        victim.write_all(b"keep this content").unwrap();
+        victim.flush().unwrap();
+
+        match thegn_core::fsperm::create_symlink(victim.path(), &link, false) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("could not plant test symlink: {error}"),
+        }
+
+        let result = verify_bundle_shape(b"not a bundle");
+        let content = std::fs::read(victim.path()).unwrap();
+        std::fs::remove_file(link).unwrap();
+        assert!(result.is_err());
+        assert_eq!(content, b"keep this content");
     }
 }
