@@ -64,73 +64,57 @@ pub fn run(
         Action::Get { key, json } => get(cfg, &key, json, &path)?,
         Action::Edit => edit(cfg, &path)?,
         Action::Set { key, value } => {
-            // Capture the prior file so a bad write can be rolled back: a mistyped
-            // value for a typed field would otherwise make the WHOLE config
-            // unparseable, silently reverting every setting to defaults on the
-            // next load. Re-validate after writing and restore on failure.
-            let prior = std::fs::read(&path).ok(); // best-effort: optional input: a missing file just means nothing to roll back
-            thegn_core::config_write::set_key(&path, &key, &value)
-                .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            thegn_core::config_write::set_key_checked(&path, &key, &value, |prior, written| {
+                // Validate the proposed generation before publishing it. A mistyped
+                // value for a typed field must never make the whole config fall
+                // back to defaults, even briefly.
+                let parse_err = thegn_core::config_compat::normalize(written)
+                    .and_then(|normalized| {
+                        toml::from_str::<Config>(&normalized.body).map_err(|e| e.to_string())
+                    })
+                    .err();
+                let diagnostics = thegn_core::config_validate::validate_diagnostics(written);
+                let enum_errs: Vec<String> = diagnostics
+                    .iter()
+                    .filter(|d| {
+                        d.severity == thegn_core::config_validate::ValidationSeverity::Error
+                    })
+                    .map(|d| d.message.clone())
+                    .collect();
+                let prior_errs: std::collections::HashSet<String> =
+                    thegn_core::config::validate_str(prior)
+                        .into_iter()
+                        .collect();
+                let new_enum_errs: Vec<&String> = enum_errs
+                    .iter()
+                    .filter(|error| !prior_errs.contains(*error))
+                    .collect();
+                if parse_err.is_some() || !new_enum_errs.is_empty() {
+                    if let Some(error) = parse_err {
+                        anyhow::bail!(
+                            "{key} = {:?} would make the config unparseable ({error}); not written",
+                            shown_value(&key, &value)
+                        );
+                    }
+                    for error in &new_enum_errs {
+                        msg::error(&format!("{}: {error}", path.display()));
+                    }
+                    anyhow::bail!(
+                        "{key} = {:?} is invalid ({} problem(s)); not written",
+                        shown_value(&key, &value),
+                        new_enum_errs.len(),
+                    );
+                }
+                Ok(())
+            })
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
             let written = std::fs::read_to_string(&path).unwrap_or_default();
-            // Runtime loading normalizes accepted aliases/collisions before
-            // serde. Raw serde here would reject an otherwise valid canonical-
-            // wins collision, even for an unrelated edit.
-            let parse_err = thegn_core::config_compat::normalize(&written)
-                .and_then(|normalized| {
-                    toml::from_str::<Config>(&normalized.body).map_err(|e| e.to_string())
-                })
-                .err();
             let diagnostics = thegn_core::config_validate::validate_diagnostics(&written);
             let enum_errs: Vec<String> = diagnostics
                 .iter()
                 .filter(|d| d.severity == thegn_core::config_validate::ValidationSeverity::Error)
                 .map(|d| d.message.clone())
                 .collect();
-            // Only enum errors this write INTRODUCED should roll it back. A stale
-            // bad value in some OTHER (now-covered) key was already
-            // warn-defaulting on every load — refusing to set an unrelated key
-            // because of it (and blaming the key just set) is a false rejection.
-            // Diff against the prior file's errors so pre-existing problems don't
-            // block an unrelated `config set`.
-            let prior_errs: std::collections::HashSet<String> = prior
-                .as_deref()
-                .and_then(|b| std::str::from_utf8(b).ok())
-                .map(thegn_core::config::validate_str)
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            let new_enum_errs: Vec<&String> = enum_errs
-                .iter()
-                .filter(|e| !prior_errs.contains(*e))
-                .collect();
-            if parse_err.is_some() || !new_enum_errs.is_empty() {
-                // Roll back to exactly the prior state (bytes, or remove the file
-                // if we created it) so the user's config is never left broken.
-                match &prior {
-                    Some(bytes) => {
-                        let _ = std::fs::write(&path, bytes); // best-effort: rollback after a failed validation; the original error is reported below
-                    }
-                    None => {
-                        let _ = std::fs::remove_file(&path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-                    }
-                }
-                if let Some(e) = parse_err {
-                    anyhow::bail!(
-                        "{}: {key} = {:?} would make the config unparseable ({e}); not written",
-                        path.display(),
-                        shown_value(&key, &value)
-                    );
-                }
-                for e in &new_enum_errs {
-                    msg::error(&format!("{}: {e}", path.display()));
-                }
-                anyhow::bail!(
-                    "{}: {key} = {:?} is invalid ({} problem(s)); not written",
-                    path.display(),
-                    shown_value(&key, &value),
-                    new_enum_errs.len(),
-                );
-            }
             for diagnostic in diagnostics
                 .iter()
                 .filter(|d| d.severity == thegn_core::config_validate::ValidationSeverity::Warning)
@@ -542,12 +526,9 @@ fn clamp_notice(key: &str, clamped: &[thegn_core::channel::Feature]) -> Option<S
     })
 }
 
-fn edit(cfg: &Config, path: &PathBuf) -> Result<()> {
+fn edit(cfg: &Config, path: &Path) -> Result<()> {
     if !path.exists() {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, EXAMPLE)?;
+        seed_example(path)?;
         msg::info(&format!("seeded {} from the example", path.display()));
     }
     // The editor seam: `[editor] command` → `[[tools]] editor` → $VISUAL/$EDITOR
@@ -570,6 +551,14 @@ fn edit(cfg: &Config, path: &PathBuf) -> Result<()> {
     if !status.success() {
         anyhow::bail!("editor exited with status {status}");
     }
+    Ok(())
+}
+
+fn seed_example(path: &Path) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    thegn_core::fsperm::write_owner_only_new(path, EXAMPLE.as_bytes())?;
     Ok(())
 }
 
@@ -645,19 +634,42 @@ mod tests {
         let normalized = thegn_core::config_compat::normalize(&written).unwrap();
         let config: Config = toml::from_str(&normalized.body).unwrap();
         assert_eq!(config.workspaces_dir, "/canonical");
-        assert!(
-            run(
-                &Config::default(),
-                Action::Set {
-                    key: "picker".into(),
-                    value: "42".into()
-                },
-                path.clone(),
-                Some(dir.path().to_owned()),
-            )
-            .is_err()
+        let original_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let error = run(
+            &Config::default(),
+            Action::Set {
+                key: "picker".into(),
+                value: "42".into(),
+            },
+            path.clone(),
+            Some(dir.path().to_owned()),
+        )
+        .unwrap_err();
+        let error_text = error.to_string();
+        assert_eq!(
+            error_text.matches(&path.display().to_string()).count(),
+            1,
+            "the rejected config set error should include the path once: {error_text}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            original_modified,
+            "a rejected config set must not replace the file"
+        );
+    }
+
+    #[test]
+    fn config_edit_seed_is_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        seed_example(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), EXAMPLE.as_bytes());
+        assert!(matches!(
+            thegn_core::fsperm::mode_bits(&path).unwrap(),
+            None | Some(0o600)
+        ));
     }
 
     #[test]

@@ -85,6 +85,15 @@ pub fn write_document_fenced(
     doc: &DocumentMut,
     expected: Option<&[u8]>,
 ) -> Result<()> {
+    write_document_fenced_checked(path, doc, expected, |_, _| Ok(()))
+}
+
+fn write_document_fenced_checked(
+    path: &Path,
+    doc: &DocumentMut,
+    expected: Option<&[u8]>,
+    check: impl FnOnce(&str, &str) -> Result<()>,
+) -> Result<()> {
     let prior = expected
         .map(std::str::from_utf8)
         .transpose()
@@ -97,12 +106,54 @@ pub fn write_document_fenced(
     )
     .map_err(anyhow::Error::msg)?;
     crate::custom_cmd::validate_write(prior, &next).map_err(anyhow::Error::msg)?;
-    write_doc_fenced(path, doc, expected)
+    write_doc_fenced(path, doc, expected, check)
 }
 
-fn write_doc_fenced(path: &Path, doc: &DocumentMut, expected: Option<&[u8]>) -> Result<()> {
+fn config_lock_path(path: &Path) -> Result<std::path::PathBuf> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().context("config path has no file name")?;
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(name);
+    lock_name.push(".lock");
+    Ok(parent.join(lock_name))
+}
+
+fn lock_config_writer(path: &Path) -> Result<std::fs::File> {
+    let lock_path = config_lock_path(path)?;
+    let lock_file = match crate::fsperm::create_owner_only_exclusive(&lock_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let file = crate::fsperm::open_regular_file_nofollow(&lock_path)
+                .with_context(|| format!("open config writer lock {}", lock_path.display()))?;
+            let metadata = file.metadata().context("inspect config writer lock")?;
+            anyhow::ensure!(
+                crate::fsperm::owned_by_current_user(&metadata),
+                "config writer lock is not owned by the current user"
+            );
+            file
+        }
+        Err(error) => return Err(error).context("create private config writer lock"),
+    };
+    match lock_file.try_lock() {
+        Ok(()) => Ok(lock_file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            anyhow::bail!("config is being written by another thegn writer; retry")
+        }
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).context("lock config writer sidecar")
+        }
+    }
+}
+
+fn write_doc_fenced(
+    path: &Path,
+    doc: &DocumentMut,
+    expected: Option<&[u8]>,
+    check: impl FnOnce(&str, &str) -> Result<()>,
+) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    let _writer_lock = lock_config_writer(path)?;
     let current = match crate::fsperm::open_regular_file_nofollow(path) {
         Ok(mut file) => {
             let metadata = file.metadata().context("inspect config destination")?;
@@ -123,6 +174,14 @@ fn write_doc_fenced(path: &Path, doc: &DocumentMut, expected: Option<&[u8]>) -> 
         "config changed during edit; retry the operation"
     );
 
+    let prior = expected
+        .map(std::str::from_utf8)
+        .transpose()
+        .context("config is not UTF-8")?
+        .unwrap_or("");
+    let next = doc.to_string();
+    check(prior, &next)?;
+
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = parent.join(format!(
         ".config-write-{}-{}",
@@ -132,7 +191,7 @@ fn write_doc_fenced(path: &Path, doc: &DocumentMut, expected: Option<&[u8]>) -> 
     let mut file = crate::fsperm::create_owner_only_exclusive(&tmp)
         .context("create private config temporary")?;
     let mut pending = ConfigTemp(Some(tmp.clone()));
-    file.write_all(doc.to_string().as_bytes())
+    file.write_all(next.as_bytes())
         .context("write config temporary")?;
     file.sync_all().context("sync config temporary")?;
     drop(file);
@@ -311,6 +370,17 @@ fn typed_value(val: &str) -> Item {
 /// integers/floats are written with their native TOML type, everything else as a
 /// string. The general `config set` counterpart to `config get`.
 pub fn set_key(config_path: &Path, dotted: &str, val: &str) -> Result<()> {
+    set_key_checked(config_path, dotted, val, |_, _| Ok(()))
+}
+
+/// Set one dotted key and run `check` against the exact prior and proposed
+/// config contents while the writer lock is held, before anything is published.
+pub fn set_key_checked(
+    config_path: &Path,
+    dotted: &str,
+    val: &str,
+    check: impl FnOnce(&str, &str) -> Result<()>,
+) -> Result<()> {
     let dotted = crate::config_compat::canonical_key(dotted);
     let parts: Vec<&str> = dotted.split('.').filter(|s| !s.is_empty()).collect();
     anyhow::ensure!(!parts.is_empty(), "empty key");
@@ -320,7 +390,7 @@ pub fn set_key(config_path: &Path, dotted: &str, val: &str) -> Result<()> {
         tbl = subtable(tbl, seg);
     }
     tbl.insert(parts[parts.len() - 1], typed_value(val));
-    write_doc(config_path, &doc, expected.as_deref())
+    write_document_fenced_checked(config_path, &doc, expected.as_deref(), check)
 }
 
 /// Set one dotted key to a string **array** (`repo_roots = ["a", "b"]`),
@@ -569,6 +639,52 @@ mod tests {
             b"[theme]\npreset = \"user-edit\"\n"
         );
         std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn writer_lock_conflict_returns_without_changing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        let original = b"picker = \"list\"\n";
+        std::fs::write(&p, original).unwrap();
+        let lock_path = config_lock_path(&p).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .unwrap();
+        held.try_lock().unwrap();
+
+        let result = set_key(&p, "picker", "auto");
+        assert!(result.is_err(), "a held writer lock must reject the write");
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+        drop(held);
+
+        set_key(&p, "picker", "auto").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "picker = \"auto\"\n");
+    }
+
+    #[test]
+    fn rejected_checked_write_leaves_bytes_and_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        let original = b"picker = \"list\"\n";
+        std::fs::write(&p, original).unwrap();
+
+        let result = set_key_checked(&p, "picker", "auto", |prior, next| {
+            assert_eq!(prior, std::str::from_utf8(original).unwrap());
+            assert!(next.contains("picker = \"auto\""));
+            anyhow::bail!("rejected by validation")
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".config-write-")
+        }));
     }
 
     #[test]
