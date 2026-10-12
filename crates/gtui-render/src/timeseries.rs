@@ -52,6 +52,73 @@ fn plot_points(values: &[f64], width: usize) -> Vec<(f64, f64)> {
     out
 }
 
+/// Plot samples by their timestamp, preserving their input order within each
+/// time bucket. Out-of-order timestamps therefore remain out of order in the
+/// connected line. Non-finite timestamps are skipped.
+fn plot_time_points(
+    times: &[f64],
+    values: &[f64],
+    width: usize,
+) -> (Vec<(f64, f64)>, Option<[f64; 2]>) {
+    let domain: Option<[f64; 2]> = times.iter().copied().filter(|time| time.is_finite()).fold(
+        None,
+        |domain, time| match domain {
+            None => Some([time, time]),
+            Some([min, max]) => Some([min.min(time), max.max(time)]),
+        },
+    );
+    let Some([min_time, max_time]) = domain else {
+        return (Vec::new(), None);
+    };
+    let pixels = width.saturating_mul(2).max(1);
+    let samples = times.len().min(values.len());
+    if samples <= pixels.saturating_mul(SAMPLES_PER_PIXEL) {
+        let points = times
+            .iter()
+            .copied()
+            .zip(values.iter().copied())
+            .filter(|(time, _)| time.is_finite())
+            .collect();
+        return (points, domain);
+    }
+
+    let mut buckets: Vec<[Option<usize>; 5]> = vec![[None; 5]; pixels];
+    for (index, (&time, &value)) in times.iter().zip(values).enumerate() {
+        if !time.is_finite() {
+            continue;
+        }
+        let bucket = if max_time == min_time {
+            0
+        } else {
+            (((time - min_time) / (max_time - min_time) * pixels as f64) as usize).min(pixels - 1)
+        };
+        let picks = &mut buckets[bucket];
+        if !value.is_finite() {
+            picks[4].get_or_insert(index);
+            continue;
+        }
+        picks[0].get_or_insert(index);
+        picks[3] = Some(index);
+        if picks[1].is_none_or(|min| value < values[min]) {
+            picks[1] = Some(index);
+        }
+        if picks[2].is_none_or(|max| value > values[max]) {
+            picks[2] = Some(index);
+        }
+    }
+    let mut indices = Vec::with_capacity(pixels.saturating_mul(5));
+    for picks in buckets {
+        indices.extend(picks.into_iter().flatten());
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    let points = indices
+        .into_iter()
+        .map(|index| (times[index], values[index]))
+        .collect();
+    (points, domain)
+}
+
 impl TimeseriesRenderer {
     /// `width` is the panel width in columns; it bounds how many samples are
     /// walked (see [`plot_points`]).
@@ -61,35 +128,42 @@ impl TimeseriesRenderer {
         bounds: [f64; 4], // [x_min, x_max, y_min, y_max]
         width: usize,
     ) -> Canvas<'a, impl Fn(&mut ratatui::widgets::canvas::Context) + 'a> {
+        let y_field = frame.fields.iter().find(|f| f.ty == FieldType::Float64);
+        let time_field = y_field.and_then(|y| {
+            frame
+                .fields
+                .iter()
+                .find(|field| field.ty == FieldType::Time && field.len() == y.len())
+        });
+        let (points, x_bounds) = match (time_field, y_field) {
+            (Some(time), Some(y)) => {
+                let (points, domain) = plot_time_points(time.floats(), y.floats(), width);
+                (points, domain.unwrap_or([bounds[0], bounds[1]]))
+            }
+            (_, Some(y)) => (plot_points(y.floats(), width), [bounds[0], bounds[1]]),
+            (_, None) => (Vec::new(), [bounds[0], bounds[1]]),
+        };
         Canvas::default()
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(title.to_string()),
             )
-            .x_bounds([bounds[0], bounds[1]])
+            .x_bounds(x_bounds)
             .y_bounds([bounds[2], bounds[3]])
             .paint(move |ctx| {
-                if frame.fields.is_empty() {
-                    return;
-                }
-
-                // For MVP: assume single series, and we just use indices as X if no time field exists.
-                let y_field = frame.fields.iter().find(|f| f.ty == FieldType::Float64);
-                if let Some(y) = y_field {
-                    let mut prev: Option<(f64, f64)> = None;
-                    for (x, v) in plot_points(y.floats(), width) {
-                        if let Some((px, py)) = prev {
-                            ctx.draw(&Line {
-                                x1: px,
-                                y1: py,
-                                x2: x,
-                                y2: v,
-                                color: Color::Green,
-                            });
-                        }
-                        prev = Some((x, v));
+                let mut prev: Option<(f64, f64)> = None;
+                for (x, v) in &points {
+                    if let Some((px, py)) = prev {
+                        ctx.draw(&Line {
+                            x1: px,
+                            y1: py,
+                            x2: *x,
+                            y2: *v,
+                            color: Color::Green,
+                        });
                     }
+                    prev = Some((*x, *v));
                 }
             })
     }
@@ -171,6 +245,46 @@ mod tests {
             pts.windows(2).all(|w| w[0].0 < w[1].0),
             "strictly ordered X"
         );
+    }
+
+    #[test]
+    fn time_points_use_timestamp_coordinates_and_domain() {
+        let (points, domain) = plot_time_points(&[0.0, 1.0, 2.0, 100.0], &[2.0, 4.0, 3.0, 8.0], 20);
+        assert_eq!(
+            points,
+            vec![(0.0, 2.0), (1.0, 4.0), (2.0, 3.0), (100.0, 8.0)]
+        );
+        assert_eq!(domain, Some([0.0, 100.0]));
+    }
+
+    #[test]
+    fn dense_time_series_is_bounded_and_keeps_spike_at_its_timestamp() {
+        let times: Vec<f64> = (0..1_000_000)
+            .map(|index| (index as f64).powf(1.01))
+            .collect();
+        let mut values: Vec<f64> = (0..1_000_000).map(|index| (index % 17) as f64).collect();
+        let spike_index = 500_123;
+        values[spike_index] = 10_000.0;
+        let (points, domain) = plot_time_points(&times, &values, 40);
+
+        assert!(
+            points.len() <= 80 * 5,
+            "bounded by width, got {}",
+            points.len()
+        );
+        assert!(
+            points
+                .iter()
+                .any(|&(time, value)| { time == times[spike_index] && value == 10_000.0 })
+        );
+        assert_eq!(domain, Some([times[0], times[times.len() - 1]]));
+    }
+
+    #[test]
+    fn non_finite_timestamps_are_skipped_and_input_order_is_retained() {
+        let (points, domain) = plot_time_points(&[10.0, f64::NAN, 2.0], &[1.0, 2.0, 3.0], 20);
+        assert_eq!(points, vec![(10.0, 1.0), (2.0, 3.0)]);
+        assert_eq!(domain, Some([2.0, 10.0]));
     }
 
     #[test]
