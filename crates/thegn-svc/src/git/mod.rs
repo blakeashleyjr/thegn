@@ -998,21 +998,107 @@ fn parse_ahead_behind(out: &str) -> Option<(usize, usize)> {
 /// *gained* an `origin/HEAD` mid-session keeps serving the `main`/`master`
 /// fallback.
 const GLYPH_BASE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const GLYPH_BASE_FAILURE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
+const GLYPH_BASE_CACHE_CAPACITY: usize = 256;
 
-/// Process-global cache of [`glyph_base`]'s resolution, keyed by worktree path.
+/// Process-global cache of [`glyph_base`]'s resolution, keyed by full execution
+/// authority and placement path (with sensitive remote fields hashed).
 /// The glyph scan re-runs for the active worktree on every hydration, so probing
 /// per scan would put a subprocess — and, for a bridged loc, a whole round trip —
 /// on the hot path. Mirrors the shape of the host's `branch_cache`.
 #[allow(clippy::type_complexity)]
 fn base_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<String, (Option<String>, std::time::Instant, BaseKey)>,
+    std::collections::HashMap<RepoExecutionIdentity, (Option<String>, std::time::Instant, BaseKey)>,
 > {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<
-            std::collections::HashMap<String, (Option<String>, std::time::Instant, BaseKey)>,
+            std::collections::HashMap<
+                RepoExecutionIdentity,
+                (Option<String>, std::time::Instant, BaseKey),
+            >,
         >,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn failed_base_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<RepoExecutionIdentity, std::time::Instant>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<RepoExecutionIdentity, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Opaque key for one repository execution placement. The digest prevents SSH
+/// identity/config and provider control arguments from reaching cache storage.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RepoExecutionIdentity(String);
+
+fn repo_execution_identity(loc: &GitLoc) -> RepoExecutionIdentity {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    let mut feed = |part: &[u8]| {
+        hash.update((part.len() as u64).to_be_bytes());
+        hash.update(part);
+    };
+    match loc {
+        GitLoc::Local(path) => {
+            feed(b"local");
+            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            feed(canonical.as_os_str().as_encoded_bytes());
+            // Resolve linked worktrees' .git pointer, then use the gitdir's
+            // stable filesystem identity. Directory mtime/length are unstable:
+            // ordinary index refreshes change them.
+            let git_entry = canonical.join(".git");
+            let git_entry = std::fs::read_to_string(&git_entry)
+                .ok()
+                .and_then(|contents| {
+                    contents
+                        .strip_prefix("gitdir: ")
+                        .map(|path| path.trim().to_owned())
+                })
+                .map(std::path::PathBuf::from)
+                .map(|path| {
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        canonical.join(path)
+                    }
+                })
+                .unwrap_or(git_entry);
+            let git_entry = std::fs::canonicalize(&git_entry).unwrap_or(git_entry);
+            feed(git_entry.as_os_str().as_encoded_bytes());
+            if let Some(identity) = thegn_core::util::file_identity(&git_entry) {
+                feed(identity.as_bytes());
+            }
+        }
+        GitLoc::Remote { ssh, path } => {
+            feed(b"ssh");
+            feed(ssh.host.as_bytes());
+            feed(&ssh.port.to_be_bytes());
+            feed(&[u8::from(ssh.forward_agent)]);
+            feed(ssh.ssh_config.as_deref().unwrap_or("").as_bytes());
+            feed(ssh.jump_host.as_deref().unwrap_or("").as_bytes());
+            feed(ssh.identity.as_deref().unwrap_or("").as_bytes());
+            feed(&(ssh.extra_args.len() as u64).to_be_bytes());
+            for arg in &ssh.extra_args {
+                feed(arg.as_bytes());
+            }
+            feed(path.as_bytes());
+        }
+        GitLoc::Provider {
+            control_prefix,
+            path,
+        } => {
+            feed(b"provider");
+            feed(&(control_prefix.len() as u64).to_be_bytes());
+            for arg in control_prefix {
+                feed(arg.as_bytes());
+            }
+            feed(path.as_bytes());
+        }
+    }
+    RepoExecutionIdentity(format!("{:x}", hash.finalize()))
 }
 
 /// Whether the cached base must be re-probed now, or can be served as-is. Pure,
@@ -1061,7 +1147,7 @@ fn base_from_probe(origin_head: Option<&str>, has_local: impl Fn(&str) -> bool) 
 /// locally. Cached per loc ([`GLYPH_BASE_TTL`]) — the probes are cheap but the
 /// scan is hot.
 fn glyph_base(loc: &GitLoc) -> Option<String> {
-    let key = loc.path();
+    let key = repo_execution_identity(loc);
     // A plain local worktree is validated by what the probe reads (the
     // `origin/HEAD` symref, the candidate loose heads, packed-refs) instead of a
     // clock: an unchanged print means the probe answers the same, so the 60 s
@@ -1081,7 +1167,18 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
             return base.clone();
         }
     }
-    let origin_head = run_status(
+    {
+        let failed = failed_base_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if failed
+            .get(&key)
+            .is_some_and(|at| base_probe_backoff_active(at.elapsed()))
+        {
+            return None;
+        }
+    }
+    let origin_result = run_status(
         loc,
         &[
             "symbolic-ref",
@@ -1089,11 +1186,18 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
             "--short",
             "refs/remotes/origin/HEAD",
         ],
-    )
-    .ok()
-    .and_then(|(exit, out)| (exit == 0).then(|| out.trim().to_string()));
+    );
+    let origin_head = match origin_result {
+        Ok((0, out)) => Some(out.trim().to_string()),
+        Ok((1, _)) => None, // no origin/HEAD is an expected observation
+        _ => {
+            record_base_probe_failure(key);
+            return None;
+        }
+    };
+    let probe_failed = std::cell::Cell::new(false);
     let base = base_from_probe(origin_head.as_deref(), |b| {
-        run_status(
+        match run_status(
             loc,
             &[
                 "show-ref",
@@ -1101,14 +1205,60 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
                 "--quiet",
                 &format!("refs/heads/{b}"),
             ],
-        )
-        .is_ok_and(|(exit, _)| exit == 0)
+        ) {
+            Ok((0, _)) => true,
+            Ok((1, _)) => false, // candidate branch absent
+            _ => {
+                probe_failed.set(true);
+                false
+            }
+        }
     });
-    base_cache()
+    if probe_failed.get() {
+        record_base_probe_failure(key);
+        return None;
+    }
+    let mut cache = base_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= GLYPH_BASE_CACHE_CAPACITY
+        && !cache.contains_key(&key)
+        && let Some(evict) = cache
+            .iter()
+            .filter(|(_, (_, at, _))| at.elapsed() >= GLYPH_BASE_TTL)
+            .min_by_key(|(_, (_, at, _))| *at)
+            .or_else(|| cache.iter().min_by_key(|(_, (_, at, _))| *at))
+            .map(|(key, _)| key.clone())
+    {
+        cache.remove(&evict);
+    }
+    cache.insert(
+        key.clone(),
+        (base.clone(), std::time::Instant::now(), print),
+    );
+    failed_base_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(key, (base.clone(), std::time::Instant::now(), print));
+        .remove(&key);
     base
+}
+
+fn record_base_probe_failure(key: RepoExecutionIdentity) {
+    let mut failed = failed_base_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if failed.len() >= GLYPH_BASE_CACHE_CAPACITY
+        && !failed.contains_key(&key)
+        && let Some(evict) = failed
+            .iter()
+            .min_by_key(|(_, at)| *at)
+            .map(|(key, _)| key.clone())
+    {
+        failed.remove(&evict);
+    }
+    failed.insert(key, std::time::Instant::now());
+}
+
+fn base_probe_backoff_active(age: std::time::Duration) -> bool {
+    age < GLYPH_BASE_FAILURE_BACKOFF
 }
 
 /// What a cached default-base resolution was validated by when stored.
@@ -1761,11 +1911,20 @@ impl GitBackend for GixGit {
         }
         match native_diff::diff_entries(loc.path(), base) {
             Ok(v) => Ok(v),
-            Err(e) => {
+            Err(e) if native_diff::is_unsupported_path(&e) => {
                 tracing::debug!(
                     target: "thegn::forge",
-                    base,
-                    error = %e,
+                    fallback = "unsupported-path",
+                    "native diff cannot represent a non-UTF-8 path in the current result protocol"
+                );
+                Err(e)
+            }
+            Err(_e) => {
+                // Keep the path-bearing error out of ordinary diagnostics: git
+                // paths and ref names can contain private repository data.
+                tracing::debug!(
+                    target: "thegn::forge",
+                    fallback = "cli",
                     "native diff unavailable — falling back to the git CLI"
                 );
                 self.fallback.diff_files(loc, base)
@@ -2227,6 +2386,83 @@ mod tests {
             GLYPH_BASE_TTL
         ));
         assert!(should_reprobe_base(Some(GLYPH_BASE_TTL), GLYPH_BASE_TTL));
+    }
+
+    #[test]
+    fn base_probe_failure_backoff_is_short_and_expires() {
+        assert!(base_probe_backoff_active(std::time::Duration::ZERO));
+        assert!(base_probe_backoff_active(
+            GLYPH_BASE_FAILURE_BACKOFF - std::time::Duration::from_millis(1)
+        ));
+        assert!(!base_probe_backoff_active(GLYPH_BASE_FAILURE_BACKOFF));
+    }
+
+    #[test]
+    fn execution_identity_separates_placements_without_retaining_authority_secrets() {
+        let a = GitLoc::provider(
+            vec!["sprite".into(), "exec".into(), "-s".into(), "alpha".into()],
+            "/workspace",
+        );
+        let b = GitLoc::provider(
+            vec!["sprite".into(), "exec".into(), "-s".into(), "beta".into()],
+            "/workspace",
+        );
+        let key_a = repo_execution_identity(&a);
+        assert_ne!(key_a, repo_execution_identity(&b));
+        assert!(!key_a.0.contains("alpha"));
+        assert!(!key_a.0.contains("workspace"));
+
+        let ssh_a = GitLoc::from_db(
+            "/ignored",
+            Some(&GitLoc::remote_db_string_for(
+                &thegn_core::remote::SshTarget {
+                    host: "same-host".into(),
+                    port: 22,
+                    forward_agent: false,
+                    ssh_config: None,
+                    jump_host: None,
+                    identity: Some("/secret/key-a".into()),
+                    extra_args: Vec::new(),
+                },
+                "/workspace",
+            )),
+        );
+        let ssh_b = GitLoc::from_db(
+            "/ignored",
+            Some(&GitLoc::remote_db_string_for(
+                &thegn_core::remote::SshTarget {
+                    host: "same-host".into(),
+                    port: 22,
+                    forward_agent: false,
+                    ssh_config: None,
+                    jump_host: None,
+                    identity: Some("/secret/key-b".into()),
+                    extra_args: Vec::new(),
+                },
+                "/workspace",
+            )),
+        );
+        let ssh_key = repo_execution_identity(&ssh_a);
+        assert_ne!(ssh_key, repo_execution_identity(&ssh_b));
+        assert!(!ssh_key.0.contains("secret"));
+        assert!(!ssh_key.0.contains("key-a"));
+    }
+
+    #[test]
+    fn local_execution_identity_survives_gitdir_entry_churn() {
+        let dir = std::env::temp_dir().join(format!("tg-git-identity-{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let loc = GitLoc::Local(dir.clone());
+        let before = repo_execution_identity(&loc);
+        // Index lock/rename activity changes gitdir mtime and length. It must
+        // not invalidate the repository execution identity.
+        std::fs::write(dir.join(".git/index.lock"), b"lock").unwrap();
+        std::fs::rename(dir.join(".git/index.lock"), dir.join(".git/index")).unwrap();
+        assert_eq!(before, repo_execution_identity(&loc));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn repo_root() -> std::path::PathBuf {
