@@ -326,8 +326,7 @@ fn run_cli_within(
             read_capped(reader, max_stdout)
         })?;
         return if status.success() {
-            String::from_utf8(stdout)
-                .map_err(|_| CiError::Other("provider output was not UTF-8".into()))
+            Ok(String::from_utf8_lossy(&stdout).into_owned())
         } else {
             Err(classify_stderr(&stderr))
         };
@@ -435,25 +434,31 @@ where
     let mut exited_at = None;
     let mut terminal_error = None;
     loop {
-        match out_rx.try_recv() {
-            Ok(Ok(value)) => output = Some(value),
-            Ok(Err(error)) => terminal_error = Some(error),
-            Err(TryRecvError::Disconnected) => {
-                terminal_error
-                    .get_or_insert_with(|| CiError::Other("provider stdout reader stopped".into()));
+        if output.is_none() {
+            match out_rx.try_recv() {
+                Ok(Ok(value)) => output = Some(value),
+                Ok(Err(error)) => terminal_error = Some(error),
+                Err(TryRecvError::Disconnected) => {
+                    terminal_error.get_or_insert_with(|| {
+                        CiError::Other("provider stdout reader stopped".into())
+                    });
+                }
+                Err(TryRecvError::Empty) => {}
             }
-            Err(TryRecvError::Empty) => {}
         }
-        match err_rx.try_recv() {
-            Ok(Ok(value)) => stderr = Some(value),
-            Ok(Err(error)) => {
-                terminal_error.get_or_insert(error);
+        if stderr.is_none() {
+            match err_rx.try_recv() {
+                Ok(Ok(value)) => stderr = Some(value),
+                Ok(Err(error)) => {
+                    terminal_error.get_or_insert(error);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    terminal_error.get_or_insert_with(|| {
+                        CiError::Other("provider stderr reader stopped".into())
+                    });
+                }
+                Err(TryRecvError::Empty) => {}
             }
-            Err(TryRecvError::Disconnected) => {
-                terminal_error
-                    .get_or_insert_with(|| CiError::Other("provider stderr reader stopped".into()));
-            }
-            Err(TryRecvError::Empty) => {}
         }
         if terminal_error.is_some() || cancel.load(std::sync::atomic::Ordering::Relaxed) {
             break;
@@ -640,7 +645,7 @@ fn run_cli_capped(cmd: Command, max: usize, cancel: &AtomicBool) -> Result<Strin
     if !status.success() {
         return Err(classify_stderr(&stderr));
     }
-    String::from_utf8(output).map_err(|_| CiError::Other("provider output was not UTF-8".into()))
+    Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
 /// Run a log-producing command while retaining only its newest complete lines.
@@ -687,7 +692,7 @@ fn run_bounded_log_within(
     if !status.success() {
         return Err(classify_stderr(&stderr));
     }
-    let (text, truncated) = log_result?;
+    let (text, truncated) = log_result;
     Ok(CiLog { text, truncated })
 }
 
@@ -2072,6 +2077,64 @@ mod tests {
             matches!(result, Err(CiError::Other(message)) if message == "CI provider command timed out")
         );
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn fallback_runner_succeeds_after_stdout_closes_before_exit() {
+        if !shell_available() {
+            return;
+        }
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf ok; exec 1>&-; sleep 0.2; echo err >&2"]);
+        let result = run_fallback_bounded(
+            cmd,
+            test_limits(Duration::from_secs(10), 1024),
+            &test_cancel(),
+            |reader| read_capped(reader, 1024),
+        );
+        let (stdout, status, stderr) = result.unwrap();
+        assert!(status.success());
+        assert_eq!(stdout, b"ok".to_vec());
+        assert_eq!(stderr, "err\n");
+    }
+
+    #[test]
+    fn fallback_runner_returns_nonzero_status_and_stderr() {
+        if !shell_available() {
+            return;
+        }
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exec 1>&-; sleep 0.2; echo bad >&2; exit 3"]);
+        let result = run_fallback_bounded(
+            cmd,
+            test_limits(Duration::from_secs(10), 1024),
+            &test_cancel(),
+            |reader| read_capped(reader, 1024),
+        );
+        let (stdout, status, stderr) = result.unwrap();
+        assert!(stdout.is_empty());
+        assert!(!status.success());
+        assert_eq!(stderr, "bad\n");
+    }
+
+    #[test]
+    fn fallback_runner_collects_multiline_log_output() {
+        if !shell_available() {
+            return;
+        }
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf 'first\\nsecond\\n'"]);
+        let result = run_fallback_bounded(
+            cmd,
+            test_limits(Duration::from_secs(10), 1024),
+            &test_cancel(),
+            |reader| collect_log(reader),
+        );
+        let ((text, truncated), status, stderr) = result.unwrap();
+        assert!(status.success());
+        assert_eq!(text, "first\nsecond\n");
+        assert!(!truncated);
+        assert!(stderr.is_empty());
     }
 
     #[test]
