@@ -140,9 +140,9 @@ pub fn parse_capture_output(out: &str) -> Result<CaptureReport, String> {
 /// Build the sh script that replays a previously-uploaded artifact triple over
 /// the clone at `workdir`: fetch the bundle + hard-reset to `reset_head` (when
 /// a bundle was carried), apply the patch (3-way fallback), untar the
-/// untracked files (`tar xf` auto-detects gzip). Each stage is independently
-/// guarded (`[ -s file ]`) and non-fatal so a partial upload still helps; the
-/// artifacts are consumed (removed) at the end.
+/// untracked files (`tar xf` auto-detects gzip). A failed stage exits with a
+/// `TG-PARITY-ERROR:<stage>` marker and leaves artifacts in place. Artifacts
+/// are removed and completion is printed only after every requested stage passes.
 pub fn replay_script(
     workdir: &str,
     stem: &str,
@@ -157,32 +157,37 @@ pub fn replay_script(
     let tar = artifact_path(stem, "tar");
     let reset = match reset_head {
         Some(h) => format!(
-            "if [ -s {bundle} ]; then \
-               git fetch {bundle} HEAD 2>&1 || git fetch {bundle} 2>&1 || true; \
-               git reset --hard {} 2>&1 || true; \
-             fi; ",
+            "if [ ! -s {bundle} ]; then fail artifact_validation; fi; \
+             if ! git fetch {bundle} HEAD 2>&1; then \
+               if ! git fetch {bundle} 2>&1; then fail fetch; fi; \
+             fi; \
+             if ! git reset --hard {} 2>&1; then fail reset; fi; ",
             sh_quote(h)
         ),
         None => String::new(),
     };
     let apply_patch = if has_patch {
         format!(
-            "if [ -s {patch} ]; then \
-               git apply --whitespace=nowarn {patch} 2>&1 \
-                 || git apply --3way --whitespace=nowarn {patch} 2>&1 || true; \
+            "if [ ! -s {patch} ]; then fail artifact_validation; fi; \
+             if ! git apply --whitespace=nowarn {patch} 2>&1; then \
+               if ! git apply --3way --whitespace=nowarn {patch} 2>&1; then fail patch; fi; \
              fi; "
         )
     } else {
         String::new()
     };
     let untar = if has_tar {
-        format!("if [ -s {tar} ]; then tar xf {tar} -C {wd} 2>&1 || true; fi; ")
+        format!(
+            "if [ ! -s {tar} ]; then fail artifact_validation; fi; \
+             if ! tar xf {tar} -C {wd} 2>&1; then fail extraction; fi; "
+        )
     } else {
         String::new()
     };
     format!(
-        "cd {wd} || exit 1; {reset}{apply_patch}{untar}\
-         rm -f {bundle} {patch} {tar} 2>/dev/null; \
+        "fail() {{ printf 'TG-PARITY-ERROR:%s\\n' \"$1\" >&2; exit 70; }}; \
+         cd {wd} || fail checkout; {reset}{apply_patch}{untar}\
+         if ! rm -f {bundle} {patch} {tar}; then fail cleanup; fi; \
          echo {}",
         sh_quote(done_msg)
     )
@@ -267,9 +272,17 @@ mod tests {
         assert!(full.contains("git apply --whitespace=nowarn /tmp/tg-parity.patch"));
         assert!(full.contains("git apply --3way"));
         assert!(full.contains("tar xf /tmp/tg-parity.tar -C /wd"));
+        assert!(full.contains("TG-PARITY-ERROR:fetch"));
+        assert!(full.contains("TG-PARITY-ERROR:reset"));
+        assert!(full.contains("TG-PARITY-ERROR:patch"));
+        assert!(full.contains("TG-PARITY-ERROR:extraction"));
+        assert!(!full.contains("|| true"));
+        assert!(full.contains("exit 70;"));
+        assert!(full.find("exit 70;").unwrap() < full.find("rm -f").unwrap());
         assert!(
             full.contains("rm -f /tmp/tg-parity.bundle /tmp/tg-parity.patch /tmp/tg-parity.tar")
         );
+        assert!(full.find("rm -f").unwrap() < full.find("echo done").unwrap());
         assert!(full.ends_with("echo done"));
 
         let none = replay_script("/wd", "tg-parity", None, false, false, "noop");
