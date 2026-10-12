@@ -92,7 +92,6 @@ fn stale_grace(period: std::time::Duration) -> std::time::Duration {
 
 #[derive(Default)]
 struct Freshness {
-    last_success: Option<tokio::time::Instant>,
     failure_started: Option<tokio::time::Instant>,
     stale_cleared: bool,
 }
@@ -106,16 +105,14 @@ impl Freshness {
         grace: std::time::Duration,
     ) -> Option<Option<MediaSnapshot>> {
         let since = *self.failure_started.get_or_insert(now);
-        let reference = self.last_success.unwrap_or(since);
-        if self.stale_cleared || now.duration_since(reference) < grace {
+        if self.stale_cleared || now.duration_since(since) < grace {
             return None;
         }
         self.stale_cleared = true;
         Some(None)
     }
 
-    fn on_success(&mut self, now: tokio::time::Instant) {
-        self.last_success = Some(now);
+    fn on_success(&mut self) {
         self.failure_started = None;
         self.stale_cleared = false;
     }
@@ -128,7 +125,7 @@ impl Freshness {
         if self.stale_cleared {
             return None;
         }
-        let since = self.last_success.or(self.failure_started)?;
+        let since = self.failure_started?;
         Some(grace.saturating_sub(now.duration_since(since)))
     }
 }
@@ -187,6 +184,10 @@ fn flap_action(was_showing: bool, new_active: bool) -> FlapAction {
     }
 }
 
+fn should_confirm_flap(read_ok: bool, was_showing: bool, new_active: bool) -> bool {
+    read_ok && flap_action(was_showing, new_active) == FlapAction::Confirm
+}
+
 /// Read one snapshot, logging read errors instead of swallowing them.
 async fn read_snapshot(client: &thegn_media::MediaClient) -> Result<Option<MediaSnapshot>, ()> {
     match client.snapshot_with_caps().await {
@@ -219,10 +220,10 @@ async fn push_snapshot(
     state: &mut WatchState,
 ) -> Option<bool> {
     let read = read_snapshot(client).await;
-    let was_empty = matches!(&read, Ok(None));
+    let read_ok = read.is_ok();
     let mut snap = match read {
         Ok(snap) => {
-            state.freshness.on_success(tokio::time::Instant::now());
+            state.freshness.on_success();
             snap
         }
         Err(()) => match state
@@ -236,11 +237,11 @@ async fn push_snapshot(
             None => return Some(was_showing),
         },
     };
-    if was_empty && flap_action(was_showing, shows_badge(&snap)) == FlapAction::Confirm {
+    if should_confirm_flap(read_ok, was_showing, shows_badge(&snap)) {
         tokio::time::sleep(CONFIRM_DELAY).await;
         match read_snapshot(client).await {
             Ok(confirm) => {
-                state.freshness.on_success(tokio::time::Instant::now());
+                state.freshness.on_success();
                 if shows_badge(&confirm) {
                     tracing::debug!(target: "thegn::media", "media badge held (transient empty ignored)");
                 } else {
@@ -248,17 +249,16 @@ async fn push_snapshot(
                 }
                 snap = confirm;
             }
-            Err(()) => {
-                snap = state
-                    .freshness
-                    .on_failure(tokio::time::Instant::now(), state.grace)
-                    .flatten();
-                if snap.is_none() && state.freshness.stale_cleared {
+            Err(()) => match state
+                .freshness
+                .on_failure(tokio::time::Instant::now(), state.grace)
+            {
+                Some(expired) => {
                     tracing::debug!(target: "thegn::media", "media provider unavailable; stale badge expired");
-                } else {
-                    return Some(was_showing);
+                    snap = expired;
                 }
-            }
+                None => return Some(was_showing),
+            },
         }
     }
     let active = shows_badge(&snap);
@@ -367,7 +367,17 @@ async fn run(
             safety.tick().await; // consume the immediate first tick
             let stream_ended = loop {
                 let changed = if active {
-                    watch.changed().await
+                    if let Some(delay) = state
+                        .freshness
+                        .until_expiry(tokio::time::Instant::now(), state.grace)
+                    {
+                        tokio::select! {
+                            changed = watch.changed() => changed,
+                            _ = tokio::time::sleep(delay) => true,
+                        }
+                    } else {
+                        watch.changed().await
+                    }
                 } else {
                     tokio::select! {
                         c = watch.changed() => c,
@@ -478,7 +488,8 @@ mod tests {
 
     use super::{
         FlapAction, Freshness, MediaSnapshotDelivery, STREAM_STABILITY, abort_and_join,
-        backoff_after_stream, drain_snapshots, flap_action, interval, should_deliver, stale_grace,
+        backoff_after_stream, drain_snapshots, flap_action, interval, should_confirm_flap,
+        should_deliver, stale_grace,
     };
     use thegn_core::media::{MediaCaps, MediaSnapshot, MediaState};
 
@@ -492,6 +503,15 @@ mod tests {
         assert_eq!(flap_action(false, true), FlapAction::Emit);
         // Already hidden and still empty → emit (no repeated re-confirm loop).
         assert_eq!(flap_action(false, false), FlapAction::Emit);
+    }
+
+    #[test]
+    fn successful_stopped_read_is_confirmed_but_failed_read_is_not() {
+        // A successful Some(snapshot) whose state is Stopped has no badge,
+        // just like Ok(None), and must pass through the anti-flap delay.
+        assert!(should_confirm_flap(true, true, false));
+        assert!(!should_confirm_flap(false, true, false));
+        assert!(!should_confirm_flap(true, false, false));
     }
 
     #[test]
@@ -516,18 +536,29 @@ mod tests {
     async fn freshness_keeps_last_good_during_grace_then_clears_once() {
         let now = tokio::time::Instant::now();
         let grace = std::time::Duration::from_secs(10);
-        let mut freshness = Freshness {
-            last_success: Some(now),
-            failure_started: None,
-            stale_cleared: false,
-        };
+        let mut freshness = Freshness::default();
+        freshness.on_success();
+        let failure_now = now + std::time::Duration::from_secs(3600);
+        assert!(freshness.on_failure(failure_now, grace).is_none());
+        assert_eq!(
+            freshness.until_expiry(failure_now, grace),
+            Some(grace),
+            "the grace starts with the first failure, even after an old success"
+        );
         assert!(
             freshness
-                .on_failure(now + grace - std::time::Duration::from_millis(1), grace)
+                .on_failure(
+                    failure_now + grace - std::time::Duration::from_millis(1),
+                    grace
+                )
                 .is_none()
         );
-        assert_eq!(freshness.on_failure(now + grace, grace), Some(None));
-        assert!(freshness.on_failure(now + grace + grace, grace).is_none());
+        assert_eq!(freshness.on_failure(failure_now + grace, grace), Some(None));
+        assert!(
+            freshness
+                .on_failure(failure_now + grace + grace, grace)
+                .is_none()
+        );
         assert_eq!(stale_grace(std::time::Duration::from_secs(4)), grace);
         assert_eq!(
             stale_grace(std::time::Duration::from_secs(5)),
