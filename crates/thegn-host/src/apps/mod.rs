@@ -40,6 +40,14 @@ pub enum ActiveApp {
     Tile(usize),
 }
 
+/// Whether a bracketed paste belongs to an embedded app or may fall through
+/// to the worktree terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteRoute {
+    NotHandled,
+    Consumed,
+}
+
 /// The lifecycle of an app slot. Apps cost nothing until first focused.
 pub enum SlotState {
     /// Not yet constructed.
@@ -307,6 +315,25 @@ impl AppHost {
             ActiveApp::Tile(i) => self.slots.get_mut(i).and_then(|s| s.state.tile_mut()),
             ActiveApp::Work => None,
         }
+    }
+
+    /// Deliver a bracketed paste to the visible tile. An active tile owns the
+    /// paste even when it is still loading, has failed, or ignores the event:
+    /// allowing it to fall through could inject text into the hidden shell.
+    pub fn route_paste(&mut self, text: &str) -> PasteRoute {
+        let ActiveApp::Tile(index) = self.active else {
+            return PasteRoute::NotHandled;
+        };
+        let Some(slot) = self.slots.get_mut(index) else {
+            return PasteRoute::Consumed;
+        };
+        if let SlotState::Running(tile) = &mut slot.state
+            && tile.handle_input(tg_kit::InputEvent::Paste(text.to_owned()))
+                == tg_kit::InputResult::Exit
+        {
+            self.active = ActiveApp::Work;
+        }
+        PasteRoute::Consumed
     }
 
     /// Tell each running tile whether it is the visible tab, on change only.
@@ -841,5 +868,74 @@ mod tests {
         host.reconcile(&cfg);
         assert_eq!(host.active_id(), Some("observe"));
         assert_eq!(host.active_tab_index(), 1);
+    }
+
+    struct PasteTile {
+        events: std::sync::Arc<std::sync::Mutex<Vec<tg_kit::InputEvent>>>,
+        result: tg_kit::InputResult,
+    }
+
+    impl AppTile for PasteTile {
+        fn id(&self) -> &'static str {
+            "observe"
+        }
+        fn title(&self) -> String {
+            "Observe".into()
+        }
+        fn pump(&mut self) -> bool {
+            false
+        }
+        fn wants_redraw(&self) -> bool {
+            false
+        }
+        fn handle_input(&mut self, event: tg_kit::InputEvent) -> tg_kit::InputResult {
+            self.events.lock().unwrap().push(event);
+            self.result
+        }
+        fn render(&mut self, _area: tg_kit::ratatui::layout::Rect, _buf: &mut Buffer) {}
+    }
+
+    fn paste_host(
+        result: tg_kit::InputResult,
+    ) -> (
+        AppHost,
+        std::sync::Arc<std::sync::Mutex<Vec<tg_kit::InputEvent>>>,
+    ) {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut slot = AppSlot::new("observe", "Observe");
+        slot.state = SlotState::Running(Box::new(PasteTile {
+            events: events.clone(),
+            result,
+        }));
+        let mut host = AppHost::new(vec![slot]);
+        host.active = ActiveApp::Tile(0);
+        (host, events)
+    }
+
+    #[test]
+    fn paste_routes_once_to_active_tile_and_never_falls_through_when_unavailable() {
+        let (mut host, events) = paste_host(tg_kit::InputResult::Ignored);
+        assert_eq!(host.route_paste("secret"), PasteRoute::Consumed);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![tg_kit::InputEvent::Paste("secret".into())]
+        );
+
+        host.active = ActiveApp::Work;
+        assert_eq!(host.route_paste("work"), PasteRoute::NotHandled);
+        assert_eq!(events.lock().unwrap().len(), 1);
+
+        host.active = ActiveApp::Tile(0);
+        host.slots[0].state = SlotState::Failed("unavailable".into());
+        assert_eq!(host.route_paste("still secret"), PasteRoute::Consumed);
+        assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn paste_exit_returns_to_work_tab() {
+        let (mut host, events) = paste_host(tg_kit::InputResult::Exit);
+        assert_eq!(host.route_paste("done"), PasteRoute::Consumed);
+        assert_eq!(host.active, ActiveApp::Work);
+        assert_eq!(events.lock().unwrap().len(), 1);
     }
 }
