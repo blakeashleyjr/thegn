@@ -33,7 +33,7 @@ pub(crate) fn completion_contract(row: i64, artifact: &str) -> String {
          You are dispatch row {row}. Commit the handoff artifact at `{artifact}`.\n\
          Then file your report for this row with `thegn dispatch report {row} --text '<VERDICT>: <summary>'`.\n\
          Lead with one verdict: PASS, REVISE, FAIL, or BLOCKED. For PASS, add a `gate:` line\n\
-         citing the successful validation command. Do not change this row's status; the supervisor\n\
+         citing the successful validation command. Do not change this row's status; the supervisor\u{20}\
          verifies the artifact and report and closes the row.\n\
          --- end thegn completion contract v{COMPLETION_CONTRACT_VERSION} ---"
     )
