@@ -18,15 +18,16 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use thegn_core::revtunnel::{
     Frame, FrameDecoder, MAX_RESYNC_SKIP, SYNC_MAGIC, SyncOutcome, encode, encode_data_chunked,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use tokio::sync::mpsc::{Sender, channel};
+use tokio::sync::{Mutex, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
 
 /// Bounded depth for the shared outbound frame sink and each per-connection
 /// inbound channel. This is the flow-control knob: with unbounded channels a
@@ -39,6 +40,49 @@ use tokio::sync::mpsc::{Sender, channel};
 /// `CHANNEL_DEPTH * 1 MiB` per connection direction rather than the whole
 /// transfer size.
 const CHANNEL_DEPTH: usize = 32;
+
+/// Safe per-tunnel ceiling for concurrent logical connections.
+const MAX_TUNNEL_CONNS: usize = 256;
+
+type ConnectionTasks = Arc<Mutex<JoinSet<()>>>;
+
+fn report_rejection(rejections: &AtomicUsize, endpoint: &'static str, reason: &'static str) {
+    let count = rejections.fetch_add(1, Ordering::Relaxed) + 1;
+    if count == 1 {
+        tracing::warn!(
+            target: "thegn::revtunnel",
+            endpoint,
+            reason,
+            rejections = count,
+            "reverse-tunnel connection rejected"
+        );
+    }
+}
+
+async fn reap_finished(tasks: &ConnectionTasks) {
+    let mut tasks = tasks.lock().await;
+    while tasks.try_join_next().is_some() {}
+}
+
+async fn abort_tasks(tasks: &ConnectionTasks) {
+    let mut tasks = tasks.lock().await;
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
+async fn stop_sink(task: JoinHandle<()>) -> io::Result<()> {
+    // Once the read side has hit EOF, queued frames (including final Close
+    // frames) are intentionally discarded. Waiting for the sink to drain here
+    // could hang forever if the peer stopped reading at tunnel end.
+    task.abort();
+    match task.await {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(io::Error::other(format!(
+            "reverse-tunnel sink task: {error}"
+        ))),
+    }
+}
 
 /// Any bidirectional async stream usable as a tunneled connection (a real
 /// `TcpStream`, or an in-memory `DuplexStream` in tests).
@@ -126,9 +170,11 @@ fn decode_err(e: thegn_core::revtunnel::DecodeError) -> io::Error {
 /// task) onto the shared stream write half. Returns the frame sink. The sink is
 /// **bounded** ([`CHANNEL_DEPTH`]) so a producer outracing the stream write
 /// blocks on `send().await` instead of queueing unboundedly (see the constant).
-fn spawn_sink<W: AsyncWrite + Unpin + Send + 'static>(mut wr: W) -> Sender<Vec<u8>> {
+fn spawn_sink<W: AsyncWrite + Unpin + Send + 'static>(
+    mut wr: W,
+) -> (Sender<Vec<u8>>, JoinHandle<()>) {
     let (tx, mut rx) = channel::<Vec<u8>>(CHANNEL_DEPTH);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         while let Some(bytes) = rx.recv().await {
             if wr.write_all(&bytes).await.is_err() {
                 break;
@@ -136,7 +182,7 @@ fn spawn_sink<W: AsyncWrite + Unpin + Send + 'static>(mut wr: W) -> Sender<Vec<u
             let _ = wr.flush().await; // best-effort: sink may be gone
         }
     });
-    tx
+    (tx, task)
 }
 
 /// Pump one logical connection's local stream ⇄ the mux:
@@ -149,38 +195,46 @@ async fn pump_conn(
     sink: Sender<Vec<u8>>,
 ) {
     let (mut rd, mut wr) = tokio::io::split(local);
-    // peer → local. Runs INDEPENDENTLY of the read direction: a half-close on the
-    // local read side must NOT tear down this return path (the peer may still be
-    // sending — e.g. a server's response after the client half-closed). It ends
-    // when the peer's `Close(id)` drops the inbound sender.
-    tokio::spawn(async move {
+    // peer → local. This future is owned by the pump, so aborting the pump also
+    // drops the local writer and cannot leave a detached task behind.
+    let inbound_to_local = async move {
         while let Some(d) = inbound.recv().await {
             if wr.write_all(&d).await.is_err() {
                 break;
             }
         }
         let _ = wr.shutdown().await; // best-effort: peer may already be gone
-    });
+    };
     // local → peer (Data frames), Close(id) at EOF/err (a half-close, not a full
     // teardown — the writer above keeps delivering the reverse direction).
     // `send(...).await` blocks when the bounded sink is full, applying
     // backpressure to this local read so a fast source can't balloon the queue.
     let mut buf = vec![0u8; 16 * 1024];
-    loop {
-        match rd.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if sink.send(encode_data_chunked(id, &buf[..n])).await.is_err() {
-                    break;
+    let local_to_peer = async {
+        loop {
+            match rd.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if sink.send(encode_data_chunked(id, &buf[..n])).await.is_err() {
+                        break;
+                    }
                 }
             }
         }
-    }
-    let _ = sink.send(encode(&Frame::Close(id))).await; // best-effort: remote may be gone
+        let _ = sink.send(encode(&Frame::Close(id))).await; // best-effort: remote may be gone
+    };
+    tokio::join!(local_to_peer, inbound_to_local);
 }
 
 /// Shared per-connection routing table: id → inbound payload sender.
-type Conns = Arc<Mutex<HashMap<u32, Sender<Vec<u8>>>>>;
+struct Route {
+    inbound: Sender<Vec<u8>>,
+    // Keep cleanup identity separate: a sender clone here would keep the
+    // inbound receiver alive after `Close` removes the route.
+    identity: Arc<()>,
+}
+
+type Conns = Arc<Mutex<HashMap<u32, Route>>>;
 
 /// Render a bounded byte preview for logs: printable ASCII verbatim, everything
 /// else as `.`. So a skipped preamble/garbage run shows up readably.
@@ -259,7 +313,11 @@ where
                         // across an await. A full inbound channel backpressures
                         // this read loop, which stalls the shared stream read and
                         // so throttles the peer's send rate for this connection.
-                        let tx = conns.lock().await.get(&id).cloned();
+                        let tx = conns
+                            .lock()
+                            .await
+                            .get(&id)
+                            .map(|route| route.inbound.clone());
                         if let Some(tx) = tx {
                             let _ = tx.send(d).await; // best-effort: connection may be gone
                         }
@@ -295,33 +353,93 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     D: Dialer,
 {
+    run_host_with_limit(stream, dialer, MAX_TUNNEL_CONNS).await
+}
+
+async fn run_host_with_limit<S, D>(stream: S, dialer: D, max_connections: usize) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    D: Dialer,
+{
     let (rd, wr) = tokio::io::split(stream);
-    let sink = spawn_sink(wr);
+    let (sink, sink_task) = spawn_sink(wr);
     let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
+    let permits = Arc::new(Semaphore::new(max_connections));
+    let rejections = Arc::new(AtomicUsize::new(0));
+    let tasks: ConnectionTasks = Arc::new(Mutex::new(JoinSet::new()));
     let conns2 = conns.clone();
-    read_loop(
+    let permits2 = permits.clone();
+    let rejections2 = rejections.clone();
+    let tasks2 = tasks.clone();
+    let result = read_loop(
         rd,
         conns,
         move |id| {
             let dialer = dialer.clone();
             let sink = sink.clone();
             let conns = conns2.clone();
+            let permits = permits2.clone();
+            let rejections = rejections2.clone();
+            let tasks = tasks2.clone();
             async move {
-                let (in_tx, in_rx) = channel::<Vec<u8>>(CHANNEL_DEPTH);
-                conns.lock().await.insert(id, in_tx);
-                tokio::spawn(async move {
-                    match dialer.dial().await {
-                        Ok(local) => pump_conn(id, local, in_rx, sink).await,
-                        Err(_) => {
-                            let _ = sink.send(encode(&Frame::Close(id))).await; // best-effort: remote may be gone
+                reap_finished(&tasks).await;
+                let permit = match permits.try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        report_rejection(&rejections, "host", "connection_limit");
+                        if let Err(error) = sink.send(encode(&Frame::Close(id))).await {
+                            tracing::debug!(target: "thegn::revtunnel", %error, "close reply dropped");
                         }
+                        return;
+                    }
+                };
+                let (in_tx, in_rx) = channel::<Vec<u8>>(CHANNEL_DEPTH);
+                let mut routes = conns.lock().await;
+                if routes.contains_key(&id) {
+                    report_rejection(&rejections, "host", "duplicate_id");
+                    drop(routes);
+                    drop(permit);
+                    if let Err(error) = sink.send(encode(&Frame::Close(id))).await {
+                        tracing::debug!(target: "thegn::revtunnel", %error, "close reply dropped");
+                    }
+                    return;
+                }
+                let identity = Arc::new(());
+                let mine = identity.clone();
+                drop(routes.insert(
+                    id,
+                    Route {
+                        inbound: in_tx,
+                        identity,
+                    },
+                ));
+                drop(routes);
+                tasks.lock().await.spawn(async move {
+                    let dial_result = dialer.dial().await;
+                    let dial_failed = dial_result.is_err();
+                    if let Ok(local) = dial_result {
+                        pump_conn(id, local, in_rx, sink.clone()).await;
+                    }
+                    let mut routes = conns.lock().await;
+                    if routes
+                        .get(&id)
+                        .is_some_and(|route| Arc::ptr_eq(&route.identity, &mine))
+                    {
+                        drop(routes.remove(&id));
+                    }
+                    drop(routes);
+                    drop(permit);
+                    if dial_failed && let Err(error) = sink.send(encode(&Frame::Close(id))).await {
+                        tracing::debug!(target: "thegn::revtunnel", %error, "close reply dropped");
                     }
                 });
             }
         },
         Some(SYNC_MAGIC),
     )
-    .await
+    .await;
+    abort_tasks(&tasks).await;
+    result.and(stop_sink(sink_task).await)
 }
 
 /// SANDBOX endpoint: accept loopback connections on `listener`, open a muxed
@@ -331,33 +449,77 @@ pub async fn run_sandbox<S>(stream: S, listener: TcpListener) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    run_sandbox_with_limit(stream, listener, MAX_TUNNEL_CONNS).await
+}
+
+async fn run_sandbox_with_limit<S>(
+    stream: S,
+    listener: TcpListener,
+    max_connections: usize,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (rd, wr) = tokio::io::split(stream);
-    let sink = spawn_sink(wr);
+    let (sink, sink_task) = spawn_sink(wr);
     // Emit the sync marker as the FIRST bytes on stdout, before any frame, so the
     // host can skip whatever one-time preamble the exec transport prepended (a
     // runtime banner/MOTD/shell echo) and lock onto the framing. See `SYNC_MAGIC`.
     let _ = sink.send(SYNC_MAGIC.to_vec()).await; // best-effort: remote may have vanished before the sync bytes
     let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
     let next_id = Arc::new(AtomicU32::new(1));
+    let permits = Arc::new(Semaphore::new(max_connections));
+    let rejections = Arc::new(AtomicUsize::new(0));
+    let tasks: ConnectionTasks = Arc::new(Mutex::new(JoinSet::new()));
 
     // Accept loop: each new local connection becomes a muxed Open.
     let acc_conns = conns.clone();
     let acc_sink = sink.clone();
     let acc_ids = next_id.clone();
-    let accept = tokio::spawn(async move {
+    let acc_permits = permits.clone();
+    let acc_rejections = rejections.clone();
+    let acc_tasks = tasks.clone();
+    tasks.lock().await.spawn(async move {
         loop {
             let Ok((sock, _)) = listener.accept().await else {
                 break;
             };
+            reap_finished(&acc_tasks).await;
+            let permit = match acc_permits.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    report_rejection(&acc_rejections, "sandbox", "connection_limit");
+                    drop(sock);
+                    continue;
+                }
+            };
             let id = acc_ids.fetch_add(1, Ordering::Relaxed);
             let (in_tx, in_rx) = channel::<Vec<u8>>(CHANNEL_DEPTH);
-            acc_conns.lock().await.insert(id, in_tx);
+            let identity = Arc::new(());
+            let mine = identity.clone();
+            acc_conns.lock().await.insert(
+                id,
+                Route {
+                    inbound: in_tx,
+                    identity,
+                },
+            );
             if acc_sink.send(encode(&Frame::Open(id))).await.is_err() {
+                drop(acc_conns.lock().await.remove(&id));
                 break;
             }
             let sink = acc_sink.clone();
-            tokio::spawn(async move {
+            let conns = acc_conns.clone();
+            acc_tasks.lock().await.spawn(async move {
+                let _permit = permit;
                 pump_conn(id, Box::new(sock), in_rx, sink).await;
+                let mut routes = conns.lock().await;
+                if routes
+                    .get(&id)
+                    .is_some_and(|route| Arc::ptr_eq(&route.identity, &mine))
+                {
+                    drop(routes.remove(&id));
+                }
             });
         }
     });
@@ -366,14 +528,343 @@ where
     // host→sandbox direction is thegn's own clean frame stream (no preamble),
     // so no sync marker is expected here.
     let res = read_loop(rd, conns, |_id| async {}, None).await;
-    accept.abort();
-    res
+    abort_tasks(&tasks).await;
+    res.and(stop_sink(sink_task).await)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Clone)]
+    struct HoldingDialer {
+        calls: Arc<AtomicUsize>,
+        far_ends: tokio::sync::mpsc::UnboundedSender<tokio::io::DuplexStream>,
+    }
+
+    impl Dialer for HoldingDialer {
+        async fn dial(&self) -> io::Result<Box<dyn IoStream>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let (near, far) = tokio::io::duplex(1024);
+            self.far_ends
+                .send(far)
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "test receiver closed"))?;
+            Ok(Box::new(near))
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingDialer {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Dialer for FailingDialer {
+        async fn dial(&self) -> io::Result<Box<dyn IoStream>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "test dial failure",
+            ))
+        }
+    }
+
+    async fn next_frame<R: AsyncRead + Unpin>(reader: &mut R, decoder: &mut FrameDecoder) -> Frame {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut bytes = [0u8; 1024];
+            loop {
+                if let Some(frame) = decoder.next_frame().unwrap() {
+                    return frame;
+                }
+                let n = reader.read(&mut bytes).await.unwrap();
+                assert_ne!(n, 0, "host stream closed before expected frame");
+                decoder.push(&bytes[..n]);
+            }
+        })
+        .await
+        .expect("timed out waiting for reverse-tunnel frame")
+    }
+
+    async fn send_opens<W: AsyncWrite + Unpin>(writer: &mut W, ids: &[u32]) {
+        let mut bytes = SYNC_MAGIC.to_vec();
+        for id in ids {
+            bytes.extend(encode(&Frame::Open(*id)));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer.write_all(&bytes))
+            .await
+            .expect("timed out writing reverse-tunnel opens")
+            .unwrap();
+    }
+
+    async fn send_open<W: AsyncWrite + Unpin>(writer: &mut W, id: u32) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            writer.write_all(&encode(&Frame::Open(id))),
+        )
+        .await
+        .expect("timed out writing reverse-tunnel open")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_caps_concurrent_opens() {
+        let (host, mut peer) = tokio::io::duplex(4096);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (far_tx, mut far_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_host_with_limit(
+            host,
+            HoldingDialer {
+                calls: calls.clone(),
+                far_ends: far_tx,
+            },
+            2,
+        ));
+        send_opens(&mut peer, &[1, 2, 3, 4]).await;
+        let mut decoder = FrameDecoder::new();
+        let rejected = [
+            next_frame(&mut peer, &mut decoder).await,
+            next_frame(&mut peer, &mut decoder).await,
+        ];
+        assert_eq!(rejected, [Frame::Close(3), Frame::Close(4)]);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let _first = tokio::time::timeout(std::time::Duration::from_secs(2), far_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let _second = tokio::time::timeout(std::time::Duration::from_secs(2), far_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("host did not stop after peer disconnect")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_permit_released_after_connection_closes() {
+        let (host, mut peer) = tokio::io::duplex(4096);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (far_tx, mut far_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_host_with_limit(
+            host,
+            HoldingDialer {
+                calls: calls.clone(),
+                far_ends: far_tx,
+            },
+            1,
+        ));
+        send_opens(&mut peer, &[1]).await;
+        let first_far = tokio::time::timeout(std::time::Duration::from_secs(2), far_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(first_far);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer.write_all(&encode(&Frame::Close(1))),
+        )
+        .await
+        .expect("timed out closing first logical connection")
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            for _ in 0..20 {
+                send_open(&mut peer, 2).await;
+                if calls.load(Ordering::Relaxed) == 2 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("connection permit was not released");
+        })
+        .await
+        .expect("timed out waiting for released connection permit");
+        let _second_far = tokio::time::timeout(std::time::Duration::from_secs(2), far_rx.recv())
+            .await
+            .expect("second dial did not complete")
+            .expect("second open was not dialed");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_host_pump_does_not_remove_reopened_route() {
+        let (host, mut peer) = tokio::io::duplex(4096);
+        let (far_tx, mut far_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_host_with_limit(
+            host,
+            HoldingDialer {
+                calls: Arc::new(AtomicUsize::new(0)),
+                far_ends: far_tx,
+            },
+            2,
+        ));
+        send_opens(&mut peer, &[1]).await;
+        let first_far = tokio::time::timeout(std::time::Duration::from_secs(2), far_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer.write_all(&encode(&Frame::Close(1))),
+        )
+        .await
+        .expect("timed out closing the first route")
+        .unwrap();
+        send_open(&mut peer, 1).await;
+        let mut second_far = tokio::time::timeout(std::time::Duration::from_secs(2), far_rx.recv())
+            .await
+            .expect("reopened route was not dialed")
+            .expect("dialer receiver closed");
+
+        // The old pump is still alive until its local read end closes. Let its
+        // completion and route cleanup happen before exercising the new route.
+        drop(first_far);
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(next_frame(&mut peer, &mut decoder).await, Frame::Close(1));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer.write_all(&encode(&Frame::Data(1, b"still routed".to_vec()))),
+        )
+        .await
+        .expect("timed out sending data to reopened route")
+        .unwrap();
+        let mut received = [0u8; 12];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            second_far.read_exact(&mut received),
+        )
+        .await
+        .expect("old pump removed the reopened route")
+        .unwrap();
+        assert_eq!(&received, b"still routed");
+
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("host did not stop after peer disconnect")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_dial_failure_does_not_leak_entry_or_permit() {
+        let (host, mut peer) = tokio::io::duplex(4096);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(run_host_with_limit(
+            host,
+            FailingDialer {
+                calls: calls.clone(),
+            },
+            1,
+        ));
+        send_opens(&mut peer, &[7]).await;
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(next_frame(&mut peer, &mut decoder).await, Frame::Close(7));
+        for _ in 0..10 {
+            send_open(&mut peer, 7).await;
+            assert_eq!(next_frame(&mut peer, &mut decoder).await, Frame::Close(7));
+            if calls.load(Ordering::Relaxed) == 2 {
+                break;
+            }
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sandbox_drops_accepted_socket_at_connection_cap() {
+        let (sandbox, mut peer) = tokio::io::duplex(4096);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(run_sandbox_with_limit(sandbox, listener, 1));
+        let mut sync = vec![0u8; SYNC_MAGIC.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer.read_exact(&mut sync),
+        )
+        .await
+        .expect("sandbox did not send the sync marker")
+        .unwrap();
+        assert_eq!(sync, SYNC_MAGIC);
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        .expect("first sandbox client connect timed out")
+        .unwrap();
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(next_frame(&mut peer, &mut decoder).await, Frame::Open(1));
+        let mut excess = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        .expect("excess sandbox client connect timed out")
+        .unwrap();
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(2), excess.read(&mut byte))
+            .await
+            .expect("sandbox kept the excess accepted socket")
+            .unwrap();
+        assert_eq!(read, 0, "excess accepted socket should be dropped");
+
+        drop(first);
+        drop(excess);
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("sandbox did not stop after tunnel disconnect")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tunnel_end_aborts_connection_tasks() {
+        let (host, mut peer) = tokio::io::duplex(4096);
+        let (far_tx, mut far_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_host_with_limit(
+            host,
+            HoldingDialer {
+                calls: Arc::new(AtomicUsize::new(0)),
+                far_ends: far_tx,
+            },
+            1,
+        ));
+        send_opens(&mut peer, &[1]).await;
+        let mut far = tokio::time::timeout(std::time::Duration::from_secs(2), far_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("host did not finish after tunnel end")
+            .unwrap()
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(2), far.read(&mut byte))
+            .await
+            .expect("dialed connection survived tunnel cancellation")
+            .unwrap();
+        assert_eq!(read, 0, "dialed stream should be dropped with the tunnel");
+    }
 
     /// A `Dialer` whose target echoes everything written to it (stands in for a
     /// real host service like `tgproxy`).
@@ -546,7 +1037,7 @@ mod tests {
         // A duplex whose far end we never read → writes block once its ~64 KiB
         // buffer fills, stalling the sink's writer task.
         let (near, _far) = tokio::io::duplex(64 * 1024);
-        let sink = spawn_sink(near);
+        let (sink, sink_task) = spawn_sink(near);
 
         // Frames large enough that a handful overflow the duplex write buffer,
         // guaranteeing the writer task blocks rather than draining forever.
@@ -572,6 +1063,7 @@ mod tests {
             "bounded sink must reject sends once full under a stalled writer \
              (an unbounded sink would accept every frame and balloon memory)"
         );
+        stop_sink(sink_task).await.unwrap();
     }
 
     /// A large multi-frame payload still round-trips end-to-end now that every
