@@ -797,7 +797,125 @@ async fn cold_stage_prompt(svc: &DaemonService, row: &AgentDispatch) -> anyhow::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::service::DaemonService;
+    use crate::daemon::session::{IdleTransition, SessionMeta};
+    use crate::daemon::tombstone::{MAX_TOMBSTONES, TOMBSTONE_TTL_MS, Tombstone};
+    use tempfile::TempDir;
+    use thegn_core::control_wire::EventFrame;
     use thegn_core::issue::NewDispatch;
+    use thegn_core::store::NotificationStore;
+    use thegn_core::{db::Db, graveyard::Graveyard, issue::AgentDispatchStatus as St};
+    use tokio::sync::{broadcast, mpsc};
+
+    fn test_service(config: thegn_core::config::Config) -> (Arc<DaemonService>, TempDir) {
+        let profile = tempfile::Builder::new()
+            .prefix("pipeline-retry-")
+            .tempdir()
+            .expect("private profile tempdir");
+        thegn_core::fsperm::ensure_private_dir(profile.path())
+            .expect("private profile permissions");
+        let (events, _rx) = broadcast::channel(16);
+        let (idle_tx, _idle_rx) = mpsc::unbounded_channel::<IdleTransition>();
+        let svc = Arc::new(DaemonService {
+            daemon_id: "test".into(),
+            sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            actor_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            accepting: AtomicBool::new(true),
+            tombs: Arc::new(tokio::sync::Mutex::new(Graveyard::new(
+                MAX_TOMBSTONES,
+                TOMBSTONE_TTL_MS,
+            ))),
+            native_ids: Mutex::new(HashMap::new()),
+            spawning_relaunches: Arc::new(Mutex::new(HashSet::new())),
+            events,
+            db: Arc::new(Mutex::new(Db::open_memory().expect("db"))),
+            grace_ms: 0,
+            idle_tx,
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            config: Arc::new(config),
+            profile_root: profile.path().to_path_buf(),
+            endpoint: "/tmp/test.sock".into(),
+        });
+        (svc, profile)
+    }
+
+    async fn bury(svc: &DaemonService, session: &str, screen: &[u8], code: i32) {
+        let tomb = Tombstone {
+            meta: SessionMeta {
+                id: session.into(),
+                worktree: None,
+                program: "aider".into(),
+                cwd: None,
+                created_at_ms: 0,
+                pid: None,
+                forked_from: None,
+            },
+            exit_code: Some(code),
+            exited_at_ms: 1,
+            final_screen: EventFrame::PaneSnapshot {
+                session: session.into(),
+                seq: 0,
+                cols: 80,
+                rows: 24,
+                bytes: screen.to_vec(),
+            },
+            history_tail: Vec::new(),
+            last_state: thegn_core::attention::PaneAgentState::Idle,
+            attached: 0,
+            rows: 24,
+            cols: 80,
+            recording: None,
+        };
+        let buried_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_millis() as i64;
+        svc.tombs
+            .lock()
+            .await
+            .insert(session.into(), tomb, buried_at_ms);
+    }
+
+    fn running_row(svc: &DaemonService, issue: &str, agent: &str) -> i64 {
+        let db = svc.db.lock().unwrap();
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                stage: Some("code"),
+                ..NewDispatch::new(issue, "/wt/257", agent)
+            })
+            .expect("row");
+        db.update_dispatch_status(id, St::Running)
+            .expect("running status");
+        id
+    }
+
+    async fn publish_late(
+        svc: &Arc<DaemonService>,
+        row_id: i64,
+        session: &'static str,
+        attempts: &Arc<Attempts>,
+    ) {
+        let task_svc = svc.clone();
+        let task_attempts = attempts.clone();
+        let task =
+            tokio::spawn(
+                async move { handle_exit(&task_svc, session, 1, &task_attempts, None).await },
+            );
+        {
+            let db = svc.db.lock().unwrap();
+            let row = db.get_dispatch(row_id).expect("get row").expect("row");
+            assert_eq!(row.session_id, None, "exit starts before publication");
+            assert_eq!(row.exit_code, None, "exit has not been stamped yet");
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let db = svc.db.lock().unwrap();
+        assert!(
+            db.bind_dispatch_session(row_id, session)
+                .expect("publish session")
+        );
+        drop(db);
+        task.await.expect("exit task").expect("handle exit");
+    }
 
     fn claude_row() -> AgentDispatch {
         let db = thegn_core::db::Db::open_memory().expect("db");
@@ -870,107 +988,27 @@ mod tests {
         assert_eq!(keep.as_deref(), Some("id"));
     }
 
-    /// THE-257: the same bounded association that stamps the event must wait
-    /// through initial roster publication before classifying the transport
-    /// failure. Before the fix, the stamp task eventually succeeded while
-    /// `handle_exit` returned on its first session lookup miss.
+    /// THE-257: a retryable exit before roster publication is stamped and
+    /// classified, then one failed relaunch parks the row with its retry note.
     #[tokio::test]
-    async fn exit_before_roster_publication_is_stamped_and_parked() {
-        use crate::daemon::service::DaemonService;
-        use crate::daemon::session::{IdleTransition, SessionMeta};
-        use crate::daemon::tombstone::{MAX_TOMBSTONES, TOMBSTONE_TTL_MS, Tombstone};
-        use thegn_core::control_wire::EventFrame;
-        use thegn_core::db::Db;
-        use thegn_core::graveyard::Graveyard;
-        use thegn_core::issue::{AgentDispatchStatus as St, NewDispatch};
-        use thegn_core::store::NotificationStore;
-        use tokio::sync::{broadcast, mpsc};
-
-        let (events, _rx) = broadcast::channel(16);
-        let (idle_tx, _idle_rx) = mpsc::unbounded_channel::<IdleTransition>();
+    async fn retryable_exit_before_publication_is_stamped_and_relaunches_once() {
         let mut config = thegn_core::config::Config::default();
         config.pipeline.transport_retry.backoff_ms = 0;
-        config.pipeline.transport_retry.max_attempts = 0;
-        let svc = Arc::new(DaemonService {
-            daemon_id: "test".into(),
-            sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            actor_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            accepting: AtomicBool::new(true),
-            tombs: Arc::new(tokio::sync::Mutex::new(Graveyard::new(
-                MAX_TOMBSTONES,
-                TOMBSTONE_TTL_MS,
-            ))),
-            native_ids: Mutex::new(HashMap::new()),
-            spawning_relaunches: Arc::new(Mutex::new(HashSet::new())),
-            events,
-            db: Arc::new(Mutex::new(Db::open_memory().expect("db"))),
-            grace_ms: 0,
-            idle_tx,
-            shutdown: Arc::new(tokio::sync::Notify::new()),
-            config: Arc::new(config),
-            profile_root: std::env::temp_dir(),
-            endpoint: "/tmp/test.sock".into(),
-        });
-        let row_id = {
-            let db = svc.db.lock().unwrap();
-            let id = db
-                .put_agent_dispatch(NewDispatch {
-                    stage: Some("code"),
-                    ..NewDispatch::new("linear:THE-257", "/wt/257", "aider")
-                })
-                .unwrap();
-            db.update_dispatch_status(id, St::Running).unwrap();
-            id
-        };
-        let session = "s-published-late";
-        let tomb = Tombstone {
-            meta: SessionMeta {
-                id: session.into(),
-                worktree: None,
-                program: "aider".into(),
-                cwd: None,
-                created_at_ms: 0,
-                pid: None,
-                forked_from: None,
-            },
-            exit_code: Some(1),
-            exited_at_ms: 1,
-            final_screen: EventFrame::PaneSnapshot {
-                session: session.into(),
-                seq: 0,
-                cols: 80,
-                rows: 24,
-                bytes: b"Connection error. SDK retry budget exhausted".to_vec(),
-            },
-            history_tail: Vec::new(),
-            last_state: thegn_core::attention::PaneAgentState::Idle,
-            attached: 0,
-            rows: 24,
-            cols: 80,
-            recording: None,
-        };
-        let buried_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is after the Unix epoch")
-            .as_millis() as i64;
-        svc.tombs
-            .lock()
-            .await
-            .insert(session.into(), tomb, buried_at_ms);
+        config.pipeline.transport_retry.max_attempts = 3;
+        config.pipeline.transport_retry.transport_signatures = vec!["Connection error".into()];
+        let (svc, _profile) = test_service(config);
+        let row_id = running_row(&svc, "linear:THE-257", "no-such-agent");
+        let session = "s-retryable-late";
+        bury(
+            &svc,
+            session,
+            b"Connection error. SDK retry budget exhausted",
+            1,
+        )
+        .await;
+        let attempts = Arc::new(Mutex::new(HashMap::new()));
 
-        let attempts = Mutex::new(HashMap::new());
-        let task_svc = svc.clone();
-        let task =
-            tokio::spawn(async move { handle_exit(&task_svc, session, 1, &attempts, None).await });
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        assert!(
-            svc.db
-                .lock()
-                .unwrap()
-                .bind_dispatch_session(row_id, session)
-                .unwrap()
-        );
-        task.await.unwrap().unwrap();
+        publish_late(&svc, row_id, session, &attempts).await;
 
         let row = svc
             .db
@@ -981,61 +1019,236 @@ mod tests {
             .unwrap();
         assert_eq!(row.exit_code, Some(1), "exit is durably stamped");
         assert!(row.exited_at_ms.is_some());
-        assert_eq!(row.status, St::WaitingHuman, "transport failure classified");
+        assert_eq!(row.status, St::WaitingHuman, "failed relaunch is parked");
+        let note = row.note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains("(attempt 1/3)"),
+            "retry attempt is recorded: {note}"
+        );
+        assert!(
+            note.contains("relaunch failed"),
+            "failed relaunch is recorded: {note}"
+        );
+        assert!(
+            attempts.lock().unwrap().is_empty(),
+            "completed attempt is forgotten"
+        );
+    }
+
+    /// A usage limit is parked without consuming transport retry budget.
+    #[tokio::test]
+    async fn limit_exit_before_publication_is_stamped_and_parked() {
+        let mut config = thegn_core::config::Config::default();
+        config.pipeline.transport_retry.backoff_ms = 0;
+        config.pipeline.transport_retry.limit_signatures = vec!["weekly limit".into()];
+        let (svc, _profile) = test_service(config);
+        let row_id = running_row(&svc, "linear:THE-257", "aider");
+        let session = "s-limit-late";
+        bury(&svc, session, b"You have hit your weekly limit", 1).await;
+        let attempts = Arc::new(Mutex::new(HashMap::new()));
+
+        publish_late(&svc, row_id, session, &attempts).await;
+
+        let row = svc
+            .db
+            .lock()
+            .unwrap()
+            .get_dispatch(row_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, St::WaitingHuman);
         assert!(
             row.note
                 .as_deref()
                 .unwrap_or_default()
-                .starts_with("transport")
+                .starts_with("limit:")
         );
+        assert_eq!(row.exit_code, Some(1));
+        assert!(attempts.lock().unwrap().is_empty());
     }
 
-    /// THE-257: an exit with no published row gives up at the bounded lookup
-    /// deadline, logs from `stamp_dispatch_exit`, and consumes its native id.
+    /// An unmatched exit is durably stamped and left to the supervisor.
+    #[tokio::test]
+    async fn unmatched_exit_before_publication_is_stamped_without_verdict() {
+        let (svc, _profile) = test_service(thegn_core::config::Config::default());
+        let row_id = running_row(&svc, "linear:THE-257", "aider");
+        let session = "s-unmatched-late";
+        bury(&svc, session, b"segfault", 1).await;
+        let attempts = Arc::new(Mutex::new(HashMap::new()));
+
+        publish_late(&svc, row_id, session, &attempts).await;
+
+        let row = svc
+            .db
+            .lock()
+            .unwrap()
+            .get_dispatch(row_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.exit_code, Some(1));
+        assert!(row.exited_at_ms.is_some());
+        assert_eq!(row.status, St::Running);
+        assert_eq!(row.note, None);
+        assert!(attempts.lock().unwrap().is_empty());
+    }
+
+    /// Publication and a terminal verdict in one DB lock leave the row
+    /// terminal; the exit cannot associate, stamp, or retain its native id.
+    #[tokio::test]
+    async fn concurrent_terminal_verdict_wins_exit_before_publication() {
+        let (svc, _profile) = test_service(thegn_core::config::Config::default());
+        let row_id = running_row(&svc, "linear:THE-257", "aider");
+        let session = "s-terminal-late";
+        bury(&svc, session, b"Connection error", 1).await;
+        svc.native_ids
+            .lock()
+            .unwrap()
+            .insert(session.into(), "native-id".into());
+        let attempts = Arc::new(Mutex::new(HashMap::new()));
+        let task_svc = svc.clone();
+        let task_attempts = attempts.clone();
+        let started = tokio::time::Instant::now();
+        let task =
+            tokio::spawn(
+                async move { handle_exit(&task_svc, session, 1, &task_attempts, None).await },
+            );
+        {
+            let db = svc.db.lock().unwrap();
+            let row = db.get_dispatch(row_id).unwrap().unwrap();
+            assert_eq!(row.session_id, None);
+            assert_eq!(row.exit_code, None);
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            !task.is_finished(),
+            "exit remains pending through the publication window"
+        );
+        {
+            let db = svc.db.lock().unwrap();
+            assert!(db.bind_dispatch_session(row_id, session).unwrap());
+            db.update_dispatch_status(row_id, St::Done).unwrap();
+        }
+        task.await.unwrap().unwrap();
+        assert!(started.elapsed() <= Duration::from_millis(750));
+        let row = svc
+            .db
+            .lock()
+            .unwrap()
+            .get_dispatch(row_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, St::Done);
+        assert_eq!(row.note, None);
+        assert_eq!(row.exit_code, None);
+        assert!(!svc.native_ids.lock().unwrap().contains_key(session));
+    }
+
+    /// Once generation A is stamped, hold the tombstone read while publishing
+    /// generation B through the retry API. A's classifier then sees the fence
+    /// change and cannot park or stamp B.
+    #[tokio::test]
+    async fn delayed_old_generation_exit_does_not_change_replacement() {
+        let mut config = thegn_core::config::Config::default();
+        config.pipeline.transport_retry.backoff_ms = 0;
+        config.pipeline.transport_retry.transport_signatures = vec!["Connection error".into()];
+        let (svc, _profile) = test_service(config);
+        let row_id = running_row(&svc, "linear:THE-257", "aider");
+        let session_a = "s-old-generation";
+        bury(&svc, session_a, b"Connection error", 1).await;
+        let attempts = Arc::new(Mutex::new(HashMap::new()));
+        let tomb_guard = svc.tombs.lock().await;
+        let task_svc = svc.clone();
+        let task_attempts = attempts.clone();
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            handle_exit(&task_svc, session_a, 1, &task_attempts, None).await
+        });
+        {
+            let row = svc
+                .db
+                .lock()
+                .unwrap()
+                .get_dispatch(row_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.session_id, None, "old exit begins before publication");
+            assert_eq!(row.exit_code, None);
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        {
+            let db = svc.db.lock().unwrap();
+            assert!(db.bind_dispatch_session(row_id, session_a).unwrap());
+        }
+
+        let stamp_deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let stamped = svc
+                .db
+                .lock()
+                .unwrap()
+                .get_dispatch(row_id)
+                .unwrap()
+                .unwrap()
+                .exit_code
+                .is_some();
+            if stamped {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < stamp_deadline,
+                "generation A was not stamped"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        {
+            let db = svc.db.lock().unwrap();
+            db.update_dispatch_status(row_id, St::Spawning).unwrap();
+            assert!(
+                db.compare_and_set_dispatch_retry_run(
+                    row_id,
+                    St::Spawning,
+                    "s-replacement",
+                    "/wt/257/retry",
+                )
+                .unwrap()
+            );
+        }
+        drop(tomb_guard);
+        task.await.unwrap().unwrap();
+        assert!(started.elapsed() <= Duration::from_millis(750));
+
+        let row = svc
+            .db
+            .lock()
+            .unwrap()
+            .get_dispatch(row_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.session_id.as_deref(), Some("s-replacement"));
+        assert_eq!(row.status, St::Running);
+        assert_eq!(row.exit_code, None);
+        assert_eq!(row.exited_at_ms, None);
+        assert_eq!(row.note, None);
+        assert!(attempts.lock().unwrap().is_empty());
+    }
+
+    /// THE-257: a row that never publishes is unchanged, and association gives
+    /// up within the existing 500 ms lookup deadline.
     #[tokio::test]
     async fn exit_without_a_published_row_gives_up_cleanly() {
-        use crate::daemon::service::DaemonService;
-        use crate::daemon::session::IdleTransition;
-        use crate::daemon::tombstone::{MAX_TOMBSTONES, TOMBSTONE_TTL_MS};
-        use thegn_core::db::Db;
-        use thegn_core::graveyard::Graveyard;
-        use thegn_core::issue::{AgentDispatchStatus as St, NewDispatch};
-        use tokio::sync::{broadcast, mpsc};
-
-        let (events, _rx) = broadcast::channel(16);
-        let (idle_tx, _idle_rx) = mpsc::unbounded_channel::<IdleTransition>();
-        let svc = DaemonService {
-            daemon_id: "test".into(),
-            sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            actor_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            accepting: AtomicBool::new(true),
-            tombs: Arc::new(tokio::sync::Mutex::new(Graveyard::new(
-                MAX_TOMBSTONES,
-                TOMBSTONE_TTL_MS,
-            ))),
-            native_ids: Mutex::new(HashMap::from([(
-                "s-never-published".into(),
-                "native-id".into(),
-            )])),
-            spawning_relaunches: Arc::new(Mutex::new(HashSet::new())),
-            events,
-            db: Arc::new(Mutex::new(Db::open_memory().expect("db"))),
-            grace_ms: 0,
-            idle_tx,
-            shutdown: Arc::new(tokio::sync::Notify::new()),
-            config: Arc::new(thegn_core::config::Config::default()),
-            profile_root: std::env::temp_dir(),
-            endpoint: "/tmp/test.sock".into(),
-        };
-        let row_id = {
+        let (svc, _profile) = test_service(thegn_core::config::Config::default());
+        let row_id = running_row(&svc, "linear:THE-257", "aider");
+        {
             let db = svc.db.lock().unwrap();
-            let id = db
-                .put_agent_dispatch(NewDispatch::new("linear:THE-257", "/wt/257", "aider"))
-                .unwrap();
-            db.update_dispatch_status(id, St::Running).unwrap();
-            assert!(db.bind_dispatch_session(id, "s-still-published").unwrap());
-            id
-        };
+            assert!(
+                db.bind_dispatch_session(row_id, "s-still-published")
+                    .unwrap()
+            );
+        }
+        svc.native_ids
+            .lock()
+            .unwrap()
+            .insert("s-never-published".into(), "native-id".into());
         let attempts = Mutex::new(HashMap::new());
         let started = tokio::time::Instant::now();
         handle_exit(&svc, "s-never-published", 1, &attempts, None)
