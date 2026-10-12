@@ -12,6 +12,8 @@ use crate::util;
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 
+pub(crate) const ORPHAN_CACHE_SWEEP_MAX_KEYS: usize = 1024;
+
 const WORKTREE_RECORD_COLUMNS: &str = "worktree, COALESCE(branch,''), COALESCE(agent,''), COALESCE(created_at,0), COALESCE(repo_path,''), COALESCE(tab_name,''), session_name, location, position, sandbox_backend, observed_backend, folder_id, env_name";
 
 fn decode_worktree_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<WorktreeRow> {
@@ -105,10 +107,10 @@ pub(crate) fn delete_worktree_cache_rows(db: &Db, wt: &str) -> Result<()> {
 }
 
 impl Db {
-    /// Prune cached rows for a bounded number of worktree keys that are neither
-    /// registered nor present on disk. This is called from the terminal slice
-    /// of `prune_missing_semantic_files`, which the `db.rs` worker loop reaches
-    /// after its semantic scan is complete.
+    /// Prune cached rows for up to `ORPHAN_CACHE_SWEEP_MAX_KEYS` worktree keys
+    /// that are neither registered nor present on disk. This is called from the
+    /// terminal slice of `prune_missing_semantic_files`, which the `db.rs`
+    /// worker loop reaches after its semantic scan is complete.
     pub(crate) fn prune_orphan_worktree_caches(&self, max_keys: usize) -> Result<usize> {
         let conn = self.conn();
         let mut cache_queries = vec![
@@ -138,13 +140,22 @@ impl Db {
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
         let registered = {
-            let mut stmt = conn.prepare("SELECT worktree FROM worktrees WHERE worktree != ''")?;
+            let mut stmt = conn.prepare(
+                "SELECT worktree FROM worktrees WHERE worktree != '' \
+                 UNION SELECT repo_path FROM workspaces WHERE repo_path != ''",
+            )?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()?
         };
         let orphan_keys: Vec<String> = keys
             .into_iter()
-            .filter(|key| !registered.contains(key) && !std::path::Path::new(key).exists())
+            .filter(|key| {
+                !registered.contains(key)
+                    && !registered.iter().any(|root| {
+                        std::path::Path::new(root).starts_with(std::path::Path::new(key))
+                    })
+                    && !std::path::Path::new(key).exists()
+            })
             .take(max_keys)
             .collect();
         for key in &orphan_keys {
@@ -1703,6 +1714,7 @@ mod tests {
     }
     use crate::db::Db;
     use crate::store::WorkspaceStore;
+    use rusqlite::params;
 
     #[test]
     fn env_pin_upserts_before_registration_and_survives_it() {
@@ -1952,7 +1964,11 @@ mod tests {
             db.put_glyph_cache(key, "{}").unwrap();
         }
 
-        assert_eq!(db.prune_orphan_worktree_caches(1024).unwrap(), 1);
+        assert_eq!(
+            db.prune_orphan_worktree_caches(ORPHAN_CACHE_SWEEP_MAX_KEYS)
+                .unwrap(),
+            1
+        );
         for table in [
             "pr_cache",
             "commit_cache",
@@ -2006,6 +2022,62 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM pr_cache", [], |row| row.get(0))
             .unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn orphan_cache_sweep_preserves_repo_ancestor_of_remote_worktree_semantics() {
+        let db = Db::open_memory().unwrap();
+        let remote = r#"{"path":"/remote/repo/.worktrees/x","host":"builder"}"#;
+        db.put_worktree(
+            "tab",
+            "/remote/repo",
+            "/remote/repo/.worktrees/x",
+            "feature",
+            Some(remote),
+            None,
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO workspaces(repo_path,name) VALUES('/remote/standalone','remote')",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO loc_cache(worktree,loc,report_json,fetched_at) VALUES('/remote/repo',1,'{}',1),('/remote/standalone',1,'{}',1)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sem_entity(id,file,name,kind,span,source_hash) VALUES('remote-entity','/remote/repo/.worktrees/x/src/lib.rs','item','function','1-1','hash')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.prune_orphan_worktree_caches(ORPHAN_CACHE_SWEEP_MAX_KEYS)
+                .unwrap(),
+            0
+        );
+        let sem_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sem_entity WHERE id='remote-entity'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sem_count, 1,
+            "registered descendant semantic row was pruned"
+        );
+        let loc_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM loc_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(loc_count, 2, "registered repo roots were pruned");
     }
 
     #[test]

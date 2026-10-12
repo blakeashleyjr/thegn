@@ -202,7 +202,9 @@ impl Db {
     /// Registered roots are retained even when they are not present locally:
     /// remote worktrees legitimately have no local filesystem path. When the
     /// worker reaches the terminal slice (`scanned == 0`), this also triggers
-    /// the bounded orphan-worktree cache sweep; see `db.rs`'s worker loop.
+    /// the bounded orphan-worktree cache sweep (up to
+    /// [`crate::db_workspace::ORPHAN_CACHE_SWEEP_MAX_KEYS`] keys); see `db.rs`'s
+    /// worker loop.
     pub(crate) fn prune_missing_semantic_files(
         &self,
         after_rowid: i64,
@@ -260,7 +262,7 @@ impl Db {
             tx.commit()?;
         }
         if scanned == 0 {
-            self.prune_orphan_worktree_caches(1024)?;
+            self.prune_orphan_worktree_caches(crate::db_workspace::ORPHAN_CACHE_SWEEP_MAX_KEYS)?;
         }
         Ok((scanned, next_rowid))
     }
@@ -466,14 +468,19 @@ mod tests {
             .unwrap();
 
         let mut after_rowid = 0;
+        let mut first_scanned = None;
         loop {
             let (scanned, next_rowid) = db.prune_missing_semantic_files(after_rowid, 512).unwrap();
+            if first_scanned.is_none() {
+                first_scanned = Some(scanned);
+            }
             if scanned == 0 {
                 break;
             }
             after_rowid = next_rowid;
         }
 
+        assert_eq!(first_scanned.unwrap(), 3);
         assert!(db.file_source_hash("/gone/src/lib.rs").unwrap().is_none());
         assert_eq!(
             db.file_source_hash("/live/src/lib.rs").unwrap().as_deref(),
