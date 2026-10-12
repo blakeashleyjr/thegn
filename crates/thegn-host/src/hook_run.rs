@@ -62,18 +62,6 @@ impl HookRunResult {
     }
 }
 
-/// Run one hook, writing its log beneath the user's XDG state directory.
-pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult {
-    run_with_log_root(
-        spec,
-        context,
-        cwd,
-        &thegn_core::util::xdg_state_home()
-            .join("thegn")
-            .join("hooks"),
-    )
-}
-
 /// Callers must invoke this from a worker, never from the compositor loop: the
 /// CPU wrapper probes the host and the child wait blocks.
 #[expect(clippy::disallowed_methods)]
