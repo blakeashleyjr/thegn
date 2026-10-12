@@ -446,8 +446,12 @@ fn path_expansion_budget_refuses_aggregate_roots_and_pin_cwds_before_normalizing
 
 #[test]
 fn path_expansion_budget_allows_small_paths_and_counts_implicit_repo_root() {
+    let paths = path_context();
     let mut cfg = Config::default();
-    cfg.workspaces_dir = "~/workspaces".into();
+    // Normalize the non-path defaults first so the projection comparison
+    // measures the path changes this budget is responsible for.
+    cfg.post_process_pure(&paths);
+    cfg.workspaces_dir = "workspace-directory".into();
     cfg.repo_roots.clear();
     cfg.pins.push(crate::config::Pin {
         name: "pin".into(),
@@ -467,32 +471,30 @@ fn path_expansion_budget_allows_small_paths_and_counts_implicit_repo_root() {
         corner_width: None,
         corner_height: None,
     });
-    let paths = path_context();
-    let before = bounded_serialized_config(&cfg).unwrap().len();
     assert!(check_path_expansion_budget(&cfg, &paths).is_ok());
 
-    let old_workspace_bytes = json_string_content_len("~/workspaces").unwrap();
-    let new_workspace_bytes = json_string_content_len("/captured/home/workspaces").unwrap();
-    let actual = projected_serialized_size(
-        before,
-        old_workspace_bytes + json_string_content_len("~/project").unwrap(),
-        new_workspace_bytes
-            + json_string_content_len("/captured/home/project").unwrap()
-            + new_workspace_bytes
-            + 2,
-    )
-    .unwrap();
-    assert!(actual <= config_budget::MAX_NORMALIZED_BYTES);
-    // The implicit root adds a second expanded workspaces path to the final
-    // representation. Its JSON array spelling contributes its content plus 2.
-    assert_eq!(
-        before - old_workspace_bytes - json_string_content_len("~/project").unwrap()
-            + new_workspace_bytes
-            + json_string_content_len("/captured/home/project").unwrap()
-            + new_workspace_bytes
-            + 2,
-        actual
+    let projection = projected_path_expansion_size(&cfg, &paths).unwrap();
+    let mut normalized = cfg.clone();
+    normalized.post_process_pure(&paths);
+    let serialized_len = bounded_serialized_config(&normalized).unwrap().len();
+    assert!(
+        serialized_len <= projection,
+        "normalized config is {serialized_len} bytes, projection is {projection}"
     );
+}
+
+#[test]
+fn path_expansion_budget_does_not_expand_user_tilde_paths() {
+    assert_eq!(
+        expanded_path_json_len("~user/project", "/captured/home").unwrap(),
+        None
+    );
+}
+
+#[test]
+fn json_string_content_len_counts_escaped_characters() {
+    let escaped = "\"\\\u{0008}\u{000c}\n\r\t\u{0000}\u{001f}é";
+    assert_eq!(json_string_content_len(escaped).unwrap(), 28);
 }
 
 #[test]
