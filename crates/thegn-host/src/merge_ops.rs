@@ -98,7 +98,7 @@ pub fn push_target(repo_root: &Path, target: &str) -> Result<()> {
 }
 
 /// Queue rows belonging to a repo (membership rule shared with the in-app drain).
-pub fn rows_for_repo(db: &Db, root: &Path) -> Vec<MergeQueueRow> {
+pub fn rows_for_repo(db: &Db, root: &Path) -> Result<Vec<MergeQueueRow>> {
     merge_driver::rows_for_repo(db, root)
 }
 
@@ -339,7 +339,7 @@ pub fn dequeue_worktree(cfg: &Config, db: &Db, worktree: &Path) -> Result<()> {
 /// Drop every queue row for `root`'s repo, un-filing each from its lifecycle
 /// folder. Returns the number removed.
 pub fn clear_repo(cfg: &Config, db: &Db, root: &Path) -> Result<usize> {
-    let rows = rows_for_repo(db, root);
+    let rows = rows_for_repo(db, root)?;
     let n = rows.len();
     for r in &rows {
         dequeue_worktree(cfg, db, Path::new(&r.worktree))?;

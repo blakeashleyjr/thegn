@@ -19,6 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use termwiz::terminal::TerminalWaker;
+use thegn_core::attention::MqStatus;
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::merge_lifecycle::LifecycleEvent;
@@ -171,7 +172,16 @@ fn drive_blocking(cfg: &Config, any_path: &std::path::Path, send: impl Fn(DriveM
             }
             Ok(None) => {}
         }
-        let items: Vec<QueueItem> = merge_driver::rows_for_repo(&db, &root)
+        let rows = match merge_driver::rows_for_repo(&db, &root) {
+            Ok(rows) => rows,
+            Err(error) => {
+                send(DriveMsg::Failed(format!(
+                    "merge queue unavailable: {error}"
+                )));
+                return;
+            }
+        };
+        let items: Vec<QueueItem> = rows
             .into_iter()
             .filter(|r| r.status != "landed" && r.status != "ready")
             .map(|r| QueueItem {
@@ -411,6 +421,20 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                     ctx.toasts
                         .info_ttl(w.clone(), now, std::time::Duration::from_secs(8));
                 }
+                for error in &out.persistence_errors {
+                    ctx.toasts.info_ttl(
+                        format!("Merge queue state write failed: {error}"),
+                        now,
+                        std::time::Duration::from_secs(10),
+                    );
+                }
+                for failure in &out.bookkeeping_failed {
+                    ctx.toasts.info_ttl(
+                        format!("Ref advanced, bookkeeping failed for {}: {} → {}; rerun merge drain to reconcile", failure.target, failure.old_oid, failure.new_oid),
+                        now,
+                        std::time::Duration::from_secs(10),
+                    );
+                }
                 let (msg, success) = drive_summary(&out);
                 if success {
                     ctx.toasts.success(msg, now);
@@ -489,23 +513,36 @@ fn drive_summary(out: &DriveOutcome) -> (String, bool) {
     let total = out.landed.len()
         + out.ready.len()
         + out.deferred.len()
+        + out.agent_blocked.len()
         + out.needs_human.len()
         + out.gate_error.len();
-    let message = if total == 0 {
+    let message = if !out.persistence_errors.is_empty() || !out.bookkeeping_failed.is_empty() {
+        format!(
+            "Merge queue partially completed: {} persistence errors, {} landed refs need bookkeeping recovery",
+            out.persistence_errors.len(),
+            out.bookkeeping_failed.len()
+        )
+    } else if total == 0 {
         "Merge queue: nothing to drain".to_owned()
     } else {
         format!(
-            "Drained: {} landed, {} ready, {} deferred, {} need a human, {} gate errors",
+            "Drained: {} landed, {} ready, {} deferred, {} agent-blocked, {} need a human, {} gate errors",
             out.landed.len(),
             out.ready.len(),
             out.deferred.len(),
+            out.agent_blocked.len(),
             out.needs_human.len(),
             out.gate_error.len(),
         )
     };
     (
         message,
-        out.deferred.is_empty() && out.needs_human.is_empty() && out.gate_error.is_empty(),
+        out.deferred.is_empty()
+            && out.agent_blocked.is_empty()
+            && out.needs_human.is_empty()
+            && out.gate_error.is_empty()
+            && out.persistence_errors.is_empty()
+            && out.bookkeeping_failed.is_empty(),
     )
 }
 
@@ -1047,10 +1084,10 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
         Err(e) => return DriveMsg::Failed(format!("land: {e}")),
     };
     let db = Db::open().ok(); // best-effort: cache: queue record writes only; the land outcome is reported regardless
-    let record = |status: &str, oid: Option<&str>, detail: Option<&str>| {
+    let record = |status: MqStatus, oid: Option<&str>, detail: Option<&str>| {
         if let Some(db) = &db {
             // best-effort: the DB is a cache; the ref move is the record.
-            let _ = db.update_merge_status(wt, status, oid, detail, None);
+            let _ = db.update_merge_status(wt, status.as_str(), oid, detail, None);
         }
     };
     // Drive the sidebar-folder lifecycle for this worktree (no-op unless
@@ -1069,7 +1106,9 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
         }
     };
     match outcome {
-        AttemptOutcome::Landed { commit, resyncs } => {
+        AttemptOutcome::Landed {
+            commit, resyncs, ..
+        } => {
             // In-app, a checkout on the target is fast-forwarded by the ref
             // watcher (`git_watch::spawn_main_checkout_heal`); anything the fold
             // could not sync is real uncommitted work, so log it rather than
@@ -1083,7 +1122,7 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                     );
                 }
             }
-            record("landed", Some(&commit), None);
+            record(MqStatus::Landed, Some(&commit), None);
             if let (Some(db), Some(root)) = (&db, integrate::main_checkout(Path::new(wt))) {
                 crate::merge_lifecycle::apply_landed(
                     &cfg.repo_merge_queue(&root),
@@ -1100,7 +1139,7 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
             })
         }
         AttemptOutcome::UpToDate { commit } => {
-            record("landed", Some(&commit), Some("already merged"));
+            record(MqStatus::Landed, Some(&commit), Some("already merged"));
             lifecycle(LifecycleEvent::Landed, &branch);
             DriveMsg::Done(DriveOutcome {
                 landed: vec![branch],
@@ -1113,7 +1152,7 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
         } => {
             let detail =
                 crate::integrate::conflict_details(&paths, &submodule_conflicts).join("\n");
-            record("deferred", None, Some(&detail));
+            record(MqStatus::Deferred, None, Some(&detail));
             lifecycle(LifecycleEvent::Failed, &branch);
             DriveMsg::Failed(format!(
                 "{branch} conflicts: {}",
@@ -1128,7 +1167,7 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
             } else {
                 format!("breaks build\n{}", log.trim())
             };
-            record("gate_failed", None, Some(&detail));
+            record(MqStatus::GateFailed, None, Some(&detail));
             lifecycle(LifecycleEvent::Failed, &branch);
             DriveMsg::Failed(format!("{branch} breaks the build (gate red)"))
         }
@@ -1140,17 +1179,21 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
             } else {
                 format!("{reason}\n{}", log.trim())
             };
-            record("gate_error", None, Some(&detail));
+            record(MqStatus::GateError, None, Some(&detail));
             lifecycle(LifecycleEvent::Failed, &branch);
             DriveMsg::Failed(format!("{branch} was NOT gated — {reason}"))
         }
         AttemptOutcome::Unreachable { detail } => {
-            record("deferred", None, Some(&detail));
+            record(MqStatus::Deferred, None, Some(&detail));
             lifecycle(LifecycleEvent::Failed, &branch);
             DriveMsg::Failed(format!("{branch}: {detail}"))
         }
         AttemptOutcome::Ready { tip } => {
-            record("ready", Some(&tip), Some("gated green — awaiting land"));
+            record(
+                MqStatus::Ready,
+                Some(&tip),
+                Some("gated green — awaiting land"),
+            );
             DriveMsg::Failed(format!("{branch} is ready but was not landed"))
         }
     }
