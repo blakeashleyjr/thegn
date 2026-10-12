@@ -13,7 +13,7 @@
 //! makes shell-script plugins impossible to write.
 
 pub mod loader;
-mod platform;
+pub(crate) mod platform;
 pub mod proc;
 pub mod provider;
 pub mod session;

@@ -9,6 +9,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::Instant;
 
+pub(crate) fn platform_is_executable_file(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
 enum ExitNotice {
     Signal(Signal),
     #[cfg(target_os = "linux")]
