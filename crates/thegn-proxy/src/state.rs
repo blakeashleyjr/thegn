@@ -11,6 +11,12 @@ use crate::model::ProxyConfig;
 use crate::shared::SharedDb;
 use crate::upstream::Upstreams;
 
+/// Upstream deadline policy: TCP connect is capped at 10s. Buffered dispatches
+/// have a 300s total deadline. Live streams have the configured first-byte
+/// deadline through the first usable event, then an idle deadline between
+/// events; their body is not subject to a client-wide total timeout.
+const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Process-wide proxy state. Cheap to clone (everything is `Arc`/shared).
 pub struct AppState {
     pub config: ProxyConfig,
@@ -42,7 +48,10 @@ impl AppState {
             limiter: Arc::new(RateLimiter::new()),
             inflight: Arc::new(InflightTracker::new()),
             metrics: Arc::new(Metrics::new()),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+                .build()
+                .expect("constant upstream timeout policy builds a reqwest client"),
             upstreams: Upstreams::new(),
             db,
             resolved: Mutex::new(HashMap::new()),
