@@ -536,7 +536,9 @@ fn clone_workspace_repo_with_deadline(
                 .map_err(|_| anyhow::anyhow!("workspace clone progress reader panicked"))?;
         }
         let status = status.expect("clone loop always records or waits for child status");
-        if let Some(reason) = stop_reason {
+        if let Some(reason) = stop_reason
+            && (reason == CloneStopReason::Cancelled || !status.success())
+        {
             anyhow::bail!("{}", reason.message());
         }
         if !status.success() {
@@ -579,6 +581,8 @@ fn stream_progress_lines_with_activity<R: std::io::BufRead>(
     mut on_activity: impl FnMut(),
 ) {
     let mut buf: Vec<u8> = Vec::new();
+    let mut first_segment = true;
+    const CLONE_BANNER: &[u8] = b"Cloning into ";
     let flush = |buf: &mut Vec<u8>, on_line: &mut dyn FnMut(String)| {
         let decoded = String::from_utf8_lossy(buf);
         let clean: String = decoded.chars().filter(|ch| !ch.is_control()).collect();
@@ -590,11 +594,19 @@ fn stream_progress_lines_with_activity<R: std::io::BufRead>(
     };
     for byte in reader.bytes() {
         let Ok(b) = byte else { break };
-        on_activity();
         if b == b'\r' || b == b'\n' {
+            if first_segment && !buf.is_empty() && !buf.starts_with(CLONE_BANNER) {
+                on_activity();
+            }
             flush(&mut buf, &mut on_line);
+            first_segment = false;
         } else if buf.len() < MAX_PROGRESS_SEGMENT {
             buf.push(b);
+            if !first_segment {
+                on_activity();
+            } else if !CLONE_BANNER.starts_with(&buf) && !buf.starts_with(CLONE_BANNER) {
+                on_activity();
+            }
         }
     }
     flush(&mut buf, &mut on_line);
@@ -1229,6 +1241,17 @@ Receiving objects: 100% (10/10)\rdone.\n";
     }
 
     #[test]
+    fn clone_banner_does_not_count_as_remote_activity() {
+        let activity_bytes = std::cell::Cell::new(0);
+        stream_progress_lines_with_activity(
+            std::io::Cursor::new(b"Cloning into 'x'...\nremote\n".as_slice()),
+            |_| {},
+            || activity_bytes.set(activity_bytes.get() + 1),
+        );
+        assert_eq!(activity_bytes.get(), "remote".len());
+    }
+
+    #[test]
     fn progress_lines_flush_trailing_without_terminator() {
         let mut lines = Vec::new();
         stream_progress_lines(std::io::Cursor::new(b"no newline".as_slice()), |l| {
@@ -1460,7 +1483,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
                 CloneLimits {
                     total: Duration::from_secs(60),
                     connect: Duration::from_millis(300),
-                    idle: Duration::from_millis(300),
+                    idle: Duration::from_secs(60),
                 },
                 || false,
                 |_| {},
@@ -1471,10 +1494,66 @@ Receiving objects: 100% (10/10)\rdone.\n";
         let elapsed = started.elapsed();
         worker.join().unwrap();
         let error = result.expect_err("a nonresponsive HTTP peer must time out");
+        assert_eq!(error, "git clone timed out (no response from remote)");
         assert!(
-            error.contains("git clone timed out"),
-            "expected timeout, got: {error}"
+            !error.contains("did not exit"),
+            "the clone process group must be reaped, got: {error}"
         );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "clone process group took {elapsed:?} to reap"
+        );
+        assert!(!temp.path().join("clone").exists());
+        assert!(
+            accept_thread.join().unwrap().is_some(),
+            "git contacted local peer"
+        );
+    }
+
+    #[test]
+    fn hung_clone_total_deadline_reaps_local_http_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let accept_thread = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => return Some(stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return None;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept clone connection: {error}"),
+                }
+            }
+        });
+        let dest = temp.path().join("clone");
+        let url = format!("http://{address}/x.git");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let worker = std::thread::spawn(move || {
+            let result = clone_workspace_repo_with_deadline(
+                &url,
+                &dest,
+                CloneLimits {
+                    total: Duration::from_millis(300),
+                    connect: Duration::from_secs(60),
+                    idle: Duration::from_secs(60),
+                },
+                || false,
+                |_| {},
+            );
+            tx.send(result.map_err(|error| error.to_string())).unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let elapsed = started.elapsed();
+        worker.join().unwrap();
+        let error = result.expect_err("a nonresponsive HTTP peer must time out");
+        assert_eq!(error, "git clone timed out");
         assert!(
             !error.contains("did not exit"),
             "the clone process group must be reaped, got: {error}"
