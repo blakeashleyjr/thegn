@@ -149,9 +149,10 @@ impl HostCandidate {
     /// — by construction — no identity/secret and the default (`ask`) install
     /// consent. Returns `(slug, config)`; the caller may override the name.
     pub fn to_host_config(&self) -> (String, HostConfig) {
-        // Slug the FQDN (unique across tailnets), matching `parse_host_target`'s
-        // convention so `--promote nuc…` and `host add nuc.tail….ts.net` agree;
-        // fall back to the short name only for a degenerate empty FQDN.
+        // Slug the FQDN, matching `parse_host_target`'s convention so
+        // `--promote nuc…` and `host add nuc.tail….ts.net` agree. Slugs are
+        // not unique; `put_host_def` rejects a conflicting authority. Fall back
+        // to the short name only for a degenerate empty FQDN.
         let base = if self.fqdn.trim().is_empty() {
             self.name.as_str()
         } else {

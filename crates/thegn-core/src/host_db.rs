@@ -139,6 +139,16 @@ const HOST_COLS: &str = "host_id, name, reach_kind, state, state_meta, caps_json
                          install_consent, heartbeat, active_step, last_probe, last_used, \
                          updated_at, headroom_json, last_headroom";
 
+fn host_authority_summary(config: &crate::host_config::HostConfig) -> String {
+    use crate::host_config::HostReach;
+    match config.reach {
+        HostReach::Local => "local".to_string(),
+        HostReach::Ssh => format!("ssh {}:{}", config.ssh.host, config.ssh.port),
+        HostReach::Iroh => "iroh authority".to_string(),
+        HostReach::Cloud => format!("cloud provider {}", config.cloud.provider),
+    }
+}
+
 impl HostStore for Db {
     fn host_get(&self, id: &HostId) -> Result<Option<HostRow>> {
         let got = self
@@ -300,7 +310,32 @@ impl HostStore for Db {
     ) -> Result<()> {
         let id = HostId::named(name);
         let json = serde_json::to_string(hc)?;
-        self.conn().execute(
+        let tx = self.conn().unchecked_transaction()?;
+        let existing: Option<Option<String>> = tx
+            .query_row(
+                "SELECT config_json FROM hosts WHERE host_id=?1",
+                params![id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(Some(existing_json)) = existing {
+            let existing_config = serde_json::from_str::<crate::host_config::HostConfig>(
+                &existing_json,
+            )
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "host alias {name:?} has an unreadable stored authority; remove it with `thegn host rm {name}` or choose `--name <other>`"
+                )
+            })?;
+            if !crate::host_config::same_host_authority(&existing_config, hc) {
+                anyhow::bail!(
+                    "host alias {name:?} is already bound to {} and cannot be rebound to {}; remove it with `thegn host rm {name}` or choose `--name <other>`",
+                    host_authority_summary(&existing_config),
+                    host_authority_summary(hc),
+                );
+            }
+        }
+        tx.execute(
             "INSERT INTO hosts (host_id, name, reach_kind, state, config_json, updated_at)
              VALUES (?1, ?2, ?3, 'unknown', ?4, ?5)
              ON CONFLICT(host_id) DO UPDATE SET
@@ -310,6 +345,7 @@ impl HostStore for Db {
                updated_at = excluded.updated_at",
             params![id.as_str(), name, hc.reach.as_str(), json, now],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -478,6 +514,175 @@ mod tests {
 
     fn caps() -> HostCaps {
         HostCaps::parse_probe("ARCH=x86_64\nOS=linux\nPODMAN=5.0\nRSYNC=1\n").unwrap()
+    }
+
+    fn ssh_host(target: &str, port: u16) -> crate::host_config::HostConfig {
+        crate::host_config::HostConfig {
+            reach: crate::host_config::HostReach::Ssh,
+            ssh: crate::config::EnvSshConfig {
+                host: target.into(),
+                port,
+                ..crate::config::EnvSshConfig::default()
+            },
+            ..crate::host_config::HostConfig::default()
+        }
+    }
+
+    #[test]
+    fn host_authority_summary_covers_each_reach_without_ticket_material() {
+        assert_eq!(
+            host_authority_summary(&crate::host_config::HostConfig {
+                reach: crate::host_config::HostReach::Local,
+                ..crate::host_config::HostConfig::default()
+            }),
+            "local"
+        );
+        assert_eq!(
+            host_authority_summary(&ssh_host("me@box", 2222)),
+            "ssh me@box:2222"
+        );
+        let iroh = crate::host_config::HostConfig {
+            reach: crate::host_config::HostReach::Iroh,
+            iroh: crate::host_config::HostIrohConfig {
+                ticket: "secret-ticket".into(),
+                ..crate::host_config::HostIrohConfig::default()
+            },
+            ..crate::host_config::HostConfig::default()
+        };
+        let summary = host_authority_summary(&iroh);
+        assert_eq!(summary, "iroh authority");
+        assert!(!summary.contains("secret-ticket"));
+        assert_eq!(
+            host_authority_summary(&crate::host_config::HostConfig {
+                reach: crate::host_config::HostReach::Cloud,
+                cloud: crate::host_config::HostCloudConfig {
+                    provider: "sprites".into(),
+                    ..crate::host_config::HostCloudConfig::default()
+                },
+                ..crate::host_config::HostConfig::default()
+            }),
+            "cloud provider sprites"
+        );
+    }
+
+    #[test]
+    fn put_host_def_rejects_authority_collision_without_mutating_row() {
+        let db = db();
+        let original = ssh_host("me@a.b", 22);
+        db.put_host_def("a-b", &original, 10).unwrap();
+        let id = HostId::named("a-b");
+        db.host_checkpoint(&id, "a-b", "ssh", &HostState::Ready, None, 11)
+            .unwrap();
+        db.host_event(&id, "provision", "kept", 12).unwrap();
+        let before: (String, String, String, String, i64) = db
+            .conn()
+            .query_row(
+                "SELECT host_id, name, reach_kind, config_json, updated_at FROM hosts WHERE host_id=?1",
+                params![id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+
+        let collision = ssh_host("me@a-b", 22);
+        let error = db.put_host_def("a-b", &collision, 99).unwrap_err();
+        assert!(error.to_string().contains("a-b"));
+        let after: (String, String, String, String, i64) = db
+            .conn()
+            .query_row(
+                "SELECT host_id, name, reach_kind, config_json, updated_at FROM hosts WHERE host_id=?1",
+                params![id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "collision must leave the stored row byte-for-byte unchanged"
+        );
+        assert_eq!(db.host_get(&id).unwrap().unwrap().state, HostState::Ready);
+        assert_eq!(db.host_events_recent(&id, 10).unwrap()[0].2, "kept");
+    }
+
+    #[test]
+    fn put_host_def_is_idempotent_for_same_authority_and_rejects_changed_port() {
+        let db = db();
+        let original = ssh_host("me@box", 22);
+        db.put_host_def("box", &original, 10).unwrap();
+        let mut updated = original.clone();
+        updated.image = "new:image".into();
+        updated.install_runtime = crate::host_config::InstallConsent::Auto;
+        db.put_host_def("box", &updated, 20).unwrap();
+        assert_eq!(db.host_defs().unwrap()[0].1.image, "new:image");
+
+        let changed_port = ssh_host("me@box", 2222);
+        assert!(db.put_host_def("box", &changed_port, 30).is_err());
+        let changed_user = ssh_host("you@box", 22);
+        assert!(db.put_host_def("box", &changed_user, 40).is_err());
+        assert_eq!(db.host_defs().unwrap()[0].1.ssh.port, 22);
+        assert_eq!(db.host_defs().unwrap()[0].1.ssh.host, "me@box");
+    }
+
+    #[test]
+    fn put_host_def_fails_closed_on_unreadable_existing_config() {
+        let db = db();
+        let id = HostId::named("broken");
+        db.host_checkpoint(&id, "broken", "ssh", &HostState::Ready, None, 1)
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE hosts SET config_json='not-json' WHERE host_id=?1",
+                params![id.as_str()],
+            )
+            .unwrap();
+        let before: (String, String, i64) = db
+            .conn()
+            .query_row(
+                "SELECT config_json, state, updated_at FROM hosts WHERE host_id=?1",
+                params![id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert!(
+            db.put_host_def("broken", &ssh_host("me@box", 22), 9)
+                .is_err()
+        );
+        let after: (String, String, i64) = db
+            .conn()
+            .query_row(
+                "SELECT config_json, state, updated_at FROM hosts WHERE host_id=?1",
+                params![id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn put_host_def_rejects_iroh_ticket_and_reach_collisions() {
+        let db = db();
+        let iroh = crate::host_config::HostConfig {
+            reach: crate::host_config::HostReach::Iroh,
+            iroh: crate::host_config::HostIrohConfig {
+                ticket: "ticket-one".into(),
+                user: "me".into(),
+                ..crate::host_config::HostIrohConfig::default()
+            },
+            ..crate::host_config::HostConfig::default()
+        };
+        db.put_host_def("shared", &iroh, 1).unwrap();
+        let changed_ticket = crate::host_config::HostConfig {
+            iroh: crate::host_config::HostIrohConfig {
+                ticket: "ticket-two".into(),
+                ..iroh.iroh.clone()
+            },
+            ..iroh.clone()
+        };
+        assert!(db.put_host_def("shared", &changed_ticket, 2).is_err());
+        assert!(
+            db.put_host_def("shared", &ssh_host("me@box", 22), 3)
+                .is_err()
+        );
+        assert_eq!(db.host_defs().unwrap()[0].1.iroh.ticket, "ticket-one");
     }
 
     #[test]
