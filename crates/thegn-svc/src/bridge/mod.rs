@@ -15,7 +15,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -31,6 +31,8 @@ use thegn_core::remote::GitLoc;
 
 /// Maximum concurrent stateless bridge RPCs across all connections.
 const MAX_BRIDGE_WORK: usize = 8;
+/// Bounded FIFO for short bursts that arrive while all workers are occupied.
+const MAX_QUEUED_BRIDGE_WORK: usize = 32;
 /// Per-stream capture ceiling. Readers continue draining after this limit.
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 /// Worst-case JSON escaping expands captured control bytes sixfold. Five
@@ -48,26 +50,109 @@ const MAX_WATCHERS_PER_CONNECTION: usize = 16;
 const MAX_WATCHERS_PER_CONNECTION: usize = 3;
 const MAX_PROCS_PER_CONNECTION: usize = 16;
 
+type BridgeWork = Box<dyn FnOnce() + Send + 'static>;
+
+struct AdmissionJob {
+    cancel: Arc<AtomicBool>,
+    work: BridgeWork,
+}
+
+#[derive(Default)]
+struct AdmissionQueue {
+    active: usize,
+    jobs: VecDeque<AdmissionJob>,
+}
+
 #[derive(Default)]
 struct AdmissionLimiter {
     active: std::sync::atomic::AtomicUsize,
+    queue: Mutex<AdmissionQueue>,
+}
+
+#[derive(Debug)]
+enum AdmissionError {
+    Busy,
+    Spawn(std::io::Error),
 }
 
 impl AdmissionLimiter {
+    fn submit(
+        self: &Arc<Self>,
+        cancel: Arc<AtomicBool>,
+        work: impl FnOnce() + Send + 'static,
+    ) -> std::result::Result<(), AdmissionError> {
+        let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        let job = AdmissionJob {
+            cancel,
+            work: Box::new(work),
+        };
+        if queue.active >= MAX_BRIDGE_WORK {
+            if queue.jobs.len() >= MAX_QUEUED_BRIDGE_WORK {
+                return Err(AdmissionError::Busy);
+            }
+            queue.jobs.push_back(job);
+            return Ok(());
+        }
+
+        queue.active += 1;
+        self.active.fetch_add(1, Ordering::AcqRel);
+        let limiter = self.clone();
+        match std::thread::Builder::new()
+            .name("bridge-exec".into())
+            .spawn(move || Self::run_worker(limiter, job))
+        {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                queue.active -= 1;
+                self.active.fetch_sub(1, Ordering::AcqRel);
+                Err(AdmissionError::Spawn(error))
+            }
+        }
+    }
+
+    fn run_worker(limiter: Arc<Self>, first: AdmissionJob) {
+        let mut next = Some(first);
+        loop {
+            if let Some(job) = next.take()
+                && !job.cancel.load(Ordering::Acquire)
+                && std::panic::catch_unwind(std::panic::AssertUnwindSafe(job.work)).is_err()
+            {
+                tracing::error!(target: "thegn::bridge", "bridge RPC worker panicked");
+            }
+            let mut queue = limiter.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            match queue.jobs.pop_front() {
+                Some(job) => next = Some(job),
+                None => {
+                    queue.active -= 1;
+                    limiter.active.fetch_sub(1, Ordering::AcqRel);
+                    return;
+                }
+            }
+        }
+    }
+
+    // Test helper for code paths that exercise permit release independently of
+    // queue scheduling.
+    #[cfg(test)]
     fn try_acquire(self: &Arc<Self>) -> Option<AdmissionPermit> {
-        self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_BRIDGE_WORK).then_some(active + 1)
-            })
-            .ok()?;
+        let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        if queue.active >= MAX_BRIDGE_WORK {
+            return None;
+        }
+        queue.active += 1;
+        self.active.fetch_add(1, Ordering::AcqRel);
         Some(AdmissionPermit(self.clone()))
     }
 }
 
+#[cfg(test)]
 struct AdmissionPermit(Arc<AdmissionLimiter>);
 
+#[cfg(test)]
 impl Drop for AdmissionPermit {
     fn drop(&mut self) {
+        let mut queue = self.0.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        queue.active -= 1;
         self.0.active.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -1070,33 +1155,30 @@ pub fn serve(reader: impl Read, writer: impl Write + Send + 'static) {
                     }
                 }
                 "exec" | "exec.batch" | "proc.list" => {
-                    let Some(permit) = bridge_admission().try_acquire() else {
-                        write_frame(
-                            &writer,
-                            &resp_err(req.id, "bridge busy: execution capacity exhausted".into()),
-                        );
-                        continue;
-                    };
                     let (w, worker_cancel) = (writer.clone(), cancel.clone());
                     let req_id = req.id;
-                    if let Err(e) = std::thread::Builder::new()
-                        .name("bridge-exec".into())
-                        .spawn(move || {
-                            let _permit = permit;
-                            let resp = match req.method.as_str() {
-                                "exec" => exec_response(&req, &worker_cancel),
-                                "exec.batch" => exec_batch_response(&req, &worker_cancel),
-                                _ => proc_response(&req),
-                            };
-                            write_frame(&w, &resp);
-                        })
-                    {
-                        // Primary path: a failed spawn would leave the host
-                        // waiting on a response that never comes — answer now.
-                        write_frame(
+                    let result = bridge_admission().submit(worker_cancel.clone(), move || {
+                        let resp = match req.method.as_str() {
+                            "exec" => exec_response(&req, &worker_cancel),
+                            "exec.batch" => exec_batch_response(&req, &worker_cancel),
+                            _ => proc_response(&req),
+                        };
+                        write_frame(&w, &resp);
+                    });
+                    match result {
+                        Ok(()) => {}
+                        Err(AdmissionError::Busy) => write_frame(
                             &writer,
-                            &resp_err(req_id, format!("spawn exec worker: {e}")),
-                        );
+                            &resp_err(req_id, "bridge busy: execution capacity exhausted".into()),
+                        ),
+                        Err(AdmissionError::Spawn(error)) => {
+                            // A failed spawn would leave the host waiting on a
+                            // response that never comes — answer now.
+                            write_frame(
+                                &writer,
+                                &resp_err(req_id, format!("spawn exec worker: {error}")),
+                            );
+                        }
                     }
                 }
                 // Stateful / fast: stay inline (they borrow `watchers`/`procs`).
@@ -2820,19 +2902,254 @@ mod tests {
     }
 
     #[test]
-    fn bridge_admission_fails_fast_at_the_shared_limit_and_releases_permits() {
+    fn bridge_admission_queues_work_and_releases_capacity() {
         let limiter = Arc::new(AdmissionLimiter::default());
-        let permits: Vec<_> = (0..MAX_BRIDGE_WORK)
-            .map(|_| limiter.try_acquire().expect("capacity is available"))
-            .collect();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (started_tx, started_rx) = channel();
+        for _ in 0..MAX_BRIDGE_WORK {
+            let gate = gate.clone();
+            let started = started_tx.clone();
+            limiter
+                .submit(Arc::new(AtomicBool::new(false)), move || {
+                    started.send(()).unwrap();
+                    let (lock, cv) = &*gate;
+                    let open = lock.lock().unwrap();
+                    drop(cv.wait_while(open, |open| !*open).unwrap());
+                })
+                .unwrap();
+        }
+        for _ in 0..MAX_BRIDGE_WORK {
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let (queued_tx, queued_rx) = channel();
+        limiter
+            .submit(Arc::new(AtomicBool::new(false)), move || {
+                queued_tx.send(()).unwrap();
+            })
+            .unwrap();
         assert_eq!(limiter.active.load(Ordering::Acquire), MAX_BRIDGE_WORK);
-        assert!(limiter.try_acquire().is_none(), "overload must fail fast");
-        drop(permits);
-        assert_eq!(limiter.active.load(Ordering::Acquire), 0);
-        assert!(
-            limiter.try_acquire().is_some(),
-            "released capacity is reusable"
+        assert_eq!(
+            limiter.queue.lock().unwrap().jobs.len(),
+            1,
+            "the extra request waits in the queue"
         );
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        queued_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let start = Instant::now();
+        while limiter.active.load(Ordering::Acquire) != 0
+            && start.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(limiter.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn bridge_admission_rejects_only_after_active_and_queue_are_full() {
+        let limiter = Arc::new(AdmissionLimiter::default());
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let high_water = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (started_tx, started_rx) = channel();
+        for _ in 0..MAX_BRIDGE_WORK + MAX_QUEUED_BRIDGE_WORK {
+            let gate = gate.clone();
+            let running = running.clone();
+            let high_water = high_water.clone();
+            let completed = completed.clone();
+            let started = started_tx.clone();
+            limiter
+                .submit(Arc::new(AtomicBool::new(false)), move || {
+                    let active = running.fetch_add(1, Ordering::AcqRel) + 1;
+                    high_water.fetch_max(active, Ordering::AcqRel);
+                    started.send(()).unwrap();
+                    let (lock, cv) = &*gate;
+                    let open = lock.lock().unwrap();
+                    drop(cv.wait_while(open, |open| !*open).unwrap());
+                    running.fetch_sub(1, Ordering::AcqRel);
+                    completed.fetch_add(1, Ordering::AcqRel);
+                })
+                .unwrap();
+        }
+        for _ in 0..MAX_BRIDGE_WORK {
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert!(matches!(
+            limiter.submit(Arc::new(AtomicBool::new(false)), || {}),
+            Err(AdmissionError::Busy)
+        ));
+        assert_eq!(limiter.active.load(Ordering::Acquire), MAX_BRIDGE_WORK);
+        assert_eq!(
+            limiter.queue.lock().unwrap().jobs.len(),
+            MAX_QUEUED_BRIDGE_WORK
+        );
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        let start = Instant::now();
+        while limiter.active.load(Ordering::Acquire) != 0
+            && start.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            completed.load(Ordering::Acquire),
+            MAX_BRIDGE_WORK + MAX_QUEUED_BRIDGE_WORK
+        );
+        assert_eq!(high_water.load(Ordering::Acquire), MAX_BRIDGE_WORK);
+        assert_eq!(limiter.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn bridge_admission_starts_queued_jobs_in_submission_order() {
+        let limiter = Arc::new(AdmissionLimiter::default());
+        let gates: Vec<_> = (0..MAX_BRIDGE_WORK)
+            .map(|_| Arc::new((Mutex::new(false), std::sync::Condvar::new())))
+            .collect();
+        let (started_tx, started_rx) = channel();
+        for (index, gate) in gates.iter().enumerate() {
+            let gate = gate.clone();
+            let started = started_tx.clone();
+            limiter
+                .submit(Arc::new(AtomicBool::new(false)), move || {
+                    started.send(index).unwrap();
+                    let (lock, cv) = &*gate;
+                    let open = lock.lock().unwrap();
+                    drop(cv.wait_while(open, |open| !*open).unwrap());
+                })
+                .unwrap();
+        }
+        let mut initial_workers = Vec::new();
+        for _ in 0..MAX_BRIDGE_WORK {
+            initial_workers.push(started_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        let (order_tx, order_rx) = channel();
+        for index in 0..12 {
+            let order = order_tx.clone();
+            limiter
+                .submit(Arc::new(AtomicBool::new(false)), move || {
+                    order.send(Some(index)).unwrap();
+                })
+                .unwrap();
+        }
+        let (lock, cv) = &*gates[initial_workers[0]];
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        let observed: Vec<_> = (0..12)
+            .map(|_| order_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
+        for index in initial_workers.into_iter().skip(1) {
+            let (lock, cv) = &*gates[index];
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        let start = Instant::now();
+        while limiter.active.load(Ordering::Acquire) != 0
+            && start.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(observed, (0..12).map(Some).collect::<Vec<_>>());
+        assert_eq!(limiter.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn bridge_admission_runs_queued_jobs_concurrently() {
+        let limiter = Arc::new(AdmissionLimiter::default());
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (started_tx, started_rx) = channel();
+        for _ in 0..MAX_BRIDGE_WORK {
+            let gate = gate.clone();
+            let started = started_tx.clone();
+            limiter
+                .submit(Arc::new(AtomicBool::new(false)), move || {
+                    started.send(()).unwrap();
+                    let (lock, cv) = &*gate;
+                    let open = lock.lock().unwrap();
+                    drop(cv.wait_while(open, |open| !*open).unwrap());
+                })
+                .unwrap();
+        }
+        for _ in 0..MAX_BRIDGE_WORK {
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+
+        let (first_tx, first_rx) = channel();
+        let (second_tx, second_rx) = channel();
+        let (done_tx, done_rx) = channel();
+        let first_done = done_tx.clone();
+        limiter
+            .submit(Arc::new(AtomicBool::new(false)), move || {
+                first_tx.send(()).unwrap();
+                second_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                first_done.send(()).unwrap();
+            })
+            .unwrap();
+        limiter
+            .submit(Arc::new(AtomicBool::new(false)), move || {
+                second_tx.send(()).unwrap();
+                first_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                done_tx.send(()).unwrap();
+            })
+            .unwrap();
+
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        for _ in 0..2 {
+            done_rx.recv_timeout(Duration::from_secs(6)).unwrap();
+        }
+        let start = Instant::now();
+        while limiter.active.load(Ordering::Acquire) != 0
+            && start.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(limiter.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn bridge_admission_skips_queued_work_cancelled_before_dequeue() {
+        let limiter = Arc::new(AdmissionLimiter::default());
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (started_tx, started_rx) = channel();
+        for _ in 0..MAX_BRIDGE_WORK {
+            let gate = gate.clone();
+            let started = started_tx.clone();
+            limiter
+                .submit(Arc::new(AtomicBool::new(false)), move || {
+                    started.send(()).unwrap();
+                    let (lock, cv) = &*gate;
+                    let open = lock.lock().unwrap();
+                    drop(cv.wait_while(open, |open| !*open).unwrap());
+                })
+                .unwrap();
+        }
+        for _ in 0..MAX_BRIDGE_WORK {
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_job = ran.clone();
+        limiter
+            .submit(cancel.clone(), move || {
+                ran_job.store(true, Ordering::Release)
+            })
+            .unwrap();
+        cancel.store(true, Ordering::Release);
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        let start = Instant::now();
+        while limiter.active.load(Ordering::Acquire) != 0
+            && start.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!ran.load(Ordering::Acquire));
+        assert_eq!(limiter.active.load(Ordering::Acquire), 0);
     }
 
     #[test]
