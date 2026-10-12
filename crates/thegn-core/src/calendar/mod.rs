@@ -145,6 +145,7 @@ pub enum ExpansionLimit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpansionError {
     InvalidWindow,
+    /// The event span or a recurrence value cannot be represented safely.
     InvalidSpan,
     Arithmetic,
     Budget(ExpansionLimit),
@@ -176,7 +177,7 @@ impl fmt::Display for ExpansionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidWindow => f.write_str("calendar window is invalid"),
-            Self::InvalidSpan => f.write_str("calendar event span is invalid"),
+            Self::InvalidSpan => f.write_str("calendar event span or recurrence value is invalid"),
             Self::Arithmetic => f.write_str("calendar date arithmetic overflowed"),
             Self::Budget(limit) => write!(f, "calendar expansion budget exhausted ({limit})"),
         }
@@ -883,6 +884,7 @@ impl CalEvent {
         // Carry the event's own duration semantics onto every instance:
         // calendar days for Date, wall time for Zoned, elapsed time for Instant.
         let span = nominal_span(self).ok_or(ExpansionError::InvalidSpan)?;
+        recur::check_values(rec, &self.start)?;
         // Instances starting up to one duration before the window still reach
         // into it, and a zone's local date can sit up to two days either side
         // of `home`'s. Nothing starts before the first representable date, so
