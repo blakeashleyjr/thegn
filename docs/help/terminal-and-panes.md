@@ -182,7 +182,9 @@ registers, and what happens over ssh.
 ## When keys collide
 
 `Ctrl-g` locks the keymap: every chord passes through to the pane until
-pressed again. Use it when a TUI inside the pane needs chords thegn owns.
+pressed again. Modified arrows, navigation keys, and F-keys use terminal
+escape sequences so the pane's TUI can distinguish their modifiers. Use it
+when a TUI inside the pane needs chords thegn owns.
 
 ## Fixing a garbled screen
 
