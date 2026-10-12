@@ -323,7 +323,6 @@ crates/thegn-host/src/push_notify.rs
 crates/thegn-host/src/queries.rs
 crates/thegn-host/src/rasterize.rs
 crates/thegn-host/src/remote_poll.rs
-crates/thegn-host/src/remote_sync.rs
 crates/thegn-host/src/replay_overlay.rs
 crates/thegn-host/src/repo_index.rs
 crates/thegn-host/src/run.rs
