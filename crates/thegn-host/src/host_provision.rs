@@ -206,64 +206,28 @@ pub(crate) fn provision_worktree_on_host(
                         Err(e) => Err(e),
                     }
                 }
-                StepKind::Dotfiles(names) => stage_and_push(runner, &container, &home, |staging| {
-                    for name in names {
-                        let rel = safe_relative_path(name)?;
-                        stage_file(staging, &host_home.join(&rel), &staging.join(rel), false)?;
-                    }
-                    Ok(())
-                }),
-                StepKind::AgentConfigs(ids) => {
-                    stage_and_push(runner, &container, &home, |staging| {
-                        for id in ids {
-                            let (dirs, files) = envplan::agent_config_paths(id);
-                            for rel in dirs {
-                                let src = host_home.join(&rel);
-                                if !src.is_dir() {
-                                    continue;
-                                }
-                                for (abs, inner, exec) in
-                                    crate::agent_configs::collect_agent_config_files(&src)
-                                {
-                                    let base = safe_relative_path(&rel)?;
-                                    let inner = safe_relative_path(&inner)?;
-                                    // Agent config collection intentionally follows links (for
-                                    // NixOS hooks); resolve that policy explicitly, then use a
-                                    // no-follow open on the resolved regular file.
-                                    let resolved = std::fs::canonicalize(&abs)
-                                        .map_err(|e| format!("resolve {}: {e}", abs.display()))?;
-                                    stage_file(
-                                        staging,
-                                        &resolved,
-                                        &staging.join(base).join(inner),
-                                        exec,
-                                    )?;
-                                }
-                            }
-                            for rel in files {
-                                let rel = safe_relative_path(&rel)?;
-                                stage_file(
-                                    staging,
-                                    &host_home.join(&rel),
-                                    &staging.join(rel),
-                                    false,
-                                )?;
-                            }
+                StepKind::Dotfiles(names) => {
+                    stage_and_push(runner, &container, &home, false, |staging| {
+                        for name in names {
+                            let rel = safe_relative_path(name)?;
+                            let source = host_home.join(&rel);
+                            let resolved = std::fs::canonicalize(&source)
+                                .map_err(|e| format!("resolve {}: {e}", source.display()))?;
+                            stage_file(staging, &resolved, &staging.join(rel), false)?;
                         }
                         Ok(())
                     })
                 }
-                StepKind::AtuinSync => stage_and_push(runner, &container, &home, |staging| {
-                    for rel in [
-                        ".config/atuin/config.toml",
-                        ".local/share/atuin/key",
-                        ".local/share/atuin/session",
-                    ] {
-                        let rel = safe_relative_path(rel)?;
-                        stage_file(staging, &host_home.join(&rel), &staging.join(rel), false)?;
-                    }
-                    Ok(())
-                }),
+                StepKind::AgentConfigs(ids) => {
+                    stage_and_push(runner, &container, &home, true, |staging| {
+                        fill_agent_config_staging(staging, &host_home, ids)
+                    })
+                }
+                StepKind::AtuinSync => {
+                    stage_and_push(runner, &container, &home, false, |staging| {
+                        fill_atuin_staging(staging, &host_home)
+                    })
+                }
                 // Provider-only machinery: no meaning on a plain OCI host.
                 StepKind::Checkpoint
                 | StepKind::HomeClosurePush(_)
@@ -331,15 +295,76 @@ fn stage_and_push(
     runner: &OciRunner,
     container: &str,
     home: &str,
+    allow_empty: bool,
     fill: impl FnOnce(&std::path::Path) -> Result<(), String>,
 ) -> Result<(), String> {
-    with_private_staging(fill, |staging| {
+    with_private_staging(fill, allow_empty, |staging| {
         runner.push_dir_to_container(container, staging, home, secs(120))
     })
 }
 
+fn fill_agent_config_staging(
+    staging: &std::path::Path,
+    host_home: &std::path::Path,
+    ids: &[String],
+) -> Result<(), String> {
+    for id in ids {
+        let (files, dirs) = envplan::agent_config_paths(id);
+        for rel in dirs {
+            let src = host_home.join(&rel);
+            if !src.is_dir() {
+                continue;
+            }
+            for (abs, inner, exec) in crate::agent_configs::collect_agent_config_files(&src) {
+                let base = safe_relative_path(&rel)?;
+                let inner = safe_relative_path(&inner)?;
+                // Agent config collection intentionally follows links (for
+                // NixOS hooks); resolve that policy explicitly, then use a
+                // no-follow open on the resolved regular file.
+                let resolved = std::fs::canonicalize(&abs)
+                    .map_err(|e| format!("resolve {}: {e}", abs.display()))?;
+                stage_file(staging, &resolved, &staging.join(base).join(inner), exec)?;
+            }
+        }
+        for rel in files {
+            let rel = safe_relative_path(&rel)?;
+            let source = host_home.join(&rel);
+            match std::fs::symlink_metadata(&source) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("inspect {}: {error}", source.display())),
+            }
+            stage_file(staging, &source, &staging.join(rel), false)?;
+        }
+    }
+    Ok(())
+}
+
+fn fill_atuin_staging(
+    staging: &std::path::Path,
+    host_home: &std::path::Path,
+) -> Result<(), String> {
+    // Config and key are required for sync; session exists only while logged in.
+    for rel in [".config/atuin/config.toml", ".local/share/atuin/key"] {
+        let rel = safe_relative_path(rel)?;
+        stage_file(staging, &host_home.join(&rel), &staging.join(rel), false)?;
+    }
+    let session = host_home.join(".local/share/atuin/session");
+    match std::fs::symlink_metadata(&session) {
+        Ok(_) => stage_file(
+            staging,
+            &session,
+            &staging.join(".local/share/atuin/session"),
+            false,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("inspect {}: {error}", session.display())),
+    }
+}
+
 fn with_private_staging(
     fill: impl FnOnce(&std::path::Path) -> Result<(), String>,
+    allow_empty: bool,
     transfer: impl FnOnce(&std::path::Path) -> Result<(), String>,
 ) -> Result<(), String> {
     let staging = tempfile::Builder::new()
@@ -352,13 +377,17 @@ fn with_private_staging(
             fill(staging.path())?;
             let mut entries = std::fs::read_dir(staging.path())
                 .map_err(|e| format!("inspect staging directory: {e}"))?;
-            if entries
+            let has_entry = entries
                 .next()
                 .transpose()
                 .map_err(|e| format!("inspect staging directory entry: {e}"))?
-                .is_none()
-            {
-                return Err("staging transaction produced no files".into());
+                .is_some();
+            if !has_entry {
+                return if allow_empty {
+                    Ok(())
+                } else {
+                    Err("staging transaction produced no files".into())
+                };
             }
             transfer(staging.path())
         });
@@ -434,12 +463,8 @@ fn stage_file(
         .and_then(|()| output.sync_all())
         .map_err(|e| format!("write staged file {}: {e}", dst.display()))?;
     if executable {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("set staged mode {}: {e}", dst.display()))?;
-        }
+        crate::platform::set_owner_executable(dst)
+            .map_err(|e| format!("set staged mode {}: {e}", dst.display()))?;
     }
     Ok(())
 }
@@ -544,16 +569,12 @@ mod tests {
         let result = with_private_staging(
             |staging| {
                 *seen.borrow_mut() = Some(staging.to_path_buf());
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    assert_eq!(
-                        std::fs::metadata(staging).unwrap().permissions().mode() & 0o777,
-                        0o700
-                    );
+                if let Some(mode) = thegn_core::fsperm::mode_bits(staging).unwrap() {
+                    assert_eq!(mode, 0o700);
                 }
                 Err("injected read failure".into())
             },
+            false,
             |_| panic!("a failed fill must never transfer"),
         );
         assert!(result.unwrap_err().contains("injected read failure"));
@@ -565,6 +586,7 @@ mod tests {
         let transferred = std::cell::Cell::new(false);
         let result = with_private_staging(
             |_| Ok(()),
+            false,
             |_| {
                 transferred.set(true);
                 Ok(())
@@ -591,6 +613,7 @@ mod tests {
                             std::fs::write(staging.join("identity"), contents)
                                 .map_err(|e| e.to_string())
                         },
+                        false,
                         |staging| {
                             paths.lock().unwrap().push(staging.to_path_buf());
                             barrier.wait();
@@ -624,11 +647,13 @@ mod tests {
 
     #[test]
     fn a_failed_staging_attempt_does_not_poison_the_retry() {
-        let failed = with_private_staging(|_| Err("injected copy failure".into()), |_| Ok(()));
+        let failed =
+            with_private_staging(|_| Err("injected copy failure".into()), false, |_| Ok(()));
         assert!(failed.unwrap_err().contains("injected copy failure"));
 
         let retry = with_private_staging(
             |staging| stage_file_from_bytes_for_test(staging, "credential", b"retry data"),
+            false,
             |staging| {
                 assert_eq!(
                     std::fs::read(staging.join("credential")).unwrap(),
@@ -661,34 +686,19 @@ mod tests {
         std::fs::create_dir(&staging).unwrap();
         stage_file(&staging, &source, &destination, false).unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"secret bytes");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&destination)
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
+        if let Some(mode) = thegn_core::fsperm::mode_bits(&destination).unwrap() {
+            assert_eq!(mode, 0o600);
         }
         assert!(stage_file(&staging, &source, &destination, false).is_err());
         let executable = staging.join("hook");
         stage_file(&staging, &source, &executable, true).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&executable).unwrap().permissions().mode() & 0o777,
-                0o700
-            );
+        if let Some(mode) = thegn_core::fsperm::mode_bits(&executable).unwrap() {
+            assert_eq!(mode, 0o700);
         }
 
-        #[cfg(unix)]
-        {
+        if crate::platform::test_symlink_supported() {
             let link = root.path().join("source-link");
-            std::os::unix::fs::symlink(&source, &link).unwrap();
+            crate::platform::test_symlink(&source, &link).unwrap();
             assert!(
                 stage_file(
                     &staging,
@@ -700,7 +710,7 @@ mod tests {
             );
             let external = root.path().join("external");
             std::fs::create_dir(&external).unwrap();
-            std::os::unix::fs::symlink(&external, staging.join("linked-parent")).unwrap();
+            crate::platform::test_symlink(&external, &staging.join("linked-parent")).unwrap();
             assert!(
                 stage_file(
                     &staging,
@@ -712,6 +722,64 @@ mod tests {
             );
             assert!(!external.join("escaped").exists());
         }
+    }
+
+    #[test]
+    fn agent_config_staging_preserves_root_and_file_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".claude.json"), "claude auth\n").unwrap();
+        std::fs::create_dir(home.path().join(".claude")).unwrap();
+        std::fs::write(home.path().join(".claude/settings.json"), "{}\n").unwrap();
+
+        fill_agent_config_staging(staging.path(), home.path(), &["claude".into()]).unwrap();
+
+        assert_eq!(
+            std::fs::read(staging.path().join(".claude.json")).unwrap(),
+            b"claude auth\n"
+        );
+        assert_eq!(
+            std::fs::read(staging.path().join(".claude/settings.json")).unwrap(),
+            b"{}\n"
+        );
+    }
+
+    #[test]
+    fn atuin_session_is_optional_but_config_and_key_are_required() {
+        let home = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".config/atuin")).unwrap();
+        std::fs::create_dir_all(home.path().join(".local/share/atuin")).unwrap();
+        std::fs::write(
+            home.path().join(".config/atuin/config.toml"),
+            "sync = true\n",
+        )
+        .unwrap();
+        std::fs::write(home.path().join(".local/share/atuin/key"), "secret\n").unwrap();
+
+        fill_atuin_staging(staging.path(), home.path()).unwrap();
+        assert!(staging.path().join(".config/atuin/config.toml").is_file());
+        assert!(staging.path().join(".local/share/atuin/key").is_file());
+        assert!(!staging.path().join(".local/share/atuin/session").exists());
+
+        std::fs::remove_file(home.path().join(".local/share/atuin/key")).unwrap();
+        let missing_key = tempfile::tempdir().unwrap();
+        assert!(fill_atuin_staging(missing_key.path(), home.path()).is_err());
+    }
+
+    #[test]
+    fn empty_agent_config_staging_is_success_without_transfer() {
+        let transferred = std::cell::Cell::new(false);
+        let result = with_private_staging(
+            |_| Ok(()),
+            true,
+            |_| {
+                transferred.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert!(!transferred.get());
     }
 
     #[test]

@@ -65,10 +65,10 @@ pub(crate) fn resolve_personal_dotfiles(
             continue;
         }
         let source = home_dir.join(&name);
-        // Dotfiles are deliberately not followed through symlinks. Only a
-        // regular file directly under HOME can be selected for staging.
-        match std::fs::symlink_metadata(&source) {
-            Ok(metadata) if metadata.file_type().is_file() => {}
+        // Dotfiles may intentionally link into a package store (for example
+        // home-manager); follow the link explicitly and select only files.
+        match std::fs::canonicalize(&source) {
+            Ok(resolved) if std::fs::metadata(&resolved).is_ok_and(|md| md.is_file()) => {}
             Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => {} // Keep it selected; the staging read will report the real failure.
@@ -140,12 +140,23 @@ mod tests {
 
         let home_dir = tempfile::tempdir().unwrap();
         std::fs::write(home_dir.path().join(".gitconfig"), "[user]\n").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(
-            home_dir.path().join(".gitconfig"),
-            home_dir.path().join(".zshrc"),
+        let store_file = home_dir.path().join("store-file");
+        std::fs::write(
+            &store_file,
+            "source /nix/store/abc123-zsh-syntax/share/x.zsh\n",
         )
         .unwrap();
+        let linked_dir = home_dir.path().join("linked-dir-target");
+        std::fs::create_dir(&linked_dir).unwrap();
+        let mut has_file_link = false;
+        let mut has_dir_link = false;
+        if crate::platform::test_symlink_supported() {
+            crate::platform::test_symlink(&store_file, &home_dir.path().join(".zshrc")).unwrap();
+            crate::platform::test_symlink(&linked_dir, &home_dir.path().join("linked-dir"))
+                .unwrap();
+            has_file_link = true;
+            has_dir_link = true;
+        }
         let config = HomeConfig {
             strategy: ShellStrategy::HostParity,
             dotfiles: vec![
@@ -157,12 +168,24 @@ mod tests {
                 "bad\nname".into(),
                 "nested\\file".into(),
                 ".zshrc".into(),
+                "linked-dir".into(),
             ],
             ..HomeConfig::default()
         };
 
         let (files, roots) = resolve_personal_dotfiles(home_dir.path(), &config, "test");
-        assert_eq!(files, vec![".gitconfig"]);
-        assert!(roots.is_empty());
+        let mut expected = vec![".gitconfig"];
+        if has_file_link {
+            expected.push(".zshrc");
+        }
+        assert_eq!(files, expected);
+        if has_dir_link {
+            assert!(!files.iter().any(|name| name == "linked-dir"));
+        }
+        if has_file_link {
+            assert!(roots.contains(&"/nix/store/abc123-zsh-syntax".to_string()));
+        } else {
+            assert!(roots.is_empty());
+        }
     }
 }
