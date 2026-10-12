@@ -1884,7 +1884,7 @@ fn run_root(root: &Path, args: &[&str]) -> Result<()> {
 fn require_mutation_lock(worktree: &Path, args: &[&str]) -> Result<thegn_core::util::GitLock> {
     thegn_core::util::lock_git_mutations(worktree).ok_or_else(|| {
         anyhow::anyhow!(
-            "refusing git {}: repository mutation lock is unavailable for {}; retry",
+            "refusing git {}: repository mutation lock is unavailable for {} (see thegn log)",
             args.join(" "),
             worktree.display()
         )
@@ -2400,6 +2400,8 @@ mod tests {
         let error = super::run_w(&loc, &[], &["add", "--", "new.txt"]).unwrap_err();
 
         assert!(error.to_string().contains("mutation lock"));
+        assert!(error.to_string().contains("see thegn log"));
+        assert!(!error.to_string().contains("retry"));
         assert!(
             super::run(&loc, &["diff", "--cached", "--name-only"])
                 .unwrap()
