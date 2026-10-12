@@ -13,7 +13,9 @@
 use thegn_core::termcaps::GlyphSet;
 use thegn_core::theme::Hue;
 
-use super::layout::{Board, BoardRow, Column, Edge, Mode, StageHead, is_unstaged};
+use super::layout::{
+    Board, BoardRow, Column, Edge, EffectiveModel, Mode, ModelSource, StageHead, is_unstaged,
+};
 use crate::chrome::S;
 use crate::seg::{Line, Seg, Tok, seg, sp};
 
@@ -96,10 +98,24 @@ fn load_label(head: &StageHead) -> String {
     }
 }
 
+fn model_label(model: &EffectiveModel) -> String {
+    match model {
+        EffectiveModel::Unspecified => "model: none".to_string(),
+        EffectiveModel::Selected { name, source } => format!(
+            "{}: {name}",
+            match source {
+                ModelSource::EntryDefault => "entry",
+                ModelSource::StageOverride => "stage",
+            }
+        ),
+        EffectiveModel::Error(_) => "model error".to_string(),
+    }
+}
+
 /// The two chrome rows above the body.
 ///
-/// Row 0 is the stage names with their live load; row 1 is each stage's agent
-/// with the `→ next` edge, which is what makes the rail read as a pipeline
+/// Row 0 is the stage names with their live load; row 1 is each stage's agent,
+/// effective model, and `→ next` edge, which makes the rail read as a pipeline
 /// rather than as a set of unrelated buckets. In [`Mode::Stacked`] the columns
 /// are drawn down the page instead, so the rail collapses to a summary and a
 /// rule.
@@ -157,9 +173,12 @@ pub(crate) fn rail(board: &Board, active_col: usize, width: usize) -> [Line; 2] 
         };
         let arrow_w = crate::seg::seg_width(&arrow);
         let agent_w = cw.saturating_sub(arrow_w + 2);
-        if !head.agent.is_empty() {
-            flows.push(seg(Tok::Slot(S::Ghost), trunc(&head.agent, agent_w)));
-        }
+        let agent_model = if head.agent.is_empty() {
+            model_label(&head.model)
+        } else {
+            format!("{}  {}", head.agent, model_label(&head.model))
+        };
+        flows.push(seg(Tok::Slot(S::Ghost), trunc(&agent_model, agent_w)));
         let used = crate::seg::seg_width(&flows).saturating_sub(cw * i);
         if arrow_w > 0 && used + arrow_w < cw {
             flows.push(sp(cw - used - arrow_w));
@@ -267,7 +286,19 @@ fn group_head(col: &Column, width: usize) -> Line {
     ];
     if !head.agent.is_empty() {
         left.push(sp(2));
-        left.push(seg(Tok::Slot(S::Ghost), trunc(&head.agent, width / 4)));
+        left.push(seg(
+            Tok::Slot(S::Ghost),
+            trunc(
+                &format!("{}  {}", head.agent, model_label(&head.model)),
+                width / 2,
+            ),
+        ));
+    } else {
+        left.push(sp(2));
+        left.push(seg(
+            Tok::Slot(S::Ghost),
+            trunc(&model_label(&head.model), width / 2),
+        ));
     }
     let right = match &head.next {
         Some(n) => vec![seg(
@@ -299,7 +330,17 @@ fn row_cell(r: &BoardRow, selected: bool, w: usize) -> Vec<Seg> {
     // Edge mark. `Edge::None` still costs a cell — exact alignment is what
     // makes the columns read as columns.
     match r.edge {
-        Edge::Inbound => segs.push(seg(Tok::Hue(Hue::Teal), gl.arrow_right)),
+        Edge::Inbound => {
+            segs.push(seg(Tok::Hue(Hue::Teal), gl.arrow_right));
+            segs.push(seg(
+                Tok::Slot(S::Dim),
+                trunc(
+                    &r.row.stage,
+                    w.saturating_sub(crate::seg::seg_width(&segs) + 10),
+                ),
+            ));
+            segs.push(sp(1));
+        }
         Edge::Child { last } => {
             let indent = (r.row.depth as usize).saturating_sub(1).min(w / 4);
             if indent > 0 {
@@ -325,8 +366,22 @@ fn row_cell(r: &BoardRow, selected: bool, w: usize) -> Vec<Seg> {
     } else {
         Tok::Slot(S::Dim)
     };
-    let right_w = crate::seg::cells(tick) + crate::seg::cells(&r.row.age) + 1;
+    let model = model_label(&r.model);
     let used = crate::seg::seg_width(&segs);
+    let right_room = w.saturating_sub(used + 1);
+    let age_prefix = format!("{tick} {}", r.row.age);
+    let model_room = right_room.saturating_sub(
+        crate::seg::cells(&age_prefix)
+            + if right_room > crate::seg::cells(&age_prefix) {
+                1
+            } else {
+                0
+            },
+    );
+    let shown_model = trunc(&model, model_room);
+    let model_gap = if shown_model.is_empty() { 0 } else { 1 };
+    let right_w = (crate::seg::cells(&age_prefix) + model_gap + crate::seg::cells(&shown_model))
+        .min(right_room);
 
     // The label is the worktree basename — the sidebar's own row identity, so
     // the two surfaces name the same thing. An empty path (a dispatch recorded
@@ -336,7 +391,7 @@ fn row_cell(r: &BoardRow, selected: bool, w: usize) -> Vec<Seg> {
     } else {
         &r.row.worktree
     };
-    let label_w = w.saturating_sub(used + right_w);
+    let label_w = w.saturating_sub(used + right_w + 1);
     let label_tone = if selected {
         Tok::Slot(S::Accent)
     } else {
@@ -351,7 +406,12 @@ fn row_cell(r: &BoardRow, selected: bool, w: usize) -> Vec<Seg> {
     segs.push(lab);
     segs.push(sp(label_w.saturating_sub(label_cells) + 1));
     segs.push(seg(Tok::Slot(S::Faint), tick));
+    segs.push(sp(1));
     segs.push(seg(age_tone, r.row.age.clone()));
+    if model_gap > 0 {
+        segs.push(sp(1));
+        segs.push(seg(Tok::Slot(S::Faint), shown_model));
+    }
     pad(segs, w)
 }
 
@@ -411,6 +471,12 @@ mod tests {
         }
     }
 
+    fn config(stages: &[PipelineStage]) -> thegn_core::config::Config {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.pipeline.stages = stages.to_vec();
+        cfg
+    }
+
     fn d(id: i64, st: Option<&str>, parent: Option<i64>, at: i64) -> AgentDispatch {
         AgentDispatch {
             id,
@@ -444,7 +510,7 @@ mod tests {
             &names,
             120_000,
         );
-        super::super::layout::board(&rows, &stages, width, 120_000, false)
+        super::super::layout::board(&rows, &config(&stages), width, 120_000, false)
     }
 
     /// Every line the renderer emits, flattened to text.
@@ -542,6 +608,36 @@ mod tests {
     }
 
     #[test]
+    fn cross_stage_rows_label_the_target_and_render_model_origin() {
+        let b = fixture(120);
+        let rendered = text(&body(&b, 1, None, 120));
+        assert!(
+            rendered.contains("code"),
+            "inbound target label missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("model error"),
+            "resolution error was blank: {rendered}"
+        );
+
+        assert_eq!(
+            model_label(&EffectiveModel::Selected {
+                name: "sonnet".into(),
+                source: ModelSource::EntryDefault,
+            }),
+            "entry: sonnet"
+        );
+        assert_eq!(
+            model_label(&EffectiveModel::Selected {
+                name: "opus".into(),
+                source: ModelSource::StageOverride,
+            }),
+            "stage: opus"
+        );
+        assert_eq!(model_label(&EffectiveModel::Unspecified), "model: none");
+    }
+
+    #[test]
     fn stacked_mode_lists_every_stage_and_every_row() {
         let b = fixture(20); // far below MIN_COL_W * columns
         assert_eq!(b.mode, Mode::Stacked);
@@ -578,7 +674,7 @@ mod tests {
 
     #[test]
     fn an_empty_board_says_why_rather_than_drawing_a_void() {
-        let b = super::super::layout::board(&[], &[], 80, 0, false);
+        let b = super::super::layout::board(&[], &config(&[]), 80, 0, false);
         let lines = body(&b, 0, None, 80);
         assert_eq!(lines.len(), 1);
         assert!(line_text(&lines[0].line).contains("No dispatches yet"));

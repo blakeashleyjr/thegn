@@ -7638,7 +7638,7 @@ async fn event_loop<T: Terminal>(
                     );
                     board = Some(crate::pipeline_board::PipelineBoard::open(
                         &model.dispatches,
-                        &current_config.pipeline.stages,
+                        &current_config,
                         &sctx,
                     ));
                 }
@@ -12072,7 +12072,7 @@ async fn event_loop<T: Terminal>(
                         if let Some(b) = board.as_mut() {
                             b.refresh(
                                 &model.dispatches,
-                                &current_config.pipeline.stages,
+                                &current_config,
                                 &crate::detail::StatusCtx::new(
                                     &panel_ui.docs,
                                     start.elapsed().as_secs(),
@@ -15659,7 +15659,7 @@ async fn event_loop<T: Terminal>(
                         // sampling interval would read as lag.
                         b.rebuild_after_key(
                             &model.dispatches,
-                            &current_config.pipeline.stages,
+                            &current_config,
                             &crate::detail::StatusCtx::new(
                                 &panel_ui.docs,
                                 start.elapsed().as_secs(),
