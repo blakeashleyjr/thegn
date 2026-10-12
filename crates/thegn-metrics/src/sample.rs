@@ -334,7 +334,7 @@ impl StatsSampler {
             let pids = refresh_pid_list(self.self_pid, self.daemon_pid, &self.tracked);
             self.sys.refresh_processes_specifics(
                 ProcessesToUpdate::Some(&pids),
-                false, // keep entries whose delta we still want next tick
+                true, // remove requested PIDs that exited since the last sample
                 ProcessRefreshKind::nothing().with_cpu().with_memory(),
             );
             if let Some(p) = self.sys.process(self.self_pid) {
@@ -496,6 +496,19 @@ fn cpu_temp(temps: &[(String, f32)]) -> Option<f32> {
 mod tests {
     use super::*;
 
+    struct ChildGuard(std::process::Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            match self.0.kill() {
+                Ok(()) | Err(_) => {}
+            }
+            match self.0.wait() {
+                Ok(_) | Err(_) => {}
+            }
+        }
+    }
+
     // A repeated PID makes sysinfo race two rayon workers onto one `Process`
     // and double-close its cached /proc handle, aborting the process. These
     // pin the dedup deterministically — the crash itself only shows up in
@@ -583,6 +596,86 @@ mod tests {
             sorted.dedup();
             assert_eq!(sorted.len(), pids.len(), "duplicate PID in {pids:?}");
         }
+    }
+
+    #[test]
+    fn reaped_tracked_process_is_pruned_and_its_proc_fd_is_released() {
+        // This exercises sysinfo's Linux /proc handle cache. Other platforms
+        // have no /proc fd links to inspect, and the targeted refresh behavior
+        // is already covered by the platform-independent sampler tests.
+        let fd_dir = std::path::Path::new("/proc/self/fd");
+        if !fd_dir.is_dir() {
+            return;
+        }
+
+        let mut child = ChildGuard(
+            std::process::Command::new("sh")
+                .args(["-c", "exec sleep 30"])
+                .spawn()
+                .expect("spawn short-lived tracked process"),
+        );
+        let pid = child.0.id();
+        let mut sampler = StatsSampler::new(std::env::temp_dir());
+        sampler.set_tracked(vec![spec(pid, "test-child")]);
+        let first = sampler.sample();
+        let first_has_child = first
+            .children
+            .iter()
+            .any(|group| group.group == "test-child");
+
+        let stat_path = format!("/proc/{pid}/stat");
+        let cached_fds = || {
+            std::fs::read_dir(fd_dir)
+                .expect("read own fd directory")
+                .filter_map(|entry| match entry {
+                    Ok(entry) => Result::ok(std::fs::read_link(entry.path())),
+                    Err(_) => None,
+                })
+                .filter(|target| target == std::path::Path::new(&stat_path))
+                .count()
+        };
+        let process_was_cached = sampler.sys.process(Pid::from_u32(pid)).is_some();
+        let cached_fd_count = cached_fds();
+
+        child.0.kill().expect("kill tracked process");
+        child.0.wait().expect("reap tracked process");
+        let mut after = None;
+        for _ in 0..3 {
+            std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+            sampler.set_tracked(vec![spec(pid, "test-child")]);
+            after = Some(sampler.sample());
+        }
+        let after = after.expect("three post-exit samples were taken");
+
+        assert!(
+            first_has_child,
+            "the live child should appear in the rollup"
+        );
+        assert!(process_was_cached, "sysinfo should track the live child");
+        assert!(
+            cached_fd_count > 0,
+            "sysinfo should cache the child's stat fd"
+        );
+        assert!(
+            !after
+                .children
+                .iter()
+                .any(|group| group.group == "test-child"),
+            "an exited child must disappear from the snapshot"
+        );
+        assert!(
+            sampler.tracked == vec![spec(pid, "test-child")],
+            "the sampler must preserve the host's tracked-process mirror"
+        );
+        assert!(
+            sampler.sys.process(Pid::from_u32(pid)).is_none(),
+            "sysinfo must drop the exited process entry"
+        );
+        assert_eq!(cached_fds(), 0, "the cached /proc stat fd must be closed");
+        assert!(
+            after.self_cpu_pct.is_some(),
+            "repeated host registration must not reset live process CPU deltas"
+        );
     }
 
     #[test]
