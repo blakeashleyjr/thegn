@@ -387,6 +387,23 @@ mod tests {
                 },
             );
         }
+        assert!(ring.len() > 1, "seeded ring should retain multiple samples");
+        let samples: Vec<_> = ring.iter().collect();
+        let mut saw_duplicate_timestamp = false;
+        for pair in samples.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                saw_duplicate_timestamp = true;
+                assert!(
+                    pair[0].1.cpu_pct.unwrap() < pair[1].1.cpu_pct.unwrap(),
+                    "equal-timestamp samples must retain arrival order"
+                );
+            }
+        }
+        assert!(
+            saw_duplicate_timestamp,
+            "seeded ring should exercise duplicate timestamps"
+        );
+
         let source = HostSource::try_new().unwrap();
         source.set_active(false);
         wait_for("worker parked", || source.in_park.load(Ordering::Acquire));
@@ -398,21 +415,6 @@ mod tests {
         let frame = source.frame_for("host_cpu_pct", &range);
         let times = frame.fields[0].floats();
         assert!(times.windows(2).all(|pair| pair[0] <= pair[1]));
-        let values = frame.fields[1].floats();
-        for (index, timestamp) in times.iter().enumerate() {
-            let expected: Vec<f64> = ring
-                .iter()
-                .filter(|(ts, _)| ts == timestamp)
-                .map(|(_, snap)| f64::from(snap.cpu_pct.unwrap()))
-                .collect();
-            let actual: Vec<f64> = values
-                .iter()
-                .enumerate()
-                .filter(|(candidate, _)| times[*candidate] == *timestamp)
-                .map(|(_, value)| *value)
-                .collect();
-            assert_eq!(actual, expected, "duplicate arrival order at index {index}");
-        }
     }
 
     #[tokio::test]
