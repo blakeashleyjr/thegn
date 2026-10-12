@@ -92,14 +92,14 @@ pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
         file.sync_all()
             .with_context(|| format!("sync {}", tmp.display()))?;
         std::fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
-        if let Ok(dir) = std::fs::File::open(d) {
-            if let Err(error) = dir.sync_all() {
-                tracing::warn!(
-                    %error,
-                    path = %d.display(),
-                    "VPS registry record was published but its directory could not be synced"
-                );
-            }
+        if let Ok(dir) = std::fs::File::open(d)
+            && let Err(error) = dir.sync_all()
+        {
+            tracing::warn!(
+                %error,
+                path = %d.display(),
+                "VPS registry record was published but its directory could not be synced"
+            );
         }
         Ok(())
     })();
