@@ -45,26 +45,8 @@ fn read_local_pending_todo(loc: &GitLoc) -> Result<Option<(std::path::PathBuf, V
     } else {
         worktree.join(resolved)
     };
-    let mut file = match thegn_core::fsperm::open_regular_file_nofollow(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::symlink_metadata(&path) {
-                Ok(_) => {
-                    return Err(error).context("open live rebase todo without following links");
-                }
-                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(None);
-                }
-                Err(metadata_error) => {
-                    return Err(metadata_error).context("inspect live rebase todo");
-                }
-            }
-        }
-        Err(error) => return Err(error).context("open live rebase todo without following links"),
-    };
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut bytes).context("read live rebase todo")?;
-    Ok(Some((path, bytes)))
+    let bytes = read_local_pending_todo_for_path(&path)?;
+    Ok(bytes.map(|bytes| (path, bytes)))
 }
 
 /// Atomically publish a local todo only while its exact previously-read bytes
@@ -82,7 +64,7 @@ fn replace_local_pending_todo(path: &std::path::Path, expected: &[u8], bytes: &[
     thegn_core::fsperm::write_owner_only_new(&temporary, bytes)
         .context("stage owner-only live rebase todo")?;
     let publish = (|| {
-        let Some((_, current)) = read_local_pending_todo_for_path(path)? else {
+        let Some(current) = read_local_pending_todo_for_path(path)? else {
             bail!("rebase todo changed on disk — reload the editor before rewriting");
         };
         if current != expected {
@@ -93,10 +75,10 @@ fn replace_local_pending_todo(path: &std::path::Path, expected: &[u8], bytes: &[
         Ok(())
     })();
     if let Err(error) = publish {
-        if let Err(cleanup_error) = std::fs::remove_file(&temporary) {
-            if cleanup_error.kind() != std::io::ErrorKind::NotFound {
-                tracing::debug!(target: "thegn::git", %cleanup_error, "could not remove staged live rebase todo");
-            }
+        if let Err(cleanup_error) = std::fs::remove_file(&temporary)
+            && cleanup_error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(target: "thegn::git", %cleanup_error, "could not remove staged live rebase todo");
         }
         return Err(error);
     }
@@ -104,9 +86,7 @@ fn replace_local_pending_todo(path: &std::path::Path, expected: &[u8], bytes: &[
 }
 
 /// Re-read an already-resolved local todo path without following links.
-fn read_local_pending_todo_for_path(
-    path: &std::path::Path,
-) -> Result<Option<(std::path::PathBuf, Vec<u8>)>> {
+fn read_local_pending_todo_for_path(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
     let mut file = match thegn_core::fsperm::open_regular_file_nofollow(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -126,7 +106,7 @@ fn read_local_pending_todo_for_path(
     };
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes).context("read live rebase todo")?;
-    Ok(Some((path.to_path_buf(), bytes)))
+    Ok(Some(bytes))
 }
 
 /// Run a read-only git probe without taking the mutation lock or advancing the
