@@ -238,6 +238,10 @@ mod tests {
     use super::nonempty;
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture invokes git to exercise bundle path metadata"
+    )]
     fn bundle_path_metadata_sees_git_atomic_replace() {
         let repo = tempfile::tempdir().unwrap();
         let run_git = |args: &[&str]| {
