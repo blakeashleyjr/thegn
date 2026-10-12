@@ -126,3 +126,15 @@ fn vtimezone_rules_evaluate_nth_weekday_onsets_and_prefer_the_default_zone() {
     );
     assert!(VtzRules::observance("20250101T000000", "+0000", "+0000", None, true).is_none());
 }
+
+#[test]
+fn old_one_shot_onset_does_not_override_preferred_zone_history() {
+    let rules = VtzRules::new(vec![
+        VtzRules::observance("16010101T000000", "+0400", "+0400", None, false).unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(
+        rules.match_zone(2025, Some(chrono_tz::Asia__Dubai)),
+        Some(chrono_tz::Asia__Dubai)
+    );
+}

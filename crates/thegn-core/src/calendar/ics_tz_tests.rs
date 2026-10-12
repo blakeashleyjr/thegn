@@ -241,6 +241,70 @@ fn fixed_half_hour_observance_resolves_and_unknown_rule_quarantines_locally() {
 }
 
 #[test]
+fn outlook_india_fixed_offset_with_1601_onset_resolves_for_modern_event() {
+    let definition = "BEGIN:VTIMEZONE\nTZID:India Standard Time\nBEGIN:STANDARD\nDTSTART:16010101T000000\nTZOFFSETFROM:+0530\nTZOFFSETTO:+0530\nEND:STANDARD\nEND:VTIMEZONE\n";
+    let input = format!(
+        "BEGIN:VCALENDAR\n{}{}END:VCALENDAR",
+        event("india", "TZID=India Standard Time:20250115T090000"),
+        definition
+    );
+    let (events, report) = parse_reported(&input);
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        start_instant(&events[0]),
+        Utc.with_ymd_and_hms(2025, 1, 15, 3, 30, 0).unwrap()
+    );
+    assert!(
+        !report
+            .diagnostics()
+            .contains(&IcsDiagnostic::UnknownTimeZone)
+    );
+}
+
+#[test]
+fn malformed_vtimezone_observances_are_unmapped() {
+    let open = "BEGIN:VTIMEZONE\nTZID:Vendor/Open\nBEGIN:STANDARD\nDTSTART:20250101T000000\nTZOFFSETFROM:+0000\nTZOFFSETTO:+0000\nEND:STANDARD\nBEGIN:DAYLIGHT\nDTSTART:20250301T000000\nTZOFFSETFROM:+0000\nTZOFFSETTO:+0100\nEND:VTIMEZONE\n";
+    let (events, report) = parse_reported(&format!(
+        "BEGIN:VCALENDAR\n{}{}END:VCALENDAR",
+        event("open", "TZID=Vendor/Open:20250115T090000"),
+        open
+    ));
+    assert!(events.is_empty());
+    assert!(
+        report
+            .diagnostics()
+            .contains(&IcsDiagnostic::UnknownTimeZone)
+    );
+
+    for duplicate in ["DTSTART", "TZOFFSETFROM", "TZOFFSETTO", "RRULE"] {
+        let mut observance = String::from(
+            "BEGIN:VTIMEZONE\nTZID:Vendor/Duplicate\nBEGIN:STANDARD\nDTSTART:20250101T000000\nTZOFFSETFROM:+0000\nTZOFFSETTO:+0000\n",
+        );
+        let repeated = match duplicate {
+            "DTSTART" => "DTSTART:20250101T000000\n",
+            "TZOFFSETFROM" => "TZOFFSETFROM:+0000\n",
+            "TZOFFSETTO" => "TZOFFSETTO:+0000\n",
+            "RRULE" => "RRULE:FREQ=YEARLY;BYMONTH=1;BYDAY=1MO\n",
+            _ => unreachable!(),
+        };
+        observance.push_str(repeated);
+        observance.push_str("END:STANDARD\nEND:VTIMEZONE\n");
+        let (events, report) = parse_reported(&format!(
+            "BEGIN:VCALENDAR\n{}{}END:VCALENDAR",
+            event("duplicate", "TZID=Vendor/Duplicate:20250115T090000"),
+            observance
+        ));
+        assert!(events.is_empty(), "accepted duplicate {duplicate}");
+        assert!(
+            report
+                .diagnostics()
+                .contains(&IcsDiagnostic::UnknownTimeZone),
+            "missing unknown timezone diagnostic for duplicate {duplicate}"
+        );
+    }
+}
+
+#[test]
 fn custom_rules_keep_weekly_recurrence_at_nine_local_across_dst() {
     let recurring = "BEGIN:VEVENT\nUID:weekly\nSUMMARY:Weekly\nDTSTART;TZID=Customized Time Zone:20250323T090000\nRRULE:FREQ=WEEKLY;COUNT=3\nEND:VEVENT\n";
     let input = format!(
