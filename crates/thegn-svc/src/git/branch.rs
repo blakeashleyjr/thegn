@@ -28,18 +28,19 @@ pub trait BranchOps: GitBackend {
     fn checkout_remote(&self, loc: &GitLoc, remote: &str, branch: &str) -> Result<()> {
         let (remote, branch) = (op::remote_name(remote)?, op::branch_name(branch)?);
         let track = format!("{remote}/{branch}");
-        run_w(loc, &[], &["checkout", "-b", branch, "--track", &track]).map(|_| ())
+        run_w(loc, &[], &["checkout", "-b", branch, "--track", &track])
+            .map(|_| after_ref_mutation(loc))
     }
 
     fn create_branch(&self, loc: &GitLoc, name: &str, base: &str) -> Result<()> {
         let (name, base) = (op::branch_name(name)?, op::revision(base)?);
-        run_w(loc, &[], &["branch", name, base]).map(|_| ())
+        run_w(loc, &[], &["branch", name, base]).map(|_| after_ref_mutation(loc))
     }
 
     fn delete_branch(&self, loc: &GitLoc, name: &str, force: bool) -> Result<()> {
         let name = op::branch_name(name)?;
         let flag = if force { "-D" } else { "-d" };
-        run_w(loc, &[], &["branch", flag, name]).map(|_| ())
+        run_w(loc, &[], &["branch", flag, name]).map(|_| after_ref_mutation(loc))
     }
 
     fn delete_remote_branch(&self, loc: &GitLoc, remote: &str, name: &str) -> Result<()> {
@@ -73,7 +74,7 @@ pub trait BranchOps: GitBackend {
         } else {
             let remote = op::remote_name(remote)?;
             let spec = format!("{branch}:{branch}");
-            run_w(loc, &[], &["fetch", remote, &spec]).map(|_| ())
+            run_w(loc, &[], &["fetch", remote, &spec]).map(|_| after_ref_mutation(loc))
         }
     }
 
@@ -108,7 +109,7 @@ pub trait BranchOps: GitBackend {
 
     fn rename_branch(&self, loc: &GitLoc, old: &str, new: &str) -> Result<()> {
         let (old, new) = (op::branch_name(old)?, op::branch_name(new)?);
-        run_w(loc, &[], &["branch", "-m", old, new]).map(|_| ())
+        run_w(loc, &[], &["branch", "-m", old, new]).map(|_| after_ref_mutation(loc))
     }
 
     /// Nuke the working tree: hard reset + clean everything (untracked,
@@ -140,6 +141,10 @@ pub trait BranchOps: GitBackend {
 
 impl<T: GitBackend + ?Sized> BranchOps for T {}
 
+fn after_ref_mutation(loc: &GitLoc) {
+    super::invalidate_glyph_base(loc);
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::testutil::{TestRepo, commit_empty, git_in};
@@ -147,6 +152,40 @@ mod tests {
     use super::{BranchOps, ForceMode};
     use std::path::{Path, PathBuf};
     use thegn_core::remote::GitLoc;
+
+    struct GlyphBaseSentinel {
+        key: super::super::RepoExecutionIdentity,
+    }
+
+    impl GlyphBaseSentinel {
+        fn seed(loc: &GitLoc) -> Self {
+            let key = super::super::repo_execution_identity(loc);
+            super::super::base_cache()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(
+                    key.clone(),
+                    (Some("sentinel".into()), std::time::Instant::now(), None),
+                );
+            Self { key }
+        }
+
+        fn is_present(&self) -> bool {
+            super::super::base_cache()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key(&self.key)
+        }
+    }
+
+    impl Drop for GlyphBaseSentinel {
+        fn drop(&mut self) {
+            super::super::base_cache()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&self.key);
+        }
+    }
 
     /// Ops run through `GitLoc` (the user's real git env, not the testutil
     /// env), so the repo itself needs an identity and deterministic knobs.
@@ -276,6 +315,65 @@ mod tests {
         CliGit.create_branch(&loc, "merged", "main").unwrap();
         CliGit.delete_branch(&loc, "merged", false).unwrap();
         assert!(!names(&loc).contains(&"merged".to_string()));
+    }
+
+    #[test]
+    fn successful_branch_mutations_invalidate_glyph_base() {
+        let repo = TestRepo::new("br-cache-create");
+        repo.commit_file("f.txt", "base\n", "c0");
+        let loc = GitLoc::Local(repo.dir.clone());
+        let cache = GlyphBaseSentinel::seed(&loc);
+        CliGit.create_branch(&loc, "feature", "HEAD").unwrap();
+        assert!(!cache.is_present(), "create_branch invalidates the cache");
+        drop(cache);
+
+        let cache = GlyphBaseSentinel::seed(&loc);
+        CliGit.delete_branch(&loc, "feature", true).unwrap();
+        assert!(!cache.is_present(), "delete_branch invalidates the cache");
+        drop(cache);
+
+        CliGit.create_branch(&loc, "old", "HEAD").unwrap();
+        let cache = GlyphBaseSentinel::seed(&loc);
+        CliGit.rename_branch(&loc, "old", "new").unwrap();
+        assert!(!cache.is_present(), "rename_branch invalidates the cache");
+        drop(cache);
+    }
+
+    #[test]
+    fn checkout_remote_invalidates_glyph_base() {
+        let repo = TestRepo::new("br-cache-checkout-remote");
+        repo.commit_file("f.txt", "base\n", "c0");
+        let clone = with_remote(&repo);
+        git_in(&repo.dir, &["push", "-q", "origin", "main:feature"]);
+        git_in(&clone, &["fetch", "-q", "origin"]);
+        let loc = GitLoc::Local(clone.clone());
+        let cache = GlyphBaseSentinel::seed(&loc);
+        CliGit.checkout_remote(&loc, "origin", "feature").unwrap();
+        assert!(!cache.is_present(), "checkout_remote invalidates the cache");
+    }
+
+    #[test]
+    fn non_current_fast_forward_invalidates_glyph_base() {
+        let repo = TestRepo::new("br-cache-fast-forward");
+        repo.commit_file("f.txt", "base\n", "c0");
+        let clone = with_remote(&repo);
+        git_in(&repo.dir, &["push", "-q", "origin", "main:feature"]);
+        let loc = GitLoc::Local(clone);
+        let cache = GlyphBaseSentinel::seed(&loc);
+        CliGit
+            .fast_forward(&loc, "feature", false, "origin")
+            .unwrap();
+        assert!(!cache.is_present(), "fast_forward invalidates the cache");
+    }
+
+    #[test]
+    fn refused_branch_mutation_keeps_glyph_base() {
+        let repo = TestRepo::new("br-cache-refused");
+        repo.commit_file("f.txt", "base\n", "c0");
+        let loc = GitLoc::Local(repo.dir.clone());
+        let cache = GlyphBaseSentinel::seed(&loc);
+        assert!(CliGit.delete_branch(&loc, "missing", true).is_err());
+        assert!(cache.is_present(), "failed mutation preserves the cache");
     }
 
     #[test]
