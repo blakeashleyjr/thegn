@@ -1056,7 +1056,10 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
             automation_origin: None,
             argv: Vec::new(),
             cwd: None,
-            env: Vec::new(),
+            env: vec![(
+                thegn_core::issue::DISPATCH_ROW_ENV.into(),
+                row_id.to_string(),
+            )],
             rows: 24,
             cols: 80,
             worktree: Some(wt.clone()),
@@ -1114,14 +1117,52 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
             Ok(())
         }
         Err(e) => {
-            // best-effort: the original error is what the operator needs; if
-            // even the failed-stamp cannot land (the roster is a cache), the
-            // row stays visibly wrong either way and the wrapped error still
-            // names it.
-            let _ = db.update_dispatch_status(row_id, AgentDispatchStatus::Failed); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-            Err(e).with_context(|| format!("dispatch {row_id} failed"))
+            let (reconciled, row_error) =
+                match fail_reserved_row(&db, row_id, &format!("open failed: {e}")) {
+                    Ok(session) => {
+                        let teardown = match session {
+                            Some(session) => match client.kill(&session).await {
+                                Ok(()) => format!("; bound session {session} torn down"),
+                                Err(kill) => format!(
+                                    "; teardown of bound session {session} failed: {kill:#}"
+                                ),
+                            },
+                            None => String::new(),
+                        };
+                        (teardown, None)
+                    }
+                    Err(error) => (String::new(), Some(error)),
+                };
+            match row_error {
+                Some(error) => Err(e).with_context(|| {
+                    format!("dispatch {row_id} failed; row reconciliation failed: {error:#}")
+                }),
+                None => Err(e).with_context(|| format!("dispatch {row_id} failed{reconciled}")),
+            }
         }
     }
+}
+
+/// Close an ambiguous reservation before looking for a daemon-side session.
+/// A bind that won before this CAS is visible in the reread; a bind arriving
+/// after it will be rejected by the daemon. A concurrent verdict wins intact.
+fn fail_reserved_row(db: &Db, row_id: i64, note: &str) -> Result<Option<String>> {
+    let mut changed = false;
+    for expected in [AgentDispatchStatus::Queued, AgentDispatchStatus::Spawning] {
+        if db.compare_and_set_dispatch_status(
+            row_id,
+            expected,
+            AgentDispatchStatus::Failed,
+            Some(note),
+        )? {
+            changed = true;
+            break;
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+    Ok(db.get_dispatch(row_id)?.and_then(|row| row.session_id))
 }
 
 /// Publish an already-opened daemon session on its roster row. The daemon and
@@ -1467,7 +1508,10 @@ async fn resume_work(
             automation_origin: None,
             argv: Vec::new(),
             cwd: None,
-            env: Vec::new(),
+            env: vec![(
+                thegn_core::issue::DISPATCH_ROW_ENV.into(),
+                new_row.to_string(),
+            )],
             rows: 24,
             cols: 80,
             worktree: Some(wt.clone()),
@@ -1522,12 +1566,28 @@ async fn resume_work(
             Ok(())
         }
         Err(e) => {
-            // best-effort: the original error is what the operator needs; if
-            // even the failed-stamp cannot land (the roster is a cache), the
-            // row stays visibly wrong either way and the wrapped error still
-            // names it.
-            let _ = db.update_dispatch_status(new_row, AgentDispatchStatus::Failed);
-            Err(e).with_context(|| format!("dispatch {new_row} failed"))
+            let (reconciled, row_error) =
+                match fail_reserved_row(&db, new_row, &format!("open failed: {e}")) {
+                    Ok(session) => {
+                        let teardown = match session {
+                            Some(session) => match client.kill(&session).await {
+                                Ok(()) => format!("; bound session {session} torn down"),
+                                Err(kill) => format!(
+                                    "; teardown of bound session {session} failed: {kill:#}"
+                                ),
+                            },
+                            None => String::new(),
+                        };
+                        (teardown, None)
+                    }
+                    Err(error) => (String::new(), Some(error)),
+                };
+            match row_error {
+                Some(error) => Err(e).with_context(|| {
+                    format!("dispatch {new_row} failed; row reconciliation failed: {error:#}")
+                }),
+                None => Err(e).with_context(|| format!("dispatch {new_row} failed{reconciled}")),
+            }
         }
     }
 }
@@ -2164,6 +2224,70 @@ mod catalog_tests {
         assert!(
             crate::Cli::try_parse_from(["thegn", "session", "browse", "http://localhost:3000/",])
                 .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod fail_reserved_row_tests {
+    use super::fail_reserved_row;
+    use thegn_core::db::Db;
+    use thegn_core::issue::{AgentDispatchStatus, NewDispatch};
+
+    fn staged_row(db: &Db) -> i64 {
+        db.put_agent_dispatch(NewDispatch {
+            stage: Some("code"),
+            ..NewDispatch::new("linear:THE-272", "/wt/272", "claude")
+        })
+        .expect("insert staged row")
+    }
+
+    #[test]
+    fn failed_reservation_returns_a_previously_bound_session() {
+        let db = Db::open_memory().expect("memory db");
+        let row = staged_row(&db);
+        assert!(db.bind_dispatch_session(row, "s1").expect("bind session"));
+
+        assert_eq!(
+            fail_reserved_row(&db, row, "open response lost").expect("reconcile row"),
+            Some("s1".into())
+        );
+        assert_eq!(
+            db.get_dispatch(row).expect("read row").unwrap().status,
+            AgentDispatchStatus::Failed
+        );
+    }
+
+    #[test]
+    fn concurrent_terminal_verdict_is_preserved_without_returning_session() {
+        let db = Db::open_memory().expect("memory db");
+        let row = staged_row(&db);
+        assert!(db.bind_dispatch_session(row, "s1").expect("bind session"));
+        db.update_dispatch_status(row, AgentDispatchStatus::Done)
+            .expect("close row");
+
+        assert_eq!(
+            fail_reserved_row(&db, row, "open response lost").unwrap(),
+            None
+        );
+        assert_eq!(
+            db.get_dispatch(row).expect("read row").unwrap().status,
+            AgentDispatchStatus::Done
+        );
+    }
+
+    #[test]
+    fn failed_unbound_reservation_has_no_session_to_tear_down() {
+        let db = Db::open_memory().expect("memory db");
+        let row = staged_row(&db);
+
+        assert_eq!(
+            fail_reserved_row(&db, row, "open response lost").unwrap(),
+            None
+        );
+        assert_eq!(
+            db.get_dispatch(row).expect("read row").unwrap().status,
+            AgentDispatchStatus::Failed
         );
     }
 }
