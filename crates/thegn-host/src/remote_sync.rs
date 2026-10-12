@@ -262,7 +262,7 @@ pub(crate) fn retarget_if_remote_oci(
         }
         Err(e) => {
             let warning = format!(
-                "remote worktree sync failed: {e}; manual recovery on the remote host: run `rm -rf \"$HOME/thegn-worktrees/{0}\" \"$HOME/thegn-worktrees/{0}.thegn-incomplete\" \"$HOME/thegn-worktrees/{0}.bundle\"`, then retry",
+                "remote worktree sync failed: {e}; after saving any work in it, manual recovery on the remote host: run `rm -rf \"$HOME/thegn-worktrees/{0}\" \"$HOME/thegn-worktrees/{0}.thegn-incomplete\" \"$HOME/thegn-worktrees/{0}.bundle\"`, then retry",
                 spec.name
             );
             warnings.push(warning.clone());
@@ -767,6 +767,7 @@ mod tests {
                 start.wait();
                 sync_once(&cache, "/repo/worktree", || {
                     calls.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                     Ok("/remote/thegn-worktrees/sandbox".to_string())
                 })
                 .unwrap()
