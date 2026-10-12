@@ -111,32 +111,117 @@ enum EndpointKind {
     Unix(String),
 }
 
-impl MpdEndpoint {
-    /// Resolve a sanitized host-side socket into an endpoint. A leading `/`
-    /// (unix) is a socket path; otherwise `host:port` (default port 6600).
-    pub fn resolve(socket: &str, password: Option<crate::MpdPassword>) -> MpdEndpoint {
-        let trimmed = socket.trim();
-        let kind = if trimmed.starts_with('/') {
-            EndpointKind::Unix(trimmed.to_string())
-        } else {
-            parse_host_port(trimmed)
-        };
-        MpdEndpoint { kind, password }
+/// Why an MPD endpoint string was rejected. Never carries the password.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MpdEndpointError {
+    /// The endpoint text is empty.
+    Empty,
+    /// No host before the port (e.g. `:6600`).
+    EmptyHost,
+    /// The port is missing, non-numeric, zero, or out of range.
+    InvalidPort(String),
+    /// Unterminated or malformed `[...]` IPv6 literal.
+    InvalidIpv6(String),
+    /// A bare host containing more than one `:` (IPv6 needs brackets).
+    AmbiguousHost(String),
+    /// Whitespace or control characters in the host.
+    InvalidHost(String),
+}
+
+impl std::fmt::Display for MpdEndpointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "mpd endpoint is empty"),
+            Self::EmptyHost => write!(f, "mpd endpoint has an empty host"),
+            Self::InvalidPort(p) => {
+                write!(f, "mpd endpoint has an invalid port {:?}", sanitize_diag(p))
+            }
+            Self::InvalidIpv6(h) => write!(
+                f,
+                "mpd endpoint has an invalid IPv6 literal {:?}",
+                sanitize_diag(h)
+            ),
+            Self::AmbiguousHost(h) => write!(
+                f,
+                "mpd endpoint {:?} is ambiguous; put IPv6 addresses in brackets, e.g. [::1]:6600",
+                sanitize_diag(h)
+            ),
+            Self::InvalidHost(h) => {
+                write!(f, "mpd endpoint has an invalid host {:?}", sanitize_diag(h))
+            }
+        }
     }
 }
 
-/// Split `host:port` (default port 6600, default host 127.0.0.1). IPv6 literals
-/// aren't special-cased — MPD endpoints are hostnames/IPv4 in practice.
-fn parse_host_port(s: &str) -> EndpointKind {
-    let (host, port) = match s.rsplit_once(':') {
-        Some((h, p)) => (h, p.trim().parse().unwrap_or(6600)),
-        None => (s, 6600),
+impl std::error::Error for MpdEndpointError {}
+
+impl MpdEndpoint {
+    /// Resolve a sanitized host-side socket into an endpoint. A leading `/`
+    /// (unix) is a socket path; otherwise `host`, `host:port`, `[v6]` or
+    /// `[v6]:port` (default port 6600). Invalid text is an error, never a
+    /// silent fallback to another host or port.
+    pub fn resolve(
+        socket: &str,
+        password: Option<crate::MpdPassword>,
+    ) -> Result<MpdEndpoint, MpdEndpointError> {
+        let trimmed = socket.trim();
+        if trimmed.is_empty() {
+            return Err(MpdEndpointError::Empty);
+        }
+        let kind = if trimmed.starts_with('/') {
+            EndpointKind::Unix(trimmed.to_string())
+        } else {
+            parse_host_port(trimmed)?
+        };
+        Ok(MpdEndpoint { kind, password })
+    }
+}
+
+fn parse_port(p: &str) -> Result<u16, MpdEndpointError> {
+    match p.trim().parse::<u16>() {
+        Ok(n) if n != 0 => Ok(n),
+        _ => Err(MpdEndpointError::InvalidPort(p.to_string())),
+    }
+}
+
+/// Split `host[:port]` / `[v6][:port]` (default port 6600).
+fn parse_host_port(s: &str) -> Result<EndpointKind, MpdEndpointError> {
+    let (host, port) = if let Some(rest) = s.strip_prefix('[') {
+        let (inner, after) = rest
+            .split_once(']')
+            .ok_or_else(|| MpdEndpointError::InvalidIpv6(s.to_string()))?;
+        if inner.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(MpdEndpointError::InvalidIpv6(inner.to_string()));
+        }
+        let port = match after {
+            "" => 6600,
+            _ => parse_port(
+                after
+                    .strip_prefix(':')
+                    .ok_or_else(|| MpdEndpointError::InvalidIpv6(s.to_string()))?,
+            )?,
+        };
+        (inner, port)
+    } else {
+        match s.matches(':').count() {
+            0 => (s, 6600),
+            1 => {
+                let (h, p) = s.split_once(':').unwrap_or((s, ""));
+                (h, parse_port(p)?)
+            }
+            _ => return Err(MpdEndpointError::AmbiguousHost(s.to_string())),
+        }
     };
-    let host = if host.is_empty() { "127.0.0.1" } else { host };
-    EndpointKind::Tcp {
+    if host.is_empty() {
+        return Err(MpdEndpointError::EmptyHost);
+    }
+    if host.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(MpdEndpointError::InvalidHost(host.to_string()));
+    }
+    Ok(EndpointKind::Tcp {
         host: host.to_string(),
         port,
-    }
+    })
 }
 
 /// A live MPD connection with its greeting consumed and password (if any) sent.
@@ -338,19 +423,26 @@ impl Mpd {
         let conn = self.conn().await?;
         Ok(MpdWatch { conn: Some(conn) })
     }
+}
 
-    /// Current volume `0..=100` (for relative stepping), or 100 when unknown.
-    async fn current_volume(&self) -> u8 {
-        let Ok(mut c) = self.conn().await else {
-            return 100;
-        };
-        let status = c.command("status").await.unwrap_or_default();
-        mpd_parse::field(&status, "volume")
-            .and_then(|v| v.trim().parse::<i64>().ok())
-            .filter(|&v| v >= 0)
-            .map(|v| v.clamp(0, 100) as u8)
-            .unwrap_or(100)
+/// Observed volume from a `status` reply: `Ok(None)` when MPD reports none
+/// (no mixer: field absent or the `-1` sentinel); `Err` when malformed.
+fn parse_volume(status: &[Pair]) -> Result<Option<u8>, MediaError> {
+    let Some(v) = mpd_parse::field(status, "volume") else {
+        return Ok(None);
+    };
+    match v.trim().parse::<i64>() {
+        Ok(n) if n < 0 => Ok(None),
+        Ok(n) => Ok(Some(n.clamp(0, 100) as u8)),
+        Err(_) => Err(MediaError::Backend(
+            "mpd status has a malformed volume".into(),
+        )),
     }
+}
+
+/// Compute a relative volume target from an observed base. Pure.
+fn relative_volume(cur: u8, delta: f64) -> u8 {
+    (f64::from(cur) + delta * 100.0).clamp(0.0, 100.0).round() as u8
 }
 
 impl MediaBackend for Mpd {
@@ -364,8 +456,9 @@ impl MediaBackend for Mpd {
             };
             let status = c.command("status").await?;
             // Nothing loaded (`state: stop` with no song) still yields a valid
-            // stopped state; the badge hides it.
-            let song = c.command("currentsong").await.unwrap_or_default();
+            // stopped state; the badge hides it. A failed `currentsong` is an
+            // error, not an empty song.
+            let song = c.command("currentsong").await?;
             Ok(Some(mpd_parse::to_state(&status, &song)))
         })
     }
@@ -375,9 +468,14 @@ impl MediaBackend for Mpd {
             // `pause` with no argument toggles pause; from stopped, `play` starts.
             let mut c = self.conn().await?;
             let status = c.command("status").await?;
-            match mpd_parse::field(&status, "state").unwrap_or("stop") {
-                "stop" => c.command("play").await.map(|_| ()),
-                _ => c.command("pause").await.map(|_| ()),
+            // A missing or unknown state must not select an arbitrary mutation.
+            match mpd_parse::field(&status, "state") {
+                Some("stop") => c.command("play").await.map(|_| ()),
+                Some("play" | "pause") => c.command("pause").await.map(|_| ()),
+                other => Err(MediaError::Backend(format!(
+                    "mpd status has an unknown state {:?}",
+                    other.map(sanitize_diag)
+                ))),
             }
         })
     }
@@ -405,18 +503,27 @@ impl MediaBackend for Mpd {
             };
             let mut c = self.conn().await?;
             c.command(&format!("repeat {repeat}")).await?;
-            c.command(&format!("single {single}")).await.map(|_| ())
+            // A failure here leaves `repeat` already applied; say so.
+            c.command(&format!("single {single}"))
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    MediaError::Backend(format!(
+                        "mpd loop mode partially applied (repeat set, single failed): {e}"
+                    ))
+                })
         })
     }
     fn volume_step(&self, delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
-            let cur = self.current_volume().await as f64;
-            let next = (cur + delta * 100.0).clamp(0.0, 100.0).round() as u8;
-            self.conn()
-                .await?
-                .command(&format!("setvol {next}"))
-                .await
-                .map(|_| ())
+            // One connection: observe, then write. Never write from a guess.
+            let mut c = self.conn().await?;
+            let status = c.command("status").await?;
+            let Some(cur) = parse_volume(&status)? else {
+                return Err(MediaError::Unsupported("mpd volume is unavailable".into()));
+            };
+            let next = relative_volume(cur, delta);
+            c.command(&format!("setvol {next}")).await.map(|_| ())
         })
     }
 
@@ -426,7 +533,11 @@ impl MediaBackend for Mpd {
         })
     }
     fn activate_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {
+            Err(MediaError::Unsupported(
+                "mpd playlist activation is not implemented".into(),
+            ))
+        })
     }
 
     fn seek(&self, offset: Duration, forward: bool) -> BoxFuture<'_, Result<(), MediaError>> {
@@ -470,10 +581,13 @@ impl MediaBackend for Mpd {
     /// The `idle` push watcher.
     fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
         Box::pin(async move {
-            Mpd::watch(self)
-                .await
-                .ok()
-                .map(|w| Box::new(w) as Box<dyn MediaWatch + Send>)
+            match Mpd::watch(self).await {
+                Ok(w) => Some(Box::new(w) as Box<dyn MediaWatch + Send>),
+                Err(e) => {
+                    tracing::debug!(target: "thegn::media", error = %e, "MPD watcher unavailable");
+                    None
+                }
+            }
         })
     }
 
@@ -532,7 +646,7 @@ mod tests {
     #[test]
     fn resolve_defaults_to_localhost_tcp() {
         // Environment parsing belongs to the audited host boundary.
-        let ep = MpdEndpoint::resolve("127.0.0.1:6600", None);
+        let ep = MpdEndpoint::resolve("127.0.0.1:6600", None).unwrap();
         match ep.kind {
             EndpointKind::Tcp { host, port } => {
                 assert_eq!(host, "127.0.0.1");
@@ -548,7 +662,8 @@ mod tests {
         let endpoint = MpdEndpoint::resolve(
             "music.lan:6601",
             Some(crate::MpdPassword::new(sentinel.to_string())),
-        );
+        )
+        .unwrap();
         let rendered = format!("{endpoint:?}");
         assert!(!rendered.contains(sentinel));
         assert!(rendered.contains("REDACTED"));
@@ -556,7 +671,7 @@ mod tests {
 
     #[test]
     fn resolve_explicit_host_port() {
-        let ep = MpdEndpoint::resolve("music.lan:6601", None);
+        let ep = MpdEndpoint::resolve("music.lan:6601", None).unwrap();
         match ep.kind {
             EndpointKind::Tcp { host, port } => {
                 assert_eq!(host, "music.lan");
@@ -568,7 +683,7 @@ mod tests {
 
     #[test]
     fn resolve_bare_host_defaults_port() {
-        match MpdEndpoint::resolve("music.lan", None).kind {
+        match MpdEndpoint::resolve("music.lan", None).unwrap().kind {
             EndpointKind::Tcp { host, port } => {
                 assert_eq!(host, "music.lan");
                 assert_eq!(port, 6600);
@@ -579,7 +694,7 @@ mod tests {
 
     #[test]
     fn resolve_unix_path() {
-        match MpdEndpoint::resolve("/run/mpd/socket", None).kind {
+        match MpdEndpoint::resolve("/run/mpd/socket", None).unwrap().kind {
             EndpointKind::Unix(p) => assert_eq!(p, "/run/mpd/socket"),
             _ => panic!("expected unix"),
         }
@@ -648,7 +763,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
-        MpdEndpoint::resolve(&format!("127.0.0.1:{port}"), None)
+        MpdEndpoint::resolve(&format!("127.0.0.1:{port}"), None).unwrap()
     }
 
     #[tokio::test]
@@ -683,5 +798,133 @@ mod tests {
         let ep = fake_server(b"OK MPD 0.23.0\n".to_vec(), b"OK\n".to_vec()).await;
         let mut c = MpdConn::dial(&ep).await.unwrap();
         assert!(c.command("status\nclear").await.is_err());
+    }
+
+    fn tcp(s: &str) -> Result<(String, u16), MpdEndpointError> {
+        match MpdEndpoint::resolve(s, None)?.kind {
+            EndpointKind::Tcp { host, port } => Ok((host, port)),
+            EndpointKind::Unix(_) => panic!("expected tcp"),
+        }
+    }
+
+    #[test]
+    fn endpoint_parser_table() {
+        assert_eq!(tcp("[::1]:6601"), Ok(("::1".into(), 6601)));
+        assert_eq!(tcp("[::1]"), Ok(("::1".into(), 6600)));
+        assert_eq!(tcp("host:65535"), Ok(("host".into(), 65535)));
+        assert!(matches!(
+            tcp("host:0"),
+            Err(MpdEndpointError::InvalidPort(_))
+        ));
+        assert!(matches!(
+            tcp("host:65536"),
+            Err(MpdEndpointError::InvalidPort(_))
+        ));
+        assert!(matches!(
+            tcp("host:abc"),
+            Err(MpdEndpointError::InvalidPort(_))
+        ));
+        assert!(matches!(
+            tcp("host:"),
+            Err(MpdEndpointError::InvalidPort(_))
+        ));
+        assert_eq!(tcp(":6600"), Err(MpdEndpointError::EmptyHost));
+        assert!(matches!(
+            tcp("::1"),
+            Err(MpdEndpointError::AmbiguousHost(_))
+        ));
+        assert!(matches!(tcp("[::1"), Err(MpdEndpointError::InvalidIpv6(_))));
+        assert!(matches!(
+            tcp("[nope]:1"),
+            Err(MpdEndpointError::InvalidIpv6(_))
+        ));
+        assert!(matches!(
+            tcp("[::1]x"),
+            Err(MpdEndpointError::InvalidIpv6(_))
+        ));
+        assert!(matches!(
+            tcp("a b:1"),
+            Err(MpdEndpointError::InvalidHost(_))
+        ));
+        assert_eq!(tcp("   ").unwrap_err(), MpdEndpointError::Empty);
+        assert!(MpdEndpoint::resolve("/run/mpd/socket", None).is_ok());
+    }
+
+    #[test]
+    fn volume_parse_never_fabricates() {
+        let p = |v: &str| mpd_parse::parse_line(&format!("volume: {v}")).unwrap();
+        assert_eq!(parse_volume(&[]).unwrap(), None);
+        assert_eq!(parse_volume(&[p("-1")]).unwrap(), None);
+        assert_eq!(parse_volume(&[p("40")]).unwrap(), Some(40));
+        assert!(parse_volume(&[p("loud")]).is_err());
+        assert_eq!(relative_volume(40, 0.05), 45);
+        assert_eq!(relative_volume(98, 0.05), 100);
+    }
+
+    /// Fake server that answers every command with `reply` and records them.
+    async fn recording_server(
+        reply: &'static str,
+    ) -> (MpdEndpoint, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let (r, mut w) = tokio::io::split(sock);
+            if w.write_all(b"OK MPD 0.23.0\n").await.is_err() {
+                return;
+            }
+            let mut r = BufReader::new(r);
+            while let Ok(Some(l)) = read_bounded_line(&mut r, 1024).await {
+                log.lock().unwrap().push(l);
+                if w.write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (
+            MpdEndpoint::resolve(&format!("127.0.0.1:{port}"), None).unwrap(),
+            seen,
+        )
+    }
+
+    #[tokio::test]
+    async fn volume_step_without_observed_volume_writes_nothing() {
+        let (ep, seen) = recording_server("volume: -1\nstate: play\nOK\n").await;
+        let m = Mpd { ep };
+        let err = m.volume_step(0.05).await.unwrap_err();
+        assert!(matches!(err, MediaError::Unsupported(_)), "{err:?}");
+        let cmds = seen.lock().unwrap().clone();
+        assert_eq!(cmds, vec!["status".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn volume_step_writes_relative_to_observed_on_one_connection() {
+        let (ep, seen) = recording_server("volume: 40\nstate: play\nOK\n").await;
+        let m = Mpd { ep };
+        m.volume_step(0.05).await.unwrap();
+        let cmds = seen.lock().unwrap().clone();
+        assert_eq!(cmds, vec!["status".to_string(), "setvol 45".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn play_pause_with_missing_state_does_not_mutate() {
+        let (ep, seen) = recording_server("volume: 40\nOK\n").await;
+        let m = Mpd { ep };
+        assert!(m.play_pause().await.is_err());
+        assert_eq!(seen.lock().unwrap().clone(), vec!["status".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn activate_playlist_is_unsupported() {
+        let (ep, _seen) = recording_server("OK\n").await;
+        let m = Mpd { ep };
+        assert!(matches!(
+            m.activate_playlist("x").await,
+            Err(MediaError::Unsupported(_))
+        ));
     }
 }
