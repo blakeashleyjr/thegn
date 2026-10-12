@@ -11481,7 +11481,18 @@ async fn event_loop<T: Terminal>(
         while let Ok((path, nw)) = watcher_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Watcher);
             if watched_worktree.as_deref() == Some(path.as_path()) {
-                diff_watcher = Some(nw);
+                if let Some(old) = diff_watcher.replace(nw) {
+                    drop(std::thread::spawn(move || {
+                        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                        drop(old);
+                    }));
+                }
+            } else {
+                // A stale registration can also hold a large inotify set.
+                drop(std::thread::spawn(move || {
+                    crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                    drop(nw);
+                }));
             }
         }
 
