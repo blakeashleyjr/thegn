@@ -105,8 +105,43 @@ fn mount_sshfs(spec: &ProjectionSpec) -> Result<Mounted> {
 }
 
 fn unmount_sshfs(spec: &ProjectionSpec) -> Result<()> {
-    let argv = SshPlacement::sshfs_unmount_argv(&spec.mountpoint);
-    run(&argv)
+    let legacy_path = spec.legacy_mountpoint();
+    let legacy_present = legacy_path.as_ref().is_some_and(|path| {
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+    });
+    let plan = sshfs_unmount_plan(spec, legacy_present);
+    let primary_result = run(&plan[0]);
+
+    let mut legacy_succeeded = false;
+    if let Some(legacy_path) = legacy_path.filter(|_| legacy_present)
+        && let Some(legacy_argv) = plan.get(1)
+    {
+        match run(legacy_argv) {
+            Ok(()) => {
+                legacy_succeeded = true;
+                if let Err(error) = std::fs::remove_dir(&legacy_path) {
+                    tracing::debug!(%error, path = %legacy_path, "could not remove empty legacy sshfs mountpoint");
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, path = %legacy_path, "could not unmount legacy sshfs mountpoint");
+            }
+        }
+    }
+
+    if primary_result.is_ok() || legacy_succeeded {
+        Ok(())
+    } else {
+        primary_result
+    }
+}
+
+fn sshfs_unmount_plan(spec: &ProjectionSpec, legacy_present: bool) -> Vec<Vec<String>> {
+    let mut plan = vec![SshPlacement::sshfs_unmount_argv(&spec.mountpoint)];
+    if legacy_present && let Some(legacy_mountpoint) = spec.legacy_mountpoint() {
+        plan.push(SshPlacement::sshfs_unmount_argv(&legacy_mountpoint));
+    }
+    plan
 }
 
 /// `rsync -e` transport flag carrying the placement's ssh knobs (port/identity).
@@ -250,5 +285,30 @@ mod tests {
         let s = spec(DataMode::Sshfs, Placement::Local);
         let b = for_data_mode(&s);
         assert!(b.mount(&s).is_err());
+    }
+
+    #[test]
+    fn sshfs_unmount_plan_keeps_primary_and_adds_legacy_only_when_present() {
+        let s = spec(DataMode::Sshfs, ssh());
+        let primary = SshPlacement::sshfs_unmount_argv(&s.mountpoint);
+        let without_legacy = sshfs_unmount_plan(&s, false);
+        assert_eq!(without_legacy, vec![primary.clone()]);
+
+        let with_legacy = sshfs_unmount_plan(&s, true);
+        assert_eq!(with_legacy[0], primary);
+        assert_eq!(with_legacy.len(), 2);
+        assert_eq!(
+            with_legacy[1],
+            SshPlacement::sshfs_unmount_argv(&s.legacy_mountpoint().unwrap())
+        );
+    }
+
+    #[test]
+    fn sshfs_unmount_plan_omits_unavailable_legacy_path() {
+        let s = spec(DataMode::Sshfs, Placement::Local);
+        assert_eq!(
+            sshfs_unmount_plan(&s, true),
+            vec![SshPlacement::sshfs_unmount_argv(&s.mountpoint)]
+        );
     }
 }
