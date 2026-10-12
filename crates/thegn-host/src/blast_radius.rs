@@ -537,15 +537,12 @@ mod tests {
     #[test]
     fn head_diff_only_treats_an_unborn_head_as_an_empty_pass() {
         fn git(root: &Path, args: &[&str]) {
-            crate::bounded_git_probe::capture(
-                thegn_core::util::git_cmd(root)
-                    .args(args)
-                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                    .env("GIT_CONFIG_SYSTEM", "/dev/null"),
-                None,
-                "blast-radius test fixture",
-            )
-            .unwrap_or_else(|error| panic!("git {args:?} failed: {error}"));
+            let mut cmd = thegn_core::util::git_cmd(root);
+            cmd.args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null");
+            crate::bounded_git_probe::capture(cmd, None, "blast-radius test fixture")
+                .unwrap_or_else(|error| panic!("git {args:?} failed: {error}"));
         }
 
         let unborn = tempfile::tempdir().unwrap();
