@@ -686,6 +686,89 @@ pub fn mount_path_unsafe(p: &str) -> bool {
         .any(|c| c.is_whitespace() || c.is_control() || matches!(c, ':' | '"' | '\'' | '\\'))
 }
 
+/// Why `p` cannot be placed verbatim in a systemd path property
+/// (`BindPaths=`, `BindReadOnlyPaths=`, `ReadWritePaths=`), or `None` if it is
+/// safe. systemd splits these values on whitespace, treats `:` as the
+/// source/destination/options delimiter, honours quotes and backslash escapes,
+/// expands `%` specifiers, and gives a leading `-`/`+` special meaning. Rather
+/// than encode (and trust our reading of) each rule, anything that is not a
+/// plain absolute, lexically-normalised path is refused.
+pub fn systemd_path_refusal(p: &str) -> Option<&'static str> {
+    if p.is_empty() {
+        return Some("is empty");
+    }
+    if !p.starts_with('/') {
+        return Some("is not absolute (a leading `-`/`+` or a relative path changes meaning)");
+    }
+    if mount_path_unsafe(p) {
+        return Some("contains whitespace, a control character, a quote, a backslash or ':'");
+    }
+    if p.contains('%') {
+        return Some("contains '%', which systemd expands as a specifier");
+    }
+    let body = p.strip_suffix('/').unwrap_or(p);
+    if body.is_empty() {
+        return None; // "/"
+    }
+    if body[1..].split('/').any(|c| matches!(c, "" | "." | "..")) {
+        return Some("is not normalised (empty, `.` or `..` component)");
+    }
+    None
+}
+
+/// `FLAG=host:dest` for a systemd bind property, or the reason the pair cannot
+/// be represented. The single encoder every systemd mount goes through.
+pub fn systemd_bind_property(flag: &str, host: &str, dest: &str) -> Result<String, String> {
+    for p in [host, dest] {
+        if let Some(why) = systemd_path_refusal(p) {
+            return Err(format!("mount path `{p}` {why}"));
+        }
+    }
+    Ok(format!("{flag}={host}:{dest}"))
+}
+
+/// `PROP=path` for a single-path systemd property (`ReadWritePaths=`).
+pub fn systemd_path_property(prop: &str, path: &str) -> Result<String, String> {
+    match systemd_path_refusal(path) {
+        Some(why) => Err(format!("mount path `{path}` {why}")),
+        None => Ok(format!("{prop}={path}")),
+    }
+}
+
+/// The directory that must be bound read-only for `link` (normally
+/// `/etc/resolv.conf`) to resolve inside a bwrap sandbox whose `/etc` is bound
+/// but whose `/run` is not (THE-730). On a systemd-resolved host the chain is
+/// `/etc/resolv.conf -> /etc/static/resolv.conf -> /run/systemd/resolve/
+/// stub-resolv.conf`, which dangles in the sandbox without that directory.
+///
+/// Fail closed: `None` unless the fully-resolved target lies strictly below
+/// `runtime_root` (`/run`), in a directory at least one level below it, and
+/// outside every `substrate` path already bound. Only the target's parent
+/// directory is returned, never `runtime_root` itself.
+pub fn resolver_bind_dir(link: &Path, runtime_root: &Path, substrate: &[&str]) -> Option<PathBuf> {
+    let target = link.canonicalize().ok()?;
+    let dir = target.parent()?;
+    if dir == runtime_root || !dir.starts_with(runtime_root) {
+        return None;
+    }
+    // Only expose directories used by known host resolver implementations.
+    // In particular, never make arbitrary /run state such as per-user sockets
+    // visible inside the sandbox.
+    let allowed = [
+        runtime_root.join("systemd/resolve"),
+        runtime_root.join("NetworkManager"),
+        runtime_root.join("resolvconf"),
+        runtime_root.join("connman"),
+    ];
+    if !allowed.iter().any(|path| dir == path) {
+        return None;
+    }
+    if substrate.iter().any(|s| dir.starts_with(s)) {
+        return None;
+    }
+    Some(dir.to_path_buf())
+}
+
 /// Canonicalize `p`, tolerating a missing tail (canonicalize the deepest
 /// existing ancestor, re-append the rest) so a not-yet-created destination is
 /// still resolved through any symlinked parent.
@@ -813,6 +896,101 @@ pub fn sealed_home_allowlist(home: &Path) -> Vec<Mount> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn systemd_paths_are_refused_unless_plain_absolute_and_normalised() {
+        for ok in ["/", "/wt/feat", "/wt/feat/", "/nix/store/x-a.b_c+d"] {
+            assert_eq!(systemd_path_refusal(ok), None, "{ok}");
+        }
+        for bad in [
+            "", "rel/path", "-/wt", "+/wt", "/a:b", "/a b", "/a\tb", "/a\nb", "/a\\b", "/a\"b",
+            "/a'b", "/a%hb", "/a//b", "/a/./b", "/a/../b", "/a/..",
+        ] {
+            assert!(systemd_path_refusal(bad).is_some(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn systemd_bind_property_encodes_plain_pairs_and_refuses_others() {
+        assert_eq!(
+            systemd_bind_property("BindPaths", "/a", "/b").as_deref(),
+            Ok("BindPaths=/a:/b")
+        );
+        let err = systemd_bind_property("BindReadOnlyPaths", "/a:evil", "/b").unwrap_err();
+        assert!(err.contains("/a:evil"), "{err}");
+        assert!(systemd_bind_property("BindPaths", "/a", "/b c").is_err());
+        assert_eq!(
+            systemd_path_property("ReadWritePaths", "/w").as_deref(),
+            Ok("ReadWritePaths=/w")
+        );
+        assert!(systemd_path_property("ReadWritePaths", "-/w").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolver_bind_dir_follows_the_symlink_chain_to_the_run_dir() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().canonicalize().unwrap();
+        let run = root.join("run");
+        let resolve = run.join("systemd").join("resolve");
+        std::fs::create_dir_all(&resolve).unwrap();
+        std::fs::write(resolve.join("stub-resolv.conf"), "nameserver 127.0.0.53\n").unwrap();
+        let etc = root.join("etc");
+        std::fs::create_dir_all(etc.join("static")).unwrap();
+        std::os::unix::fs::symlink(
+            resolve.join("stub-resolv.conf"),
+            etc.join("static").join("resolv.conf"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            etc.join("static").join("resolv.conf"),
+            etc.join("resolv.conf"),
+        )
+        .unwrap();
+        let etc_s = etc.to_string_lossy().into_owned();
+        assert_eq!(
+            resolver_bind_dir(&etc.join("resolv.conf"), &run, &[etc_s.as_str()]),
+            Some(resolve.clone())
+        );
+        // Already covered by a bound substrate path: nothing extra to bind.
+        let resolve_s = resolve.to_string_lossy().into_owned();
+        assert_eq!(
+            resolver_bind_dir(&etc.join("resolv.conf"), &run, &[resolve_s.as_str()]),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolver_bind_dir_refuses_targets_outside_the_runtime_root() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().canonicalize().unwrap();
+        let run = root.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        // A plain file under /etc (the non-resolved case): nothing to bind.
+        let plain = root.join("resolv.conf");
+        std::fs::write(&plain, "nameserver 1.1.1.1\n").unwrap();
+        assert_eq!(resolver_bind_dir(&plain, &run, &[]), None);
+        // A target directly in the runtime root would bind all of /run.
+        let direct = run.join("resolv.conf");
+        std::fs::write(&direct, "x").unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&direct, &link).unwrap();
+        assert_eq!(resolver_bind_dir(&link, &run, &[]), None);
+        // Dangling link: unresolvable, so refused.
+        let dangling = root.join("dangling");
+        std::os::unix::fs::symlink(run.join("gone").join("x"), &dangling).unwrap();
+        assert_eq!(resolver_bind_dir(&dangling, &run, &[]), None);
+        // Even though this is below /run, exposing a user session directory
+        // would reveal sockets such as the session bus and agent credentials.
+        let user_dir = run.join("user").join("1000");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        let user_target = user_dir.join("resolv.conf");
+        std::fs::write(&user_target, "x").unwrap();
+        let user_link = root.join("user-link");
+        std::os::unix::fs::symlink(&user_target, &user_link).unwrap();
+        assert_eq!(resolver_bind_dir(&user_link, &run, &[]), None);
+    }
 
     #[test]
     fn carveouts_are_rw_existing_paths_under_home() {

@@ -1937,3 +1937,184 @@ fn oci_create_stamps_the_seal_label() {
             .contains("--label thegn.seal_home=1")
     );
 }
+
+#[test]
+fn bwrap_resolver_bind_is_skipped_for_no_network_and_covered_dirs() {
+    let dir = std::path::Path::new("/run/systemd/resolve");
+    let mut s = spec(Backend::Bwrap);
+    s.network = Network::Nat;
+    assert_eq!(
+        resolver_bind_filter(&s, &[], dir).as_deref(),
+        Some("/run/systemd/resolve")
+    );
+    // network = none: fail closed, no resolver mount.
+    s.network = Network::None;
+    assert_eq!(resolver_bind_filter(&s, &[], dir), None);
+    // The user's `/run/systemd/resolve:ro` workaround (or a parent): no duplicate.
+    s.network = Network::Nat;
+    s.mounts.push(Mount {
+        host: "/run/systemd/resolve".into(),
+        dest: "/run/systemd/resolve".into(),
+        ro: true,
+        cache: false,
+    });
+    assert_eq!(resolver_bind_filter(&s, &[], dir), None);
+    // Already under a hardcoded parent.
+    let s2 = spec(Backend::Bwrap);
+    assert_eq!(resolver_bind_filter(&s2, &["/run/systemd"], dir), None);
+}
+
+#[test]
+fn bwrap_resolver_bind_is_covered_for_nested_user_mounts() {
+    let dir = std::path::Path::new("/run/systemd/resolve");
+    let nested = Mount {
+        host: "/host/netif".into(),
+        dest: "/run/systemd/resolve/netif".into(),
+        ro: false,
+        cache: false,
+    };
+    let mut s = spec(Backend::Bwrap);
+    s.mounts.push(nested.clone());
+    assert_eq!(
+        resolver_bind_filter(&s, &[], dir).as_deref(),
+        Some("/run/systemd/resolve")
+    );
+    assert!(bwrap_mount_covered(&nested, &["/run/systemd/resolve"]));
+    let at_dir = Mount {
+        dest: "/run/systemd/resolve".into(),
+        ..nested.clone()
+    };
+    assert!(!bwrap_mount_covered(&at_dir, &["/run/systemd/resolve"]));
+}
+
+#[test]
+fn bwrap_network_none_argv_has_no_resolver_bind() {
+    let resolver_dir = std::path::Path::new("/run/systemd/resolve");
+    let resolver_dirs = [
+        "/run/systemd/resolve",
+        "/run/NetworkManager",
+        "/run/resolvconf",
+        "/run/connman",
+    ];
+    let contains_resolver_dir = |argv: &[String]| {
+        argv.iter().any(|arg| {
+            resolver_dirs
+                .iter()
+                .any(|dir| arg.as_str() == *dir || arg.starts_with(*dir))
+        })
+    };
+
+    let mut nat = spec(Backend::Bwrap);
+    nat.network = Network::Nat;
+    let nat_argv = backend_enter_argv_with_resolver_dir(&nat, "true", Some(resolver_dir));
+    assert!(
+        nat_argv
+            .windows(3)
+            .any(|w| { w[0] == "--ro-bind" && w[1] == "/run/systemd/resolve" && w[2] == w[1] })
+    );
+
+    let mut none = spec(Backend::Bwrap);
+    none.network = Network::None;
+    let argv = backend_enter_argv_with_resolver_dir(&none, "true", Some(resolver_dir));
+    assert!(
+        !contains_resolver_dir(&argv),
+        "unexpected resolver bind in argv: {}",
+        argv.join(" ")
+    );
+    assert!(argv.iter().any(|arg| arg == "--unshare-net"));
+}
+
+#[test]
+fn systemd_launch_refuses_mount_paths_systemd_would_misparse() {
+    // Open profiles emit no mount properties, so a host and destination that
+    // would be unsafe if emitted are irrelevant to this backend's argv.
+    let mut open = spec(Backend::Systemd);
+    open.mounts.push(Mount {
+        host: "/host/My Code/repo".into(),
+        dest: "/sandbox/My Code/repo".into(),
+        ro: false,
+        cache: false,
+    });
+    assert!(launchable(&open).is_ok());
+    assert!(systemd_mount_props(&open).unwrap().is_empty());
+
+    // The existing .git/config exception is emitted even for an open profile,
+    // so its destination must still pass the same path validation.
+    let mut git_config = spec(Backend::Systemd);
+    git_config.mounts.push(Mount {
+        host: "/repo/.git/config".into(),
+        dest: "/repo/.git/config".into(),
+        ro: true,
+        cache: false,
+    });
+    let props = systemd_mount_props(&git_config).unwrap();
+    assert_eq!(props.len(), 1);
+    assert_eq!(props[0], "ReadOnlyPaths=/repo/.git/config");
+    git_config.mounts.last_mut().unwrap().dest = "/repo/My Code/config".into();
+    assert!(matches!(
+        enter_argv(&git_config, "true"),
+        Err(EnterError::Refused(_))
+    ));
+
+    // Hardened with no sealed HOME emits no property for a read-only mount.
+    let mut hardened_ro = spec(Backend::Systemd);
+    hardened_ro.read_only_root = true;
+    hardened_ro.mounts.push(Mount {
+        host: "/host/Some Dir".into(),
+        dest: "/sandbox/Some Dir".into(),
+        ro: true,
+        cache: false,
+    });
+    assert!(launchable(&hardened_ro).is_ok());
+    assert!(
+        systemd_mount_props(&hardened_ro)
+            .unwrap()
+            .iter()
+            .all(|p| !p.contains("Some Dir"))
+    );
+
+    // A writable destination is emitted as ReadWritePaths and must be refused.
+    let mut emitted = spec(Backend::Systemd);
+    emitted.read_only_root = true;
+    emitted.mounts.push(Mount {
+        host: "/host/repo".into(),
+        dest: "/sandbox/My Code/repo".into(),
+        ro: false,
+        cache: false,
+    });
+    assert!(matches!(
+        enter_argv(&emitted, "true"),
+        Err(EnterError::Refused(_))
+    ));
+
+    // A host path is emitted only for binds beneath a sealed HOME.
+    let mut sealed = spec(Backend::Systemd);
+    sealed.read_only_root = true;
+    sealed.seal_home = Some("/home/test user".into());
+    sealed.mounts.push(Mount {
+        host: "/host/My Code/repo".into(),
+        dest: "/home/test user/repo".into(),
+        ro: false,
+        cache: false,
+    });
+    let refusal = systemd_mount_props(&sealed).unwrap_err();
+    assert!(refusal.contains("/host/My Code/repo"), "{refusal}");
+
+    // The default writable carve-outs are encoded by the same checked path
+    // property builder, including a HOME that systemd would split/expand.
+    let synthetic_carveout = Mount {
+        host: "/host/home/tmp".into(),
+        dest: "/home/user name/tmp".into(),
+        ro: false,
+        cache: false,
+    };
+    let mut carveout_spec = spec(Backend::Systemd);
+    carveout_spec.read_only_root = true;
+    carveout_spec.mounts.clear();
+    assert!(
+        systemd_mount_props_with_carveouts(&carveout_spec, &[synthetic_carveout])
+            .unwrap_err()
+            .contains("user name")
+    );
+    assert!(launchable(&spec(Backend::Systemd)).is_ok());
+}
