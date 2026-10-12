@@ -6,18 +6,16 @@
 //! GraphQL-level errors) answers `NotConfigured` — so the `Ladder` falls
 //! through to [`GithubCli`](thegn_core::github::GithubCli). Transport
 //! failures and timeouts are `Offline` (final: retrying on `gh` would just
-//! repeat the failure), and feed the process-wide circuit breaker +
-//! connectivity holder.
-//!
-//! The seam is sync: each call builds a current-thread runtime and
-//! `block_on`s the shared HTTP request, exactly as the host used to do at its
-//! one call site — so callers stay on blocking threads and never need a
-//! runtime handle.
+//! repeat the failure), and feed a per-token circuit breaker plus the
+//! process-wide connectivity holder. The synchronous seam reuses one
+//! current-thread runtime and one reqwest connection pool; it does not sleep
+//! during backoff.
 
 use crate::issue::http::{TrackerHttpBudget, TrackerHttpClient};
 use serde_json::Value;
-use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
 use thegn_core::forge::checkout::{ForgeCheckoutScope, checkout_scope};
 use thegn_core::forge::model::*;
 use thegn_core::forge::{Forge, ForgeCaps, ForgeError, PrRef, RepoRef};
@@ -33,10 +31,6 @@ fn github_parts(identity: &ForgeRepoIdentity) -> Option<(String, String)> {
         return None;
     }
     Some((owner.to_string(), repo.to_string()))
-}
-
-fn runtime_error(error: impl std::fmt::Display) -> ForgeError {
-    ForgeError::NotConfigured(Cow::Owned(format!("no runtime: {error}")))
 }
 
 /// Source a GitHub token for the native impl. Precedence:
@@ -410,21 +404,21 @@ pub fn parse_owner_repo(url: &str) -> Option<(String, String)> {
     (repository.host == "github.com").then_some((repository.owner, repository.name))
 }
 
-/// Per-operation timeout on GitHub GraphQL calls. A stalled TLS handshake to
-/// api.github.com blocks the refresh task for up to the reqwest default (15s)
-/// with no user feedback; cap it at 10s so the fallback kicks in promptly.
+/// Per-operation timeout on GitHub GraphQL calls. A stalled TLS handshake can
+/// block a refresh task; cap each operation at 10s so fallback kicks in promptly.
 const NATIVE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Open the circuit after this many consecutive transient failures. When open,
-/// we skip the native path entirely (going straight to the CLI fallback) for
-/// `CIRCUIT_OPEN_SECS` seconds so a network partition doesn't spawn a hanging
-/// HTTP task every refresh interval.
+/// Open the circuit after this many consecutive transport or HTTP failures.
+/// When open, skip native HTTP for `CIRCUIT_OPEN_SECS` and use the CLI fallback.
 const CIRCUIT_OPEN_AFTER: u32 = 3;
 const CIRCUIT_OPEN_SECS: u64 = 60;
+const MAX_RETRY_AFTER_SECS: u64 = 86_400;
 
-/// Simple half-open circuit breaker shared across all `GithubNative` calls
-/// (process-global; the native layer is cheap to construct).
-static CIRCUIT: std::sync::OnceLock<GhCircuit> = std::sync::OnceLock::new();
+/// One bounded circuit state per GitHub token, shared across native instances.
+const MAX_CIRCUITS: usize = 64;
+static CIRCUITS: OnceLock<Mutex<HashMap<u64, Arc<GhCircuit>>>> = OnceLock::new();
+static HTTP_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+static HTTP_RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
 
 struct GhCircuit {
     failures: std::sync::atomic::AtomicU32,
@@ -475,10 +469,86 @@ impl GhCircuit {
             );
         }
     }
+
+    fn record_backoff(&self, delay: std::time::Duration) {
+        self.failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut guard) = self.open_until.lock() {
+            *guard = Some(std::time::Instant::now() + delay);
+        }
+        thegn_core::connectivity::report_success();
+    }
+
+    fn record_http_failure(&self) {
+        let failures = self
+            .failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if failures >= CIRCUIT_OPEN_AFTER {
+            if let Ok(mut guard) = self.open_until.lock() {
+                *guard = Some(
+                    std::time::Instant::now() + std::time::Duration::from_secs(CIRCUIT_OPEN_SECS),
+                );
+            }
+        }
+        // An HTTP error is still evidence that GitHub is reachable.
+        thegn_core::connectivity::report_success();
+    }
 }
 
-fn circuit() -> &'static GhCircuit {
-    CIRCUIT.get_or_init(GhCircuit::new)
+fn circuit_for(token: &str) -> Arc<GhCircuit> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    "api.github.com".hash(&mut hasher);
+    token.hash(&mut hasher);
+    let key = hasher.finish();
+    let circuits = CIRCUITS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut circuits = circuits.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(circuit) = circuits.get(&key) {
+        return Arc::clone(circuit);
+    }
+    if circuits.len() >= MAX_CIRCUITS {
+        if let Some(evicted) = circuits.keys().next().copied() {
+            circuits.remove(&evicted);
+        }
+    }
+    let circuit = Arc::new(GhCircuit::new());
+    circuits.insert(key, Arc::clone(&circuit));
+    circuit
+}
+
+fn shared_http_client() -> Result<&'static reqwest::Client, ForgeError> {
+    HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
+                .no_zstd()
+                .connect_timeout(crate::issue::http::CONNECT_TIMEOUT)
+                .read_timeout(crate::issue::http::READ_IDLE_TIMEOUT)
+                .timeout(NATIVE_REQUEST_TIMEOUT)
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| {
+            ForgeError::NotConfigured(format!("GitHub HTTP client build failed: {error}").into())
+        })
+}
+
+fn shared_http_runtime() -> Result<&'static tokio::runtime::Runtime, ForgeError> {
+    HTTP_RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| {
+            ForgeError::NotConfigured(format!("GitHub runtime build failed: {error}").into())
+        })
 }
 
 /// GitHub GraphQL for `pr_status` / `pr_list`; see the module doc.
@@ -513,11 +583,6 @@ impl GithubNative {
                 "native layer is local-only".into(),
             ));
         }
-        if circuit().is_open() {
-            return Err(ForgeError::NotConfigured(
-                "circuit open after repeated failures".into(),
-            ));
-        }
         let Some((owner, repo)) = self.owner_repo(loc) else {
             return Err(ForgeError::NotConfigured(
                 "origin is not a public GitHub remote".into(),
@@ -526,6 +591,9 @@ impl GithubNative {
         let Some(token) = token() else {
             return Err(ForgeError::NotConfigured("no GitHub token".into()));
         };
+        if circuit_for(&token).is_open() {
+            return Err(ForgeError::NotConfigured("GitHub backoff active".into()));
+        }
         Ok((token, owner, repo))
     }
 
@@ -539,11 +607,6 @@ impl GithubNative {
                 "native layer is local-only".into(),
             ));
         }
-        if circuit().is_open() {
-            return Err(ForgeError::NotConfigured(
-                "circuit open after repeated failures".into(),
-            ));
-        }
         let Some((origin_owner, origin_repo)) = self.owner_repo(loc) else {
             return Err(ForgeError::NotConfigured(
                 "origin is not a public GitHub remote".into(),
@@ -552,6 +615,9 @@ impl GithubNative {
         let Some(token) = token() else {
             return Err(ForgeError::NotConfigured("no GitHub token".into()));
         };
+        if circuit_for(&token).is_open() {
+            return Err(ForgeError::NotConfigured("GitHub backoff active".into()));
+        }
         let scope = checkout_scope(loc)?;
         let Some((scope_origin_owner, scope_origin_repo)) = github_parts(&scope.origin) else {
             return Err(ForgeError::NotConfigured(
@@ -585,19 +651,16 @@ impl GithubNative {
 
     /// One GraphQL round trip under the shared HTTP budget and 10-second deadline.
     fn graphql(&self, token: String, body: Value, what: &'static str) -> Result<Value, ForgeError> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(runtime_error)?;
-        let client = TrackerHttpClient::new_with_operation_timeout(
+        let client = TrackerHttpClient::with_client(
             "github",
             "https://api.github.com/",
             format!("Bearer {token}"),
             TrackerHttpBudget::process(),
             NATIVE_REQUEST_TIMEOUT,
+            shared_http_client()?.clone(),
         )
         .map_err(|_| ForgeError::NotConfigured("GitHub HTTP client build failed".into()))?;
-        rt.block_on(graphql_request(&client, &body, what, circuit()))
+        shared_http_runtime()?.block_on(graphql_request(&client, &body, what, &circuit_for(&token)))
     }
 }
 
@@ -610,6 +673,9 @@ async fn graphql_request(
     use crate::issue::IssueError;
     use reqwest::Method;
 
+    if health.is_open() {
+        return Err(ForgeError::RateLimited);
+    }
     let mut operation = client.operation();
     let envelope = match operation.json_envelope(Method::POST, "graphql", body).await {
         Ok(envelope) => envelope,
@@ -626,6 +692,45 @@ async fn graphql_request(
         }
     };
     let code = envelope.status.as_u16();
+    if !envelope.status.is_success() {
+        let body_message = serde_json::from_slice::<Value>(&envelope.body)
+            .ok()
+            .and_then(|response| {
+                response
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        let rate_limited = code == 429
+            || (code == 403
+                && (body_message
+                    .as_deref()
+                    .is_some_and(|message| message.to_ascii_lowercase().contains("rate limit"))
+                    || envelope
+                        .headers
+                        .get("x-ratelimit-remaining")
+                        .is_some_and(|value| value.as_bytes() == b"0")));
+        let error = match code {
+            401 => ForgeError::NotAuthenticated,
+            403 if rate_limited => ForgeError::RateLimited,
+            403 => ForgeError::NotAuthenticated,
+            429 => ForgeError::RateLimited,
+            _ => {
+                let message = body_message.as_deref().unwrap_or("unknown error");
+                ForgeError::Other(format!("GitHub API HTTP {code}: {message}"))
+            }
+        };
+        if matches!(code, 401 | 403 | 429) {
+            if let Some(delay) = retry_delay(&envelope.headers) {
+                health.record_backoff(delay);
+            } else {
+                health.record_http_failure();
+            }
+        }
+        tracing::warn!(target: "thegn::forge", op = what, error = %error,
+            "GitHub API returned an error status");
+        return Err(error);
+    }
     let response: Value = match serde_json::from_slice(&envelope.body) {
         Ok(response) => response,
         Err(_) => {
@@ -639,22 +744,6 @@ async fn graphql_request(
             return Err(error);
         }
     };
-    if !envelope.status.is_success() {
-        let message = response
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown error");
-        let error = match code {
-            429 => ForgeError::RateLimited,
-            403 if message.to_ascii_lowercase().contains("rate limit") => ForgeError::RateLimited,
-            401 | 403 => ForgeError::NotAuthenticated,
-            _ => ForgeError::Other(format!("GitHub API HTTP {code}: {message}")),
-        };
-        health.record_success();
-        tracing::warn!(target: "thegn::forge", op = what, error = %error,
-            "GitHub API returned an error status");
-        return Err(error);
-    }
     if response
         .get("errors")
         .and_then(Value::as_array)
@@ -668,6 +757,39 @@ async fn graphql_request(
     }
     health.record_success();
     Ok(response)
+}
+
+fn retry_delay(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let retry_after = headers.get(reqwest::header::RETRY_AFTER).and_then(|value| {
+        let value = value.to_str().ok()?.trim();
+        if let Ok(seconds) = value.parse::<u64>() {
+            return Some(std::time::Duration::from_secs(seconds));
+        }
+        let retry_at = chrono::DateTime::parse_from_rfc2822(value)
+            .ok()?
+            .timestamp();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        Some(std::time::Duration::from_secs(
+            retry_at.saturating_sub(now).max(0) as u64,
+        ))
+    });
+    let reset = headers
+        .get("x-ratelimit-reset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|epoch| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|now| std::time::Duration::from_secs(epoch.saturating_sub(now.as_secs())))
+        })
+        .filter(|delay| !delay.is_zero());
+    retry_after
+        .or(reset)
+        .map(|delay| delay.min(std::time::Duration::from_secs(MAX_RETRY_AFTER_SECS)))
 }
 
 impl Probe for GithubNative {

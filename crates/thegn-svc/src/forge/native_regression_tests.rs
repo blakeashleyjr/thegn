@@ -1,5 +1,4 @@
 use super::*;
-use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -67,21 +66,53 @@ fn client_with_content_type(
     .unwrap()
 }
 
+fn client_with_header(
+    status: u16,
+    body: &str,
+    header: (&'static str, &'static str),
+) -> TrackerHttpClient {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::http::{HeaderName, HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::any;
+
+    let body = body.to_owned();
+    let app = Router::new().fallback(any(move |_: Request| {
+        let body = body.clone();
+        async move {
+            let mut response =
+                (StatusCode::from_u16(status).unwrap(), Body::from(body)).into_response();
+            response.headers_mut().insert(
+                HeaderName::from_static(header.0),
+                HeaderValue::from_static(header.1),
+            );
+            response
+        }
+    }));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    TrackerHttpClient::new_with_operation_timeout(
+        "github-test",
+        &format!("http://{address}"),
+        "Bearer fixture".into(),
+        Arc::new(TrackerHttpBudget::with_permits(8)),
+        Duration::from_secs(2),
+    )
+    .unwrap()
+}
+
 pub(super) fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-}
-
-#[test]
-fn runtime_failure_keeps_dynamic_message_in_owned_not_configured_payload() {
-    let error = runtime_error("fixture runtime failure");
-    let ForgeError::NotConfigured(message) = error else {
-        panic!("runtime failure was not classified as not configured");
-    };
-    assert!(matches!(&message, Cow::Owned(_)));
-    assert_eq!(message, "no runtime: fixture runtime failure");
 }
 
 #[test]
@@ -219,7 +250,14 @@ fn typed_http_answers_are_not_global_network_failures() {
             .unwrap_err();
             assert_eq!(error, expected);
             assert!(!error.falls_through());
-            assert_eq!(health.failures.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                health.failures.load(Ordering::Relaxed),
+                if matches!(status, 401 | 403 | 429) {
+                    1
+                } else {
+                    0
+                }
+            );
         }
 
         // GitHub error responses remain classifiable from their status and
@@ -240,8 +278,75 @@ fn typed_http_answers_are_not_global_network_failures() {
             .unwrap_err();
             assert_eq!(error, expected);
             assert!(!error.falls_through());
-            assert_eq!(health.failures.load(Ordering::Relaxed), 0);
+            assert_eq!(health.failures.load(Ordering::Relaxed), 1);
         }
+    });
+}
+
+#[test]
+fn non_json_403_is_classified_and_retry_after_suppresses_the_next_call() {
+    let rt = runtime();
+    rt.block_on(async {
+        let client = client_with_header(403, "<html>denied</html>", ("retry-after", "30"));
+        let health = GhCircuit::new();
+        let body = serde_json::json!({"query":"fixture"});
+
+        assert_eq!(
+            graphql_request(&client, &body, "fixture", &health).await,
+            Err(ForgeError::NotAuthenticated)
+        );
+        assert!(health.is_open());
+        assert_eq!(
+            graphql_request(&client, &body, "fixture", &health).await,
+            Err(ForgeError::RateLimited)
+        );
+        assert_eq!(health.failures.load(Ordering::Relaxed), 1);
+    });
+}
+
+#[test]
+fn rate_limit_retry_headers_set_backoff_and_200_remains_successful() {
+    let rt = runtime();
+    rt.block_on(async {
+        let health = GhCircuit::new();
+        let body = serde_json::json!({"query":"fixture"});
+        let error = graphql_request(
+            &client_with_header(429, "slow down", ("retry-after", "45")),
+            &body,
+            "fixture",
+            &health,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, ForgeError::RateLimited);
+        assert!(health.is_open());
+        assert_eq!(
+            retry_delay(&reqwest::header::HeaderMap::from_iter([(
+                reqwest::header::HeaderName::from_static("x-ratelimit-reset"),
+                reqwest::header::HeaderValue::from_str(
+                    &(std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        + 120)
+                        .to_string(),
+                )
+                .unwrap(),
+            )]))
+            .unwrap()
+            .as_secs()
+                >= 119
+        );
+
+        let success = graphql_request(
+            &client(200, r#"{"data":{"ok":true}}"#),
+            &body,
+            "fixture",
+            &GhCircuit::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(success, serde_json::json!({"data":{"ok":true}}));
     });
 }
 
