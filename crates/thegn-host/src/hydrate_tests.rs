@@ -58,6 +58,59 @@ fn glyph_row(
 }
 
 #[test]
+fn glyph_partition_keeps_suspended_cache_skips_uncached_and_scans_active() {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    let now = Instant::now();
+    let suspended = "/repo/suspended".to_string();
+    let absent = "/repo/absent".to_string();
+    let active = "/repo/active".to_string();
+    let cached_row = glyph_row(true, 2, 1, Some("feature"), "/repo", 3, 1, Some((8, 2)));
+    let mut cache = HashMap::new();
+    cache.insert(suspended.clone(), (cached_row.clone(), now));
+    cache.insert(
+        active.clone(),
+        (
+            cached_row.clone(),
+            now.checked_sub(Duration::from_secs(5)).unwrap(),
+        ),
+    );
+    let mut may_scan = HashMap::new();
+    may_scan.insert(suspended.clone(), false);
+    may_scan.insert(absent.clone(), false);
+    may_scan.insert(active.clone(), true);
+
+    let (to_scan, reused, prior) = partition_glyph_paths(
+        &[suspended.clone(), absent, active.clone()],
+        &cache,
+        &may_scan,
+        GlyphPartitionConfig {
+            active_path: Some(&active),
+            gate_remote_scans: true,
+            now,
+            ttl: Duration::from_secs(60),
+            active_floor: Duration::from_secs(1),
+        },
+    );
+    assert_eq!(to_scan, vec![active.clone()], "active path live-scans");
+    assert_eq!(reused, vec![(suspended, cached_row.clone())]);
+    assert_eq!(prior.get(&active), Some(&cached_row));
+}
+
+#[test]
+fn glyph_location_lookup_failure_falls_back_to_local_scan_policy() {
+    let path = "/repo/local";
+    let on_lookup_error = may_live_scan_for_location(path, Err("database unavailable"), false);
+    let on_local_miss = may_live_scan_for_location(path, Ok::<Option<String>, String>(None), false);
+    assert!(
+        on_lookup_error,
+        "a DB error must retain local live scanning"
+    );
+    assert_eq!(on_lookup_error, on_local_miss);
+}
+
+#[test]
 fn pr_clean_decision_only_acts_on_definitive_states() {
     // Both policies enabled: cleaning is still gated on a DEFINITIVE state.
     let cfg = thegn_core::config::DiskConfig {
@@ -790,20 +843,13 @@ fn count_error_lines_counts_only_errors() {
 fn update_log_error_total_is_incremental_and_resets_on_rotation() {
     // A real file exercised through the incremental scanner: the running total
     // must fold in only the appended errors, and reset when the file shrinks.
-    // The global state is process-wide, so this test drives it end to end.
-    let dir = std::env::temp_dir().join(format!(
-        "thegn-logscan-{}-{}",
-        std::process::id(),
-        now_secs()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("thegn.log");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("thegn.log");
+    let state = std::sync::Mutex::new((0, 0));
 
-    // Baseline: reset global state to a known point by pointing at an empty
-    // file first (FromStart with 0 bytes → total 0).
     std::fs::write(&path, b"").unwrap();
     let len0 = std::fs::metadata(&path).unwrap().len();
-    let base = update_log_error_total(&path, len0);
+    let base = update_log_error_total_in(&state, &path, len0);
 
     // Append two ERRORs.
     let a = "2026-06-05T12:00:01  ERROR thegn::a  one\n\
@@ -811,11 +857,11 @@ fn update_log_error_total_is_incremental_and_resets_on_rotation() {
                  2026-06-05T12:00:03  ERROR thegn::a  two\n";
     std::fs::write(&path, a.as_bytes()).unwrap();
     let len1 = std::fs::metadata(&path).unwrap().len();
-    let t1 = update_log_error_total(&path, len1);
+    let t1 = update_log_error_total_in(&state, &path, len1);
     assert_eq!(t1, base + 2, "both appended errors counted");
 
     // Idle pass (no growth): total unchanged, and no re-scan of old bytes.
-    let t_idle = update_log_error_total(&path, len1);
+    let t_idle = update_log_error_total_in(&state, &path, len1);
     assert_eq!(t_idle, t1);
 
     // Append one more ERROR — only the suffix should be scanned, adding 1.
@@ -823,28 +869,70 @@ fn update_log_error_total_is_incremental_and_resets_on_rotation() {
     full.push_str("2026-06-05T12:00:04  ERROR thegn::a  three\n");
     std::fs::write(&path, full.as_bytes()).unwrap();
     let len2 = std::fs::metadata(&path).unwrap().len();
-    let t2 = update_log_error_total(&path, len2);
+    let t2 = update_log_error_total_in(&state, &path, len2);
     assert_eq!(t2, t1 + 1, "only the appended error is added");
 
     // Rotation: file shrinks to a single ERROR → total resets to that count.
     let rotated = "2026-06-05T13:00:00  ERROR thegn::a  fresh\n";
     std::fs::write(&path, rotated.as_bytes()).unwrap();
     let len3 = std::fs::metadata(&path).unwrap().len();
-    let t3 = update_log_error_total(&path, len3);
+    let t3 = update_log_error_total_in(&state, &path, len3);
     assert_eq!(t3, 1, "rotation resets the running total");
+}
 
-    let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+#[test]
+fn log_scan_read_failure_keeps_offset_for_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("thegn.log");
+    let state = std::sync::Mutex::new((0, 0));
+    assert_eq!(update_log_error_total_in(&state, &path, 40), 0);
+    assert_eq!(*state.lock().unwrap(), (0, 0));
+
+    let content = "2026-06-05T12:00:01  ERROR thegn::a  one\n";
+    std::fs::write(&path, content).unwrap();
+    assert_eq!(
+        update_log_error_total_in(&state, &path, content.len() as u64),
+        1,
+        "the error remains countable after the failed read"
+    );
+}
+
+#[test]
+fn log_scan_retains_partial_error_record_until_newline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("thegn.log");
+    let state = std::sync::Mutex::new((0, 0));
+    let first = "2026-06-05T12:00:01  ERROR thegn::a  one\n2026-06-05T12:00:02  ERR";
+    std::fs::write(&path, first).unwrap();
+    assert_eq!(
+        update_log_error_total_in(&state, &path, first.len() as u64),
+        1
+    );
+    assert_eq!(
+        state.lock().unwrap().0,
+        "2026-06-05T12:00:01  ERROR thegn::a  one\n".len() as u64
+    );
+
+    let full = format!("{first}OR thegn::a  two\n");
+    std::fs::write(&path, &full).unwrap();
+    assert_eq!(
+        update_log_error_total_in(&state, &path, full.len() as u64),
+        2
+    );
+}
+
+#[test]
+fn log_scan_commit_rejects_a_stale_snapshot() {
+    let state = std::sync::Mutex::new((10, 2));
+    *state.lock().unwrap() = (20, 3);
+    assert!(!commit_log_scan(&state, (10, 2), (30, 4)));
+    assert_eq!(*state.lock().unwrap(), (20, 3));
 }
 
 #[test]
 fn read_log_tail_lines_is_bounded_and_snaps_to_line() {
-    let dir = std::env::temp_dir().join(format!(
-        "thegn-logtail-{}-{}",
-        std::process::id(),
-        now_secs()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("thegn.log");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("thegn.log");
 
     // Build a file larger than the tail window so the read must be bounded.
     let mut content = String::new();
@@ -867,8 +955,6 @@ fn read_log_tail_lines_is_bounded_and_snaps_to_line() {
     assert_eq!(lines.last().unwrap().message, "line 1999");
     // Every parsed row is well-formed (no partial first line).
     assert!(lines.iter().all(|l| l.message.starts_with("line ")));
-
-    let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -1331,19 +1417,97 @@ fn branch_fetch_needed_open_follows_ttl_warm_only_cold_miss() {
     let stale = Some(ttl + Duration::from_secs(1));
 
     // Nothing wanted → never fetch, regardless of cache state.
-    assert!(!branch_fetch_needed(false, true, None, ttl));
-    assert!(!branch_fetch_needed(false, false, None, ttl));
+    assert!(!branch_fetch_needed(false, true, None, ttl, None));
+    assert!(!branch_fetch_needed(false, false, None, ttl, None));
 
     // Open section: TTL refresh — cold or stale fetches, fresh skips.
-    assert!(branch_fetch_needed(true, true, None, ttl));
-    assert!(branch_fetch_needed(true, true, stale, ttl));
-    assert!(!branch_fetch_needed(true, true, fresh, ttl));
+    assert!(branch_fetch_needed(true, true, None, ttl, None));
+    assert!(branch_fetch_needed(true, true, stale, ttl, None));
+    assert!(!branch_fetch_needed(true, true, fresh, ttl, None));
 
     // Warm-only: cold miss ONLY — a cached list is reused even when stale, so the
     // repo-global `branches_full` subprocess never runs on the ticker.
-    assert!(branch_fetch_needed(true, false, None, ttl));
-    assert!(!branch_fetch_needed(true, false, stale, ttl));
-    assert!(!branch_fetch_needed(true, false, fresh, ttl));
+    assert!(branch_fetch_needed(true, false, None, ttl, None));
+    assert!(!branch_fetch_needed(true, false, stale, ttl, None));
+    assert!(!branch_fetch_needed(true, false, fresh, ttl, None));
+}
+
+#[test]
+fn branch_fetch_failure_backoff_suppresses_warm_and_open_refreshes() {
+    use std::time::Duration;
+
+    let ttl = crate::branch_cache::BRANCH_CACHE_TTL;
+    let inside_backoff = ttl - Duration::from_millis(1);
+    assert!(!branch_fetch_needed(
+        true,
+        false,
+        None,
+        ttl,
+        Some(inside_backoff)
+    ));
+    assert!(!branch_fetch_needed(
+        true,
+        true,
+        Some(ttl),
+        ttl,
+        Some(inside_backoff)
+    ));
+    assert!(branch_fetch_needed(true, false, None, ttl, Some(ttl)));
+    assert!(branch_fetch_needed(true, true, Some(ttl), ttl, Some(ttl)));
+}
+
+fn test_branch(name: &str) -> thegn_core::gitrefs::BranchInfo {
+    thegn_core::gitrefs::BranchInfo {
+        name: name.into(),
+        is_head: true,
+        upstream: Some("origin/main".into()),
+        ahead: 0,
+        behind: 0,
+        upstream_gone: false,
+        sha: String::new(),
+        date: 0,
+        subject: "test branch".into(),
+    }
+}
+
+#[test]
+fn failed_branch_fetch_preserves_cached_observation() {
+    let good = vec![test_branch("main")];
+    let branches =
+        apply_branch_refresh(None, true, Some(Err("failure".into())), Some(good.clone()));
+    assert_eq!(branches, good);
+
+    let branches = apply_branch_refresh(None, true, Some(Err("failure".into())), None);
+    assert!(branches.is_empty(), "cold failure has no fabricated data");
+
+    let fresh = vec![test_branch("feature")];
+    let branches = apply_branch_refresh(None, true, Some(Ok(fresh.clone())), None);
+    assert_eq!(branches, fresh);
+}
+
+#[test]
+fn failed_branch_fetch_does_not_poison_shared_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let good = vec![test_branch("main")];
+    crate::branch_cache::put(root, good.clone());
+    let branches = apply_branch_refresh(
+        Some(root),
+        true,
+        Some(Err("malformed branch row".into())),
+        crate::branch_cache::get(root).map(|(branches, _)| branches),
+    );
+    assert_eq!(branches, good);
+    assert!(branch_failure_age(root, std::time::Instant::now()).is_some());
+    let (cached, _) = crate::branch_cache::get(root).expect("good cache entry survives failure");
+    assert_eq!(cached, good);
+
+    let fresh = vec![test_branch("feature")];
+    let branches = apply_branch_refresh(Some(root), true, Some(Ok(fresh.clone())), None);
+    assert_eq!(branches, fresh);
+    assert!(branch_failure_age(root, std::time::Instant::now()).is_none());
+    let (cached, _) = crate::branch_cache::get(root).expect("successful refresh updates cache");
+    assert_eq!(cached, fresh);
 }
 
 #[test]
