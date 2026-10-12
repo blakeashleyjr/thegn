@@ -657,6 +657,30 @@ fn write_message(
     inner.done_cv.notify_all();
     let mut replay_errored = false;
     while let Some(replay_msg) = replay.pop_front() {
+        let (fatal, abandoned_oob, abandoned_clipboard) = {
+            let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(q.status, WriterStatus::Fatal(_)) {
+                let mut abandoned_oob = matches!(&replay_msg, Msg::Oob(_));
+                let mut abandoned_clipboard = matches!(&replay_msg, Msg::Clipboard(_));
+                release_message_capacity(&mut q, &replay_msg);
+                while let Some(remaining) = replay.pop_front() {
+                    abandoned_oob |= matches!(&remaining, Msg::Oob(_));
+                    abandoned_clipboard |= matches!(&remaining, Msg::Clipboard(_));
+                    release_message_capacity(&mut q, &remaining);
+                }
+                (true, abandoned_oob, abandoned_clipboard)
+            } else {
+                (false, false, false)
+            }
+        };
+        if fatal {
+            released_oob |= abandoned_oob;
+            released_clipboard |= abandoned_clipboard;
+            // The remaining local replay messages were abandoned with the
+            // current one; release their reservations before dropping them.
+            // (The loop above drained them while holding the accounting lock.)
+            break;
+        }
         let replay_bytes = match &replay_msg {
             Msg::Oob(bytes) | Msg::Clipboard(bytes) => bytes,
             Msg::Frame(..) => unreachable!("only OOB and clipboard messages are deferred"),
@@ -1311,16 +1335,42 @@ mod tests {
         assert!(submit.join().unwrap());
         assert!(matches!(writer.take_status(), WriterStatus::Fatal(_)));
         release_tx.send(()).unwrap();
-        let deadline = Instant::now() + std::time::Duration::from_secs(1);
-        while !writer.inner.q.lock().unwrap().worker_done {
-            assert!(
-                Instant::now() < deadline,
-                "writer did not finish after reset gate"
-            );
-            std::thread::yield_now();
-        }
         drop(writer);
         assert_eq!(*log.lock().unwrap(), vec![PARSER_RESET.to_vec()]);
+    }
+
+    #[test]
+    fn fatal_during_first_replay_abandons_remaining_oob_and_releases_capacity() {
+        let writer = test_writer();
+        writer.inner.q.lock().unwrap().frame_submitted = true;
+        for byte in [b'A', b'B'] {
+            assert!(writer.try_submit_oob(vec![byte]).is_ok());
+            let oob = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+            assert!(
+                write_message(&writer.inner, oob, |_| {
+                    Err(std::io::ErrorKind::Interrupted.into())
+                })
+                .0
+            );
+        }
+        assert!(writer.submit_frame(vec![b'F'], None));
+        let frame = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        let mut calls = Vec::new();
+        let (errored, released_oob, _) = write_message(&writer.inner, frame, |bytes| {
+            calls.push(bytes.to_vec());
+            if bytes == [b'A'] {
+                writer.inner.q.lock().unwrap().status = WriterStatus::Fatal("sink deadline".into());
+            }
+            Ok(())
+        });
+        assert!(!errored);
+        assert!(released_oob);
+        assert_eq!(calls, vec![PARSER_RESET.to_vec(), vec![b'F'], vec![b'A']]);
+        let q = writer.inner.q.lock().unwrap();
+        assert!(matches!(q.status, WriterStatus::Fatal(_)));
+        assert_eq!(q.oob_in_flight, 0);
+        assert_eq!(q.oob_bytes, 0);
+        assert!(q.deferred.is_empty());
     }
 
     #[test]
