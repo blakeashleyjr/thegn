@@ -239,8 +239,8 @@ impl MediaBackend for MprisZbus {
         Box::pin(async move {
             let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
             let props = self.player_props(&bus).await?;
-            let cur = f64_of(&props, "Volume").unwrap_or(0.5);
-            let next = (cur + delta).clamp(0.0, 1.0);
+            // A missing Volume must not be replaced by a guess and written back.
+            let next = stepped_volume(f64_of(&props, "Volume"), delta)?;
             self.player_set(&bus, "Volume", Value::F64(next)).await
         })
     }
@@ -451,14 +451,20 @@ impl MediaBackend for MprisZbus {
             let proxy = self.props_proxy(&bus).await?;
             let iface = InterfaceName::try_from(ROOT_IFACE)
                 .map_err(|e| MediaError::Backend(e.to_string()))?;
-            let cur = proxy
-                .get(iface.clone(), "Fullscreen")
-                .await
-                .ok()
-                .and_then(|v| bool::try_from(v).ok())
-                .unwrap_or(false);
+            // A failed or unparseable read must not be turned into `false` and
+            // written back as `true`.
+            let read = proxy.get(iface.clone(), "Fullscreen").await.map_err(|e| {
+                let message = format!("read Fullscreen: {e}");
+                if is_missing_property_error(&e) {
+                    MediaError::Unsupported(message)
+                } else {
+                    MediaError::Backend(message)
+                }
+            })?;
+            let cur = Result::ok(bool::try_from(read));
+            let next = toggled_fullscreen(cur)?;
             proxy
-                .set(iface, "Fullscreen", Value::Bool(!cur))
+                .set(iface, "Fullscreen", Value::Bool(next))
                 .await
                 .map_err(|e| MediaError::Backend(e.to_string()))
         })
@@ -523,6 +529,34 @@ impl MediaWatch for MprisWatch {
 /// The tail after the `org.mpris.MediaPlayer2.` prefix (the player's short name).
 fn tail(bus: &str) -> &str {
     bus.strip_prefix(MPRIS_PREFIX).unwrap_or(bus)
+}
+
+/// Next volume for a relative step. A missing or non-finite read is an error:
+/// never synthesize a base value and write it.
+fn stepped_volume(current: Option<f64>, delta: f64) -> Result<f64, MediaError> {
+    let cur = current.filter(|value| value.is_finite()).ok_or_else(|| {
+        MediaError::Unsupported("player did not report a finite Volume".to_string())
+    })?;
+    Ok((cur + delta).clamp(0.0, 1.0))
+}
+
+/// Inverse of the current fullscreen state; an unreadable state is an error
+/// rather than an assumed `false`.
+fn toggled_fullscreen(current: Option<bool>) -> Result<bool, MediaError> {
+    current
+        .map(|c| !c)
+        .ok_or_else(|| MediaError::Backend("Fullscreen state unreadable".to_string()))
+}
+
+fn is_missing_property_error(error: &zbus::fdo::Error) -> bool {
+    match error {
+        zbus::fdo::Error::UnknownProperty(_) | zbus::fdo::Error::InvalidArgs(_) => true,
+        zbus::fdo::Error::ZBus(zbus::Error::MethodError(name, _, _)) => matches!(
+            name.as_str(),
+            "org.freedesktop.DBus.Error.UnknownProperty" | "org.freedesktop.DBus.Error.InvalidArgs"
+        ),
+        _ => false,
+    }
 }
 
 /// Pick which player to show from the present `candidates` (each a sorted
@@ -706,8 +740,8 @@ fn parse_state(player: &str, props: &HashMap<String, OwnedValue>) -> MediaState 
         shuffle: bool_of(props, "Shuffle"),
         loop_mode: str_of(props, "LoopStatus").map(|s| LoopMode::from_mpris(&s)),
         volume: f64_of(props, "Volume").map(|v| (v * 100.0).round().clamp(0.0, 100.0) as u8),
-        can_go_next: bool_of(props, "CanGoNext").unwrap_or(true),
-        can_go_previous: bool_of(props, "CanGoPrevious").unwrap_or(true),
+        can_go_next: bool_of(props, "CanGoNext").unwrap_or(false),
+        can_go_previous: bool_of(props, "CanGoPrevious").unwrap_or(false),
         art_url: str_of(&meta, "mpris:artUrl").filter(|s| !s.is_empty()),
         kind: MediaKind::from_hints(player, mime.as_deref(), url.as_deref()),
         can_seek: bool_of(props, "CanSeek").unwrap_or(false),
@@ -724,6 +758,31 @@ mod tests {
         assert_eq!(micros_of(&Value::U64(u64::MAX)), None);
         assert_eq!(micros_of(&Value::U64(i64::MAX as u64)), Some(i64::MAX));
         assert_eq!(micros_of(&Value::U64(30_000_000)), Some(30_000_000));
+    }
+
+    #[test]
+    fn volume_step_requires_a_read_value() {
+        assert!(stepped_volume(None, 0.1).is_err());
+        assert!(stepped_volume(Some(f64::NAN), 0.1).is_err());
+        assert!(stepped_volume(Some(f64::INFINITY), 0.1).is_err());
+        assert_eq!(stepped_volume(Some(0.5), 0.1).unwrap(), 0.6);
+        assert_eq!(stepped_volume(Some(0.95), 0.1).unwrap(), 1.0);
+        assert_eq!(stepped_volume(Some(0.05), -0.1).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn fullscreen_toggle_requires_a_read_value() {
+        assert!(toggled_fullscreen(None).is_err());
+        assert!(toggled_fullscreen(Some(false)).unwrap());
+        assert!(!toggled_fullscreen(Some(true)).unwrap());
+    }
+
+    #[test]
+    fn missing_capability_props_default_to_unsupported() {
+        let s = parse_state("p", &HashMap::new());
+        assert!(!s.can_go_next);
+        assert!(!s.can_go_previous);
+        assert!(!s.can_seek);
     }
 
     #[test]
