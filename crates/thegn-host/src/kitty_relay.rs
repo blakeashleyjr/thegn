@@ -1396,7 +1396,10 @@ mod tests {
         assert!(relay.feed(&apc("Ga=d;")).is_empty());
 
         assert!(relay.feed(&apc("Ga=T,i=2,m=1,f=24,s=1,v=1;AQ")).is_empty());
-        assert!(relay.feed(&apc("Ga=d;")).is_empty());
+        assert_eq!(
+            relay.feed(&apc("Ga=d;")),
+            [Piece::GfxOther(apc("Ga=d,d=I,i=2147418113,q=2;"))]
+        );
         assert_eq!(relay.feed(&apc("Gm=0;ID")), [Piece::Rejected]);
     }
 
