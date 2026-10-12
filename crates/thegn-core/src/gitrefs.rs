@@ -215,7 +215,7 @@ pub fn parse_stashes(out: &str) -> anyhow::Result<Vec<StashEntry>> {
         .enumerate()
         .map(|(line_no, line)| {
             let malformed = || anyhow::anyhow!("malformed stash row {}", line_no + 1);
-            let mut it = line.splitn(4, '\u{1f}');
+            let mut it = line.split('\u{1f}');
             let selector = it.next().ok_or_else(malformed)?;
             let index = selector
                 .strip_prefix("stash@{")
@@ -662,6 +662,41 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn malformed_gitref_fields_are_rejected() {
+        let sha = "a".repeat(40);
+        let cases = [
+            ("track missing bracket", parse_track("[ahead 1").map(|_| ())),
+            ("track missing count", parse_track("[ahead]").map(|_| ())),
+            ("track extra data", parse_track("[ahead 1 x]").map(|_| ())),
+            (
+                "track duplicate field",
+                parse_track("[ahead 1, ahead 2]").map(|_| ()),
+            ),
+            (
+                "track unknown field",
+                parse_track("[sideways 1]").map(|_| ()),
+            ),
+            ("track empty field", parse_track("[]").map(|_| ())),
+            (
+                "tag unknown object type",
+                parse_tags(&format!("v1{US}{sha}{US}unknown")).map(|_| ()),
+            ),
+            (
+                "tag empty name",
+                parse_tags(&format!("{US}{sha}{US}commit")).map(|_| ()),
+            ),
+            (
+                "stash extra field",
+                parse_stashes(&format!("stash@{{0}}{US}{sha}{US}1{US}message{US}extra"))
+                    .map(|_| ()),
+            ),
+        ];
+        for (case, result) in cases {
+            assert!(result.is_err(), "{case} should be rejected");
+        }
     }
 
     // --- parse_tags ---

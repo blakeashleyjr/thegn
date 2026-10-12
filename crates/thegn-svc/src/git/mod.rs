@@ -1020,6 +1020,11 @@ fn unquote_c_path(path: &str) -> Option<Vec<u8>> {
     let mut i = 1;
     while i + 1 < bytes.len() {
         if bytes[i] != b'\\' {
+            // A quote before the final byte means this is not one complete
+            // C-quoted token (for example Git's quoted rename spelling).
+            if bytes[i] == b'"' {
+                return None;
+            }
             decoded.push(bytes[i]);
             i += 1;
             continue;
@@ -1318,11 +1323,9 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
         _ => None,
     };
     {
-        let cache = base_cache().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((base, at, stored)) = cache.get(&key)
-            && base_entry_valid(&print, stored, at.elapsed())
-        {
-            return base.clone();
+        let mut cache = base_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(base) = cached_glyph_base(&mut cache, &key, &print, std::time::Instant::now()) {
+            return base;
         }
     }
     {
@@ -1488,6 +1491,25 @@ fn record_base_probe_failure(key: RepoExecutionIdentity) {
 
 fn base_probe_backoff_active(age: std::time::Duration) -> bool {
     age < GLYPH_BASE_FAILURE_BACKOFF
+}
+
+fn cached_glyph_base(
+    cache: &mut std::collections::HashMap<
+        RepoExecutionIdentity,
+        (Option<String>, std::time::Instant, BaseKey),
+    >,
+    key: &RepoExecutionIdentity,
+    print: &BaseKey,
+    now: std::time::Instant,
+) -> Option<Option<String>> {
+    let (base, at, stored) = cache.get_mut(key)?;
+    if !base_entry_valid(print, stored, now.saturating_duration_since(*at)) {
+        return None;
+    }
+    if matches!((print, stored), (Some(current), Some(previous)) if current == previous) {
+        *at = now;
+    }
+    Some(base.clone())
 }
 
 /// What a cached default-base resolution was validated by when stored.
@@ -2746,6 +2768,30 @@ mod tests {
     }
 
     #[test]
+    fn glyph_base_print_hit_refreshes_idle_expiry() {
+        let now = std::time::Instant::now();
+        let print = Some(thegn_core::git_memo::base_refs_print(&repo_root()).unwrap());
+        let key = RepoExecutionIdentity("print-used-recently".into());
+        let mut bases = std::collections::HashMap::from([(
+            key.clone(),
+            (
+                Some("main".into()),
+                now.checked_sub(GLYPH_BASE_PRINT_IDLE_TTL + std::time::Duration::from_secs(1))
+                    .unwrap(),
+                print.clone(),
+            ),
+        )]);
+        assert_eq!(
+            cached_glyph_base(&mut bases, &key, &print, now),
+            Some(Some("main".into()))
+        );
+
+        let mut failures = std::collections::HashMap::new();
+        purge_expired_glyph_bases(&mut bases, &mut failures, now);
+        assert!(bases.contains_key(&key));
+    }
+
+    #[test]
     fn execution_identity_separates_placements_without_retaining_authority_secrets() {
         let a = GitLoc::provider(
             vec!["sprite".into(), "exec".into(), "-s".into(), "alpha".into()],
@@ -3158,6 +3204,10 @@ mod tests {
         assert_eq!(unquote_c_path(r#""caf\303\251""#).unwrap(), b"caf\xc3\xa9");
         assert_eq!(decode_numstat_path(r#""caf\303\251.md""#), "café.md");
         assert_eq!(decode_numstat_path(r#""bad\377""#), r#""bad\377""#);
+        assert_eq!(
+            decode_numstat_path(r#""caf\303\251" => "x""#),
+            r#""caf\303\251" => "x""#
+        );
         assert!(unquote_c_path(r#""bad\q""#).is_none());
     }
 
