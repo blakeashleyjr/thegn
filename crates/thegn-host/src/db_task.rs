@@ -15,12 +15,20 @@
 //! thread (`run::persist_session_layout` captures rows on the loop and queues
 //! the transaction): main.rs flushes the queue on every clean exit, and the
 //! cold workspace-switch path calls [`flush`] before resurrecting a session
-//! whose rows may still be queued — only a SIGKILL can drop a layout write.
+//! whose rows may still be queued. The bounded-queue overflow policy can also
+//! drop a newly submitted layout write; critical-write failure surfacing is a
+//! separate follow-up.
 //!
 //! The thread blocks on `recv()` (no polling, no timer, no `TerminalWaker`
 //! pulse), so it adds zero idle wakes — the 0%-idle contract is untouched.
+//!
+//! The FIFO is bounded. Overflow drops new best-effort writes and preserves
+//! the order of writes already queued; [`dropped_writes`] exposes the count
+//! for a later UI surfacing slice. Replaceable writes retain one pending job
+//! per key, regardless of how often a caller updates that key.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -30,12 +38,16 @@ use thegn_core::db::Db;
 /// A unit of best-effort work run against the writer's connection.
 type Job = Box<dyn FnOnce(&Db) + Send>;
 
+/// The production cap bounds memory while allowing ordinary bursts to drain.
+#[cfg(not(test))]
+const MAX_QUEUED_JOBS: usize = 4096;
+#[cfg(test)]
+const MAX_QUEUED_JOBS: usize = 8;
+
 enum Msg {
     Run(Job),
     RunLatest {
         key: String,
-        generation: u64,
-        job: Job,
     },
     /// A barrier: the writer acks once every earlier `Run` has completed.
     Flush(SyncSender<()>),
@@ -43,61 +55,58 @@ enum Msg {
 
 struct Writer {
     tx: Sender<Msg>,
-    generations: Arc<Mutex<HashMap<String, u64>>>,
+    state: Arc<QueueState>,
+}
+
+#[derive(Default)]
+struct QueueState {
+    latest: Mutex<HashMap<String, Job>>,
+    depth: AtomicUsize,
+    dropped: AtomicU64,
+    overflow_warned: AtomicBool,
 }
 
 fn writer() -> &'static Writer {
     static W: OnceLock<Writer> = OnceLock::new();
-    W.get_or_init(|| {
-        let generations = Arc::new(Mutex::new(HashMap::new()));
-        Writer {
-            tx: spawn_with_generations(Db::open, Arc::clone(&generations)),
-            generations,
-        }
-    })
+    W.get_or_init(|| spawn_writer(Db::open))
 }
 
 /// Spawn the writer thread with a connection opener and return its send handle.
 /// Split from [`writer`] so tests can drive [`run`] with an isolated DB.
-fn spawn_with_generations(
-    open: impl Fn() -> anyhow::Result<Db> + Send + 'static,
-    generations: Arc<Mutex<HashMap<String, u64>>>,
-) -> Sender<Msg> {
+fn spawn_writer(open: impl Fn() -> anyhow::Result<Db> + Send + 'static) -> Writer {
     let (tx, rx) = channel::<Msg>();
+    let state = Arc::new(QueueState::default());
+    let worker_state = Arc::clone(&state);
     std::thread::Builder::new()
         .name("thegn-db-writer".into())
-        .spawn(move || run(rx, open, generations))
+        .spawn(move || run(rx, open, worker_state))
         .expect("spawn db-writer thread");
-    tx
+    Writer { tx, state }
 }
 
 /// Drain jobs in FIFO order against a lazily-opened connection. A failed open is
 /// logged once and its job dropped (best-effort semantics); the next job retries
 /// the open, so a transient failure self-heals. Returns when the channel closes.
-fn run(
-    rx: Receiver<Msg>,
-    open: impl Fn() -> anyhow::Result<Db>,
-    generations: Arc<Mutex<HashMap<String, u64>>>,
-) {
+fn run(rx: Receiver<Msg>, open: impl Fn() -> anyhow::Result<Db>, state: Arc<QueueState>) {
     let mut db: Option<Db> = None;
     let mut warned = false;
     while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Run(job) => {
+                dequeue(&state);
                 run_job(&mut db, &mut warned, &open, job);
             }
-            Msg::RunLatest {
-                key,
-                generation,
-                job,
-            } => {
-                let is_latest = generations
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(&key)
-                    .copied()
-                    == Some(generation);
-                if is_latest {
+            Msg::RunLatest { key } => {
+                let job = {
+                    let mut latest = state
+                        .latest
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let job = latest.remove(&key);
+                    dequeue(&state);
+                    job
+                };
+                if let Some(job) = job {
                     run_job(&mut db, &mut warned, &open, job);
                 }
             }
@@ -107,6 +116,55 @@ fn run(
             }
         }
     }
+}
+
+fn reserve(state: &QueueState) -> bool {
+    let mut depth = state.depth.load(Ordering::Relaxed);
+    loop {
+        if depth >= MAX_QUEUED_JOBS {
+            return false;
+        }
+        match state.depth.compare_exchange_weak(
+            depth,
+            depth + 1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => depth = actual,
+        }
+    }
+}
+
+fn dequeue(state: &QueueState) {
+    let previous = state.depth.fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(previous > 0, "dequeued a job without a queue reservation");
+    if previous.saturating_sub(1) <= MAX_QUEUED_JOBS / 2 {
+        state.overflow_warned.store(false, Ordering::Release);
+    }
+}
+
+fn note_drop(state: &QueueState) {
+    state.dropped.fetch_add(1, Ordering::Relaxed);
+    if !state.overflow_warned.swap(true, Ordering::AcqRel) {
+        tracing::warn!(
+            dropped = state.dropped.load(Ordering::Relaxed),
+            "db-writer queue full; dropping new best-effort write"
+        );
+    }
+}
+
+fn enqueue(writer: &Writer, job: impl FnOnce(&Db) + Send + 'static) -> bool {
+    if !reserve(&writer.state) {
+        note_drop(&writer.state);
+        return false;
+    }
+    if let Err(error) = writer.tx.send(Msg::Run(Box::new(job))) {
+        dequeue(&writer.state);
+        tracing::debug!(%error, "db-writer stopped before write could be queued");
+        return false;
+    }
+    true
 }
 
 fn run_job(
@@ -138,35 +196,49 @@ fn run_job(
 /// Queue a best-effort DB write to run on the writer thread, in send order.
 /// Fire-and-forget: returns immediately and never blocks the caller, so it is
 /// safe to call from the event loop. Failure to enqueue (writer gone) is
-/// silently ignored — the DB is a cache.
+/// logged at debug level if the writer has stopped; a full queue increments
+/// the drop counter and emits one warning per overflow episode.
 pub(crate) fn persist(job: impl FnOnce(&Db) + Send + 'static) {
-    let _ = writer().tx.send(Msg::Run(Box::new(job))); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+    enqueue(writer(), job);
 }
 
 /// Queue a replaceable write. A queued write is skipped if a newer value for
-/// the same key arrived before the writer began it.
+/// the same key arrived before the writer began it. Replacements keep the FIFO
+/// position of the key's first pending enqueue, so the newest value can run
+/// ahead of `persist` jobs queued after that first `persist_latest` call.
 pub(crate) fn persist_latest(key: String, job: impl FnOnce(&Db) + Send + 'static) {
-    let writer = writer();
-    enqueue_latest(&writer.tx, &writer.generations, key, Box::new(job));
+    enqueue_latest(writer(), key, job);
 }
 
-fn enqueue_latest(
-    tx: &Sender<Msg>,
-    generations: &Mutex<HashMap<String, u64>>,
-    key: String,
-    job: Job,
-) {
-    // Keys must come from a small fixed set so this generation map stays bounded.
-    let mut generations = generations
+fn enqueue_latest(writer: &Writer, key: String, job: impl FnOnce(&Db) + Send + 'static) -> bool {
+    // Keys must come from a small fixed set so the pending-slot map stays bounded.
+    let mut latest = writer
+        .state
+        .latest
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let generation = generations.get(&key).copied().unwrap_or(0).wrapping_add(1);
-    generations.insert(key.clone(), generation);
-    let _ = tx.send(Msg::RunLatest {
-        key,
-        generation,
-        job,
-    }); // best-effort: send: the consumer may be gone; the DB is a cache
+    if let Some(slot) = latest.get_mut(&key) {
+        *slot = Box::new(job);
+        return true;
+    }
+    if !reserve(&writer.state) {
+        note_drop(&writer.state);
+        return false;
+    }
+    latest.insert(key.clone(), Box::new(job));
+    if let Err(error) = writer.tx.send(Msg::RunLatest { key: key.clone() }) {
+        latest.remove(&key);
+        dequeue(&writer.state);
+        tracing::debug!(%error, "db-writer stopped before replaceable write could be queued");
+        return false;
+    }
+    true
+}
+
+/// Number of best-effort writes rejected because the bounded queue was full.
+#[allow(dead_code)] // Exposed for the follow-up UI surfacing slice.
+pub(crate) fn dropped_writes() -> u64 {
+    writer().state.dropped.load(Ordering::Relaxed)
 }
 
 /// Block until every previously-queued write has run, or `timeout` elapses
@@ -185,47 +257,32 @@ mod tests {
     use super::*;
     use thegn_core::store::WorkspaceStore;
 
-    type TempWriter = (
-        Sender<Msg>,
-        std::path::PathBuf,
-        Arc<Mutex<HashMap<String, u64>>>,
-    );
+    type TempWriter = (Writer, std::path::PathBuf, tempfile::TempDir);
 
-    /// A writer over a throwaway on-disk DB, plus a flush helper bound to its
-    /// own channel (not the process-global one). The dir is unique per CALL
-    /// (pid + counter), not just per process — the module's tests run as
-    /// parallel threads of one process, and a shared dir would let one test's
-    /// `remove_dir_all` delete another's live DB mid-test.
+    /// A writer over a private throwaway on-disk DB.
     fn temp_writer() -> TempWriter {
-        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("tg-dbtask-{}-{seq}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("t.db");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
         let p = path.clone();
-        let generations = Arc::new(Mutex::new(HashMap::new()));
-        let tx = spawn_with_generations(move || Db::open_at(&p), Arc::clone(&generations));
-        (tx, path, generations)
+        (spawn_writer(move || Db::open_at(&p)), path, dir)
     }
 
-    fn barrier(tx: &Sender<Msg>) {
+    fn barrier(writer: &Writer) {
         let (ack_tx, ack_rx) = sync_channel(0);
-        tx.send(Msg::Flush(ack_tx)).unwrap();
+        writer.tx.send(Msg::Flush(ack_tx)).unwrap();
         ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 
     #[test]
     fn writes_run_in_fifo_order_last_wins() {
-        let (tx, path, _) = temp_writer();
+        let (writer, path, _dir) = temp_writer();
         for v in ["first", "second", "third"] {
             let v = v.to_string();
-            tx.send(Msg::Run(Box::new(move |db| {
+            assert!(enqueue(&writer, move |db| {
                 let _ = db.set_ui_state("t", "k", &v); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-            })))
-            .unwrap();
+            }));
         }
-        barrier(&tx);
+        barrier(&writer);
         // Reopen independently: the last queued write wins (FIFO).
         let db = Db::open_at(&path).unwrap();
         assert_eq!(db.get_ui_state("t", "k").unwrap().as_deref(), Some("third"));
@@ -233,12 +290,11 @@ mod tests {
 
     #[test]
     fn flush_barrier_waits_for_queued_work() {
-        let (tx, path, _) = temp_writer();
-        tx.send(Msg::Run(Box::new(|db| {
+        let (writer, path, _dir) = temp_writer();
+        assert!(enqueue(&writer, |db| {
             let _ = db.set_ui_state("t", "flushed", "yes"); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-        })))
-        .unwrap();
-        barrier(&tx); // must not return before the write above ran
+        }));
+        barrier(&writer); // must not return before the write above ran
         let db = Db::open_at(&path).unwrap();
         assert_eq!(
             db.get_ui_state("t", "flushed").unwrap().as_deref(),
@@ -248,32 +304,30 @@ mod tests {
 
     #[test]
     fn persist_latest_coalesces_queued_values_by_key() {
-        let (tx, path, generations) = temp_writer();
+        let (writer, path, _dir) = temp_writer();
         let (started_tx, started_rx) = channel();
         let (release_tx, release_rx) = channel();
-        tx.send(Msg::Run(Box::new(move |_db| {
+        assert!(enqueue(&writer, move |_db| {
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
-        })))
-        .unwrap();
+        }));
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
         let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for value in ["first", "second", "third"] {
             let value = value.to_string();
             let ran = Arc::clone(&ran);
-            enqueue_latest(
-                &tx,
-                &generations,
+            assert!(enqueue_latest(
+                &writer,
                 "replaceable".to_string(),
-                Box::new(move |db| {
+                move |db| {
                     ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     db.set_ui_state("t", "latest", &value).unwrap();
-                }),
-            );
+                }
+            ));
         }
         release_tx.send(()).unwrap();
-        barrier(&tx);
+        barrier(&writer);
 
         assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
         let db = Db::open_at(&path).unwrap();
@@ -285,24 +339,22 @@ mod tests {
 
     #[test]
     fn lock_contention_does_not_block_enqueue_and_recovers_after_commit() {
-        let (tx, path, _) = temp_writer();
-        tx.send(Msg::Run(Box::new(|db| {
+        let (writer, path, _dir) = temp_writer();
+        assert!(enqueue(&writer, |db| {
             db.set_ui_state("t", "ready", "yes").unwrap();
-        })))
-        .unwrap();
-        barrier(&tx);
+        }));
+        barrier(&writer);
         let lock = rusqlite::Connection::open(&path).unwrap();
         lock.execute_batch("BEGIN IMMEDIATE").unwrap();
 
         let started = std::time::Instant::now();
-        tx.send(Msg::Run(Box::new(|db| {
+        assert!(enqueue(&writer, |db| {
             db.set_ui_state("t", "locked", "written").unwrap();
-        })))
-        .unwrap();
+        }));
         assert!(started.elapsed() < Duration::from_millis(50));
 
         let (ack_tx, ack_rx) = sync_channel(0);
-        tx.send(Msg::Flush(ack_tx)).unwrap();
+        writer.tx.send(Msg::Flush(ack_tx)).unwrap();
         assert!(ack_rx.recv_timeout(Duration::from_millis(100)).is_err());
 
         lock.execute_batch("COMMIT").unwrap();
@@ -318,16 +370,105 @@ mod tests {
     fn open_failure_is_survived_without_panic() {
         // An opener that always fails: jobs are dropped, the thread stays alive,
         // and the flush barrier still acks.
-        let tx = spawn_with_generations(
-            || anyhow::bail!("no db for you"),
-            Arc::new(Mutex::new(HashMap::new())),
-        );
-        tx.send(Msg::Run(Box::new(|_db| {
+        let writer = spawn_writer(|| anyhow::bail!("no db for you"));
+        assert!(enqueue(&writer, |_db| {
             unreachable!("open never succeeds")
-        })))
-        .unwrap();
+        }));
         let (ack_tx, ack_rx) = sync_channel(0);
-        tx.send(Msg::Flush(ack_tx)).unwrap();
+        writer.tx.send(Msg::Flush(ack_tx)).unwrap();
         assert!(ack_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+    }
+
+    #[test]
+    fn bounded_queue_drops_overflow_without_blocking() {
+        let (writer, _path, _dir) = temp_writer();
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        assert!(enqueue(&writer, move |_db| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let mut accepted = 0;
+        let mut dropped = 0;
+        for _ in 0..(MAX_QUEUED_JOBS + 5) {
+            let ran = Arc::clone(&ran);
+            let started = std::time::Instant::now();
+            if enqueue(&writer, move |_db| {
+                ran.fetch_add(1, Ordering::SeqCst);
+            }) {
+                accepted += 1;
+            } else {
+                dropped += 1;
+            }
+            assert!(started.elapsed() < Duration::from_millis(50));
+        }
+        assert_eq!(accepted, MAX_QUEUED_JOBS);
+        assert_eq!(dropped, 5);
+        assert_eq!(writer.state.dropped.load(Ordering::Relaxed), 5);
+
+        release_tx.send(()).unwrap();
+        barrier(&writer);
+        assert_eq!(ran.load(Ordering::SeqCst), MAX_QUEUED_JOBS);
+        assert_eq!(writer.state.depth.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn overflow_warning_rearms_after_queue_drains_below_half() {
+        let state = QueueState::default();
+        for _ in 0..MAX_QUEUED_JOBS {
+            assert!(reserve(&state));
+        }
+
+        note_drop(&state);
+        dequeue(&state);
+        assert!(state.overflow_warned.load(Ordering::Acquire));
+        note_drop(&state);
+        assert_eq!(state.dropped.load(Ordering::Relaxed), 2);
+        assert!(state.overflow_warned.load(Ordering::Acquire));
+
+        while state.depth.load(Ordering::Relaxed) > MAX_QUEUED_JOBS / 2 {
+            dequeue(&state);
+        }
+        assert!(!state.overflow_warned.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn latest_slot_holds_one_job_per_key_under_contention() {
+        let (writer, path, _dir) = temp_writer();
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        assert!(enqueue(&writer, move |_db| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        for value in 0..10_000 {
+            let ran = Arc::clone(&ran);
+            assert!(enqueue_latest(
+                &writer,
+                "replaceable".to_string(),
+                move |db| {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    db.set_ui_state("t", "latest-many", &value.to_string())
+                        .unwrap();
+                }
+            ));
+        }
+        assert_eq!(writer.state.latest.lock().unwrap().len(), 1);
+        assert!(writer.state.depth.load(Ordering::Relaxed) <= 1);
+
+        release_tx.send(()).unwrap();
+        barrier(&writer);
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        let db = Db::open_at(&path).unwrap();
+        assert_eq!(
+            db.get_ui_state("t", "latest-many").unwrap().as_deref(),
+            Some("9999")
+        );
     }
 }
