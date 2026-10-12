@@ -8,9 +8,10 @@
 //!
 //! Seeking to a time T reconstructs the pane's grid by spinning up a **fresh**
 //! [`AlacrittyEmulator`] and re-feeding the retained byte slice up to T — the
-//! same bytes through the same parser, so the grid is exact within the retained
-//! window when chunks remain whole (no [`PaneEmulator`] trait changes, no grid
-//! serialization). The ring is bounded by both a logical byte and duration
+//! same bytes through the same parser. Exact reconstruction is only claimed
+//! while retained history has not crossed an eviction or chunk-truncation
+//! boundary; otherwise the reconstructed state is explicitly marked partial.
+//! The ring is bounded by both a logical byte and duration
 //! budget; eviction drops oldest events and any keyframe whose byte range no
 //! longer exists. The retained front is a fidelity boundary: replay does not
 //! preserve parser/grid context from before it, including when a chunk is cut.
@@ -101,6 +102,8 @@ pub struct Recording {
     /// updated when a `Resize` event is evicted so it stays the true baseline.
     base_rows: u16,
     base_cols: u16,
+    /// Sticky notice that output or preceding parser/grid context was dropped.
+    history_truncated: bool,
 }
 
 /// Immutable, capped input owned by one replay-search job.
@@ -110,12 +113,15 @@ pub(crate) struct SearchSnapshot {
     base_cols: u16,
     max_events: usize,
     incomplete: bool,
+    history_truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SearchResult {
     Match(u64),
+    PartialMatch(u64),
     NoMatch,
+    PartialNoMatch,
     Incomplete,
     Cancelled,
 }
@@ -197,7 +203,11 @@ impl SearchSnapshot {
                         best_before = Some(at_ms);
                     }
                 } else if at_ms > from_ms {
-                    return SearchResult::Match(at_ms);
+                    return if self.history_truncated {
+                        SearchResult::PartialMatch(at_ms)
+                    } else {
+                        SearchResult::Match(at_ms)
+                    };
                 }
             }
         }
@@ -206,7 +216,24 @@ impl SearchSnapshot {
         } else if self.incomplete {
             SearchResult::Incomplete
         } else if reverse {
-            best_before.map_or(SearchResult::NoMatch, SearchResult::Match)
+            best_before.map_or_else(
+                || {
+                    if self.history_truncated {
+                        SearchResult::PartialNoMatch
+                    } else {
+                        SearchResult::NoMatch
+                    }
+                },
+                |at| {
+                    if self.history_truncated {
+                        SearchResult::PartialMatch(at)
+                    } else {
+                        SearchResult::Match(at)
+                    }
+                },
+            )
+        } else if self.history_truncated {
+            SearchResult::PartialNoMatch
         } else {
             SearchResult::NoMatch
         }
@@ -236,6 +263,7 @@ impl Recording {
             last_keyframe_ms: 0,
             base_rows: rows.max(1),
             base_cols: cols.max(1),
+            history_truncated: false,
         }
     }
 
@@ -267,6 +295,7 @@ impl Recording {
             base_cols: self.base_cols,
             max_events,
             incomplete,
+            history_truncated: self.history_truncated,
         }
     }
 
@@ -304,6 +333,11 @@ impl Recording {
             .max_bytes
             .saturating_sub(overhead)
             .min(usize::MAX as u64) as usize;
+        let retained_len = bytes.len().min(max_payload);
+        if retained_len < bytes.len() {
+            self.history_truncated = true;
+            self.revision = self.revision.wrapping_add(1);
+        }
         let bytes = &bytes[bytes.len().saturating_sub(max_payload)..];
         if bytes.is_empty() {
             return;
@@ -411,6 +445,7 @@ impl Recording {
                 .saturating_sub((removed as u64).saturating_mul(REPLAY_ENTRY_OVERHEAD_BYTES));
         }
         if evicted_any {
+            self.history_truncated = true;
             self.revision = self.revision.wrapping_add(1);
         }
     }
@@ -430,8 +465,15 @@ impl Recording {
         self.events.is_empty()
     }
 
+    /// Whether replay begins after dropped output or lost parser/grid context.
+    /// Once true, this remains true for the lifetime of the recording.
+    pub fn history_truncated(&self) -> bool {
+        self.history_truncated
+    }
+
     /// Reconstruct the pane's grid at time `at_ms` into a fresh emulator by
-    /// re-feeding the retained byte slice. Exact within the retained window.
+    /// re-feeding the retained byte slice. Exactness is unavailable after
+    /// [`history_truncated`](Self::history_truncated) becomes true.
     ///
     /// Production callers want the cursor too and use
     /// [`reconstruct_with_cursor`](Self::reconstruct_with_cursor); this
@@ -580,6 +622,12 @@ impl Recording {
         let mut header = Header::new(self.base_cols, self.base_rows);
         header.term = Some("thegn".to_string());
         let mut writer = CastWriter::new(out, &header)?;
+        if self.history_truncated {
+            writer.marker(
+                0.0,
+                "Replay history is partial; earlier parser or grid state is unavailable",
+            )?;
+        }
         let mut carry = Utf8Carry::default();
         for ev in &self.events {
             let t = (ev.at_ms.saturating_sub(base)) as f64 / 1000.0;
@@ -725,6 +773,57 @@ mod tests {
         assert_eq!(grid_text(&replayed), grid_text(&reference));
         assert!(grid_text(&replayed).contains("hello world"));
         assert!(grid_text(&replayed).contains("second line"));
+    }
+
+    #[test]
+    fn eviction_and_oversized_chunks_mark_history_partial() {
+        let epoch = Instant::now();
+        let mut evicted = Recording::from_config(&replay_cfg(140), 24, 80);
+        assert!(!evicted.history_truncated());
+        evicted.push_bytes(b"\x1b[2;3H  ", epoch);
+        evicted.push_bytes(b"X", epoch + Duration::from_millis(1));
+        assert!(evicted.history_truncated());
+        assert!(evicted.search_snapshot().history_truncated);
+
+        let mut oversized = Recording::from_config(&replay_cfg(140), 24, 80);
+        oversized.push_bytes(&[b'x'; 200], epoch);
+        assert!(oversized.history_truncated());
+
+        let mut retained = Recording::from_config(&replay_cfg(256), 24, 80);
+        retained.push_bytes(b"small", epoch);
+        assert!(!retained.history_truncated());
+    }
+
+    #[test]
+    fn search_results_disclose_a_partial_retained_window() {
+        let epoch = Instant::now();
+        let mut rec = Recording::from_config(&replay_cfg(140), 24, 80);
+        rec.push_bytes(b"discarded", epoch);
+        rec.push_bytes(b"needle", epoch + Duration::from_millis(1));
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            rec.search_snapshot().search("needle", 0, false, &cancelled),
+            SearchResult::PartialMatch(1)
+        );
+    }
+
+    #[test]
+    fn truncated_cast_has_partial_marker_and_fresh_cast_does_not() {
+        let epoch = Instant::now();
+        let mut truncated = Recording::from_config(&replay_cfg(140), 24, 80);
+        truncated.push_bytes(b"\x1b[2;3H  ", epoch);
+        truncated.push_bytes(b"X", epoch + Duration::from_millis(1));
+        let mut cast = Vec::new();
+        truncated.export_cast(&mut cast).unwrap();
+        let cast = String::from_utf8(cast).unwrap();
+        assert!(cast.contains("Replay history is partial"));
+
+        let mut fresh = Recording::from_config(&replay_cfg(256), 24, 80);
+        fresh.push_bytes(b"X", epoch);
+        let mut cast = Vec::new();
+        fresh.export_cast(&mut cast).unwrap();
+        let cast = String::from_utf8(cast).unwrap();
+        assert!(!cast.contains("Replay history is partial"));
     }
 
     #[test]
