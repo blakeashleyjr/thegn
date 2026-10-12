@@ -382,12 +382,16 @@ impl SessionActor {
         // (Kill / mailbox closed) — the latter must actively terminate the PTY
         // child (see below).
         // The activity observer's next deadline, or `None` when the session is
-        // settled. This is the daemon's half of the ~0%-idle contract: a
-        // finished agent arms no timer at all, so a fleet of idle sessions
-        // costs exactly nothing until one of them speaks again.
+        // settled. Recording completion has its own worker wake, so a finished
+        // agent arms no timer at all and a fleet of idle sessions costs nothing
+        // until one of them speaks again.
         let mut next_tick = self.activity_deadline();
 
         let (exit_code, child_exited): (Option<i32>, bool) = loop {
+            let recording_wake = self
+                .recorder
+                .as_ref()
+                .map(|recorder| recorder.completion_wake());
             tokio::select! {
                 ev = pane_rx.recv() => match ev {
                     Some(PaneEvent::Output(_, bytes)) => self.on_output(&bytes),
@@ -397,6 +401,7 @@ impl SessionActor {
                     None => break (None, true), // reader gone ⇒ child already EOF'd
                 },
                 () = sleep_until_opt(next_tick) => self.observe_activity(),
+                () = notified_opt(recording_wake.as_deref()) => {},
                 finished = recording_done_rx.recv() => {
                     if let Some(finished) = finished {
                         self.recording_completed(finished);
@@ -872,23 +877,13 @@ impl SessionActor {
         self.publish_state();
     }
 
-    /// When the observer next wants waking, as a tokio deadline.
+    /// When the activity observer next wants waking, as a tokio deadline.
+    /// Recording completion is signalled separately by its worker.
     fn activity_deadline(&self) -> Option<tokio::time::Instant> {
         let now = tokio::time::Instant::now();
-        let activity = self
-            .activity
+        self.activity
             .next_tick(&self.cfg.activity, unix_now_secs())
-            .map(|secs| now + std::time::Duration::from_secs_f64(secs));
-        let recording = self
-            .recorder
-            .as_ref()
-            .map(|_| now + std::time::Duration::from_millis(250));
-        match (activity, recording) {
-            (Some(activity), Some(recording)) => Some(activity.min(recording)),
-            (Some(activity), None) => Some(activity),
-            (None, Some(recording)) => Some(recording),
-            (None, None) => None,
-        }
+            .map(|secs| now + std::time::Duration::from_secs_f64(secs))
     }
 
     /// Broadcast a state transition. **Edge-triggered**: a working agent
@@ -1286,6 +1281,13 @@ async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
     }
 }
 
+async fn notified_opt(wake: Option<&tokio::sync::Notify>) {
+    match wake {
+        Some(wake) => wake.notified().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 fn unix_now_secs() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1454,6 +1456,13 @@ mod tests {
         db: super::super::service::SharedDb,
     }
 
+    struct BuiltActor {
+        actor: SessionActor,
+        pane_rx: mpsc::Receiver<PaneEvent>,
+        msg_rx: mpsc::Receiver<SessionMsg>,
+        harness: Harness,
+    }
+
     /// Spawn a real PTY session actor running `script` under `/bin/sh -c`.
     fn spawn_actor(script: &str, sub_cap: Option<usize>) -> Harness {
         spawn_actor_as(script, sub_cap, "sh")
@@ -1473,6 +1482,22 @@ mod tests {
         program: &str,
         cfg: Config,
     ) -> Harness {
+        let BuiltActor {
+            actor,
+            pane_rx,
+            msg_rx,
+            harness,
+        } = build_actor_cfg(script, sub_cap, program, cfg);
+        tokio::spawn(actor.run(pane_rx, msg_rx));
+        harness
+    }
+
+    fn build_actor_cfg(
+        script: &str,
+        sub_cap: Option<usize>,
+        program: &str,
+        cfg: Config,
+    ) -> BuiltActor {
         let (pane_tx, pane_rx) = mpsc::channel(256);
         let pty = crate::pane_pty::open_pty(
             0,
@@ -1524,15 +1549,128 @@ mod tests {
         let (msg_tx, msg_rx) = mpsc::channel(16);
         // Subscribe BEFORE the actor can publish anything — see `Harness::feed`.
         let feed = events.subscribe();
-        tokio::spawn(actor.run(pane_rx, msg_rx));
-        Harness {
-            msg_tx,
-            live,
-            idle_rx,
-            tombs,
-            feed,
-            db,
+        BuiltActor {
+            actor,
+            pane_rx,
+            msg_rx,
+            harness: Harness {
+                msg_tx,
+                live,
+                idle_rx,
+                tombs,
+                feed,
+                db,
+            },
         }
+    }
+
+    #[tokio::test]
+    async fn recording_does_not_arm_a_periodic_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.recording.dir = tmp.path().to_string_lossy().into_owned();
+        let BuiltActor {
+            mut actor,
+            pane_rx,
+            msg_rx,
+            mut harness,
+        } = build_actor_cfg("cat", None, "sh", cfg);
+        let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+        actor.recording_done_tx = Some(completed_tx);
+
+        actor
+            .on_record(RecordSpec::Start)
+            .expect("recording starts");
+        assert!(
+            actor.activity_deadline().is_none(),
+            "recording must not add a periodic activity deadline"
+        );
+        actor.on_record(RecordSpec::Stop).expect("recording stops");
+        tokio::time::timeout(std::time::Duration::from_secs(2), completed_rx.recv())
+            .await
+            .expect("recording worker finishes")
+            .expect("recording completion is reported");
+
+        tokio::spawn(actor.run(pane_rx, msg_rx));
+        harness
+            .msg_tx
+            .send(SessionMsg::Kill)
+            .await
+            .expect("actor accepts kill");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(harness.feed.recv().await, Ok(frame) if matches!(frame.as_ref(), EventFrame::SessionExit { session, .. } if session == "s1")) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("actor tears down after test");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn worker_cap_finalizes_a_quiet_session_without_polling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.recording.dir = tmp.path().to_string_lossy().into_owned();
+        cfg.recording.max_bytes = 64;
+        let mut h = spawn_actor_cfg("cat", None, "sh", cfg);
+
+        let (start_tx, start_rx) = oneshot::channel();
+        h.msg_tx
+            .send(SessionMsg::Record {
+                spec: RecordSpec::Start,
+                reply: start_tx,
+            })
+            .await
+            .expect("actor accepts recording start");
+        start_rx
+            .await
+            .expect("actor replies")
+            .expect("recording starts");
+        assert!(
+            h.live
+                .lock()
+                .expect("live metadata lock")
+                .recording
+                .is_some(),
+            "recording must be active before the capped output arrives"
+        );
+
+        h.msg_tx
+            .send(SessionMsg::Stdin([vec![b'x'; 256], vec![b'\n']].concat()))
+            .await
+            .expect("actor accepts stdin");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if h.live
+                    .lock()
+                    .expect("live metadata lock")
+                    .recording
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker cap finalizes the quiet session within 2 seconds");
+
+        h.msg_tx
+            .send(SessionMsg::Kill)
+            .await
+            .expect("actor accepts kill");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(h.feed.recv().await, Ok(frame) if matches!(frame.as_ref(), EventFrame::SessionExit { session, .. } if session == "s1")) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("actor tears down after test");
     }
 
     #[tokio::test(flavor = "multi_thread")]
