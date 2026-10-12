@@ -1098,6 +1098,49 @@ mod tests {
         assert_eq!(got, want, "numstat totals diverged for spec {spec:?}");
     }
 
+    fn assert_backend_rows_match_cli(repo: &TestRepo, spec: &str) {
+        use super::super::{CliGit, GitBackend as _, GitLoc, GixGit};
+
+        let loc = GitLoc::Local(repo.dir.clone());
+        let rows = |mut entries: Vec<DiffEntry>| {
+            entries.sort_by(|left, right| left.path.cmp(&right.path));
+            entries
+                .into_iter()
+                .map(|entry| (entry.path, entry.added, entry.deleted, entry.binary))
+                .collect::<Vec<_>>()
+        };
+        let expected = CliGit.diff_files(&loc, spec).expect("CLI diff rows");
+        let actual = GixGit::new()
+            .diff_files(&loc, spec)
+            .unwrap_or_else(|error| panic!("gix diff {spec}: {error}"));
+        assert_eq!(
+            rows(actual),
+            rows(expected),
+            "GixGit rows diverged from CliGit for {spec:?}"
+        );
+    }
+
+    #[test]
+    fn staged_and_unstaged_edits_to_one_path_match_cli_rows() {
+        let repo = TestRepo::new("nd-staged-plus-unstaged");
+        repo.commit_file("same.txt", "one\ntwo\n", "seed");
+        std::fs::write(repo.dir.join("same.txt"), "one\nstaged\n").unwrap();
+        repo.out(&["add", "same.txt"]);
+        std::fs::write(repo.dir.join("same.txt"), "one\nstaged\nunstaged\n").unwrap();
+
+        assert_backend_rows_match_cli(&repo, "HEAD");
+    }
+
+    #[test]
+    fn intent_to_add_matches_cli_rows() {
+        let repo = TestRepo::new("nd-intent-to-add");
+        repo.commit_file("base.txt", "base\n", "seed");
+        std::fs::write(repo.dir.join("intent.txt"), "new\nfile\n").unwrap();
+        repo.out(&["add", "-N", "intent.txt"]);
+
+        assert_backend_rows_match_cli(&repo, "HEAD");
+    }
+
     #[test]
     fn symmetric_range_matches_the_cli() {
         let repo = TestRepo::new("nd-sym");
