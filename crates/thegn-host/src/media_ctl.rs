@@ -19,6 +19,35 @@ type MediaOpTail = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
 static MEDIA_OP_TAIL: LazyLock<MediaOpTail> = LazyLock::new(|| Arc::new(Mutex::new(None)));
 static MEDIA_OP_PENDING: LazyLock<Arc<AtomicUsize>> =
     LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
+static MEDIA_PICK_IN_FLIGHT: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
+static MEDIA_QUEUE_IN_FLIGHT: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
+static MEDIA_SOURCES_IN_FLIGHT: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
+
+fn replace_in_flight(
+    slot: &Mutex<Option<tokio::task::JoinHandle<()>>>,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let previous = slot
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .replace(handle);
+    if let Some(previous) = previous {
+        previous.abort();
+    }
+}
+
+async fn within_media_budget<F, T>(future: F) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    match tokio::time::timeout(MEDIA_OP_BUDGET, future).await {
+        Ok(value) => Some(value),
+        Err(_) => {
+            tracing::warn!(target: "thegn::media", budget_secs = MEDIA_OP_BUDGET.as_secs(), "media fetch exceeded its time budget");
+            None
+        }
+    }
+}
 
 struct PendingOp(Arc<AtomicUsize>);
 
@@ -166,10 +195,11 @@ fn spawn_media_watch(
     generation: u64,
     tx: tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
     waker: TerminalWaker,
+    previous: Option<tokio::task::JoinHandle<()>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     // Body lives in `media_watch`; it resolves the backend, streams snapshots,
     // self-heals, and respawns on stream end.
-    crate::media_watch::spawn(cfg, generation, tx, waker)
+    crate::media_watch::spawn(cfg, generation, tx, waker, previous)
 }
 
 /// Abort any running watcher and (re)spawn one for `cfg`. Called at startup, on
@@ -182,10 +212,13 @@ pub(crate) fn restart_media_watch(
     waker: &TerminalWaker,
 ) {
     let generation_value = generation.advance();
-    if let Some(h) = handle.take() {
-        h.abort();
-    }
+    let previous = handle.take();
     if !cfg.enabled {
+        *handle = previous.map(|previous| {
+            tokio::spawn(async move {
+                crate::media_watch::abort_and_join(Some(previous)).await;
+            })
+        });
         // No watcher will run, so nothing would ever push the clearing `None`:
         // push it here, or the last ▶ badge / Media section stick for the rest
         // of the session after `[media] enabled = false` (and activating the
@@ -201,7 +234,7 @@ pub(crate) fn restart_media_watch(
         }
         return;
     }
-    *handle = spawn_media_watch(cfg, generation_value, tx.clone(), waker.clone());
+    *handle = spawn_media_watch(cfg, generation_value, tx.clone(), waker.clone(), previous);
 }
 
 /// Fire a transport op off-thread, then push the resulting snapshot so the badge/
@@ -305,18 +338,26 @@ pub(crate) fn spawn_media_playlist(
     waker: TerminalWaker,
 ) {
     let generation = generation.current();
-    tokio::spawn(async move {
-        if let Some(client) = crate::media_secret::client_for(&cfg).await {
-            if let Err(e) = client.activate_playlist(&id).await {
-                tracing::warn!(target: "thegn::media", error = %e, "playlist {id} activation failed");
+    let accepted = chain_op(
+        &MEDIA_OP_TAIL,
+        &MEDIA_OP_PENDING,
+        MAX_PENDING_MEDIA_OPS,
+        async move {
+            if let Some(client) = crate::media_secret::client_for(&cfg).await {
+                if let Err(e) = client.activate_playlist(&id).await {
+                    tracing::warn!(target: "thegn::media", error = %e, "playlist {id} activation failed");
+                }
+                let _ = tx.send(crate::media_watch::MediaSnapshotDelivery {
+                    generation,
+                    snapshot: snapshot_or_log(&client, "playlist").await,
+                }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
-            let _ = tx.send(crate::media_watch::MediaSnapshotDelivery {
-                generation,
-                snapshot: snapshot_or_log(&client, "playlist").await,
-            }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-        }
-    });
+        },
+    );
+    if !accepted {
+        tracing::debug!(target: "thegn::media", "playlist activation dropped because the pending limit was reached");
+    }
 }
 
 /// Fetch the playlist / player list off-thread for the secondary picker.
@@ -326,18 +367,23 @@ pub(crate) fn spawn_media_pick(
     tx: tokio_mpsc::UnboundedSender<MediaPick>,
     waker: TerminalWaker,
 ) {
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let Some(client) = crate::media_secret::client_for(&cfg).await else {
             return;
         };
-        let pick = if players {
-            MediaPick::Players(client.players().await)
-        } else {
-            MediaPick::Playlists(client.playlists().await.unwrap_or_default())
-        };
+        let pick = within_media_budget(async {
+            if players {
+                MediaPick::Players(client.players().await)
+            } else {
+                MediaPick::Playlists(client.playlists().await.unwrap_or_default())
+            }
+        })
+        .await;
+        let Some(pick) = pick else { return };
         let _ = tx.send(pick); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
+    replace_in_flight(&MEDIA_PICK_IN_FLIGHT, handle);
 }
 
 /// Fetch the play queue / up-next list off-thread for the docked Media panel.
@@ -347,20 +393,25 @@ pub(crate) fn spawn_media_queue(
     tx: tokio_mpsc::UnboundedSender<MediaQueueDelivery>,
     waker: TerminalWaker,
 ) {
-    tokio::spawn(async move {
-        let queue = match crate::media_secret::client_for(&cfg).await {
-            Some(client) => match client.queue().await {
-                Ok(queue) => Ok(queue),
-                Err(e) => {
-                    tracing::debug!(target: "thegn::media", error = %e, "media queue fetch failed");
-                    Err(e.to_string())
-                }
-            },
-            None => Err("media provider unavailable".to_string()),
-        };
+    let handle = tokio::spawn(async move {
+        let queue = within_media_budget(async {
+            match crate::media_secret::client_for(&cfg).await {
+                Some(client) => match client.queue().await {
+                    Ok(queue) => Ok(queue),
+                    Err(e) => {
+                        tracing::debug!(target: "thegn::media", error = %e, "media queue fetch failed");
+                        Err(e.to_string())
+                    }
+                },
+                None => Err("media provider unavailable".to_string()),
+            }
+        })
+        .await
+        .unwrap_or_else(|| Err("media queue fetch timed out".to_string()));
         let _ = tx.send(MediaQueueDelivery { request, queue }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
+    replace_in_flight(&MEDIA_QUEUE_IN_FLIGHT, handle);
 }
 
 /// Fetch the provider's source/player list off-loop for the docked panel.
@@ -372,19 +423,25 @@ pub(crate) fn spawn_media_sources(
     tx: tokio_mpsc::UnboundedSender<MediaSourcesDelivery>,
     waker: TerminalWaker,
 ) {
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let Some(client) = crate::media_secret::client_for(&cfg).await else {
             return;
         };
-        let sources = client.players().await;
+        let Some(sources) = within_media_budget(client.players()).await else {
+            return;
+        };
         let _ = tx.send(MediaSourcesDelivery { request, sources });
         let _ = waker.wake();
     });
+    replace_in_flight(&MEDIA_SOURCES_IN_FLIGHT, handle);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MediaPreflightError, chain_op, loop_target, shuffle_target};
+    use super::{
+        MediaPreflightError, chain_op, loop_target, replace_in_flight, shuffle_target,
+        within_media_budget,
+    };
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
     use thegn_core::media::{LoopMode, MediaSnapshot, MediaState};
@@ -501,5 +558,35 @@ mod tests {
         last.await.unwrap();
         second_rx.await.unwrap();
         assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn replacing_a_fetch_slot_aborts_the_previous_task() {
+        struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let slot = Mutex::new(None);
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let old = tokio::spawn(async move {
+            let _guard = DropFlag(task_dropped);
+            std::future::pending::<()>().await;
+        });
+        replace_in_flight(&slot, old);
+        tokio::task::yield_now().await;
+        replace_in_flight(&slot, tokio::spawn(async {}));
+        let current = slot.lock().unwrap().take().unwrap();
+        current.await.unwrap();
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn media_fetch_budget_resolves_pending_work_as_timeout() {
+        let outcome = within_media_budget(std::future::pending::<()>()).await;
+        assert!(outcome.is_none(), "pending provider work must time out");
     }
 }
