@@ -177,7 +177,10 @@ pub fn account_dir(cfg: &Config, db: &Db, provider_id: &str, name: &str) -> Opti
             .map(|(n, d, _)| (n.clone(), d.clone()))
             .collect::<Vec<_>>(),
     );
-    if shared.contains(&name.to_string()) {
+    if shared.contains(name) {
+        crate::msg::warn(&format!(
+            "account '{name}' shares a credential directory with another account; refusing to use it"
+        ));
         return None;
     }
     entries
@@ -515,6 +518,49 @@ mod tests {
                 .iter()
                 .any(|account| { account.name == "first" || account.name == "second" })
         );
+    }
+
+    #[test]
+    fn colliding_config_and_db_accounts_are_refused() {
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.push(Account {
+            name: "cfg".into(),
+            provider: "codex".into(),
+            dir: Some("/shared/creds".into()),
+        });
+        db.put_account("codex", "dbrow", "/shared/creds", true, 1)
+            .unwrap();
+
+        assert_eq!(account_dir(&cfg, &db, "codex", "cfg"), None);
+        assert_eq!(account_dir(&cfg, &db, "codex", "dbrow"), None);
+        let listed = list(&cfg, &db, "codex");
+        assert!(
+            !listed
+                .iter()
+                .any(|account| account.name == "cfg" || account.name == "dbrow")
+        );
+    }
+
+    #[test]
+    fn same_name_config_and_db_records_are_not_a_collision() {
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.push(Account {
+            name: "same".into(),
+            provider: "codex".into(),
+            dir: Some("/shared/creds".into()),
+        });
+        db.put_account("codex", "same", "/shared/creds", true, 1)
+            .unwrap();
+
+        assert_eq!(
+            account_dir(&cfg, &db, "codex", "same"),
+            Some(PathBuf::from("/shared/creds"))
+        );
+        let listed = list(&cfg, &db, "codex");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "same");
     }
 
     /// A live main checkout (`.git` directory) at `dir/<name>`.
