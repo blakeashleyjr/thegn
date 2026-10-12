@@ -2499,6 +2499,7 @@ fn systemd_runtime_dir(value: Option<std::ffi::OsString>) -> Option<std::path::P
 
 /// Build backend argv with an optional injected resolver directory for tests.
 /// Production callers leave it unset and use the host resolver probe.
+#[cfg(test)]
 fn backend_enter_argv_with_resolver_dir(
     spec: &SandboxSpec,
     script: &str,

@@ -53,7 +53,7 @@ pub(crate) fn daemon_socket_usable(cfg: &thegn_core::config::Config) -> bool {
         let legacy = crate::daemon::legacy_socket_state() == crate::daemon::LegacySocketState::Live;
         if legacy {
             thegn_core::msg::warn(
-                "pane daemon disabled: an old daemon is still using the legacy socket; detach its panes and run `thegn daemon stop`. Panes will run in-process until it stops.",
+                "pane daemon disabled: an old daemon is still using the legacy socket; detach its panes, run `thegn daemon stop`, then restart thegn. Panes will run in-process until restart.",
             );
         } else {
             thegn_core::msg::warn(
