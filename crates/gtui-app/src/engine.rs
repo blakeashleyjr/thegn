@@ -456,6 +456,9 @@ impl QueryEngine {
                         }),
                     };
                     if let Some(update) = update {
+                        // Backpressure here also delays command handling while the UI is not
+                        // draining (for example, while this tile is hidden). A queued hide,
+                        // close, or time-range change is handled after capacity returns.
                         if self.frames_tx.send(update).await.is_err() {
                             pending.abort_all();
                             return QueryOutcome::Disconnected;
@@ -708,7 +711,7 @@ mod tests {
 
     #[tokio::test]
     async fn undrained_result_queue_bounds_buffering_and_resumes_progress() {
-        let (cmd, mut updates, queries, _, _) = spawn_counting(6, Duration::from_secs(3600));
+        let (cmd, mut updates, queries, _, _) = spawn_counting(12, Duration::from_secs(3600));
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert!(updates.len() <= RESULT_CHANNEL_CAPACITY);
@@ -717,7 +720,7 @@ mod tests {
             "completed result backpressure allowed too many panel queries to start"
         );
 
-        receive_updates(&mut updates, 6).await;
+        receive_updates(&mut updates, 12).await;
         drop(cmd);
     }
 
