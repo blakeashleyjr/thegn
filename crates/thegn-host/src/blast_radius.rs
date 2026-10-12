@@ -34,6 +34,11 @@ use crate::lsp::LspInner;
 /// sprawling change never balloons the LSP work).
 const MAX_CHANGED_FILES: usize = 50;
 
+type BlastInput = (
+    Vec<ChangedEntity>,
+    std::collections::BTreeMap<String, Vec<CallerRef>>,
+);
+
 /// A cheap, stable content hash for the source-changed skip check.
 fn source_hash(src: &str) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -255,9 +260,8 @@ fn build_graph(root: &Path, lsp: &LspInner, db: &Db) -> Option<bool> {
 fn head_diff_text(loc: &GitLoc) -> Option<String> {
     // Same sanitized flags the semantic footer uses so the patch parses cleanly.
     // off-loop: this runs inside `spawn_graph_build`'s blocking task.
-    #[expect(clippy::disallowed_methods)]
-    let out = loc
-        .git_command(&[
+    let out = crate::bounded_git_probe::capture(
+        loc.git_command(&[
             "-c",
             "diff.noprefix=false",
             "diff",
@@ -266,19 +270,20 @@ fn head_diff_text(loc: &GitLoc) -> Option<String> {
             "--no-renames",
             "-U3",
             "HEAD",
-        ])
-        .output()
-        .ok()?;
-    if out.status.success() {
-        return Some(String::from_utf8_lossy(&out.stdout).trim().to_string());
+        ]),
+        None,
+        "blast-radius diff",
+    );
+    if let Ok(stdout) = out {
+        return Some(String::from_utf8_lossy(&stdout).trim().to_string());
     }
 
-    // off-loop: this runs inside `spawn_graph_build`'s blocking task.
-    #[expect(clippy::disallowed_methods)]
-    let head = loc
-        .git_command(&["rev-parse", "--verify", "-q", "HEAD^{commit}"])
-        .output()
-        .ok()?;
+    let head = crate::bounded_git_probe::capture_capability(
+        loc.git_command(&["rev-parse", "--verify", "-q", "HEAD^{commit}"]),
+        std::time::Duration::from_secs(5),
+        16 * 1024,
+    )
+    .ok()?;
     if head.status.success() {
         None
     } else {
@@ -335,10 +340,7 @@ fn collect_changed_and_callers(
     root: &Path,
     summary: &EntitySummary,
     mut caller_lookup: impl FnMut(&str) -> anyhow::Result<Vec<SemEntityRow>>,
-) -> anyhow::Result<(
-    Vec<ChangedEntity>,
-    std::collections::BTreeMap<String, Vec<CallerRef>>,
-)> {
+) -> anyhow::Result<BlastInput> {
     use std::collections::BTreeMap;
     let root_s = root.to_string_lossy().into_owned();
     let mut changed: Vec<ChangedEntity> = Vec::new();
@@ -535,17 +537,15 @@ mod tests {
     #[test]
     fn head_diff_only_treats_an_unborn_head_as_an_empty_pass() {
         fn git(root: &Path, args: &[&str]) {
-            let output = thegn_core::util::git_cmd(root)
-                .args(args)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            crate::bounded_git_probe::capture(
+                thegn_core::util::git_cmd(root)
+                    .args(args)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_SYSTEM", "/dev/null"),
+                None,
+                "blast-radius test fixture",
+            )
+            .unwrap_or_else(|error| panic!("git {args:?} failed: {error}"));
         }
 
         let unborn = tempfile::tempdir().unwrap();
