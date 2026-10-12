@@ -444,6 +444,37 @@ fn reminders_are_inert_without_configuration() {
 }
 
 #[test]
+fn reminder_cache_query_stays_near_the_default_lead_without_long_event_leads() {
+    let from = chrono::DateTime::from_timestamp_millis(utc_ms(2026, 8, 21, 9, 0)).unwrap();
+    let to = from;
+    let range = reminder_cache_window(from, to, chrono_tz::UTC, 10).unwrap();
+    assert_eq!(range.from, d(2026, 8, 20));
+    assert_eq!(range.to, d(2026, 8, 22));
+    assert!(range.to.signed_duration_since(range.from).num_days() < 28);
+}
+
+#[test]
+fn unsupported_imported_reminder_leads_are_counted_for_host_diagnostics() {
+    let t = TmpDb::new("rem-over-cap");
+    let mut e = event("too-far");
+    e.reminders = vec![thegn_core::calendar::Reminder {
+        minutes_before: thegn_core::calendar::reminders::MAX_LEAD_MINS + 1,
+    }];
+    apply_page(
+        &t.db,
+        "work",
+        "ics",
+        &page(vec![e], vec![], ""),
+        d(2026, 8, 1),
+        d(2026, 8, 31),
+    );
+    let window = reminder_window(0, utc_ms(2026, 8, 21, 8, 59), utc_ms(2026, 8, 21, 9, 1));
+    let due = due_reminders(&t.db, &reminder_cfg(), window).unwrap();
+    assert!(due.reminders.is_empty());
+    assert_eq!(due.unsupported_leads, 1);
+}
+
+#[test]
 fn a_multi_day_event_raises_one_reminder_for_exactly_the_given_window() {
     let t = TmpDb::new("rem-multiday");
     let mut trip = CalEvent::new(

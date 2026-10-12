@@ -594,13 +594,25 @@ pub struct AccountResult {
 impl CalendarRouter {
     /// Every active account, metered against the process-wide pool.
     pub fn from_config(cfg: &CalendarConfig) -> Self {
-        Self::from_config_with_pool(cfg, AdmissionPool::global())
+        Self::from_config_with_zone(cfg, cfg.effective_home_zone())
+    }
+
+    /// Every active account using the already-resolved home zone for this sync.
+    pub fn from_config_with_zone(cfg: &CalendarConfig, zone: thegn_core::calendar::Tz) -> Self {
+        Self::from_config_with_pool_and_zone(cfg, AdmissionPool::global(), zone)
     }
 
     /// Every active account, metered against `pool`.
     pub fn from_config_with_pool(cfg: &CalendarConfig, pool: Arc<AdmissionPool>) -> Self {
-        let admission =
-            AccountAdmission::new(cfg.admission_budget(), pool, cfg.effective_home_zone());
+        Self::from_config_with_pool_and_zone(cfg, pool, cfg.effective_home_zone())
+    }
+
+    fn from_config_with_pool_and_zone(
+        cfg: &CalendarConfig,
+        pool: Arc<AdmissionPool>,
+        zone: thegn_core::calendar::Tz,
+    ) -> Self {
+        let admission = AccountAdmission::new(cfg.admission_budget(), pool, zone);
         let accounts = cfg
             .active_accounts()
             .into_iter()

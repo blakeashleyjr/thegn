@@ -711,7 +711,7 @@ async fn caldav_redirect_never_replays_a_sync_token_body_for_any_status() {
             .list_events(
                 window().0,
                 window().1,
-                &caldav::scope_token(&[], "sync-secret"),
+                &caldav::scope_token(&[], "UTC", "sync-secret"),
             )
             .await
             .unwrap_err();
@@ -945,11 +945,14 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
             .list_events(
                 window().0,
                 window().1,
-                &caldav::scope_token(&[], "expired-token"),
+                &caldav::scope_token(&[], "UTC", "expired-token"),
             )
             .await
             .unwrap();
-        assert_eq!(page.sync_token(), caldav::scope_token(&[], "new-token"));
+        assert_eq!(
+            page.sync_token(),
+            caldav::scope_token(&[], "UTC", "new-token")
+        );
         // Expired-token recovery is an authoritative snapshot even though the
         // server handed back a fresh token (THE-452).
         assert_eq!(page.mode(), PageMode::Snapshot);
@@ -1007,7 +1010,7 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
             .list_events(
                 window().0,
                 window().1,
-                &caldav::scope_token(&[], "expired-token"),
+                &caldav::scope_token(&[], "UTC", "expired-token"),
             )
             .await
             .unwrap_err();
@@ -1228,7 +1231,7 @@ async fn declared_oversized_error_body_is_refused_without_waiting_for_payload() 
                             .list_events(
                                 window().0,
                                 window().1,
-                                &caldav::scope_token(&[], "prior-token"),
+                                &caldav::scope_token(&[], "UTC", "prior-token"),
                             )
                             .await
                     }
@@ -1630,7 +1633,7 @@ async fn media_encoding_and_shared_pool_policies_apply_to_real_backends() {
     dav.list_events(
         window().0,
         window().1,
-        &caldav::scope_token(&[], "dav-sync-secret"),
+        &caldav::scope_token(&[], "UTC", "dav-sync-secret"),
     )
     .await
     .unwrap();
@@ -2533,7 +2536,7 @@ async fn caldav_events_and_deletions_share_the_budget() {
     };
     let (from, to) = window();
     let err = caldav::CalDavBackend::new(&acct, budget_of(4))
-        .list_events(from, to, &caldav::scope_token(&[], "tok-prev"))
+        .list_events(from, to, &caldav::scope_token(&[], "UTC", "tok-prev"))
         .await
         .unwrap_err();
     assert!(
@@ -2541,12 +2544,15 @@ async fn caldav_events_and_deletions_share_the_budget() {
         "{err:?}"
     );
     let page = caldav::CalDavBackend::new(&acct, budget_of(5))
-        .list_events(from, to, &caldav::scope_token(&[], "tok-prev"))
+        .list_events(from, to, &caldav::scope_token(&[], "UTC", "tok-prev"))
         .await
         .unwrap();
     assert_eq!(page.events().len(), 2);
     assert_eq!(page.deleted().len(), 3);
-    assert_eq!(page.sync_token(), caldav::scope_token(&[], "tok-next"));
+    assert_eq!(
+        page.sync_token(),
+        caldav::scope_token(&[], "UTC", "tok-next")
+    );
     server.abort();
 }
 
@@ -2566,7 +2572,7 @@ async fn caldav_many_deletions_are_refused_at_the_cap() {
     };
     let (from, to) = window();
     let err = caldav::CalDavBackend::new(&acct, budget_of(100))
-        .list_events(from, to, &caldav::scope_token(&[], "tok-prev"))
+        .list_events(from, to, &caldav::scope_token(&[], "UTC", "tok-prev"))
         .await
         .unwrap_err();
     assert!(
@@ -2763,7 +2769,7 @@ async fn an_over_budget_caldav_delta_falls_back_to_a_full_fetch() {
     );
     let (from, to) = window();
     let page = backend
-        .list_events(from, to, &caldav::scope_token(&[], "tok-prev"))
+        .list_events(from, to, &caldav::scope_token(&[], "UTC", "tok-prev"))
         .await
         .unwrap();
     assert_eq!(
@@ -2826,7 +2832,7 @@ async fn caldav_token_recovery_releases_every_reservation() {
     );
     let (from, to) = window();
     let page = backend
-        .list_events(from, to, &caldav::scope_token(&[], "expired"))
+        .list_events(from, to, &caldav::scope_token(&[], "UTC", "expired"))
         .await
         .unwrap();
     assert_eq!(page.events().len(), 3);
@@ -2940,6 +2946,73 @@ fn the_router_anchors_floating_times_to_the_configured_home_zone() {
     }
 }
 
+#[tokio::test]
+async fn changing_home_zone_discards_the_ics_cursor_and_reanchors_cached_floating_events() {
+    use axum::{http::HeaderMap, response::IntoResponse};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let validators = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let seen = validators.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().fallback(axum::routing::any(move |headers: HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(
+                        headers
+                            .get(axum::http::header::IF_NONE_MATCH)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned),
+                    );
+                    (
+                        axum::http::StatusCode::OK,
+                        [("content-type", "text/calendar"), ("etag", "rev-1")],
+                        FLOATING_AND_EXPLICIT,
+                    )
+                        .into_response()
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    });
+
+    let acct = CalendarAccount {
+        url: format!("http://{address}/feed.ics"),
+        allow_private_network: true,
+        ..account("feed", CalendarProviderKind::IcsUrl)
+    };
+    let (from, to) = window();
+    let make_cfg = |zone: &str| CalendarConfig {
+        home_zone: zone.into(),
+        accounts: vec![acct.clone()],
+        ..CalendarConfig::default()
+    };
+    let first = router(&make_cfg("Asia/Kolkata"));
+    let one = first.list_events(from, to, &BTreeMap::new()).await;
+    let page = one[0].result.as_ref().unwrap();
+    let token = page.sync_token().to_owned();
+    assert_eq!(page.mode(), PageMode::Snapshot);
+    assert_eq!(
+        start_zone_of(page, "Floating").as_deref(),
+        Some("Asia/Kolkata")
+    );
+
+    let second = router(&make_cfg("America/Los_Angeles"));
+    let two = second
+        .list_events(from, to, &BTreeMap::from([("feed".to_string(), token)]))
+        .await;
+    let page = two[0].result.as_ref().unwrap();
+    assert_eq!(page.mode(), PageMode::Snapshot);
+    assert_eq!(
+        start_zone_of(page, "Floating").as_deref(),
+        Some("America/Los_Angeles")
+    );
+    assert_eq!(*validators.lock().unwrap(), vec![None, None]);
+    server.abort();
+}
+
 #[test]
 fn every_backend_is_built_with_the_zone_it_was_given() {
     let kolkata = AccountAdmission::isolated(
@@ -2978,7 +3051,10 @@ async fn a_full_caldav_snapshot_that_returns_a_token_is_still_a_snapshot() {
         .await
         .unwrap();
     assert_eq!(page.mode(), PageMode::Snapshot);
-    assert_eq!(page.sync_token(), caldav::scope_token(&[], "tok-next"));
+    assert_eq!(
+        page.sync_token(),
+        caldav::scope_token(&[], "UTC", "tok-next")
+    );
     assert!(
         page.deleted().is_empty(),
         "a snapshot carries no tombstones"
@@ -2997,7 +3073,7 @@ async fn a_caldav_delta_without_a_next_token_stays_a_delta() {
     .await;
     let (from, to) = window();
     let page = caldav::CalDavBackend::new(&caldav_acct(address), adm())
-        .list_events(from, to, &caldav::scope_token(&[], "tok-prev"))
+        .list_events(from, to, &caldav::scope_token(&[], "UTC", "tok-prev"))
         .await
         .unwrap();
     assert_eq!(page.mode(), PageMode::Delta);

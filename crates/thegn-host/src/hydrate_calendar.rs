@@ -281,7 +281,8 @@ fn sync_accounts_with_generation(
     generation: Option<&crate::hydrate_schedule::ScheduleFence>,
     notify: &mut dyn FnMut(String),
 ) -> bool {
-    let Some(window) = CalendarWindow::new(from, to, home_zone(cfg)) else {
+    let home = cfg.effective_home_zone();
+    let Some(window) = CalendarWindow::new(from, to, home) else {
         tracing::warn!(target: "thegn::calendar", "invalid home-zone calendar window; skipping sync");
         return false;
     };
@@ -335,7 +336,7 @@ fn sync_accounts_with_generation(
     // isn't re-hit just because a stale sibling needs work.
     let mut scoped = cfg.clone();
     scoped.accounts.retain(|a| wanted.contains(&a.name));
-    let router = CalendarRouter::from_config(&scoped);
+    let router = CalendarRouter::from_config_with_zone(&scoped, home);
     if !router.is_configured() {
         return false;
     }
@@ -772,6 +773,13 @@ pub(crate) fn spawn_reminder_check_with_generation(
                             crate::handlers::calendar::raise_reminder(r, &waker);
                         }
                     }
+                    if due.unsupported_leads > 0 {
+                        tracing::warn!(
+                            target: "thegn::calendar",
+                            count = due.unsupported_leads,
+                            "cached calendar reminders exceed the supported 28-day lead"
+                        );
+                    }
                     match due.skipped {
                         0 => ReminderOutcome::Complete,
                         _ => ReminderOutcome::Incomplete(CalendarViewError::MalformedCache),
@@ -821,6 +829,7 @@ fn reminders_configured(cfg: &CalendarConfig) -> bool {
 pub(crate) struct DueReminders {
     pub reminders: Vec<thegn_core::calendar::DueReminder>,
     pub skipped: usize,
+    pub unsupported_leads: usize,
 }
 
 /// Which reminders came due in exactly `window`.
@@ -839,9 +848,10 @@ pub(crate) fn due_reminders(
         return Ok(DueReminders {
             reminders: Vec::new(),
             skipped: 0,
+            unsupported_leads: 0,
         });
     }
-    let home = home_zone(cfg);
+    let home = cfg.effective_home_zone();
     let invalid = || CalendarViewError::Expansion(ExpansionError::InvalidWindow);
     let to_at = chrono::DateTime::from_timestamp_millis(window.to_ms).ok_or_else(invalid)?;
     // The core clamps catch-up to an hour, so the scan does too: a stale
@@ -852,24 +862,31 @@ pub(crate) fn due_reminders(
     let from_at = chrono::DateTime::from_timestamp_millis(from_ms).ok_or_else(invalid)?;
     let day = |at: chrono::DateTime<chrono::Utc>| at.with_timezone(&home).date_naive();
     let lead = |mins: u32| chrono::TimeDelta::minutes(i64::from(mins));
-    let defaults = cfg.default_reminders();
-
     // A reminder fires when its TRIGGER is in `(from, to]`, and the trigger is
-    // `lead` before the start, so the occurrences worth looking at start in
-    // `[from, to + lead]`. Load as far as the supported horizon (a bounded
-    // indexed read), but expand only as far as the longest lead actually
-    // present in what was loaded (THE-460) — never a fixed day.
-    let first = day(from_at).pred_opt().unwrap_or(day(from_at));
-    let widest = to_at
-        .checked_add_signed(lead(thegn_core::calendar::reminders::MAX_LEAD_MINS))
-        .ok_or_else(invalid)?;
-    let last_loaded = day(widest).succ_opt().unwrap_or(day(widest));
-    let range =
-        CalendarWindow::new(first, last_loaded, home).ok_or(CalendarViewError::InvalidWindow)?;
-    let cached = load_cached_window(db, range)?;
+    // `lead` before the start. Begin with the configured default lead, plus a
+    // one-day date-bucket margin. Only widen when an event in those rows has a
+    // longer lead (THE-460).
+    let defaults = cfg.default_reminders();
+    let initial_lead = thegn_core::calendar::reminders::max_lead_mins(&[], &defaults);
+    let range_for = |mins| reminder_cache_window(from_at, to_at, home, mins);
+    let first_range = range_for(initial_lead).ok_or_else(invalid)?;
+    let mut cached = load_cached_window(db, first_range)?;
+    let needed = thegn_core::calendar::reminders::max_lead_mins(&cached.events, &defaults);
+    if needed > initial_lead {
+        let wider =
+            range_for(thegn_core::calendar::reminders::MAX_LEAD_MINS).ok_or_else(invalid)?;
+        cached = load_cached_window(db, wider)?;
+    }
+    let unsupported_leads = cached
+        .events
+        .iter()
+        .flat_map(|event| event.reminders.iter())
+        .filter(|reminder| reminder.minutes_before > thegn_core::calendar::reminders::MAX_LEAD_MINS)
+        .count();
     let needed = thegn_core::calendar::reminders::max_lead_mins(&cached.events, &defaults);
     let reach = to_at.checked_add_signed(lead(needed)).ok_or_else(invalid)?;
-    let (from, to) = (first, day(reach).succ_opt().unwrap_or(day(reach)));
+    let from = first_range.from;
+    let to = day(reach).succ_opt().unwrap_or(day(reach));
     let expanded = thegn_core::calendar::expand_calendar(&cached.events, from, to, home)
         .map_err(CalendarViewError::Expansion)?;
     Ok(DueReminders {
@@ -884,7 +901,21 @@ pub(crate) fn due_reminders(
         // that would not decode: both mean "these reminders are everything the
         // cache could yield", not "the evaluation failed".
         skipped: cached.skipped + expanded.skipped,
+        unsupported_leads,
     })
+}
+
+fn reminder_cache_window(
+    from_at: chrono::DateTime<chrono::Utc>,
+    to_at: chrono::DateTime<chrono::Utc>,
+    home: chrono_tz::Tz,
+    lead_mins: u32,
+) -> Option<CalendarWindow> {
+    let day = |at: chrono::DateTime<chrono::Utc>| at.with_timezone(&home).date_naive();
+    let first = day(from_at).pred_opt().unwrap_or(day(from_at));
+    let reach = to_at.checked_add_signed(chrono::TimeDelta::minutes(i64::from(lead_mins)))?;
+    let last = day(reach).succ_opt().unwrap_or(day(reach));
+    CalendarWindow::new(first, last, home)
 }
 
 fn widen(from: NaiveDate, to: NaiveDate) -> (NaiveDate, NaiveDate) {

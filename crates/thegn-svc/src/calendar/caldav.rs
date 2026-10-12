@@ -365,16 +365,16 @@ fn page_from_multistatus(
         meter.release_transient(copy);
         parsed.map_err(CalendarError::from)
     })?;
-    let token = scope_token(calendar_ids, &token);
+    let token = scope_token(calendar_ids, zone, &token);
     EventPage::from_meter(meter, mode, events, deleted, token)
 }
 
-const SCOPE_PREFIX: &str = "tgf1:";
+const SCOPE_PREFIX: &str = "tgf2:";
 
 /// A stable (FNV-1a) digest of the effective collection filter, independent of
 /// order and duplicates. `DefaultHasher` is not stable across releases, and the
 /// digest is persisted inside the cursor.
-fn filter_digest(ids: &[String]) -> u64 {
+fn filter_digest(ids: &[String], zone: &str) -> u64 {
     let mut sorted: Vec<&str> = ids.iter().map(String::as_str).collect();
     sorted.sort_unstable();
     sorted.dedup();
@@ -385,26 +385,30 @@ fn filter_digest(ids: &[String]) -> u64 {
             h = h.wrapping_mul(0x0100_0000_01b3);
         }
     }
+    for b in zone.bytes().chain(std::iter::once(0)) {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
     h
 }
 
-/// Bind a server sync token to the filter it was collected under. An empty
-/// token stays empty (it means "no cursor").
-pub(crate) fn scope_token(ids: &[String], token: &str) -> String {
+/// Bind a server sync token to the collection filter and floating-time zone it
+/// was collected under. An empty token stays empty (it means "no cursor").
+pub(crate) fn scope_token(ids: &[String], zone: &str, token: &str) -> String {
     if token.is_empty() {
         return String::new();
     }
-    format!("{SCOPE_PREFIX}{:016x}:{token}", filter_digest(ids))
+    format!("{SCOPE_PREFIX}{:016x}:{token}", filter_digest(ids, zone))
 }
 
 /// The server token inside a stored cursor, or empty (forcing a full fetch)
 /// when the cursor was minted under a different filter or predates scoping.
-fn unscope_token<'a>(ids: &[String], stored: &'a str) -> &'a str {
+fn unscope_token<'a>(ids: &[String], zone: &str, stored: &'a str) -> &'a str {
     let Some(rest) = stored.strip_prefix(SCOPE_PREFIX) else {
         return "";
     };
     match rest.split_once(':') {
-        Some((digest, token)) if digest == format!("{:016x}", filter_digest(ids)) => token,
+        Some((digest, token)) if digest == format!("{:016x}", filter_digest(ids, zone)) => token,
         _ => "",
     }
 }
@@ -532,7 +536,7 @@ impl CalDavBackend {
 
             // A cursor minted under a different `calendar_ids` filter must not
             // resume: the server's delta would omit collections newly selected.
-            let sync_token = unscope_token(&self.calendar_ids, sync_token);
+            let sync_token = unscope_token(&self.calendar_ids, self.zone.name(), sync_token);
             let incremental = !sync_token.is_empty();
             let body = if incremental {
                 sync_collection_body(sync_token)?
@@ -857,20 +861,32 @@ mod tests {
     fn cursor_is_bound_to_the_calendar_filter() {
         let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let work = ids(&["work"]);
-        let stored = scope_token(&work, "srv-1");
-        assert_eq!(unscope_token(&work, &stored), "srv-1");
+        let stored = scope_token(&work, "UTC", "srv-1");
+        assert_eq!(unscope_token(&work, "UTC", &stored), "srv-1");
         // Order and duplicates do not matter.
         assert_eq!(
-            unscope_token(&ids(&["b", "a"]), &scope_token(&ids(&["a", "b", "a"]), "t")),
+            unscope_token(
+                &ids(&["b", "a"]),
+                "UTC",
+                &scope_token(&ids(&["a", "b", "a"]), "UTC", "t")
+            ),
             "t"
         );
         // A changed filter, an unscoped legacy token, and garbage all force a
         // full fetch.
-        assert_eq!(unscope_token(&ids(&["work", "personal"]), &stored), "");
-        assert_eq!(unscope_token(&[], &stored), "");
-        assert_eq!(unscope_token(&work, "srv-1"), "");
-        assert_eq!(unscope_token(&work, "tgf1:zz"), "");
-        assert_eq!(scope_token(&work, ""), "");
+        assert_eq!(
+            unscope_token(&ids(&["work", "personal"]), "UTC", &stored),
+            ""
+        );
+        assert_eq!(unscope_token(&[], "UTC", &stored), "");
+        assert_eq!(unscope_token(&work, "UTC", "srv-1"), "");
+        assert_eq!(unscope_token(&work, "UTC", "tgf1:zz"), "");
+        assert_eq!(
+            unscope_token(&work, "UTC", "tgf1:0123456789abcdef:srv-1"),
+            ""
+        );
+        assert_eq!(scope_token(&work, "UTC", ""), "");
+        assert_eq!(unscope_token(&work, "Europe/Berlin", &stored), "");
     }
 
     #[test]
@@ -879,8 +895,11 @@ mod tests {
         let meter =
             AccountAdmission::isolated(Default::default(), thegn_core::calendar::Tz::UTC).meter();
         let p = page_from_multistatus(&multistatus(), "UTC", &ids, PageMode::Delta, meter).unwrap();
-        assert_eq!(unscope_token(&ids, p.sync_token()), "t1");
-        assert_eq!(unscope_token(&["personal".to_string()], p.sync_token()), "");
+        assert_eq!(unscope_token(&ids, "UTC", p.sync_token()), "t1");
+        assert_eq!(
+            unscope_token(&["personal".to_string()], "UTC", p.sync_token()),
+            ""
+        );
     }
 
     #[test]
