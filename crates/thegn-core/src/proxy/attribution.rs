@@ -28,7 +28,7 @@ pub fn identity_proof(secret: &[u8], challenge: &str) -> String {
 
 /// Verifies an identity proof in constant time.
 pub fn verify_identity_proof(secret: &[u8], challenge: &str, proof: &str) -> bool {
-    let Ok(bytes) = hex_decode(proof) else {
+    let Some(bytes) = hex_decode(proof) else {
         return false;
     };
     let mut mac =
@@ -133,6 +133,14 @@ fn hex_decode(hex: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Parses a 32-byte host secret represented as exactly 64 hexadecimal digits.
+pub fn parse_secret_hex(value: &str) -> Option<Vec<u8>> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    hex_decode(value)
+}
+
 /// Encodes an attribution scope into a `mpk_<hex>` token.
 pub fn encode(scope: &AttributionScope) -> String {
     let json = serde_json::to_vec(scope).unwrap_or_default();
@@ -205,6 +213,16 @@ mod tests {
         assert_eq!(decode("mpk_zz"), None); // bad hex
         assert_eq!(decode("mpk_7b"), None); // valid hex "{" but not valid json object
         assert_eq!(decode("mpk_abc"), None); // odd length
+    }
+
+    #[test]
+    fn parses_host_secret_hex() {
+        let parsed = parse_secret_hex("0123456789abcdef".repeat(4).as_str()).unwrap();
+        assert_eq!(parsed.len(), 32);
+        assert_eq!(parsed[0], 0x01);
+        assert_eq!(parsed[31], 0xef);
+        assert_eq!(parse_secret_hex(&"a".repeat(63)), None);
+        assert_eq!(parse_secret_hex(&"g".repeat(64)), None);
     }
 
     #[test]
