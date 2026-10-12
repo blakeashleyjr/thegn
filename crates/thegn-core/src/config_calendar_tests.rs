@@ -318,6 +318,19 @@ fn an_unknown_home_zone_falls_back_to_local() {
 }
 
 #[test]
+fn the_effective_home_zone_is_the_configured_one_else_the_system_zone() {
+    let ok = CalendarConfig {
+        home_zone: "Europe/Berlin".into(),
+        ..CalendarConfig::default()
+    };
+    assert_eq!(ok.effective_home_zone(), chrono_tz::Tz::Europe__Berlin);
+    assert_eq!(
+        CalendarConfig::default().effective_home_zone(),
+        crate::calendar::tz::system_zone()
+    );
+}
+
+#[test]
 fn a_miscased_zone_is_accepted_rather_than_reported() {
     // Case is not a mistake worth failing over — the lookup normalizes it.
     let cfg = CalendarConfig {

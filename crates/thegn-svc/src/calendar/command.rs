@@ -329,7 +329,7 @@ pub struct CommandBackend {
     env: BTreeMap<String, String>,
     granted: Vec<Capability>,
     timeout: Duration,
-    zone: String,
+    zone: thegn_core::calendar::Tz,
     admission: AccountAdmission,
 }
 
@@ -347,30 +347,23 @@ impl CommandBackend {
                 .filter_map(|c| Capability::parse(c))
                 .collect(),
             timeout: Duration::from_secs(a.timeout_secs.clamp(1, 300)),
-            zone: String::new(),
+            zone: admission.zone(),
             admission,
         }
     }
 
-    pub fn with_zone(mut self, zone: &str) -> Self {
-        self.zone = zone.to_string();
-        self
-    }
-
     /// The environment handed to the plugin.
-    fn query_env(&self, from: NaiveDate, to: NaiveDate, token: &str) -> BTreeMap<String, String> {
+    pub(crate) fn query_env(
+        &self,
+        from: NaiveDate,
+        to: NaiveDate,
+        token: &str,
+    ) -> BTreeMap<String, String> {
         let mut env = self.env.clone();
         env.insert("THEGN_CAL_FROM".into(), from.to_string());
         env.insert("THEGN_CAL_TO".into(), to.to_string());
         env.insert("THEGN_CAL_SYNC_TOKEN".into(), token.to_string());
-        env.insert(
-            "THEGN_CAL_HOME_ZONE".into(),
-            if self.zone.is_empty() {
-                "UTC".into()
-            } else {
-                self.zone.clone()
-            },
-        );
+        env.insert("THEGN_CAL_HOME_ZONE".into(), self.zone.name().to_string());
         env.insert(
             "THEGN_CAL_MAX_EVENTS".into(),
             self.admission.budget().max_events().to_string(),

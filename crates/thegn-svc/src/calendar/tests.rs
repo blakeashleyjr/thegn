@@ -32,7 +32,7 @@ impl axum::serve::Listener for CountingListener {
 /// A default budget over a private pool, so parallel tests never contend for
 /// the process-wide one.
 fn adm() -> AccountAdmission {
-    AccountAdmission::isolated(AdmissionBudget::default())
+    AccountAdmission::isolated(AdmissionBudget::default(), thegn_core::calendar::Tz::UTC)
 }
 
 /// A router over a private pool.
@@ -2195,7 +2195,10 @@ fn webcal_urls_are_fetched_over_https() {
 // --- admission budget --------------------------------------------------------
 
 fn budget_of(n: usize) -> AccountAdmission {
-    AccountAdmission::isolated(AdmissionBudget::new(n).unwrap())
+    AccountAdmission::isolated(
+        AdmissionBudget::new(n).unwrap(),
+        thegn_core::calendar::Tz::UTC,
+    )
 }
 
 fn ics_feed(n: usize) -> String {
@@ -2287,7 +2290,11 @@ fn a_page_owns_its_reservation_until_dropped() {
     };
     let backend = ics::IcsBackend::new(
         &acct,
-        AccountAdmission::new(AdmissionBudget::default(), pool.clone()),
+        AccountAdmission::new(
+            AdmissionBudget::default(),
+            pool.clone(),
+            thegn_core::calendar::Tz::UTC,
+        ),
     );
     let (from, to) = window();
     let page = block_on(backend.list_events(from, to, "")).unwrap();
@@ -2424,7 +2431,11 @@ async fn a_remote_feed_over_the_budget_never_advances_its_etag() {
     let pool = AdmissionPool::new(1_000, 128 << 20);
     let b = ics_url::IcsUrlBackend::new(
         &acct,
-        AccountAdmission::new(AdmissionBudget::new(10).unwrap(), pool.clone()),
+        AccountAdmission::new(
+            AdmissionBudget::new(10).unwrap(),
+            pool.clone(),
+            thegn_core::calendar::Tz::UTC,
+        ),
     );
     let (from, to) = window();
     let err = b.list_events(from, to, "").await.unwrap_err();
@@ -2437,7 +2448,11 @@ async fn a_remote_feed_over_the_budget_never_advances_its_etag() {
 
     let b = ics_url::IcsUrlBackend::new(
         &acct,
-        AccountAdmission::new(AdmissionBudget::new(50).unwrap(), pool.clone()),
+        AccountAdmission::new(
+            AdmissionBudget::new(50).unwrap(),
+            pool.clone(),
+            thegn_core::calendar::Tz::UTC,
+        ),
     );
     let page = b.list_events(from, to, "").await.unwrap();
     assert_eq!(page.events().len(), 50);
@@ -2461,7 +2476,11 @@ async fn a_saturated_global_budget_refuses_before_any_request() {
             allow_private_network: true,
             ..account("r", provider)
         };
-        let admission = AccountAdmission::new(AdmissionBudget::default(), pool.clone());
+        let admission = AccountAdmission::new(
+            AdmissionBudget::default(),
+            pool.clone(),
+            thegn_core::calendar::Tz::UTC,
+        );
         let backend: Box<dyn CalendarBackend> = match provider {
             CalendarProviderKind::IcsUrl => Box::new(ics_url::IcsUrlBackend::new(&acct, admission)),
             _ => Box::new(caldav::CalDavBackend::new(&acct, admission)),
@@ -2732,7 +2751,11 @@ async fn an_over_budget_caldav_delta_falls_back_to_a_full_fetch() {
     let pool = AdmissionPool::new(1_000, 128 << 20);
     let backend = caldav::CalDavBackend::new(
         &acct,
-        AccountAdmission::new(AdmissionBudget::new(10).unwrap(), pool.clone()),
+        AccountAdmission::new(
+            AdmissionBudget::new(10).unwrap(),
+            pool.clone(),
+            thegn_core::calendar::Tz::UTC,
+        ),
     );
     let (from, to) = window();
     let page = backend
@@ -2791,7 +2814,11 @@ async fn caldav_token_recovery_releases_every_reservation() {
     let pool = AdmissionPool::new(1_000, 128 << 20);
     let backend = caldav::CalDavBackend::new(
         &acct,
-        AccountAdmission::new(AdmissionBudget::default(), pool.clone()),
+        AccountAdmission::new(
+            AdmissionBudget::default(),
+            pool.clone(),
+            thegn_core::calendar::Tz::UTC,
+        ),
     );
     let (from, to) = window();
     let page = backend
@@ -2847,4 +2874,78 @@ fn caldav_unescaping_is_single_pass_and_sized_before_it_runs() {
         "x".repeat(crate::http::MAX_REQUEST_BYTES)
     );
     assert!(caldav::parse_multistatus(&huge).0.is_empty());
+}
+
+// --- home zone reaches every backend (THE-464) ------------------------------
+
+const FLOATING_AND_EXPLICIT: &str = "\
+BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:float
+SUMMARY:Floating
+DTSTART:20260821T093000
+DTEND:20260821T103000
+END:VEVENT
+BEGIN:VEVENT
+UID:utc
+SUMMARY:Explicit UTC
+DTSTART:20260821T093000Z
+DTEND:20260821T103000Z
+END:VEVENT
+BEGIN:VEVENT
+UID:tzid
+SUMMARY:Explicit TZID
+DTSTART;TZID=America/New_York:20260821T093000
+DTEND;TZID=America/New_York:20260821T103000
+END:VEVENT
+END:VCALENDAR";
+
+fn start_zone_of(page: &EventPage, uid: &str) -> Option<String> {
+    let e = page.events().iter().find(|e| e.title == uid)?;
+    match &e.start {
+        thegn_core::calendar::EventTime::Zoned { zone, .. } => Some(zone.as_str().to_string()),
+        // A trailing `Z` parses to an absolute instant, which no zone touches.
+        thegn_core::calendar::EventTime::Instant { .. } => Some("UTC".to_string()),
+        _ => None,
+    }
+}
+
+#[test]
+fn the_router_anchors_floating_times_to_the_configured_home_zone() {
+    let t = Tmp::new("home-zone");
+    std::fs::write(t.0.join("a.ics"), FLOATING_AND_EXPLICIT).unwrap();
+    for zone in ["Asia/Kolkata", "America/Los_Angeles", "Pacific/Auckland"] {
+        let cfg = CalendarConfig {
+            home_zone: zone.into(),
+            accounts: vec![CalendarAccount {
+                path: t.0.join("a.ics").display().to_string(),
+                ..account("a", CalendarProviderKind::Ics)
+            }],
+            ..CalendarConfig::default()
+        };
+        let (from, to) = window();
+        let results = block_on(router(&cfg).list_events(from, to, &BTreeMap::new()));
+        let page = results[0].result.as_ref().unwrap();
+        assert_eq!(start_zone_of(page, "Floating").as_deref(), Some(zone));
+        // Explicit zones are never rewritten by the home zone.
+        assert_eq!(start_zone_of(page, "Explicit UTC").as_deref(), Some("UTC"));
+        assert_eq!(
+            start_zone_of(page, "Explicit TZID").as_deref(),
+            Some("America/New_York")
+        );
+    }
+}
+
+#[test]
+fn every_backend_is_built_with_the_zone_it_was_given() {
+    let kolkata = AccountAdmission::isolated(
+        AdmissionBudget::default(),
+        thegn_core::calendar::Tz::Asia__Kolkata,
+    );
+    assert_eq!(kolkata.zone(), thegn_core::calendar::Tz::Asia__Kolkata);
+    // The plugin sees the same zone in its environment.
+    let b = command::CommandBackend::new(&command_account("true"), kolkata);
+    let (from, to) = window();
+    let env = b.query_env(from, to, "");
+    assert_eq!(env["THEGN_CAL_HOME_ZONE"], "Asia/Kolkata");
 }

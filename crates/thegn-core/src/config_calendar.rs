@@ -230,6 +230,15 @@ impl CalendarConfig {
         }
     }
 
+    /// The zone every calendar consumer anchors floating times and date
+    /// bucketing to: the configured home zone, else the system zone. The one
+    /// resolution shared by backend parsing, the command environment, the sync
+    /// window, recurrence expansion and reminders (THE-464).
+    pub fn effective_home_zone(&self) -> chrono_tz::Tz {
+        self.home_zone()
+            .unwrap_or_else(crate::calendar::tz::system_zone)
+    }
+
     /// Seconds between calendar syncs, or `None` when nothing is configured —
     /// in which case the ticker emits no calendar slot at all and a user
     /// without a calendar pays nothing.
