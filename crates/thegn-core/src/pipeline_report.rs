@@ -68,10 +68,9 @@ pub fn display_fit(s: &str, cells: usize) -> String {
     }
 
     if truncated {
-        while width + 1 > cells {
-            let Some(last) = output.pop() else {
-                break;
-            };
+        while width + 1 > cells
+            && let Some(last) = output.pop()
+        {
             width -= UnicodeWidthChar::width(last).unwrap_or(0);
         }
         output.push('…');
