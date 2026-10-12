@@ -141,6 +141,67 @@ pub struct GenerationPolicy {
     pub min_age_secs: u64,
 }
 
+/// One hook log directly inside a worktree-slug directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookLog {
+    pub name: String,
+    pub mtime_secs: u64,
+}
+
+/// Choose hook logs to remove: expired files are always removed, then the
+/// newest `keep_newest` remaining files are retained. Equal mtimes sort by
+/// ascending filename for a stable policy result.
+pub fn plan_hook_log_prune(
+    logs: &[HookLog],
+    keep_newest: usize,
+    max_age_secs: u64,
+    now_secs: u64,
+) -> Vec<String> {
+    let mut young: Vec<_> = logs
+        .iter()
+        .filter(|log| now_secs.saturating_sub(log.mtime_secs) <= max_age_secs)
+        .collect();
+    young.sort_by(|a, b| b.mtime_secs.cmp(&a.mtime_secs).then(a.name.cmp(&b.name)));
+    let retained: std::collections::BTreeSet<_> = young
+        .iter()
+        .take(keep_newest)
+        .map(|log| log.name.as_str())
+        .collect();
+    let mut remove: Vec<_> = logs
+        .iter()
+        .filter(|log| !retained.contains(log.name.as_str()))
+        .map(|log| log.name.clone())
+        .collect();
+    remove.sort();
+    remove
+}
+
+/// Earliest time an old generation might meet the age floor. `None` means all
+/// packages have only one generation, so no age passage alone can make a
+/// prune possible. The minimum is intentionally conservative: it includes
+/// every generation belonging to a package with at least two entries.
+pub fn generation_recheck_after(inventory: &[Generation], policy: GenerationPolicy) -> Option<u64> {
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    for generation in inventory {
+        *counts.entry(generation.package_name.as_str()).or_default() += 1;
+    }
+    inventory
+        .iter()
+        .filter(|generation| {
+            counts
+                .get(generation.package_name.as_str())
+                .copied()
+                .unwrap_or(0)
+                >= 2
+        })
+        .map(|generation| {
+            generation
+                .newest_mtime_secs
+                .saturating_add(policy.min_age_secs)
+        })
+        .min()
+}
+
 /// A selected generation footprint. The host resolves these identifiers back
 /// to the already-enumerated paths; this policy never performs I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -643,5 +704,56 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn hook_log_retention_handles_empty_young_old_and_tied_rows() {
+        assert!(plan_hook_log_prune(&[], 2, 10, 100).is_empty());
+        let young = [
+            HookLog {
+                name: "c.log".into(),
+                mtime_secs: 99,
+            },
+            HookLog {
+                name: "b.log".into(),
+                mtime_secs: 100,
+            },
+            HookLog {
+                name: "a.log".into(),
+                mtime_secs: 100,
+            },
+        ];
+        assert!(plan_hook_log_prune(&young, 3, 10, 100).is_empty());
+        assert_eq!(
+            plan_hook_log_prune(&young, 1, 10, 100),
+            vec!["b.log", "c.log"]
+        );
+        let old = [
+            HookLog {
+                name: "b.log".into(),
+                mtime_secs: 80,
+            },
+            HookLog {
+                name: "a.log".into(),
+                mtime_secs: 80,
+            },
+        ];
+        assert_eq!(
+            plan_hook_log_prune(&old, 20, 10, 100),
+            vec!["a.log", "b.log"]
+        );
+    }
+
+    #[test]
+    fn generation_recheck_uses_oldest_candidate_and_ignores_singletons() {
+        let policy = GenerationPolicy { min_age_secs: 10 };
+        let rows = [
+            generation("multi", "a", 20, 1),
+            generation("multi", "b", 50, 1),
+            generation("single", "only", 0, 1),
+        ];
+        assert_eq!(generation_recheck_after(&rows, policy), Some(30));
+        assert_eq!(generation_recheck_after(&rows[2..], policy), None);
+        assert_eq!(generation_recheck_after(&[], policy), None);
     }
 }
