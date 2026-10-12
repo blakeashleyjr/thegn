@@ -1143,7 +1143,7 @@ fn recurrence_rejects_rdates_that_change_the_dtstart_value_type() {
 }
 
 #[test]
-fn recurrence_rejects_an_unknown_rdate_zone_unless_it_matches_dtstart() {
+fn recurrence_rejects_unknown_rdate_and_series_zones() {
     let mut mismatched = recurring(
         zoned(2026, 8, 1, 9, 0, "America/New_York"),
         zoned(2026, 8, 1, 10, 0, "America/New_York"),
