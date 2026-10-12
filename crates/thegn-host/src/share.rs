@@ -12,7 +12,7 @@
 
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use termwiz::terminal::TerminalWaker;
 use thegn_core::config::ShareConfig;
 use thegn_core::share::build_share_spec;
@@ -151,20 +151,26 @@ impl ShareInstance {
             let worktree = self.worktree.clone();
             let port = self.port;
             let generation = self.generation;
-            let spawn = std::thread::Builder::new().name("tgshare-down".into()).spawn(move || {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                thegn_svc::share::serve_down(&td.sidecar, &td.serve);
-                if let Some(tx) = tx {
-                    if let Err(error) = tx.send(ShareEvent::Down { worktree, port, generation }) {
+            let spawn = std::thread::Builder::new()
+                .name("tgshare-down".into())
+                .spawn(move || {
+                    crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                    thegn_svc::share::serve_down(&td.sidecar, &td.serve);
+                    if let Some(tx) = tx
+                        && let Err(error) = tx.send(ShareEvent::Down {
+                            worktree,
+                            port,
+                            generation,
+                        })
+                    {
                         tracing::debug!(%error, "share teardown acknowledgement receiver is gone");
                     }
-                }
-                if let Some(waker) = waker {
-                    if let Err(error) = waker.wake() {
+                    if let Some(waker) = waker
+                        && let Err(error) = waker.wake()
+                    {
                         tracing::debug!(%error, "share teardown waker is unavailable");
                     }
-                }
-            });
+                });
             if let Err(error) = spawn {
                 tracing::warn!(%error, "could not spawn share teardown worker");
             }
@@ -180,6 +186,7 @@ pub struct ShareSupervisor {
 }
 
 static NEXT_SHARE_GENERATION: AtomicU64 = AtomicU64::new(1);
+static SHARE_PROCESS_NONCE: OnceLock<u64> = OnceLock::new();
 
 impl ShareSupervisor {
     pub fn new() -> Self {
@@ -259,11 +266,19 @@ impl ShareSupervisor {
             );
         }
         let provider = thegn_svc::share::for_provider(&spec).kind();
-        let generation = NEXT_SHARE_GENERATION
+        let sequence = NEXT_SHARE_GENERATION
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| "share generation counter exhausted".to_string())?;
+        let process_nonce = *SHARE_PROCESS_NONCE.get_or_init(|| {
+            let started = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            started ^ u64::from(std::process::id()).rotate_left(17)
+        });
+        let generation = process_nonce.wrapping_add(sequence);
         let shared = Shared::new();
         let t_shared = shared.clone();
         let t_tx = tx.clone();
@@ -317,9 +332,23 @@ impl ShareSupervisor {
                 generation,
                 error,
                 ..
-            } => match self.find_mut(&worktree, port, generation) {
-                Some(i) if matches!(i.state, ShareState::Starting) => {
+            } => match self
+                .instances
+                .iter()
+                .find(|i| i.worktree == worktree && i.port == port && i.generation == generation)
+                .map(|i| i.state.clone())
+            {
+                Some(ShareState::Starting) => {
+                    let Some(i) = self.find_mut(&worktree, port, generation) else {
+                        return false;
+                    };
                     i.state = ShareState::Failed(error);
+                    true
+                }
+                Some(ShareState::Stopping) => {
+                    self.instances.retain(|i| {
+                        !(i.worktree == worktree && i.port == port && i.generation == generation)
+                    });
                     true
                 }
                 _ => {
@@ -681,6 +710,31 @@ mod tests {
             worktree: "/wt".into(),
             port: 3000,
             generation: 31
+        }));
+        assert!(sup.instances.is_empty());
+    }
+
+    #[test]
+    fn failed_acknowledges_a_stopped_starting_generation() {
+        let mut sup = ShareSupervisor::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 51,
+            provider: "bore",
+            public: true,
+            state: ShareState::Starting,
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+        assert_eq!(sup.stop("/wt", Some(3000)), vec![3000]);
+        assert!(sup.on_event(ShareEvent::Failed {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 51,
+            provider: "bore",
+            error: "startup failed during stop".into(),
         }));
         assert!(sup.instances.is_empty());
     }
