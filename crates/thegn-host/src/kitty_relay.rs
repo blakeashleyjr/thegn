@@ -122,10 +122,8 @@ pub struct KittyRelay {
     scanned: usize,
 }
 
-/// Child IDs are reserved when a first chunk is classified. If later transfer
-/// aggregation or payload validation rejects that transfer, its bounded slot
-/// remains reserved until the child deletes it or the relay resets. This keeps
-/// the table bounded; a later placement can still map to that rejected image.
+/// Child IDs are reserved when a first chunk is classified. A reservation made
+/// only for an incomplete transfer is released if that transfer is rejected.
 #[derive(Debug, Default)]
 struct CornerIds {
     child: [Option<u32>; CORNER_IDS],
@@ -141,9 +139,9 @@ impl CornerIds {
         self.child.iter().position(|id| *id == Some(child_id))
     }
 
-    fn allocate(&mut self, child_id: u32) -> Option<usize> {
+    fn allocate(&mut self, child_id: u32) -> Option<(usize, bool)> {
         if let Some(slot) = self.slot_for(child_id) {
-            return Some(slot);
+            return Some((slot, false));
         }
         let slot = self
             .child
@@ -152,7 +150,21 @@ impl CornerIds {
             .skip(1)
             .find_map(|(slot, id)| id.is_none().then_some(slot))?;
         self.child[slot] = Some(child_id);
-        Some(slot)
+        Some((slot, true))
+    }
+
+    fn release(&mut self, reservation: Reservation) {
+        if !reservation.fresh {
+            return;
+        }
+        match reservation.id {
+            ReservationId::Child(child_id) => {
+                if let Some(slot) = self.slot_for(child_id) {
+                    self.child[slot] = None;
+                }
+            }
+            ReservationId::Anonymous => self.anonymous_live = false,
+        }
     }
 
     fn delete_live(&mut self) -> Vec<u8> {
@@ -174,6 +186,20 @@ impl CornerIds {
 struct Transfer {
     bytes: Vec<u8>,
     chunks: usize,
+    content_size: (usize, usize),
+    reservation: Option<Reservation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReservationId {
+    Child(u32),
+    Anonymous,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Reservation {
+    id: ReservationId,
+    fresh: bool,
 }
 
 impl KittyRelay {
@@ -246,7 +272,7 @@ impl KittyRelay {
                         self.partial = Vec::new();
                         // An oversized/malformed APC inside a logical transfer
                         // invalidates the whole unit; later Gm chunks are orphans.
-                        self.transfer = None;
+                        self.drop_transfer(None, &mut None);
                         self.state = if ended {
                             ScanState::Text
                         } else {
@@ -258,8 +284,10 @@ impl KittyRelay {
                         self.partial.push(byte);
                         if ended {
                             let seq = std::mem::take(&mut self.partial);
-                            let piece = classify(seq, content_size, &mut self.ids);
-                            self.accept_piece(piece, &mut emit);
+                            let mut reservation = None;
+                            let piece =
+                                classify(seq, content_size, &mut self.ids, &mut reservation);
+                            self.accept_piece(piece, content_size, reservation, &mut emit);
                             self.state = ScanState::Text;
                         } else {
                             self.state = ScanState::Apc {
@@ -287,19 +315,47 @@ impl KittyRelay {
         }
     }
 
-    fn accept_piece(&mut self, piece: Piece, emit: &mut impl FnMut(Piece)) {
+    fn drop_transfer(
+        &mut self,
+        preserve: Option<Reservation>,
+        inherited: &mut Option<Reservation>,
+    ) {
+        let Some(transfer) = self.transfer.take() else {
+            return;
+        };
+        if let Some(reservation) = transfer.reservation {
+            if preserve.is_some_and(|current| current.id == reservation.id) {
+                *inherited = Some(reservation);
+                return;
+            }
+            self.ids.release(reservation);
+        }
+    }
+
+    fn accept_piece(
+        &mut self,
+        piece: Piece,
+        content_size: (usize, usize),
+        reservation: Option<Reservation>,
+        emit: &mut impl FnMut(Piece),
+    ) {
         match piece {
             Piece::GfxDisplay(bytes) if is_multi_transmit(&bytes) => {
                 // A fresh transmit is an unambiguous boundary. It supersedes
                 // any incomplete transfer and lets recovery start again.
-                self.transfer = None;
+                let mut inherited = None;
+                self.drop_transfer(reservation, &mut inherited);
                 let mut transfer = Transfer {
                     bytes: Vec::new(),
                     chunks: 1,
+                    content_size,
+                    reservation: reservation.filter(|slot| slot.fresh).or(inherited),
                 };
                 if append_transfer(&mut transfer, bytes) {
                     self.transfer = Some(transfer);
                 } else {
+                    self.transfer = Some(transfer);
+                    self.drop_transfer(None, &mut None);
                     emit(Piece::Rejected);
                 }
             }
@@ -309,8 +365,16 @@ impl KittyRelay {
                     emit(Piece::Rejected);
                     return;
                 };
+                if transfer.content_size != content_size {
+                    self.transfer = Some(transfer);
+                    self.drop_transfer(None, &mut None);
+                    emit(Piece::Rejected);
+                    return;
+                }
                 transfer.chunks += 1;
                 if transfer.chunks > MAX_TRANSFER_CHUNKS || !append_transfer(&mut transfer, bytes) {
+                    self.transfer = Some(transfer);
+                    self.drop_transfer(None, &mut None);
                     emit(Piece::Rejected);
                     return;
                 }
@@ -318,6 +382,8 @@ impl KittyRelay {
                     if valid_transfer(&transfer.bytes) {
                         emit(Piece::GfxDisplay(transfer.bytes));
                     } else {
+                        self.transfer = Some(transfer);
+                        self.drop_transfer(None, &mut None);
                         emit(Piece::Rejected);
                     }
                 } else {
@@ -327,18 +393,18 @@ impl KittyRelay {
             Piece::GfxOther(bytes) if bytes.is_empty() => {
                 // A child delete-all with no live IDs still terminates any
                 // incomplete transfer, but has no outer-terminal command.
-                self.transfer = None;
+                self.drop_transfer(None, &mut None);
             }
             Piece::GfxOther(bytes) if is_delete(&bytes) => {
-                self.transfer = None;
+                self.drop_transfer(None, &mut None);
                 emit(Piece::GfxOther(bytes));
             }
             Piece::GfxDisplay(bytes) => {
-                self.transfer = None;
+                self.drop_transfer(reservation, &mut None);
                 emit(Piece::GfxDisplay(bytes));
             }
             Piece::Rejected => {
-                self.transfer = None;
+                self.drop_transfer(None, &mut None);
                 emit(Piece::Rejected);
             }
             other => emit(other),
@@ -355,7 +421,12 @@ impl KittyRelay {
 
 /// Classify a complete APC sequence (`ESC _ … ESC \`). Non-graphics APCs (not
 /// `ESC _ G`) pass through to the emulator verbatim.
-fn classify(seq: Vec<u8>, content_size: (usize, usize), ids: &mut CornerIds) -> Piece {
+fn classify(
+    seq: Vec<u8>,
+    content_size: (usize, usize),
+    ids: &mut CornerIds,
+    reservation: &mut Option<Reservation>,
+) -> Piece {
     // seq = ESC _ <body> ESC \  → body is seq[2 .. len-2].
     if seq.len() < 4 || seq[2] != b'G' {
         return Piece::Emulator(seq);
@@ -370,7 +441,7 @@ fn classify(seq: Vec<u8>, content_size: (usize, usize), ids: &mut CornerIds) -> 
     } else {
         &[]
     };
-    match canonical_graphics(ctrl, payload, content_size, ids) {
+    match canonical_graphics(ctrl, payload, content_size, ids, reservation) {
         Some(Canonical::Query) => Piece::GfxAnswer(answer_for(ctrl)),
         Some(Canonical::Display(bytes)) => Piece::GfxDisplay(bytes),
         Some(Canonical::Other(bytes)) => Piece::GfxOther(bytes),
@@ -529,6 +600,7 @@ fn canonical_graphics(
     payload: &[u8],
     content_size: (usize, usize),
     ids: &mut CornerIds,
+    reservation: &mut Option<Reservation>,
 ) -> Option<Canonical> {
     let control = Control::parse(ctrl)?;
     let get = |key: &[u8]| control.get(key);
@@ -737,10 +809,19 @@ fn canonical_graphics(
     let mapped_id = if action == b"T" {
         if let Some(child_id) = get(b"i") {
             let child_id = parse_u32_positive(child_id)?;
-            let slot = ids.allocate(child_id)?;
+            let (slot, fresh) = ids.allocate(child_id)?;
+            *reservation = Some(Reservation {
+                id: ReservationId::Child(child_id),
+                fresh,
+            });
             Some(CornerIds::host_id(slot))
         } else {
+            let fresh = !ids.anonymous_live;
             ids.anonymous_live = true;
+            *reservation = Some(Reservation {
+                id: ReservationId::Anonymous,
+                fresh,
+            });
             Some(CornerIds::host_id(0))
         }
     } else if action == b"p" {
@@ -1271,6 +1352,21 @@ mod tests {
     }
 
     #[test]
+    fn rejected_transfers_release_fresh_id_slots() {
+        let mut relay = KittyRelay::new();
+        for child_id in 1..=15 {
+            let first = format!("Ga=T,i={child_id},m=1,f=24,s=1,v=1;AQ");
+            assert!(relay.feed(&apc(&first)).is_empty());
+            assert_eq!(relay.feed(&apc("Gm=0;I")), [Piece::Rejected]);
+        }
+
+        assert!(matches!(
+            relay.feed(&apc("Ga=T,i=999,f=24,s=1,v=1;AQID")).as_slice(),
+            [Piece::GfxDisplay(_)]
+        ));
+    }
+
+    #[test]
     fn trailing_lone_esc_is_buffered_then_completed() {
         let mut r = KittyRelay::new();
         // Text, then a lone ESC at the very end of the read.
@@ -1291,6 +1387,19 @@ mod tests {
             relay.feed(&apc("Ga=d,i=2;")).as_slice(),
             [Piece::GfxOther(_)]
         ));
+        assert_eq!(relay.feed(&apc("Gm=0;ID")), [Piece::Rejected]);
+    }
+
+    #[test]
+    fn empty_delete_all_emits_no_graphics_piece_and_cancels_transfer() {
+        let mut relay = KittyRelay::new();
+        assert!(relay.feed(&apc("Ga=d;")).is_empty());
+
+        assert!(relay.feed(&apc("Ga=T,i=2,m=1,f=24,s=1,v=1;AQ")).is_empty());
+        assert_eq!(
+            relay.feed(&apc("Ga=d;")),
+            [Piece::GfxOther(apc("Ga=d,d=I,i=2147418113,q=2;"))]
+        );
         assert_eq!(relay.feed(&apc("Gm=0;ID")), [Piece::Rejected]);
     }
 
@@ -1568,6 +1677,37 @@ mod tests {
         assert!(bytes.starts_with(b"\x1b_Ga=T,i=2147418113,m=1,"));
         assert!(bytes.ends_with(b"\x1b_Gm=0,q=2;ID\x1b\\"));
         assert_eq!(bytes.windows(2).filter(|part| *part == b"i=").count(), 1);
+    }
+
+    #[test]
+    fn multi_chunk_transfer_is_rejected_when_corner_geometry_changes() {
+        let mut relay = KittyRelay::new();
+        let mut pieces = Vec::new();
+        relay.feed_with_rect(&apc("Ga=T,i=19,m=1,f=24,s=1,v=1;AQ"), (40, 12), |piece| {
+            pieces.push(piece)
+        });
+        assert!(pieces.is_empty());
+
+        relay.feed_with_rect(&apc("Gm=0;ID"), (10, 4), |piece| pieces.push(piece));
+        assert_eq!(pieces, [Piece::Rejected]);
+        assert!(
+            !pieces
+                .iter()
+                .any(|piece| matches!(piece, Piece::GfxDisplay(_)))
+        );
+    }
+
+    #[test]
+    fn multi_chunk_transfer_keeps_same_corner_geometry() {
+        let mut relay = KittyRelay::new();
+        let mut pieces = Vec::new();
+        relay.feed_with_rect(&apc("Ga=T,i=19,m=1,f=24,s=1,v=1;AQ"), (40, 12), |piece| {
+            pieces.push(piece)
+        });
+        assert!(pieces.is_empty());
+
+        relay.feed_with_rect(&apc("Gm=0;ID"), (40, 12), |piece| pieces.push(piece));
+        assert!(matches!(pieces.as_slice(), [Piece::GfxDisplay(_)]));
     }
 
     #[test]
