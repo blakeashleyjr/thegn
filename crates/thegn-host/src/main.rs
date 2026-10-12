@@ -1079,15 +1079,15 @@ fn run_main() -> anyhow::Result<()> {
     //
     // Bounded over the `Runtime::new()` default (which sizes the worker pool to
     // ncpu and lets the blocking pool grow to 512): the host is I/O-bound, not
-    // compute-bound, so a small worker pool keeps latency snappy, and a tight
-    // blocking cap + short keep-alive stop the on-demand hydration/git threads
-    // from sprawling (each thread is a glibc arena → RSS). Tunable, but these
-    // defaults cut the steady-state thread count from ~60 without hurting feel.
+    // compute-bound, so a small worker pool keeps latency snappy. The blocking
+    // cap limits concurrency; a 45-second keep-alive avoids churning short-lived
+    // workers between nearby UI reads (each thread has a glibc arena), while
+    // still allowing the pool to shrink after a quiet interval.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(8)
         .max_blocking_threads(32)
-        .thread_keep_alive(std::time::Duration::from_secs(3))
+        .thread_keep_alive(std::time::Duration::from_secs(45))
         .thread_name("thegn-rt")
         .build()?;
     // Admit the configuration before the runtime starts and before the
