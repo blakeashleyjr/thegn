@@ -58,6 +58,11 @@ pub fn parse(locale: Option<&str>) -> Option<LocaleTag> {
         if s.is_empty() {
             continue;
         }
+        if s == "x" {
+            // Private-use subtags are opaque, even if they resemble a -u-
+            // extension or contain values the resolvers understand.
+            break;
+        }
         if in_unicode_ext {
             if s.len() == 1 {
                 // A different singleton ends the `u` extension.
@@ -179,6 +184,9 @@ mod tests {
         let t = parse(Some("en-t-hc-h12")).unwrap();
         assert_eq!(t.hour12, None);
         assert_eq!(t.region, None);
+        let t = parse(Some("en-x-u-hc-h12")).unwrap();
+        assert_eq!(t.hour12, None);
+        assert_eq!(t.first_day, None);
         // A -u- keyword with a value-less / unknown type is ignored.
         let t = parse(Some("en-GB-u-ca-gregory-fw-xyz")).unwrap();
         assert_eq!((t.hour12, t.first_day), (None, None));
