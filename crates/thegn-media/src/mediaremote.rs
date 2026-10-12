@@ -130,21 +130,19 @@ impl MediaBackend for MediaRemote {
         Box::pin(async move { self.run(&["previous"]).await.map(|_| ()) })
     }
     fn set_shuffle(&self, _on: bool) -> BoxFuture<'_, Result<(), MediaError>> {
-        Box::pin(async move { Err(MediaError::Backend("shuffle unsupported".into())) })
+        Box::pin(async move { Err(MediaError::Unsupported("shuffle".into())) })
     }
     fn set_loop(&self, _mode: crate::model::LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
-        Box::pin(async move { Err(MediaError::Backend("loop unsupported".into())) })
+        Box::pin(async move { Err(MediaError::Unsupported("loop".into())) })
     }
     fn volume_step(&self, _delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
-        Box::pin(async move {
-            Ok(()) // system Now-Playing exposes no volume; caps().volume == false
-        })
+        Box::pin(async move { Err(MediaError::Unsupported("volume step".into())) })
     }
     fn playlists(&self) -> BoxFuture<'_, Result<Vec<crate::model::Playlist>, MediaError>> {
-        Box::pin(async move { Ok(Vec::new()) })
+        Box::pin(async move { Err(MediaError::Unsupported("playlists".into())) })
     }
     fn activate_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move { Err(MediaError::Unsupported("playlist activation".into())) })
     }
 
     fn players(&self) -> BoxFuture<'_, Vec<String>> {
