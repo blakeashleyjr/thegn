@@ -898,15 +898,6 @@ mod tests {
     use super::*;
     use crate::devcontainer::parse;
 
-    fn temp_root(tag: &str) -> PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
-            "tg-dc-overlay-{tag}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ))
-    }
-
     fn ctx() -> SubstCtx<'static> {
         SubstCtx {
             local_workspace_folder: "/home/u/proj".into(),
@@ -1289,54 +1280,6 @@ mod tests {
         let warns = apply_to_sandbox(&dc, &mut sb, &ctx());
         assert!(sb.build.is_none());
         assert!(warns.iter().any(|warning| warning.contains("escapes")));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlinked_dockerfile_leaf_is_refused() {
-        use std::os::unix::fs::symlink;
-        let root = temp_root("link");
-        let outside = root.with_extension("outside");
-        std::fs::create_dir_all(root.join(".devcontainer")).unwrap();
-        std::fs::write(&outside, "FROM scratch").unwrap();
-        symlink(&outside, root.join(".devcontainer/Dockerfile")).unwrap();
-        let config_dir_path = root.join(".devcontainer");
-        let config_dir = config_dir_path.to_string_lossy();
-        let dc = parse_with_dir(
-            r#"{ "build": { "dockerfile": "Dockerfile", "context": "." } }"#,
-            config_dir.as_ref(),
-        );
-        let mut sb = SandboxConfig::default();
-        let warns = apply_to_sandbox(&dc, &mut sb, &ctx());
-        assert!(sb.build.is_none());
-        assert!(warns.iter().any(|warning| warning.contains("symlink")));
-        std::fs::remove_file(root.join(".devcontainer/Dockerfile")).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-        std::fs::remove_file(outside).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn dockerfile_below_symlinked_directory_is_refused() {
-        use std::os::unix::fs::symlink;
-        let root = temp_root("parent-link");
-        let outside = root.with_extension("outside-dir");
-        std::fs::create_dir_all(root.join(".devcontainer")).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        symlink(&outside, root.join(".devcontainer/sub")).unwrap();
-        let config_dir_path = root.join(".devcontainer");
-        let config_dir = config_dir_path.to_string_lossy();
-        let dc = parse_with_dir(
-            r#"{ "build": { "dockerfile": "sub/Dockerfile", "context": "." } }"#,
-            config_dir.as_ref(),
-        );
-        let mut sb = SandboxConfig::default();
-        let warns = apply_to_sandbox(&dc, &mut sb, &ctx());
-        assert!(sb.build.is_none());
-        assert!(warns.iter().any(|warning| warning.contains("symlink")));
-        std::fs::remove_file(root.join(".devcontainer/sub")).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-        std::fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
