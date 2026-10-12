@@ -44,7 +44,7 @@ mod tests {
     #[test]
     fn refused_preview_is_retained_and_submitted_once_when_capacity_returns() {
         let mut slot = PendingPreviewOob::default();
-        slot.offer(vec![1, 2], |bytes| Err(bytes));
+        slot.offer(vec![1, 2], Err);
         assert_eq!(slot.pending(), Some([1, 2].as_slice()));
 
         let submitted = RefCell::new(Vec::new());
@@ -63,10 +63,10 @@ mod tests {
     #[test]
     fn newer_blob_replaces_pending_and_empty_blob_does_not_clear_it() {
         let mut slot = PendingPreviewOob::default();
-        slot.offer(vec![1], |bytes| Err(bytes));
+        slot.offer(vec![1], Err);
         slot.offer(Vec::new(), |_| Ok(()));
         assert_eq!(slot.pending(), Some([1].as_slice()));
-        slot.offer(vec![2], |bytes| Err(bytes));
+        slot.offer(vec![2], Err);
         assert_eq!(slot.pending(), Some([2].as_slice()));
     }
 }
