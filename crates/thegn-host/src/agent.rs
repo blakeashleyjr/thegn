@@ -3524,16 +3524,9 @@ pub fn launch_spec_full(
     }
     // Tier-2 dotfiles: materialize each active bundle's dotfile tree into its
     // managed HOME (idempotent, off the event loop — launch_spec is blocking).
-    if !loc.is_remote()
-        && let Some(db) = db.as_ref()
-    {
-        let slug = repo_slug(db, &repo_root);
-        for name in bundle::active_chain(cfg, db, worktree, slug.as_deref()) {
-            if let Some(b) = cfg.bundle.get(&name)
-                && let Some(spec) = &b.dotfiles
-            {
-                bundle::materialize_dotfiles(spec, &bundle::managed_home(&name));
-            }
+    if !loc.is_remote() {
+        for (spec, home) in bundle::dotfile_targets(cfg, &resolved) {
+            bundle::materialize_dotfiles(&spec, &home);
         }
     }
     if let Some(spec) = outcome.spec.as_mut() {
