@@ -582,10 +582,7 @@ fn parse_hex(s: &str) -> Option<Rgb> {
     match h.len() {
         3 if h.is_ascii() => {
             let mut chars = h.chars();
-            let channel = |c: char| match u8::from_str_radix(&format!("{c}{c}"), 16) {
-                Ok(value) => Some(value),
-                Err(_) => None,
-            };
+            let channel = |c: char| Result::ok(u8::from_str_radix(&format!("{c}{c}"), 16));
             Some((
                 channel(chars.next()?)?,
                 channel(chars.next()?)?,
