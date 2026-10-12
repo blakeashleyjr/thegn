@@ -7773,6 +7773,7 @@ dependencies = [
  "anyhow",
  "ratatui",
  "serde",
+ "thegn-core",
  "toml 0.8.23",
 ]
 
