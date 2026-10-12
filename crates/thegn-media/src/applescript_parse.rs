@@ -16,9 +16,9 @@ use crate::model::{LoopMode, MediaKind, MediaState, PlaybackState};
 const SEP: char = '\u{1f}';
 const FIELDS: usize = 10;
 
-pub(crate) fn pick_active<'a>(
-    reads: Vec<(&'a str, Result<Option<String>, MediaError>)>,
-) -> Result<Option<(&'a str, String)>, MediaError> {
+pub(crate) fn pick_active(
+    reads: Vec<(&str, Result<Option<String>, MediaError>)>,
+) -> Result<Option<(&str, String)>, MediaError> {
     let mut first_error = None;
     for (app, read) in reads {
         match read {
