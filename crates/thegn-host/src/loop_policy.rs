@@ -184,7 +184,16 @@ mod tests {
         let mut slice: Vec<_> = (0..LOG_RETAIN + 2)
             .map(|index| thegn_core::log::parser::parse_log(&format!("line-{index}")))
             .collect();
-        slice[500] = thegn_core::log::parser::parse_log("[3 log lines dropped under overload]");
+        // Ingress creates synthetic gap metadata directly; parsing it as a
+        // source log would interpret its first words as timestamp and level.
+        let gap = "[3 log lines dropped under overload]".to_string();
+        slice[500] = ParsedLog {
+            timestamp: String::new(),
+            level: thegn_core::log::parser::LogLevel::Warn,
+            original: gap.clone(),
+            message: gap,
+            worktree: None,
+        };
         let mut rows = Vec::new();
 
         assert!(apply_log_slice(&mut rows, slice, true));
