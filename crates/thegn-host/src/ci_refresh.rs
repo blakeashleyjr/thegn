@@ -229,10 +229,11 @@ fn ci_refresh_coordinator() -> &'static Mutex<CiRefreshCoordinator> {
 }
 
 fn clear_ci_refresh_flight() {
-    if let Ok(mut coordinator) = ci_refresh_coordinator().lock() {
-        coordinator.flight.clear();
-        coordinator.queued = None;
-    }
+    let mut coordinator = ci_refresh_coordinator()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    coordinator.flight.clear();
+    coordinator.queued = None;
 }
 
 struct FlightGuard {
@@ -241,12 +242,14 @@ struct FlightGuard {
 
 impl Drop for FlightGuard {
     fn drop(&mut self) {
-        if let Ok(mut coordinator) = ci_refresh_coordinator().lock()
-            && coordinator
-                .flight
-                .running
-                .as_ref()
-                .is_some_and(|running| Arc::ptr_eq(&running.cancel, &self.cancel))
+        let mut coordinator = ci_refresh_coordinator()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if coordinator
+            .flight
+            .running
+            .as_ref()
+            .is_some_and(|running| Arc::ptr_eq(&running.cancel, &self.cancel))
         {
             coordinator.flight.clear();
             coordinator.queued = None;
@@ -408,23 +411,20 @@ pub(crate) fn spawn_ci_cache_refresh_with_generation(
         token,
         generation,
     };
-    let should_spawn = match ci_refresh_coordinator().lock() {
-        Ok(mut coordinator) => {
-            let token = FlightToken {
-                key: request.token.key.clone(),
-                force: request.token.force,
-                cancel: Arc::clone(&request.token.cancel),
-            };
-            let start = coordinator.flight.submit(token);
-            if !start {
-                coordinator.queued = Some(request.clone());
-            }
-            start
+    let should_spawn = {
+        let mut coordinator = ci_refresh_coordinator()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let token = FlightToken {
+            key: request.token.key.clone(),
+            force: request.token.force,
+            cancel: Arc::clone(&request.token.cancel),
+        };
+        let start = coordinator.flight.submit(token);
+        if !start {
+            coordinator.queued = Some(request.clone());
         }
-        Err(error) => {
-            tracing::debug!(target: "thegn::ci", %error, "could not admit CI cache refresh");
-            return;
-        }
+        start
     };
     if !should_spawn {
         return;
@@ -443,20 +443,17 @@ fn run_ci_refresh_worker(mut request: RefreshRequest) {
     loop {
         guard.cancel = Arc::clone(&request.token.cancel);
         run_ci_refresh_request(&request);
-        let next = match ci_refresh_coordinator().lock() {
-            Ok(mut coordinator) => {
-                let token = coordinator.flight.finish();
-                match token {
-                    Some(token) => coordinator.queued.take().map(|mut next| {
-                        next.token = token;
-                        next
-                    }),
-                    None => None,
-                }
-            }
-            Err(error) => {
-                tracing::debug!(target: "thegn::ci", %error, "could not finish CI cache refresh flight");
-                None
+        let next = {
+            let mut coordinator = ci_refresh_coordinator()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let token = coordinator.flight.finish();
+            match token {
+                Some(token) => coordinator.queued.take().map(|mut next| {
+                    next.token = token;
+                    next
+                }),
+                None => None,
             }
         };
         let Some(next) = next else {
@@ -468,10 +465,13 @@ fn run_ci_refresh_worker(mut request: RefreshRequest) {
 
 fn run_ci_refresh_request(request: &RefreshRequest) {
     let cfg = request.full.ci.clone();
-    let Some(path) = request.token.key.active_path.as_deref() else {
-        return;
-    };
-    let cwd = std::path::Path::new(path);
+    let cwd = request
+        .token
+        .key
+        .active_path
+        .as_deref()
+        .map(std::path::Path::new)
+        .unwrap_or_else(|| std::path::Path::new(""));
     if cwd.is_dir() {
         let loc = thegn_core::remote::GitLoc::for_worktree(cwd);
         refresh_ci_cache_for(
@@ -653,7 +653,7 @@ fn refresh_ci_cache_for(
                 });
             }
         }
-        Err(e) if cancel.load(Ordering::Relaxed) => return false,
+        Err(_) if cancel.load(Ordering::Relaxed) => return false,
         Err(e) => {
             if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
                 return false;
@@ -891,9 +891,9 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
-            if !call_budget.charge_bytes(log.text.len()) {
+            let within_byte_budget = call_budget.charge_bytes(log.text.len());
+            if !within_byte_budget {
                 tracing::debug!(target: "thegn::ci", budget = MAX_LOG_INGEST_BYTES, "CI log ingestion byte budget exhausted");
-                break 'runs;
             }
             let mut entry = thegn_core::ci_log::CiLogEntry::new(
                 &key,
@@ -925,6 +925,9 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
                     tracing::debug!(target: "thegn::ci", %error, "could not cache fetched CI log");
                     run_complete = false;
                 }
+            }
+            if !within_byte_budget {
+                break 'runs;
             }
         }
         if run_complete
@@ -1305,6 +1308,7 @@ mod tests {
             .with_log_text("x".repeat(MAX_LOG_INGEST_BYTES + 1));
         let runs = [ci_run("run-a", "sha-a"), ci_run("run-b", "sha-b")];
         ingest_test(&temp, &provider, &runs, MAX_LOG_INGEST_CALLS, 60_000);
+        ingest_test(&temp, &provider, &runs[..1], MAX_LOG_INGEST_CALLS, 60_001);
         assert_eq!(provider.log_calls.lock().expect("calls").len(), 1);
     }
 
@@ -1478,21 +1482,17 @@ mod tests {
     #[test]
     fn ci_refresh_latch_clears_after_refused_admission() {
         let _lock = FLIGHT_TEST_LOCK.lock().expect("flight test lock");
-        {
-            let mut coordinator = ci_refresh_coordinator().lock().expect("coordinator");
-            coordinator
-                .flight
-                .submit(flight_token("/refused", None, false));
-        }
         clear_ci_refresh_flight();
-        assert!(
-            ci_refresh_coordinator()
-                .lock()
-                .expect("coordinator")
-                .flight
-                .running
-                .is_none()
+        spawn_ci_cache_refresh_with_generation(
+            crate::session::Session::default(),
+            thegn_core::config::Config::default(),
+            None,
+            false,
+            None,
         );
+        let coordinator = ci_refresh_coordinator().lock().expect("coordinator");
+        assert!(coordinator.flight.running.is_none());
+        assert!(coordinator.queued.is_none());
     }
 
     #[test]
