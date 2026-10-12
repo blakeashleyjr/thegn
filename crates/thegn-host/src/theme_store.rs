@@ -522,11 +522,7 @@ pub(crate) fn scan_dir(dir: &Path) -> (Vec<UserTheme>, Vec<String>) {
             .get(&thegn_core::util::slugify(&theme.meta.name))
             .copied()
             .unwrap_or(0);
-        if exact_count > 1 || normalized_count > 1 {
-            false
-        } else {
-            true
-        }
+        exact_count <= 1 && normalized_count <= 1
     });
     themes.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
     warnings.sort();
@@ -643,16 +639,6 @@ pub(crate) fn write_theme(dir: &Path, theme: &UserTheme) -> Result<(), String> {
                 return Err(format!(
                     "theme filename collision: `{}` already belongs to `{}`",
                     destination.display(),
-                    existing.meta.name
-                ));
-            }
-            let expected_filename =
-                format!("{}.toml", thegn_core::util::slugify(&existing.meta.name));
-            if destination.file_name().and_then(|name| name.to_str())
-                != Some(expected_filename.as_str())
-            {
-                return Err(format!(
-                    "existing theme filename does not match `{}`",
                     existing.meta.name
                 ));
             }
@@ -878,7 +864,7 @@ mod tests {
         assert!(edited.contains("text = \"#abcdef\""));
         assert!(edited.contains("bg0 = \"#010203\""));
         assert!(edited.contains("# keep bg0"));
-        let _ = std::fs::remove_dir_all(dir);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -942,7 +928,7 @@ mod tests {
             }
         }
         assert_eq!((imported, saved, applied), (1, 1, 1));
-        let _ = std::fs::remove_dir_all(dir);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -959,7 +945,7 @@ mod tests {
             warning.contains(path.to_string_lossy().as_ref())
                 && warning.contains(thegn_core::theme::PRESETS[0])
         }));
-        let _ = std::fs::remove_dir_all(dir);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -975,7 +961,7 @@ mod tests {
         let error = write_theme(&dir, &theme("Night-Sky")).unwrap_err();
         assert!(error.contains("filename collision"), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        let _ = std::fs::remove_dir_all(dir);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -996,7 +982,7 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("ambiguous user theme identity"))
         );
-        let _ = std::fs::remove_dir_all(dir);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1014,7 +1000,7 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("ambiguous normalized user theme identity"))
         );
-        let _ = std::fs::remove_dir_all(dir);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1109,7 +1095,7 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
-        assert!(std::fs::metadata(&config).unwrap().is_file());
+        assert!(std::fs::metadata(&config).unwrap().permissions().readonly());
         assert!(
             std::fs::read_to_string(&config)
                 .unwrap()
