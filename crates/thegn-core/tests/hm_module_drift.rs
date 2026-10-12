@@ -1,12 +1,15 @@
 //! `nix/hm-module.nix` is a hand-maintained third copy of the config schema
-//! (Rust structs → `config.toml.example` → the home-manager module). Two
-//! drift checks keep it honest against the Rust source of truth:
+//! (Rust structs → `config.toml.example` → the home-manager module).
+//! Four drift checks keep it honest against the Rust source of truth:
 //!
 //! 1. every TOML key the module's `tomlFormat.generate` block renders exists
 //!    in the `Config` schema (same walker as the example-file test);
 //! 2. every `lib.types.enum [...]` value list is a subset of some
 //!    `config_enum!`'s accepted spellings (canonical + aliases), so the Nix
 //!    option can never offer a value the binary rejects.
+//! 3. every numeric option's Nix range matches its Rust schema destination.
+//! 4. every Nix enum's values are accepted by that option's exact Rust schema
+//!    destination.
 //!
 //! The mapping is deliberately parsed from the Nix text (no Nix evaluator in
 //! the test): the block is a flat attrset of `snake_key = …;`, `section.key
@@ -320,9 +323,19 @@ fn every_numeric_option_matches_its_destination_range() {
             continue;
         }
 
-        let minimum = schema.get("minimum").and_then(Value::as_u64);
-        let maximum = schema.get("maximum").and_then(Value::as_u64);
-        assert_eq!(minimum, Some(0), "schema minimum for unsigned field {path}");
+        let minimum = schema.get("minimum").and_then(Value::as_f64);
+        assert_eq!(
+            minimum,
+            Some(0.0),
+            "schema minimum for unsigned field {path}"
+        );
+        let maximum = schema.get("maximum").and_then(Value::as_f64).map(|m| {
+            assert!(
+                m.fract().abs() < f64::EPSILON,
+                "schema maximum for {path} must be a whole number, got {m}"
+            );
+            m as u64
+        });
         if let Some(maximum) = maximum {
             assert_eq!(
                 nix_type,
