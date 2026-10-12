@@ -59,7 +59,6 @@
 
 crates/gtui-app/src/app.rs
 crates/gtui-app/src/engine.rs
-crates/tg-kit/src/standalone.rs
 crates/thegn-core/src/account.rs
 crates/thegn-core/src/activity.rs
 crates/thegn-core/src/ansi_cells.rs
