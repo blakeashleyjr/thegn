@@ -229,8 +229,8 @@ impl SessionMigrationStore for Db {
                 db.conn().execute(
                     "INSERT INTO agent_dispatches
                        (issue_id,worktree_path,agent_name,dispatched_at_ms,status,stage,
-                        parent_id,session_id,artifact_path,note,chunk_path,report)
-                     VALUES (?1,?2,?3,?4,?5,?6,NULL,NULL,?7,?8,?9,?10)",
+                        parent_id,session_id,artifact_path,note,chunk_path,report,chunk_scope)
+                     VALUES (?1,?2,?3,?4,?5,?6,NULL,NULL,?7,?8,?9,?10,?11)",
                     params![
                         dispatch.issue_id,
                         dispatch.worktree_path,
@@ -242,6 +242,7 @@ impl SessionMigrationStore for Db {
                         dispatch.note,
                         dispatch.chunk_path,
                         dispatch.report,
+                        dispatch.chunk_scope,
                     ],
                 )?;
                 result
@@ -427,7 +428,7 @@ fn sidebar_rows(db: &Db) -> Result<Vec<MigrationUiState>> {
 fn dispatches_for_worktree(db: &Db, worktree: &str) -> Result<Vec<MigrationDispatch>> {
     let mut stmt = db.conn().prepare(
         "SELECT id,issue_id,worktree_path,agent_name,dispatched_at_ms,status,stage,parent_id,
-                session_id,artifact_path,note,chunk_path,report
+                session_id,artifact_path,note,chunk_path,report,chunk_scope
            FROM agent_dispatches WHERE worktree_path=?1 ORDER BY id",
     )?;
     Ok(stmt
@@ -446,6 +447,7 @@ fn dispatches_for_worktree(db: &Db, worktree: &str) -> Result<Vec<MigrationDispa
                 note: row.get(10)?,
                 chunk_path: row.get(11)?,
                 report: row.get(12)?,
+                chunk_scope: row.get(13)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -774,6 +776,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "future_state");
+        assert!(target.confirm_migration(&plan).unwrap());
+    }
+
+    #[test]
+    fn migration_preserves_admitted_chunk_scope_verbatim() {
+        let source = Db::open_memory().unwrap();
+        let target = Db::open_memory().unwrap();
+        source
+            .conn()
+            .execute(
+                "INSERT INTO agent_dispatches
+                   (issue_id,worktree_path,agent_name,dispatched_at_ms,status)
+                 VALUES('THE-214','/scope','agent',1,'running')",
+                [],
+            )
+            .unwrap();
+        source
+            .conn()
+            .execute(
+                "UPDATE agent_dispatches SET chunk_scope=?1 WHERE worktree_path='/scope'",
+                [r#"{"v":1,"files":["src/**"]}"#],
+            )
+            .unwrap();
+
+        let bundle = source
+            .migration_snapshot("default", "target", "default", "/scope")
+            .unwrap();
+        let plan = plan_migration(
+            bundle,
+            target
+                .migration_target_snapshot("default", "/scope")
+                .unwrap(),
+        )
+        .unwrap();
+        target.import_migration(&plan).unwrap();
+
+        let migrated_id: i64 = target
+            .conn()
+            .query_row(
+                "SELECT id FROM agent_dispatches WHERE worktree_path='/scope'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            target.dispatch_chunk_scope(migrated_id).unwrap(),
+            Some(vec!["src/**".to_string()])
+        );
         assert!(target.confirm_migration(&plan).unwrap());
     }
 
