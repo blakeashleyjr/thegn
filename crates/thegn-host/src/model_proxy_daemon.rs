@@ -678,9 +678,15 @@ mod tests {
         let server = std::thread::spawn(move || {
             for _ in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0u8; 512];
-                let count = stream.read(&mut request).unwrap();
-                let request = String::from_utf8_lossy(&request[..count]);
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 128];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert_ne!(count, 0, "identity request ended before its headers");
+                    request.extend_from_slice(&chunk[..count]);
+                    assert!(request.len() <= 512, "identity request headers too large");
+                }
+                let request = String::from_utf8_lossy(&request);
                 let challenge = request
                     .split("challenge=")
                     .nth(1)
