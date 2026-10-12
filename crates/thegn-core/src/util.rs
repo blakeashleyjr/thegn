@@ -1395,12 +1395,9 @@ impl Drop for GitWriteScope {
 }
 
 /// A held cross-process advisory lock around git MUTATIONS on a shared repo.
-/// Multiple thegn/agent processes operating on the same canonical `.git` would
-/// otherwise race it (concurrent `worktree add`/commit/rebase clobbering the
-/// shared index/refs/config — the corruption behind the core.worktree saga).
-/// `flock` is advisory and tied to the open fd, so the lock auto-releases on
-/// `Drop` AND on process death — there are never stale locks. Reads stay
-/// lock-free; only the svc write runners acquire this.
+/// The lock coordinates thegn processes that acquire it; ordinary Git commands
+/// do not honor it. `flock` is advisory and tied to the open fd, so it
+/// auto-releases on `Drop` and process death. Reads stay lock-free.
 #[must_use = "the lock releases as soon as the guard is dropped"]
 pub struct GitLock(
     // Held purely for RAII: the unix Drop unlocks explicitly; on Windows the
@@ -1408,27 +1405,51 @@ pub struct GitLock(
     #[cfg_attr(windows, allow(dead_code))] std::fs::File,
 );
 
-/// Acquire the per-repo git-mutation lock (blocking) at
-/// `<git-common>/thegn-git.lock`, serializing concurrent mutations on the
-/// same `.git`. Best-effort: returns `None` (degrading to today's unlocked
-/// behavior) if the lock file can't be opened/locked, so a permissions quirk
-/// never wedges the user out of git. Call only on background threads — it blocks.
+/// Acquire the per-repo git-mutation lock at `<git-common>/thegn-git.lock`.
+/// This typed API reports failure so a required mutation can refuse to run.
+/// It blocks while another holder has the lock; call only on background
+/// threads. The lock coordinates thegn callers only, not ordinary Git.
 // The `fcntl::Flock` replacement takes ownership of the file (RAII guard),
 // which doesn't fit this guard's separate Drop unlock; the raw call is still
 // sound here — migrate both together.
 #[allow(deprecated)]
 #[cfg(not(windows))]
-pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
+pub fn try_lock_git_mutations(worktree: &Path) -> std::io::Result<GitLock> {
     let path = git_common_dir(worktree).join("thegn-git.lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .ok()?;
-    file.lock().ok()?;
-    Some(GitLock(file))
+    let file = match crate::fsperm::open_regular_file_nofollow(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match crate::fsperm::create_owner_only_exclusive(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    crate::fsperm::open_regular_file_nofollow(&path)?
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    file.lock()?;
+    Ok(GitLock(file))
+}
+
+/// Legacy best-effort wrapper. New required mutations should use
+/// [`try_lock_git_mutations`] and refuse to proceed when acquisition fails.
+/// The lock is advisory among thegn callers; ordinary Git does not honor it.
+#[cfg(not(windows))]
+pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
+    match try_lock_git_mutations(worktree) {
+        Ok(lock) => Some(lock),
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::git",
+                worktree = %worktree.display(),
+                error = %error,
+                "could not acquire git-mutation lock"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -2119,6 +2140,132 @@ mod tests {
             "re-acquire after drop succeeds"
         );
         let _ = std::fs::remove_dir_all(&tmp); // best-effort: test cleanup: scratch removal must never fail the test
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_git_lock_creates_owner_only_file_and_reacquires() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let worktree = temp.path().join("repo");
+        std::fs::create_dir_all(worktree.join(".git")).unwrap();
+
+        let lock_path = worktree.join(".git/thegn-git.lock");
+        let lock = try_lock_git_mutations(&worktree).unwrap();
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "new lock file must be owner-only"
+        );
+        drop(lock);
+        drop(try_lock_git_mutations(&worktree).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_git_lock_waits_for_another_holder() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let worktree = temp.path().join("repo");
+        std::fs::create_dir_all(worktree.join(".git")).unwrap();
+        let held = try_lock_git_mutations(&worktree).unwrap();
+        let worker_worktree = worktree.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let acquired = try_lock_git_mutations(&worker_worktree).is_ok();
+            sender.send(acquired).unwrap();
+        });
+
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "second process-equivalent holder must wait while the lock is held"
+        );
+        drop(held);
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(true),
+            "second holder must acquire after release"
+        );
+        worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_git_lock_refuses_symlink_without_creating_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let worktree = temp.path().join("repo");
+        std::fs::create_dir_all(worktree.join(".git")).unwrap();
+        let outside = temp.path().join("outside");
+        symlink(&outside, worktree.join(".git/thegn-git.lock")).unwrap();
+
+        let error = try_lock_git_mutations(&worktree)
+            .err()
+            .expect("symlink lock path must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            !outside.exists(),
+            "lock acquisition must not follow the link"
+        );
+        assert!(lock_git_mutations(&worktree).is_none());
+        assert!(!outside.exists(), "legacy wrapper must also fail closed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_git_lock_refuses_fifo_directory_and_missing_common_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let worktree = temp.path().join("repo");
+        std::fs::create_dir_all(worktree.join(".git")).unwrap();
+
+        let fifo = worktree.join(".git/thegn-git.lock");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        assert_eq!(
+            try_lock_git_mutations(&worktree)
+                .err()
+                .expect("FIFO lock path must be refused")
+                .kind(),
+            std::io::ErrorKind::InvalidInput,
+            "FIFO must be rejected without blocking"
+        );
+        std::fs::remove_file(&fifo).unwrap();
+
+        std::fs::create_dir(&fifo).unwrap();
+        assert_eq!(
+            try_lock_git_mutations(&worktree)
+                .err()
+                .expect("directory lock path must be refused")
+                .kind(),
+            std::io::ErrorKind::InvalidInput,
+            "directory must be rejected"
+        );
+        std::fs::remove_dir(&fifo).unwrap();
+
+        let no_git_worktree = temp.path().join("missing-git");
+        std::fs::create_dir(&no_git_worktree).unwrap();
+        assert_eq!(
+            try_lock_git_mutations(&no_git_worktree)
+                .err()
+                .expect("lock creation must fail without a common directory")
+                .kind(),
+            std::io::ErrorKind::NotFound,
+            "lock creation must report a missing common directory"
+        );
     }
 
     #[test]
