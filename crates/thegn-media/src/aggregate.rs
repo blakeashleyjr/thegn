@@ -120,15 +120,18 @@ impl MediaBackend for Aggregate {
     /// Union of every child's controllable players (for the picker).
     fn players(&self) -> BoxFuture<'_, Vec<String>> {
         Box::pin(async move {
-            let players =
-                join_all(self.children.iter().map(|c| async move {
-                    tokio::time::timeout(SNAPSHOT_BUDGET, c.players()).await
-                }))
-                .await;
+            let players = join_all(self.children.iter().enumerate().map(|(i, c)| async move {
+                (i, tokio::time::timeout(SNAPSHOT_BUDGET, c.players()).await)
+            }))
+            .await;
             let mut out = Vec::new();
-            for result in players {
-                let Ok(source_players) = result else {
-                    continue;
+            for (i, result) in players {
+                let source_players = match result {
+                    Ok(source_players) => source_players,
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::media", child = i, %error, "media players timed out");
+                        continue;
+                    }
                 };
                 for p in source_players {
                     if !out.contains(&p) {
@@ -147,13 +150,12 @@ impl MediaBackend for Aggregate {
             let watches = join_all(
                 self.children
                     .iter()
-                    .map(|c| bounded_watch(c.watch(), SNAPSHOT_BUDGET)),
+                    .enumerate()
+                    .map(|(i, c)| bounded_watch(i, c.watch(), SNAPSHOT_BUDGET)),
             )
             .await;
-            let children = watches;
-            children
-                .iter()
-                .any(Option::is_some)
+            let children = watches.into_iter().flatten().collect::<Vec<_>>();
+            (!children.is_empty())
                 .then(|| Box::new(AggregateWatch { children }) as Box<dyn MediaWatch + Send>)
         })
     }
@@ -202,6 +204,9 @@ impl Aggregate {
             *self.active.lock().unwrap() = None;
             return Ok(None);
         }
+        for (child, error) in &failures {
+            tracing::debug!(target: "thegn::media", child = *child, %error, "media snapshot failed; using another source");
+        }
         let sticky = self.sticky.lock().unwrap().clone();
         let view: Vec<(&str, PlaybackState)> = cands
             .iter()
@@ -216,13 +221,18 @@ impl Aggregate {
 }
 
 fn bounded_watch<'a>(
+    child: usize,
     watch: BoxFuture<'a, Option<Box<dyn MediaWatch + Send>>>,
     budget: std::time::Duration,
 ) -> BoxFuture<'a, Option<Box<dyn MediaWatch + Send>>> {
     Box::pin(async move {
-        tokio::time::timeout(budget, watch)
-            .await
-            .unwrap_or_default()
+        match tokio::time::timeout(budget, watch).await {
+            Ok(watch) => watch,
+            Err(error) => {
+                tracing::debug!(target: "thegn::media", child, %error, "media watcher setup timed out");
+                None
+            }
+        }
     })
 }
 
@@ -302,8 +312,10 @@ pub fn choose_state(
 
 /// A merged push stream that directly owns every child watcher. Child futures
 /// are polled concurrently; dropping this value drops all watchers immediately.
+/// The merged stream ends as soon as any child stream ends, so the host can
+/// reconnect and resolve the available sources again.
 pub struct AggregateWatch {
-    children: Vec<Option<Box<dyn MediaWatch + Send>>>,
+    children: Vec<Box<dyn MediaWatch + Send>>,
 }
 
 impl MediaWatch for AggregateWatch {
@@ -311,28 +323,21 @@ impl MediaWatch for AggregateWatch {
         &mut self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
         Box::pin(async move {
-            loop {
-                let futures = self
-                    .children
-                    .iter_mut()
-                    .enumerate()
-                    .filter_map(|(index, child)| {
-                        child.as_mut().map(|watch| {
-                            Box::pin(async move { (index, watch.changed().await) })
-                                as BoxFuture<'_, (usize, bool)>
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                if futures.is_empty() {
-                    return false;
-                }
-                let ((index, changed), _, remaining) = select_all(futures).await;
-                drop(remaining);
-                if changed {
-                    return true;
-                }
-                self.children[index] = None;
+            let futures = self
+                .children
+                .iter_mut()
+                .enumerate()
+                .map(|(index, watch)| {
+                    Box::pin(async move { (index, watch.changed().await) })
+                        as BoxFuture<'_, (usize, bool)>
+                })
+                .collect::<Vec<_>>();
+            if futures.is_empty() {
+                return false;
             }
+            let ((_, changed), _, remaining) = select_all(futures).await;
+            drop(remaining);
+            changed
         })
     }
 }
@@ -438,19 +443,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aggregate_watch_reports_simultaneous_changes_as_refresh_wakes() {
+    async fn aggregate_watch_ends_when_any_child_ends() {
+        let stalled_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let aggregate = Aggregate::new(
             vec![
-                fake_backend(Box::new(ReadyWatch(Some(true)))),
-                fake_backend(Box::new(ReadyWatch(Some(true)))),
+                fake_backend(Box::new(DropWatch(stalled_dropped.clone()))),
+                fake_backend(Box::new(ReadyWatch(Some(false)))),
             ],
             Vec::new(),
         );
         let mut watch = aggregate.watch().await.unwrap();
-        // Both ready children produce their own wake, then the stream ends.
-        assert!(watch.changed().await);
-        assert!(watch.changed().await);
-        assert!(!watch.changed().await);
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), watch.changed()).await,
+            Ok(false)
+        );
+        drop(watch);
+        assert!(stalled_dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn aggregate_watch_reports_simultaneous_changes_as_refresh_wakes() {
+        let aggregate = Aggregate::new(
+            vec![
+                fake_backend(Box::new(WakeOnceWatch(false))),
+                fake_backend(Box::new(WakeOnceWatch(false))),
+            ],
+            Vec::new(),
+        );
+        let mut watch = aggregate.watch().await.unwrap();
+        // Each child produces a wake, then remains alive and pending.
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), watch.changed()).await,
+            Ok(true)
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), watch.changed()).await,
+            Ok(true)
+        );
     }
 
     #[tokio::test]
@@ -458,8 +488,8 @@ mod tests {
         let healthy = Box::pin(async { Some(Box::new(TestWatch) as Box<dyn MediaWatch + Send>) });
         let stalled = Box::pin(std::future::pending());
         let watches = join_all([
-            bounded_watch(stalled, std::time::Duration::from_millis(10)),
-            bounded_watch(healthy, std::time::Duration::from_millis(10)),
+            bounded_watch(0, stalled, std::time::Duration::from_millis(10)),
+            bounded_watch(1, healthy, std::time::Duration::from_millis(10)),
         ])
         .await;
 
@@ -640,6 +670,21 @@ mod tests {
             &mut self,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
             Box::pin(async move { self.0.take().unwrap_or(false) })
+        }
+    }
+
+    struct WakeOnceWatch(bool);
+
+    impl MediaWatch for WakeOnceWatch {
+        fn changed(
+            &mut self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+            if self.0 {
+                Box::pin(std::future::pending())
+            } else {
+                self.0 = true;
+                Box::pin(async { true })
+            }
         }
     }
 
