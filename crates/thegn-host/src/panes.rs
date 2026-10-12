@@ -483,6 +483,18 @@ impl Panes {
         }
     }
 
+    /// Mark an existing pane as a filtered corner stream and clear any
+    /// per-pane byte recording that cannot reproduce its parser boundaries.
+    #[allow(
+        dead_code,
+        reason = "corner activation sites are owned by adjacent batch lanes"
+    )]
+    pub(crate) fn enter_corner_role(&mut self, id: u32) {
+        if let Some(pane) = self.table.get_mut(&id) {
+            pane.enter_corner_role();
+        }
+    }
+
     /// Spawn one shell pane in `cwd`, sized to `center`; returns its id.
     pub(crate) fn spawn(
         &mut self,
