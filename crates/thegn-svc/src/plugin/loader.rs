@@ -137,7 +137,7 @@ pub fn discover(cfg: &Config, config_dir: &Path) -> (Vec<LoadedPlugin>, Vec<Spec
         }
     }
     dirs.sort();
-    let mut plugin_dir_count = 0;
+    let mut manifests = Vec::new();
     for dir in dirs {
         let manifest_path = dir.join("plugin.toml");
         let metadata = match std::fs::symlink_metadata(&manifest_path) {
@@ -148,17 +148,20 @@ pub fn discover(cfg: &Config, config_dir: &Path) -> (Vec<LoadedPlugin>, Vec<Spec
                 continue;
             }
         };
-        plugin_dir_count += 1;
-        if plugin_dir_count > MAX_PLUGIN_DIRS {
-            problems.push(discovery_problem(
-                &plugins_dir,
-                format!("plugin directory count exceeds {MAX_PLUGIN_DIRS}"),
-            ));
-            problems.sort_by(|left, right| {
-                (&left.plugin, &left.problem).cmp(&(&right.plugin, &right.problem))
-            });
-            return (out, problems);
-        }
+        manifests.push((dir, metadata));
+    }
+    if manifests.len() > MAX_PLUGIN_DIRS {
+        problems.push(discovery_problem(
+            &plugins_dir,
+            format!("plugin directory count exceeds {MAX_PLUGIN_DIRS}"),
+        ));
+        problems.sort_by(|left, right| {
+            (&left.plugin, &left.problem).cmp(&(&right.plugin, &right.problem))
+        });
+        return (out, problems);
+    }
+    for (dir, metadata) in manifests {
+        let manifest_path = dir.join("plugin.toml");
         match metadata {
             metadata if metadata.file_type().is_symlink() => {
                 problems.push(discovery_problem(
