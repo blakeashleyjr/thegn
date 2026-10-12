@@ -692,3 +692,20 @@ fn horizons_are_bounded_at_admission_and_never_collapse() {
     assert!(ok.sync_horizon(chrono::NaiveDate::MIN).is_err());
     assert!(ok.sync_horizon(chrono::NaiveDate::MAX).is_err());
 }
+
+#[test]
+fn a_default_reminder_lead_beyond_the_horizon_is_a_validation_error() {
+    use crate::calendar::reminders::MAX_LEAD_MINS;
+    let ok = CalendarConfig {
+        reminder_default_mins: vec![10, MAX_LEAD_MINS],
+        ..CalendarConfig::default()
+    };
+    assert!(validate_calendar(&ok).is_empty());
+    let bad = CalendarConfig {
+        reminder_default_mins: vec![10, MAX_LEAD_MINS + 1],
+        ..CalendarConfig::default()
+    };
+    let errors = validate_calendar(&bad);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("reminder_default_mins[1]"), "{errors:?}");
+}
