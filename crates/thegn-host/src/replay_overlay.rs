@@ -541,7 +541,7 @@ impl ReplayOverlay {
             &Line::SplitMinLeft {
                 l: left,
                 r: right,
-                min_l: 20,
+                min_l: 32,
             },
             panel,
         );
