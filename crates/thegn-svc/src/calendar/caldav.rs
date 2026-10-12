@@ -21,7 +21,7 @@ use thegn_core::calendar::CalendarWindow;
 use thegn_core::config_calendar::CalendarAccount;
 use tokio::time::Instant;
 
-use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage};
+use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage, PageMode};
 use crate::http::{
     CalendarHttpClient, CalendarHttpError, ExpectedMedia, MAX_BODY_BYTES, MAX_REQUEST_BYTES,
     discard_body, map_error, read_body, validate_encoding, validate_media,
@@ -40,7 +40,7 @@ pub(super) fn map_transport_error(error: CalendarHttpError) -> CalendarError {
 pub struct CalDavBackend {
     username: String,
     token: String,
-    zone: String,
+    zone: thegn_core::calendar::Tz,
     calendar_ids: Vec<String>,
     timeout: Duration,
     admission: AccountAdmission,
@@ -65,7 +65,7 @@ impl CalDavBackend {
         CalDavBackend {
             username: a.username.clone(),
             token: thegn_core::config::expand_env_ref(&a.token).unwrap_or_default(),
-            zone: String::new(),
+            zone: admission.zone(),
             calendar_ids: a
                 .calendar_ids
                 .iter()
@@ -83,15 +83,15 @@ impl CalDavBackend {
         }
     }
 
-    pub fn with_zone(mut self, zone: &str) -> Self {
-        self.zone = zone.to_string();
-        self
-    }
-
     #[cfg(test)]
     pub(crate) fn with_timeout_for_test(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stored_cursor_for_test(&self, server_token: &str) -> String {
+        scope_token(&self.calendar_ids, self.zone.name(), server_token)
     }
 
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -330,8 +330,10 @@ fn page_from_multistatus(
     text: &str,
     zone: &str,
     calendar_ids: &[String],
+    mode: PageMode,
     mut meter: AdmissionMeter,
 ) -> Result<EventPage, CalendarError> {
+    debug_assert!(matches!(mode, PageMode::Snapshot | PageMode::Delta));
     let mut events = Vec::new();
     let mut deleted = Vec::new();
     let token = walk_multistatus(text, |r| {
@@ -342,6 +344,11 @@ fn page_from_multistatus(
             return Ok(());
         }
         if r.deleted {
+            // A snapshot is the complete picture: what it omits is already
+            // gone, so a stray 404 entry in a `calendar-query` carries nothing.
+            if mode != PageMode::Delta {
+                return Ok(());
+            }
             // The href is all a tombstone carries, so it has to be the id.
             // `uid_from_href` mirrors what the fetch path stores.
             let id = uid_from_href(&r.href);
@@ -363,16 +370,16 @@ fn page_from_multistatus(
         meter.release_transient(copy);
         parsed.map_err(CalendarError::from)
     })?;
-    let token = scope_token(calendar_ids, &token);
-    EventPage::from_meter(meter, events, deleted, token)
+    let token = scope_token(calendar_ids, zone, &token);
+    EventPage::from_meter(meter, mode, events, deleted, token)
 }
 
-const SCOPE_PREFIX: &str = "tgf1:";
+const SCOPE_PREFIX: &str = "tgf2:";
 
 /// A stable (FNV-1a) digest of the effective collection filter, independent of
 /// order and duplicates. `DefaultHasher` is not stable across releases, and the
 /// digest is persisted inside the cursor.
-fn filter_digest(ids: &[String]) -> u64 {
+fn filter_digest(ids: &[String], zone: &str) -> u64 {
     let mut sorted: Vec<&str> = ids.iter().map(String::as_str).collect();
     sorted.sort_unstable();
     sorted.dedup();
@@ -383,26 +390,30 @@ fn filter_digest(ids: &[String]) -> u64 {
             h = h.wrapping_mul(0x0100_0000_01b3);
         }
     }
+    for b in zone.bytes().chain(std::iter::once(0)) {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
     h
 }
 
-/// Bind a server sync token to the filter it was collected under. An empty
-/// token stays empty (it means "no cursor").
-pub(crate) fn scope_token(ids: &[String], token: &str) -> String {
+/// Bind a server sync token to the collection filter and floating-time zone it
+/// was collected under. An empty token stays empty (it means "no cursor").
+pub(crate) fn scope_token(ids: &[String], zone: &str, token: &str) -> String {
     if token.is_empty() {
         return String::new();
     }
-    format!("{SCOPE_PREFIX}{:016x}:{token}", filter_digest(ids))
+    format!("{SCOPE_PREFIX}{:016x}:{token}", filter_digest(ids, zone))
 }
 
 /// The server token inside a stored cursor, or empty (forcing a full fetch)
 /// when the cursor was minted under a different filter or predates scoping.
-fn unscope_token<'a>(ids: &[String], stored: &'a str) -> &'a str {
+fn unscope_token<'a>(ids: &[String], zone: &str, stored: &'a str) -> &'a str {
     let Some(rest) = stored.strip_prefix(SCOPE_PREFIX) else {
         return "";
     };
     match rest.split_once(':') {
-        Some((digest, token)) if digest == format!("{:016x}", filter_digest(ids)) => token,
+        Some((digest, token)) if digest == format!("{:016x}", filter_digest(ids, zone)) => token,
         _ => "",
     }
 }
@@ -493,7 +504,7 @@ impl CalendarBackend for CalDavBackend {
         to: NaiveDate,
         sync_token: &'a str,
     ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
-        let Some(window) = CalendarWindow::new(from, to, thegn_core::calendar::Tz::UTC) else {
+        let Some(window) = CalendarWindow::new(from, to, self.zone) else {
             return Box::pin(async { Err(CalendarError::Api("invalid calendar window".into())) });
         };
         self.list_events_for_window(window, sync_token)
@@ -530,7 +541,7 @@ impl CalDavBackend {
 
             // A cursor minted under a different `calendar_ids` filter must not
             // resume: the server's delta would omit collections newly selected.
-            let sync_token = unscope_token(&self.calendar_ids, sync_token);
+            let sync_token = unscope_token(&self.calendar_ids, self.zone.name(), sync_token);
             let incremental = !sync_token.is_empty();
             let body = if incremental {
                 sync_collection_body(sync_token)?
@@ -613,7 +624,17 @@ impl CalDavBackend {
             meter.release_transient(MAX_BODY_BYTES - text.capacity().min(MAX_BODY_BYTES));
             let text = String::from_utf8(text)
                 .map_err(|_| CalendarError::Parse("CalDAV response is not UTF-8".into()))?;
-            match page_from_multistatus(&text, self.zone(), &self.calendar_ids, meter) {
+            match page_from_multistatus(
+                &text,
+                self.zone(),
+                &self.calendar_ids,
+                if incremental {
+                    PageMode::Delta
+                } else {
+                    PageMode::Snapshot
+                },
+                meter,
+            ) {
                 // A delta over the account's own budget (a bulk delete, a
                 // server re-stamping everything) would be refused again on
                 // every tick, because the cursor is — correctly — not
@@ -638,11 +659,7 @@ impl CalDavBackend {
 
 impl CalDavBackend {
     fn zone(&self) -> &str {
-        if self.zone.is_empty() {
-            "UTC"
-        } else {
-            &self.zone
-        }
+        self.zone.name()
     }
 
     /// A 409/507 token recovery is exactly one additional REPORT, sharing the
@@ -697,7 +714,15 @@ impl CalDavBackend {
         meter.release_transient(MAX_BODY_BYTES - bytes.capacity().min(MAX_BODY_BYTES));
         let text = String::from_utf8(bytes)
             .map_err(|_| CalendarError::Parse("CalDAV response is not UTF-8".into()))?;
-        page_from_multistatus(&text, self.zone(), &self.calendar_ids, meter)
+        // Whatever the original request was, this page is a `calendar-query`
+        // snapshot: it is authoritative regardless of the token it returns.
+        page_from_multistatus(
+            &text,
+            self.zone(),
+            &self.calendar_ids,
+            PageMode::Snapshot,
+            meter,
+        )
     }
 }
 
@@ -793,8 +818,9 @@ mod tests {
 
     fn page(ids: &[&str]) -> EventPage {
         let ids: Vec<String> = ids.iter().map(|s| (*s).to_string()).collect();
-        let meter = AccountAdmission::isolated(Default::default()).meter();
-        page_from_multistatus(&multistatus(), "UTC", &ids, meter).unwrap()
+        let meter =
+            AccountAdmission::isolated(Default::default(), thegn_core::calendar::Tz::UTC).meter();
+        page_from_multistatus(&multistatus(), "UTC", &ids, PageMode::Delta, meter).unwrap()
     }
 
     #[test]
@@ -840,29 +866,45 @@ mod tests {
     fn cursor_is_bound_to_the_calendar_filter() {
         let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let work = ids(&["work"]);
-        let stored = scope_token(&work, "srv-1");
-        assert_eq!(unscope_token(&work, &stored), "srv-1");
+        let stored = scope_token(&work, "UTC", "srv-1");
+        assert_eq!(unscope_token(&work, "UTC", &stored), "srv-1");
         // Order and duplicates do not matter.
         assert_eq!(
-            unscope_token(&ids(&["b", "a"]), &scope_token(&ids(&["a", "b", "a"]), "t")),
+            unscope_token(
+                &ids(&["b", "a"]),
+                "UTC",
+                &scope_token(&ids(&["a", "b", "a"]), "UTC", "t")
+            ),
             "t"
         );
         // A changed filter, an unscoped legacy token, and garbage all force a
         // full fetch.
-        assert_eq!(unscope_token(&ids(&["work", "personal"]), &stored), "");
-        assert_eq!(unscope_token(&[], &stored), "");
-        assert_eq!(unscope_token(&work, "srv-1"), "");
-        assert_eq!(unscope_token(&work, "tgf1:zz"), "");
-        assert_eq!(scope_token(&work, ""), "");
+        assert_eq!(
+            unscope_token(&ids(&["work", "personal"]), "UTC", &stored),
+            ""
+        );
+        assert_eq!(unscope_token(&[], "UTC", &stored), "");
+        assert_eq!(unscope_token(&work, "UTC", "srv-1"), "");
+        assert_eq!(unscope_token(&work, "UTC", "tgf1:zz"), "");
+        assert_eq!(
+            unscope_token(&work, "UTC", "tgf1:0123456789abcdef:srv-1"),
+            ""
+        );
+        assert_eq!(scope_token(&work, "UTC", ""), "");
+        assert_eq!(unscope_token(&work, "Europe/Berlin", &stored), "");
     }
 
     #[test]
     fn page_token_carries_the_filter_scope() {
         let ids = vec!["work".to_string()];
-        let meter = AccountAdmission::isolated(Default::default()).meter();
-        let p = page_from_multistatus(&multistatus(), "UTC", &ids, meter).unwrap();
-        assert_eq!(unscope_token(&ids, p.sync_token()), "t1");
-        assert_eq!(unscope_token(&["personal".to_string()], p.sync_token()), "");
+        let meter =
+            AccountAdmission::isolated(Default::default(), thegn_core::calendar::Tz::UTC).meter();
+        let p = page_from_multistatus(&multistatus(), "UTC", &ids, PageMode::Delta, meter).unwrap();
+        assert_eq!(unscope_token(&ids, "UTC", p.sync_token()), "t1");
+        assert_eq!(
+            unscope_token(&["personal".to_string()], "UTC", p.sync_token()),
+            ""
+        );
     }
 
     #[test]

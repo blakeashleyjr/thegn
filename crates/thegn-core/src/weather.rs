@@ -335,28 +335,10 @@ pub fn resolve_units(pref: Option<Units>, locale: Option<&str>) -> Units {
     if let Some(u) = pref {
         return u;
     }
-    match locale_region(locale).as_deref() {
+    match crate::locale_tag::region(locale).as_deref() {
         Some("US" | "LR" | "MM") => Units::Imperial,
         _ => Units::Metric,
     }
-}
-
-/// Pull the region out of a POSIX locale string: `en_US.UTF-8` → `US`.
-///
-/// Same shape as [`crate::calendar::locale`]'s resolver: handles the `_`/`-`
-/// separator and the `.CHARSET` / `@modifier` suffixes; `C` and `POSIX` have no
-/// region.
-fn locale_region(locale: Option<&str>) -> Option<String> {
-    let raw = locale?.trim();
-    if raw.is_empty() || raw == "C" || raw == "POSIX" {
-        return None;
-    }
-    let head = raw.split(['.', '@']).next()?;
-    let region = head.split(['_', '-']).nth(1)?;
-    if region.is_empty() {
-        return None;
-    }
-    Some(region.to_ascii_uppercase())
 }
 
 /// The `ui_state` cache key for one configuration:

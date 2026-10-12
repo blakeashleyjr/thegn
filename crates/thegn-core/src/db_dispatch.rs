@@ -732,6 +732,39 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Run identity and last-status timestamp of every `spawning` row whose
+    /// last status write is older than `cutoff_ms` (v73
+    /// `status_changed_at_ms`, falling back to creation time for rows that
+    /// predate the column). Candidates only: the reaper rechecks the timestamp
+    /// and fences each park on the exact run.
+    pub fn spawning_run_refs(
+        &self,
+        cutoff_ms: i64,
+    ) -> Result<Vec<(crate::issue::DispatchRunRef, i64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, issue_id, COALESCE(session_id,''), run_gen, \
+                    COALESCE(status_changed_at_ms, dispatched_at_ms) \
+             FROM agent_dispatches \
+             WHERE status=?1 AND COALESCE(status_changed_at_ms, dispatched_at_ms) < ?2",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![AgentDispatchStatus::Spawning.as_str(), cutoff_ms],
+            |r| {
+                Ok((
+                    crate::issue::DispatchRunRef {
+                        id: r.get(0)?,
+                        issue_id: r.get(1)?,
+                        session_id: r.get(2)?,
+                        run_gen: r.get(3)?,
+                    },
+                    r.get(4)?,
+                ))
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Record the harness-native conversation id of the run `run` identifies.
     /// One CAS on `(id, session_id, run_gen)`: a replaced run matches nothing,
     /// so a stale writer can never attach an id to a newer generation. An id

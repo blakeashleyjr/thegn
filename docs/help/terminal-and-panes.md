@@ -181,8 +181,10 @@ registers, and what happens over ssh.
 
 ## When keys collide
 
-`Ctrl-g` locks the keymap: every chord passes through to the pane until
-pressed again. Use it when a TUI inside the pane needs chords thegn owns.
+Every chord thegn does not bind passes through to the pane with its modifiers
+intact, whether or not the keymap is locked. `Ctrl-g` locks the keymap, letting
+a TUI use chords thegn owns. Use it when a TUI inside the pane needs those
+chords.
 
 ## Fixing a garbled screen
 

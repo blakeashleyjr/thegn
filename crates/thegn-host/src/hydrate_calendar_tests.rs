@@ -54,12 +54,29 @@ fn event(uid: &str) -> CalEvent {
 
 /// A complete page admitted against a private pool.
 fn page(events: Vec<CalEvent>, deleted: Vec<String>, sync_token: &str) -> EventPage {
+    // Legacy shorthand: a cursor-less page is a snapshot, otherwise a delta.
+    let mode = if sync_token.is_empty() {
+        PageMode::Snapshot
+    } else {
+        PageMode::Delta
+    };
+    page_in(mode, events, deleted, sync_token)
+}
+
+fn page_in(
+    mode: PageMode,
+    events: Vec<CalEvent>,
+    deleted: Vec<String>,
+    sync_token: &str,
+) -> EventPage {
     EventPage::try_new(
+        mode,
         events,
         deleted,
         sync_token,
         &thegn_svc::calendar::AccountAdmission::isolated(
             thegn_core::calendar::AdmissionBudget::default(),
+            thegn_core::calendar::Tz::UTC,
         ),
     )
     .unwrap()
@@ -427,6 +444,27 @@ fn reminders_are_inert_without_configuration() {
 }
 
 #[test]
+fn unsupported_imported_reminder_leads_are_counted_for_host_diagnostics() {
+    let t = TmpDb::new("rem-over-cap");
+    let mut e = event("too-far");
+    e.reminders = vec![thegn_core::calendar::Reminder {
+        minutes_before: thegn_core::calendar::reminders::MAX_LEAD_MINS + 1,
+    }];
+    apply_page(
+        &t.db,
+        "work",
+        "ics",
+        &page(vec![e], vec![], ""),
+        d(2026, 8, 1),
+        d(2026, 8, 31),
+    );
+    let window = reminder_window(0, utc_ms(2026, 8, 21, 8, 59), utc_ms(2026, 8, 21, 9, 1));
+    let due = due_reminders(&t.db, &reminder_cfg(), window).unwrap();
+    assert!(due.reminders.is_empty());
+    assert_eq!(due.unsupported_leads, 1);
+}
+
+#[test]
 fn a_multi_day_event_raises_one_reminder_for_exactly_the_given_window() {
     let t = TmpDb::new("rem-multiday");
     let mut trip = CalEvent::new(
@@ -732,4 +770,165 @@ fn an_invalid_horizon_is_refused_and_never_collapses_to_today() {
     refuse_horizon("calendar.horizon_past_days: bad", &mut |m| seen.push(m));
     assert_eq!(seen.len(), 1);
     assert!(seen[0].contains("horizon_past_days"));
+}
+
+#[test]
+fn a_snapshot_that_returns_a_cursor_still_replaces_the_cache() {
+    // THE-452: the host used to read a non-empty token as "delta" and merge,
+    // resurrecting everything the authoritative snapshot omitted.
+    let t = TmpDb::new("snapshot-with-token");
+    let (from, to) = window();
+    apply_page(
+        &t.db,
+        "work",
+        "caldav",
+        &page_in(PageMode::Snapshot, vec![event("a"), event("b")], vec![], ""),
+        from,
+        to,
+    );
+    apply_page(
+        &t.db,
+        "work",
+        "caldav",
+        &page_in(PageMode::Snapshot, vec![event("c")], vec![], "tok-9"),
+        from,
+        to,
+    );
+    let cached = load_cached(&t.db, from, to).unwrap().events;
+    assert_eq!(cached.len(), 1);
+    assert_eq!(cached[0].uid, "c");
+    assert_eq!(
+        t.db.get_calendar_sync("work").unwrap().unwrap().sync_token,
+        "tok-9"
+    );
+}
+
+#[test]
+fn a_delta_without_a_cursor_never_erases_unrelated_rows() {
+    let t = TmpDb::new("delta-no-token");
+    let (from, to) = window();
+    apply_page(
+        &t.db,
+        "work",
+        "caldav",
+        &page_in(
+            PageMode::Snapshot,
+            vec![event("a"), event("b")],
+            vec![],
+            "t1",
+        ),
+        from,
+        to,
+    );
+    apply_page(
+        &t.db,
+        "work",
+        "caldav",
+        &page_in(PageMode::Delta, vec![event("c")], vec!["a".into()], ""),
+        from,
+        to,
+    );
+    let mut uids: Vec<String> = load_cached(&t.db, from, to)
+        .unwrap()
+        .events
+        .into_iter()
+        .map(|e| e.uid)
+        .collect();
+    uids.sort();
+    assert_eq!(uids, ["b", "c"]);
+    // The lost cursor is dropped, so the next fetch is a full one.
+    assert!(
+        t.db.get_calendar_sync("work")
+            .unwrap()
+            .unwrap()
+            .sync_token
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_reset_is_believed_even_when_empty_but_an_empty_snapshot_is_not() {
+    let t = TmpDb::new("reset");
+    let (from, to) = window();
+    apply_page(
+        &t.db,
+        "work",
+        "command",
+        &page_in(PageMode::Snapshot, vec![event("a")], vec![], ""),
+        from,
+        to,
+    );
+    apply_page(
+        &t.db,
+        "work",
+        "command",
+        &page_in(PageMode::Snapshot, vec![], vec![], "x"),
+        from,
+        to,
+    );
+    assert!(
+        t.db.has_calendar_events("work").unwrap(),
+        "guard still holds"
+    );
+    apply_page(
+        &t.db,
+        "work",
+        "command",
+        &page_in(PageMode::Reset, vec![], vec![], ""),
+        from,
+        to,
+    );
+    assert!(!t.db.has_calendar_events("work").unwrap());
+}
+
+#[test]
+fn a_week_long_reminder_lead_is_a_candidate_not_just_yesterday_to_tomorrow() {
+    // THE-460: the scan used to stop at tomorrow, so an event a week out with
+    // a week-long lead had its trigger due now and was never considered.
+    let t = TmpDb::new("rem-week");
+    let (from, to) = window();
+    let mut trip = event("trip"); // 2026-08-21 09:00 UTC
+    trip.reminders = vec![thegn_core::calendar::Reminder {
+        minutes_before: 7 * 24 * 60,
+    }];
+    apply_page(
+        &t.db,
+        "work",
+        "ics",
+        &page(vec![trip], vec![], ""),
+        from,
+        to,
+    );
+    let hit = reminder_window(1, utc_ms(2026, 8, 14, 8, 59), utc_ms(2026, 8, 14, 9, 1));
+    let due = due_reminders(&t.db, &reminder_cfg(), hit).unwrap();
+    assert_eq!(due.reminders.len(), 1, "{:?}", due.reminders);
+    assert_eq!(due.reminders[0].trigger_mins, 7 * 24 * 60);
+    // The tick after the trigger does not repeat it.
+    let after = reminder_window(2, utc_ms(2026, 8, 14, 9, 1), utc_ms(2026, 8, 14, 9, 3));
+    assert!(
+        due_reminders(&t.db, &reminder_cfg(), after)
+            .unwrap()
+            .reminders
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_long_configured_default_lead_reaches_events_beyond_tomorrow() {
+    let t = TmpDb::new("rem-default-week");
+    let (from, to) = window();
+    apply_page(
+        &t.db,
+        "work",
+        "ics",
+        &page(vec![event("plain")], vec![], ""),
+        from,
+        to,
+    );
+    let cfg = CalendarConfig {
+        reminder_default_mins: vec![3 * 24 * 60],
+        ..reminder_cfg()
+    };
+    let hit = reminder_window(1, utc_ms(2026, 8, 18, 8, 59), utc_ms(2026, 8, 18, 9, 1));
+    assert_eq!(due_reminders(&t.db, &cfg, hit).unwrap().reminders.len(), 1);
 }

@@ -15,6 +15,7 @@
 
 pub(crate) mod agent_error_cache;
 pub(crate) mod agent_open;
+pub(crate) mod calendar_api;
 pub(crate) mod client;
 pub(crate) mod fork;
 pub(crate) mod inbox;
@@ -333,6 +334,7 @@ async fn run(
             ),
         )),
         native_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
+        spawning_relaunches: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         events: events.clone(),
         db: db.clone(),
         grace_ms: thegn_core::time_policy::duration_millis(cfg.daemon.lease_grace_secs),

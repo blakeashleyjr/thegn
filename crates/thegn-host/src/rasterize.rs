@@ -22,9 +22,71 @@ pub struct Raster {
 /// a preview pane is a few hundred pixels at most.
 const MAX_DIM: u32 = 800;
 
-/// Decode encoded image `bytes` to RGBA, downscaling to fit [`MAX_DIM`].
-fn decode_and_fit(bytes: &[u8]) -> Result<Raster, String> {
-    let img = image::load_from_memory(bytes).map_err(|e| format!("image decode failed: {e}"))?;
+/// Hard bounds on the SOURCE image, checked from the header before any pixel
+/// buffer is allocated. [`MAX_DIM`] only caps the final raster; without these a
+/// tiny compressed file declaring enormous dimensions would still be fully
+/// decoded first.
+#[derive(Clone, Copy)]
+pub(crate) struct DecodeLimits {
+    max_dim: u32,
+    max_pixels: u64,
+    max_alloc: u64,
+}
+
+/// Keep player supplied cover art to a modest decode budget.
+pub(crate) const MEDIA_ART_LIMITS: DecodeLimits = DecodeLimits {
+    max_dim: 8192,
+    max_pixels: 32 * 1024 * 1024,
+    max_alloc: 192 * 1024 * 1024,
+};
+/// Bound preview source dimensions while allowing high resolution photos.
+const MAX_PREVIEW_INPUT_DIM: u32 = 16384;
+/// Bound preview pixel count to 256 MP before decoder allocation.
+const MAX_PREVIEW_INPUT_PIXELS: u64 = 256 * 1024 * 1024;
+/// Larger camera images remain previewable while the pixel buffer stays bounded to 1 GiB.
+const PREVIEW_LIMITS: DecodeLimits = DecodeLimits {
+    max_dim: MAX_PREVIEW_INPUT_DIM,
+    max_pixels: MAX_PREVIEW_INPUT_PIXELS,
+    max_alloc: 1024 * 1024 * 1024,
+};
+/// Bound preview file reads to 256 MiB while covering large camera JPEGs.
+const MAX_PREVIEW_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Whether declared source dimensions are within the decode budget. Pure.
+fn check_dimensions(w: u32, h: u32, limits: DecodeLimits) -> Result<(), String> {
+    if w == 0 || h == 0 {
+        return Err("image has no pixels".to_string());
+    }
+    if w > limits.max_dim || h > limits.max_dim {
+        return Err(format!("image dimensions {w}x{h} exceed the decode limit"));
+    }
+    if u64::from(w) * u64::from(h) > limits.max_pixels {
+        return Err(format!("image {w}x{h} exceeds the pixel limit"));
+    }
+    Ok(())
+}
+
+/// Decode encoded image `bytes` to RGBA, downscaling to fit [`MAX_DIM`]. The
+/// header dimensions are validated and decoder limits installed first.
+fn decode_and_fit(bytes: &[u8], limits: DecodeLimits) -> Result<Raster, String> {
+    let reader = || {
+        image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|e| format!("image decode failed: {e}"))
+    };
+    let (w, h) = reader()?
+        .into_dimensions()
+        .map_err(|e| format!("image decode failed: {e}"))?;
+    check_dimensions(w, h, limits)?;
+    let mut r = reader()?;
+    let mut decoder_limits = image::Limits::default();
+    decoder_limits.max_image_width = Some(limits.max_dim);
+    decoder_limits.max_image_height = Some(limits.max_dim);
+    decoder_limits.max_alloc = Some(limits.max_alloc);
+    r.limits(decoder_limits);
+    let img = r
+        .decode()
+        .map_err(|e| format!("image decode failed: {e}"))?;
     let img = if img.width() > MAX_DIM || img.height() > MAX_DIM {
         img.resize(MAX_DIM, MAX_DIM, image::imageops::FilterType::Triangle)
     } else {
@@ -39,15 +101,57 @@ fn decode_and_fit(bytes: &[u8]) -> Result<Raster, String> {
     })
 }
 
-/// Rasterize an image file (PNG/JPEG) to RGBA. Blocking.
-pub fn image_file(path: &Path) -> Result<Raster, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("read failed: {e}"))?;
-    decode_and_fit(&bytes)
+/// Read at most `cap` bytes from a REGULAR file. The kind is verified on the
+/// opened handle (not just the path), the open cannot block on a FIFO, and the
+/// read is `take`n so a file that grows after the size check is still bounded.
+fn read_regular_capped(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    // Cheap pre-check so special files are refused before opening them at all.
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err("not a regular file".to_string()),
+        Err(e) => return Err(format!("read failed: {e}")),
+    }
+    let file =
+        crate::platform::open_read_nonblocking(path).map_err(|e| format!("read failed: {e}"))?;
+    let meta = file.metadata().map_err(|e| format!("read failed: {e}"))?;
+    if !meta.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    if meta.len() > cap {
+        return Err("file exceeds the size cap".to_string());
+    }
+    let mut buf = Vec::new();
+    file.take(cap.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read failed: {e}"))?;
+    if buf.len() as u64 > cap {
+        return Err("file exceeds the size cap".to_string());
+    }
+    Ok(buf)
 }
 
-/// Decode encoded image `bytes` (e.g. cover art fetched over HTTP) to RGBA.
-pub fn image_bytes(bytes: &[u8]) -> Result<Raster, String> {
-    decode_and_fit(bytes)
+/// Rasterize an image file (PNG/JPEG) to RGBA. Blocking.
+pub fn image_file(path: &Path) -> Result<Raster, String> {
+    image_file_with_limits(path, MAX_PREVIEW_FILE_BYTES, PREVIEW_LIMITS)
+}
+
+/// Rasterize a file with caller-chosen byte and decode limits. Blocking.
+pub(crate) fn image_file_with_limits(
+    path: &Path,
+    cap: u64,
+    limits: DecodeLimits,
+) -> Result<Raster, String> {
+    let bytes = read_regular_capped(path, cap)?;
+    decode_and_fit(&bytes, limits)
+}
+
+/// Decode bytes with caller-chosen limits (cover art uses the tighter budget).
+pub(crate) fn image_bytes_with_limits(
+    bytes: &[u8],
+    limits: DecodeLimits,
+) -> Result<Raster, String> {
+    decode_and_fit(bytes, limits)
 }
 
 /// Rasterize page 1 of a PDF via `pdftoppm` (poppler) → PNG on stdout → RGBA.
@@ -61,7 +165,7 @@ pub fn pdf_page1(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
         .arg("-"); // write PNG to stdout
     let out = crate::preview_jobs::run_renderer(&mut cmd, cancel)
         .map_err(|e| format!("pdftoppm: {}", capture_err(&e)))?;
-    decode_and_fit(&out)
+    decode_and_fit(&out, PREVIEW_LIMITS)
 }
 
 /// Extract a PDF's text via `pdftotext` (the no-graphics fallback). Output cut
@@ -94,7 +198,7 @@ pub fn mermaid(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
     let result = match crate::preview_jobs::run_renderer_quiet(&mut cmd, cancel) {
         Ok(()) => std::fs::read(&tmp)
             .map_err(|e| format!("mmdc output read failed: {e}"))
-            .and_then(|bytes| decode_and_fit(&bytes)),
+            .and_then(|bytes| decode_and_fit(&bytes, PREVIEW_LIMITS)),
         Err(e) => Err(format!("mmdc: {}", capture_err(&e))),
     };
     let _ = std::fs::remove_file(&tmp); // best-effort: temp cleanup
@@ -132,7 +236,7 @@ mod tests {
         image::DynamicImage::ImageRgba8(img)
             .write_to(&mut buf, image::ImageFormat::Png)
             .unwrap();
-        let r = decode_and_fit(buf.get_ref()).unwrap();
+        let r = decode_and_fit(buf.get_ref(), PREVIEW_LIMITS).unwrap();
         assert_eq!((r.w, r.h), (2, 3));
         assert_eq!(r.rgba.len(), 2 * 3 * 4);
         assert_eq!(&r.rgba[0..4], &[255, 0, 0, 255]);
@@ -145,7 +249,7 @@ mod tests {
         image::DynamicImage::ImageRgba8(img)
             .write_to(&mut buf, image::ImageFormat::Png)
             .unwrap();
-        let r = decode_and_fit(buf.get_ref()).unwrap();
+        let r = decode_and_fit(buf.get_ref(), PREVIEW_LIMITS).unwrap();
         assert!(r.w <= MAX_DIM && r.h <= MAX_DIM);
         assert!(
             r.w == MAX_DIM || r.h == MAX_DIM,
@@ -154,8 +258,71 @@ mod tests {
     }
 
     #[test]
+    fn dimension_guard_bounds_width_height_and_pixels() {
+        assert!(check_dimensions(800, 800, MEDIA_ART_LIMITS).is_ok());
+        assert!(check_dimensions(MEDIA_ART_LIMITS.max_dim, 1, MEDIA_ART_LIMITS).is_ok());
+        assert!(check_dimensions(0, 10, MEDIA_ART_LIMITS).is_err());
+        assert!(check_dimensions(MEDIA_ART_LIMITS.max_dim + 1, 1, MEDIA_ART_LIMITS).is_err());
+        assert!(check_dimensions(1, MEDIA_ART_LIMITS.max_dim + 1, MEDIA_ART_LIMITS).is_err());
+        // Each side is legal but the area is not.
+        assert!(
+            check_dimensions(
+                MEDIA_ART_LIMITS.max_dim,
+                MEDIA_ART_LIMITS.max_dim,
+                MEDIA_ART_LIMITS
+            )
+            .is_err()
+        );
+        assert!(check_dimensions(MAX_PREVIEW_INPUT_DIM, 1, PREVIEW_LIMITS).is_ok());
+        assert!(
+            check_dimensions(
+                MAX_PREVIEW_INPUT_DIM,
+                MAX_PREVIEW_INPUT_PIXELS as u32 / MAX_PREVIEW_INPUT_DIM,
+                PREVIEW_LIMITS
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn dimension_bomb_png_is_refused_before_decode() {
+        // 1x1 PNG with the IHDR rewritten to 60000x60000: tiny file, huge claim.
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1))
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        let mut png = buf.into_inner();
+        png[16..20].copy_from_slice(&60000u32.to_be_bytes());
+        png[20..24].copy_from_slice(&60000u32.to_be_bytes());
+        let crc = crc32fast::hash(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+        let err = decode_and_fit(&png, MEDIA_ART_LIMITS)
+            .err()
+            .expect("must refuse");
+        assert!(err.contains("dimensions 60000x60000 exceed the decode limit"));
+    }
+
+    #[test]
+    fn read_regular_capped_enforces_cap_and_kind() {
+        let dir = std::env::temp_dir().join(format!("thegn-rast-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("f.bin");
+        std::fs::write(&f, [7u8; 100]).unwrap();
+        assert_eq!(read_regular_capped(&f, 100).unwrap().len(), 100);
+        assert!(read_regular_capped(&f, 99).is_err());
+        assert!(read_regular_capped(&dir, 100).is_err(), "directory refused");
+        if crate::platform::test_fifo_supported() {
+            let fifo = dir.join("p");
+            crate::platform::test_fifo(&fifo).unwrap();
+            // Must return promptly instead of blocking on the FIFO.
+            assert!(read_regular_capped(&fifo, 100).is_err());
+        }
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: temp cleanup
+    }
+
+    #[test]
     fn garbage_bytes_error_not_panic() {
-        assert!(decode_and_fit(b"not an image").is_err());
+        assert!(decode_and_fit(b"not an image", PREVIEW_LIMITS).is_err());
     }
 
     #[test]

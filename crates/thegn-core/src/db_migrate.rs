@@ -1114,6 +1114,50 @@ pub(crate) fn verify_v72_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v73: `agent_dispatches.status_changed_at_ms`, the wall-clock ms of the last
+/// `status` write. A trigger stamps it on EVERY `UPDATE OF status` (the CAS
+/// helpers, `update_dispatch_status`, the retry reservation, raw SQL), so no
+/// call site can forget. An explicit write of the column in the same UPDATE
+/// wins (the trigger only fires while it is unchanged). Existing and freshly
+/// inserted rows read NULL; readers fall back to `dispatched_at_ms`.
+pub(crate) fn migrate_v73(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "status_changed_at_ms") {
+        conn.execute(
+            "ALTER TABLE agent_dispatches ADD COLUMN status_changed_at_ms INTEGER",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS agent_dispatches_status_stamp
+         AFTER UPDATE OF status ON agent_dispatches
+         WHEN NEW.status_changed_at_ms IS OLD.status_changed_at_ms
+         BEGIN
+             UPDATE agent_dispatches
+                SET status_changed_at_ms =
+                    CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+              WHERE id = NEW.id;
+         END;",
+    )?;
+    Ok(())
+}
+
+/// Verify the v73 column and trigger before the version stamp.
+pub(crate) fn verify_v73_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "status_changed_at_ms") {
+        bail!("schema v73 migration did not add agent_dispatches.status_changed_at_ms");
+    }
+    let trigger: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' \
+         AND name='agent_dispatches_status_stamp'",
+        [],
+        |r| r.get(0),
+    )?;
+    if trigger == 0 {
+        bail!("schema v73 migration did not create the status stamp trigger");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -1560,7 +1604,9 @@ mod tests {
     };
     use crate::autopilot::AutopilotIssueKey;
     use crate::db::Db;
-    use crate::store::{AutopilotStore, ClaimOutcome, SessionForkStore, WorkspaceStore};
+    use crate::store::{
+        AutopilotStore, ClaimOutcome, NotificationStore, SessionForkStore, WorkspaceStore,
+    };
     use rusqlite::{Connection, params};
 
     #[test]
@@ -1619,6 +1665,102 @@ mod tests {
             ("running", "sess-h", 3)
         );
         assert_eq!(native, None, "no native id is manufactured");
+    }
+
+    #[test]
+    fn v73_stamps_every_status_write_and_honours_explicit_stamp() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_dispatches (
+                 id INTEGER PRIMARY KEY, issue_id TEXT NOT NULL, status TEXT NOT NULL);
+             INSERT INTO agent_dispatches (issue_id, status) VALUES ('linear:H-1', 'running');",
+        )
+        .unwrap();
+        assert!(super::verify_v73_schema(&conn).is_err());
+        super::migrate_v73(&conn).unwrap();
+        super::migrate_v73(&conn).unwrap();
+        super::verify_v73_schema(&conn).unwrap();
+        let stamp = |c: &Connection| -> Option<i64> {
+            c.query_row(
+                "SELECT status_changed_at_ms FROM agent_dispatches",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(stamp(&conn), None, "no stamp is manufactured for old rows");
+        conn.execute("UPDATE agent_dispatches SET status='spawning'", [])
+            .unwrap();
+        assert!(stamp(&conn).unwrap() > 1_600_000_000_000);
+        conn.execute(
+            "UPDATE agent_dispatches SET status='running', status_changed_at_ms=5",
+            [],
+        )
+        .unwrap();
+        assert_eq!(stamp(&conn), Some(5), "an explicit stamp wins");
+    }
+
+    #[test]
+    fn opening_pre_v73_db_migrates_stamp_and_stale_query_falls_back_to_dispatch_time() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("thegn.db");
+        let id;
+        let dispatched_at_ms;
+        {
+            let db = Db::open_at(&path).unwrap();
+            let wt = dir.path().join("wt");
+            std::fs::create_dir(&wt).unwrap();
+            id = db
+                .put_agent_dispatch(crate::issue::NewDispatch {
+                    issue_id: "linear:THE-739",
+                    worktree_path: wt.to_str().unwrap(),
+                    agent_name: "worker",
+                    stage: Some("code"),
+                    parent_id: None,
+                    session_id: Some("dead-session"),
+                    artifact_path: Some("handoff.md"),
+                    chunk_path: None,
+                })
+                .unwrap();
+            db.update_dispatch_status(id, crate::issue::AgentDispatchStatus::Spawning)
+                .unwrap();
+            dispatched_at_ms = db
+                .conn()
+                .query_row(
+                    "SELECT dispatched_at_ms FROM agent_dispatches WHERE id=?1",
+                    [id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap();
+            // Model a v72 on-disk schema and version stamp. Reopening below
+            // exercises Db::open_at's actual migration ladder.
+            db.conn()
+                .execute_batch(
+                    "DROP TRIGGER agent_dispatches_status_stamp;
+                 ALTER TABLE agent_dispatches DROP COLUMN status_changed_at_ms;
+                 PRAGMA user_version=72;",
+                )
+                .unwrap();
+        }
+
+        let db = Db::open_at(&path).unwrap();
+        super::verify_v73_schema(db.conn()).unwrap();
+        let stamp: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT status_changed_at_ms FROM agent_dispatches WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamp, None, "migration leaves old rows unstamped");
+        let candidates = db.spawning_run_refs(dispatched_at_ms + 1).unwrap();
+        let (run, changed_at_ms) = candidates
+            .iter()
+            .find(|(run, _)| run.id == id)
+            .expect("NULL status stamp falls back to dispatched_at_ms");
+        assert_eq!(changed_at_ms, &dispatched_at_ms);
+        assert_eq!(run.session_id, "dead-session");
     }
 
     #[test]

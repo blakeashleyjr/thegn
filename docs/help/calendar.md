@@ -92,7 +92,8 @@ Each row shows the weekday, the time, the DST-aware abbreviation (`EST` vs
 `EDT`), how far ahead or behind your zone it is, and a `+1d` / `-1d` marker when
 it's a different date there. Set `format` on a row for a minute-safe strftime
 override; an empty value inherits `[calendar] time_format` (including its
-locale-driven `auto` choice). Set `show_date = true` to replace that row's
+locale-driven `auto` choice, based on the territory tables from CLDR 48 / ICU
+78.3). Set `show_date = true` to replace that row's
 weekday and relative marker with its local date as `YYYY-MM-DD`.
 
 Formats are validated before drawing and pass through the bounded calendar
@@ -252,7 +253,10 @@ Each output line is `{"method": "...", "params": {...}}`:
 
 - **`events`** — `{events: [...], deleted: [...], sync_token: "..."}`. Send it as
   many times as you like; the pages accumulate. Return the same `sync_token`
-  next time to do an incremental fetch.
+  next time to do an incremental fetch. Add `mode` to say what the run
+  produced: `snapshot` (the whole window; a `sync_token` may still come back),
+  `delta` (changes since the token you were sent), `unchanged`, or `reset`
+  (replace the cache even if empty). Omit it and thegn infers the old way.
 - **`manifest`** — declare an id, the API version you speak, and the
   capabilities you want. Optional, but it's the only way to request one.
 - **`log`** — `{level, message}`, routed to thegn's log. Diagnostics go here or
