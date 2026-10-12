@@ -1762,7 +1762,9 @@ impl ControlApi for DaemonService {
     }
 
     /// `calendar.events`: the recurrence-expanded occurrences in `[from, to]`
-    /// as a flat, start-sorted list.
+    /// as a flat, start-sorted list, with `skipped_rows` and `incomplete`
+    /// reporting cache rows that could not be decoded or expanded. The
+    /// inclusive window is limited to 366 days.
     ///
     /// This serves thegn's calendar *cache*, which is populated by hydration
     /// and sync. A daemon with no UI hydration (or one whose accounts have not
@@ -1772,12 +1774,32 @@ impl ControlApi for DaemonService {
         &'a self,
         from: &'a str,
         to: &'a str,
-    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::calendar::CalEvent>>> {
+    ) -> BoxFuture<'a, ControlResult<thegn_svc::control::CalendarEventsReply>> {
         Box::pin(async move {
+            let accounts = self.config.calendar.active_accounts();
+            if accounts.is_empty() {
+                return Err(ControlError::Unimplemented("calendar is not configured"));
+            }
             let (from, to) = super::calendar_api::parse_window(from, to)?;
             let home = super::calendar_api::home_zone(&self.config.calendar);
-            self.with_db(move |db| Ok(super::calendar_api::events_in_window(db, from, to, home)))
-                .await?
+            let account_names: Vec<String> = accounts.into_iter().map(|a| a.name).collect();
+            let window =
+                thegn_core::calendar::CalendarWindow::new(from, to, home).ok_or_else(|| {
+                    ControlError::InvalidArgument(
+                        "the requested calendar window is not representable".into(),
+                    )
+                })?;
+            let rows = self
+                .with_db(move |db| {
+                    db.get_calendar_events(window.start_ms, window.end_exclusive_ms, &account_names)
+                        .map_err(|e| e.context("read calendar cache"))
+                })
+                .await?;
+            tokio::task::spawn_blocking(move || {
+                super::calendar_api::events_from_rows(rows, from, to, home)
+            })
+            .await
+            .map_err(|e| ControlError::Internal(anyhow::anyhow!("calendar expansion task: {e}")))?
         })
     }
 
@@ -3764,6 +3786,12 @@ mod tests {
         use thegn_core::store::{CalendarRow, CalendarStore};
         let mut config = thegn_core::config::Config::default();
         config.calendar.home_zone = "UTC".into();
+        config.calendar.accounts = vec![thegn_core::config_calendar::CalendarAccount {
+            name: "work".into(),
+            provider: thegn_core::config_calendar::CalendarProviderKind::Ics,
+            enabled: true,
+            ..thegn_core::config_calendar::CalendarAccount::default()
+        }];
         let (svc, _rx) = service_with_config(0, config);
         let at: chrono::DateTime<chrono::Utc> = "2026-03-10T09:00:00Z".parse().unwrap();
         let ev = CalEvent::new(
@@ -3793,14 +3821,83 @@ mod tests {
             .calendar_events("2026-03-01", "2026-03-31")
             .await
             .unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].title, "standup");
+        assert_eq!(got.events.len(), 1);
+        assert_eq!(got.events[0].title, "standup");
+        assert_eq!(got.skipped_rows, 0);
+        assert!(!got.incomplete);
         assert!(matches!(
             svc.calendar_events("garbage", "2026-03-31").await,
             Err(ControlError::InvalidArgument(_))
         ));
         let clocks = svc.calendar_clocks().await.unwrap();
         assert_eq!(clocks[0]["is_home"], true);
+    }
+
+    #[tokio::test]
+    async fn calendar_events_requires_active_accounts_and_filters_removed_accounts() {
+        use thegn_core::calendar::{CalEvent, EventTime};
+        use thegn_core::config_calendar::{CalendarAccount, CalendarProviderKind};
+        use thegn_core::store::{CalendarRow, CalendarStore};
+        let at: chrono::DateTime<chrono::Utc> = "2026-03-10T09:00:00Z".parse().unwrap();
+        let event = |uid: &str| {
+            CalEvent::new(
+                uid,
+                uid,
+                EventTime::Instant { at },
+                EventTime::Instant {
+                    at: at + chrono::Duration::hours(1),
+                },
+            )
+        };
+        let mut config = thegn_core::config::Config::default();
+        config.calendar.home_zone = "UTC".into();
+        config.calendar.accounts = vec![CalendarAccount {
+            name: "current".into(),
+            provider: CalendarProviderKind::Ics,
+            enabled: true,
+            ..CalendarAccount::default()
+        }];
+        let (svc, _rx) = service_with_config(0, config);
+        {
+            let db = svc.db.lock().unwrap();
+            let row_for = |uid| CalendarRow {
+                uid: uid.into(),
+                calendar: String::new(),
+                start_ms: at.timestamp_millis(),
+                end_ms: at.timestamp_millis() + 3_600_000,
+                recurring: false,
+                json: serde_json::to_string(&event(uid)).unwrap(),
+            };
+            db.put_calendar_events("current", &[row_for("active")])
+                .unwrap();
+            db.put_calendar_events("removed", &[row_for("removed")])
+                .unwrap();
+        }
+        let got = svc
+            .calendar_events("2026-03-01", "2026-03-31")
+            .await
+            .unwrap();
+        assert_eq!(
+            got.events
+                .iter()
+                .map(|e| e.uid.as_str())
+                .collect::<Vec<_>>(),
+            ["active"]
+        );
+
+        let (svc, _rx) = service_with_config(0, thegn_core::config::Config::default());
+        assert!(matches!(
+            svc.calendar_events("2026-03-01", "2026-03-31").await,
+            Err(ControlError::Unimplemented("calendar is not configured"))
+        ));
+
+        let mut disabled = thegn_core::config::Config::default();
+        disabled.calendar.enabled = false;
+        let (svc, _rx) = service_with_config(0, disabled);
+        assert!(matches!(
+            svc.calendar_events("2026-03-01", "2026-03-31").await,
+            Err(ControlError::Unimplemented("calendar is not configured"))
+        ));
     }
 
     /// grace_ms == 0 ⇒ the never-reap default: an UNTIMED relay lease

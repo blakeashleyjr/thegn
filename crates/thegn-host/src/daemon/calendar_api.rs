@@ -5,7 +5,7 @@
 //! serves thegn's calendar *cache*, which hydration/sync populates; this module
 //! never fetches from a provider.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use chrono_tz::Tz;
 use serde_json::{Value, json};
 use thegn_core::calendar::{
@@ -14,7 +14,10 @@ use thegn_core::calendar::{
 };
 use thegn_core::config_calendar::CalendarConfig;
 use thegn_core::store::CalendarStore;
-use thegn_svc::control::{ControlError, ControlResult};
+use thegn_svc::control::{CalendarEventsReply, ControlError, ControlResult};
+
+/// Maximum inclusive date span accepted by `calendar.events`.
+pub(crate) const MAX_WINDOW_DAYS: u64 = 366;
 
 /// The zone dates and all-day events are read in: `[calendar] home_zone`, else
 /// the system zone (the same fallback the calendar popup uses).
@@ -35,6 +38,12 @@ pub(crate) fn parse_window(from: &str, to: &str) -> ControlResult<(NaiveDate, Na
             "`from` must not be after `to`".into(),
         ));
     }
+    let days = (to - from).num_days() as u64 + 1;
+    if days > MAX_WINDOW_DAYS {
+        return Err(ControlError::InvalidArgument(format!(
+            "calendar window exceeds the maximum of {MAX_WINDOW_DAYS} inclusive days"
+        )));
+    }
     Ok((from, to))
 }
 
@@ -43,21 +52,18 @@ pub(crate) fn parse_window(from: &str, to: &str) -> ControlResult<(NaiveDate, Na
 /// broken by title then uid.
 ///
 /// A cache row that fails to deserialize, or that is row-locally malformed, is
-/// skipped and counted (logged) rather than failing the call. A failed cache
-/// read, or an expansion that exhausts the shared budget, is an error: a
-/// truncated calendar is never returned as complete.
-pub(crate) fn events_in_window(
-    db: &impl CalendarStore,
+/// skipped and counted in the reply. A failed cache read, or an expansion that
+/// exhausts the shared budget, is an error: a truncated calendar is never
+/// returned as complete.
+pub(crate) fn events_from_rows(
+    rows: Vec<(String, String)>,
     from: NaiveDate,
     to: NaiveDate,
     home: Tz,
-) -> ControlResult<Vec<CalEvent>> {
-    let window = CalendarWindow::new(from, to, home).ok_or_else(|| {
+) -> ControlResult<CalendarEventsReply> {
+    let _window = CalendarWindow::new(from, to, home).ok_or_else(|| {
         ControlError::InvalidArgument("the requested calendar window is not representable".into())
     })?;
-    let rows = db
-        .get_calendar_events(window.start_ms, window.end_exclusive_ms, &[])
-        .map_err(|e| ControlError::Internal(e.context("read calendar cache")))?;
     let mut cached = Vec::with_capacity(rows.len());
     let mut bad_rows = 0usize;
     for (_, json) in rows {
@@ -67,7 +73,8 @@ pub(crate) fn events_in_window(
         }
     }
     let expanded = expand_calendar(&cached, from, to, home).map_err(expansion_error)?;
-    if bad_rows + expanded.skipped > 0 {
+    let skipped_rows = (bad_rows + expanded.skipped).min(u32::MAX as usize) as u32;
+    if skipped_rows > 0 {
         tracing::warn!(
             target: "thegn::calendar",
             undecodable = bad_rows,
@@ -75,7 +82,29 @@ pub(crate) fn events_in_window(
             "calendar.events: skipped cache rows; the result is incomplete"
         );
     }
-    Ok(flatten_sorted(expanded.occurrences, home))
+    let occurrences = expanded.occurrences;
+    drop(expanded.by_date);
+    Ok(CalendarEventsReply {
+        events: flatten_sorted(occurrences, home),
+        skipped_rows,
+        incomplete: skipped_rows > 0,
+    })
+}
+
+#[cfg(test)]
+fn events_in_window(
+    db: &impl CalendarStore,
+    from: NaiveDate,
+    to: NaiveDate,
+    home: Tz,
+) -> ControlResult<CalendarEventsReply> {
+    let window = CalendarWindow::new(from, to, home).ok_or_else(|| {
+        ControlError::InvalidArgument("the requested calendar window is not representable".into())
+    })?;
+    let rows = db
+        .get_calendar_events(window.start_ms, window.end_exclusive_ms, &[])
+        .map_err(|e| ControlError::Internal(e.context("read calendar cache")))?;
+    events_from_rows(rows, from, to, home)
 }
 
 fn expansion_error(e: ExpansionError) -> ControlError {
@@ -126,10 +155,30 @@ pub(crate) fn clocks_json(cfg: &CalendarConfig, now: DateTime<Utc>) -> Value {
         readings
             .into_iter()
             .map(|r| {
+                let time = match &r.format {
+                    ClockFormat::H12 => {
+                        let h = r.local.hour();
+                        let h12 = if h % 12 == 0 { 12 } else { h % 12 };
+                        format!(
+                            "{h12}:{:02}{}",
+                            r.local.minute(),
+                            if h < 12 { "am" } else { "pm" }
+                        )
+                    }
+                    ClockFormat::H24 => format!("{:02}:{:02}", r.local.hour(), r.local.minute()),
+                    ClockFormat::Custom(fmt) => r.local.format(fmt).to_string(),
+                };
                 json!({
                     "label": r.label,
                     "zone": r.zone.name(),
                     "local": r.local.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    "time": time,
+                    "format": match &r.format {
+                        ClockFormat::H12 => "h12".to_string(),
+                        ClockFormat::H24 => "h24".to_string(),
+                        ClockFormat::Custom(fmt) => fmt.clone(),
+                    },
+                    "show_date": r.show_date,
                     "utc_offset_secs": r.utc_offset_secs,
                     "is_dst": r.is_dst,
                     "abbrev": r.abbrev,
@@ -197,6 +246,10 @@ mod tests {
                 Err(ControlError::InvalidArgument(_))
             ));
         }
+        assert!(matches!(
+            parse_window("2024-01-01", "2025-01-01"),
+            Err(ControlError::InvalidArgument(_))
+        ));
     }
 
     #[test]
@@ -211,8 +264,10 @@ mod tests {
         db.put_calendar_events("work", &[row(&late), row(&early), row(&outside), bad])
             .unwrap();
         let got = events_in_window(&db, day("2026-03-01"), day("2026-03-31"), Tz::UTC).unwrap();
-        let titles: Vec<_> = got.iter().map(|e| e.title.as_str()).collect();
+        let titles: Vec<_> = got.events.iter().map(|e| e.title.as_str()).collect();
         assert_eq!(titles, ["early", "late"]);
+        assert_eq!(got.skipped_rows, 1);
+        assert!(got.incomplete);
     }
 
     #[test]
@@ -227,8 +282,8 @@ mod tests {
         r.recurring = true;
         db.put_calendar_events("work", &[r]).unwrap();
         let got = events_in_window(&db, day("2026-03-03"), day("2026-03-10"), Tz::UTC).unwrap();
-        assert_eq!(got.len(), 2, "2026-03-03 and 2026-03-04 only");
-        assert!(got.windows(2).all(|w| {
+        assert_eq!(got.events.len(), 2, "2026-03-03 and 2026-03-04 only");
+        assert!(got.events.windows(2).all(|w| {
             w[0].start.instant_in(Tz::UTC, GapPolicy::ShiftForward)
                 <= w[1].start.instant_in(Tz::UTC, GapPolicy::ShiftForward)
         }));
@@ -236,15 +291,17 @@ mod tests {
 
     #[test]
     fn oversized_window_is_an_invalid_argument() {
-        let db = Db::open_memory().unwrap();
-        let r = events_in_window(&db, day("2000-01-01"), day("2026-01-01"), Tz::UTC);
-        assert!(matches!(r, Err(ControlError::InvalidArgument(_))));
+        assert!(matches!(
+            parse_window("2000-01-01", "2026-01-01"),
+            Err(ControlError::InvalidArgument(_))
+        ));
     }
 
     #[test]
     fn clocks_lead_with_the_home_row() {
         let cfg = CalendarConfig {
             home_zone: "UTC".into(),
+            time_format: thegn_core::config_calendar::TimeFormat::H12,
             ..CalendarConfig::default()
         };
         let now: DateTime<Utc> = "2026-03-10T12:00:00Z".parse().unwrap();
@@ -253,5 +310,8 @@ mod tests {
         assert_eq!(rows[0]["is_home"], true);
         assert_eq!(rows[0]["zone"], "UTC");
         assert_eq!(rows[0]["local"], "2026-03-10T12:00:00");
+        assert_eq!(rows[0]["format"], "h12");
+        assert_eq!(rows[0]["time"], "12:00pm");
+        assert_eq!(rows[0]["show_date"], false);
     }
 }
