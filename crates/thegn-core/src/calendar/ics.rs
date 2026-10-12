@@ -18,6 +18,7 @@ use super::admission::{
     MAX_COMPONENT_DEPTH, MAX_LINE_BYTES,
 };
 use super::recur::{RRule, Recurrence, parse_ics_datetime};
+use super::validate::validate_event;
 use super::{CalEvent, EventStatus, EventTime, Reminder, TzRef};
 
 /// One unfolded content line: `NAME;PARAM=v:VALUE`.
@@ -665,7 +666,7 @@ pub fn parse_ics_window_reported(
                                 cal_name.len() + if b.uid.is_empty() { ENTRY_OVERHEAD } else { 0 };
                             meter.charge_event(extra, 0)?;
                             meter.admit_event()?;
-                            if let Some(mut e) = b.finish(default_zone) {
+                            if let Some(mut e) = b.finish(default_zone, report) {
                                 e.calendar = cal_name.clone();
                                 out.push(e);
                             } else {
@@ -795,6 +796,7 @@ struct Builder {
     start: Option<EventTime>,
     end: Option<EventTime>,
     duration: Option<chrono::Duration>,
+    duration_seen: bool,
     rrules: Vec<RRule>,
     rdates: Vec<EventTime>,
     exdates: Vec<EventTime>,
@@ -952,6 +954,7 @@ impl Builder {
                 }
             }
             "DURATION" => {
+                self.duration_seen = true;
                 self.duration = parse_duration(&line.value);
                 if self.duration.is_none() {
                     report.record(IcsDiagnostic::InvalidEvent);
@@ -1008,22 +1011,51 @@ impl Builder {
         Ok(())
     }
 
-    fn finish(self, default_zone: &str) -> Option<CalEvent> {
+    fn finish(self, default_zone: &str, report: &mut IcsReport) -> Option<CalEvent> {
         let start = self.start?;
+        if self.end.is_some() && self.duration_seen {
+            return None;
+        }
         // RFC 5545: DTEND is optional. With a DURATION, add it; with neither, a
         // dated event lasts one day and a timed event is a point in time.
-        let end = self.end.clone().unwrap_or_else(|| match &start {
-            EventTime::Date { date } => EventTime::Date {
-                date: date.succ_opt().unwrap_or(*date),
-            },
-            EventTime::Zoned { local, zone } => EventTime::Zoned {
-                local: *local + self.duration.unwrap_or_default(),
-                zone: zone.clone(),
-            },
-            EventTime::Instant { at } => EventTime::Instant {
-                at: *at + self.duration.unwrap_or_default(),
-            },
-        });
+        let end = if let Some(end) = self.end.clone() {
+            end
+        } else {
+            match &start {
+                EventTime::Date { date } => {
+                    let default_end = date.succ_opt()?;
+                    match self.duration {
+                        None => EventTime::Date { date: default_end },
+                        Some(duration) => {
+                            let seconds = duration.num_seconds();
+                            if seconds > 0 && seconds % 86_400 == 0 {
+                                match date.checked_add_signed(duration) {
+                                    Some(date) => EventTime::Date { date },
+                                    None => {
+                                        report.record(IcsDiagnostic::InvalidEvent);
+                                        EventTime::Date { date: default_end }
+                                    }
+                                }
+                            } else {
+                                report.record(IcsDiagnostic::InvalidEvent);
+                                EventTime::Date { date: default_end }
+                            }
+                        }
+                    }
+                }
+                EventTime::Zoned { local, zone } => {
+                    let local = local.checked_add_signed(self.duration.unwrap_or_default())?;
+                    EventTime::Zoned {
+                        local,
+                        zone: zone.clone(),
+                    }
+                }
+                EventTime::Instant { at } => {
+                    let at = at.checked_add_signed(self.duration.unwrap_or_default())?;
+                    EventTime::Instant { at }
+                }
+            }
+        };
         // Re-anchor floating times that named no TZID onto the account's zone.
         let start = anchor(start, default_zone);
         let end = anchor(end, default_zone);
@@ -1055,6 +1087,9 @@ impl Builder {
                 rdates: self.rdates,
                 exdates: self.exdates,
             });
+        }
+        if validate_event(&e).is_err() {
+            return None;
         }
         Some(e)
     }

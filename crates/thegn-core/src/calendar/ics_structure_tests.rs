@@ -184,12 +184,67 @@ fn duplicate_singleton_property_is_reported() {
 
 #[test]
 fn singleton_property_set_is_recognized() {
-    let input = one_event(
-        "UID:x\nSUMMARY:s\nDESCRIPTION:d\nLOCATION:l\nURL:https://example.test\nSTATUS:CONFIRMED\nDTSTART;VALUE=DATE:20261012\nDTEND;VALUE=DATE:20261013\nDURATION:PT1H\nORGANIZER:mailto:a@example.test\nLAST-MODIFIED:20261012T000000Z\nDTSTAMP:20261012T000000Z",
-    );
+    let input = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:x\nSUMMARY:s\nDESCRIPTION:d\nLOCATION:l\nURL:https://example.test\nSTATUS:CONFIRMED\nDTSTART;VALUE=DATE:20261012\nDTEND;VALUE=DATE:20261013\nORGANIZER:mailto:a@example.test\nLAST-MODIFIED:20261012T000000Z\nDTSTAMP:20261012T000000Z\nEND:VEVENT\nBEGIN:VEVENT\nUID:y\nDTSTART;VALUE=DATE:20261013\nDURATION:P1D\nEND:VEVENT\nEND:VCALENDAR";
+    let (events, report) = parse_report(input);
+    assert!(report.diagnostics().is_empty());
+    assert_eq!(events.len(), 2);
+    assert_legacy_matches(input, &events);
+}
+
+#[test]
+fn all_day_duration_adds_its_full_number_of_days() {
+    let input = one_event("UID:x\nDTSTART;VALUE=DATE:20261012\nDURATION:P3D");
     let (events, report) = parse_report(&input);
     assert!(report.diagnostics().is_empty());
     assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].end,
+        EventTime::Date {
+            date: NaiveDate::from_ymd_opt(2026, 10, 15).unwrap()
+        }
+    );
+    assert_legacy_matches(&input, &events);
+}
+
+#[test]
+fn non_day_all_day_duration_is_reported_and_uses_one_day_default() {
+    let input = one_event("UID:x\nDTSTART;VALUE=DATE:20261012\nDURATION:PT1H");
+    let (events, report) = parse_report(&input);
+    assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].end,
+        EventTime::Date {
+            date: NaiveDate::from_ymd_opt(2026, 10, 13).unwrap()
+        }
+    );
+    assert_legacy_matches(&input, &events);
+}
+
+#[test]
+fn dtend_and_duration_together_are_reported_and_dropped() {
+    let input =
+        one_event("UID:x\nDTSTART;VALUE=DATE:20261012\nDTEND;VALUE=DATE:20261013\nDURATION:P1D");
+    let (events, report) = parse_report(&input);
+    assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
+    assert_eq!(
+        report
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| **diagnostic == IcsDiagnostic::InvalidEvent)
+            .count(),
+        1
+    );
+    assert!(events.is_empty());
+    assert_legacy_matches(&input, &events);
+}
+
+#[test]
+fn date_start_with_timed_end_is_reported_and_dropped() {
+    let input = one_event("UID:x\nDTSTART;VALUE=DATE:20261012\nDTEND:20261012T100000Z");
+    let (events, report) = parse_report(&input);
+    assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
+    assert!(events.is_empty());
     assert_legacy_matches(&input, &events);
 }
 
