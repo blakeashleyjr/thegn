@@ -730,14 +730,28 @@ pub fn parse_ics_window_reported(
                         .last()
                         .is_some_and(|part| matches!(part, ComponentName::Alarm))
             });
-            if in_alarm
-                && line.name == "TRIGGER"
-                && let Some(mins) = parse_trigger_minutes(&line.value)
-            {
-                meter.charge_event(ENTRY_OVERHEAD, 1)?;
-                b.reminders.push(Reminder {
-                    minutes_before: mins,
-                });
+            if in_alarm && line.name == "TRIGGER" {
+                let related = line
+                    .params
+                    .get("RELATED")
+                    .map(|value| value.to_ascii_uppercase());
+                match related.as_deref() {
+                    None | Some("START") => {
+                        if let Some(mins) = parse_trigger_minutes(&line.value) {
+                            meter.charge_event(ENTRY_OVERHEAD, 1)?;
+                            b.reminders.push(Reminder {
+                                minutes_before: mins,
+                            });
+                        }
+                    }
+                    Some("END") => {
+                        if let Some(mins) = parse_trigger_minutes(&line.value) {
+                            meter.charge_event(ENTRY_OVERHEAD, 1)?;
+                            b.end_reminders.push(mins);
+                        }
+                    }
+                    Some(_) => {}
+                }
             }
             continue;
         }
@@ -1013,6 +1027,7 @@ struct Builder {
     rdates: Vec<EventTime>,
     exdates: Vec<EventTime>,
     reminders: Vec<Reminder>,
+    end_reminders: Vec<u32>,
     organizer: String,
     categories: String,
     last_modified: i64,
@@ -1090,10 +1105,11 @@ impl Builder {
         let home = default_zone
             .parse::<chrono_tz::Tz>()
             .unwrap_or(chrono_tz::UTC);
+        // ICS admission quarantines unknown TZIDs before this window heuristic runs.
         let zone = self
             .start
             .as_ref()
-            .map(|start| super::recur::series_zone(start, home));
+            .and_then(|start| super::recur::series_zone(start, home));
         self.rrules.iter().any(|r| {
             super::recur::until_bound(r, zone)
                 .is_none_or(|u| u.date().checked_add_signed(span).unwrap_or(NaiveDate::MAX) >= lo)
@@ -1301,7 +1317,7 @@ impl Builder {
         Ok(())
     }
 
-    fn finish(self, default_zone: &str, report: &mut IcsReport) -> Option<CalEvent> {
+    fn finish(mut self, default_zone: &str, report: &mut IcsReport) -> Option<CalEvent> {
         if self.quarantined {
             return None;
         }
@@ -1371,6 +1387,18 @@ impl Builder {
         e.organizer = self.organizer;
         e.category = self.categories;
         e.status = self.status.unwrap_or_default();
+        if let Some(span) = super::nominal_span(&e) {
+            let span_minutes = span.num_minutes();
+            for before_end in self.end_reminders {
+                if let Some(minutes_before) = i64::from(before_end)
+                    .checked_sub(span_minutes)
+                    .filter(|minutes| *minutes >= 0)
+                    .and_then(|minutes| u32::try_from(minutes).ok())
+                {
+                    self.reminders.push(Reminder { minutes_before });
+                }
+            }
+        }
         e.reminders = self.reminders;
         e.updated_at_ms = self.last_modified;
         e.extra = self.extra;
