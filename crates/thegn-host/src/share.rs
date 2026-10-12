@@ -112,6 +112,7 @@ struct ServeTeardown {
 /// SIGTERM; a `SidecarServe` share carries a `teardown` to run `down_argv`.
 struct Shared {
     shutdown: AtomicBool,
+    endpoint_conflict: AtomicBool,
     pid: Mutex<Option<u32>>,
     teardown: Mutex<Option<ServeTeardown>>,
 }
@@ -120,6 +121,7 @@ impl Shared {
     fn new() -> Arc<Self> {
         Arc::new(Shared {
             shutdown: AtomicBool::new(false),
+            endpoint_conflict: AtomicBool::new(false),
             pid: Mutex::new(None),
             teardown: Mutex::new(None),
         })
@@ -338,7 +340,7 @@ impl ShareSupervisor {
                 .find(|i| i.worktree == worktree && i.port == port && i.generation == generation)
                 .map(|i| i.state.clone())
             {
-                Some(ShareState::Starting) => {
+                Some(ShareState::Starting | ShareState::Up(_)) => {
                     let Some(i) = self.find_mut(&worktree, port, generation) else {
                         return false;
                     };
@@ -454,8 +456,12 @@ fn supervise(
 
     let provider = share::for_provider(&spec).kind();
     let emit = |ev: ShareEvent| {
-        let _ = tx.send(ev); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        if let Err(error) = tx.send(ev) {
+            tracing::debug!(%error, "share event receiver is gone");
+        }
+        if let Err(error) = waker.wake() {
+            tracing::debug!(%error, "share waker is unavailable");
+        }
     };
     let fail = |e: String| {
         if shared.shutdown.load(Ordering::SeqCst) {
@@ -471,15 +477,18 @@ fn supervise(
             }
             return;
         }
-        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-        let _ = tx.send(ShareEvent::Failed {
+        if let Err(error) = tx.send(ShareEvent::Failed {
             worktree: worktree.clone(),
             port,
             generation,
             provider,
             error: e,
-        });
-        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        }) {
+            tracing::debug!(%error, "share failure receiver is gone");
+        }
+        if let Err(error) = waker.wake() {
+            tracing::debug!(%error, "share failure waker is unavailable");
+        }
     };
 
     let launch = match share::for_provider(&spec).launch() {
@@ -503,6 +512,15 @@ fn supervise(
             match share::start(&plan, &statedir, spec.ready_timeout) {
                 Ok(running) => {
                     *shared.pid.lock().unwrap() = Some(running.child.id());
+                    let conflict_shared = shared.clone();
+                    running.on_endpoint_conflict(Box::new(move || {
+                        conflict_shared
+                            .endpoint_conflict
+                            .store(true, Ordering::Release);
+                        if let Some(pid) = *conflict_shared.pid.lock().unwrap() {
+                            crate::platform::terminate_pid(pid);
+                        }
+                    }));
                     if shared.shutdown.load(Ordering::SeqCst) {
                         running.stop();
                         emit(ShareEvent::Down {
@@ -521,11 +539,17 @@ fn supervise(
                     });
                     running.wait();
                     *shared.pid.lock().unwrap() = None;
-                    emit(ShareEvent::Down {
-                        worktree,
-                        port,
-                        generation,
-                    });
+                    if shared.endpoint_conflict.load(Ordering::Acquire) {
+                        fail(
+                            "provider announced a different public endpoint; share stopped".into(),
+                        );
+                    } else {
+                        emit(ShareEvent::Down {
+                            worktree,
+                            port,
+                            generation,
+                        });
+                    }
                 }
                 Err(e) => fail(e.to_string()),
             }
@@ -689,6 +713,35 @@ mod tests {
     }
 
     #[test]
+    fn matching_failure_terminates_a_live_share_view() {
+        let mut sup = ShareSupervisor::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 22,
+            provider: "bore",
+            public: true,
+            state: ShareState::Up(
+                PublicEndpoint::parse_url("https://new.test").expect("valid URL"),
+            ),
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+        assert!(sup.on_event(ShareEvent::Failed {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 22,
+            provider: "bore",
+            error: "provider announced a different public endpoint; share stopped".into(),
+        }));
+        let views = sup.views("/wt");
+        let view = &views[0];
+        assert!(view.failed);
+        assert!(view.url.is_none());
+    }
+
+    #[test]
     fn stop_retains_stopping_generation_until_down_acknowledgement() {
         let mut sup = ShareSupervisor::new();
         sup.instances.push(ShareInstance {
@@ -759,5 +812,45 @@ mod tests {
             thegn_svc::lsp::sanitize_for_terminal(view.copy_value().as_deref().unwrap()),
             "opaque-ticket_7"
         );
+    }
+
+    #[test]
+    fn url_and_socket_endpoints_project_to_copy_and_browser_values() {
+        let url = thegn_svc::share::UrlRule::Fixed("https://Example.com:443".into())
+            .fixed()
+            .expect("valid URL endpoint");
+        let url_view = ShareView {
+            worktree: "/wt".into(),
+            port: 3000,
+            url: Some(url.canonical()),
+            endpoint: Some(url),
+            failed: false,
+            stopping: false,
+            error: None,
+            provider: "bore",
+            public: true,
+        };
+        assert_eq!(
+            url_view.copy_value().as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(url_view.browser_url(), Some("https://example.com"));
+
+        let socket = thegn_svc::share::UrlRule::Fixed("bore.pub:4123".into())
+            .fixed()
+            .expect("valid socket endpoint");
+        let socket_view = ShareView {
+            worktree: "/wt".into(),
+            port: 3000,
+            url: Some(socket.canonical()),
+            endpoint: Some(socket),
+            failed: false,
+            stopping: false,
+            error: None,
+            provider: "bore",
+            public: true,
+        };
+        assert_eq!(socket_view.copy_value().as_deref(), Some("bore.pub:4123"));
+        assert!(socket_view.browser_url().is_none());
     }
 }
