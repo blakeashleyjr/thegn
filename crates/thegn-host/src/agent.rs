@@ -1115,7 +1115,6 @@ fn attach_vpn_with<P: VpnProvider>(
     rt: &thegn_svc::vpn::OciRuntime,
     remove_sidecar: impl FnOnce(&thegn_svc::vpn::OciRuntime, &str) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    use thegn_core::config::VpnOnError;
     let Some(vpn) = spec.vpn.clone() else {
         return Ok(());
     };
@@ -1191,14 +1190,18 @@ fn rollback_vpn<P: VpnProvider>(
     }
 }
 
+#[expect(clippy::disallowed_methods)]
 fn remove_vpn_sidecar(rt: &thegn_svc::vpn::OciRuntime, sidecar: &str) -> anyhow::Result<()> {
     use anyhow::Context;
     let mut argv = rt.prefix.clone();
     argv.extend(["rm".to_string(), "-f".to_string(), sidecar.to_string()]);
-    let output = std::process::Command::new(&argv[0])
+    let output = std::process::Command::new(timeout_bin()?)
+        .arg("--kill-after=5")
+        .arg("10")
+        .arg(&argv[0])
         .args(&argv[1..])
         .output()
-        .with_context(|| format!("run {} to remove VPN sidecar", argv[0]))?;
+        .with_context(|| format!("run {} rm -f to remove VPN sidecar", argv[0]))?;
     if !output.status.success() {
         anyhow::bail!("{} rm -f exited with {}", argv[0], output.status);
     }

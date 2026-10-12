@@ -136,7 +136,7 @@ fn in_container_launch_failure_does_not_roll_back_sidecar() {
     let calls = provider.calls.clone();
     let rt = OciRuntime::new(vec!["fake-runtime".into()]);
 
-    let result = run_with_vpn_rollback_using(
+    let result: anyhow::Result<()> = run_with_vpn_rollback_using(
         &mut spec,
         &provider,
         &rt,
@@ -214,7 +214,7 @@ fn later_launch_failure_tears_down_attached_sidecar() {
     let rt = OciRuntime::new(vec!["fake-runtime".into()]);
     attach_vpn_with(&mut spec, &provider, &rt, record_removal(&calls)).unwrap();
 
-    let result = run_with_vpn_rollback_using(
+    let result: anyhow::Result<()> = run_with_vpn_rollback_using(
         &mut spec,
         &provider,
         &rt,
