@@ -186,6 +186,14 @@ fn run_once(request: RefreshRequest) {
     use thegn_svc::issue::IssueRouter;
 
     if !cwd.is_dir() {
+        if let Some(report) = report.as_ref() {
+            send_tracker_toast(
+                &report.tx,
+                &report.waker,
+                "Issue refresh failed — worktree is unavailable".to_owned(),
+                thegn_core::notification::Priority::Alert,
+            );
+        }
         return;
     }
     let repo_root = thegn_core::repo::main_worktree(&cwd).unwrap_or_else(|| cwd.clone());
@@ -194,12 +202,28 @@ fn run_once(request: RefreshRequest) {
     // Provider-as-plugin: append live plugin issue providers.
     crate::plugin_providers::extend_issue_router(&mut router);
     if !router.is_configured() {
+        if let Some(report) = report.as_ref() {
+            send_tracker_toast(
+                &report.tx,
+                &report.waker,
+                "No issue tracker configured".to_owned(),
+                thegn_core::notification::Priority::Info,
+            );
+        }
         return;
     }
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     else {
+        if let Some(report) = report.as_ref() {
+            send_tracker_toast(
+                &report.tx,
+                &report.waker,
+                "Issue refresh failed — could not start the tracker runtime".to_owned(),
+                thegn_core::notification::Priority::Alert,
+            );
+        }
         return;
     };
     // Repo scope for GitHub (other providers scope by team/project and
@@ -304,12 +328,20 @@ fn run_once(request: RefreshRequest) {
 
 const MAX_REPORT_ENTRIES: usize = 3;
 const MAX_REPORT_ENTRY_CHARS: usize = 180;
+const MAX_REPORT_MESSAGE_CHARS: usize = MAX_REPORT_ENTRIES * (2 * MAX_REPORT_ENTRY_CHARS + 4) + 64;
 
 fn safe_report_text(value: &str) -> String {
+    truncate_report_text(&sanitize_and_redact(value), MAX_REPORT_ENTRY_CHARS)
+}
+
+fn sanitize_and_redact(value: &str) -> String {
     let sanitized = thegn_svc::lsp::sanitize_for_terminal(value);
-    let redacted = thegn_core::ci_log::redact(&sanitized);
-    let mut chars = redacted.chars();
-    let short: String = chars.by_ref().take(MAX_REPORT_ENTRY_CHARS).collect();
+    thegn_core::ci_log::redact(&sanitized)
+}
+
+fn truncate_report_text(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let short: String = chars.by_ref().take(max_chars).collect();
     if chars.next().is_some() {
         format!("{short}…")
     } else {
@@ -369,13 +401,17 @@ pub(crate) fn send_tracker_toast(
     message: String,
     priority: thegn_core::notification::Priority,
 ) {
-    let message = safe_report_text(&message);
+    let message = prepare_tracker_toast_message(&message);
     if let Err(error) = tx.send(crate::hydrate::RefreshKind::Toast { message, priority }) {
         tracing::debug!(%error, "failed to send tracker toast");
     }
     if let Err(error) = waker.wake() {
         tracing::debug!(%error, "failed to wake after tracker toast");
     }
+}
+
+fn prepare_tracker_toast_message(message: &str) -> String {
+    truncate_report_text(&sanitize_and_redact(message), MAX_REPORT_MESSAGE_CHARS)
 }
 
 /// The pure old-vs-new cache diff behind the tracker refresh's notification
@@ -503,7 +539,7 @@ pub(crate) fn populate_tracker(
 mod tests {
     use super::{
         MAX_REPORT_ENTRY_CHARS, RefreshCoalescer, RefreshGuard, format_refresh_report,
-        safe_report_text,
+        prepare_tracker_toast_message, safe_report_text,
     };
 
     #[test]
@@ -569,6 +605,21 @@ mod tests {
                 .count()
                 <= MAX_REPORT_ENTRY_CHARS + 1
         );
+    }
+
+    #[test]
+    fn sent_toast_preserves_more_suffix_for_long_multi_account_failures() {
+        let failures = (0..4)
+            .map(|index| (format!("provider/account-{index}"), "x".repeat(180)))
+            .collect::<Vec<_>>();
+        let (message, _) = format_refresh_report(&failures, None, false).unwrap();
+
+        let prepared = prepare_tracker_toast_message(&message);
+
+        assert!(prepared.contains("and 1 more"));
+        assert!(prepared.contains("provider/account-0:"));
+        assert!(prepared.contains("provider/account-2:"));
+        assert!(!prepared.contains("provider/account-3:"));
     }
 
     #[test]

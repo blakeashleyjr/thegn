@@ -87,7 +87,7 @@ pub(crate) fn toggle_link(ctx: &mut TrackerCtx) {
             };
             if let Err(error) = result {
                 tracing::debug!(target: "thegn::db", %error, "issue link update failed");
-                send_tracker_toast(
+                crate::hydrate_tracker::send_tracker_toast(
                     &refresh_tx,
                     &waker,
                     format!("Issue link update failed: {error}"),
@@ -95,6 +95,16 @@ pub(crate) fn toggle_link(ctx: &mut TrackerCtx) {
                 );
                 return;
             }
+            crate::hydrate_tracker::send_tracker_toast(
+                &refresh_tx,
+                &waker,
+                if already_linked {
+                    format!("Unlinked {id_for_write}")
+                } else {
+                    format!("Linked {id_for_write}")
+                },
+                thegn_core::notification::Priority::Info,
+            );
             pulse_model_refresh(refresh_tx, waker);
         });
         ctx.model.status = if already_linked {

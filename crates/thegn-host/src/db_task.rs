@@ -792,7 +792,11 @@ mod tests {
             Db::open_at(&opener_path)
         });
         let order = Arc::new(Mutex::new(Vec::new()));
-        for value in 0..MAX_QUEUED_JOBS {
+        let initial_critical_order = Arc::clone(&order);
+        assert!(persist_critical_for(&writer, move |_db| {
+            initial_critical_order.lock().unwrap().push(usize::MIN);
+        }));
+        for value in 0..(MAX_QUEUED_JOBS - 1) {
             let order = Arc::clone(&order);
             assert!(enqueue(&writer, move |_db| {
                 order.lock().unwrap().push(value);
@@ -815,7 +819,8 @@ mod tests {
         assert_eq!(writer.state.dropped.load(Ordering::Relaxed), 1);
         assert_eq!(
             *order.lock().unwrap(),
-            (1..MAX_QUEUED_JOBS)
+            std::iter::once(usize::MIN)
+                .chain(1..(MAX_QUEUED_JOBS - 1))
                 .chain(std::iter::once(usize::MAX))
                 .collect::<Vec<_>>()
         );
