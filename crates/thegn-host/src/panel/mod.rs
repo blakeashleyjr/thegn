@@ -455,7 +455,7 @@ impl Default for ChangeRow {
             path: String::new(),
             added: 0,
             deleted: 0,
-            count: thegn_svc::git::DiffCount::Unavailable,
+            count: thegn_svc::git::DiffCount::Exact(0),
             submodule: None,
             incoming: false,
         }
@@ -1625,6 +1625,14 @@ mod tests {
         assert_eq!(Section::from_key("git"), Some(Section::Pr));
         assert_eq!(Section::from_key("tasks"), Some(Section::Jobs));
         assert_eq!(Section::from_key("nope"), None);
+    }
+
+    #[test]
+    fn default_change_row_count_is_exact_zero() {
+        assert_eq!(
+            ChangeRow::default().count,
+            thegn_svc::git::DiffCount::Exact(0)
+        );
     }
 
     #[test]

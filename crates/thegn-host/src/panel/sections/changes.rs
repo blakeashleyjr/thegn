@@ -330,15 +330,15 @@ fn change_row(c: &ChangeRow, i: usize, on: bool, deep: bool, cols: usize) -> Pan
     let r: Vec<Seg> = match c.stage {
         Stage::Conflict if !on => vec![seg(hue(Hue::Red), "resolve ").bold(), seg(g2(), "↵")],
         Stage::Untracked => vec![seg(g2(), "new")],
-        _ if let Some(label) = diff_count_label(c.count) => {
-            vec![seg(hue(Hue::Amber), label)]
-        }
-        _ => {
-            let mut v = diffstat(c.added, c.deleted);
-            v.push(sp(1));
-            v.extend(split_bar(c.added, c.deleted, if deep { 8 } else { 5 }));
-            v
-        }
+        _ => match diff_count_label(c.count) {
+            Some(label) => vec![seg(hue(Hue::Amber), label)],
+            None => {
+                let mut v = diffstat(c.added, c.deleted);
+                v.push(sp(1));
+                v.extend(split_bar(c.added, c.deleted, if deep { 8 } else { 5 }));
+                v
+            }
+        },
     };
     // Prefix width: glyph(1) + sp(1) + status(2) = 4.
     // indent() adds sp(2) to l and sp(1) to r; draw_line adds 1-cell gap between l and r.
@@ -471,6 +471,12 @@ fn incoming_divider(data: &crate::panel::PanelData, deep: bool, _cols: usize) ->
                 let (added, deleted, saw_text, saw_binary) =
                     if c.count == thegn_svc::git::DiffCount::Binary {
                         (added, deleted, saw_text, true)
+                    } else if c.count == thegn_svc::git::DiffCount::Unavailable {
+                        let unavailable = |total| match total {
+                            thegn_svc::git::DiffCount::Capped => total,
+                            _ => thegn_svc::git::DiffCount::Unavailable,
+                        };
+                        (unavailable(added), unavailable(deleted), true, saw_binary)
                     } else {
                         (
                             add(added, c.added),
@@ -1020,6 +1026,32 @@ mod tests {
         };
 
         assert!(flat(&content(&ctx)).contains("capped"));
+    }
+
+    #[test]
+    fn incoming_total_propagates_unavailable_file_counts() {
+        let mut unavailable = chg("core/src/unavailable.rs", true, 0);
+        unavailable.count = thegn_svc::git::DiffCount::Unavailable;
+        let model = crate::chrome::FrameModel {
+            panel: crate::panel::PanelData {
+                changes: vec![unavailable],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ui = PanelUi {
+            open: Section::Changes,
+            width: crate::layout::PanelWidth::Normal,
+            ..Default::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 44,
+            rows: 28,
+        };
+
+        assert!(flat(&content(&ctx)).contains("unavailable"));
     }
 
     #[test]

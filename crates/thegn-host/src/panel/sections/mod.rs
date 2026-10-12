@@ -317,6 +317,12 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 |(a, d), c| {
                     if c.count == thegn_svc::git::DiffCount::Binary {
                         (a, d)
+                    } else if c.count == thegn_svc::git::DiffCount::Unavailable {
+                        let unavailable = |total| match total {
+                            thegn_svc::git::DiffCount::Capped => total,
+                            _ => thegn_svc::git::DiffCount::Unavailable,
+                        };
+                        (unavailable(a), unavailable(d))
                     } else {
                         (add(a, c.added), add(d, c.deleted))
                     }
@@ -1319,6 +1325,22 @@ mod spec {
         )))]);
 
         assert!(rendered.contains("capped"), "summary: {rendered}");
+    }
+
+    #[test]
+    fn changes_summary_propagates_unavailable_file_counts() {
+        let mut model = model();
+        model.panel.changes = vec![ChangeRow {
+            count: thegn_svc::git::DiffCount::Unavailable,
+            ..Default::default()
+        }];
+
+        let rendered = text(&[PanelRow::plain(Line::segs(summary(
+            Section::Changes,
+            &model,
+        )))]);
+
+        assert!(rendered.contains("unavailable"), "summary: {rendered}");
     }
 
     fn render(section: Section, width: PanelWidth) -> String {
