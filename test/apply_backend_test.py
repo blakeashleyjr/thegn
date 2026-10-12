@@ -32,7 +32,7 @@ def run_backend(worktree: Path, home: Path) -> subprocess.CompletedProcess[str]:
             "--working-directory",
             str(worktree),
             "_apply-backend",
-            "backend=podman",
+            "podman",
         ],
         cwd=worktree,
         env=env,
