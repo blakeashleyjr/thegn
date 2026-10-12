@@ -141,6 +141,44 @@ fn an_empty_full_fetch_does_not_erase_a_populated_cache() {
 }
 
 #[test]
+fn opaque_caldav_tombstone_deletes_the_cached_resource() {
+    let t = TmpDb::new("opaque-href");
+    let (from, to) = window();
+    let admission = || {
+        thegn_svc::calendar::AccountAdmission::isolated(
+            thegn_core::calendar::AdmissionBudget::default(),
+            thegn_core::calendar::Tz::UTC,
+        )
+    };
+    let href = "/cal/random-server-key.ics".to_string();
+    let full = EventPage::try_new_with_hrefs(
+        PageMode::Snapshot,
+        vec![event("meeting@example")],
+        vec![],
+        vec![href.clone()],
+        vec![],
+        "",
+        &admission(),
+    )
+    .unwrap();
+    assert!(apply_page(&t.db, "work", "caldav", &full, from, to));
+    assert!(t.db.has_calendar_events("work").unwrap());
+
+    let delta = EventPage::try_new_with_hrefs(
+        PageMode::Delta,
+        vec![],
+        vec!["random-server-key".into()],
+        vec![],
+        vec![href],
+        "next-token",
+        &admission(),
+    )
+    .unwrap();
+    assert!(apply_page(&t.db, "work", "caldav", &delta, from, to));
+    assert!(!t.db.has_calendar_events("work").unwrap());
+}
+
+#[test]
 fn an_empty_first_fetch_is_believed() {
     // With nothing cached there is nothing to protect — an empty calendar is
     // simply an empty calendar, and must not be treated as suspicious forever.
@@ -304,6 +342,7 @@ fn an_undeserializable_row_is_skipped_not_fatal() {
                 + 3_600_000,
             recurring: false,
             json: "{ not json at all".into(),
+            ..Default::default()
         }],
     )
     .unwrap();

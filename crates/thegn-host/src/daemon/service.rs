@@ -3848,6 +3848,7 @@ mod tests {
                     end_ms: at.timestamp_millis() + 3_600_000,
                     recurring: false,
                     json: serde_json::to_string(&ev).unwrap(),
+                    ..Default::default()
                 }],
             )
             .unwrap();
@@ -3902,6 +3903,7 @@ mod tests {
                 end_ms: at.timestamp_millis() + 3_600_000,
                 recurring: false,
                 json: serde_json::to_string(&event(uid)).unwrap(),
+                ..Default::default()
             };
             db.put_calendar_events("current", &[row_for("active")])
                 .unwrap();
