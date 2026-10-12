@@ -51,7 +51,7 @@ fn request_etag_over_limit(zone: &str, stored: &str) -> bool {
 
 #[cfg(test)]
 mod cursor_tests {
-    use super::{request_etag, request_etag_over_limit, stored_cursor};
+    use super::{MAX_REQUEST_BYTES, request_etag, request_etag_over_limit, stored_cursor};
 
     #[test]
     fn ics_cursor_requires_the_current_zone_and_rejects_legacy_etags() {
