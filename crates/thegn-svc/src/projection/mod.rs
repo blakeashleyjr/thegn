@@ -96,12 +96,28 @@ fn mount_sshfs(spec: &ProjectionSpec) -> Result<Mounted> {
     let Placement::Ssh(s) = &spec.placement else {
         bail!("sshfs projection requires an ssh placement");
     };
-    std::fs::create_dir_all(&spec.mountpoint).ok(); // best-effort: failure surfaces via the mount error below
-    let argv = s.sshfs_mount_argv(&spec.remote_dir, &spec.mountpoint);
+    if !s.extra_args.is_empty() {
+        bail!("sshfs projection does not support ssh extra_args");
+    }
+    if let Err(error) = std::fs::create_dir_all(&spec.mountpoint) {
+        tracing::debug!(%error, path = %spec.mountpoint, "could not create sshfs projection mountpoint");
+    }
+    let argv = sshfs_mount_argv_for(s, &spec.remote_dir, &spec.mountpoint);
     run(&argv)?;
     Ok(Mounted {
         local_cwd: Some(spec.mountpoint.clone()),
     })
+}
+
+fn sshfs_mount_argv_for(s: &SshPlacement, remote: &str, mountpoint: &str) -> Vec<String> {
+    let mut argv = s.sshfs_mount_argv(remote, mountpoint);
+    if let Some(config) = &s.ssh_config {
+        argv.extend(["-F".into(), config.clone()]);
+    }
+    if let Some(jump_host) = &s.jump_host {
+        argv.extend(["-o".into(), format!("ProxyJump={jump_host}")]);
+    }
+    argv
 }
 
 fn unmount_sshfs(spec: &ProjectionSpec) -> Result<()> {
@@ -244,16 +260,28 @@ fn reap_legacy_mounts_with(
     reaped
 }
 
-/// `rsync -e` transport flag carrying the placement's ssh knobs (port/identity).
+/// `rsync -e` transport flag carrying the placement's ssh knobs.
 fn rsync_ssh_opt(s: &SshPlacement) -> Vec<String> {
-    let mut ssh = String::from("ssh");
+    let mut ssh = vec!["ssh".to_string()];
     if s.port != 22 {
-        ssh.push_str(&format!(" -p {}", s.port));
+        ssh.extend(["-p".into(), s.port.to_string()]);
+    }
+    if let Some(config) = &s.ssh_config {
+        ssh.extend(["-F".into(), config.clone()]);
+    }
+    if let Some(jump_host) = &s.jump_host {
+        ssh.extend(["-J".into(), jump_host.clone()]);
     }
     if let Some(id) = &s.identity {
-        ssh.push_str(&format!(" -i {id}"));
+        ssh.extend(["-i".into(), id.clone()]);
     }
-    vec!["-e".into(), ssh]
+    ssh.extend(s.extra_args.iter().cloned());
+    let command = ssh
+        .iter()
+        .map(|arg| thegn_core::util::sh_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    vec!["-e".into(), command]
 }
 
 /// `host:remote_dir/` (trailing slash → sync directory *contents*).
@@ -275,7 +303,9 @@ fn mount_sync(spec: &ProjectionSpec) -> Result<Mounted> {
     let Placement::Ssh(s) = &spec.placement else {
         bail!("sync projection requires an ssh placement");
     };
-    std::fs::create_dir_all(&spec.mountpoint).ok(); // best-effort: failure surfaces via the mount error below
+    if let Err(error) = std::fs::create_dir_all(&spec.mountpoint) {
+        tracing::debug!(%error, path = %spec.mountpoint, "could not create sync projection mountpoint");
+    }
     let mut argv = vec!["rsync".into(), "-az".into(), "--delete".into()];
     argv.extend(rsync_ssh_opt(s));
     argv.push(rsync_remote(s, &spec.remote_dir));
@@ -426,6 +456,71 @@ mod tests {
         // Default port omits -p.
         let q = SshPlacement::plain("h".into(), 22, false, TransportKind::Ssh);
         assert_eq!(rsync_ssh_opt(&q), vec!["-e", "ssh"]);
+    }
+
+    #[test]
+    fn rsync_ssh_opt_carries_config_and_jump_host() {
+        let mut placement = SshPlacement::plain("dev-box".into(), 22, false, TransportKind::Ssh);
+        placement.ssh_config = Some("/cfg".into());
+        placement.jump_host = Some("bastion".into());
+
+        assert_eq!(
+            rsync_ssh_opt(&placement),
+            vec!["-e", "ssh -F /cfg -J bastion"]
+        );
+    }
+
+    #[test]
+    fn rsync_ssh_opt_quotes_identity_and_appends_extra_args() {
+        let mut placement = SshPlacement::plain("dev-box".into(), 22, false, TransportKind::Ssh);
+        placement.identity = Some("/k/my id".into());
+        placement.extra_args = vec!["-v".into()];
+
+        assert_eq!(
+            rsync_ssh_opt(&placement),
+            vec!["-e", "ssh -i '/k/my id' -v"]
+        );
+    }
+
+    #[test]
+    fn sshfs_mount_argv_carries_config_and_jump_host() {
+        let mut placement = SshPlacement::plain("dev-box".into(), 22, false, TransportKind::Ssh);
+        placement.ssh_config = Some("/cfg".into());
+        placement.jump_host = Some("bastion".into());
+        let argv = sshfs_mount_argv_for(&placement, "/srv/work", "/tmp/mount");
+
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair[0] == "-F" && pair[1] == "/cfg")
+        );
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair[0] == "-o" && pair[1] == "ProxyJump=bastion")
+        );
+
+        let plain = SshPlacement::plain("dev-box".into(), 22, false, TransportKind::Ssh);
+        assert_eq!(
+            sshfs_mount_argv_for(&plain, "/srv/work", "/tmp/mount"),
+            plain.sshfs_mount_argv("/srv/work", "/tmp/mount")
+        );
+    }
+
+    #[test]
+    fn sshfs_extra_args_fail_before_creating_mountpoint_or_spawning() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut placement = match ssh() {
+            Placement::Ssh(placement) => placement,
+            _ => unreachable!(),
+        };
+        placement.extra_args = vec!["-v".into()];
+        let mut projection = spec(DataMode::Sshfs, Placement::Ssh(placement));
+        let mountpoint = temp.path().join("mount");
+        projection.mountpoint = mountpoint.to_str().unwrap().to_string();
+
+        let error = for_data_mode(&projection).mount(&projection).unwrap_err();
+
+        assert!(error.to_string().contains("extra_args"));
+        assert!(!mountpoint.exists());
     }
 
     #[test]
