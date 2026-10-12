@@ -31,6 +31,12 @@ static PALETTE: std::sync::LazyLock<std::sync::RwLock<theme::Palette>> =
 static RESOLVED: std::sync::LazyLock<std::sync::RwLock<[ColorAttribute; S::COUNT]>> =
     std::sync::LazyLock::new(|| std::sync::RwLock::new(resolve_slots(&theme::Palette::default())));
 
+/// The shipped network icon is the sentinel for automatic medium selection.
+/// Resolve it once so rendering the network widget does not build a full
+/// `StatsConfig` on every frame.
+static DEFAULT_NET_ICON: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| thegn_core::config::StatsConfig::default().net_icon);
+
 fn resolve_slots(p: &theme::Palette) -> [ColorAttribute; S::COUNT] {
     S::ALL.map(|s| theme_color(slot_rgb(p, s)))
 }
@@ -1536,8 +1542,7 @@ pub(crate) fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWi
         }),
         "net" => s.net_bps.map(|(rx, tx)| {
             let glyphs = crate::caps::active_glyphs();
-            let shipped_default = thegn_core::config::StatsConfig::default().net_icon;
-            let icon = if ic.net_icon == shipped_default {
+            let icon = if ic.net_icon.as_str() == DEFAULT_NET_ICON.as_str() {
                 match s.net_medium {
                     thegn_metrics::NetMedium::Wifi => ic.net_icon.as_str(),
                     thegn_metrics::NetMedium::Ethernet => glyphs.net_wired,
