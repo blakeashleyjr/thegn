@@ -149,7 +149,6 @@ crates/thegn-host/src/autoscale.rs
 crates/thegn-host/src/blast_radius.rs
 crates/thegn-host/src/bridge_sup.rs
 crates/thegn-host/src/build_cache.rs
-crates/thegn-host/src/ci_refresh.rs
 crates/thegn-host/src/cli_help.rs
 crates/thegn-host/src/clipboard.rs
 crates/thegn-host/src/cmd/attach.rs
