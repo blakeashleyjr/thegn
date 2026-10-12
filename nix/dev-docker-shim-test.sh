@@ -19,7 +19,7 @@ if ! python3 -c 'import socket, sys; s=socket.socket(socket.AF_UNIX); s.bind(sys
     runtime=/run
   else
     echo 'dev-docker-shim checks skipped: runner cannot create a Unix socket'
-    exit 0
+    exit 1
   fi
 fi
 
