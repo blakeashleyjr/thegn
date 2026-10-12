@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
+use futures::StreamExt;
 use serde_json::Value;
 use thegn_core::config_model_proxy::RoutingStrategy;
 use thegn_core::proxy::classify::{FailKind, classify_response};
@@ -291,19 +292,17 @@ async fn try_chain(
                 .limiter
                 .try_acquire(&ident, backend.rate, Instant::now());
         }
-        if !is_last && state.inflight.at_cap(&ident, backend.inflight_cap) {
+        let Some(_permit) = state.inflight.try_acquire(&ident, backend.inflight_cap) else {
             state.metrics.inc_fallthrough(&ident, "loadshed_inflight");
             continue;
-        }
+        };
 
         let backend_body = apply_transforms(backend, parsed, body);
-        state.inflight.enter(&ident);
         let attempt = state
             .upstreams
             .for_backend(backend)
             .dispatch(&state.client, backend, &backend_body)
             .await;
-        state.inflight.leave(&ident);
 
         let resp = match attempt {
             Ok(r) => r,
@@ -469,6 +468,11 @@ async fn try_stream_chain(
                 .try_acquire(&ident, backend.rate, Instant::now());
         }
 
+        let Some(permit) = state.inflight.try_acquire(&ident, backend.inflight_cap) else {
+            state.metrics.inc_fallthrough(&ident, "loadshed_inflight");
+            continue;
+        };
+
         let backend_body = apply_transforms(backend, &parsed, body);
 
         if backend.is_anthropic() {
@@ -514,7 +518,8 @@ async fn try_stream_chain(
                                     est_tokens as u64,
                                 )),
                             };
-                            return sse.map(Body::from);
+                            return sse
+                                .map(|bytes| hold_inflight_permit(Body::from(bytes), permit));
                         }
                         FailKind::Exhausted => {
                             let until = parse_reset_from_body(&resp.body, now)
@@ -540,14 +545,17 @@ async fn try_stream_chain(
         }
 
         // OpenAI-surface backend: open the stream and relay it live.
-        let resp = match state
-            .upstreams
-            .for_backend(backend)
-            .open_stream(&state.client, backend, &backend_body)
-            .await
-        {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
+        let opened = tokio::time::timeout(
+            cfg.first_byte,
+            state
+                .upstreams
+                .for_backend(backend)
+                .open_stream(&state.client, backend, &backend_body),
+        )
+        .await;
+        let resp = match opened {
+            Ok(Ok(r)) if r.status().is_success() => r,
+            Ok(Ok(r)) => {
                 let status = r.status().as_u16();
                 let headers = r.headers().clone();
                 let bytes = r.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
@@ -564,9 +572,13 @@ async fn try_stream_chain(
                 }
                 continue;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(backend = %ident, error = %e, "stream backend error");
                 state.metrics.inc_fallthrough(&ident, "network_error");
+                continue;
+            }
+            Err(_) => {
+                state.metrics.inc_fallthrough(&ident, "first_byte_timeout");
                 continue;
             }
         };
@@ -632,10 +644,20 @@ async fn try_stream_chain(
             state.health.record_success(&ident, &backend.model);
             state.set_resolved(&route.name, &ident);
             state.metrics.inc_request(&route.name, &ident, "ok_stream");
-            return Some(body);
+            return Some(hold_inflight_permit(body, permit));
         }
     }
     None
+}
+
+/// Keeps a backend-attempt permit alive until the client finishes or drops its
+/// response body, including when a streamed response is cancelled.
+fn hold_inflight_permit(body: Body, permit: thegn_core::proxy::ratelimit::InflightPermit) -> Body {
+    let stream = futures::stream::unfold(
+        (body.into_data_stream(), permit),
+        |(mut body, permit)| async move { body.next().await.map(|chunk| (chunk, (body, permit))) },
+    );
+    Body::from_stream(stream)
 }
 
 /// Records the right health/metrics signal for a pre-commit stream that did not
