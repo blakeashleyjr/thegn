@@ -1128,7 +1128,7 @@ fn set_status(id: i64, status: &str, force: bool, why: Option<&str>, json: bool)
     // always be able to record a bad outcome. This comment is the rule a
     // future edit will erode; keep it.
     if parsed == AgentDispatchStatus::Done && !force {
-        done_gate(&row)?;
+        done_gate_bound(&db, &row)?;
     }
     // A supplied reason is primary audit data, not cache context: commit it
     // atomically with the status so the command cannot claim success after
@@ -1177,15 +1177,15 @@ fn set_status(id: i64, status: &str, force: bool, why: Option<&str>, json: bool)
 }
 
 /// The `set-status done` gate (THE-76 + THE-88): a row that carries an
-/// artifact may only be recorded done when its handoff is real. Two
-/// gates, both in [`pipeline_run::verify_report`]:
+/// artifact may only be recorded done when its handoff is real. The gates live
+/// in [`pipeline_run::verify_report`]:
 ///
 /// 1. The artifact is present in the row's worktree, committed in `HEAD`, and
 ///    unchanged at that path
 ///    (THE-76's original rule — a session exiting is not a handoff).
-/// 2. The row carries a non-empty `report` (THE-88 — the worker must file
-///    `thegn dispatch report <id>`; the report is what the Lead reads, the
-///    artifact pointer only tells it where to look if a reviewer needs to).
+/// 2. The row carries a non-empty report with an explicit PASS and successful
+///    gate citation. When the report has a recorded HEAD, that commit must
+///    still contain the unchanged artifact.
 ///
 /// `--force` is the deliberate override for BOTH rules (the refusal names
 /// it). Pane-exit auto-stamps (`pty_drain.rs:855-895`) bypass the gate
@@ -1193,14 +1193,24 @@ fn set_status(id: i64, status: &str, force: bool, why: Option<&str>, json: bool)
 /// handoff verdict, so it is not subject to either check.
 fn done_gate(row: &AgentDispatch) -> Result<()> {
     let report = pipeline_run::verify_report(&verify_facts(row));
+    require_done_report(row.id, report)
+}
+
+fn done_gate_bound(db: &Db, row: &AgentDispatch) -> Result<()> {
+    let report_head = db.dispatch_report_head(row.id)?;
+    let facts = verify_facts_with_report_head(row, report_head.as_deref());
+    require_done_report(row.id, pipeline_run::verify_report(&facts))
+}
+
+fn require_done_report(id: i64, report: pipeline_run::VerifyReport) -> Result<()> {
     if report.ok {
         return Ok(());
     }
     anyhow::bail!(
         "dispatch {} is not verifiably finished:\n  - {}\nrun `thegn dispatch verify {}` for detail, or `--force` to record it anyway",
-        row.id,
+        id,
         report.reasons.join("\n  - "),
-        row.id
+        id
     );
 }
 
@@ -1212,10 +1222,18 @@ fn done_gate(row: &AgentDispatch) -> Result<()> {
 /// `pub(crate)`: the resume path in `cmd/session.rs` reads the same facts —
 /// one implementation, two callers.
 pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
+    verify_facts_with_report_head(row, None)
+}
+
+fn verify_facts_with_report_head(
+    row: &AgentDispatch,
+    report_head: Option<&str>,
+) -> pipeline_run::VerifyFacts {
     // THE-88: report presence is a row fact even for plain dispatches. It is
     // only a completion gate when an artifact is present, but `dispatch
     // verify` should faithfully report the column in either case.
     let report_present = row.report.as_deref().is_some_and(|r| !r.trim().is_empty());
+    let report_verdict = pipeline_report::verdict_of(row.report.as_deref());
     let Some(artifact) = row
         .artifact_path
         .as_deref()
@@ -1233,7 +1251,9 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
             // A plain (non-pipeline) row is never gated; the report fact is
             // still returned so verify reflects the row faithfully.
             report_present,
+            report_verdict,
             report_gate_valid: true,
+            report_commit_binding: pipeline_run::ReportCommitBinding::Unbound,
         };
     };
     let wt = std::path::Path::new(&row.worktree_path);
@@ -1270,7 +1290,7 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
     // THE-88: a row carrying an artifact must also file a report —
     // `verify_report` turns the missing case into an `ok=false` reason that
     // names the `dispatch report` command as the fix.
-    pipeline_run::VerifyFacts {
+    let mut facts = pipeline_run::VerifyFacts {
         stage: row.stage.clone(),
         artifact: Some(artifact),
         exists,
@@ -1278,10 +1298,46 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
         dirty,
         worktree_state: Some(worktree_state),
         report_present,
-        report_gate_valid: row
-            .report
-            .as_deref()
-            .is_none_or(|report| !pipeline_report::pass_without_gate_evidence(report)),
+        report_verdict,
+        report_gate_valid: report_verdict != pipeline_report::Verdict::Pass
+            || row
+                .report
+                .as_deref()
+                .is_none_or(|report| pipeline_report::gate_evidence(report).is_some()),
+        report_commit_binding: pipeline_run::ReportCommitBinding::Unbound,
+    };
+    if report_present && let Some(report_head) = report_head {
+        let head = git_out_allow_empty(wt, &["rev-parse", "--verify", "HEAD"])
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let (is_ancestor, artifact_unchanged) = match (head.as_deref(), facts.artifact.as_deref()) {
+            (Some(head), Some(artifact)) => (
+                git_exit_0_or_1(wt, &["merge-base", "--is-ancestor", report_head, head]),
+                git_exit_0_or_1(wt, &["diff", "--quiet", report_head, head, "--", artifact]),
+            ),
+            _ => (None, None),
+        };
+        facts.report_commit_binding = pipeline_run::report_commit_binding(
+            Some(report_head),
+            head.as_deref(),
+            is_ancestor,
+            artifact_unchanged,
+        );
+    }
+    facts
+}
+
+/// Return Some(true/false) for git exit 0/1; any spawn or other exit failure is unknown.
+fn git_exit_0_or_1(worktree: &std::path::Path, args: &[&str]) -> Option<bool> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(worktree)
+        .output()
+        .ok()?;
+    match output.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
     }
 }
 
@@ -1345,6 +1401,7 @@ pub(crate) fn reap_plan_rows(
             artifact_exists: f.exists,
             artifact_tracked: f.tracked,
             report_present: f.report_present,
+            report_verdict: f.report_verdict,
             report_gate_valid: f.report_gate_valid,
         }
     })
@@ -1513,7 +1570,9 @@ fn verify(id: i64, json: bool) -> Result<()> {
     let row = db
         .get_dispatch(id)?
         .ok_or_else(|| anyhow::anyhow!("no dispatch with id {id}"))?;
-    let report = pipeline_run::verify_report(&verify_facts(&row));
+    let report_head = db.dispatch_report_head(id)?;
+    let facts = verify_facts_with_report_head(&row, report_head.as_deref());
+    let report = pipeline_run::verify_report(&facts);
     if json {
         // One flat document — the report plus the row id — so a supervisor can
         // grep `"ok":false` / `"id":12` from a single line.
@@ -1567,7 +1626,18 @@ fn report(id: i64, text: &str, json: bool) -> Result<()> {
 /// THE-88 — the DB-bound half of `dispatch report`. Validated text → row.
 pub(crate) fn write_report(db: &Db, id: i64, text: &str, json: bool) -> Result<()> {
     let validated = pipeline_report::report_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
-    db.set_dispatch_report(id, &validated)?;
+    let row = db
+        .get_dispatch(id)?
+        .ok_or_else(|| anyhow::anyhow!("roster row {id} does not exist"))?;
+    let head_oid = git_out_allow_empty(
+        std::path::Path::new(&row.worktree_path),
+        &["rev-parse", "--verify", "HEAD"],
+    )
+    .filter(|oid| !oid.is_empty());
+    if head_oid.is_none() {
+        tracing::warn!(target: "thegn::pipeline", dispatch_id = id, "could not record HEAD for dispatch report");
+    }
+    db.set_dispatch_report_bound(id, &validated, head_oid.as_deref())?;
     // A PASS is a claim that the queue-boundary suite is green. Surfaced, never
     // refused: a report that cannot be filed is a silent death, which is the
     // worse failure — see the handoff contract in `[[pipeline.stages]]`.
@@ -1914,7 +1984,11 @@ fn wake_handoff(
     }
     let report = row.report.clone();
     let artifact = row.artifact_path.clone();
-    let facts = verify_facts(&row);
+    let report_head = match db.dispatch_report_head(target.target.id) {
+        Ok(head) => head,
+        Err(_) => return unknown(),
+    };
+    let facts = verify_facts_with_report_head(&row, report_head.as_deref());
     let verdict = pipeline_run::verify_report(&facts);
     let outcome = if facts.worktree_state == Some(pipeline_run::WorktreeState::Unknown) {
         pipeline_run::HandoffOutcome::InfrastructureUnknown
@@ -1924,8 +1998,11 @@ fn wake_handoff(
         } else {
             pipeline_run::HandoffOutcome::Absent
         }
-    } else if verdict.ok {
+    } else if verdict.ok && facts.report_commit_binding == pipeline_run::ReportCommitBinding::Bound
+    {
         pipeline_run::HandoffOutcome::VerifiedHandoff
+    } else if facts.report_commit_binding == pipeline_run::ReportCommitBinding::Unknown {
+        pipeline_run::HandoffOutcome::InfrastructureUnknown
     } else if facts.stage.is_some() && facts.artifact.is_none() {
         pipeline_run::HandoffOutcome::UnverifiedCandidate
     } else if !facts.exists && !facts.report_present {
@@ -1937,10 +2014,15 @@ fn wake_handoff(
         Ok(Some(row)) => row,
         Ok(None) | Err(_) => return unknown(),
     };
+    let current_report_head = match db.dispatch_report_head(target.target.id) {
+        Ok(head) => head,
+        Err(_) => return unknown(),
+    };
     if !same_run(&current)
         || current.worktree_path != row.worktree_path
         || current.artifact_path != row.artifact_path
         || current.report != row.report
+        || current_report_head != report_head
     {
         return unknown();
     }
@@ -2209,7 +2291,13 @@ mod tests {
             })
             .unwrap();
         db.bind_dispatch_session(id, "session-253").unwrap();
-        db.set_dispatch_report(id, "finished").unwrap();
+        write_report(
+            &db,
+            id,
+            "PASS\ngate: cargo nextest run --workspace -- 1 passed, 0 skipped",
+            false,
+        )
+        .unwrap();
         let run = db.dispatch_run_ref(id).unwrap().unwrap();
         let mut target = FencedWaitTarget {
             target: WaitTarget {
@@ -2229,6 +2317,60 @@ mod tests {
             &target,
         );
         assert_eq!(stale, pipeline_run::HandoffOutcome::InfrastructureUnknown);
+    }
+
+    #[test]
+    fn a_report_bound_to_a_newer_commit_is_not_a_verified_wake_handoff() {
+        let (_dir, db) = db("wake-stale-report-commit");
+        let (_worktree_dir, worktree) = git_repo("wake-stale-report-worktree");
+        std::fs::write(worktree.join("handoff.md"), "version one\n").unwrap();
+        assert!(git_ok(&worktree, &["add", "--", "handoff.md"]));
+        assert!(git_ok(&worktree, &["commit", "-q", "-m", "artifact one"]));
+        let first =
+            thegn_core::util::git_out_allow_empty(&worktree, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(worktree.join("handoff.md"), "version two\n").unwrap();
+        assert!(git_ok(&worktree, &["add", "--", "handoff.md"]));
+        assert!(git_ok(&worktree, &["commit", "-q", "-m", "artifact two"]));
+        let id = db
+            .put_agent_dispatch(thegn_core::issue::NewDispatch {
+                stage: Some("code"),
+                artifact_path: Some("handoff.md"),
+                ..thegn_core::issue::NewDispatch::new(
+                    "linear:THE-253",
+                    worktree.to_str().unwrap(),
+                    "coder",
+                )
+            })
+            .unwrap();
+        db.bind_dispatch_session(id, "session-stale-report")
+            .unwrap();
+        write_report(
+            &db,
+            id,
+            "PASS\ngate: cargo nextest run --workspace -- 1 passed, 0 skipped",
+            false,
+        )
+        .unwrap();
+        assert!(git_ok(&worktree, &["reset", "-q", "--hard", &first]));
+        let row = db.get_dispatch(id).unwrap().unwrap();
+        let done_error = done_gate_bound(&db, &row).unwrap_err().to_string();
+        assert!(
+            done_error.contains("older or changed artifact commit"),
+            "{done_error}"
+        );
+        let run = db.dispatch_run_ref(id).unwrap().unwrap();
+        let target = FencedWaitTarget {
+            target: WaitTarget {
+                id,
+                session_id: run.session_id,
+                stage: Some("code".into()),
+                issue_id: "linear:THE-253".into(),
+            },
+            run_gen: run.run_gen,
+        };
+        let (outcome, _, _) = wake_handoff(Ok(db), &target);
+        assert_eq!(outcome, pipeline_run::HandoffOutcome::UnverifiedCandidate);
+        assert!(!outcome.handoff_present());
     }
 
     #[test]
@@ -2893,6 +3035,43 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("--force"), "{err}");
+    }
+
+    #[test]
+    fn committed_artifact_with_fail_report_cannot_be_completed_or_reaped_done() {
+        let (_db_dir, db) = db("fail-report-done-gate");
+        let (_worktree_dir, root) = git_repo("fail-report-worktree");
+        commit_artifact(&root);
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                stage: Some("code"),
+                artifact_path: Some(ARTIFACT),
+                ..NewDispatch::new("linear:THE-269", root.to_str().unwrap(), "coder")
+            })
+            .unwrap();
+        let run = db
+            .publish_dispatch_run(id, "fail-session", ARTIFACT)
+            .unwrap();
+        assert_eq!(run, thegn_core::issue::DispatchRunPublishOutcome::Published);
+        write_report(&db, id, "FAIL: tests failed", false).unwrap();
+        let run = db.dispatch_run_ref(id).unwrap().unwrap();
+        db.stamp_dispatch_exit(&run, Some(1)).unwrap();
+        let row = db.get_dispatch(id).unwrap().unwrap();
+        let done_error = done_gate_bound(&db, &row).unwrap_err().to_string();
+        assert!(
+            done_error.contains("verdict is fail") && done_error.contains("Lead"),
+            "{done_error}"
+        );
+        let plan = reap_plan_rows(&[row], Some(&[]));
+        assert_eq!(plan.len(), 1);
+        assert!(!matches!(
+            &plan[0].verdict,
+            pipeline_reap::ReapVerdict::CloseDone
+        ));
+        assert!(matches!(
+            &plan[0].verdict,
+            pipeline_reap::ReapVerdict::NeedsDecision { why } if why.contains("FAIL") && why.contains("Lead")
+        ));
     }
 
     // --- THE-88: report / note / status verbs ------------------------------

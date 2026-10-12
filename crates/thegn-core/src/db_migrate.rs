@@ -1212,6 +1212,25 @@ pub(crate) fn verify_v75_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v76: bind each filed dispatch report to the worktree HEAD observed then.
+pub(crate) fn migrate_v76(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "report_head_oid") {
+        conn.execute(
+            "ALTER TABLE agent_dispatches ADD COLUMN report_head_oid TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Verify the v76 report commit binding column.
+pub(crate) fn verify_v76_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "report_head_oid") {
+        bail!("schema v76 migration did not add agent_dispatches.report_head_oid");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -1829,6 +1848,32 @@ mod tests {
             .unwrap();
         assert!(caldav_token.is_empty(), "v75 forces a CalDAV snapshot");
         assert_eq!(ics_token, "etag-1", "non-CalDAV cursors are preserved");
+    }
+
+    #[test]
+    fn v76_adds_report_head_binding_idempotently_and_preserves_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_dispatches (
+                 id INTEGER PRIMARY KEY, issue_id TEXT NOT NULL, report TEXT);
+             INSERT INTO agent_dispatches(issue_id, report) VALUES ('linear:H-76', 'PASS');",
+        )
+        .unwrap();
+        assert!(super::verify_v76_schema(&conn).is_err());
+        super::migrate_v76(&conn).unwrap();
+        super::migrate_v76(&conn).unwrap();
+        super::verify_v76_schema(&conn).unwrap();
+        let (issue, report, head): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT issue_id, report, report_head_oid FROM agent_dispatches",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (issue.as_str(), report.as_str(), head),
+            ("linear:H-76", "PASS", None)
+        );
     }
 
     #[test]
