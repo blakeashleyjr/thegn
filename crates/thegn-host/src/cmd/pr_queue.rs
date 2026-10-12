@@ -213,9 +213,13 @@ fn bind_checkout(
     let canonical_wt_main =
         wt_main.map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
     if canonical_wt_main.as_deref() != Some(canonical_root.as_path()) {
+        let worktree_repository = wt_main
+            .map(|path| format!("repository {}", path.display()))
+            .unwrap_or_else(|| "an unknown repository".to_string());
         anyhow::bail!(
-            "worktree {} belongs to another repository than {}",
+            "worktree {} belongs to {}, not {}",
             wt.display(),
+            worktree_repository,
             root.display()
         );
     }
