@@ -1787,9 +1787,12 @@ fn systemd_local_secrets_go_to_environment_file_not_argv() {
 
 #[test]
 fn remote_oci_sends_host_secrets_on_stdin_and_keeps_synthetic_env_inline() {
+    let state = tempfile::tempdir().unwrap();
+    let state_home = state.path().to_string_lossy().into_owned();
     let _env = crate::testenv::EnvGuard::mutate_pairs(&[
         ("GH_TOKEN", Some("ghp_secret")),
         ("THEGN_SANDBOX", None),
+        ("XDG_STATE_HOME", Some(&state_home)),
     ]);
     let mut s = spec(Backend::Podman);
     s.env = vec![
@@ -1803,20 +1806,89 @@ fn remote_oci_sends_host_secrets_on_stdin_and_keeps_synthetic_env_inline() {
         TransportKind::Ssh,
     ));
     let secret_env = ssh_oci_secret_env(&s);
-    let (argv, input) = oci_create_argv_and_stdin(&s, oci_create_opts(&s).unwrap(), &secret_env);
+    let opts = oci_create_opts_with_ssh_secrets(&s, &secret_env).unwrap();
+    let (argv, input) = oci_create_argv_and_stdin(&s, opts, &secret_env);
     let j = argv.join(" ");
     assert!(!j.contains("ghp_secret"), "remote argv leaked secret: {j}");
     assert!(j.contains("--env-file /dev/stdin"), "stdin env-file: {j}");
+    assert_eq!(
+        j.matches("--env-file").count(),
+        1,
+        "one remote env-file: {j}"
+    );
     assert!(
         j.contains("-e THEGN_SANDBOX=1"),
         "synthetic env inline: {j}"
     );
     let input = String::from_utf8(input.expect("SSH host secret stdin")).unwrap();
     assert_eq!(input, "GH_TOKEN=ghp_secret\n");
+    let env_dir = state.path().join("thegn/sandbox-env");
+    if env_dir.exists() {
+        assert!(
+            std::fs::read_dir(env_dir).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".env")),
+            "remote secrets must not create a local env-file"
+        );
+    }
     assert!(
         !redact_stderr("remote rejected ghp_secret".into(), &["ghp_secret".into()])
             .contains("ghp_secret")
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn stderr_with_timeout_stdin_redacts_payload_and_reports_child_failure() {
+    let argv = vec!["sh".into(), "-c".into(), "cat >&2; exit 3".into()];
+    let result = stderr_with_timeout_stdin(&argv, Duration::from_secs(2), b"K=canary\n".to_vec());
+    let (success, stderr) = result.expect("child exits and stderr is retained");
+    assert!(!success, "exit status 3 must be reported as failure");
+    assert!(stderr.contains("[REDACTED]"), "redacted stderr: {stderr}");
+    assert!(
+        !stderr.contains("canary"),
+        "secret leaked in stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stderr_with_timeout_stdin_keeps_stderr_when_feeder_hits_epipe() {
+    let argv = vec![
+        "sh".into(),
+        "-c".into(),
+        "printf 'remote diagnostic' >&2; exit 3".into(),
+    ];
+    let input = vec![b'x'; 1024 * 1024];
+    let (success, stderr) = stderr_with_timeout_stdin(&argv, Duration::from_secs(2), input)
+        .expect("child exit diagnostics survive a broken stdin pipe");
+    assert!(!success, "a child that rejects input reports failure");
+    assert!(
+        stderr.contains("remote diagnostic"),
+        "stderr was lost: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stderr_with_timeout_stdin_kills_and_reaps_on_timeout() {
+    let argv = vec!["sh".into(), "-c".into(), "sleep 5".into()];
+    assert!(
+        stderr_with_timeout_stdin(&argv, Duration::from_millis(100), b"K=canary\n".to_vec())
+            .is_none(),
+        "a command exceeding its deadline returns None"
+    );
+}
+
+#[test]
+fn stderr_redaction_skips_short_common_values() {
+    let stderr = redact_stderr(
+        "CI=1 TERM=xterm token=long-secret-value".into(),
+        &["1".into(), "xterm".into(), "long-secret-value".into()],
+    );
+    assert_eq!(stderr, "CI=1 TERM=xterm token=[REDACTED]");
 }
 
 #[cfg(unix)]
