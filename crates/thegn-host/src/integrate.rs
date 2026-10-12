@@ -17,6 +17,7 @@ use crate::platform::gate_path::ScratchDirectory;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use thegn_core::config::MergeQueueConfig;
 use thegn_core::db::Db;
 use thegn_core::fold::{
@@ -27,6 +28,10 @@ use thegn_core::remote::GitLoc;
 use thegn_core::store::WorktreeAuxStore;
 use thegn_core::util;
 use thegn_svc::git::{CasOutcome, CliGit, GitBackend, MergeTreeOutcome, PlumbingOps};
+
+const DRIVER_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(600);
+const DIAGNOSIS_GATE_LIMIT: usize = 8;
+const DIAGNOSIS_TIME_LIMIT: Duration = Duration::from_secs(60 * 60);
 
 #[path = "integrate_candidates.rs"]
 mod candidates;
@@ -40,11 +45,16 @@ use persistence::{observe_outcomes, persist};
 
 fn remove_scratch_worktree(repo_root: &Path, scratch: ScratchDirectory) {
     if scratch.verify().is_err() {
+        gate_runner::record_external_quarantine(
+            scratch.path(),
+            "scratch worktree identity changed",
+        );
         tracing::warn!(target: "thegn::integrate", path = %scratch.path().display(), "scratch worktree identity changed; preserving it");
         return;
     }
     let path = scratch.path().to_string_lossy().to_string();
     if !util::git_ok(repo_root, &["worktree", "remove", "--force", &path]) {
+        gate_runner::record_external_quarantine(scratch.path(), "scratch worktree cleanup failed");
         tracing::warn!(target: "thegn::integrate", path, "scratch worktree cleanup failed; preserving it for repair");
     }
 }
@@ -293,6 +303,7 @@ impl PlumbingAdapter {
                 theirs,
                 &paths,
                 &self.regenerate_command,
+                DRIVER_SUBPROCESS_TIMEOUT,
             )
         {
             return MergeOutcome::Clean { tree };
@@ -302,7 +313,13 @@ impl PlumbingAdapter {
         // is enabled (a recorded resolution may auto-apply). The check-attr probe
         // is skipped when rerere alone already warrants the worktree.
         if (self.rerere || has_custom_driver(&self.repo_root, &paths))
-            && let Some(tree) = driver_merge(&self.repo_root, ours, theirs, self.rerere)
+            && let Some(tree) = driver_merge(
+                &self.repo_root,
+                ours,
+                theirs,
+                self.rerere,
+                DRIVER_SUBPROCESS_TIMEOUT,
+            )
         {
             return MergeOutcome::Clean { tree };
         }
@@ -339,7 +356,13 @@ fn has_custom_driver(repo_root: &Path, paths: &[String]) -> bool {
 /// written tree oid only if the merge ends with NO unmerged paths; otherwise
 /// `None` (caller defers). Never leaves a worktree behind.
 // off-loop: the fold runs from the CLI / spawn_blocking (see the module doc).
-fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Option<String> {
+fn driver_merge(
+    repo_root: &Path,
+    ours: &str,
+    theirs: &str,
+    rerere: bool,
+    timeout: Duration,
+) -> Option<String> {
     // Operands sit in option-parsing positions; refuse dash-led ones before spawn.
     thegn_core::git_operand::revision(ours).ok()?;
     thegn_core::git_operand::revision(theirs).ok()?;
@@ -357,6 +380,7 @@ fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Opt
         }
         return None;
     }
+    let mut preserve_scratch = false;
     let tree = (|| -> Option<String> {
         scratch.verify().ok()?;
         // rerere on: apply recorded resolutions and stage them (autoUpdate).
@@ -376,20 +400,22 @@ fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Opt
         // Git uses exit 1 for a merge with conflicts. That is the sole
         // nonzero result that can proceed to index inspection; other failures
         // (including an already-active merge) are infrastructure errors.
-        let (status, stdout, stderr) = match run_driver_merge(&tmp, &args) {
-            Ok(output) => output,
-            Err(error) => {
-                warn_driver_merge_failure("could not start merge", &error.to_string());
+        let (status, log) = match run_driver_merge(&tmp, &args, timeout) {
+            DriverRun::Completed { status, log } => (status, log),
+            DriverRun::Failed { reason, log } => {
+                warn_driver_merge_failure(&reason, &log);
+                return None;
+            }
+            DriverRun::Poisoned { reason, log } => {
+                gate_runner::record_external_quarantine(scratch.path(), &reason);
+                warn_driver_merge_failure(&reason, &log);
+                preserve_scratch = true;
                 return None;
             }
         };
         let exit_code = status.code();
         if !status.success() && exit_code != Some(1) {
-            let diagnostics = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
-            warn_driver_merge_failure(
-                &format!("merge failed with status {exit_code:?}"),
-                &diagnostics,
-            );
+            warn_driver_merge_failure(&format!("merge failed with status {exit_code:?}"), &log);
             return None;
         }
         // Reject a pre-existing or foreign merge state before trusting the index.
@@ -420,7 +446,9 @@ fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Opt
         let tree = tree.trim().to_string();
         (!tree.is_empty()).then_some(tree)
     })();
-    remove_scratch_worktree(repo_root, scratch);
+    if !preserve_scratch {
+        remove_scratch_worktree(repo_root, scratch);
+    }
     if tree.is_some() {
         thegn_core::msg::info(
             "merge queue: resolved a conflict via a merge-driver/rerere worktree",
@@ -429,12 +457,9 @@ fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Opt
     tree
 }
 
-/// Run the one real merge while retaining only a bounded tail from each pipe.
-/// Reader workers drain the complete pipes so a verbose driver cannot block Git.
-fn run_driver_merge(
-    dir: &Path,
-    args: &[&str],
-) -> std::io::Result<(std::process::ExitStatus, String, String)> {
+/// Run the one real merge under gate_capture's process group, deadline, and
+/// bounded combined diagnostic tail.
+fn run_driver_merge(dir: &Path, args: &[&str], timeout: Duration) -> DriverRun {
     use std::process::Stdio;
 
     let mut command = util::git_cmd(dir);
@@ -444,61 +469,42 @@ fn run_driver_merge(
         // working directory unchanged. Merge drivers inherit that directory,
         // so pin it to the scratch worktree to contain relative side effects.
         .current_dir(dir)
-        .stdin(Stdio::null());
-    run_bounded_output(&mut command)
+        .stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0");
+    run_driver_command(command, timeout)
 }
 
-/// Run a subprocess with null stdin and retain only a 4 KiB tail from each
-/// output stream while draining both pipes completely.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "waits for the child off the event loop"
-)]
-fn run_bounded_output(
-    command: &mut std::process::Command,
-) -> std::io::Result<(std::process::ExitStatus, String, String)> {
-    use std::io::Read;
-    use std::process::Stdio;
-
-    fn reader<R: Read + Send + 'static>(
-        mut pipe: R,
-    ) -> std::thread::JoinHandle<std::io::Result<String>> {
-        std::thread::spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            let mut retained = Vec::with_capacity(4096);
-            let mut chunk = [0_u8; 1024];
-            loop {
-                let count = pipe.read(&mut chunk)?;
-                if count == 0 {
-                    break;
-                }
-                retained.extend_from_slice(&chunk[..count]);
-                if retained.len() > 4096 {
-                    let excess = retained.len() - 4096;
-                    retained.drain(..excess);
-                }
-            }
-            Ok(String::from_utf8_lossy(&retained).into_owned())
-        })
+fn run_driver_command(command: std::process::Command, timeout: Duration) -> DriverRun {
+    match crate::gate_capture::run(command, timeout) {
+        crate::gate_capture::CaptureResult::Completed { status, log } => {
+            DriverRun::Completed { status, log }
+        }
+        crate::gate_capture::CaptureResult::Timeout { log } => DriverRun::Failed {
+            reason: "subprocess deadline exceeded".into(),
+            log,
+        },
+        crate::gate_capture::CaptureResult::Infrastructure { reason, log } => {
+            DriverRun::Failed { reason, log }
+        }
+        crate::gate_capture::CaptureResult::Poisoned { reason, log } => {
+            DriverRun::Poisoned { reason, log }
+        }
     }
+}
 
-    // This helper owns both output pipes. Set them here, beside the takes,
-    // so no caller can spawn a child whose missing stream would return early
-    // without reaping it.
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    let stdout = child.stdout.take().expect("piped child stdout");
-    let stderr = child.stderr.take().expect("piped child stderr");
-    let stdout = reader(stdout);
-    let stderr = reader(stderr);
-    let status = child.wait()?;
-    let stdout = stdout
-        .join()
-        .map_err(|_| std::io::Error::other("merge stdout reader panicked"))??;
-    let stderr = stderr
-        .join()
-        .map_err(|_| std::io::Error::other("merge stderr reader panicked"))??;
-    Ok((status, stdout, stderr))
+enum DriverRun {
+    Completed {
+        status: std::process::ExitStatus,
+        log: String,
+    },
+    Failed {
+        reason: String,
+        log: String,
+    },
+    Poisoned {
+        reason: String,
+        log: String,
+    },
 }
 
 fn warn_driver_merge_failure(reason: &str, diagnostics: &str) {
@@ -524,6 +530,7 @@ fn regenerate_merge(
     theirs: &str,
     conflict_paths: &[String],
     regenerate_command: &str,
+    timeout: Duration,
 ) -> Option<String> {
     thegn_core::git_operand::revision(ours).ok()?;
     thegn_core::git_operand::revision(theirs).ok()?;
@@ -541,6 +548,7 @@ fn regenerate_merge(
         }
         return None;
     }
+    let mut preserve_scratch = false;
     let tree = (|| -> Option<String> {
         scratch.verify().ok()?;
         // Regeneration only applies to an actual conflicted merge. A clean
@@ -554,21 +562,26 @@ fn regenerate_merge(
             "--no-ff",
             theirs,
         ];
-        let (status, stdout, stderr) = match run_driver_merge(&tmp, &args) {
-            Ok(output) => output,
-            Err(error) => {
-                warn_driver_merge_failure("could not start regeneration merge", &error.to_string());
+        let (status, log) = match run_driver_merge(&tmp, &args, timeout) {
+            DriverRun::Completed { status, log } => (status, log),
+            DriverRun::Failed { reason, log } => {
+                warn_driver_merge_failure(&reason, &log);
+                return None;
+            }
+            DriverRun::Poisoned { reason, log } => {
+                gate_runner::record_external_quarantine(scratch.path(), &reason);
+                warn_driver_merge_failure(&reason, &log);
+                preserve_scratch = true;
                 return None;
             }
         };
         if status.code() != Some(1) {
-            let diagnostics = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
             warn_driver_merge_failure(
                 &format!(
                     "regeneration merge did not report conflicts (status {:?})",
                     status.code()
                 ),
-                &diagnostics,
+                &log,
             );
             return None;
         }
@@ -610,14 +623,18 @@ fn regenerate_merge(
             .arg("-c")
             .arg(regenerate_command)
             .current_dir(&tmp)
-            .stdin(Stdio::null());
-        let (status, stdout, stderr) = match run_bounded_output(&mut command) {
-            Ok(output) => output,
-            Err(error) => {
-                warn_driver_merge_failure(
-                    "could not start regeneration command",
-                    &error.to_string(),
-                );
+            .stdin(Stdio::null())
+            .env("GIT_TERMINAL_PROMPT", "0");
+        let (status, log) = match run_driver_command(command, timeout) {
+            DriverRun::Completed { status, log } => (status, log),
+            DriverRun::Failed { reason, log } => {
+                warn_driver_merge_failure(&reason, &log);
+                return None;
+            }
+            DriverRun::Poisoned { reason, log } => {
+                gate_runner::record_external_quarantine(scratch.path(), &reason);
+                warn_driver_merge_failure(&reason, &log);
+                preserve_scratch = true;
                 return None;
             }
         };
@@ -627,7 +644,7 @@ fn regenerate_merge(
                     "regeneration command failed with status {:?}",
                     status.code()
                 ),
-                &format!("stdout:\n{stdout}\nstderr:\n{stderr}"),
+                &log,
             );
             return None;
         }
@@ -706,7 +723,9 @@ fn regenerate_merge(
         }
         (!tree.is_empty()).then_some(tree)
     })();
-    remove_scratch_worktree(repo_root, scratch);
+    if !preserve_scratch {
+        remove_scratch_worktree(repo_root, scratch);
+    }
     if tree.is_some() {
         thegn_core::msg::info(&format!(
             "merge queue: regenerated {} for a lockfile-only merge",
@@ -1188,11 +1207,24 @@ fn bisect_offender(
     landed: &[Branch],
     cfg: &MergeQueueConfig,
     opts: &LandOpts,
-    diagnostics: &mut String,
+    diagnosis: &mut DiagnosisState<'_>,
 ) -> Result<Option<String>> {
+    let DiagnosisState {
+        diagnostics,
+        budget,
+    } = diagnosis;
     // A red base says nothing about any candidate. Establish this before any
     // prefix can be blamed; retain its diagnostic alongside the union failure.
-    let base_verdict = diagnosed_gate(repo_root, base, cfg, "base", diagnostics, &adapter.history);
+    let base_verdict = if let Some(verdict) = budget.base_verdicts.get(base).cloned() {
+        verdict
+    } else {
+        let Some(()) = budget.take_gate(diagnostics) else {
+            return Ok(None);
+        };
+        let verdict = diagnosed_gate(repo_root, base, cfg, "base", diagnostics, &adapter.history);
+        budget.remember_base_verdict(base, &verdict);
+        verdict
+    };
     match base_verdict {
         GateVerdict::Passed => {}
         GateVerdict::Failed { .. } => return Ok(None),
@@ -1200,6 +1232,10 @@ fn bisect_offender(
     }
     let mut prefix: Vec<Branch> = Vec::new();
     for branch in landed {
+        if budget.exhausted() {
+            budget.record_exhaustion(diagnostics);
+            return Ok(None);
+        }
         // Re-fold the exact candidate object tested in the union. A branch ref
         // may have moved during the union/base gate; re-reading it would test
         // different code and attribute that verdict to the original snapshot.
@@ -1207,6 +1243,9 @@ fn bisect_offender(
         let plan = fold::fold(adapter, base, prefix.clone(), &cfg.regenerate_paths, opts)
             .map_err(|error| aborted_bisect(error, diagnostics))?;
         if plan.advanced() {
+            let Some(()) = budget.take_gate(diagnostics) else {
+                return Ok(None);
+            };
             let verdict = diagnosed_gate(
                 repo_root,
                 &plan.final_tip,
@@ -1225,6 +1264,55 @@ fn bisect_offender(
         }
     }
     Ok(None)
+}
+
+struct DiagnosisState<'a> {
+    diagnostics: &'a mut String,
+    budget: &'a mut DiagnosisBudget,
+}
+
+struct DiagnosisBudget {
+    gates_left: usize,
+    deadline: Instant,
+    base_verdicts: HashMap<String, GateVerdict>,
+    exhausted_recorded: bool,
+}
+
+impl DiagnosisBudget {
+    fn new(gates: usize, duration: Duration) -> Self {
+        Self {
+            gates_left: gates,
+            deadline: Instant::now() + duration,
+            base_verdicts: HashMap::new(),
+            exhausted_recorded: false,
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.gates_left == 0 || Instant::now() >= self.deadline
+    }
+
+    fn take_gate(&mut self, diagnostics: &mut String) -> Option<()> {
+        if self.exhausted() {
+            self.record_exhaustion(diagnostics);
+            return None;
+        }
+        self.gates_left -= 1;
+        Some(())
+    }
+
+    fn remember_base_verdict(&mut self, base: &str, verdict: &GateVerdict) {
+        if matches!(verdict, GateVerdict::Passed | GateVerdict::Failed { .. }) {
+            self.base_verdicts.insert(base.to_owned(), verdict.clone());
+        }
+    }
+
+    fn record_exhaustion(&mut self, diagnostics: &mut String) {
+        if !self.exhausted_recorded {
+            diagnostics.push_str("[diagnosis] failure not localized within budget\n");
+            self.exhausted_recorded = true;
+        }
+    }
 }
 
 fn aborted_bisect(error: anyhow::Error, diagnostics: &mut String) -> BisectAborted {
@@ -1489,6 +1577,7 @@ fn run_fold_admitted(
     let mut gate_offenders: Vec<String> = Vec::new();
     let mut cas_attempts = 0u32;
     let mut diagnostics = String::new();
+    let mut diagnosis_budget = DiagnosisBudget::new(DIAGNOSIS_GATE_LIMIT, DIAGNOSIS_TIME_LIMIT);
 
     loop {
         if let Err(error) = adapter.history.revalidate() {
@@ -1620,7 +1709,10 @@ fn run_fold_admitted(
                     &landed,
                     cfg,
                     &opts,
-                    &mut diagnostics,
+                    &mut DiagnosisState {
+                        diagnostics: &mut diagnostics,
+                        budget: &mut diagnosis_budget,
+                    },
                 ) {
                     Ok(o) => o,
                     // The gate stopped being runnable mid-bisect: report the
@@ -2763,6 +2855,36 @@ mod tests {
     }
 
     #[test]
+    fn slow_custom_driver_obeys_the_subprocess_deadline() {
+        let repo = Repo::new("driver-timeout");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        git(
+            &repo.dir,
+            &[
+                "config",
+                "merge.slow.driver",
+                "sleep 30; true %O %A %B %L %P",
+            ],
+        );
+        repo.commit(".gitattributes", "data.txt merge=slow\n", "attrs");
+        repo.commit("data.txt", "base\n", "seed");
+        git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
+        repo.commit("data.txt", "feat\n", "feature edit");
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit("data.txt", "main\n", "main edit");
+
+        let ours = repo.out(&["rev-parse", "main"]);
+        let theirs = repo.out(&["rev-parse", "feat"]);
+        let started = Instant::now();
+        assert!(driver_merge(&repo.dir, &ours, &theirs, false, Duration::from_secs(1)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let worktrees = repo.out(&["worktree", "list", "--porcelain"]);
+        assert!(!worktrees.contains("tg-drivermerge-"), "{worktrees}");
+    }
+
+    #[test]
     fn conflicting_branch_is_deferred_clean_one_still_lands() {
         let repo = Repo::new("conflict");
         if !repo.history_supported_or_refused() {
@@ -3443,13 +3565,85 @@ mod tests {
             &repo.branch_set(),
             &config,
             &land_opts(&config, "main"),
-            &mut diagnostics,
+            &mut DiagnosisState {
+                diagnostics: &mut diagnostics,
+                budget: &mut DiagnosisBudget::new(DIAGNOSIS_GATE_LIMIT, DIAGNOSIS_TIME_LIMIT),
+            },
         )
         .unwrap_err();
         assert!(error.downcast_ref::<BisectAborted>().is_some());
         assert!(diagnostics.contains("[base] passed"));
         assert!(diagnostics.contains("[prefix preparation]"));
         assert!(diagnostics.contains("signing failed"));
+    }
+
+    #[test]
+    fn offender_diagnosis_stops_at_the_aggregate_gate_budget() {
+        let repo = Repo::new("prefix-budget");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "one.txt", "one\n");
+        repo.feature("b2", "two.txt", "two\n");
+        repo.feature("b3", "three.txt", "three\n");
+        repo.feature("b4", "bad.txt", "bad\n");
+        let counter = repo.dir.join("gate-count");
+        let command = format!(
+            "printf x >> {}; test ! -e bad.txt",
+            thegn_core::util::sh_quote(&counter.to_string_lossy()),
+        );
+        let config = cfg(&command);
+        if !repo.gate_supported_or_refused(&config) {
+            return;
+        }
+        let adapter = PlumbingAdapter {
+            history: CanonicalHistory::capture(&repo.dir).unwrap(),
+            loc: GitLoc::Local(repo.dir.clone()),
+            repo_root: repo.dir.clone(),
+            regenerate_paths: Vec::new(),
+            regenerate_command: String::new(),
+            sign: false,
+            rerere: false,
+        };
+        let mut diagnostics = String::new();
+        let mut budget = DiagnosisBudget::new(2, DIAGNOSIS_TIME_LIMIT);
+        let result = bisect_offender(
+            &repo.dir,
+            &adapter,
+            &repo.out(&["rev-parse", "main"]),
+            &repo.branch_set(),
+            &config,
+            &land_opts(&config, "main"),
+            &mut DiagnosisState {
+                diagnostics: &mut diagnostics,
+                budget: &mut budget,
+            },
+        )
+        .unwrap();
+        assert_eq!(result, None, "budget exhaustion must blame no branch");
+        assert_eq!(std::fs::read_to_string(counter).unwrap().len(), 2);
+        assert!(diagnostics.contains("[diagnosis] failure not localized within budget"));
+    }
+
+    #[test]
+    fn base_gate_errors_are_not_cached_but_determinate_verdicts_are() {
+        let mut budget = DiagnosisBudget::new(DIAGNOSIS_GATE_LIMIT, DIAGNOSIS_TIME_LIMIT);
+        let base = "base-oid";
+        let error = GateVerdict::Error {
+            reason: "gate capture unavailable".into(),
+            log: String::new(),
+        };
+
+        budget.remember_base_verdict(base, &error);
+        assert!(!budget.base_verdicts.contains_key(base));
+
+        let passed = GateVerdict::Passed;
+        budget.remember_base_verdict(base, &passed);
+        assert_eq!(budget.base_verdicts.get(base), Some(&passed));
+
+        let failed = GateVerdict::Failed { log: "red".into() };
+        budget.remember_base_verdict(base, &failed);
+        assert_eq!(budget.base_verdicts.get(base), Some(&failed));
     }
 
     #[test]
@@ -3619,22 +3813,22 @@ mod tests {
     }
 
     #[test]
-    fn bounded_output_owns_and_captures_both_pipes() {
+    fn driver_capture_combines_both_output_streams() {
         use std::process::Stdio;
 
         let mut command = std::process::Command::new("sh");
         command
             .args(["-c", "printf stdout-marker; printf stderr-marker >&2"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdin(Stdio::null());
 
-        let result = run_bounded_output(&mut command);
-        assert!(result.is_ok(), "bounded output must establish both pipes");
-        let (status, stdout, stderr) = result.unwrap();
+        let DriverRun::Completed { status, log } =
+            run_driver_command(command, Duration::from_secs(5))
+        else {
+            panic!("capture should complete");
+        };
         assert!(status.success());
-        assert_eq!(stdout, "stdout-marker");
-        assert_eq!(stderr, "stderr-marker");
+        assert!(log.contains("stdout-marker"));
+        assert!(log.contains("stderr-marker"));
     }
 
     #[test]
@@ -3653,6 +3847,7 @@ mod tests {
             &other_oid,
             &["Cargo.lock".into()],
             "true",
+            DRIVER_SUBPROCESS_TIMEOUT,
         );
         assert!(
             tree.is_none(),
@@ -3663,6 +3858,29 @@ mod tests {
             !worktrees.contains("tg-foldregen-"),
             "regeneration scratch worktree leaked: {worktrees}"
         );
+    }
+
+    #[test]
+    fn slow_regeneration_command_obeys_the_subprocess_deadline() {
+        let repo = regen_repo("regen-timeout");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        let ours = repo.out(&["rev-parse", "main"]);
+        let theirs = repo.out(&["rev-parse", "b1"]);
+        let started = Instant::now();
+        let tree = regenerate_merge(
+            &repo.dir,
+            &ours,
+            &theirs,
+            &["Cargo.lock".into()],
+            "sleep 30",
+            Duration::from_secs(1),
+        );
+        assert!(tree.is_none());
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let worktrees = repo.out(&["worktree", "list", "--porcelain"]);
+        assert!(!worktrees.contains("tg-foldregen-"), "{worktrees}");
     }
 
     #[test]
@@ -3824,6 +4042,9 @@ mod tests {
 
         remove_scratch_worktree(&repo.dir, scratch);
 
+        assert!(gate_quarantines().iter().any(|(workspace, reason)| {
+            workspace == &path && reason == "scratch worktree identity changed"
+        }));
         assert!(victim.path().is_dir(), "victim directory must remain");
         assert!(std::fs::read_dir(victim.path()).unwrap().next().is_none());
         // Repair only this test's deliberately moved registration and owned dir.
