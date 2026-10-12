@@ -89,6 +89,8 @@ const MAX_CONCURRENT_RETRIES: usize = 8;
 const MAX_PENDING_EXITS: usize = 64;
 /// Attempt-counter entries above which terminal rows are garbage-collected.
 const ATTEMPTS_GC_THRESHOLD: usize = 128;
+/// Bound the durable roster work on a lagged/overflowed exit reconcile.
+const RECONCILE_ROW_LIMIT: usize = 512;
 
 /// Attempt counters, keyed by roster ROW id (a relaunch re-stamps the session
 /// id, so the row id is the stable key). Cleared when the row parks or
@@ -244,27 +246,49 @@ fn reconcile_missed_exits(obs: Arc<Observer>) -> BoxFut {
 
 async fn reconcile_pass(obs: &Arc<Observer>) {
     {
-        let rows = match obs.svc.with_db(|db| db.list_dispatches()).await {
-            Ok(rows) => rows,
+        let (candidates, truncated) = match obs
+            .svc
+            .with_db(|db| reconcile_candidates(db, RECONCILE_ROW_LIMIT))
+            .await
+        {
+            Ok(result) => result,
             Err(e) => {
                 tracing::warn!(target: "thegn::daemon", "exit reconcile: {e:#}");
                 return;
             }
         };
-        for row in rows {
-            // Only a row still `running` can hold a missed exit: a parked or
-            // spawning row was already handled by a retry cycle.
-            if row.status != AgentDispatchStatus::Running || row.exited_at_ms.is_some() {
-                continue;
-            }
-            let Some(session) = row.session_id.filter(|s| !s.is_empty()) else {
-                continue;
-            };
+        if truncated {
+            tracing::warn!(
+                target: "thegn::daemon",
+                limit = RECONCILE_ROW_LIMIT,
+                "exit reconcile truncated; only the oldest running rows were checked"
+            );
+        }
+        for (id, session) in candidates {
             if let Some(tomb) = obs.svc.tombstone(&session).await {
+                tracing::debug!(target: "thegn::daemon", dispatch_id = id, "reconciling missed exit");
                 observe_exit(obs, session, tomb.exit_code);
             }
         }
     }
+}
+
+fn reconcile_candidates(
+    db: &thegn_core::db::Db,
+    limit: usize,
+) -> anyhow::Result<(Vec<(i64, String)>, bool)> {
+    let (rows, truncated) =
+        db.list_dispatches_with_status(&[AgentDispatchStatus::Running], limit)?;
+    let candidates = rows
+        .into_iter()
+        .filter(|row| row.exited_at_ms.is_none())
+        .filter_map(|row| {
+            row.session_id
+                .filter(|session| !session.is_empty())
+                .map(|session| (row.id, session))
+        })
+        .collect();
+    Ok((candidates, truncated))
 }
 
 /// Associate and persist a daemon session exit on its dispatch row. The
@@ -718,20 +742,31 @@ async fn gc_attempts(svc: &DaemonService, attempts: &Attempts) {
         }
         map.keys().copied().collect()
     };
-    let Ok(rows) = svc.with_db(|db| db.list_dispatches()).await else {
+    let query_ids = ids.clone();
+    let live = svc
+        .with_db(move |db| live_attempt_ids(db, &query_ids))
+        .await;
+    let Ok(live) = live else {
         return;
     };
-    let live: HashSet<i64> = rows
-        .iter()
-        .filter(|r| !r.status.is_terminal())
-        .map(|r| r.id)
-        .collect();
     let mut map = attempts.lock().unwrap_or_else(|p| p.into_inner());
     for id in ids {
         if !live.contains(&id) {
             map.remove(&id);
         }
     }
+}
+
+fn live_attempt_ids(db: &thegn_core::db::Db, ids: &[i64]) -> anyhow::Result<HashSet<i64>> {
+    let mut live = HashSet::with_capacity(ids.len());
+    for id in ids {
+        if let Some(row) = db.get_dispatch(*id)?
+            && !row.status.is_terminal()
+        {
+            live.insert(*id);
+        }
+    }
+    Ok(live)
 }
 
 /// Re-render the row's stage prompt cold — the no-continue-form relaunch.
@@ -903,6 +938,53 @@ mod tests {
         db.update_dispatch_status(id, St::Running)
             .expect("running status");
         id
+    }
+
+    #[test]
+    fn attempt_gc_reads_only_the_requested_ids_and_keeps_nonterminal_rows() {
+        let (svc, _profile) = test_service(thegn_core::config::Config::default());
+        let running = running_row(&svc, "linear:THE-259-live", "aider");
+        let terminal = running_row(&svc, "linear:THE-259-done", "aider");
+        svc.db
+            .lock()
+            .unwrap()
+            .update_dispatch_status(terminal, St::Done)
+            .unwrap();
+
+        let db = svc.db.lock().unwrap();
+        let live = live_attempt_ids(&db, &[running, terminal, 999]).unwrap();
+        assert_eq!(live, HashSet::from([running]));
+    }
+
+    #[test]
+    fn reconcile_candidates_are_oldest_first_limited_running_rows_with_sessions() {
+        let (svc, _profile) = test_service(thegn_core::config::Config::default());
+        let db = svc.db.lock().unwrap();
+        let done = db
+            .put_agent_dispatch(NewDispatch {
+                session_id: Some("done-session"),
+                ..NewDispatch::new("linear:THE-259-done", "/wt/259", "aider")
+            })
+            .unwrap();
+        db.update_dispatch_status(done, St::Done).unwrap();
+        let oldest = db
+            .put_agent_dispatch(NewDispatch {
+                session_id: Some("old-session"),
+                ..NewDispatch::new("linear:THE-259-old", "/wt/259", "aider")
+            })
+            .unwrap();
+        db.update_dispatch_status(oldest, St::Running).unwrap();
+        let newer = db
+            .put_agent_dispatch(NewDispatch {
+                session_id: Some("new-session"),
+                ..NewDispatch::new("linear:THE-259-new", "/wt/259", "aider")
+            })
+            .unwrap();
+        db.update_dispatch_status(newer, St::Running).unwrap();
+
+        let (candidates, truncated) = reconcile_candidates(&db, 1).unwrap();
+        assert_eq!(candidates, vec![(oldest, "old-session".to_string())]);
+        assert!(truncated, "the second running row must set truncation");
     }
 
     async fn publish_late(
