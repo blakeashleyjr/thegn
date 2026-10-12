@@ -242,13 +242,14 @@ pub(crate) fn spawn_add(tx: &PrqTx, waker: &TerminalWaker, worktree: PathBuf) {
                 return;
             }
         };
-        match db.enqueue_pr(
+        match db.enqueue_bound_pr(
             &root.to_string_lossy(),
             pr.number,
             Some(&wt),
             &pr.head_ref_name,
             &pr.base_ref_name,
             forge.id(),
+            &pr.url,
         ) {
             Ok(()) => send(PrqMsg::Note(format!("Queued PR #{}", pr.number))),
             Err(e) => send(PrqMsg::Failed(format!("could not queue: {e}"))),
@@ -798,6 +799,7 @@ mod tests {
             branch: "feat".into(),
             base_branch: "main".into(),
             forge: "github".into(),
+            pr_url: None,
             status: status.into(),
             blocker: None,
             detail: None,
