@@ -235,12 +235,18 @@ pub fn forget(name: &str) {
     if let Err(error) = keyring_del(name) {
         tracing::debug!(target: "thegn::secret", %error, "best-effort keyring secret cleanup failed");
     }
-    if let Ok(path) = secrets_file(name) {
-        if let Some(parent) = path.parent() {
-            if let Err(error) = file_del_at(parent, name) {
+    // Do not derive and delete the pre-hash fallback filename. That historical
+    // sanitizer was not injective (`a/b` and `a_b` both became `a_b.token`), so
+    // automatic legacy cleanup could delete a different account's credential.
+    // Existing `file:` refs remain directly resolvable and can be removed by
+    // their explicit path during a user-directed migration.
+    match secrets_dir() {
+        Ok(dir) => {
+            if let Err(error) = file_del_at(&dir, name) {
                 tracing::warn!(%error, "refused file-backed secret removal");
             }
         }
+        Err(error) => tracing::warn!(%error, "secrets dir unavailable for removal"),
     }
 }
 
@@ -423,9 +429,10 @@ fn token_path_in(dir: &std::path::Path, name: &str) -> Result<PathBuf> {
     // Keep a readable prefix; the sidecar below verifies the exact account for
     // this hashed filename, including aliases such as `a/b` and `a_b`.
     let safe = safe_account_prefix(name);
-    let mut identity_input = b"thegn-secret-account-v2\0".to_vec();
-    identity_input.extend_from_slice(name.as_bytes());
-    let identity = format!("{:x}", Sha256::digest(&identity_input));
+    let mut hasher = Sha256::new();
+    hasher.update(b"thegn-secret-account-v2\0");
+    hasher.update(name.as_bytes());
+    let identity = format!("{:x}", hasher.finalize());
     Ok(dir.join(format!("{safe}-{identity}.token")))
 }
 
@@ -1229,7 +1236,7 @@ mod tests {
 
         assert!(file_get_in(temp.path(), "acct").is_err());
         assert!(file_del_at(temp.path(), "acct").is_err());
-        assert_eq!(std::fs::read_to_string(legacy).unwrap(), "keep-me");
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "keep-me");
         assert_eq!(
             std::fs::read_to_string(account_path(&legacy)).unwrap(),
             "other"
