@@ -50,10 +50,7 @@ impl<R> RefreshCoalescer<R> {
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let request = match pending.get_mut(key) {
-            Some(slot) => slot.take(),
-            None => return None,
-        };
+        let request = pending.get_mut(key)?.take();
         if request.is_none() {
             pending.remove(key);
         }
