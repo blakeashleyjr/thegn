@@ -24,6 +24,8 @@ use thegn_core::secretref::BareAs;
 use std::collections::VecDeque;
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 /// Provider-side bounds are deliberately finite even before the host applies
 /// the user's cache policy.  This protects the blocking provider lane from a
@@ -35,6 +37,9 @@ const GITLAB_JOBS_PAGE_SIZE: usize = 100;
 const GITLAB_JOBS_MAX_PAGES: usize = 50;
 const GITLAB_JOBS_MAX_ROWS: usize = GITLAB_JOBS_PAGE_SIZE * GITLAB_JOBS_MAX_PAGES;
 const GITLAB_JOBS_MAX_BYTES: usize = 4 * 1024 * 1024;
+const CI_CLI_TIMEOUT: Duration = Duration::from_secs(30);
+const CI_CLI_MAX_STDOUT: usize = 8 * 1024 * 1024;
+const CI_CLI_MAX_STDERR: usize = 64 * 1024;
 
 /// A CI/CD backend for one provider. Read methods first; mutations are
 /// capability-gated via [`Self::caps`] so a provider can decline what it can't do.
@@ -269,13 +274,47 @@ pub type CiClient = Box<dyn CiProvider>;
 
 // === helpers ===============================================================
 
-fn run_cli(cmd: &mut std::process::Command) -> Result<String, CiError> {
-    let out = cmd.output().map_err(|e| CiError::Other(e.to_string()))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        Err(classify_stderr(&String::from_utf8_lossy(&out.stderr)))
+fn run_cli(cmd: Command) -> Result<String, CiError> {
+    run_cli_within(
+        cmd,
+        crate::issue::gh_run::Limits {
+            timeout: CI_CLI_TIMEOUT,
+            max_stdout: CI_CLI_MAX_STDOUT,
+            max_stderr: CI_CLI_MAX_STDERR,
+        },
+    )
+}
+
+fn run_cli_within(
+    mut cmd: Command,
+    limits: crate::issue::gh_run::Limits,
+) -> Result<String, CiError> {
+    use crate::issue::gh_run::{RunError, run_blocking};
+    use crate::plugin::proc::bounded_group_termination_supported;
+
+    if !bounded_group_termination_supported() {
+        // Preserve the established platform behavior where process-group
+        // termination is unavailable; bounded tree ownership is supported on
+        // platforms accepted by the shared runner.
+        let out = cmd
+            .output()
+            .map_err(|error| CiError::Other(error.to_string()))?;
+        return if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(classify_stderr(&String::from_utf8_lossy(&out.stderr)))
+        };
     }
+
+    let cancel = AtomicBool::new(false);
+    run_blocking(cmd, limits, &cancel).map_err(|error| match error {
+        RunError::NotInstalled => CiError::NotInstalled,
+        RunError::Exit { stderr, .. } => classify_stderr(&stderr),
+        RunError::Timeout => CiError::Other("CI provider command timed out".into()),
+        RunError::Truncated => CiError::Other("provider output byte budget exhausted".into()),
+        RunError::Io(message) => CiError::Other(format!("CI provider command failed: {message}")),
+        RunError::Cancelled => CiError::Other("CI provider command cancelled".into()),
+    })
 }
 
 /// Read no more than `max` bytes, probing one additional byte only to detect
@@ -302,7 +341,19 @@ fn read_capped<R: Read>(mut reader: R, max: usize) -> Result<Vec<u8>, CiError> {
 }
 
 /// Run a command while bounding stdout before it is buffered in memory.
-fn run_cli_capped(cmd: &mut Command, max: usize) -> Result<String, CiError> {
+fn run_cli_capped(cmd: Command, max: usize) -> Result<String, CiError> {
+    use crate::plugin::proc::bounded_group_termination_supported;
+    if bounded_group_termination_supported() {
+        return run_cli_within(
+            cmd,
+            crate::issue::gh_run::Limits {
+                timeout: CI_CLI_TIMEOUT,
+                max_stdout: max,
+                max_stderr: CI_CLI_MAX_STDERR,
+            },
+        );
+    }
+    let mut cmd = cmd;
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -762,7 +813,7 @@ impl CiProvider for GithubCi {
             args.push("--branch");
             args.push(b);
         }
-        let json = run_cli(&mut self.command(loc, &args)?)?;
+        let json = run_cli(self.command(loc, &args)?)?;
         let (runs, discarded_rows) = parse_gh_runs_with_discarded(&json).map_err(CiError::Other)?;
         if discarded_rows > 0 {
             tracing::warn!(target: "thegn::ci", discarded_rows, "discarded malformed GitHub run rows");
@@ -776,7 +827,7 @@ impl CiProvider for GithubCi {
     fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRunDetail, CiError> {
         let args = github_run_detail_argv(run_id)?;
         let argv: Vec<_> = args.iter().map(String::as_str).collect();
-        let json = run_cli(&mut self.command(loc, &argv)?)?;
+        let json = run_cli(self.command(loc, &argv)?)?;
         let value: serde_json::Value = serde_json::from_str(&json)
             .map_err(|error| CiError::Other(format!("invalid provider run response: {error}")))?;
         let observed = value
@@ -821,9 +872,8 @@ impl CiProvider for GithubCi {
     }
 
     fn workflows(&self, loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError> {
-        let json = run_cli(
-            &mut self.command(loc, &["workflow", "list", "--json", "id,name,path,state"])?,
-        )?;
+        let json =
+            run_cli(self.command(loc, &["workflow", "list", "--json", "id,name,path,state"])?)?;
         parse_gh_workflows(&json).map_err(CiError::Other)
     }
 
@@ -835,19 +885,19 @@ impl CiProvider for GithubCi {
     ) -> Result<(), CiError> {
         let args = github_workflow_argv(workflow, inputs)?;
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_cli(&mut self.command(loc, &argv)?).map(|_| ())
+        run_cli(self.command(loc, &argv)?).map(|_| ())
     }
 
     fn rerun(&self, loc: &GitLoc, run_id: &str, scope: RerunScope) -> Result<(), CiError> {
         let args = github_rerun_argv(run_id, scope)?;
         let argv: Vec<_> = args.iter().map(String::as_str).collect();
-        run_cli(&mut self.command(loc, &argv)?).map(|_| ())
+        run_cli(self.command(loc, &argv)?).map(|_| ())
     }
 
     fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError> {
         let args = github_cancel_argv(run_id)?;
         let argv: Vec<_> = args.iter().map(String::as_str).collect();
-        run_cli(&mut self.command(loc, &argv)?).map(|_| ())
+        run_cli(self.command(loc, &argv)?).map(|_| ())
     }
 
     fn caps(&self) -> CiCaps {
@@ -1147,7 +1197,7 @@ impl CiProvider for GitlabCi {
         let remote = self.remote(loc)?;
         let project_segment = Self::project_seg(&remote);
         let endpoint = gitlab_pipelines_endpoint(&project_segment, branch, limit)?;
-        let json = run_cli(&mut self.command(loc, &remote, &["api", &endpoint])?)?;
+        let json = run_cli(self.command(loc, &remote, &["api", &endpoint])?)?;
         let (runs, discarded) =
             parse_gitlab_pipelines_with_discarded(&json).map_err(CiError::Other)?;
         if discarded > 0 {
@@ -1166,7 +1216,7 @@ impl CiProvider for GitlabCi {
         // Pipeline header + its jobs (two calls; the jobs carry the states).
         let run_endpoint = gitlab_run_endpoint(&proj, run_id, "")?;
         let jobs_endpoint = gitlab_run_endpoint(&proj, run_id, "jobs")?;
-        let pipe_json = run_cli(&mut self.command(loc, &remote, &["api", &run_endpoint])?)?;
+        let pipe_json = run_cli(self.command(loc, &remote, &["api", &run_endpoint])?)?;
         let value: serde_json::Value = serde_json::from_str(&pipe_json).map_err(|error| {
             CiError::Other(format!("invalid provider pipeline response: {error}"))
         })?;
@@ -1189,10 +1239,8 @@ impl CiProvider for GitlabCi {
         for page in 1..=GITLAB_JOBS_MAX_PAGES {
             let endpoint = format!("{jobs_endpoint}?per_page={GITLAB_JOBS_PAGE_SIZE}&page={page}");
             let remaining = GITLAB_JOBS_MAX_BYTES.saturating_sub(bytes);
-            let jobs_json = run_cli_capped(
-                &mut self.command(loc, &remote, &["api", &endpoint])?,
-                remaining,
-            )?;
+            let jobs_json =
+                run_cli_capped(self.command(loc, &remote, &["api", &endpoint])?, remaining)?;
             bytes = bytes.saturating_add(jobs_json.len());
             let page_rows =
                 serde_json::from_str::<Vec<serde_json::Value>>(&jobs_json).map_err(|error| {
@@ -1267,7 +1315,7 @@ impl CiProvider for GitlabCi {
             args.push(format!("{k}={v}"));
         }
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_cli(&mut self.command(loc, &remote, &argv)?).map(|_| ())
+        run_cli(self.command(loc, &remote, &argv)?).map(|_| ())
     }
 
     fn rerun(&self, loc: &GitLoc, run_id: &str, _scope: RerunScope) -> Result<(), CiError> {
@@ -1277,7 +1325,7 @@ impl CiProvider for GitlabCi {
         // GitLab: `retry` re-runs failed jobs; a fresh full run isn't a single
         // call, so both scopes map to retry (it's the closest primitive).
         let endpoint = gitlab_run_endpoint(&proj, run_id, "retry")?;
-        run_cli(&mut self.command(loc, &remote, &["api", "-X", "POST", &endpoint])?).map(|_| ())
+        run_cli(self.command(loc, &remote, &["api", "-X", "POST", &endpoint])?).map(|_| ())
     }
 
     fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError> {
@@ -1285,7 +1333,7 @@ impl CiProvider for GitlabCi {
         let remote = self.remote(loc)?;
         let proj = Self::project_seg(&remote);
         let endpoint = gitlab_run_endpoint(&proj, run_id, "cancel")?;
-        run_cli(&mut self.command(loc, &remote, &["api", "-X", "POST", &endpoint])?).map(|_| ())
+        run_cli(self.command(loc, &remote, &["api", "-X", "POST", &endpoint])?).map(|_| ())
     }
 
     fn caps(&self) -> CiCaps {
@@ -1556,6 +1604,90 @@ fn warn_unknown_gitlab_state(status: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bounded_shell_available() -> bool {
+        crate::plugin::proc::bounded_group_termination_supported()
+            && Command::new("sh").arg("-c").arg("exit 0").output().is_ok()
+    }
+
+    fn test_limits(timeout: Duration, max_stdout: usize) -> crate::issue::gh_run::Limits {
+        crate::issue::gh_run::Limits {
+            timeout,
+            max_stdout,
+            max_stderr: 1024,
+        }
+    }
+
+    #[test]
+    fn bounded_cli_times_out_a_hung_provider() {
+        if !bounded_shell_available() {
+            return;
+        }
+        let start = std::time::Instant::now();
+        let result = run_cli_within(
+            {
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", "sleep 30"]);
+                cmd
+            },
+            test_limits(Duration::from_millis(200), 1024),
+        );
+        assert!(
+            matches!(result, Err(CiError::Other(message)) if message == "CI provider command timed out")
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn bounded_cli_reaps_pipe_holding_descendants() {
+        if !bounded_shell_available() {
+            return;
+        }
+        let start = std::time::Instant::now();
+        let result = run_cli_within(
+            {
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", "sleep 30 & echo ok"]);
+                cmd
+            },
+            test_limits(Duration::from_secs(2), 1024),
+        );
+        assert!(result.is_ok());
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn bounded_cli_rejects_stdout_over_its_byte_budget() {
+        if !bounded_shell_available() {
+            return;
+        }
+        let result = run_cli_within(
+            {
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", "while :; do printf x; done"]);
+                cmd
+            },
+            test_limits(Duration::from_secs(5), 1024),
+        );
+        assert!(
+            matches!(result, Err(CiError::Other(message)) if message == "provider output byte budget exhausted")
+        );
+    }
+
+    #[test]
+    fn bounded_cli_preserves_spawn_io_error_detail() {
+        if !crate::plugin::proc::bounded_group_termination_supported() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let result = run_cli_within(
+            Command::new(temp.path()),
+            test_limits(Duration::from_secs(1), 1024),
+        );
+        assert!(matches!(result, Err(CiError::Other(message)) if message
+                .strip_prefix("CI provider command failed: ")
+                .is_some_and(|detail| !detail.is_empty())));
+    }
 
     #[test]
     fn collector_redacts_pem_before_evicting_its_begin_line() {
