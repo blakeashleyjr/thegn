@@ -318,7 +318,8 @@ fn fill_agent_config_staging(
             for (abs, inner, exec) in crate::agent_configs::collect_agent_config_files(&src) {
                 let base = safe_relative_path(&rel)?;
                 let inner = safe_relative_path(&inner)?;
-                if is_agent_secret_path(&inner) {
+                let relative_path = base.join(&inner);
+                if is_agent_secret_path(&relative_path) {
                     continue;
                 }
                 // Agent config collection intentionally follows links (for
@@ -327,7 +328,12 @@ fn fill_agent_config_staging(
                 let Some(resolved) = resolve_optional_agent_config_file(&abs)? else {
                     continue;
                 };
-                stage_file(staging, &resolved, &staging.join(base).join(inner), exec)?;
+                let destination = staging.join(&relative_path);
+                if is_sanitized_agent_config_path(&relative_path) {
+                    stage_sanitized_agent_config(staging, &resolved, &destination)?;
+                } else {
+                    stage_file(staging, &resolved, &destination, exec)?;
+                }
             }
         }
         for rel in files {
@@ -340,8 +346,8 @@ fn fill_agent_config_staging(
                 continue;
             };
             let destination = staging.join(&rel);
-            if rel == std::path::Path::new(".claude.json") {
-                stage_sanitized_claude_json(staging, &resolved, &destination)?;
+            if is_sanitized_agent_config_path(&rel) {
+                stage_sanitized_agent_config(staging, &resolved, &destination)?;
             } else {
                 stage_file(staging, &resolved, &destination, false)?;
             }
@@ -395,10 +401,21 @@ fn fill_atuin_staging(
 /// credentials are never mounted into sealed panes. Keep host credentials out
 /// of this separate host-to-container provisioning path too.
 fn is_agent_secret_path(path: &std::path::Path) -> bool {
-    let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+    let components = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if components
+        .iter()
+        .take(components.len().saturating_sub(1))
+        .any(|component| component == "secrets" || component == "credentials")
+    {
+        return true;
+    }
+    let Some(name) = components.last() else {
         return false;
     };
-    let name = name.to_ascii_lowercase();
     name.contains("credential")
         || name.contains("creds")
         || name.contains("token")
@@ -412,32 +429,57 @@ fn is_agent_secret_path(path: &std::path::Path) -> bool {
         || name.ends_with(".auth.json")
 }
 
-/// Claude's top-level config also carries API-key and OAuth credentials.
-/// Keep its non-secret settings while refusing to stage malformed or
-/// unexpected top-level JSON, which cannot be safely inspected.
-fn stage_sanitized_claude_json(
+fn is_sanitized_agent_config_path(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("json" | "toml")
+    )
+}
+
+/// Agent configs can contain credentials in nested MCP environments and
+/// headers. Sanitize every staged JSON/TOML config recursively; malformed
+/// files are skipped instead of copied verbatim.
+fn stage_sanitized_agent_config(
     staging_root: &std::path::Path,
     src: &std::path::Path,
     dst: &std::path::Path,
 ) -> Result<(), String> {
     use std::io::Write;
 
-    let mut source = thegn_core::fsperm::open_regular_file_nofollow(src)
-        .map_err(|e| format!("read {}: {e}", src.display()))?;
+    let mut source = match thegn_core::fsperm::open_regular_file_nofollow(src) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("read {}: {error}", src.display())),
+    };
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut source, &mut bytes)
         .map_err(|e| format!("read {}: {e}", src.display()))?;
-    let Ok(serde_json::Value::Object(mut object)) = serde_json::from_slice(&bytes) else {
-        return Ok(());
+    let extension = dst
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let sanitized = if extension == "json" {
+        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Ok(());
+        };
+        sanitize_json_config(&mut value);
+        serde_json::to_vec(&value).map_err(|e| format!("serialize {}: {e}", src.display()))?
+    } else {
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return Ok(());
+        };
+        let Ok(mut value) = text.parse::<toml::Value>() else {
+            return Ok(());
+        };
+        sanitize_toml_config(&mut value);
+        toml::to_string(&value)
+            .map_err(|e| format!("serialize {}: {e}", src.display()))?
+            .into_bytes()
     };
-    object.retain(|key, _| {
-        let normalized = key.to_ascii_lowercase();
-        !normalized.contains("apikey")
-            && !normalized.contains("api_key")
-            && !normalized.contains("token")
-    });
-    let sanitized = serde_json::to_vec(&serde_json::Value::Object(object))
-        .map_err(|e| format!("serialize {}: {e}", src.display()))?;
     create_staging_parents(staging_root, dst)?;
     let mut output = thegn_core::fsperm::create_owner_only_exclusive(dst)
         .map_err(|e| format!("create staged file {}: {e}", dst.display()))?;
@@ -445,6 +487,55 @@ fn stage_sanitized_claude_json(
         .write_all(&sanitized)
         .and_then(|()| output.sync_all())
         .map_err(|e| format!("write staged file {}: {e}", dst.display()))
+}
+
+fn is_config_secret_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    matches!(normalized.as_str(), "env" | "headers")
+        || [
+            "apikey",
+            "api_key",
+            "token",
+            "secret",
+            "password",
+            "credential",
+        ]
+        .iter()
+        .any(|needle| normalized.contains(needle))
+}
+
+fn sanitize_json_config(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.retain(|key, _| !is_config_secret_key(key));
+            for child in object.values_mut() {
+                sanitize_json_config(child);
+            }
+        }
+        serde_json::Value::Array(array) => {
+            for child in array {
+                sanitize_json_config(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sanitize_toml_config(value: &mut toml::Value) {
+    match value {
+        toml::Value::Table(table) => {
+            table.retain(|key, _| !is_config_secret_key(key));
+            for child in table.values_mut() {
+                sanitize_toml_config(child);
+            }
+        }
+        toml::Value::Array(array) => {
+            for child in array {
+                sanitize_toml_config(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn with_private_staging(
@@ -534,8 +625,11 @@ fn stage_file(
     executable: bool,
 ) -> Result<(), String> {
     use std::io::{Read, Write};
-    let mut source = thegn_core::fsperm::open_regular_file_nofollow(src)
-        .map_err(|e| format!("read {}: {e}", src.display()))?;
+    let mut source = match thegn_core::fsperm::open_regular_file_nofollow(src) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("read {}: {error}", src.display())),
+    };
     let mut bytes = Vec::new();
     source
         .read_to_end(&mut bytes)
@@ -815,7 +909,7 @@ mod tests {
         let staging = tempfile::tempdir().unwrap();
         std::fs::write(
             home.path().join(".claude.json"),
-            r#"{"theme":"dark","primaryApiKey":"sk-secret","customApiKey":"also-secret","refreshToken":"token-secret","oauthAccount":{"email":"person@example.com"}}"#,
+            r#"{"theme":"dark","primaryApiKey":"sk-secret","customApiKey":"also-secret","refreshToken":"token-secret","oauthAccount":{"email":"person@example.com"},"mcpServers":{"x":{"command":"node","env":{"GITHUB_TOKEN":"nested-secret","SAFE_VALUE":"keep"}}},"projects":{"/p":{"mcpServers":{"y":{"headers":{"Authorization":"Bearer nested-secret","Accept":"application/json"}}}}}}"#,
         )
         .unwrap();
         std::fs::create_dir(home.path().join(".claude")).unwrap();
@@ -825,6 +919,19 @@ mod tests {
         std::fs::create_dir(home.path().join(".codex")).unwrap();
         std::fs::write(home.path().join(".codex/auth.json"), "secret\n").unwrap();
         std::fs::create_dir(home.path().join(".gemini")).unwrap();
+        std::fs::create_dir_all(home.path().join(".gemini/secrets")).unwrap();
+        std::fs::create_dir_all(home.path().join(".gemini/credentials")).unwrap();
+        std::fs::write(
+            home.path().join(".gemini/secrets/foo.json"),
+            r#"{"visible":"secret directory"}"#,
+        )
+        .unwrap();
+        std::fs::write(home.path().join(".gemini/credentials/default"), "secret\n").unwrap();
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            "model = 'keep'\n\n[mcp_servers.x]\ncommand = 'node'\n\n[mcp_servers.x.env]\nGITHUB_TOKEN = 'nested-secret'\nSAFE_VALUE = 'keep'\n\n[mcp_servers.x.headers]\nAuthorization = 'Bearer nested-secret'\nAccept = 'application/json'\n",
+        )
+        .unwrap();
         std::fs::write(home.path().join(".gemini/oauth_creds.json"), "secret\n").unwrap();
         std::fs::write(home.path().join(".gemini/api_key.json"), "secret\n").unwrap();
         std::fs::write(home.path().join(".gemini/apikey.json"), "secret\n").unwrap();
@@ -848,6 +955,21 @@ mod tests {
         assert!(claude_config.get("primaryApiKey").is_none());
         assert!(claude_config.get("customApiKey").is_none());
         assert!(claude_config.get("refreshToken").is_none());
+        assert!(claude_config["mcpServers"]["x"].get("env").is_none());
+        assert!(
+            claude_config["projects"]["/p"]["mcpServers"]["y"]
+                .get("headers")
+                .is_none()
+        );
+        assert_eq!(claude_config["mcpServers"]["x"]["command"], "node");
+        assert_eq!(claude_config["mcpServers"]["x"]["SAFE_VALUE"], "keep");
+        let codex_config: toml::Value = toml::from_str(
+            &std::fs::read_to_string(staging.path().join(".codex/config.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(codex_config["model"].as_str(), Some("keep"));
+        assert!(codex_config["mcp_servers"]["x"].get("env").is_none());
+        assert!(codex_config["mcp_servers"]["x"].get("headers").is_none());
         assert_eq!(
             std::fs::read(staging.path().join(".claude/settings.json")).unwrap(),
             b"{}\n"
@@ -855,6 +977,8 @@ mod tests {
         assert!(!staging.path().join(".claude/.credentials.json").exists());
         assert!(!staging.path().join(".claude/oauth_token.json").exists());
         assert!(!staging.path().join(".codex/auth.json").exists());
+        assert!(!staging.path().join(".gemini/secrets/foo.json").exists());
+        assert!(!staging.path().join(".gemini/credentials/default").exists());
         for secret in [
             ".gemini/oauth_creds.json",
             ".gemini/api_key.json",
@@ -887,6 +1011,25 @@ mod tests {
             resolve_optional_agent_config_file(&home.path().join("rewritten.json")).unwrap();
 
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn agent_config_vanishing_before_open_is_a_skip() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let source = root.path().join("vanished.json");
+        std::fs::write(&source, r#"{"safe":"value"}"#).unwrap();
+        let vanished = std::fs::canonicalize(&source).unwrap();
+        std::fs::remove_file(&source).unwrap();
+        let raw_destination = staging.path().join("raw.json");
+        let sanitized_destination = staging.path().join("sanitized.json");
+
+        assert!(stage_file(staging.path(), &vanished, &raw_destination, false).is_ok());
+        assert!(
+            stage_sanitized_agent_config(staging.path(), &vanished, &sanitized_destination).is_ok()
+        );
+        assert!(!raw_destination.exists());
+        assert!(!sanitized_destination.exists());
     }
 
     #[test]
