@@ -126,8 +126,8 @@ impl std::fmt::Display for ResumeDispatchConflict {
 
 impl std::error::Error for ResumeDispatchConflict {}
 
-/// A child admission named a parent that was absent from the roster snapshot
-/// read under the admission write lock.
+/// A child admission named a parent that was absent from the roster table
+/// when checked under the admission write lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParentDispatchConflict {
     pub parent_id: i64,
@@ -141,7 +141,169 @@ impl std::fmt::Display for ParentDispatchConflict {
 
 impl std::error::Error for ParentDispatchConflict {}
 
+/// Whether an ordinary `dispatch set-status` transition is permitted.
+/// Active states may move to any recognized state; idempotent writes are
+/// allowed. Terminal transitions are `Done -> Merged|Abandoned`,
+/// `Failed -> Done|Abandoned`, and `Unknown -> Failed|Abandoned`. All other
+/// terminal transitions, including resurrection to an active state, are
+/// refused. `Failed -> Done` remains legal so a fixed artifact can be
+/// re-verified by the existing completion gate.
+pub fn set_status_transition_allowed(from: AgentDispatchStatus, to: AgentDispatchStatus) -> bool {
+    use AgentDispatchStatus::*;
+    if from == to {
+        return from != Unknown;
+    }
+    if from.is_active() {
+        return to != Unknown;
+    }
+    matches!(
+        (from, to),
+        (Done, Merged | Abandoned) | (Failed, Done | Abandoned) | (Unknown, Failed | Abandoned)
+    )
+}
+
+/// A checked set-status operation was illegal or lost its expected-status CAS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchTransitionConflict {
+    Illegal {
+        id: i64,
+        from: AgentDispatchStatus,
+        to: AgentDispatchStatus,
+    },
+    Stale {
+        id: i64,
+        expected: AgentDispatchStatus,
+        actual: AgentDispatchStatus,
+    },
+}
+
+impl std::fmt::Display for DispatchTransitionConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Illegal { id, from, to } => write!(
+                f,
+                "dispatch {id} cannot transition from {} to {}",
+                from.as_str(),
+                to.as_str()
+            ),
+            Self::Stale {
+                id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "dispatch {id} changed from expected {} to {} before update",
+                expected.as_str(),
+                actual.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DispatchTransitionConflict {}
+
+const ADMISSION_ACTIVE_STATUSES: [AgentDispatchStatus; 5] = [
+    AgentDispatchStatus::Queued,
+    AgentDispatchStatus::Spawning,
+    AgentDispatchStatus::Running,
+    AgentDispatchStatus::WaitingHuman,
+    AgentDispatchStatus::PrOpen,
+];
+
+const ADMISSION_DISPATCH_COLS: &str = "id, issue_id, worktree_path, agent_name, dispatched_at_ms, status, \
+     stage, parent_id, session_id, artifact_path, chunk_path, exit_code, exited_at_ms";
+
+fn map_admission_dispatch(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::issue::AgentDispatch> {
+    Ok(crate::issue::AgentDispatch {
+        id: r.get(0)?,
+        issue_id: r.get(1)?,
+        worktree_path: r.get(2)?,
+        agent_name: r.get(3)?,
+        dispatched_at_ms: crate::issue::normalize_dispatch_ms(r.get(4)?),
+        status: AgentDispatchStatus::parse(&r.get::<_, String>(5)?),
+        stage: r.get(6)?,
+        parent_id: r.get(7)?,
+        session_id: r.get(8)?,
+        artifact_path: r.get(9)?,
+        note: None,
+        chunk_path: r.get(10)?,
+        report: None,
+        exit_code: r.get(11)?,
+        exited_at_ms: r.get(12)?,
+    })
+}
+
 impl Db {
+    /// Read only active rows plus terminal rows for this issue/worktree pair.
+    /// Wide human and worker text is deliberately excluded from admission.
+    pub fn admission_rows(
+        &self,
+        issue_id: &str,
+        worktree_path: &str,
+    ) -> Result<Vec<crate::issue::AgentDispatch>> {
+        let sql = format!(
+            "SELECT {ADMISSION_DISPATCH_COLS} FROM agent_dispatches \
+             WHERE status IN (?1, ?2, ?3, ?4, ?5) OR (issue_id=?6 AND worktree_path=?7) \
+             ORDER BY dispatched_at_ms DESC, id DESC"
+        );
+        let statuses = ADMISSION_ACTIVE_STATUSES.map(AgentDispatchStatus::as_str);
+        let mut stmt = self.conn().prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                statuses[0],
+                statuses[1],
+                statuses[2],
+                statuses[3],
+                statuses[4],
+                issue_id,
+                worktree_path
+            ],
+            map_admission_dispatch,
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Apply the set-status transition table using expected-status CAS.
+    pub fn set_dispatch_status_checked(
+        &self,
+        id: i64,
+        expected: AgentDispatchStatus,
+        to: AgentDispatchStatus,
+        note: Option<&str>,
+    ) -> Result<()> {
+        if self.get_dispatch(id)?.is_none() {
+            anyhow::bail!("no dispatch with id {id}");
+        }
+        if !set_status_transition_allowed(expected, to) {
+            return Err(anyhow::Error::new(DispatchTransitionConflict::Illegal {
+                id,
+                from: expected,
+                to,
+            }));
+        }
+        if !self.cas_dispatch_status(id, None, expected, to, note)? {
+            let actual = self
+                .get_dispatch(id)?
+                .ok_or_else(|| anyhow::anyhow!("no dispatch with id {id}"))?
+                .status;
+            return Err(anyhow::Error::new(DispatchTransitionConflict::Stale {
+                id,
+                expected,
+                actual,
+            }));
+        }
+        Ok(())
+    }
+
+    /// Compact indexed projection used while a claim holds SQLite's writer lock.
+    fn dispatch_parent_exists(&self, parent_id: i64) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_dispatches WHERE id=?1)",
+            [parent_id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Validate and insert a non-claim dispatch row under one write lock.
     pub fn put_dispatch_with_parent_check(
         &self,
@@ -339,6 +501,23 @@ impl Db {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let changed = match fence {
+            None if expected == AgentDispatchStatus::Unknown => tx.execute(
+                "UPDATE agent_dispatches SET status=?1 WHERE id=?2 AND trim(status) NOT IN \
+                 (?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    status.as_str(),
+                    id,
+                    AgentDispatchStatus::Queued.as_str(),
+                    AgentDispatchStatus::Spawning.as_str(),
+                    AgentDispatchStatus::Running.as_str(),
+                    AgentDispatchStatus::WaitingHuman.as_str(),
+                    AgentDispatchStatus::PrOpen.as_str(),
+                    AgentDispatchStatus::Merged.as_str(),
+                    AgentDispatchStatus::Abandoned.as_str(),
+                    AgentDispatchStatus::Done.as_str(),
+                    AgentDispatchStatus::Failed.as_str(),
+                ],
+            )?,
             None => tx.execute(
                 "UPDATE agent_dispatches SET status=?1 WHERE id=?2 AND status=?3",
                 rusqlite::params![status.as_str(), id, expected.as_str()],
@@ -660,9 +839,9 @@ impl Db {
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<std::result::Result<i64, DispatchAdmissionDecision>> {
-            let rows = self.list_dispatches()?;
+            let rows = self.admission_rows(new.issue_id, new.worktree_path)?;
             if let Some(parent_id) = new.parent_id
-                && !rows.iter().any(|row| row.id == parent_id)
+                && !self.dispatch_parent_exists(parent_id)?
             {
                 return Err(anyhow::Error::new(ParentDispatchConflict { parent_id }));
             }
@@ -913,7 +1092,7 @@ impl Db {
                     )?;
                 }
 
-                let rows = self.list_dispatches()?;
+                let rows = self.admission_rows(new.issue_id, new.worktree_path)?;
                 let decision = decide(&rows, &req, limit);
                 if !decision.granted() {
                     return Ok(Err(decision));
@@ -2325,6 +2504,209 @@ mod tests {
         assert_eq!(
             db.dispatch_notes(id, None, 0).unwrap()[0].text,
             "firstsecond"
+        );
+    }
+
+    #[test]
+    fn set_status_transition_table_covers_every_pair() {
+        use AgentDispatchStatus::*;
+        let statuses = [
+            Queued,
+            Spawning,
+            Running,
+            WaitingHuman,
+            PrOpen,
+            Merged,
+            Abandoned,
+            Done,
+            Failed,
+            Unknown,
+        ];
+        for from in statuses {
+            for to in statuses {
+                let expected = if from.is_active() {
+                    to != Unknown
+                } else {
+                    matches!(
+                        (from, to),
+                        (Merged, Merged)
+                            | (Abandoned, Abandoned)
+                            | (Done, Done | Merged | Abandoned)
+                            | (Failed, Failed | Done | Abandoned)
+                            | (Unknown, Failed | Abandoned)
+                    )
+                };
+                assert_eq!(
+                    set_status_transition_allowed(from, to),
+                    expected,
+                    "transition {} -> {}",
+                    from.as_str(),
+                    to.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn checked_set_status_refuses_done_resurrection_without_writing() {
+        let db = Db::open_memory().unwrap();
+        let id = put_row(&db, "linear:THE-242", "/wt/done");
+        db.update_dispatch_status(id, AgentDispatchStatus::Done)
+            .unwrap();
+        let err = db
+            .set_dispatch_status_checked(
+                id,
+                AgentDispatchStatus::Done,
+                AgentDispatchStatus::Running,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<DispatchTransitionConflict>(),
+            Some(DispatchTransitionConflict::Illegal {
+                from: AgentDispatchStatus::Done,
+                to: AgentDispatchStatus::Running,
+                ..
+            })
+        ));
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Done
+        );
+    }
+
+    #[test]
+    fn checked_set_status_reports_stale_expected_status() {
+        let db = Db::open_memory().unwrap();
+        let id = put_row(&db, "linear:THE-242", "/wt/stale");
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        let err = db
+            .set_dispatch_status_checked(
+                id,
+                AgentDispatchStatus::Queued,
+                AgentDispatchStatus::Failed,
+                None,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("expected queued to running"));
+        assert_eq!(
+            err.downcast_ref::<DispatchTransitionConflict>(),
+            Some(&DispatchTransitionConflict::Stale {
+                id,
+                expected: AgentDispatchStatus::Queued,
+                actual: AgentDispatchStatus::Running,
+            })
+        );
+        let missing = db
+            .set_dispatch_status_checked(
+                99_999,
+                AgentDispatchStatus::Queued,
+                AgentDispatchStatus::Failed,
+                None,
+            )
+            .unwrap_err();
+        assert!(missing.to_string().contains("no dispatch with id 99999"));
+    }
+
+    #[test]
+    fn checked_set_status_allows_failed_reverification_and_unknown_reconciliation() {
+        let db = Db::open_memory().unwrap();
+        let failed = put_row(&db, "linear:THE-242-F", "/wt/failed");
+        db.update_dispatch_status(failed, AgentDispatchStatus::Failed)
+            .unwrap();
+        db.set_dispatch_status_checked(
+            failed,
+            AgentDispatchStatus::Failed,
+            AgentDispatchStatus::Done,
+            Some("reverified artifact"),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_dispatch(failed).unwrap().unwrap().status,
+            AgentDispatchStatus::Done
+        );
+        assert_eq!(db.dispatch_note_count(failed, None).unwrap(), 1);
+
+        let unknown = put_row(&db, "linear:THE-242-U", "/wt/unknown");
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET status='legacy_state' WHERE id=?1",
+                [unknown],
+            )
+            .unwrap();
+        db.set_dispatch_status_checked(
+            unknown,
+            AgentDispatchStatus::Unknown,
+            AgentDispatchStatus::Abandoned,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_dispatch(unknown).unwrap().unwrap().status,
+            AgentDispatchStatus::Abandoned
+        );
+    }
+
+    #[test]
+    fn admission_projection_scopes_terminals_and_omits_wide_text() {
+        let db = Db::open_memory().unwrap();
+        let terminal_elsewhere = put_row(&db, "linear:OTHER", "/wt/other");
+        db.update_dispatch_status(terminal_elsewhere, AgentDispatchStatus::Done)
+            .unwrap();
+        let same_terminal = put_row(&db, "linear:THE-259", "/wt/target");
+        db.update_dispatch_status(same_terminal, AgentDispatchStatus::Done)
+            .unwrap();
+        db.set_dispatch_report(same_terminal, "wide report")
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET note='wide note' WHERE id=?1",
+                [same_terminal],
+            )
+            .unwrap();
+        let rows = db.admission_rows("linear:THE-259", "/wt/target").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, same_terminal);
+        assert_eq!(rows[0].status, AgentDispatchStatus::Done);
+        assert_eq!(rows[0].note, None);
+        assert_eq!(rows[0].report, None);
+    }
+
+    #[test]
+    fn padded_active_status_occupies_capacity_after_v79_migration() {
+        let db = Db::open_memory().unwrap();
+        let active = put_row(&db, "linear:THE-259-A", "/wt/a");
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET stage='code', status=char(9)||'running'||char(10)
+                 WHERE id=?1",
+                [active],
+            )
+            .unwrap();
+        crate::db_migrate::migrate_v79(db.conn()).unwrap();
+        let decision = db
+            .claim_dispatch(
+                crate::issue::NewDispatch {
+                    stage: Some("code"),
+                    ..crate::issue::NewDispatch::new("linear:THE-259-B", "/wt/b", "claude")
+                },
+                1,
+                None,
+            )
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            decision,
+            crate::pipeline_claim::ClaimDecision::AtCapacity { .. }
+        ));
+    }
+
+    #[test]
+    fn admission_active_statuses_match_pipeline_occupying_statuses() {
+        assert_eq!(
+            ADMISSION_ACTIVE_STATUSES.as_slice(),
+            crate::pipeline_claim::occupying_statuses().as_slice()
         );
     }
 }
