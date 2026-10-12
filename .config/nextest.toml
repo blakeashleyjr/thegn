@@ -1,6 +1,24 @@
 # cargo-nextest configuration. Read automatically by `cargo nextest run`
 # (both the CI `test` job and the pre-push hook run `just test`).
 
+# THE-744: keep every nextest test process away from the user's XDG state.
+# Module-level guards cover known writers; this run-wide setup also isolates
+# tests that use production defaults without an explicit per-test environment
+# guard. Nextest has no teardown script, so setup removes isolated state dirs
+# older than a day before creating a fresh one.
+experimental = ["setup-scripts"]
+
+[scripts.setup.isolate-state]
+command = [
+  "sh",
+  "-c",
+  "find \"${TMPDIR:-/tmp}\" -maxdepth 1 -name 'thegn-nextest-state.*' -mmin +1440 -exec rm -rf {} + && d=$(mktemp -d \"${TMPDIR:-/tmp}/thegn-nextest-state.XXXXXX\") && printf 'XDG_STATE_HOME=%s\\n' \"$d\" >> \"$NEXTEST_ENV\"",
+]
+
+[[profile.default.scripts]]
+filter = 'all()'
+setup = ['isolate-state']
+
 # Bound a hung test. Without `terminate-after`, nextest warns forever and a
 # wedged test only surfaces at the CI job's `timeout-minutes: 50` — as a
 # timed-out job rather than a named failing test. A lock-starved test
