@@ -38,6 +38,7 @@ impl<R> RefreshCoalescer<R> {
         }
     }
 
+    #[cfg(test)]
     fn begin(&self, key: &str, req: R) -> Option<R> {
         self.begin_with(key, req, |_, new| new)
     }
