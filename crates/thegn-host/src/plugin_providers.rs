@@ -9,9 +9,8 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use thegn_svc::issue::{
-    Issue, IssueBackend, IssueCaps, IssueDetail, IssueDraft, IssueError, IssueFilter, IssuePatch,
-};
+use thegn_core::issue::{Issue, IssueDetail, IssueDraft, IssueFilter, IssuePatch};
+use thegn_svc::issue::{IssueBackend, IssueCaps, IssueError};
 use thegn_svc::plugin::{PluginIssueBackend, ProviderBridge};
 
 /// One live plugin issue provider: `(plugin id, account label, bridge, caps)`.
