@@ -461,10 +461,7 @@ impl MediaBackend for MprisZbus {
                     MediaError::Backend(message)
                 }
             })?;
-            let cur = match bool::try_from(read) {
-                Ok(value) => Some(value),
-                Err(_) => None,
-            };
+            let cur = Result::ok(bool::try_from(read));
             let next = toggled_fullscreen(cur)?;
             proxy
                 .set(iface, "Fullscreen", Value::Bool(next))
