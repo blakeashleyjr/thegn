@@ -20,9 +20,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{
-    Receiver, Sender, SyncSender, TryRecvError, TrySendError, channel, sync_channel,
-};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -327,7 +325,7 @@ impl FsCoalescer {
 
 fn bounded_unique_paths(paths: &[String]) -> Vec<String> {
     let mut unique = BTreeSet::new();
-    let mut bytes = 0;
+    let mut bytes: usize = 0;
     for path in paths {
         if unique.contains(path) {
             continue;
