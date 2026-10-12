@@ -76,6 +76,10 @@ pub(crate) struct DaemonService {
     /// `agent_dispatches.native_session_id`, written by the retry observer once
     /// the row's run identity is known. Entries are removed at session exit.
     pub native_ids: Mutex<HashMap<String, String>>,
+    /// Dispatch rows whose retry reservation is being opened in this daemon.
+    /// Empty after a crash, so the reaper can distinguish active slow opens
+    /// from reservations abandoned by the previous process.
+    pub spawning_relaunches: Arc<Mutex<std::collections::HashSet<i64>>>,
     pub events: broadcast::Sender<Arc<EventFrame>>,
     pub db: SharedDb,
     /// `[daemon] lease_grace_secs`, in ms.
@@ -99,6 +103,17 @@ pub(crate) struct DaemonService {
 }
 
 impl DaemonService {
+    /// Protect a retry reservation from the stale-spawning reaper. Construct
+    /// before changing the row to `spawning`; dropping the guard releases it
+    /// on every success, failure, and early-return path.
+    pub(crate) fn track_spawning_relaunch(&self, row_id: i64) -> SpawningRelaunchGuard {
+        self.spawning_relaunches.lock().unwrap().insert(row_id);
+        SpawningRelaunchGuard {
+            ids: self.spawning_relaunches.clone(),
+            row_id,
+        }
+    }
+
     /// Stop admitting sessions, terminate the snapshot of all live actors and
     /// join their receipts. Safe to call from RPC and from daemon signal/idle
     /// shutdown paths; repeated calls are idempotent.
@@ -121,6 +136,19 @@ impl DaemonService {
         let tasks = std::mem::take(&mut *self.actor_tasks.lock().await);
         for task in tasks {
             let _ = task.await;
+        }
+    }
+}
+
+pub(crate) struct SpawningRelaunchGuard {
+    ids: Arc<Mutex<std::collections::HashSet<i64>>>,
+    row_id: i64,
+}
+
+impl Drop for SpawningRelaunchGuard {
+    fn drop(&mut self) {
+        if let Ok(mut ids) = self.ids.lock() {
+            ids.remove(&self.row_id);
         }
     }
 }
@@ -2766,6 +2794,7 @@ mod tests {
                 super::super::tombstone::TOMBSTONE_TTL_MS,
             ))),
             native_ids: Mutex::new(HashMap::new()),
+            spawning_relaunches: Arc::new(Mutex::new(std::collections::HashSet::new())),
             events,
             db: Arc::new(Mutex::new(Db::open_memory().expect("in-memory db"))),
             grace_ms,
