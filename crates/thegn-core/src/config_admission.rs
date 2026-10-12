@@ -616,6 +616,7 @@ pub fn admit_layers(inputs: LayerInputs<'_>) -> Result<AdmittedLayers, ConfigAdm
     // walk runs only when one of them contributed.
     let supplied_runtime_values = !env_values.is_empty() || !inputs.overrides.is_empty();
     check_final_config(&cfg, supplied_runtime_values)?;
+    check_path_expansion_budget(&cfg, inputs.paths)?;
     cfg.post_process_pure(inputs.paths);
     // The EFFECTIVE candidate — tilde expansion, injected default
     // agents/tools/actions, clamped values, dropped metrics targets — is what
@@ -1159,6 +1160,127 @@ fn check_normalized_candidate(cfg: &Config) -> Result<Vec<u8>, ConfigAdmissionEr
         return Err(ConfigAdmissionError::Oversized);
     }
     Ok(bytes)
+}
+
+/// Prove the path replacements fit the normalized serialization budget before
+/// `post_process_pure` allocates those replacement strings. The serialized
+/// input is already bounded; account for its exact JSON string lengths and a
+/// conservative separator for each `~/...` path joined to the captured home.
+fn check_path_expansion_budget(
+    cfg: &Config,
+    paths: &PathExpansionContext,
+) -> Result<(), ConfigAdmissionError> {
+    if projected_path_expansion_size(cfg, paths)? > config_budget::MAX_NORMALIZED_BYTES {
+        return Err(ConfigAdmissionError::Oversized);
+    }
+    Ok(())
+}
+
+fn projected_path_expansion_size(
+    cfg: &Config,
+    paths: &PathExpansionContext,
+) -> Result<usize, ConfigAdmissionError> {
+    let home = paths
+        .home()
+        .to_str()
+        .ok_or(ConfigAdmissionError::InvalidUtf8)?;
+    let serialized_bytes = bounded_serialized_config(cfg)?.len();
+    let mut old_path_bytes = 0usize;
+    let mut new_path_bytes = 0usize;
+
+    let mut account = |path: &str, replaces_existing: bool| -> Result<(), ConfigAdmissionError> {
+        let Some(expanded) = expanded_path_json_len(path, home)? else {
+            return Ok(());
+        };
+        if replaces_existing {
+            old_path_bytes = old_path_bytes
+                .checked_add(json_string_content_len(path)?)
+                .ok_or(ConfigAdmissionError::Oversized)?;
+        }
+        new_path_bytes = new_path_bytes
+            .checked_add(expanded)
+            .ok_or(ConfigAdmissionError::Oversized)?;
+        Ok(())
+    };
+
+    for pin in &cfg.pins {
+        if let Some(cwd) = &pin.cwd {
+            account(cwd, true)?;
+        }
+    }
+    account(&cfg.worktrees_dir, true)?;
+    account(&cfg.workspaces_dir, true)?;
+    if cfg.repo_roots.is_empty() {
+        // post_process_inner first copies the expanded workspaces_dir here,
+        // then expands that copy as a repo root too.
+        let implicit_root_bytes = match expanded_path_json_len(&cfg.workspaces_dir, home)? {
+            Some(expanded) => expanded,
+            None => json_string_content_len(&cfg.workspaces_dir)?,
+        };
+        new_path_bytes = new_path_bytes
+            .checked_add(implicit_root_bytes)
+            .ok_or(ConfigAdmissionError::Oversized)?;
+        new_path_bytes = new_path_bytes
+            .checked_add(2)
+            .ok_or(ConfigAdmissionError::Oversized)?;
+    } else {
+        for root in &cfg.repo_roots {
+            account(root, true)?;
+        }
+    }
+
+    projected_serialized_size(serialized_bytes, old_path_bytes, new_path_bytes)
+}
+
+fn projected_serialized_size(
+    serialized_bytes: usize,
+    old_path_bytes: usize,
+    new_path_bytes: usize,
+) -> Result<usize, ConfigAdmissionError> {
+    serialized_bytes
+        .checked_sub(old_path_bytes)
+        .and_then(|bytes| bytes.checked_add(new_path_bytes))
+        .ok_or(ConfigAdmissionError::Oversized)
+}
+
+/// Return encoded JSON content bytes for the replacement, if `path` expands.
+/// For `~/...`, the separator is counted even when the home already ends in a
+/// separator, making this a safe upper bound without constructing a PathBuf.
+fn expanded_path_json_len(path: &str, home: &str) -> Result<Option<usize>, ConfigAdmissionError> {
+    let Some(rest) = path.strip_prefix('~') else {
+        return Ok(None);
+    };
+    if rest.is_empty() {
+        return Ok(Some(json_string_content_len(home)?));
+    }
+    let Some(rest) = rest.strip_prefix('/') else {
+        return Ok(None);
+    };
+    let home_bytes = json_string_content_len(home)?;
+    let rest_bytes = json_string_content_len(rest)?;
+    let separator_bytes = if std::path::MAIN_SEPARATOR == '\\' {
+        2
+    } else {
+        1
+    };
+    home_bytes
+        .checked_add(separator_bytes)
+        .and_then(|bytes| bytes.checked_add(rest_bytes))
+        .map(Some)
+        .ok_or(ConfigAdmissionError::Oversized)
+}
+
+fn json_string_content_len(value: &str) -> Result<usize, ConfigAdmissionError> {
+    value.chars().try_fold(0usize, |bytes, ch| {
+        let encoded = match ch {
+            '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            _ => ch.len_utf8(),
+        };
+        bytes
+            .checked_add(encoded)
+            .ok_or(ConfigAdmissionError::Oversized)
+    })
 }
 
 fn check_final_config(cfg: &Config, schema_walk: bool) -> Result<(), ConfigAdmissionError> {
