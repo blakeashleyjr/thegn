@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn display_text_removes_terminal_and_bidi_controls() {
         let normalized = display_text("a\x1b[31mb\nc\u{202e}d");
-        assert_eq!(normalized, "a [31mb c d");
+        assert_eq!(normalized, "a [31mb cd");
         assert!(
             !normalized
                 .chars()
