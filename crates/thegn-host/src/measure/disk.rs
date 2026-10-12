@@ -16,6 +16,8 @@ static INFLIGHT: AtomicBool = AtomicBool::new(false);
 
 type GenerationMemo = std::collections::HashMap<std::path::PathBuf, (u128, u64, Option<u64>)>;
 static GENERATION_MEMO: OnceLock<Mutex<GenerationMemo>> = OnceLock::new();
+static LAST_WALK: OnceLock<Mutex<std::collections::HashMap<std::path::PathBuf, i64>>> =
+    OnceLock::new();
 
 #[cfg(test)]
 thread_local! {
@@ -93,6 +95,30 @@ fn remember_generation_noop(
 /// happened: on the machine this was diagnosed on that is 490 GiB, 368 GiB of it
 /// build output, which is the cost this whole gate exists to remove.
 const FORCE_WALK_AFTER_SECS: i64 = 86_400;
+
+fn lazy_skip(cached_at: i64, last_walk: Option<i64>, now: i64, quiet: bool) -> bool {
+    if cached_at <= 0 {
+        return false;
+    }
+    let last_walk = last_walk.unwrap_or(cached_at);
+    quiet && now.saturating_sub(last_walk) < FORCE_WALK_AFTER_SECS
+}
+
+fn last_walk_at(path: &std::path::Path, cached_at: i64) -> Option<i64> {
+    let mut last_walk = LAST_WALK
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Some(*last_walk.entry(path.to_path_buf()).or_insert(cached_at))
+}
+
+fn remember_walk(path: &std::path::Path, walked_at: i64) {
+    LAST_WALK
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf(), walked_at);
+}
 
 /// Background per-worktree disk scan.
 ///
@@ -207,10 +233,10 @@ pub(crate) fn spawn_scan(
             // sentinels can miss a deep edit and a size must not be allowed to
             // drift indefinitely. Past the ceiling we always walk.
             let cached_at = stamps.get(path_s.as_str()).copied().unwrap_or(0);
-            let ceiling_passed =
-                cached_at <= 0 || now.saturating_sub(cached_at) >= FORCE_WALK_AFTER_SECS;
-            if !ceiling_passed
-                && thegn_core::disk::likely_unchanged_since(path, cached_at)
+            let last_walk = last_walk_at(path, cached_at);
+            let quiet = thegn_core::disk::likely_unchanged_since(path, cached_at)
+                && cached_all.contains_key(path_s.as_str());
+            if lazy_skip(cached_at, last_walk, now, quiet)
                 && let Some(&(total, target)) = cached_all.get(path_s.as_str())
             {
                 // Re-stamp so the scheduler treats the row as fresh; without
@@ -220,6 +246,7 @@ pub(crate) fn spawn_scan(
                 continue;
             }
             let usage = thegn_core::disk::measure_worktree(path);
+            remember_walk(path, thegn_core::util::now());
             // A repo root's `du` already includes any worktree checked out
             // beneath it (`worktree_mode = "in_repo"` puts them at
             // `<root>/.worktrees/<slug>`), so subtract the children we have
@@ -814,6 +841,18 @@ fn branch_of(db: &Db, path: &str) -> String {
 mod generation_tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn lazy_skip_uses_the_last_real_walk_after_cache_restamps() {
+        let now = 200_000;
+        assert!(!lazy_skip(
+            now - 60,
+            Some(now - FORCE_WALK_AFTER_SECS - 1),
+            now,
+            true,
+        ));
+        assert!(lazy_skip(now - 60, Some(now - 60), now, true));
+    }
 
     #[test]
     fn artifact_names_match_cargo_library_dep_info_and_executable_outputs() {
