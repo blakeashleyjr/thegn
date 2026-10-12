@@ -28,7 +28,8 @@
     },
     {
       "change": "add-agent-model-env-selection",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
+      "delivered_at": "2026-10-11",
       "disposition": "residual-split",
       "owners": [
         {
@@ -36,7 +37,7 @@
           "project": "Agent & Workflow Platform"
         }
       ],
-      "summary": "Runtime model selection shipped; pipeline-board presentation remains."
+      "summary": "Runtime model selection and pipeline-board presentation delivered; archive reconciliation remains."
     },
     {
       "change": "add-automation-rules",

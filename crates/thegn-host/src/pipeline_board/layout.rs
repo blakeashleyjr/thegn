@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use thegn_core::config::Config;
 use thegn_core::config_pipeline::PipelineStage;
 
 use crate::monitor_pipeline::{PipelineRow, UNSTAGED, stage_sequence};
@@ -61,6 +62,25 @@ pub(crate) struct StageHead {
     pub next: Option<String>,
     /// Whether the stage is configured at all, or only present on the roster.
     pub configured: bool,
+    /// Effective model as launch resolves it, with its source (or failure).
+    pub model: EffectiveModel,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum EffectiveModel {
+    #[default]
+    Unspecified,
+    Selected {
+        name: String,
+        source: ModelSource,
+    },
+    Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelSource {
+    EntryDefault,
+    StageOverride,
 }
 
 /// How a row connects to its parent.
@@ -69,7 +89,7 @@ pub(crate) enum Edge {
     /// No parent to draw. The renderer still spends a cell on it, so every
     /// column stays exactly aligned.
     None,
-    /// The parent sits in the PREVIOUS stage column — the left-to-right flow.
+    /// The parent's configured `next` names this row's stage.
     Inbound,
     /// The parent sits in THIS column: a fan-out inside one stage, drawn with
     /// tree connectors at [`PipelineRow::depth`]. `last` picks the corner.
@@ -82,11 +102,15 @@ pub(crate) enum Edge {
 pub(crate) struct BoardRow {
     pub row: PipelineRow,
     pub edge: Edge,
+    /// Configured stage of the parent for a cross-stage inbound edge.
+    pub inbound_from: Option<String>,
     /// This row is some other row's [`Edge::Inbound`] parent — it carries an
     /// outbound tick so the flow reads in both directions.
     pub outbound: bool,
     /// Live past its stage's advisory `timeout_secs`. A cue, never an action.
     pub stalled: bool,
+    /// Effective model for this active dispatch, resolved using its agent and stage.
+    pub model: EffectiveModel,
 }
 
 /// One stage column.
@@ -147,11 +171,12 @@ pub(crate) fn stalled(row: &PipelineRow, timeout_secs: u64, now_ms: i64) -> bool
 /// really has.
 pub(crate) fn board(
     rows: &[PipelineRow],
-    stages: &[PipelineStage],
+    cfg: &Config,
     width: usize,
     now_ms: i64,
     hide_finished: bool,
 ) -> Board {
+    let stages = &cfg.pipeline.stages;
     let configured: Vec<String> = stages
         .iter()
         .filter_map(|s| s.stage_name())
@@ -168,6 +193,7 @@ pub(crate) fn board(
         .enumerate()
         .map(|(i, n)| (n.as_str(), i))
         .collect();
+    let row_of_id: BTreeMap<i64, &PipelineRow> = rows.iter().map(|r| (r.id, r)).collect();
     let col_of_id: BTreeMap<i64, usize> = rows
         .iter()
         .filter_map(|r| col_of.get(r.stage.as_str()).map(|&c| (r.id, c)))
@@ -181,10 +207,18 @@ pub(crate) fn board(
         let (Some(parent), Some(&mine)) = (r.parent_id, col_of_id.get(&r.id)) else {
             continue;
         };
+        let parent_row = row_of_id.get(&parent);
+        if parent_row.is_some_and(|p| {
+            p.stage != r.stage
+                && cfg
+                    .pipeline
+                    .stage(&p.stage)
+                    .and_then(PipelineStage::next_name)
+                    == Some(r.stage.as_str())
+        }) {
+            outbound.insert(parent);
+        }
         match col_of_id.get(&parent) {
-            Some(&pc) if pc + 1 == mine => {
-                outbound.insert(parent);
-            }
             // Same column AND the fold indented it: a genuine in-stage child.
             Some(&pc) if pc == mine && r.depth > 0 => {
                 last_child.insert(parent, r.id);
@@ -211,6 +245,9 @@ pub(crate) fn board(
                     timeout_secs: stage.map(|s| s.timeout_secs).unwrap_or(0),
                     next: stage.and_then(|s| s.next_name()).map(str::to_string),
                     configured: stage.is_some(),
+                    model: stage.map_or(EffectiveModel::Unspecified, |stage| {
+                        effective_model(cfg, &stage.agent, Some(name))
+                    }),
                 },
                 rows: Vec::new(),
             }
@@ -230,20 +267,38 @@ pub(crate) fn board(
             continue;
         }
         let edge = match r.parent_id {
-            Some(p) => match col_of_id.get(&p) {
-                Some(&pc) if pc + 1 == ci => Edge::Inbound,
-                Some(&pc) if pc == ci && r.depth > 0 => Edge::Child {
+            Some(p) => match (row_of_id.get(&p), col_of_id.get(&p)) {
+                (Some(parent), Some(_))
+                    if parent.stage != r.stage
+                        && cfg
+                            .pipeline
+                            .stage(&parent.stage)
+                            .and_then(PipelineStage::next_name)
+                            == Some(r.stage.as_str()) =>
+                {
+                    Edge::Inbound
+                }
+                (Some(_), Some(&pc)) if pc == ci && r.depth > 0 => Edge::Child {
                     last: last_child.get(&p) == Some(&r.id),
                 },
                 _ => Edge::None,
             },
             None => Edge::None,
         };
+        let inbound_from = if edge == Edge::Inbound {
+            r.parent_id
+                .and_then(|parent| row_of_id.get(&parent))
+                .map(|parent| parent.stage.clone())
+        } else {
+            None
+        };
         let timeout = columns[ci].head.timeout_secs;
         columns[ci].rows.push(BoardRow {
             edge,
+            inbound_from,
             outbound: outbound.contains(&r.id),
             stalled: stalled(r, timeout, now_ms),
+            model: effective_model(cfg, &r.agent_name, Some(&r.stage)),
             row: r.clone(),
         });
     }
@@ -267,6 +322,31 @@ pub(crate) fn board(
     }
 }
 
+fn effective_model(cfg: &Config, agent: &str, stage: Option<&str>) -> EffectiveModel {
+    // Historical and UNSTAGED rows have no configured stage overrides. Resolve
+    // their agent defaults without asking effective_agent to validate a stale
+    // stage name.
+    let stage = stage.filter(|name| cfg.pipeline.stage(name).is_some());
+    let stage_override = stage
+        .and_then(|name| cfg.pipeline.stage(name))
+        .and_then(|stage| stage.model.as_deref())
+        .is_some_and(|model| !model.trim().is_empty());
+    match thegn_core::agent_task::effective_agent(cfg, agent, stage) {
+        Ok(eff) => match eff.model {
+            Some(name) if stage_override => EffectiveModel::Selected {
+                name,
+                source: ModelSource::StageOverride,
+            },
+            Some(name) => EffectiveModel::Selected {
+                name,
+                source: ModelSource::EntryDefault,
+            },
+            None => EffectiveModel::Unspecified,
+        },
+        Err(error) => EffectiveModel::Error(error),
+    }
+}
+
 /// The `UNSTAGED` column is never configured, so it never carries stage facts.
 /// Re-exported for the view's header rail, which labels it differently.
 pub(crate) fn is_unstaged(head: &StageHead) -> bool {
@@ -286,6 +366,33 @@ mod tests {
             timeout_secs: 60,
             next: next.map(str::to_string),
             ..PipelineStage::default()
+        }
+    }
+
+    fn config(stages: &[PipelineStage]) -> Config {
+        let mut cfg = Config::default();
+        cfg.pipeline.stages = stages.to_vec();
+        cfg
+    }
+
+    fn agent(
+        name: &str,
+        harness: Option<&str>,
+        model: Option<&str>,
+    ) -> thegn_core::config::NamedCommand {
+        thegn_core::config::NamedCommand {
+            name: name.into(),
+            command: harness.unwrap_or("claude").into(),
+            hints: Vec::new(),
+            provider: None,
+            harness: harness.map(str::to_string),
+            model: model.map(str::to_string),
+            env: Default::default(),
+            permissions: Vec::new(),
+            resume: false,
+            route_via_proxy: false,
+            drawer_scope: None,
+            drawer_cwd: None,
         }
     }
 
@@ -334,7 +441,7 @@ mod tests {
             &stages,
             0,
         );
-        let b = board(&rows, &stages, 200, 0, false);
+        let b = board(&rows, &config(&stages), 200, 0, false);
         assert_eq!(names(&b), vec!["architect", "code", "zeta", UNSTAGED]);
     }
 
@@ -343,7 +450,7 @@ mod tests {
         // The org chart is what the board draws; a stage nobody has reached yet
         // vanishing would read as a misconfiguration.
         let stages = [stage("architect", Some("code")), stage("code", None)];
-        let b = board(&[], &stages, 200, 0, false);
+        let b = board(&[], &config(&stages), 200, 0, false);
         assert_eq!(names(&b), vec!["architect", "code"]);
         assert!(b.columns.iter().all(|c| c.rows.is_empty()));
         assert_eq!(b.columns[0].head.total, 0);
@@ -355,7 +462,7 @@ mod tests {
 
     #[test]
     fn an_empty_board_with_no_config_has_no_columns_and_stacks() {
-        let b = board(&[], &[], 200, 0, false);
+        let b = board(&[], &config(&[]), 200, 0, false);
         assert!(b.columns.is_empty());
         assert_eq!(b.mode, Mode::Stacked);
         assert_eq!(b.row_count(), 0);
@@ -366,17 +473,26 @@ mod tests {
     fn mode_flips_exactly_at_min_col_w_times_the_column_count() {
         let stages = [stage("a", Some("b")), stage("b", None)];
         let exact = MIN_COL_W * 2;
-        assert_eq!(board(&[], &stages, exact, 0, false).mode, Mode::Columns);
         assert_eq!(
-            board(&[], &stages, exact - 1, 0, false).mode,
+            board(&[], &config(&stages), exact, 0, false).mode,
+            Mode::Columns
+        );
+        assert_eq!(
+            board(&[], &config(&stages), exact - 1, 0, false).mode,
             Mode::Stacked,
             "one cell short of the budget must stack"
         );
         // Zero width can never be columns.
-        assert_eq!(board(&[], &stages, 0, 0, false).mode, Mode::Stacked);
+        assert_eq!(
+            board(&[], &config(&stages), 0, 0, false).mode,
+            Mode::Stacked
+        );
         // …and the per-column width is the honest split.
-        assert_eq!(board(&[], &stages, exact, 0, false).col_w, MIN_COL_W);
-        assert_eq!(board(&[], &stages, 0, 0, false).col_w, 0);
+        assert_eq!(
+            board(&[], &config(&stages), exact, 0, false).col_w,
+            MIN_COL_W
+        );
+        assert_eq!(board(&[], &config(&stages), 0, 0, false).col_w, 0);
     }
 
     #[test]
@@ -390,7 +506,7 @@ mod tests {
             &stages,
             0,
         );
-        let b = board(&rows, &stages, 200, 0, false);
+        let b = board(&rows, &config(&stages), 200, 0, false);
         assert_eq!(b.columns[0].rows[0].edge, Edge::None);
         assert!(
             b.columns[0].rows[0].outbound,
@@ -412,7 +528,7 @@ mod tests {
             &stages,
             0,
         );
-        let b = board(&rows, &stages, 200, 0, false);
+        let b = board(&rows, &config(&stages), 200, 0, false);
         let edges: Vec<Edge> = b.columns[0].rows.iter().map(|r| r.edge).collect();
         assert_eq!(
             edges,
@@ -426,23 +542,177 @@ mod tests {
     }
 
     #[test]
-    fn a_parent_two_columns_back_or_gone_is_no_edge_at_all() {
-        // Only the IMMEDIATELY previous column is a flow; a longer hop (or a
-        // pruned parent) must not draw a connector to nothing.
-        let stages = [stage("a", None), stage("b", None), stage("c", None)];
+    fn configured_transition_renders_across_reordered_columns_and_skips() {
+        // Declaration order controls display only. `a → c` remains a real
+        // transition even though b sits between them and c is declared first.
+        let stages = [stage("c", None), stage("b", None), stage("a", Some("c"))];
         let rows = fold(
             &[
                 d(1, Some("a"), None, 10),
                 d(2, Some("c"), Some(1), 20),
-                d(3, Some("b"), Some(999), 30),
+                d(3, Some("b"), Some(1), 30),
             ],
             &stages,
             0,
         );
-        let b = board(&rows, &stages, 200, 0, false);
-        assert_eq!(b.columns[2].rows[0].edge, Edge::None);
+        let b = board(&rows, &config(&stages), 200, 0, false);
+        assert_eq!(names(&b), vec!["c", "b", "a"]);
+        assert_eq!(b.columns[0].rows[0].edge, Edge::Inbound);
+        assert!(b.columns[2].rows[0].outbound);
         assert_eq!(b.columns[1].rows[0].edge, Edge::None);
+        assert!(!b.columns[1].rows[0].outbound);
+    }
+
+    #[test]
+    fn adjacent_columns_without_next_and_historical_parent_have_no_edge() {
+        let stages = [stage("a", None), stage("b", None), stage("c", None)];
+        let rows = fold(
+            &[
+                d(1, Some("a"), None, 10),
+                d(2, Some("b"), Some(1), 20),
+                d(3, Some("legacy-a"), None, 30),
+                d(4, Some("legacy-b"), Some(3), 40),
+            ],
+            &stages,
+            0,
+        );
+        let b = board(&rows, &config(&stages), 200, 0, false);
+        assert_eq!(b.columns[1].rows[0].edge, Edge::None);
+        assert_eq!(b.columns[4].rows[0].edge, Edge::None);
         assert!(!b.columns[0].rows[0].outbound);
+    }
+
+    #[test]
+    fn hidden_terminal_parent_keeps_child_edge_without_visible_outbound_row() {
+        let stages = [stage("b", None), stage("a", Some("b"))];
+        let mut parent = d(1, Some("a"), None, 10);
+        parent.status = AgentDispatchStatus::Done;
+        let rows = fold(&[parent, d(2, Some("b"), Some(1), 20)], &stages, 0);
+        let b = board(&rows, &config(&stages), 200, 0, true);
+        assert_eq!(b.columns[1].rows.len(), 0);
+        assert_eq!(b.columns[0].rows[0].edge, Edge::Inbound);
+    }
+
+    #[test]
+    fn invalid_cycle_still_resolves_edges_without_traversal_or_panic() {
+        let stages = [stage("a", Some("b")), stage("b", Some("a"))];
+        let rows = fold(
+            &[d(1, Some("a"), None, 10), d(2, Some("b"), Some(1), 20)],
+            &stages,
+            0,
+        );
+        let b = board(&rows, &config(&stages), 200, 0, false);
+        assert_eq!(b.columns[1].rows[0].edge, Edge::Inbound);
+        assert!(b.columns[0].rows[0].outbound);
+    }
+
+    #[test]
+    fn configured_and_active_models_show_resolution_source_or_error() {
+        let mut stages = [
+            stage("inherited", None),
+            stage("override", None),
+            stage("none", None),
+            stage("invalid", None),
+            stage("blank-override", None),
+        ];
+        for s in &mut stages {
+            s.agent = if s.name == "none" { "plain" } else { "worker" }.into();
+        }
+        stages[1].model = Some("opus".into());
+        stages[3].model = Some("not-supported".into());
+        stages[4].model = Some("  ".into());
+        let mut cfg = config(&stages);
+        cfg.agents
+            .push(agent("worker", Some("claude"), Some("sonnet")));
+        cfg.agents.push(agent("plain", Some("claude"), None));
+        cfg.agents
+            .push(agent("bad-harness", Some("antigravity"), Some("x")));
+        cfg.pipeline.stages[3].agent = "bad-harness".into();
+
+        let rows = fold(
+            &[
+                d(1, Some("inherited"), None, 10),
+                d(2, Some("override"), None, 20),
+                d(3, Some("none"), None, 30),
+                d(4, Some("invalid"), None, 40),
+                d(5, Some("blank-override"), None, 50),
+            ],
+            &stages,
+            0,
+        );
+        let mut rows = rows;
+        rows[0].agent_name = "worker".into();
+        rows[1].agent_name = "worker".into();
+        rows[2].agent_name = "plain".into();
+        rows[3].agent_name = "bad-harness".into();
+        rows[4].agent_name = "worker".into();
+        let b = board(&rows, &cfg, 200, 0, false);
+
+        assert_eq!(
+            b.columns[0].head.model,
+            EffectiveModel::Selected {
+                name: "sonnet".into(),
+                source: ModelSource::EntryDefault,
+            }
+        );
+        assert_eq!(
+            b.columns[1].head.model,
+            EffectiveModel::Selected {
+                name: "opus".into(),
+                source: ModelSource::StageOverride,
+            }
+        );
+        assert_eq!(b.columns[2].head.model, EffectiveModel::Unspecified);
+        assert!(matches!(&b.columns[3].head.model, EffectiveModel::Error(_)));
+        assert_eq!(b.columns[0].rows[0].model, b.columns[0].head.model);
+        assert_eq!(b.columns[1].rows[0].model, b.columns[1].head.model);
+        assert_eq!(b.columns[2].rows[0].model, EffectiveModel::Unspecified);
+        assert!(matches!(
+            &b.columns[3].rows[0].model,
+            EffectiveModel::Error(_)
+        ));
+        assert_eq!(
+            b.columns[4].head.model,
+            EffectiveModel::Selected {
+                name: "sonnet".into(),
+                source: ModelSource::EntryDefault,
+            }
+        );
+        assert_eq!(b.columns[4].rows[0].model, b.columns[4].head.model);
+    }
+
+    #[test]
+    fn unstaged_and_historical_rows_resolve_the_entry_model_without_stage_errors() {
+        let stages = [stage("current", None)];
+        let mut cfg = config(&stages);
+        cfg.agents
+            .push(agent("worker", Some("claude"), Some("sonnet")));
+        let rows = fold(
+            &[d(1, None, None, 10), d(2, Some("renamed-stage"), None, 20)],
+            &stages,
+            0,
+        );
+        let mut rows = rows;
+        for row in &mut rows {
+            row.agent_name = "worker".into();
+        }
+
+        let b = board(&rows, &cfg, 200, 0, false);
+        let expected = EffectiveModel::Selected {
+            name: "sonnet".into(),
+            source: ModelSource::EntryDefault,
+        };
+        for name in [UNSTAGED, "renamed-stage"] {
+            let row = b
+                .columns
+                .iter()
+                .find(|column| column.head.name == name)
+                .unwrap()
+                .rows
+                .first()
+                .unwrap();
+            assert_eq!(row.model, expected, "unexpected model for {name}");
+        }
     }
 
     #[test]
@@ -451,9 +721,9 @@ mod tests {
         let mut done = d(2, Some("code"), None, 20);
         done.status = AgentDispatchStatus::Done;
         let rows = fold(&[d(1, Some("code"), None, 10), done], &stages, 0);
-        let shown = board(&rows, &stages, 200, 0, false);
+        let shown = board(&rows, &config(&stages), 200, 0, false);
         assert_eq!(shown.columns[0].rows.len(), 2);
-        let hidden = board(&rows, &stages, 200, 0, true);
+        let hidden = board(&rows, &config(&stages), 200, 0, true);
         assert_eq!(hidden.columns[0].rows.len(), 1);
         assert_eq!(hidden.columns[0].rows[0].row.id, 1);
         assert_eq!(
@@ -485,10 +755,10 @@ mod tests {
     fn the_stall_cue_rides_the_stage_that_owns_the_row() {
         let stages = [stage("code", None)];
         let rows = fold(&[d(1, Some("code"), None, 0)], &stages, 500_000);
-        assert!(board(&rows, &stages, 200, 500_000, false).columns[0].rows[0].stalled);
+        assert!(board(&rows, &config(&stages), 200, 500_000, false).columns[0].rows[0].stalled);
         // An UNSTAGED row has no configured budget, so it can never stall.
         let orphan = fold(&[d(9, None, None, 0)], &stages, 500_000);
-        let b = board(&orphan, &stages, 200, 500_000, false);
+        let b = board(&orphan, &config(&stages), 200, 500_000, false);
         let un = b
             .columns
             .iter()

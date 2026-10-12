@@ -31,7 +31,7 @@ use crate::detail::StatusCtx;
 use crate::layer::{self, Anchor, LayerSpec};
 use crate::monitor_pipeline::DispatchRoster;
 use crate::seg::{Line, Tok};
-use thegn_core::config_pipeline::PipelineStage;
+use thegn_core::config::Config;
 
 pub(crate) mod action;
 pub(crate) mod layout;
@@ -128,15 +128,11 @@ pub struct PipelineBoard {
 }
 
 impl PipelineBoard {
-    /// Open sized against `ctx.screen`, showing `roster` grouped by `stages`.
-    pub fn open(
-        roster: &DispatchRoster,
-        stages: &[PipelineStage],
-        ctx: &StatusCtx,
-    ) -> PipelineBoard {
+    /// Open sized against `ctx.screen`, showing `roster` grouped by configured stages.
+    pub fn open(roster: &DispatchRoster, cfg: &Config, ctx: &StatusCtx) -> PipelineBoard {
         let (cols, rows) = Self::dims(ctx.screen);
         let mut b = PipelineBoard {
-            board: layout::board(&[], stages, cols, ctx.now_ms, false),
+            board: layout::board(&[], cfg, cols, ctx.now_ms, false),
             lines: Vec::new(),
             col: 0,
             cursor: None,
@@ -154,7 +150,7 @@ impl PipelineBoard {
             rows,
             body_rows: rows.saturating_sub(CHROME_ROWS),
         };
-        b.rebuild(roster, stages, ctx);
+        b.rebuild(roster, cfg, ctx);
         b
     }
 
@@ -202,16 +198,11 @@ impl PipelineBoard {
     /// A frozen board returns immediately and touches nothing — which is also
     /// what keeps a frozen picture from re-dirtying the frame at the sample
     /// rate.
-    pub fn refresh(
-        &mut self,
-        roster: &DispatchRoster,
-        stages: &[PipelineStage],
-        ctx: &StatusCtx,
-    ) -> bool {
+    pub fn refresh(&mut self, roster: &DispatchRoster, cfg: &Config, ctx: &StatusCtx) -> bool {
         if self.frozen {
             return false;
         }
-        self.rebuild(roster, stages, ctx);
+        self.rebuild(roster, cfg, ctx);
         true
     }
 
@@ -221,16 +212,11 @@ impl PipelineBoard {
     /// freezing the data must not freeze the navigation. It rebuilds against
     /// the frozen clock, so a frozen board still shows the instant it was
     /// frozen at.
-    pub fn rebuild_after_key(
-        &mut self,
-        roster: &DispatchRoster,
-        stages: &[PipelineStage],
-        ctx: &StatusCtx,
-    ) {
-        self.rebuild(roster, stages, ctx);
+    pub fn rebuild_after_key(&mut self, roster: &DispatchRoster, cfg: &Config, ctx: &StatusCtx) {
+        self.rebuild(roster, cfg, ctx);
     }
 
-    fn rebuild(&mut self, roster: &DispatchRoster, stages: &[PipelineStage], ctx: &StatusCtx) {
+    fn rebuild(&mut self, roster: &DispatchRoster, cfg: &Config, ctx: &StatusCtx) {
         self.resize(ctx.screen);
         self.last_now_ms = ctx.now_ms;
         self.stale = roster.stale.clone();
@@ -238,13 +224,15 @@ impl PipelineBoard {
         // The configured stages are the single source for BOTH the row fold's
         // grouping order and the board's columns, so a stale sampled order can
         // never disagree with the live config about where a row belongs.
-        let names: Vec<String> = stages
+        let names: Vec<String> = cfg
+            .pipeline
+            .stages
             .iter()
             .filter_map(|s| s.stage_name())
             .map(str::to_string)
             .collect();
         let rows = crate::monitor_pipeline::ordered_rows(&roster.rows, &names, now);
-        self.board = layout::board(&rows, stages, self.cols, now, self.hide_finished);
+        self.board = layout::board(&rows, cfg, self.cols, now, self.hide_finished);
         self.resolve_cursor();
         self.relines();
         self.clamp_scroll();
