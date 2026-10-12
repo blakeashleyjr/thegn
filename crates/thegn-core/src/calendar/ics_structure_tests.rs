@@ -227,6 +227,14 @@ fn dtend_and_duration_together_are_reported_and_dropped() {
         one_event("UID:x\nDTSTART;VALUE=DATE:20261012\nDTEND;VALUE=DATE:20261013\nDURATION:P1D");
     let (events, report) = parse_report(&input);
     assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
+    assert_eq!(
+        report
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| **diagnostic == IcsDiagnostic::InvalidEvent)
+            .count(),
+        1
+    );
     assert!(events.is_empty());
     assert_legacy_matches(&input, &events);
 }

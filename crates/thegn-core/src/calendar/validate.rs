@@ -50,12 +50,10 @@ pub fn validate_event(event: &CalEvent) -> Result<(), EventDefect> {
         !recurrence.rules.is_empty()
             || !recurrence.rdates.is_empty()
             || !recurrence.exdates.is_empty()
-    }) {
-        if super::nominal_span(event).is_none()
-            || super::recur::check_values(recurrence, &event.start).is_err()
-        {
-            return Err(EventDefect::RecurrenceShape);
-        }
+    }) && (super::nominal_span(event).is_none()
+        || super::recur::check_values(recurrence, &event.start).is_err())
+    {
+        return Err(EventDefect::RecurrenceShape);
     }
     Ok(())
 }

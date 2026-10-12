@@ -118,3 +118,17 @@ fn accepts_nonrecurring_zoned_endpoints_in_different_zones() {
     );
     assert_eq!(validate_event(&event), Ok(()));
 }
+
+#[test]
+fn event_defect_display_values_are_stable() {
+    assert_eq!(EventDefect::EmptyUid.to_string(), "empty UID");
+    assert_eq!(
+        EventDefect::MixedShape.to_string(),
+        "mixed all-day and timed endpoints"
+    );
+    assert_eq!(EventDefect::Reversed.to_string(), "end precedes start");
+    assert_eq!(
+        EventDefect::RecurrenceShape.to_string(),
+        "incompatible recurrence values"
+    );
+}
