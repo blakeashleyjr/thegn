@@ -409,13 +409,11 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                             *ctx.want_model_refresh = true;
                         }
                         StepReaction::InfrastructureHeld => {
-                            ctx.toasts.info_ttl(
-                            format!(
+                            let message = format!(
                                 "{branch} held: environment/policy, not a code verdict: `{detail}`"
-                            ),
-                            now,
-                            std::time::Duration::from_secs(8),
-                        );
+                            );
+                            ctx.toasts
+                                .info_ttl(message, now, std::time::Duration::from_secs(8));
                             *ctx.want_model_refresh = true;
                         }
                         StepReaction::Held => {
@@ -1139,8 +1137,11 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
         Err(e) => return DriveMsg::Failed(format!("land: {e}")),
     };
     let db = Db::open().map_err(|error| error.to_string());
-    let record = |status: MqStatus, oid: Option<&str>, detail: Option<&str>| match &db {
-        Ok(db) => record_queue_status(Ok(db), wt, status, oid, detail),
+    let record = |status: MqStatus,
+                  oid: Option<&str>,
+                  conflict_paths: Option<&str>,
+                  error_detail: Option<&str>| match &db {
+        Ok(db) => record_queue_status(Ok(db), wt, status, oid, conflict_paths, error_detail),
         Err(error) => Err(error.clone()),
     };
     // Drive the sidebar-folder lifecycle for this worktree (no-op unless
@@ -1178,7 +1179,7 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                 }
             }
             let out = landed_outcome_after_record(
-                record(MqStatus::Landed, Some(&commit), None),
+                record(MqStatus::Landed, Some(&commit), None, None),
                 &branch,
                 &target,
                 &old_oid,
@@ -1200,7 +1201,12 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
             DriveMsg::Done(out)
         }
         AttemptOutcome::UpToDate { commit } => {
-            let write = record(MqStatus::Landed, Some(&commit), Some("already merged"));
+            let write = record(
+                MqStatus::Landed,
+                Some(&commit),
+                Some("already merged"),
+                None,
+            );
             if write.is_ok() {
                 lifecycle(LifecycleEvent::Landed, &branch);
             }
@@ -1216,7 +1222,7 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
         } => {
             let detail =
                 crate::integrate::conflict_details(&paths, &submodule_conflicts).join("\n");
-            let write = record(MqStatus::Deferred, None, Some(&detail));
+            let write = record(MqStatus::Deferred, None, Some(&detail), None);
             if write.is_ok() {
                 lifecycle(LifecycleEvent::Failed, &branch);
             }
@@ -1233,7 +1239,7 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
             } else {
                 format!("breaks build\n{}", log.trim())
             };
-            let write = record(MqStatus::GateFailed, None, Some(&detail));
+            let write = record(MqStatus::GateFailed, None, None, Some(&detail));
             if write.is_ok() {
                 lifecycle(LifecycleEvent::Failed, &branch);
             }
@@ -1250,7 +1256,7 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
             } else {
                 format!("{reason}\n{}", log.trim())
             };
-            let write = record(MqStatus::GateError, None, Some(&detail));
+            let write = record(MqStatus::GateError, None, None, Some(&detail));
             if write.is_ok() {
                 lifecycle(LifecycleEvent::Failed, &branch);
             }
@@ -1260,7 +1266,7 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
             ))
         }
         AttemptOutcome::Unreachable { detail } => {
-            let write = record(MqStatus::Deferred, None, Some(&detail));
+            let write = record(MqStatus::Deferred, None, Some(&detail), None);
             if write.is_ok() {
                 lifecycle(LifecycleEvent::Failed, &branch);
             }
@@ -1271,6 +1277,7 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                 MqStatus::Ready,
                 Some(&tip),
                 Some("gated green — awaiting land"),
+                None,
             );
             DriveMsg::Failed(append_write_error(
                 format!("{branch} is ready but was not landed"),
@@ -1285,9 +1292,10 @@ fn record_queue_status(
     wt: &str,
     status: MqStatus,
     oid: Option<&str>,
-    detail: Option<&str>,
+    conflict_paths: Option<&str>,
+    error_detail: Option<&str>,
 ) -> Result<(), String> {
-    db?.update_merge_status(wt, status.as_str(), oid, None, detail)
+    db?.update_merge_status(wt, status.as_str(), oid, conflict_paths, error_detail)
         .map_err(|error| error.to_string())
 }
 
@@ -1348,6 +1356,7 @@ mod tests {
                 MqStatus::Landed,
                 Some("new-commit-oid"),
                 None,
+                None,
             ),
             "feature",
             "main",
@@ -1363,6 +1372,48 @@ mod tests {
         assert_eq!(failure.new_oid, "new-commit-oid");
         assert!(failure.error.contains("injected landed write failure"));
         assert!(!drive_summary(&out).1);
+    }
+
+    #[test]
+    fn queue_status_keeps_conflict_paths_out_of_error_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(dir.path().join("queue.sqlite")).unwrap();
+        db.enqueue_merge("/wt/feature", "feature", "main").unwrap();
+
+        record_queue_status(
+            Ok(&db),
+            "/wt/feature",
+            MqStatus::Deferred,
+            None,
+            Some("src/a.rs\nsrc/b.rs"),
+            None,
+        )
+        .unwrap();
+
+        let row = db.list_merge_queue().unwrap().remove(0);
+        assert_eq!(row.conflict_paths.as_deref(), Some("src/a.rs\nsrc/b.rs"));
+        assert_eq!(row.error_detail, None);
+    }
+
+    #[test]
+    fn queue_status_keeps_gate_failure_in_error_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(dir.path().join("queue.sqlite")).unwrap();
+        db.enqueue_merge("/wt/feature", "feature", "main").unwrap();
+
+        record_queue_status(
+            Ok(&db),
+            "/wt/feature",
+            MqStatus::GateError,
+            None,
+            None,
+            Some("gate unavailable\nlog"),
+        )
+        .unwrap();
+
+        let row = db.list_merge_queue().unwrap().remove(0);
+        assert_eq!(row.conflict_paths, None);
+        assert_eq!(row.error_detail.as_deref(), Some("gate unavailable\nlog"));
     }
 
     #[test]
