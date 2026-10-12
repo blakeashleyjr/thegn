@@ -380,12 +380,35 @@ fn row(d: &AgentDispatch, stage: &str, depth: u8, now_ms: i64) -> PipelineRow {
         glyph: d.status.glyph(),
         status: d.status,
         agent_name: d.agent_name.clone(),
-        worktree: thegn_core::util::basename(&d.worktree_path).to_string(),
+        worktree: display_label(thegn_core::util::basename(&d.worktree_path)),
         worktree_path: d.worktree_path.clone(),
         session_id: d.session_id.clone(),
         age: fmt_age_ms(now_ms.saturating_sub(d.dispatched_at_ms)),
-        issue_id: d.issue_id.clone(),
+        issue_id: display_label(&d.issue_id),
     }
+}
+
+/// Sanitize labels that enter board and sidebar text rendering. Keep the raw
+/// roster values in identity fields used for lookup, grouping, and navigation.
+fn display_label(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || is_format_control(c) {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+fn is_format_control(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891 |
+        0x08E2 | 0x180E | 0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x2064 |
+        0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD |
+        0x13430..=0x1343F | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 |
+        0xE0020..=0xE007F)
 }
 
 /// `4s` / `3m` / `2h` / `5d`. A negative span (clock skew, a stamp from the
@@ -423,9 +446,9 @@ pub(crate) fn stage_badges(
         let key = (d.dispatched_at_ms, d.id);
         match out.get_mut(&d.worktree_path) {
             Some(e) if e.0 >= key => {}
-            Some(e) => *e = (key, stage.to_string()),
+            Some(e) => *e = (key, display_label(stage)),
             None => {
-                out.insert(d.worktree_path.clone(), (key, stage.to_string()));
+                out.insert(d.worktree_path.clone(), (key, display_label(stage)));
             }
         }
     }
@@ -756,6 +779,24 @@ mod tests {
     }
 
     #[test]
+    fn board_labels_escape_terminal_controls_and_unicode_formatting() {
+        let mut hostile = d(1, Some("code"), None, 10);
+        hostile.issue_id = "THE-1\x1b]52;c;AAAA\u{7}\u{202e}".into();
+        hostile.worktree_path = "/wt/w\x1b[2Jx".into();
+        let rows = ordered_rows(&[hostile], &["code".into()], 0);
+        let row = &rows[0];
+
+        for label in [&row.issue_id, &row.worktree] {
+            assert!(!label.contains('\x1b'));
+            assert!(!label.contains('\u{7}'));
+            assert!(!label.contains('\u{202e}'));
+        }
+        assert_eq!(row.worktree_path, "/wt/w\x1b[2Jx");
+        assert!(row.issue_id.contains('\u{fffd}'));
+        assert!(row.worktree.contains('\u{fffd}'));
+    }
+
+    #[test]
     fn age_formats_across_units_and_never_goes_negative() {
         assert_eq!(fmt_age_ms(-5_000), "0s");
         assert_eq!(fmt_age_ms(4_000), "4s");
@@ -781,6 +822,18 @@ mod tests {
         let m = stage_badges(&[a, b, c, e]);
         assert_eq!(m.get("/wt/x").map(String::as_str), Some("code"));
         assert!(!m.contains_key("/wt/y"));
+    }
+
+    #[test]
+    fn stage_badge_value_is_safe_while_worktree_identity_key_stays_raw() {
+        let mut row = d(1, Some("code\x1b[31m"), None, 10);
+        row.worktree_path = "/wt/w\x1b[2Jx".into();
+        let badges = stage_badges(&[row]);
+        assert_eq!(badges.len(), 1);
+        assert!(badges.contains_key("/wt/w\x1b[2Jx"));
+        let badge = badges.get("/wt/w\x1b[2Jx").unwrap();
+        assert!(!badge.contains('\x1b'));
+        assert!(badge.contains('\u{fffd}'));
     }
 
     #[test]
