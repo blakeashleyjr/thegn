@@ -33,9 +33,6 @@ pub(crate) struct WorktreeSlice {
     pub placement_label: Option<String>,
     pub loc: Option<thegn_core::loc::LocReport>,
     pub disk: Option<u64>,
-    /// False means the worker ended before it could build a cache slice; the
-    /// result exists only to release the matching in-flight marker.
-    pub successful: bool,
     pub container_events: Vec<thegn_core::models::ContainerEvent>,
     pub timeline: Vec<thegn_core::models::TimelineEvent>,
     /// When this slice was last seeded/refreshed (`None` = never): drives the
@@ -223,15 +220,19 @@ pub(crate) fn drain_prefetch_results(
             successful,
         } = res;
         loop_perf.tick(crate::perf::WakeSource::Prefetch);
-        // Release the dedupe guard: this path may warm again after its TTL.
-        if let Some(generation) = generation
-            && !inflight.finish(&path, generation)
-        {
-            continue;
-        }
         if !successful {
+            // Failed workers release only their own generation; a replacement
+            // request remains protected from an older completion.
+            if let Some(generation) = generation {
+                inflight.finish(&path, generation);
+            }
             continue;
         }
+        // A stale generation still carries a freshly built slice worth
+        // retaining. It cannot release the replacement request's latch or
+        // paint the live frame, but it may seed the path cache.
+        let current_generation =
+            generation.is_none_or(|generation| inflight.finish(&path, generation));
         // Keyed like the switch detection: a terminal never matches a dir's
         // prefetch, so the launch-dir worktree's panel can't paint onto it.
         let is_active = path == crate::hydrate::active_slice_key(session);
@@ -241,6 +242,9 @@ pub(crate) fn drain_prefetch_results(
         slice.disk = disk;
         // A prefetched panel is fresh — stamps the re-warm TTL.
         slice.seeded_at = Some(std::time::Instant::now());
+        if !current_generation {
+            continue;
+        }
         // A fast-fill for the worktree the user just cold-switched to (still
         // active + pending) paints the live frame: preserve loop-owned
         // now-playing media and re-merge this worktree's LSP diags (the fresh

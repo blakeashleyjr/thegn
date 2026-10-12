@@ -58,7 +58,7 @@ pub(crate) fn spawn_month_fetch(
     let admission = crate::sched::spawn_bg(move || {
         let mut completion = MonthFetchCompletion {
             tx: worker_tx.clone(),
-            waker: worker_waker.clone(),
+            waker: Some(worker_waker.clone()),
             year,
             month,
             sent: false,
@@ -98,27 +98,44 @@ pub(crate) fn spawn_month_fetch(
             Some(db) => expand_month(db, wide_from, wide_to, home),
             None => MonthView::failed(CalendarViewError::CacheUnavailable),
         };
-        deliver(&worker_tx, &worker_waker, year, month, month_view, None);
+        deliver(
+            &worker_tx,
+            Some(&worker_waker),
+            year,
+            month,
+            month_view,
+            None,
+        );
         completion.sent = true;
     });
+    deliver_unavailable_if_refused(admission, &tx, Some(&waker), year, month);
+    admission
+}
+
+fn deliver_unavailable_if_refused(
+    admission: crate::sched::Admission,
+    tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
+    waker: Option<&TerminalWaker>,
+    year: i32,
+    month: u32,
+) {
     if admission != crate::sched::Admission::Admitted {
         deliver(
-            &tx,
-            &waker,
+            tx,
+            waker,
             year,
             month,
             MonthView::failed(CalendarViewError::CacheUnavailable),
             None,
         );
     }
-    admission
 }
 
 /// Ensures the calendar popup receives a terminal result if the month worker
 /// panics before its normal delivery.
 struct MonthFetchCompletion {
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
-    waker: TerminalWaker,
+    waker: Option<TerminalWaker>,
     year: i32,
     month: u32,
     sent: bool,
@@ -129,7 +146,7 @@ impl Drop for MonthFetchCompletion {
         if !self.sent {
             deliver(
                 &self.tx,
-                &self.waker,
+                self.waker.as_ref(),
                 self.year,
                 self.month,
                 MonthView::failed(CalendarViewError::CacheUnavailable),
@@ -231,7 +248,7 @@ pub(crate) fn spawn_periodic_sync_with_generation(
         let month_view = expand_month(&db, wide_from, wide_to, home_zone(&cfg));
         deliver(
             &tx,
-            &waker,
+            Some(&waker),
             today.year(),
             today.month(),
             month_view,
@@ -1000,7 +1017,7 @@ fn home_zone(cfg: &CalendarConfig) -> chrono_tz::Tz {
 
 fn deliver(
     tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
-    waker: &TerminalWaker,
+    waker: Option<&TerminalWaker>,
     year: i32,
     month: u32,
     view: MonthView,
@@ -1029,7 +1046,9 @@ fn deliver(
         generation: *generation,
         kind: Box::new(result),
     });
-    if tx.send(result).is_ok() {
+    if tx.send(result).is_ok()
+        && let Some(waker) = waker
+    {
         // best-effort: the loop may already be shutting down.
         let _ = waker.wake();
     }

@@ -2,6 +2,34 @@ use super::*;
 use crate::hydrate_tuning::DEFAULT_MODEL_REFRESH_MS;
 use crate::session::{GroupKind, Session, WorktreeGroup};
 
+#[test]
+fn dropped_panel_prefetch_completion_sends_failed_generation_and_rearms_latch() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let path = std::path::PathBuf::from("/repo/wt");
+    let mut inflight = crate::handlers::prefetch_policy::PrefetchInflight::new();
+    assert!(inflight.try_begin(&path));
+    let generation = inflight.generation(&path).unwrap();
+    let completion = PanelPrefetchCompletion {
+        tx,
+        path: path.clone(),
+        generation,
+        waker: None,
+        sent: false,
+    };
+    drop(completion);
+
+    let result = rx.try_recv().unwrap();
+    assert_eq!(result.path, path);
+    assert_eq!(result.generation, Some(generation));
+    assert!(!result.successful);
+
+    assert!(inflight.finish(&result.path, result.generation.unwrap()));
+    assert!(
+        inflight.try_begin(&result.path),
+        "failed result re-arms latch"
+    );
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "test fixture mirrors the flat GlyphRow fields so call sites remain readable"

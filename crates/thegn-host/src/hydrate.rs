@@ -3734,7 +3734,7 @@ pub(crate) fn spawn_panel_prefetch(
                 let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         }
-    });
+    })
 }
 
 /// Guarantees a terminal prefetch result on early return or panic, releasing
