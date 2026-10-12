@@ -251,7 +251,7 @@ pub(crate) fn collect_attention(
     //
     // Deliberately NOT the board's feed: the board samples only while its tab
     // is live, and the sidebar tag must stay honest with the tab closed.
-    let roster = db.list_dispatches().unwrap_or_default();
+    let roster = db.list_dispatch_roster().unwrap_or_default();
     // Tell a shut board its roster moved — the only way a dispatch written by
     // another process reaches a tab that is hidden until a row exists. One hash
     // over rows already in memory; no extra I/O, no wake source.
