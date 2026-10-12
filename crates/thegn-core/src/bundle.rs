@@ -312,6 +312,7 @@ pub fn managed_home(bundle_name: &str) -> std::path::PathBuf {
 pub fn managed_home_checked(cfg: &Config, bundle_name: &str) -> Option<std::path::PathBuf> {
     let slug = util::slugify(bundle_name);
     if slug.is_empty()
+        || slug.len() > 255
         || cfg
             .bundle
             .keys()
@@ -669,14 +670,14 @@ pub fn materialize_dotfiles(
 ) -> usize {
     use crate::config::DotfileMode;
     let source = std::path::PathBuf::from(util::expand_tilde(&spec.source));
-    if !source.is_dir() {
+    if !matches!(std::fs::symlink_metadata(&source), Ok(metadata) if metadata.is_dir()) {
         crate::msg::warn(&format!(
             "bundle: dotfiles source {} is not a directory; skipping",
             source.display()
         ));
         return 0;
     }
-    if let Err(e) = std::fs::create_dir_all(dest_home) {
+    if let Err(e) = ensure_directory_chain_nofollow(dest_home) {
         crate::msg::warn(&format!(
             "bundle: cannot create managed HOME {}: {e}",
             dest_home.display()
@@ -687,10 +688,18 @@ pub fn materialize_dotfiles(
     // unchanged since the last materialization.
     let sig = dotfiles_signature(&source, spec.mode);
     let meta = dest_home.join(".thegn-dotfiles.json");
+    if let Ok(metadata) = std::fs::symlink_metadata(&meta)
+        && (!metadata.is_file() || metadata.file_type().is_symlink())
+    {
+        crate::msg::warn("bundle: dotfiles signature path is not a regular file; skipping");
+        return 0;
+    }
     if std::fs::read_to_string(&meta).ok().as_deref() == Some(sig.as_str()) {
         return 0;
     }
     let mut n = 0;
+    let mut all_succeeded = true;
+    let mut budget = CopyBudget { entries: 0 };
     let entries = match std::fs::read_dir(&source) {
         Ok(e) => e,
         Err(e) => {
@@ -698,28 +707,76 @@ pub fn materialize_dotfiles(
             return 0;
         }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                all_succeeded = false;
+                crate::msg::warn(&format!(
+                    "bundle: cannot read dotfiles source entry: {error}"
+                ));
+                continue;
+            }
+        };
         let from = entry.path();
         let Some(base) = from.file_name() else {
             continue;
         };
         let to = dest_home.join(base);
-        let _ = std::fs::remove_file(&to).or_else(|_| std::fs::remove_dir_all(&to)); // best-effort: cleanup: clear the destination (file or dir) before rematerializing
+        if let Err(error) = std::fs::remove_file(&to).or_else(|_| std::fs::remove_dir_all(&to))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            all_succeeded = false;
+            crate::msg::warn(&format!(
+                "bundle: cannot clear dotfile target {}: {error}",
+                to.display()
+            ));
+            continue;
+        }
         let res = match spec.mode {
             DotfileMode::Symlink => symlink(&from, &to),
-            DotfileMode::Template => copy_tree(&from, &to),
+            DotfileMode::Template => copy_tree_bounded(&from, &to, 0, &mut budget),
         };
         match res {
             Ok(()) => n += 1,
-            Err(e) => crate::msg::warn(&format!(
-                "bundle: dotfile {} → {}: {e}",
-                from.display(),
-                to.display()
-            )),
+            Err(e) => {
+                all_succeeded = false;
+                crate::msg::warn(&format!(
+                    "bundle: dotfile {} → {}: {e}",
+                    from.display(),
+                    to.display()
+                ));
+            }
         }
     }
-    let _ = std::fs::write(&meta, sig); // best-effort: cache write: the signature meta only enables the skip-fast-path; failure just re-copies
+    if all_succeeded && let Err(error) = std::fs::write(&meta, sig) {
+        tracing::debug!(target: "thegn::bundle", %error, "could not write dotfiles signature");
+    }
     n
+}
+
+const MAX_DOTFILE_DEPTH: usize = 32;
+const MAX_DOTFILE_ENTRIES: usize = 10_000;
+
+fn ensure_directory_chain_nofollow(path: &std::path::Path) -> std::io::Result<()> {
+    let mut current = std::path::PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "directory path contains a non-directory or symlink",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)?
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn dotfiles_signature(source: &std::path::Path, mode: crate::config::DotfileMode) -> String {
@@ -749,18 +806,52 @@ fn symlink(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> 
 }
 #[cfg(not(unix))]
 fn symlink(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    copy_tree(from, to)
+    copy_tree_bounded(from, to, 0, &mut CopyBudget { entries: 0 })
 }
 
-fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    if from.is_dir() {
-        std::fs::create_dir_all(to)?;
-        for entry in std::fs::read_dir(from)?.flatten() {
-            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+struct CopyBudget {
+    entries: usize,
+}
+
+fn copy_tree_bounded(
+    from: &std::path::Path,
+    to: &std::path::Path,
+    depth: usize,
+    budget: &mut CopyBudget,
+) -> std::io::Result<()> {
+    if depth > MAX_DOTFILE_DEPTH || budget.entries >= MAX_DOTFILE_ENTRIES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "dotfile template exceeds traversal bounds",
+        ));
+    }
+    budget.entries += 1;
+    let metadata = std::fs::symlink_metadata(from)?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "template symlinks are not followed",
+        ));
+    }
+    if metadata.is_dir() {
+        std::fs::create_dir(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_tree_bounded(
+                &entry.path(),
+                &to.join(entry.file_name()),
+                depth + 1,
+                budget,
+            )?;
         }
         Ok(())
-    } else {
+    } else if metadata.is_file() {
         std::fs::copy(from, to).map(|_| ())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsupported template entry type",
+        ))
     }
 }
 
@@ -1238,7 +1329,92 @@ mod tests {
         let mut punctuation = Config::default();
         punctuation.bundle.insert("!!!".into(), Bundle::default());
         assert!(managed_home_checked(&punctuation, "!!!").is_none());
+        assert!(managed_home_checked(&Config::default(), &"a".repeat(300)).is_none());
         assert!(managed_home_checked(&Config::default(), "work").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_refuses_symlinked_home_without_touching_target() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let outside = root.path().join("outside");
+        let home = root.path().join("home");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(source.join(".bashrc"), "test").unwrap();
+        symlink(&outside, &home).unwrap();
+        let spec = DotfilesSpec {
+            source: source.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+
+        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn template_copy_skips_symlinks_and_does_not_cache_partial_success() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let outside = root.path().join("outside");
+        let home = root.path().join("home");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(source.join(".bashrc"), "export X=1\n").unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        symlink(&outside, &source.join("link")).unwrap();
+        let spec = DotfilesSpec {
+            source: source.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+
+        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        assert!(home.join(".bashrc").is_file());
+        assert!(!home.join("link/secret.txt").exists());
+        assert!(!home.join(".thegn-dotfiles.json").exists());
+        assert!(materialize_dotfiles(&spec, &home) >= 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_template_symlink_does_not_write_signature() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("home");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join(".bashrc"), "export X=1\n").unwrap();
+        symlink(&root.path().join("missing"), &source.join("dangling")).unwrap();
+        let spec = DotfilesSpec {
+            source: source.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+
+        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        assert!(!home.join(".thegn-dotfiles.json").exists());
+        assert!(materialize_dotfiles(&spec, &home) >= 1);
+    }
+
+    #[test]
+    fn template_copy_enforces_depth_and_entry_limits() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        std::fs::write(&source, "content").unwrap();
+
+        let mut full_budget = CopyBudget {
+            entries: MAX_DOTFILE_ENTRIES,
+        };
+        assert!(copy_tree_bounded(&source, &dest, 0, &mut full_budget).is_err());
+
+        let mut empty_budget = CopyBudget { entries: 0 };
+        assert!(
+            copy_tree_bounded(&source, &dest, MAX_DOTFILE_DEPTH + 1, &mut empty_budget).is_err()
+        );
     }
 
     #[test]
