@@ -89,6 +89,11 @@ impl CalDavBackend {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn stored_cursor_for_test(&self, server_token: &str) -> String {
+        scope_token(&self.calendar_ids, self.zone.name(), server_token)
+    }
+
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if self.token.is_empty() {
             return req;
