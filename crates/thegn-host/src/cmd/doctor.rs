@@ -2866,7 +2866,7 @@ fn pane_daemon_report(cfg: &Config) {
         crate::daemon::LegacySocketState::Stale => "stale",
         crate::daemon::LegacySocketState::Absent => "absent",
     };
-    outln!("  legacy socket {legacy} {legacy_label}");
+    outln!("  legacy socket {} {legacy_label}", legacy.display());
     if cfg!(windows) {
         // The endpoint is a fixed-length hash of the path, so length is moot.
         outln!("  endpoint      named pipe (path length not a constraint)");
