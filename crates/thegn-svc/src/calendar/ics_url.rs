@@ -206,13 +206,21 @@ impl CalendarBackend for IcsUrlBackend {
             // whole document (often years of history), so only events that
             // can occur in the sync window count toward `max_events`.
             let mut events = Vec::new();
-            thegn_core::calendar::parse_ics_window(
+            let mut report = thegn_core::calendar::ics::IcsReport::default();
+            thegn_core::calendar::ics::parse_ics_window_reported(
                 &body,
                 zone,
                 Some((from, to)),
                 &mut meter,
                 &mut events,
+                || Ok(()),
+                &mut report,
             )?;
+            if report.is_document_failure() {
+                return Err(CalendarError::Parse(
+                    "calendar document is incomplete or structurally malformed".into(),
+                ));
+            }
             drop(body);
             EventPage::from_meter(
                 meter,
