@@ -917,9 +917,8 @@ mod tests {
     #[test]
     fn checked_local_read_treats_dangling_symlink_as_unreadable() {
         let dir = tempfile::tempdir().unwrap();
-        let init = Command::new("git")
+        let init = util::git_cmd(dir.path())
             .args(["init", "--quiet"])
-            .current_dir(dir.path())
             .status()
             .unwrap();
         assert!(init.success());
