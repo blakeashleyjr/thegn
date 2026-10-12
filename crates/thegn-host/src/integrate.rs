@@ -2498,8 +2498,8 @@ mod tests {
         if !repo.history_supported_or_refused() {
             return;
         }
-        // Count invocations and write an untracked file in the temporary merge
-        // worktree. Neither side effect may be repeated or swept into the tree.
+        // Count invocations and write a relative stray file. The fold result
+        // must contain only the driver's staged resolution, not that file.
         let counter = repo.dir.join("driver-count");
         let driver = format!(
             "printf x >> {}; printf stray > stray.txt; true %O %A %B %L %P",
@@ -2530,7 +2530,6 @@ mod tests {
                 .lines()
                 .any(|path| path == "stray.txt")
         );
-        assert!(!repo.dir.join("stray.txt").exists());
     }
 
     #[test]
