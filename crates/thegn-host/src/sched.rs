@@ -10,7 +10,7 @@
 //!
 //! | Caller | Work class / marker | Completion | Refusal |
 //! | --- | --- | --- | --- |
-//! | `hydrate_tracker::spawn_issue_cache_refresh` | replaceable cache refresh; no latch | cache write + waker | skip; periodic trigger retries |
+//! | `hydrate_tracker::request_issue_refresh` (`spawn_issue_cache_refresh` fire-and-forget wrapper) | replaceable cache refresh; per-worktree coalescer (one admitted pass, newest queued request kept) | cache write + waker per drained pass | abandon key incl. coalesced request; return `Busy` (`r` reports it); periodic trigger retries |
 //! | `hydrate::spawn_panel_prefetch` | replaceable cache prefetch; run-loop path latch | result channel | return admission; caller clears path latch |
 //! | `hydrate::spawn_pr_cache_refresh` | replaceable cache refresh; generation fence only | cache + waker | skip; switch/ticker retries |
 //! | sibling PR branch cache refresh | replaceable cache refresh; generation fence only | cache | skip; next refresh retries |

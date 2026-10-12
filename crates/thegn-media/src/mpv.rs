@@ -71,30 +71,39 @@ fn decode_reply(msg: &Value) -> Result<Reply, MediaError> {
     }
 }
 
-/// True when a loop property value means repeat is on (`inf`, `force`, a
-/// positive count, `true`); `no` / `false` / `0` mean off.
-fn loop_on(v: &Value) -> bool {
+/// Parse a loop property value without treating unrecognized values as on/off.
+fn loop_on(v: &Value) -> Option<bool> {
     match v {
-        Value::Bool(b) => *b,
-        Value::String(s) => !matches!(s.as_str(), "" | "no" | "false" | "0"),
-        Value::Number(n) => n.as_i64().is_none_or(|n| n != 0),
-        _ => false,
+        Value::Bool(b) => Some(*b),
+        Value::String(s) => match s.to_ascii_lowercase().as_str() {
+            "" | "no" | "false" | "off" | "0" => Some(false),
+            "inf" | "force" | "yes" | "true" | "on" => Some(true),
+            number => number.parse::<i64>().ok().map(|n| n != 0),
+        },
+        Value::Number(n) => n.as_i64().map(|n| n != 0),
+        _ => None,
     }
 }
 
 /// Fold `loop-file` and `loop-playlist` into one mode (track repeat wins,
 /// as in mpv). `None` when neither property could be read.
 fn decode_loop(file: Option<&Value>, playlist: Option<&Value>) -> Option<LoopMode> {
-    if file.is_none() && playlist.is_none() {
-        return None;
+    if file.and_then(loop_on) == Some(true) {
+        return Some(LoopMode::Track);
     }
-    Some(if file.is_some_and(loop_on) {
-        LoopMode::Track
-    } else if playlist.is_some_and(loop_on) {
-        LoopMode::Playlist
-    } else {
-        LoopMode::None
-    })
+    match (file, playlist) {
+        (Some(file), Some(playlist))
+            if loop_on(file) == Some(false) && loop_on(playlist) == Some(true) =>
+        {
+            Some(LoopMode::Playlist)
+        }
+        (Some(file), Some(playlist))
+            if loop_on(file) == Some(false) && loop_on(playlist) == Some(false) =>
+        {
+            Some(LoopMode::None)
+        }
+        _ => None,
+    }
 }
 
 /// Opaque queue id: `<index>:<mpv entry id>` (or just `<index>` when mpv does
@@ -262,7 +271,7 @@ impl MediaBackend for MpvIpc {
             // there is somewhere to go (or playlist repeat wraps around).
             let pos = self.get("playlist-pos").await?.and_then(|v| v.as_i64());
             let count = self.get("playlist-count").await?.and_then(|v| v.as_i64());
-            let wraps = loop_playlist.as_ref().is_some_and(loop_on);
+            let wraps = loop_playlist.as_ref().and_then(loop_on) == Some(true);
             let (can_go_next, can_go_previous) = match (pos, count) {
                 (Some(p), Some(c)) if p >= 0 && c > 0 => (wraps || p + 1 < c, wraps || p > 0),
                 _ => (false, false),
@@ -542,7 +551,9 @@ mod tests {
         assert_eq!(decode_loop(Some(&inf), Some(&no)), Some(LoopMode::Track));
         assert_eq!(decode_loop(Some(&no), Some(&inf)), Some(LoopMode::Playlist));
         assert_eq!(decode_loop(Some(&inf), Some(&inf)), Some(LoopMode::Track));
-        assert_eq!(decode_loop(None, Some(&json!(3))), Some(LoopMode::Playlist));
+        assert_eq!(decode_loop(None, Some(&json!(3))), None);
+        assert_eq!(decode_loop(None, Some(&no)), None);
+        assert_eq!(decode_loop(Some(&json!("unknown")), Some(&inf)), None);
     }
 
     #[test]

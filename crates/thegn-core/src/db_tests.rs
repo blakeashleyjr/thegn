@@ -4133,10 +4133,24 @@ fn chunk_claim_fails_closed_for_unreadable_active_scope_and_leaves_no_row() {
 fn chunk_claim_fails_closed_when_scope_overlap_cannot_be_proven() {
     let db = Db::open_memory().unwrap();
     let sibling = db
-        .put_agent_dispatch(crate::issue::NewDispatch {
-            chunk_path: Some("sibling.md"),
-            ..crate::issue::NewDispatch::new("linear:A-1", "/wt/shared", "code")
-        })
+        .claim_dispatch_admitted(
+            crate::issue::NewDispatch {
+                chunk_path: Some("sibling.md"),
+                ..claim_new("linear:A-1", "/wt/shared", "code", "sibling.md")
+            },
+            3,
+            None,
+            Some(&crate::pipeline_chunk::PreparedChunkAdmission {
+                path: "sibling.md".into(),
+                scope: crate::pipeline_chunk::ChunkScope {
+                    files: vec!["src/../unknown.rs".into()],
+                    ..Default::default()
+                },
+                siblings: vec![],
+            }),
+            None,
+        )
+        .unwrap()
         .unwrap();
     let prepared = crate::pipeline_chunk::PreparedChunkAdmission {
         path: "incoming.md".into(),
@@ -4148,7 +4162,7 @@ fn chunk_claim_fails_closed_when_scope_overlap_cannot_be_proven() {
             row: sibling,
             path: "sibling.md".into(),
             scope: Some(Ok(crate::pipeline_chunk::ChunkScope {
-                files: vec!["src/../unknown.rs".into()],
+                files: vec!["docs/claimed-by-stale-file.rs".into()],
                 ..Default::default()
             })),
         }],
@@ -4183,6 +4197,14 @@ fn forced_chunk_overlap_requires_and_records_a_reason() {
         ..crate::issue::NewDispatch::new("linear:A-1", "/wt/shared", "code")
     })
     .unwrap();
+    let prepared = crate::pipeline_chunk::PreparedChunkAdmission {
+        path: "two.md".into(),
+        scope: crate::pipeline_chunk::ChunkScope {
+            files: vec!["src/shared.rs".into()],
+            ..Default::default()
+        },
+        siblings: vec![],
+    };
     let result = db
         .claim_dispatch_admitted(
             crate::issue::NewDispatch {
@@ -4191,7 +4213,7 @@ fn forced_chunk_overlap_requires_and_records_a_reason() {
             },
             3,
             None,
-            None,
+            Some(&prepared),
             Some("separate ownership reviewed"),
         )
         .unwrap()

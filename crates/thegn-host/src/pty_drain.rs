@@ -871,6 +871,17 @@ fn automatic_dispatch_exit_status(
     }
 }
 
+/// Apply the automatic plain-dispatch exit verdict only to the run and status
+/// observed by the exit handler. A supervisor verdict or relaunch wins the CAS.
+fn apply_auto_exit_status(
+    db: &thegn_core::db::Db,
+    run: &thegn_core::issue::DispatchRunRef,
+    observed: thegn_core::issue::AgentDispatchStatus,
+    status: thegn_core::issue::AgentDispatchStatus,
+) -> anyhow::Result<bool> {
+    db.compare_and_set_dispatch_status_run(run, observed, status, None)
+}
+
 /// A pane's PTY closed: drawer/pool/corner/pin routing, then the owning-tab
 /// respawn-or-remove logic with fast-crash detection and process-exit
 /// notification routing. Moved verbatim from the run.rs drain (`continue`s
@@ -1333,9 +1344,23 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                             let (_dec, _) =
                                 crate::notify::record(&db, &nstate, kind, &issue_id, &msg, &wt);
                         }
-                        if let Some(status) = auto_status {
-                            // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                            let _ = db.update_dispatch_status(dispatch_id, status);
+                        if let Some(status) = auto_status
+                            && let Some(row) = row.as_ref()
+                        {
+                            match apply_auto_exit_status(&db, &run, row.status, status) {
+                                Ok(true) => {}
+                                Ok(false) => tracing::debug!(
+                                    target: "thegn::dispatch",
+                                    row = dispatch_id,
+                                    "automatic exit status lost a concurrent state or run change"
+                                ),
+                                Err(error) => tracing::debug!(
+                                    target: "thegn::dispatch",
+                                    row = dispatch_id,
+                                    %error,
+                                    "automatic exit status write failed"
+                                ),
+                            }
                         }
                         // Tell the pipeline board its roster moved. A flag, not
                         // a channel send: this task holds no refresh sender, and
@@ -1649,6 +1674,92 @@ mod tests {
     use super::*;
     use crate::emulator::{AlacrittyEmulator, PaneEmulator};
     use crate::session::{GroupKind, Session, WorktreeGroup};
+    use thegn_core::db::Db;
+    use thegn_core::issue::{AgentDispatchStatus, DispatchRunRef, NewDispatch};
+    use thegn_core::store::NotificationStore;
+
+    fn running_dispatch(db: &Db) -> (i64, DispatchRunRef) {
+        let id = db
+            .put_agent_dispatch(NewDispatch::new("linear:THE-242", "/wt/242", "claude"))
+            .expect("insert dispatch");
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .expect("start dispatch");
+        let run = db
+            .dispatch_run_ref(id)
+            .expect("read run")
+            .expect("dispatch run exists");
+        (id, run)
+    }
+
+    #[test]
+    fn automatic_exit_status_preserves_a_concurrent_abandonment() {
+        let db = Db::open_memory().expect("memory db");
+        let (id, run) = running_dispatch(&db);
+        db.set_dispatch_status_checked(
+            id,
+            AgentDispatchStatus::Running,
+            AgentDispatchStatus::Abandoned,
+            None,
+        )
+        .expect("concurrent abandonment");
+
+        assert!(
+            !apply_auto_exit_status(
+                &db,
+                &run,
+                AgentDispatchStatus::Running,
+                AgentDispatchStatus::Failed,
+            )
+            .expect("fenced status update")
+        );
+        assert_eq!(
+            db.get_dispatch(id).expect("read dispatch").unwrap().status,
+            AgentDispatchStatus::Abandoned
+        );
+    }
+
+    #[test]
+    fn automatic_exit_status_does_not_write_through_a_relaunch() {
+        let db = Db::open_memory().expect("memory db");
+        let (id, old_run) = running_dispatch(&db);
+        assert!(
+            db.bind_dispatch_session(id, "new-session")
+                .expect("bind relaunched session")
+        );
+
+        assert!(
+            !apply_auto_exit_status(
+                &db,
+                &old_run,
+                AgentDispatchStatus::Running,
+                AgentDispatchStatus::Done,
+            )
+            .expect("fenced status update")
+        );
+        let row = db.get_dispatch(id).expect("read dispatch").unwrap();
+        assert_eq!(row.status, AgentDispatchStatus::Running);
+        assert_eq!(row.session_id.as_deref(), Some("new-session"));
+    }
+
+    #[test]
+    fn automatic_exit_status_updates_an_unchanged_run() {
+        let db = Db::open_memory().expect("memory db");
+        let (id, run) = running_dispatch(&db);
+
+        assert!(
+            apply_auto_exit_status(
+                &db,
+                &run,
+                AgentDispatchStatus::Running,
+                AgentDispatchStatus::Done,
+            )
+            .expect("fenced status update")
+        );
+        assert_eq!(
+            db.get_dispatch(id).expect("read dispatch").unwrap().status,
+            AgentDispatchStatus::Done
+        );
+    }
 
     fn term_row(id: i64, name: &str) -> thegn_core::models::TerminalRow {
         thegn_core::models::TerminalRow {

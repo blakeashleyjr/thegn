@@ -349,6 +349,35 @@ fn explicit_broader_policy_runs_without_database_or_authorship_prerequisites() {
 }
 
 #[test]
+fn broader_policy_bounds_hostile_review_payload_before_launch() {
+    let fixture = Fixture::new();
+    let mut request = request(&fixture);
+    request.snapshot = PrReviewSnapshot::default();
+    request.url = "legacy view URL".into();
+    request.feedback = "F".repeat(100_000);
+    request.title = "T".repeat(10_000);
+    let queue = PrQueueConfig {
+        own_prs_only: false,
+        ..queue()
+    };
+
+    execute(
+        &queue,
+        &request,
+        None,
+        || Ok(None),
+        |task| {
+            assert!(task.prompt.len() <= thegn_core::agent_task::MAX_RENDERED_PROMPT_BYTES);
+            assert!(task.prompt.contains("Rules:"));
+            assert!(task.prompt.contains("Do NOT merge, close, or approve"));
+            assert!(task.prompt.contains("task data omitted"));
+            true
+        },
+    )
+    .unwrap();
+}
+
+#[test]
 fn preparation_failure_never_reaches_launch_even_with_valid_authority() {
     let fixture = Fixture::new();
     let forge = fixture.forge(vec![fixture.proof.clone()]);

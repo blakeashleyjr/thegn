@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures::future::BoxFuture;
+use serde_json::Value;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use thegn_core::config::DaemonConfig;
@@ -27,6 +28,85 @@ fn now_ms() -> i64 {
 
 fn is_legacy_unix_addr(addr: &ControlAddr, legacy: &std::path::Path) -> bool {
     matches!(addr, ControlAddr::Unix(path) if path == legacy)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ScopeCheck {
+    Match,
+    Mismatch(String),
+    Unknown,
+    NotOurs,
+}
+
+fn classify_scope_reply(reply: Result<Value>, expected: &[String]) -> ScopeCheck {
+    let value = match reply {
+        Ok(value) => value,
+        Err(error) => {
+            if error
+                .downcast_ref::<thegn_svc::control::client::ControlRequestError>()
+                .is_some_and(|request| request.status() == 404)
+            {
+                return ScopeCheck::Unknown;
+            }
+            if error
+                .downcast_ref::<thegn_svc::control::client::ControlProtocolError>()
+                .is_some_and(|protocol| {
+                    matches!(
+                        protocol,
+                        thegn_svc::control::client::ControlProtocolError::EmptySuccessBody
+                            | thegn_svc::control::client::ControlProtocolError::MissingJsonContentType
+                    )
+                })
+            {
+                // A pre-route Unix daemon includes tonic's gRPC fallback,
+                // which answers unknown paths with HTTP 200 and an empty,
+                // non-JSON body rather than an HTTP 404.
+                return ScopeCheck::Unknown;
+            }
+            return ScopeCheck::NotOurs;
+        }
+    };
+    let Some(scope) = value.get("scope").and_then(Value::as_str) else {
+        return ScopeCheck::NotOurs;
+    };
+    if expected.iter().any(|candidate| candidate == scope) {
+        ScopeCheck::Match
+    } else {
+        ScopeCheck::Mismatch(scope.to_owned())
+    }
+}
+
+pub(super) async fn check_daemon_scope(client: &ControlClient, expected: &[String]) -> ScopeCheck {
+    let result = match tokio::time::timeout(
+        Duration::from_secs(5),
+        client.call_raw("GET", super::SCOPE_PATH, None),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => return ScopeCheck::NotOurs,
+    };
+    let check = classify_scope_reply(result, expected);
+    if check == ScopeCheck::Unknown {
+        tracing::debug!(target: "thegn::daemon", "daemon has no scope endpoint; accepting legacy daemon");
+    }
+    check
+}
+
+fn client_socket_label(client: &ControlClient) -> String {
+    match client.addr() {
+        ControlAddr::Unix(path) => path.display().to_string(),
+        ControlAddr::Tcp { addr, .. } => addr.clone(),
+        ControlAddr::HttpOrigin { origin, .. } => origin.clone(),
+    }
+}
+
+fn scope_mismatch_error(socket: &std::path::Path, actual: &str) -> anyhow::Error {
+    anyhow!(
+        "pane daemon socket {} belongs to a different state directory (reported scope {})",
+        socket.display(),
+        actual
+    )
 }
 
 /// Find a live daemon for this state dir WITHOUT spawning one: registry
@@ -62,8 +142,21 @@ pub(crate) async fn connect_daemon(dcfg: &DaemonConfig) -> Option<ControlClient>
     {
         let client = ControlClient::new(addr);
         if client.health().await.is_ok() {
-            start_error_state_bridge(&client);
-            return Some(client);
+            match check_daemon_scope(&client, &scopes).await {
+                ScopeCheck::Match | ScopeCheck::Unknown => {
+                    start_error_state_bridge(&client);
+                    return Some(client);
+                }
+                ScopeCheck::Mismatch(actual) => {
+                    tracing::warn!(
+                        target: "thegn::daemon",
+                        socket = %client_socket_label(&client),
+                        %actual,
+                        "refusing daemon from a different state directory"
+                    );
+                }
+                ScopeCheck::NotOurs => {}
+            }
         }
     }
 
@@ -73,8 +166,21 @@ pub(crate) async fn connect_daemon(dcfg: &DaemonConfig) -> Option<ControlClient>
     if !dcfg.socket.is_empty() || sock != legacy {
         let client = ControlClient::new(ControlAddr::Unix(sock));
         if client.health().await.is_ok() {
-            start_error_state_bridge(&client);
-            return Some(client);
+            match check_daemon_scope(&client, &scopes).await {
+                ScopeCheck::Match | ScopeCheck::Unknown => {
+                    start_error_state_bridge(&client);
+                    return Some(client);
+                }
+                ScopeCheck::Mismatch(actual) => {
+                    tracing::warn!(
+                        target: "thegn::daemon",
+                        socket = %client_socket_label(&client),
+                        %actual,
+                        "refusing daemon from a different state directory"
+                    );
+                }
+                ScopeCheck::NotOurs => {}
+            }
         }
     }
     None
@@ -84,6 +190,7 @@ pub(crate) async fn connect_daemon(dcfg: &DaemonConfig) -> Option<ControlClient>
 /// its socket. The registry row is a hint; a successful `/health` round-trip
 /// is the truth.
 pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> {
+    let scopes = super::scope_aliases();
     let legacy = thegn_core::config_daemon::legacy_socket_path(
         &thegn_core::util::xdg_state_home().join("thegn"),
     );
@@ -107,6 +214,15 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
     let sock = super::socket_path(dcfg);
     let client = ControlClient::new(ControlAddr::Unix(sock.clone()));
 
+    // `connect_daemon` skips foreign daemons so callers that only need to
+    // discover one can degrade gracefully. Startup must stop here instead of
+    // racing a spawn against a foreign process that already owns the socket.
+    if client.health().await.is_ok()
+        && let ScopeCheck::Mismatch(actual) = check_daemon_scope(&client, &scopes).await
+    {
+        return Err(scope_mismatch_error(&sock, &actual));
+    }
+
     // 3. Spawn detached (own process group, null stdio — the compositor must
     //    not adopt the daemon on its tty) and wait for the socket. The daemon
     //    binds the socket as its lock, so a spawn race resolves itself: the
@@ -123,8 +239,16 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         if client.health().await.is_ok() {
-            start_error_state_bridge(&client);
-            return Ok(client);
+            match check_daemon_scope(&client, &scopes).await {
+                ScopeCheck::Match | ScopeCheck::Unknown => {
+                    start_error_state_bridge(&client);
+                    return Ok(client);
+                }
+                ScopeCheck::Mismatch(actual) => {
+                    return Err(scope_mismatch_error(&sock, &actual));
+                }
+                ScopeCheck::NotOurs => {}
+            }
         }
     }
     Err(anyhow!(
@@ -608,6 +732,79 @@ impl ExecSource for LazyDaemonSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_reply_classification_is_fail_closed_and_accepts_legacy_daemons() {
+        let expected = vec!["v1-current".to_owned(), "/old/state/thegn".to_owned()];
+        assert_eq!(
+            classify_scope_reply(Ok(serde_json::json!({ "scope": "v1-current" })), &expected),
+            ScopeCheck::Match
+        );
+        assert_eq!(
+            classify_scope_reply(
+                Ok(serde_json::json!({ "scope": "/old/state/thegn" })),
+                &expected
+            ),
+            ScopeCheck::Match
+        );
+        assert_eq!(
+            classify_scope_reply(Ok(serde_json::json!({ "scope": "v1-other" })), &expected),
+            ScopeCheck::Mismatch("v1-other".to_owned())
+        );
+        assert_eq!(
+            classify_scope_reply(
+                Err(anyhow::Error::new(
+                    thegn_svc::control::client::ControlRequestError::new(404, ""),
+                )),
+                &expected
+            ),
+            ScopeCheck::Unknown
+        );
+        assert_eq!(
+            classify_scope_reply(
+                Err(anyhow::Error::new(
+                    thegn_svc::control::client::ControlRequestError::new(500, ""),
+                )),
+                &expected
+            ),
+            ScopeCheck::NotOurs
+        );
+        assert_eq!(
+            classify_scope_reply(
+                Err(anyhow::Error::new(
+                    thegn_svc::control::client::ControlProtocolError::EmptySuccessBody,
+                )),
+                &expected
+            ),
+            ScopeCheck::Unknown
+        );
+        assert_eq!(
+            classify_scope_reply(
+                Err(anyhow::Error::new(
+                    thegn_svc::control::client::ControlProtocolError::MissingJsonContentType,
+                )),
+                &expected
+            ),
+            ScopeCheck::Unknown
+        );
+        assert_eq!(
+            classify_scope_reply(
+                Err(anyhow::Error::new(
+                    thegn_svc::control::client::ControlProtocolError::InvalidJson,
+                )),
+                &expected
+            ),
+            ScopeCheck::NotOurs
+        );
+        assert_eq!(
+            classify_scope_reply(Ok(serde_json::json!({})), &expected),
+            ScopeCheck::NotOurs
+        );
+        assert_eq!(
+            classify_scope_reply(Ok(serde_json::json!({ "scope": 42 })), &expected),
+            ScopeCheck::NotOurs
+        );
+    }
 
     #[test]
     fn registry_discovery_does_not_adopt_legacy_unix_socket() {

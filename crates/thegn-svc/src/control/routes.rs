@@ -364,7 +364,7 @@ pub fn implemented_caps() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thegn_core::capability::{Surface, coverage_problems, lookup, scope_of};
+    use thegn_core::capability::{SURFACE_GAPS, Surface, coverage_problems, lookup, scope_of};
 
     #[test]
     fn control_api_doc_routes_match_registry() {
@@ -387,7 +387,7 @@ mod tests {
             .filter(|line| line.trim_start().starts_with('|'))
         {
             let cells: Vec<_> = line.split('|').map(str::trim).collect();
-            if cells.len() < 6 || !cells[1].starts_with('`') {
+            if cells.len() < 8 || !cells[1].starts_with('`') {
                 continue;
             }
             let route = cells[1].trim_matches('`');
@@ -403,7 +403,7 @@ mod tests {
                 "duplicate route row: {route} ({cap})"
             );
 
-            if cells[4..].join("|").contains("**reserved**") {
+            if cells[6..].join("|").contains("**reserved**") {
                 assert!(
                     ROUTES.iter().all(|registered| registered.path != path),
                     "reserved route {path} is present in ROUTES"
@@ -419,6 +419,43 @@ mod tests {
                     scope_of(capability).as_str(),
                     "wrong scope for {method} {path} ({cap})"
                 );
+                let stability = if capability.stub.is_some() {
+                    "stub"
+                } else if capability.deprecated.is_some() {
+                    "deprecated"
+                } else {
+                    "stable"
+                };
+                assert_eq!(
+                    cells[4].trim_matches('`'),
+                    stability,
+                    "wrong stability for {method} {path} ({cap})"
+                );
+                if let Some(replacement) = capability.deprecated {
+                    assert!(
+                        cells[6..].join("|").contains(&format!("use {replacement}")),
+                        "deprecated capability {cap} must name its replacement in Notes"
+                    );
+                }
+                let surfaces = capability
+                    .surfaces
+                    .names()
+                    .into_iter()
+                    .filter(|surface| {
+                        !SURFACE_GAPS.iter().any(|(gap_cap, gap_surface, _)| {
+                            *gap_cap == cap && gap_surface.as_str() == *surface
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert_eq!(
+                    cells[5],
+                    format!("`{surfaces}`"),
+                    "wrong surfaces for {method} {path} ({cap})"
+                );
+            } else {
+                assert_eq!(cells[4], "—", "wrong stability for {method} {path}");
+                assert_eq!(cells[5], "—", "wrong surfaces for {method} {path}");
             }
             assert!(
                 documented.insert(row),

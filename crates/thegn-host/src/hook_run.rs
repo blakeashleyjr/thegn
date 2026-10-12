@@ -81,7 +81,7 @@ fn run_with_log_root(
         Err(error) => {
             let stderr = format!("failed to start hook: {error}");
             let log_error = allocation_error.or_else(|| {
-                append_log(&log_path, context, HookRunState::Failed, "", &stderr)
+                write_log(&log_path, context, HookRunState::Failed, "", &stderr)
                     .err()
                     .map(|error| error.to_string())
             });
@@ -146,7 +146,7 @@ fn run_with_log_root(
         HookRunState::Failed
     };
     let log_error = allocation_error.or_else(|| {
-        append_log(&log_path, context, state, &stdout, &stderr)
+        write_log(&log_path, context, state, &stdout, &stderr)
             .err()
             .map(|error| error.to_string())
     });
@@ -296,6 +296,7 @@ fn join_pipe(pipe: Option<PipeReader>, deadline: Instant) -> String {
 
 const HOOK_LOG_KEEP_NEWEST: usize = 20;
 const HOOK_LOG_MAX_AGE_SECS: u64 = 14 * 86_400;
+const HOOK_LOG_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const HOOK_LOG_PRUNE_INTERVAL_SECS: i64 = 60 * 60;
 const HOOK_LOG_ALLOCATION_ATTEMPTS: usize = 1000;
 static LAST_LOG_PRUNE: OnceLock<Mutex<std::collections::HashMap<PathBuf, i64>>> = OnceLock::new();
@@ -329,6 +330,23 @@ pub(crate) fn prune_logs(root: &Path, now_secs: i64) {
     last_run.insert(root.to_path_buf(), now_secs);
     drop(last_run);
 
+    prune_logs_with(
+        root,
+        now_secs,
+        HOOK_LOG_KEEP_NEWEST,
+        HOOK_LOG_MAX_AGE_SECS,
+        HOOK_LOG_MAX_TOTAL_BYTES,
+    );
+}
+
+fn prune_logs_with(
+    root: &Path,
+    now_secs: i64,
+    keep_newest: usize,
+    max_age_secs: u64,
+    max_total_bytes: u64,
+) {
+    let mut emptied_candidates = std::collections::HashSet::new();
     let Ok(root_meta) = std::fs::symlink_metadata(root) else {
         return;
     };
@@ -375,15 +393,135 @@ pub(crate) fn prune_logs(root: &Path, now_secs: i64) {
         }
         let remove = thegn_core::disk_reclaim::plan_hook_log_prune(
             &logs,
-            HOOK_LOG_KEEP_NEWEST,
-            HOOK_LOG_MAX_AGE_SECS,
+            keep_newest,
+            max_age_secs,
             now_secs.max(0) as u64,
         );
         for name in remove {
-            // best-effort: hook logs are diagnostics; inability to prune one must not stop the disk scan.
-            let _ = std::fs::remove_file(path.join(name));
+            let file_path = path.join(name);
+            match std::fs::remove_file(&file_path) {
+                Ok(()) => {
+                    emptied_candidates.insert(path.clone());
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "could not remove expired hook log");
+                }
+            }
         }
     }
+
+    let retained = collect_direct_logs(root);
+    for path in plan_total_byte_prune(&retained, max_total_bytes) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    emptied_candidates.insert(parent.to_path_buf());
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, path = %path.display(), "could not remove hook log over total byte cap");
+            }
+        }
+    }
+
+    for path in emptied_candidates {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            continue;
+        }
+        let is_empty = match std::fs::read_dir(&path) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(error) => {
+                tracing::debug!(%error, path = %path.display(), "could not inspect hook log directory");
+                continue;
+            }
+        };
+        if is_empty && let Err(error) = std::fs::remove_dir(&path) {
+            tracing::debug!(%error, path = %path.display(), "could not remove empty hook log directory");
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RetainedHookLog {
+    path: PathBuf,
+    slug: std::ffi::OsString,
+    name: std::ffi::OsString,
+    mtime_secs: u64,
+    bytes: u64,
+}
+
+fn collect_direct_logs(root: &Path) -> Vec<RetainedHookLog> {
+    let mut logs = Vec::new();
+    let Ok(slugs) = std::fs::read_dir(root) else {
+        return logs;
+    };
+    for slug_entry in slugs.flatten() {
+        let slug_path = slug_entry.path();
+        let Ok(slug_meta) = std::fs::symlink_metadata(&slug_path) else {
+            continue;
+        };
+        if !slug_meta.is_dir() || slug_meta.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&slug_path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "log") {
+                continue;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() || meta.file_type().is_symlink() {
+                continue;
+            }
+            let (Some(slug), Some(name)) = (slug_path.file_name(), path.file_name()) else {
+                continue;
+            };
+            let slug = slug.to_owned();
+            let name = name.to_owned();
+            let mtime_secs = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |age| age.as_secs());
+            logs.push(RetainedHookLog {
+                path,
+                slug,
+                name,
+                mtime_secs,
+                bytes: meta.len(),
+            });
+        }
+    }
+    logs
+}
+
+fn plan_total_byte_prune(logs: &[RetainedHookLog], max_total_bytes: u64) -> Vec<PathBuf> {
+    let mut oldest_first = logs.to_vec();
+    oldest_first.sort_by(|a, b| {
+        a.mtime_secs
+            .cmp(&b.mtime_secs)
+            .then(a.slug.cmp(&b.slug))
+            .then(a.name.cmp(&b.name))
+    });
+    let mut total_bytes = logs.iter().fold(0u128, |total, log| {
+        total.saturating_add(u128::from(log.bytes))
+    });
+    let mut remove = Vec::new();
+    for log in oldest_first {
+        if total_bytes <= u128::from(max_total_bytes) {
+            break;
+        }
+        total_bytes = total_bytes.saturating_sub(u128::from(log.bytes));
+        remove.push(log.path);
+    }
+    remove
 }
 
 fn log_path(
@@ -447,7 +585,7 @@ fn log_path(
             .open(&path)
         {
             Ok(file) => {
-                // Keep this reservation even if append_log later fails: reusing a path
+                // Keep this reservation even if finalization later fails: reusing a path
                 // already returned in a HookRunResult could identify a different run.
                 drop(file);
                 indices.insert(key, index);
@@ -510,7 +648,7 @@ fn failure_tail(output: &str) -> String {
         .join("\n")
 }
 
-fn append_log(
+fn write_log(
     path: &Path,
     context: &HookContext,
     state: HookRunState,
@@ -527,10 +665,7 @@ fn append_log(
         redact_output(stdout),
         redact_output(stderr),
     );
-    use std::io::Write;
-    let mut file = crate::platform::append_private_file(path)?;
-    file.write_all(line.as_bytes())?;
-    Ok(())
+    thegn_core::fsperm::write_owner_only_atomic(path, line.as_bytes())
 }
 
 fn redact_output(output: &str) -> String {
@@ -729,6 +864,95 @@ mod tests {
     }
 
     #[test]
+    fn prune_logs_applies_total_byte_cap_oldest_first_across_slug_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = dir.path().join("alpha");
+        let beta = dir.path().join("beta");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+        let logs = [
+            (alpha.join("a.log"), 100),
+            (beta.join("b.log"), 101),
+            (alpha.join("c.log"), 102),
+            (beta.join("d.log"), 103),
+            (alpha.join("e.log"), 104),
+            (beta.join("f.log"), 105),
+        ];
+        for (path, modified_secs) in &logs {
+            std::fs::write(path, b"0123456789").unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(*modified_secs))
+                .unwrap();
+        }
+
+        prune_logs_with(dir.path(), 200, 20, 14 * 86_400, 35);
+
+        for (path, modified_secs) in &logs {
+            assert_eq!(
+                path.exists(),
+                *modified_secs >= 103,
+                "unexpected retained status for {}",
+                path.display()
+            );
+        }
+        let total_bytes: u64 = collect_direct_logs(dir.path())
+            .iter()
+            .map(|log| log.bytes)
+            .sum();
+        assert!(total_bytes <= 35);
+    }
+
+    #[test]
+    fn prune_logs_removes_only_slug_directories_emptied_by_this_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let emptied = dir.path().join("emptied");
+        let already_empty = dir.path().join("already-empty");
+        std::fs::create_dir_all(&emptied).unwrap();
+        std::fs::create_dir_all(&already_empty).unwrap();
+        std::fs::write(emptied.join("old.log"), b"log").unwrap();
+
+        prune_logs_with(dir.path(), 200, 20, 14 * 86_400, 0);
+
+        assert!(!emptied.exists());
+        assert!(already_empty.is_dir());
+    }
+
+    #[test]
+    fn total_byte_prune_breaks_mtime_ties_by_slug_then_name() {
+        let logs = vec![
+            RetainedHookLog {
+                path: PathBuf::from("beta/z.log"),
+                slug: "beta".into(),
+                name: "z.log".into(),
+                mtime_secs: 10,
+                bytes: 10,
+            },
+            RetainedHookLog {
+                path: PathBuf::from("alpha/b.log"),
+                slug: "alpha".into(),
+                name: "b.log".into(),
+                mtime_secs: 10,
+                bytes: 10,
+            },
+            RetainedHookLog {
+                path: PathBuf::from("alpha/a.log"),
+                slug: "alpha".into(),
+                name: "a.log".into(),
+                mtime_secs: 10,
+                bytes: 10,
+            },
+        ];
+
+        assert_eq!(
+            plan_total_byte_prune(&logs, 20),
+            vec![PathBuf::from("alpha/a.log")]
+        );
+    }
+
+    #[test]
     fn hook_base_env_excludes_inherited_context_and_credentials() {
         let env = hook_base_env([
             ("PATH".into(), "/bin".into()),
@@ -819,7 +1043,7 @@ mod tests {
     fn hook_log_redacts_command_output_and_is_private() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hooks").join("post-create.log");
-        append_log(
+        write_log(
             &path,
             &context(),
             HookRunState::Failed,
@@ -838,7 +1062,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("not-a-file");
         std::fs::create_dir(&path).unwrap();
-        let error = append_log(&path, &context(), HookRunState::Failed, "output", "error")
+        let error = write_log(&path, &context(), HookRunState::Failed, "output", "error")
             .expect_err("a directory cannot be opened as an append log");
         assert!(!error.to_string().is_empty());
 
@@ -854,5 +1078,36 @@ mod tests {
         assert!(!result.succeeded());
         assert!(result.summary().contains("hook failed"));
         assert!(result.summary().contains("hook log unavailable"));
+    }
+
+    #[test]
+    fn hook_log_atomic_write_replaces_stale_reserved_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = log_path(dir.path(), "/repo/worktree", HookEvent::PostCreate).unwrap();
+        std::fs::write(&path, b"stale").unwrap();
+
+        write_log(&path, &context(), HookRunState::Succeeded, "fresh", "").unwrap();
+
+        let contents = std::fs::read_to_string(path).unwrap();
+        assert!(!contents.contains("stale"));
+        assert!(contents.contains("stdout:\nfresh"));
+    }
+
+    #[test]
+    fn hook_log_atomic_write_does_not_write_through_reserved_hard_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = log_path(dir.path(), "/repo/worktree", HookEvent::PostCreate).unwrap();
+        let other = path.with_file_name("other.log");
+        std::fs::hard_link(&path, &other).unwrap();
+
+        write_log(&path, &context(), HookRunState::Succeeded, "fresh", "").unwrap();
+
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("stdout:\nfresh")
+        );
+        assert!(std::fs::read(&other).unwrap().is_empty());
+        crate::platform::test_assert_owner_only_permissions(&path, path.parent().unwrap());
     }
 }

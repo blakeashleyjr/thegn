@@ -154,7 +154,27 @@ pub(super) fn content(ctx: &SectionCtx<'_>) -> Vec<PanelRow> {
                 "queue unavailable",
             )])));
         } else {
+            let cursor = if ctx.ui.open == Section::Media
+                && (offset..offset + media.queue.len()).contains(&ctx.ui.cursor)
+            {
+                ctx.ui.cursor.saturating_sub(offset)
+            } else {
+                0
+            };
+            let radius = ctx.rows.max(8).saturating_mul(2).saturating_add(2);
+            let lo = cursor.saturating_sub(radius);
+            let hi = cursor
+                .saturating_add(radius)
+                .saturating_add(1)
+                .min(media.queue.len());
             for (i, item) in media.queue.iter().enumerate() {
+                if i < lo || i >= hi {
+                    rows.push(
+                        PanelRow::plain(Line::Segs(Vec::new()))
+                            .with_hit(PanelHit::Row(Section::Media, offset + i)),
+                    );
+                    continue;
+                }
                 let current = if item.is_current {
                     crate::caps::active_glyphs().caret_open
                 } else {
@@ -208,6 +228,62 @@ mod tests {
             shuffle: Some(false),
             loop_mode: Some(thegn_core::media::LoopMode::None),
             ..Default::default()
+        }
+    }
+
+    fn collection_fixture(queue_len: usize) -> (crate::chrome::FrameModel, crate::panel::PanelUi) {
+        let mut model = crate::chrome::FrameModel::default();
+        model.panel.media = Some(state());
+        let mut ui = crate::panel::PanelUi {
+            tab: crate::panel::PanelTab::System,
+            width: crate::layout::PanelWidth::Full,
+            ..Default::default()
+        };
+        ui.media.sync_snapshot(
+            model.panel.media.as_ref(),
+            Some(MediaCaps {
+                queue: true,
+                ..MediaCaps::default()
+            }),
+            0,
+        );
+        let source_request = ui
+            .media
+            .take_sources_request(model.panel.media.as_ref())
+            .unwrap();
+        ui.media.set_sources(
+            source_request,
+            model.panel.media.as_ref(),
+            vec!["player".into()],
+        );
+        ui.media.begin_request(model.panel.media.as_ref());
+        let queue_request = ui
+            .media
+            .take_queue_request(model.panel.media.as_ref())
+            .unwrap();
+        ui.media.set_queue(
+            queue_request,
+            model.panel.media.as_ref(),
+            Ok((0..queue_len)
+                .map(|index| QueueItem {
+                    id: index.to_string(),
+                    title: format!("track-{index}"),
+                    ..Default::default()
+                })
+                .collect()),
+        );
+        (model, ui)
+    }
+
+    fn line_text(line: &Line) -> String {
+        match line {
+            Line::Segs(segs) | Line::Split { l: segs, .. } => {
+                segs.iter().map(|part| part.text.as_str()).collect()
+            }
+            Line::SplitMinLeft { l, r, .. } => {
+                l.iter().chain(r).map(|part| part.text.as_str()).collect()
+            }
+            Line::Blank | Line::Fill { .. } => String::new(),
         }
     }
 
@@ -392,6 +468,105 @@ mod tests {
             !matches!(hit, PanelHit::Row(Section::Media, index)
                 if index >= ui.media.sources.len() + thegn_core::media::MAX_QUEUE_ITEMS)
         }));
+    }
+
+    #[test]
+    fn queue_rows_keep_navigation_hits_but_only_render_near_cursor() {
+        let (model, mut ui) = collection_fixture(thegn_core::media::MAX_QUEUE_ITEMS);
+        ui.open = Section::Media;
+        let sources = ui.media.sources.len();
+        let radius = 30_usize * 2 + 2;
+
+        ui.cursor = 0;
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 80,
+            rows: 30,
+        };
+        let rows = content(&ctx);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row.hit, Some(PanelHit::Row(Section::Media, _))))
+                .count(),
+            sources + thegn_core::media::MAX_QUEUE_ITEMS
+        );
+        assert!(
+            rows.iter()
+                .filter(|row| matches!(row.hit, Some(PanelHit::Row(Section::Media, index)) if index >= sources))
+                .filter(|row| !line_text(&row.line).is_empty())
+                .count()
+                <= 2 * radius + 1
+        );
+
+        ui.cursor = sources + 400;
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 80,
+            rows: 30,
+        };
+        let rows = content(&ctx);
+        let cursor_row = rows
+            .iter()
+            .find(|row| row.hit == Some(PanelHit::Row(Section::Media, ui.cursor)))
+            .unwrap();
+        assert!(line_text(&cursor_row.line).contains("track-400"));
+    }
+
+    #[test]
+    fn built_media_panel_never_displays_placeholder_hits() {
+        let (model, mut ui) = collection_fixture(450);
+        ui.open = Section::Media;
+        ui.cursor = ui.media.sources.len() + 400;
+        for width in [
+            crate::layout::PanelWidth::Full,
+            crate::layout::PanelWidth::Half,
+        ] {
+            ui.width = width;
+            let frame = crate::panel::frame::build_panel(&model, &ui, 60, 40, true);
+            let hit_rows = frame
+                .rows
+                .iter()
+                .filter(|row| matches!(row.hit, Some(PanelHit::Row(Section::Media, _))))
+                .collect::<Vec<_>>();
+            assert!(!hit_rows.is_empty());
+            assert!(
+                hit_rows
+                    .iter()
+                    .all(|row| !line_text(&row.line).trim().is_empty())
+            );
+            if width == crate::layout::PanelWidth::Full {
+                assert!(hit_rows.iter().any(|row| {
+                    row.hit == Some(PanelHit::Row(Section::Media, ui.cursor))
+                        && line_text(&row.line).contains("track-400")
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn stale_queue_cursor_renders_head_rows_in_full_panel() {
+        let (model, mut ui) = collection_fixture(thegn_core::media::MAX_QUEUE_ITEMS);
+        ui.open = Section::Media;
+        let sources = ui.media.sources.len();
+        ui.cursor = sources + thegn_core::media::MAX_QUEUE_ITEMS + 50;
+
+        let frame = crate::panel::frame::build_panel(&model, &ui, 60, 40, true);
+        let queue_rows = frame
+            .rows
+            .iter()
+            .filter(|row| {
+                matches!(row.hit, Some(PanelHit::Row(Section::Media, index)) if index >= sources)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!queue_rows.is_empty());
+        assert!(
+            queue_rows
+                .iter()
+                .all(|row| !line_text(&row.line).trim().is_empty())
+        );
     }
 
     #[test]

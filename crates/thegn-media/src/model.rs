@@ -246,12 +246,13 @@ pub enum LoopMode {
 }
 
 impl LoopMode {
-    /// Parse an MPRIS `LoopStatus` property value.
-    pub fn from_mpris(s: &str) -> LoopMode {
+    /// Parse a known MPRIS `LoopStatus` property value.
+    pub fn parse_mpris(s: &str) -> Option<LoopMode> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "track" => LoopMode::Track,
-            "playlist" => LoopMode::Playlist,
-            _ => LoopMode::None,
+            "none" => Some(LoopMode::None),
+            "track" => Some(LoopMode::Track),
+            "playlist" => Some(LoopMode::Playlist),
+            _ => None,
         }
     }
 
@@ -414,10 +415,11 @@ mod tests {
 
     #[test]
     fn loop_mode_roundtrip_and_cycle() {
-        assert_eq!(LoopMode::from_mpris("Track"), LoopMode::Track);
-        assert_eq!(LoopMode::from_mpris("Playlist"), LoopMode::Playlist);
-        assert_eq!(LoopMode::from_mpris("None"), LoopMode::None);
-        assert_eq!(LoopMode::from_mpris("none"), LoopMode::None);
+        assert_eq!(LoopMode::parse_mpris("Track"), Some(LoopMode::Track));
+        assert_eq!(LoopMode::parse_mpris("Playlist"), Some(LoopMode::Playlist));
+        assert_eq!(LoopMode::parse_mpris("None"), Some(LoopMode::None));
+        assert_eq!(LoopMode::parse_mpris(" none "), Some(LoopMode::None));
+        assert_eq!(LoopMode::parse_mpris("garbage"), None);
         assert_eq!(LoopMode::Track.as_mpris(), "Track");
         // None → Playlist → Track → None
         assert_eq!(LoopMode::None.cycle(), LoopMode::Playlist);

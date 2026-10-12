@@ -106,11 +106,29 @@ impl Field {
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub fields: Vec<Field>,
+    /// Whether the returned samples cover the requested time window.
+    pub coverage: Coverage,
+}
+
+/// Retention coverage for a query window. `retained_from` is Unix time in
+/// seconds and identifies the earliest retained sample when known.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Coverage {
+    Complete,
+    Partial { retained_from: Option<f64> },
 }
 
 impl Frame {
     pub fn new(fields: Vec<Field>) -> Self {
-        Self { fields }
+        Self {
+            fields,
+            coverage: Coverage::Complete,
+        }
+    }
+
+    pub fn with_coverage(mut self, coverage: Coverage) -> Self {
+        self.coverage = coverage;
+        self
     }
 }
 
