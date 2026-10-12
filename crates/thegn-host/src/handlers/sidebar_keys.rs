@@ -139,6 +139,7 @@ fn worktree_mq_entries(
                 MqStatus::Deferred
                     | MqStatus::GateFailed
                     | MqStatus::GateError
+                    | MqStatus::AgentBlocked
                     | MqStatus::NeedsHuman
             ) {
                 v.push(("mq-retry", "Retry"));
@@ -1688,6 +1689,8 @@ mod tests {
         for s in [
             MqStatus::Deferred,
             MqStatus::GateFailed,
+            MqStatus::GateError,
+            MqStatus::AgentBlocked,
             MqStatus::NeedsHuman,
         ] {
             assert_eq!(ids(Some(s)), vec!["mq-remove", "mq-retry"], "{s:?}");

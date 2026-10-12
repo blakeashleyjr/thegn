@@ -171,7 +171,16 @@ fn drive_blocking(cfg: &Config, any_path: &std::path::Path, send: impl Fn(DriveM
             }
             Ok(None) => {}
         }
-        let items: Vec<QueueItem> = merge_driver::rows_for_repo(&db, &root)
+        let rows = match merge_driver::rows_for_repo(&db, &root) {
+            Ok(rows) => rows,
+            Err(error) => {
+                send(DriveMsg::Failed(format!(
+                    "merge queue unavailable: {error}"
+                )));
+                return;
+            }
+        };
+        let items: Vec<QueueItem> = rows
             .into_iter()
             .filter(|r| r.status != "landed" && r.status != "ready")
             .map(|r| QueueItem {
@@ -411,6 +420,20 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                     ctx.toasts
                         .info_ttl(w.clone(), now, std::time::Duration::from_secs(8));
                 }
+                for error in &out.persistence_errors {
+                    ctx.toasts.info_ttl(
+                        format!("Merge queue state write failed: {error}"),
+                        now,
+                        std::time::Duration::from_secs(10),
+                    );
+                }
+                for failure in &out.bookkeeping_failed {
+                    ctx.toasts.info_ttl(
+                        format!("Ref advanced, bookkeeping failed for {}: {} → {}; rerun merge drain to reconcile", failure.target, failure.old_oid, failure.new_oid),
+                        now,
+                        std::time::Duration::from_secs(10),
+                    );
+                }
                 let (msg, success) = drive_summary(&out);
                 if success {
                     ctx.toasts.success(msg, now);
@@ -489,23 +512,36 @@ fn drive_summary(out: &DriveOutcome) -> (String, bool) {
     let total = out.landed.len()
         + out.ready.len()
         + out.deferred.len()
+        + out.agent_blocked.len()
         + out.needs_human.len()
         + out.gate_error.len();
-    let message = if total == 0 {
+    let message = if !out.persistence_errors.is_empty() || !out.bookkeeping_failed.is_empty() {
+        format!(
+            "Merge queue partially completed: {} persistence errors, {} landed refs need bookkeeping recovery",
+            out.persistence_errors.len(),
+            out.bookkeeping_failed.len()
+        )
+    } else if total == 0 {
         "Merge queue: nothing to drain".to_owned()
     } else {
         format!(
-            "Drained: {} landed, {} ready, {} deferred, {} need a human, {} gate errors",
+            "Drained: {} landed, {} ready, {} deferred, {} agent-blocked, {} need a human, {} gate errors",
             out.landed.len(),
             out.ready.len(),
             out.deferred.len(),
+            out.agent_blocked.len(),
             out.needs_human.len(),
             out.gate_error.len(),
         )
     };
     (
         message,
-        out.deferred.is_empty() && out.needs_human.is_empty() && out.gate_error.is_empty(),
+        out.deferred.is_empty()
+            && out.agent_blocked.is_empty()
+            && out.needs_human.is_empty()
+            && out.gate_error.is_empty()
+            && out.persistence_errors.is_empty()
+            && out.bookkeeping_failed.is_empty(),
     )
 }
 
@@ -1069,7 +1105,9 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
         }
     };
     match outcome {
-        AttemptOutcome::Landed { commit, resyncs } => {
+        AttemptOutcome::Landed {
+            commit, resyncs, ..
+        } => {
             // In-app, a checkout on the target is fast-forwarded by the ref
             // watcher (`git_watch::spawn_main_checkout_heal`); anything the fold
             // could not sync is real uncommitted work, so log it rather than
