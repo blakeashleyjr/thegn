@@ -12,7 +12,7 @@
 //! `rebase-merge/git-rebase-todo` can be re-read and rewritten — safe
 //! because the host serializes mutations per worktree.
 
-use super::{GitBackend, gpg_args, run_w};
+use super::{GitBackend, gpg_args, run_status, run_w};
 use anyhow::{Context, Result, anyhow, bail};
 use thegn_core::git_operand as op;
 use thegn_core::rebase_todo::{
@@ -44,6 +44,16 @@ fn read_rebase_marker(loc: &GitLoc, rel: &str) -> Result<Option<Vec<u8>>> {
         };
     }
     Ok(loc.read_git_path(rel))
+}
+
+/// Run a read-only git probe without taking the mutation lock or advancing the
+/// write epoch. A non-zero exit is an error for these observations.
+fn run_read(loc: &GitLoc, args: &[&str]) -> Result<String> {
+    let (status, stdout) = run_status(loc, args)?;
+    if status != 0 {
+        bail!("git {} failed with exit status {status}", args.join(" "));
+    }
+    Ok(stdout)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -108,14 +118,24 @@ fn rebase_with_todo(
         } else {
             format!("{base}..HEAD")
         };
-        let revs = run_w(loc, &[], &["rev-list", "--reverse", &range])
+        let revs = run_read(loc, &["rev-list", "--reverse", &range])
             .context("verify rebase range before starting")?;
-        let expected: Vec<&str> = revs.split_whitespace().collect();
-        // Keep explicit `drop` entries in this equality check: they are the
-        // user's deliberate decision for an in-range commit, not an omission.
-        let planned: Vec<&str> = todo.iter().map(|entry| entry.sha.as_str()).collect();
-        let expected_set: std::collections::HashSet<_> = expected.iter().copied().collect();
-        let planned_set: std::collections::HashSet<_> = planned.iter().copied().collect();
+        let expected: Vec<String> = revs.split_whitespace().map(str::to_owned).collect();
+        // Panel-built todos carry abbreviated ids. Compare canonical commit ids
+        // and ignore structural/no-op actions that have no commit identity.
+        let mut planned = Vec::new();
+        for entry in todo.iter().filter(|entry| entry.action.is_commit()) {
+            let expression = format!("{}^{{commit}}", entry.sha);
+            planned.push(
+                run_read(loc, &["rev-parse", "--verify", &expression])?
+                    .trim()
+                    .to_owned(),
+            );
+        }
+        let expected_set: std::collections::HashSet<_> =
+            expected.iter().map(String::as_str).collect();
+        let planned_set: std::collections::HashSet<_> =
+            planned.iter().map(String::as_str).collect();
         if expected_set != planned_set
             || expected_set.len() != expected.len()
             || planned_set.len() != planned.len()
@@ -128,8 +148,6 @@ fn rebase_with_todo(
         std::process::id(),
         TODO_SCRATCH_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
-    loc.write_git_path(&scratch_name, serialize_todo(todo).as_bytes())
-        .context("write prepared rebase todo")?;
     let mut cleanup_path = None;
     let result = (|| {
         let scratch = loc
@@ -140,7 +158,21 @@ fn rebase_with_todo(
         } else {
             format!("{}/{scratch}", loc.path())
         };
-        cleanup_path = Some(scratch.clone());
+        match loc {
+            GitLoc::Local(_) => {
+                thegn_core::fsperm::write_owner_only_new(
+                    std::path::Path::new(&scratch),
+                    serialize_todo(todo).as_bytes(),
+                )
+                .context("create owner-only rebase todo scratch file")?;
+                cleanup_path = Some(scratch.clone());
+            }
+            _ => {
+                cleanup_path = Some(scratch.clone());
+                loc.write_git_path(&scratch_name, serialize_todo(todo).as_bytes())
+                    .context("write prepared rebase todo")?;
+            }
+        }
         let editor = format!("cp {}", sh_quote(&scratch));
         let mut args = gpg_args(opts.override_gpg).to_vec();
         args.extend([
@@ -157,6 +189,13 @@ fn rebase_with_todo(
         classify(loc, run_w(loc, &envs, &args))
     })();
     match cleanup_path {
+        Some(path) if matches!(loc, GitLoc::Local(_)) => match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(target: "thegn::git", %error, "could not remove prepared rebase todo scratch file")
+            }
+        },
         Some(path) => match loc
             .sh_command(&format!("rm -f -- {}", sh_quote(&path)))
             .status()
@@ -191,7 +230,7 @@ fn classify(loc: &GitLoc, res: Result<String>) -> Result<RebaseOutcome> {
             if !rebasing {
                 return Err(e);
             }
-            let conflicts = run_w(loc, &[], &["diff", "--name-only", "--diff-filter=U"])
+            let conflicts = run_read(loc, &["diff", "--name-only", "--diff-filter=U"])
                 .context("probe unmerged paths while classifying rebase")?;
             if !conflicts.trim().is_empty() {
                 Ok(RebaseOutcome::Conflict)
@@ -206,9 +245,9 @@ fn classify(loc: &GitLoc, res: Result<String>) -> Result<RebaseOutcome> {
 /// or `--root` for a root commit.
 fn base_for(loc: &GitLoc, sha: &str) -> Result<String> {
     let commit_expr = format!("{sha}^{{commit}}");
-    let commit = run_w(loc, &[], &["rev-parse", "--verify", "-q", &commit_expr])
+    let commit = run_read(loc, &["rev-parse", "--verify", "-q", &commit_expr])
         .with_context(|| format!("verify rebase target {sha}"))?;
-    let parents = run_w(loc, &[], &["rev-list", "--parents", "-n", "1", &commit])
+    let parents = run_read(loc, &["rev-list", "--parents", "-n", "1", &commit])
         .with_context(|| format!("read parents of rebase target {sha}"))?;
     let mut ids = parents.split_whitespace();
     let _verified_commit = ids
@@ -217,7 +256,7 @@ fn base_for(loc: &GitLoc, sha: &str) -> Result<String> {
     match (ids.next(), ids.next()) {
         (Some(parent), None) => Ok(parent.to_owned()),
         (None, None) => Ok("--root".to_string()),
-        _ => bail!("git returned an invalid parent list for rebase target {sha}"),
+        _ => bail!("merge commits cannot be rebased here"),
     }
 }
 
@@ -228,18 +267,14 @@ fn todo_for(loc: &GitLoc, base: &str) -> Result<Vec<TodoEntry>> {
     } else {
         format!("{base}..HEAD")
     };
-    let out = run_w(
-        loc,
-        &[],
-        &["log", "--reverse", "--format=%x1f%H%x1f%s", &range],
-    )?;
+    let out = run_read(loc, &["log", "--reverse", "--format=%x1f%H%x1f%s", &range])?;
     let todo = todo_from_log(&out);
     if todo.is_empty() {
         bail!("no commits to rebase");
     }
     // Merge commits cannot be linearized by a plain rebase -i; refuse with a
     // clear error instead of silently dropping them (no --rebase-merges yet).
-    let merges = run_w(loc, &[], &["log", "--merges", "--format=%h", &range])?;
+    let merges = run_read(loc, &["log", "--merges", "--format=%h", &range])?;
     if !merges.trim().is_empty() {
         bail!("range contains merge commits — rebase them manually");
     }
@@ -461,7 +496,7 @@ pub trait RebaseOps: GitBackend {
             b.map(|b| String::from_utf8_lossy(&b).trim().to_string())
                 .unwrap_or_default()
         };
-        let conflicts = run_w(loc, &[], &["diff", "--name-only", "--diff-filter=U"])
+        let conflicts = run_read(loc, &["diff", "--name-only", "--diff-filter=U"])
             .context("probe unmerged paths in rebase status")?;
         let conflicted = !conflicts.trim().is_empty();
         Ok(Some(RebaseStatus {
@@ -469,10 +504,9 @@ pub trait RebaseOps: GitBackend {
             head_name: text(Some(head_name))
                 .trim_start_matches("refs/heads/")
                 .to_string(),
-            stopped_sha: {
-                let s = text(loc.read_git_path("rebase-merge/stopped-sha"));
-                (!s.is_empty()).then_some(s)
-            },
+            stopped_sha: read_rebase_marker(loc, "rebase-merge/stopped-sha")?
+                .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+                .filter(|sha| !sha.is_empty()),
             done: parse_todo(&text(Some(done))),
             remaining: parse_todo(&text(Some(remaining))),
             paused: if conflicted {
@@ -627,12 +661,50 @@ mod tests {
     }
 
     #[test]
+    fn interactive_rebase_resolves_panel_style_short_sha_todos() {
+        let r = linear("short-sha-todo");
+        let c2 = r.sha_of("c2");
+        let base = base_for(&r.loc(), &c2).unwrap();
+        let mut todo = CliGit.rebase_todo_for(&r.loc(), &c2).unwrap();
+        for entry in &mut todo {
+            entry.sha.truncate(8);
+        }
+
+        assert_eq!(
+            CliGit
+                .rebase_interactive(&r.loc(), &base, &todo, &opts())
+                .unwrap(),
+            RebaseOutcome::Done
+        );
+        assert_eq!(r.subjects(), ["c4", "c3", "c2", "c1"]);
+    }
+
+    #[test]
     fn base_for_uses_root_only_for_a_verified_root_commit() {
         let r = repo("base-for-root");
         r.commit_file("root.txt", "root\n", "root");
         let root = r.sha_of("root");
         assert_eq!(base_for(&r.loc(), &root).unwrap(), "--root");
         assert!(base_for(&r.loc(), "deadbeef-deadbeef").is_err());
+    }
+
+    #[test]
+    fn base_for_explains_that_merge_targets_are_unsupported() {
+        let r = repo("base-for-merge");
+        r.commit_file("base.txt", "base\n", "base");
+        r.out(&["checkout", "-q", "-b", "topic"]);
+        r.commit_file("topic.txt", "topic\n", "topic");
+        r.out(&["checkout", "-q", "main"]);
+        r.commit_file("main.txt", "main\n", "main");
+        r.out(&["merge", "--no-ff", "topic", "-m", "merge"]);
+        let merge = r.out(&["rev-parse", "HEAD"]);
+
+        let error = base_for(&r.loc(), merge.trim()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("merge commits cannot be rebased here")
+        );
     }
 
     #[test]

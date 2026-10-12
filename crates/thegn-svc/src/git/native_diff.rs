@@ -278,15 +278,59 @@ fn tree_to_tree(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<DiffEntr
     changes.options(|o| {
         o.track_rewrites(None);
     });
-    changes
+    let mut path_error = None;
+    let _walk_outcome = changes
         .for_each_to_obtain_tree(new, |change| {
             let raw_path = change.location().as_ref();
             let path = match std::str::from_utf8(raw_path) {
                 Ok(path) => path.to_owned(),
-                Err(_) => return Err(unsupported_path(raw_path)),
+                Err(_) => {
+                    path_error = Some(unsupported_path(raw_path));
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
             };
-            let mut platform = path_operation(raw_path, "diff", || change.diff(&mut cache))?;
-            let counts = path_operation(raw_path, "line counts", || platform.line_counts())?;
+            let mode = change.entry_mode();
+            let source_mode = match change {
+                gix::object::tree::diff::Change::Modification {
+                    previous_entry_mode,
+                    ..
+                } => previous_entry_mode,
+                gix::object::tree::diff::Change::Rewrite {
+                    source_entry_mode, ..
+                } => source_entry_mode,
+                _ => mode,
+            };
+            // Directory changes are traversal bookkeeping, not numstat rows.
+            if mode.is_tree() || source_mode.is_tree() {
+                cache.clear_resource_cache_keep_allocation();
+                return Ok(std::ops::ControlFlow::Continue(()));
+            }
+            // Git represents a changed gitlink as one added and one deleted line.
+            if mode.kind() == gix::object::tree::EntryKind::Commit
+                || source_mode.kind() == gix::object::tree::EntryKind::Commit
+            {
+                out.push(DiffEntry {
+                    path,
+                    added: 1,
+                    deleted: 1,
+                });
+                cache.clear_resource_cache_keep_allocation();
+                return Ok(std::ops::ControlFlow::Continue(()));
+            }
+            let mut platform = match path_operation(raw_path, "diff", || change.diff(&mut cache)) {
+                Ok(platform) => platform,
+                Err(error) => {
+                    path_error = Some(error);
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+            };
+            let counts = match path_operation(raw_path, "line counts", || platform.line_counts()) {
+                Ok(counts) => counts,
+                Err(error) => {
+                    path_error = Some(error);
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+            };
             let (added, deleted) = counts.map(|c| (c.insertions, c.removals)).unwrap_or((0, 0));
             out.push(DiffEntry {
                 path,
@@ -296,7 +340,10 @@ fn tree_to_tree(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<DiffEntr
             cache.clear_resource_cache_keep_allocation();
             Ok::<_, anyhow::Error>(std::ops::ControlFlow::Continue(()))
         })
-        .context("gix tree diff")??;
+        .context("gix tree diff")?;
+    if let Some(error) = path_error {
+        return Err(error);
+    }
     Ok(out)
 }
 
@@ -420,7 +467,16 @@ fn tree_to_worktree(repo: &gix::Repository, rev: &str) -> Result<Vec<DiffEntry>>
                     deleted: d.count_removals(),
                 });
             }
-            _ => bail!("gix external diff/filter disposition requires CLI fallback for {path:?}"),
+            gix::diff::blob::platform::prepare_diff::Operation::SourceOrDestinationIsBinary => {
+                out.push(DiffEntry {
+                    path,
+                    added: 0,
+                    deleted: 0,
+                });
+            }
+            gix::diff::blob::platform::prepare_diff::Operation::ExternalCommand { .. } => {
+                bail!("gix external diff/filter disposition requires CLI fallback for {path:?}")
+            }
         }
         cache.clear_resource_cache_keep_allocation();
     }
@@ -684,11 +740,36 @@ mod tests {
     }
 
     #[test]
+    fn worktree_binary_and_deleted_file_match_the_cli() {
+        let repo = TestRepo::new("nd-wt-binary-delete");
+        repo.commit_file("deleted.txt", "one\ntwo\n", "base");
+        std::fs::write(repo.dir.join("blob.bin"), [0u8, 1, 0, 2]).unwrap();
+        repo.out(&["add", "blob.bin"]);
+        repo.out(&["commit", "-q", "-m", "add binary"]);
+        std::fs::remove_file(repo.dir.join("deleted.txt")).unwrap();
+        std::fs::write(repo.dir.join("blob.bin"), [0u8, 3, 0, 4]).unwrap();
+        assert_parity(&repo, "HEAD");
+        let entries = diff_entries(&repo.dir, "HEAD").unwrap();
+        assert!(entries.iter().any(|entry| entry.path == "deleted.txt"));
+        assert!(entries.iter().any(|entry| entry.path == "blob.bin"));
+    }
+
+    #[test]
     fn per_file_entries_match_the_cli_rows() {
         let repo = TestRepo::new("nd-rows");
         repo.commit_file("a.txt", "one\n", "base");
+        repo.commit_file("kind.txt", "link-target\n", "base type");
         repo.out(&["checkout", "-q", "-b", "feat"]);
         repo.commit_file("a.txt", "one\ntwo\n", "edit a");
+        let link_blob = repo.out(&["hash-object", "kind.txt"]);
+        repo.out(&[
+            "update-index",
+            "--cacheinfo",
+            "120000",
+            link_blob.trim(),
+            "kind.txt",
+        ]);
+        repo.out(&["commit", "-q", "-m", "change file to symlink"]);
         commit_nested(&repo, "dir/b.txt", "b\n", "add b");
         let mut got = diff_entries(&repo.dir, "main...HEAD").unwrap();
         got.sort_by(|x, y| x.path.cmp(&y.path));
@@ -719,6 +800,44 @@ mod tests {
         assert_eq!(
             got, want,
             "per-file rows diverged from `git diff --numstat`"
+        );
+    }
+
+    #[test]
+    fn missing_changed_blob_aborts_native_and_uses_the_cli_result() {
+        use super::super::GitBackend as _;
+
+        let repo = TestRepo::new("nd-missing-object");
+        repo.commit_file("base.txt", "base\n", "base");
+        repo.out(&["checkout", "-q", "-b", "feat"]);
+        repo.commit_file("changed.txt", "changed\n", "add changed file");
+        let blob = repo.out(&["rev-parse", "HEAD:changed.txt"]);
+        let objects = repo.out(&["rev-parse", "--git-path", "objects"]);
+        let blob = blob.trim();
+        let loose_object = repo
+            .dir
+            .join(objects.trim())
+            .join(&blob[..2])
+            .join(&blob[2..]);
+        assert!(
+            loose_object.is_file(),
+            "fixture blob must be a loose object"
+        );
+        std::fs::remove_file(loose_object).unwrap();
+
+        assert!(diff_entries(&repo.dir, "main...HEAD").is_err());
+        let loc = super::super::GitLoc::Local(repo.dir.clone());
+        let expected = super::super::CliGit
+            .diff_files(&loc, "main...HEAD")
+            .unwrap_err()
+            .to_string();
+        let actual = super::super::GixGit::new()
+            .diff_files(&loc, "main...HEAD")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            actual, expected,
+            "native failure must return the CLI fallback result"
         );
     }
 
@@ -829,11 +948,13 @@ mod tests {
             "tree lookup",
             "diff",
             "line counts",
-            "load resource",
+            "load old resource",
+            "load worktree resource",
             "prepare diff",
         ] {
-            let error = path_operation::<()>(path, stage, || anyhow::bail!("injected"))
-                .expect_err("an operation fault must escape to trigger CLI fallback");
+            let error =
+                path_operation::<(), anyhow::Error>(path, stage, || anyhow::bail!("injected"))
+                    .expect_err("an operation fault must escape to trigger CLI fallback");
             let message = format!("{error:#}");
             assert!(message.contains(stage), "{message}");
             assert!(message.contains("6469722f6e616d65ff"), "{message}");
