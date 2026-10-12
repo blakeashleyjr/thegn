@@ -649,7 +649,7 @@ mod tests {
             control: attach_control_tx,
             end: tokio::sync::oneshot::channel().1,
         };
-        let session = adapt("session-1".into(), stream);
+        let mut session = adapt("session-1".into(), stream);
         frame_tx
             .send(EventFrame::PaneSnapshot {
                 session: "session-2".into(),
