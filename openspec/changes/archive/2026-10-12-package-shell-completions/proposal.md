@@ -1,3 +1,5 @@
+> Retired (THE-144): superseded by openspec/changes/rework-shell-completions/; not implemented.
+
 # Install generated shell completions with the package
 
 Linear: THE-36

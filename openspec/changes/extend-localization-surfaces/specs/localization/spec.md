@@ -2,6 +2,24 @@
 
 ## ADDED Requirements
 
+### Requirement: Translations are compiled in with zero runtime I/O
+
+Shipped translation sources SHALL be compiled into the binary, and the active
+locale MUST be resolved once before the first frame without runtime translation
+file I/O. Runtime lookup SHALL fall back to the en-US value when a localized
+key is unavailable rather than returning an empty value or panicking.
+
+#### Scenario: Locale sources are embedded
+
+- **WHEN** the application starts
+- **THEN** its shipped locale sources are available from the binary without
+  runtime filesystem reads
+
+#### Scenario: Missing localized key falls back
+
+- **WHEN** runtime lookup cannot find a localized value
+- **THEN** the en-US value renders rather than an empty label or panic
+
 ### Requirement: The e2e freeze pins the locale
 
 Under `THEGN_E2E=1` the active locale SHALL resolve to `en-US` regardless of `[ui] language` and the host locale, so muse baselines are locale-deterministic; the pseudolocale hook MUST be inert under the freeze.

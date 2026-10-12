@@ -89,7 +89,7 @@
     },
     {
       "change": "add-fleet-view",
-      "lifecycle": "proposed",
+      "lifecycle": "archived",
       "disposition": "superseded-retire",
       "owners": [
         {
@@ -97,10 +97,11 @@
           "project": "Proposal Retirement & Cleanup"
         }
       ],
-      "summary": "The stale fleet-view design was superseded by the delivered pipeline board.",
+      "summary": "Retired add-fleet-view as superseded by openspec/changes/archive/2026-09-09-add-pipeline-board/.",
       "successors": [
         "openspec/changes/archive/2026-09-09-add-pipeline-board/"
-      ]
+      ],
+      "archive_path": "openspec/changes/archive/2026-10-12-add-fleet-view/"
     },
     {
       "change": "add-generic-tracker-model",
@@ -152,7 +153,7 @@
     },
     {
       "change": "add-localization",
-      "lifecycle": "proposed",
+      "lifecycle": "archived",
       "disposition": "superseded-retire",
       "owners": [
         {
@@ -160,10 +161,11 @@
           "project": "Proposal Retirement & Cleanup"
         }
       ],
-      "summary": "The duplicate localization substrate was absorbed by the canonical localization change.",
+      "summary": "Retired add-localization as superseded by openspec/changes/extend-localization-surfaces/.",
       "successors": [
         "openspec/changes/extend-localization-surfaces/"
-      ]
+      ],
+      "archive_path": "openspec/changes/archive/2026-10-12-add-localization/"
     },
     {
       "change": "add-merge-queue-tui",
@@ -847,7 +849,7 @@
     },
     {
       "change": "package-shell-completions",
-      "lifecycle": "proposed",
+      "lifecycle": "archived",
       "disposition": "superseded-retire",
       "owners": [
         {
@@ -859,10 +861,11 @@
           "project": "Proposal Retirement & Cleanup"
         }
       ],
-      "summary": "The static packaging proposal is superseded by the live completion engine and awaits coordinated retirement.",
+      "summary": "Retired package-shell-completions as superseded by openspec/changes/rework-shell-completions/.",
       "successors": [
         "openspec/changes/rework-shell-completions/"
-      ]
+      ],
+      "archive_path": "openspec/changes/archive/2026-10-12-package-shell-completions/"
     },
     {
       "change": "pane-zoom-stack",
