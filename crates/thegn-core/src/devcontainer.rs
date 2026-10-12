@@ -191,7 +191,7 @@ pub enum ParseError {
     Read { path: PathBuf, error: String },
     /// A JSON array or object exceeded its bounded entry count.
     Budget {
-        /// Collection kind that exceeded its limit.
+        /// Top-level field containing the collection, or `nested` when unknown.
         field: &'static str,
         /// Maximum number of entries permitted.
         limit: usize,
@@ -262,7 +262,7 @@ pub fn parse(text: &str) -> Result<DevContainer, ParseError> {
     let stripped = strip_jsonc(text);
     let value: Value =
         serde_json::from_str(&stripped).map_err(|e| ParseError::Json(e.to_string()))?;
-    validate_collection_budgets(&value)?;
+    validate_collection_budgets(&value, "nested")?;
     let obj = value.as_object().ok_or(ParseError::NotAnObject)?;
 
     Ok(DevContainer {
@@ -321,33 +321,59 @@ pub fn parse(text: &str) -> Result<DevContainer, ParseError> {
     })
 }
 
-fn validate_collection_budgets(value: &Value) -> Result<(), ParseError> {
+fn validate_collection_budgets(value: &Value, field: &'static str) -> Result<(), ParseError> {
     match value {
         Value::Array(values) => {
             if values.len() > MAX_PARSE_COLLECTION_ENTRIES {
                 return Err(ParseError::Budget {
-                    field: "array",
+                    field,
                     limit: MAX_PARSE_COLLECTION_ENTRIES,
                 });
             }
             for value in values {
-                validate_collection_budgets(value)?;
+                validate_collection_budgets(value, field)?;
             }
         }
         Value::Object(values) => {
             if values.len() > MAX_PARSE_COLLECTION_ENTRIES {
                 return Err(ParseError::Budget {
-                    field: "object",
+                    field,
                     limit: MAX_PARSE_COLLECTION_ENTRIES,
                 });
             }
-            for value in values.values() {
-                validate_collection_budgets(value)?;
+            for (key, value) in values {
+                let child_field = if field == "nested" {
+                    collection_budget_field(key)
+                } else {
+                    field
+                };
+                validate_collection_budgets(value, child_field)?;
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+fn collection_budget_field(key: &str) -> &'static str {
+    match key {
+        "build" => "build",
+        "containerEnv" => "containerEnv",
+        "dockerComposeFile" => "dockerComposeFile",
+        "features" => "features",
+        "forwardPorts" => "forwardPorts",
+        "initializeCommand" => "initializeCommand",
+        "mounts" => "mounts",
+        "onCreateCommand" => "onCreateCommand",
+        "overrideFeatureInstallOrder" => "overrideFeatureInstallOrder",
+        "postAttachCommand" => "postAttachCommand",
+        "postCreateCommand" => "postCreateCommand",
+        "postStartCommand" => "postStartCommand",
+        "remoteEnv" => "remoteEnv",
+        "runArgs" => "runArgs",
+        "updateContentCommand" => "updateContentCommand",
+        _ => "nested",
+    }
 }
 
 /// Versioned, collision-resistant identifier for a repo/config pair, suitable
@@ -357,6 +383,10 @@ fn validate_collection_budgets(value: &Value) -> Result<(), ParseError> {
 pub fn devcontainer_id(repo_root: &Path, config_relative_path: &Path) -> String {
     let repo_bytes = repo_root.as_os_str().as_encoded_bytes();
     let config_bytes = config_relative_path.as_os_str().as_encoded_bytes();
+    devcontainer_id_from_bytes(repo_bytes, config_bytes)
+}
+
+fn devcontainer_id_from_bytes(repo_bytes: &[u8], config_bytes: &[u8]) -> String {
     let digest = crate::identity::digest_parts(
         "thegn.devcontainer-id.v2",
         &[
@@ -1136,6 +1166,22 @@ mod tests {
     }
 
     #[test]
+    fn devcontainer_id_distinguishes_invalid_encoded_path_bytes() {
+        assert_eq!(
+            String::from_utf8_lossy(b"/r\xff"),
+            String::from_utf8_lossy(b"/r\xfe")
+        );
+        assert_ne!(
+            devcontainer_id_from_bytes(b"/r\xff", b"c"),
+            devcontainer_id_from_bytes(b"/r\xfe", b"c")
+        );
+        assert_ne!(
+            devcontainer_id_from_bytes(b"ab", b"c"),
+            devcontainer_id_from_bytes(b"a", b"bc")
+        );
+    }
+
+    #[test]
     fn substitution_stops_expansion_at_output_budget() {
         let ctx = SubstCtx {
             local_workspace_folder: "x".repeat(4096),
@@ -1164,12 +1210,14 @@ mod tests {
         let mounts_over_limit = serde_json::json!({
             "mounts": vec![Value::Null; MAX_PARSE_COLLECTION_ENTRIES + 1]
         });
+        let mounts_error = parse(&mounts_over_limit.to_string()).unwrap_err();
+        assert!(mounts_error.to_string().contains("exceeds 1024 entries"));
         assert!(matches!(
-            parse(&mounts_over_limit.to_string()),
-            Err(ParseError::Budget {
-                field: "array",
+            mounts_error,
+            ParseError::Budget {
+                field: "mounts",
                 limit: MAX_PARSE_COLLECTION_ENTRIES
-            })
+            }
         ));
 
         let mut env_at_limit = serde_json::Map::new();
@@ -1187,7 +1235,7 @@ mod tests {
         assert!(matches!(
             parse(&over_limit.to_string()),
             Err(ParseError::Budget {
-                field: "object",
+                field: "remoteEnv",
                 limit: MAX_PARSE_COLLECTION_ENTRIES
             })
         ));
