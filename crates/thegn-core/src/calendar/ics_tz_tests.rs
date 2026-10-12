@@ -280,6 +280,9 @@ fn malformed_vtimezone_observances_are_unmapped() {
         let mut observance = String::from(
             "BEGIN:VTIMEZONE\nTZID:Vendor/Duplicate\nBEGIN:STANDARD\nDTSTART:20250101T000000\nTZOFFSETFROM:+0000\nTZOFFSETTO:+0000\n",
         );
+        if duplicate == "RRULE" {
+            observance.push_str("RRULE:FREQ=YEARLY;BYMONTH=1;BYDAY=1MO\n");
+        }
         let repeated = match duplicate {
             "DTSTART" => "DTSTART:20250101T000000\n",
             "TZOFFSETFROM" => "TZOFFSETFROM:+0000\n",
