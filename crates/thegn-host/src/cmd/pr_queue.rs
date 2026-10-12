@@ -209,7 +209,10 @@ fn bind_checkout(
     wt_branch: Option<&str>,
     pr_head: &str,
 ) -> Result<Option<PathBuf>> {
-    if wt_main != Some(root) {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let canonical_wt_main =
+        wt_main.map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+    if canonical_wt_main.as_deref() != Some(canonical_root.as_path()) {
         anyhow::bail!(
             "worktree {} belongs to another repository than {}",
             wt.display(),
@@ -453,6 +456,40 @@ mod bind_checkout_tests {
         assert!(
             bind_checkout(&root, &wt, true, Some(&wt_main), Some("feat"), "feat").is_err(),
             "a worktree from repo B cannot be stored under repo A's queue"
+        );
+    }
+
+    #[test]
+    fn equivalent_path_spellings_bind_to_the_same_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let root = integrate::main_checkout(&repo).unwrap();
+        let wt = repo.canonicalize().unwrap();
+        let wt_main = integrate::main_checkout(&wt).unwrap();
+        let alias_dir = root.parent().unwrap().join("alias");
+        std::fs::create_dir(&alias_dir).unwrap();
+        let alternate_root = alias_dir.join("..").join(root.file_name().unwrap());
+        assert_ne!(root, alternate_root, "fixture uses distinct path spellings");
+        assert_eq!(
+            alternate_root.canonicalize().unwrap(),
+            wt_main.canonicalize().unwrap()
+        );
+
+        assert_eq!(
+            bind_checkout(
+                &alternate_root,
+                &wt,
+                false,
+                Some(&wt_main),
+                Some("feat"),
+                "feat"
+            )
+            .unwrap()
+            .as_deref(),
+            Some(wt.as_path()),
+            "equivalent repository path spellings must remain bound"
         );
     }
 }
