@@ -1993,7 +1993,12 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(expiry, 1000 + crate::db::MAX_LEASE_TTL_SECS * 1000);
+        let max_ttl_ms = crate::db::MAX_LEASE_TTL_SECS * 1000;
+        assert!(expiry > now, "a live legacy lease must remain live");
+        assert!(
+            expiry <= now + max_ttl_ms + 5_000,
+            "a migrated lease must be bounded relative to migration time"
+        );
         let recent_expiry: i64 = conn
             .query_row(
                 "SELECT expires_at_ms FROM pipeline_leases WHERE name='recent'",
@@ -2001,7 +2006,6 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let max_ttl_ms = crate::db::MAX_LEASE_TTL_SECS * 1000;
         assert!(recent_expiry > now, "a live legacy lease must remain live");
         assert!(
             recent_expiry <= now + max_ttl_ms + 5_000,
