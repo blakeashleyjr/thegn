@@ -1556,7 +1556,7 @@ mod tests {
                     "b.md",
                     vec!["docs/x.md".into()],
                     vec![crate::pipeline_chunk::PreparedSiblingScope {
-                        row: sibling.id,
+                        row: sibling,
                         path: "a.md".into(),
                         scope: Some(Ok(crate::pipeline_chunk::ChunkScope {
                             files: vec!["src/other.rs".into()],
@@ -1571,7 +1571,7 @@ mod tests {
         let DispatchAdmissionDecision::ScopeRefused(reason) = result else {
             panic!("expected a scope refusal, got {result:?}");
         };
-        assert!(reason.contains(&sibling.id.to_string()), "{reason}");
+        assert!(reason.contains(&sibling.to_string()), "{reason}");
         assert!(reason.contains("a.md"), "{reason}");
         assert!(reason.contains("ownership is unknown"), "{reason}");
         assert!(reason.contains("thegn dispatch set-status"), "{reason}");
