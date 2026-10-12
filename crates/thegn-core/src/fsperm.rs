@@ -318,9 +318,9 @@ impl PrivateDir {
     pub fn write_owner_only_atomic(&self, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
         #[cfg(unix)]
         {
-            use nix::fcntl::{OFlag, openat};
+            use nix::fcntl::{OFlag, openat, renameat};
             use nix::sys::stat::{Mode, fchmod};
-            use nix::unistd::{UnlinkatFlags, renameat, unlinkat};
+            use nix::unistd::{UnlinkatFlags, unlinkat};
             let name_path = Path::new(name);
             let mut components = name_path.components();
             let Some(Component::Normal(component)) = components.next() else {
@@ -400,25 +400,24 @@ pub fn ensure_private_dir_beneath(anchor: &Path, rel: &Path) -> std::io::Result<
     #[cfg(unix)]
     {
         use nix::fcntl::{OFlag, open, openat};
-        use nix::sys::stat::{Mode, SFlag, fchmod, fstat};
-        use nix::unistd::{geteuid, mkdirat};
+        use nix::sys::stat::{Mode, SFlag, fchmod, fstat, mkdirat};
+        use nix::unistd::geteuid;
         use std::os::fd::OwnedFd;
 
-        let components = rel.components().collect::<Vec<_>>();
+        let components = rel
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(name),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         let mut current: OwnedFd = open(
             anchor,
             OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
             Mode::empty(),
         )
         .map_err(nix_io_error)?;
-        for (index, component) in components.iter().enumerate() {
-            let Component::Normal(name) = component else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "relative directory must contain only normal path components",
-                ));
-            };
-            let name = *name;
+        for (index, name) in components.iter().enumerate() {
             let opened = match openat(
                 &current,
                 name,
