@@ -818,10 +818,10 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
 
 /// Claim the per-session feed bridge slot, reclaiming a completed bridge.
 fn claim_feed_bridge(entry: &mut PluginEntry) -> bool {
-    if let Some(bridge) = &entry.feed_bridge {
-        if !bridge.is_finished() {
-            return false;
-        }
+    if let Some(bridge) = &entry.feed_bridge
+        && !bridge.is_finished()
+    {
+        return false;
     }
     entry.feed_bridge = None;
     true
