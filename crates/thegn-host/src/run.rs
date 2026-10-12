@@ -66,6 +66,23 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+fn fence_vanished_paths(
+    session: &crate::session::Session,
+    creating_tabs: &std::collections::HashSet<(String, usize)>,
+    paths: &[String],
+) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| {
+            !session.worktrees.iter().any(|group| {
+                group.path.as_str() == path.as_str()
+                    && creating_tabs.iter().any(|(name, _)| name == &group.name)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// Mirror the scope-aware drawer runtime into the geometry locals. The
 /// layout/compositor still deals in a pane id; ownership, pooling, and stale
 /// result handling remain in [`DrawerRuntime`].
@@ -1235,9 +1252,12 @@ pub(crate) fn persist_pin_state(supervisor: &crate::pins::PinSupervisor, session
     if session_id.is_empty() {
         return;
     }
-    if let Ok(db) = thegn_core::db::Db::open() {
-        let _ = db.set_pin_state(session_id, &supervisor.to_json(), now_secs()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-    }
+    let session_id = session_id.to_string();
+    let json = supervisor.to_json();
+    let now = now_secs();
+    crate::db_task::persist_latest(format!("pin_state:{session_id}"), move |db| {
+        drop(Result::ok(db.set_pin_state(&session_id, &json, now)));
+    });
 }
 
 /// Launch-or-focus the pin at 1-based `index` for the current workspace. Returns
@@ -1855,10 +1875,7 @@ fn request_preview_scan(
 /// Persist a share lifecycle event to the `shares` table (resurrection layer).
 fn persist_share_event(ev: &crate::share::ShareEvent) {
     use crate::share::ShareEvent;
-    let Ok(db) = thegn_core::db::Db::open() else {
-        return;
-    };
-    match ev {
+    let write: Option<Box<dyn FnOnce(&thegn_core::db::Db) + Send>> = match ev {
         ShareEvent::Up {
             worktree,
             port,
@@ -1867,11 +1884,29 @@ fn persist_share_event(ev: &crate::share::ShareEvent) {
             ..
         } => {
             let canonical = url.canonical();
-            let _ = db.upsert_share(worktree, *port, provider, Some(&canonical), "up"); // best-effort: cache write: the share state row feeds the UI/`share list`
+            let worktree = worktree.clone();
+            let port = *port;
+            let provider = (*provider).to_string();
+            Some(Box::new(move |db: &thegn_core::db::Db| {
+                drop(Result::ok(db.upsert_share(
+                    &worktree,
+                    port,
+                    &provider,
+                    Some(&canonical),
+                    "up",
+                )));
+            }))
         }
         ShareEvent::Failed { worktree, port, .. } | ShareEvent::Down { worktree, port, .. } => {
-            let _ = db.delete_share(worktree, *port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            let worktree = worktree.clone();
+            let port = *port;
+            Some(Box::new(move |db: &thegn_core::db::Db| {
+                drop(Result::ok(db.delete_share(&worktree, port)));
+            }))
         }
+    };
+    if let Some(write) = write {
+        crate::db_task::persist(write);
     }
 }
 
@@ -5149,10 +5184,11 @@ fn sync_tests_for_worktree(
 }
 
 fn persist_tests_for_worktree(ui: &crate::panel::PanelUi, worktree: &str) {
-    if let Ok(json) = serde_json::to_string(&ui.tests.to_cache())
-        && let Ok(db) = thegn_core::db::Db::open()
-    {
-        let _ = db.put_test_cache(worktree, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    if let Ok(json) = serde_json::to_string(&ui.tests.to_cache()) {
+        let worktree = worktree.to_string();
+        crate::db_task::persist(move |db| {
+            drop(Result::ok(db.put_test_cache(&worktree, &json)));
+        });
     }
 }
 
@@ -12289,19 +12325,20 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 RefreshKind::VanishedTabs(result) => {
-                    let gone: Vec<&str> = result.paths.iter().map(String::as_str).collect();
+                    let paths = fence_vanished_paths(&session, &creating_tabs, &result.paths);
+                    let gone: Vec<&str> = paths.iter().map(String::as_str).collect();
                     let landing = crate::handlers::worktree_delete::Landing::plan(
                         &model, &session, &sb, &gone,
                     );
                     if crate::merge_lifecycle::apply_vanished_tabs(
                         &mut session,
                         &mut panes,
-                        &result.paths,
+                        &paths,
                         &landing,
                     ) {
                         model.status = format!(
                             "Worktree dir gone: {} — removed from session",
-                            result.paths.join(", ")
+                            paths.join(", ")
                         );
                         refresh_tab_model(&mut model, &session, &mut sb);
                         landing.place_cursor(&mut model, &mut sb);
@@ -13092,9 +13129,10 @@ async fn event_loop<T: Terminal>(
                 if let Some(prev) = &last_forward_target {
                     for port in forward_supervisor.stop_all_on(prev) {
                         let _ = preview_supervisor.provider_down(prev, port);
-                        if let Ok(db) = thegn_core::db::Db::open() {
-                            let _ = db.delete_forward(prev, port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                        }
+                        let worktree = prev.clone();
+                        crate::db_task::persist(move |db| {
+                            drop(Result::ok(db.delete_forward(&worktree, port)));
+                        });
                     }
                     // Tear down the reverse model-proxy/host tunnels too.
                     reverse_tunnel_supervisor.stop_worktree(prev);
@@ -13138,15 +13176,17 @@ async fn event_loop<T: Terminal>(
                                     container_port,
                                     started.url.clone(),
                                 );
-                                if let Ok(db) = thegn_core::db::Db::open() {
-                                    let _ = db.upsert_forward(
-                                        // best-effort: cache write: the forward state row feeds the UI/`share list`; the forward itself is already up
-                                        &worktree,
+                                let saved_worktree = worktree.clone();
+                                let saved_url = started.url.clone();
+                                let host_port = started.host_port;
+                                crate::db_task::persist(move |db| {
+                                    drop(Result::ok(db.upsert_forward(
+                                        &saved_worktree,
                                         container_port,
-                                        started.host_port,
-                                        &started.url,
-                                    );
-                                }
+                                        host_port,
+                                        &saved_url,
+                                    )));
+                                });
                                 model.status = if started.remapped {
                                     format!(
                                         "Port {container_port} in use → forwarded at {}",
@@ -13191,9 +13231,9 @@ async fn event_loop<T: Terminal>(
                     if forward_supervisor.stop(&worktree, container_port) {
                         let preview_changed =
                             preview_supervisor.provider_down(&worktree, container_port);
-                        if let Ok(db) = thegn_core::db::Db::open() {
-                            let _ = db.delete_forward(&worktree, container_port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                        }
+                        crate::db_task::persist(move |db| {
+                            drop(Result::ok(db.delete_forward(&worktree, container_port)));
+                        });
                         model.forwards = current_forward_views(&forward_supervisor, &session);
                         if preview_changed {
                             model.preview = session
@@ -17003,10 +17043,14 @@ async fn event_loop<T: Terminal>(
                             // Dismissing the first-launch keymap picker (item
                             // 621) counts as choosing the defaults — persist so
                             // it never reappears.
-                            if m.tag == menu::MenuKindTag::KeymapPicker
-                                && let Ok(db) = thegn_core::db::Db::open()
-                            {
-                                let _ = db.set_ui_state("", "keymap_preset", "default"); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                            if m.tag == menu::MenuKindTag::KeymapPicker {
+                                crate::db_task::persist(|db| {
+                                    drop(Result::ok(db.set_ui_state(
+                                        "",
+                                        "keymap_preset",
+                                        "default",
+                                    )));
+                                });
                             }
                             // Esc on the sandbox-halt modal is a dismissal:
                             // suppress it for this key (the row's error dot
@@ -17869,9 +17913,10 @@ async fn event_loop<T: Terminal>(
                         KeyCode::Enter => {
                             if let Some(key) = p.selected_key() {
                                 // Record frecency so the choice floats up next time.
-                                if let Ok(db) = thegn_core::db::Db::open() {
-                                    let _ = db.bump_palette_usage(&key); // best-effort: cache write: frecency bookkeeping; the palette works without it
-                                }
+                                let saved_key = key.clone();
+                                crate::db_task::persist(move |db| {
+                                    drop(Result::ok(db.bump_palette_usage(&saved_key)));
+                                });
                                 // --- new: file/git/symbol dispatch prefixes ---
                                 if let Some(payload) = key.strip_prefix("open-file:") {
                                     // "open-file:{rel_path}:{line_no}"
@@ -18394,9 +18439,10 @@ async fn event_loop<T: Terminal>(
                                     // jump to the Issues panel section.
                                     let wt = active_tab_path(&session);
                                     let wt_str = wt.to_string_lossy().to_string();
-                                    if let Ok(db) = thegn_core::db::Db::open() {
-                                        let _ = db.link_issue(&wt_str, issue_id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                                    }
+                                    let issue_id = issue_id.to_string();
+                                    crate::db_task::persist(move |db| {
+                                        drop(Result::ok(db.link_issue(&wt_str, &issue_id)));
+                                    });
                                     panel_ui.open = crate::panel::Section::Issues;
                                     hydration_gen += 1;
                                     spawn_model_hydration(
@@ -24489,6 +24535,10 @@ fn action_allowed_during_schema_refusal(action: &crate::keymap::Action) -> bool 
 #[cfg(test)]
 #[path = "run_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "run_db_loop_tests.rs"]
+mod db_loop_tests;
 
 #[cfg(test)]
 #[path = "run_terminal_tests.rs"]
