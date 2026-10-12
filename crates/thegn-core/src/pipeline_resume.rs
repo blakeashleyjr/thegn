@@ -120,7 +120,7 @@ pub fn finisher_prompt(i: &FinisherInput) -> String {
         "artifact": {
             "provenance": "pipeline roster path and host filesystem/git inspection",
             "path": artifact,
-            "present": !i.artifact.is_empty(),
+            "present": i.artifact_exists,
             "exists": i.artifact_exists,
             "tracked": i.artifact_tracked,
         },
