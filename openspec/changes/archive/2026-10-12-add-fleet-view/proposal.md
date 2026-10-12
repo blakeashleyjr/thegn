@@ -1,3 +1,5 @@
+> Retired (THE-144): superseded by openspec/changes/archive/2026-09-09-add-pipeline-board/; not implemented.
+
 # Add fleet view (btop-for-agents, authoritative metrics)
 
 > **⛔ STATUS 2026-08-26 — SUPERSEDED by `openspec/changes/add-pipeline-board`.**
