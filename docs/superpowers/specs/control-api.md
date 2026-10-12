@@ -35,13 +35,14 @@ flag and is reported as unsafe. Every TCP request remains token-gated.
 Every token holds a scope set (csv in `pairings.scope`). The verb→scope table
 is `thegn_core::control::required_scope` — the single tested policy source.
 
-| Scope   | Grants                                                                                   |
-| ------- | ---------------------------------------------------------------------------------------- |
-| `read`  | list sessions/leases, snapshots, `/v1/me`, event feed, git status, bounded preview fetch |
-| `write` | open/attach/detach/kill sessions, terminal input, resize, open-worktree                  |
-| `git`   | stage + commit through the GitBackend seam (implies read, **not** write)                 |
-| `exec`  | run a trusted configured tool or launch preset (implies read, not write or git)          |
-| `admin` | pairing management, daemon shutdown (implies everything)                                 |
+| Scope       | Grants                                                                                   |
+| ----------- | ---------------------------------------------------------------------------------------- |
+| `read`      | list sessions/leases, snapshots, `/v1/me`, event feed, git status, bounded preview fetch |
+| `write`     | open/attach/detach/kill sessions, terminal input, resize, open-worktree                  |
+| `git`       | stage + commit through the GitBackend seam (implies read, **not** write)                 |
+| `exec`      | run a trusted configured tool or launch preset (implies read, not write or git)          |
+| `merge_add` | enqueue a worktree for merge (implies read; independent of write and git)                |
+| `admin`     | pairing management, daemon shutdown (implies everything)                                 |
 
 `git`, `write`, and `exec` are independent: a companion that can commit must
 not be able to type into terminals or execute configured tools. Read-only
@@ -65,33 +66,66 @@ action runs** (403 / `PERMISSION_DENIED`).
 
 ## Routes
 
-| Route                                                                                 | Verb scope | Notes                                                                                                               |
-| ------------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------- |
-| `GET /health`                                                                         | —          | liveness                                                                                                            |
-| `POST /v1/pair`                                                                       | —          | redeem a pairing code (single-use, atomic)                                                                          |
-| `GET /v1/me`                                                                          | read       | `{pairing_id, label, scopes}` — scope switching is client-side token selection                                      |
-| `GET /v1/sessions`                                                                    | read       | list daemon sessions (worktree hints, geometry, lease state)                                                        |
-| `POST /v1/sessions`                                                                   | write      | open a session `{argv, cwd?, env?, rows, cols, worktree?}`                                                          |
-| `GET /v1/sessions/{s}/snapshot`                                                       | read       | `{seq, rows, cols, ansi_b64}` — the warm screen as an ANSI repaint                                                  |
-| `POST /v1/sessions/{s}/input`                                                         | write      | `{b64\|text, enter?}`                                                                                               |
-| `POST /v1/sessions/{s}/resize`                                                        | write      | `{rows, cols}`                                                                                                      |
-| `POST /v1/sessions/{s}/detach`                                                        | write      | `{client_id}`; last client out opens a relay lease                                                                  |
-| `GET /v1/sessions/{s}/attach`                                                         | write      | WS upgrade (`?client_id&rows&cols&observer`); binary `EventFrame`s down, raw-binary stdin / JSON `{type:resize}` up |
-| `DELETE /v1/sessions/{s}`                                                             | write      | kill the PTY                                                                                                        |
-| `GET /v1/events`                                                                      | read       | WS: the broadcast feed; optional `kinds=activity,exit&session=<id>&signal_lag=1` narrowing                          |
-| `GET /v1/events/sse`                                                                  | read       | same filtered feed, JSON envelopes with SSE `event:` kind                                                           |
-| `GET /v1/leases`                                                                      | read       | relay leases (detached sessions kept warm)                                                                          |
-| `GET /v1/worktrees`                                                                   | read       | worktrees registered with thegn: `{path, branch, repo_root, location, created_at}`                                  |
-| `POST /v1/worktrees/open`                                                             | write      | `{repo, branch?}` → the running compositor's intent mailbox                                                         |
-| `POST /v1/preview/fetch`                                                              | read       | bounded credential-free HTTP fetch; this does not create or drive a browser session                                 |
-| `GET /v1/git/status?worktree=`                                                        | read       | porcelain codes per changed file                                                                                    |
-| `POST /v1/git/stage`                                                                  | git        | `{worktree, paths}` — GitBackend seam; git stays source of truth                                                    |
-| `POST /v1/git/commit`                                                                 | git        | `{worktree, message}` → `{commit}`                                                                                  |
-| `GET /v1/merge/list?worktree=`                                                        | read       | `{queue}` — the repo's merge-queue rows (scoped to the worktree's repo)                                             |
-| `POST /v1/merge/add`                                                                  | git        | `{worktree}` → `{queued, message}` — enqueue the worktree's current branch                                          |
-| `POST /v1/merge/clear`                                                                | git        | `{worktree}` → `{cleared}` — empty the queue for the worktree's repo                                                |
-| `GET/POST /v1/pairings`, `DELETE /v1/pairings/{id}`, `POST /v1/pairings/{id}/approve` | admin      | pairing lifecycle                                                                                                   |
-| `POST /v1/push/register`                                                              | —          | **reserved** for push notifications (AI 422/423); absent in v1                                                      |
+| Route                                        | Capability              | Scope       | Notes                                                                                                         |
+| -------------------------------------------- | ----------------------- | ----------- | ------------------------------------------------------------------------------------------------------------- |
+| `GET /health`                                | `—`                     | `—`         | liveness                                                                                                      |
+| `GET /pair`                                  | `—`                     | `—`         | static pairing redeem page                                                                                    |
+| `GET /v1/agent/sessions`                     | `agent.sessions`        | `read`      | List discovered coding-agent sessions (harness, id, worktree, mtime, summary)                                 |
+| `GET /v1/automations`                        | `automations.list`      | `read`      | List trusted automation rules and recent audited outcomes                                                     |
+| `POST /v1/automations/test`                  | `automations.test`      | `read`      | Purely evaluate one automation rule against an event fixture                                                  |
+| `GET /v1/calendar/clocks`                    | `calendar.clocks`       | `read`      | Resolved world clocks                                                                                         |
+| `GET /v1/calendar/events`                    | `calendar.events`       | `read`      | Merged calendar events over a date window                                                                     |
+| `POST /v1/calendar/sources/{account}/events` | `calendar.ingest`       | `write`     | Push events into a calendar source's own cache                                                                |
+| `GET /v1/ci/logs`                            | `ci.logs`               | `read`      | Bounded, redacted cached CI job logs                                                                          |
+| `GET /v1/ci/runs`                            | `ci.runs`               | `read`      | Cached CI run and job metadata for a worktree                                                                 |
+| `POST /v1/daemon/shutdown`                   | `daemon.shutdown`       | `admin`     | shut down the daemon (admin)                                                                                  |
+| `GET /v1/dispatches`                         | `dispatches.list`       | `read`      | List the agent-dispatch roster (issue, worktree, agent, status)                                               |
+| `POST /v1/dispatches`                        | `dispatches.put`        | `write`     | Record a new dispatch on the roster                                                                           |
+| `POST /v1/dispatches/{id}/status`            | `dispatches.set_status` | `write`     | Advance a dispatch's status on the roster                                                                     |
+| `POST /v1/editor/open`                       | `editor.open`           | `write`     | Queue a worktree or worktree-relative file for local editor handoff                                           |
+| `GET /v1/events`                             | `events.subscribe`      | `read`      | WS upgrade: broadcast feed; optional kinds/session/signal_lag narrowing                                       |
+| `GET /v1/events/sse`                         | `events.subscribe`      | `read`      | same filtered feed as JSON envelopes with SSE event kinds                                                     |
+| `POST /v1/git/commit`                        | `git.commit`            | `git`       | {worktree, message} → {commit}                                                                                |
+| `POST /v1/git/stage`                         | `git.stage`             | `git`       | {worktree, paths} — GitBackend seam; git stays source of truth                                                |
+| `GET /v1/git/status`                         | `git.status`            | `read`      | porcelain codes per changed file                                                                              |
+| `GET /v1/issues`                             | `issues.list`           | `read`      | List tracker issues (filter by status/limit) from the configured provider                                     |
+| `GET /v1/issues/{id}`                        | `issues.get`            | `read`      | Read one tracker issue with its detail and comments                                                           |
+| `POST /v1/issues/{id}`                       | `issues.update`         | `write`     | Patch a tracker issue (status/assignee/priority/title)                                                        |
+| `POST /v1/issues/{id}/comment`               | `issues.comment`        | `write`     | Post a comment on a tracker issue                                                                             |
+| `GET /v1/leases`                             | `leases.list`           | `read`      | Relay lease state per session                                                                                 |
+| `POST /v1/mcp_proxy/reload`                  | `mcp_proxy.reload`      | `write`     | Re-read config and reconcile the mcp-proxy hub's upstreams (start/stop/restart/refilter)                      |
+| `GET /v1/mcp_proxy/status`                   | `mcp_proxy.status`      | `read`      | mcp-proxy hub state: per-upstream instances, breaker + health, exposed tool counts, withheld reasons          |
+| `GET /v1/me`                                 | `me`                    | `read`      | {pairing_id, label, scopes} — scope switching is client-side token selection                                  |
+| `POST /v1/merge/add`                         | `merge.add`             | `merge_add` | {worktree} → {queued, message} — enqueue the current branch                                                   |
+| `POST /v1/merge/clear`                       | `merge.clear`           | `git`       | {worktree} → {cleared} — empty the queue for the worktree repo                                                |
+| `GET /v1/merge/list`                         | `merge.list`            | `read`      | {queue} — repo merge-queue rows, scoped to the worktree repo                                                  |
+| `POST /v1/notify`                            | `notify.push`           | `write`     | Push a notification into the tray                                                                             |
+| `POST /v1/pair`                              | `—`                     | `—`         | redeem a pairing code (unauthenticated; possession of the single-use code is the credential)                  |
+| `GET /v1/pairings`                           | `pairings.list`         | `admin`     | list pairings (admin)                                                                                         |
+| `POST /v1/pairings`                          | `pairings.issue`        | `admin`     | issue a pairing code (admin)                                                                                  |
+| `DELETE /v1/pairings/{id}`                   | `pairings.revoke`       | `admin`     | revoke a pairing (admin)                                                                                      |
+| `POST /v1/pairings/{id}/approve`             | `pairings.approve`      | `admin`     | approve a pairing (admin)                                                                                     |
+| `GET /v1/pr/status`                          | `pr.status`             | `read`      | Cached PR status for a worktree                                                                               |
+| `POST /v1/preview/fetch`                     | `preview.fetch`         | `read`      | bounded credential-free HTTP fetch; does not create or drive a browser session                                |
+| `POST /v1/push/register`                     | `—`                     | `—`         | **reserved** for push notifications; absent in v1                                                             |
+| `GET /v1/sessions`                           | `sessions.list`         | `read`      | list daemon sessions (worktree hints, geometry, lease state)                                                  |
+| `POST /v1/sessions`                          | `sessions.open`         | `write`     | open a session {argv, cwd?, env?, rows, cols, worktree?}                                                      |
+| `POST /v1/sessions/fork`                     | `sessions.fork`         | `write`     | Fork a live daemon or recorded harness session                                                                |
+| `DELETE /v1/sessions/{s}`                    | `sessions.kill`         | `write`     | kill the PTY                                                                                                  |
+| `GET /v1/sessions/{s}/attach`                | `sessions.attach`       | `write`     | WS upgrade (?client_id&rows&cols&observer); binary EventFrames down, raw-binary stdin / JSON {type:resize} up |
+| `POST /v1/sessions/{s}/detach`               | `sessions.detach`       | `write`     | {client_id}; last client out opens a relay lease                                                              |
+| `POST /v1/sessions/{s}/input`                | `sessions.input`        | `write`     | {b64\|text, enter?}                                                                                           |
+| `POST /v1/sessions/{s}/record`               | `sessions.record`       | `write`     | Start/stop/query an asciicast recording of a session's output                                                 |
+| `POST /v1/sessions/{s}/resize`               | `sessions.resize`       | `write`     | {rows, cols}                                                                                                  |
+| `GET /v1/sessions/{s}/snapshot`              | `sessions.snapshot`     | `read`      | {seq, rows, cols, ansi_b64} — the warm screen as an ANSI repaint                                              |
+| `POST /v1/sessions/{s}/split`                | `sessions.split`        | `write`     | Create a sibling pane/session next to an existing one                                                         |
+| `POST /v1/sessions/{s}/wait`                 | `sessions.wait`         | `read`      | Block until a session reaches a state (idle, exit, pattern)                                                   |
+| `GET /v1/skills`                             | `skills.list`           | `read`      | List embedded and configured skill metadata                                                                   |
+| `POST /v1/tools/run`                         | `tools.run`             | `exec`      | Run one trusted configured tool by name in a worktree                                                         |
+| `GET /v1/worktrees`                          | `worktrees.list`        | `read`      | Worktrees registered with thegn (path, branch, repo root, location)                                           |
+| `POST /v1/worktrees`                         | `worktrees.create`      | `git`       | Create a worktree, optionally from an issue (branch from its hint, link it)                                   |
+| `POST /v1/worktrees/folder`                  | `folders.assign`        | `git`       | Assign or clear a worktree's repo-local sidebar folder                                                        |
+| `POST /v1/worktrees/open`                    | `worktrees.open`        | `write`     | Open/focus a worktree in the owning instance                                                                  |
 
 Browser automation is not part of v1: there is no browser provider or session
 lifecycle to navigate. Local preview discovery and the UI's external-browser
