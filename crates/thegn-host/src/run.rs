@@ -7278,6 +7278,7 @@ async fn event_loop<T: Terminal>(
     let writer = crate::frame_writer::FrameWriter::spawn(
         waker.clone(),
         crate::frame_writer::FrameWriter::want_sync(use_termwiz_renderer),
+        !use_termwiz_renderer,
     );
     let mut palette: Option<crate::search_everywhere::PaletteSession> = None;
     // When set, `palette` is the dedicated drawer picker. Its stable
