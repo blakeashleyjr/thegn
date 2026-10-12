@@ -1380,6 +1380,30 @@ pub(crate) fn verify_v79_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v80: bind queued PRs to the URL observed at enqueue. Legacy active rows
+/// cannot be safely attributed and are held for an explicit re-add.
+pub(crate) fn migrate_v80(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "pr_queue", "pr_url") {
+        conn.execute("ALTER TABLE pr_queue ADD COLUMN pr_url TEXT", [])?;
+        conn.execute(
+            "UPDATE pr_queue
+                SET status='needs_human',
+                    detail='repository identity not recorded (queued before v80); re-add with `thegn pr queue add --pr ' || number || '` to verify it'
+              WHERE status NOT IN ('merged','closed','needs_human')",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Verify the additive v80 PR identity column.
+pub(crate) fn verify_v80_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "pr_queue", "pr_url") {
+        bail!("schema v80 migration did not add pr_queue.pr_url");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -1948,6 +1972,49 @@ mod tests {
             (head.as_str(), status.as_str(), rerun),
             ("head-a", "watching", None)
         );
+    }
+
+    #[test]
+    fn v80_adds_pr_url_and_holds_unbound_rows_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pr_queue (key TEXT PRIMARY KEY, number INTEGER NOT NULL,
+                 status TEXT NOT NULL, detail TEXT);
+             INSERT INTO pr_queue VALUES
+                 ('/repo#7',7,'watching',NULL),('/repo#8',8,'merged',NULL),
+                 ('/repo#9',9,'needs_human','already held');",
+        )
+        .unwrap();
+        assert!(super::verify_v80_schema(&conn).is_err());
+        super::migrate_v80(&conn).unwrap();
+        conn.execute(
+            "UPDATE pr_queue SET status='watching' WHERE key='/repo#7'",
+            [],
+        )
+        .unwrap();
+        super::migrate_v80(&conn).unwrap();
+        super::verify_v80_schema(&conn).unwrap();
+        let rows = {
+            let mut stmt = conn
+                .prepare("SELECT key,status,detail,pr_url FROM pr_queue ORDER BY key")
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        assert_eq!(rows[0].1, "watching", "the hold is applied only once");
+        assert_eq!(rows[1].1, "merged", "terminal rows remain untouched");
+        assert_eq!(rows[2].1, "needs_human");
+        assert!(rows.iter().all(|row| row.3.is_none()));
+        assert!(rows[0].2.as_deref().unwrap().contains("--pr 7"));
     }
 
     #[test]

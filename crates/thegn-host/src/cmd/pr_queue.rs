@@ -160,6 +160,12 @@ fn add(cfg: &Config, pr: Option<u64>, worktree: Option<String>) -> Result<()> {
         Ok(p) => p,
         Err(e) => anyhow::bail!("could not resolve a pull request: {}", e.describe()),
     };
+    if thegn_core::forge::model::repo_identity_from_pr_url(&status.url).is_none() {
+        anyhow::bail!(
+            "could not bind PR #{}: forge returned an invalid PR URL",
+            status.number
+        );
+    }
 
     let wt_main = integrate::main_checkout(&wt_path);
     let wt_branch = loc
@@ -178,13 +184,14 @@ fn add(cfg: &Config, pr: Option<u64>, worktree: Option<String>) -> Result<()> {
     let bound_worktree = bound_worktree
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
-    db.enqueue_pr(
+    db.enqueue_bound_pr(
         &root.to_string_lossy(),
         status.number,
         bound_worktree.as_deref(),
         &status.head_ref_name,
         &status.base_ref_name,
         forge.id(),
+        &status.url,
     )?;
     let _ = cfg;
     outln!(

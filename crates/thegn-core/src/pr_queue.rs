@@ -15,6 +15,44 @@ use crate::agent_task::TaskKind;
 use crate::config_pr_queue::{PrMergeMode, PrQueueConfig, PrWatchKind};
 use crate::forge::model::{Bucket, CheckRun, PrStatus, check_bucket};
 
+/// Prove that the fetched PR is the same repository and number that was
+/// explicitly bound when the queue row was created.
+pub fn attest_pr_identity(
+    bound_url: Option<&str>,
+    number: u64,
+    fetched_url: &str,
+    fetched_number: u64,
+) -> Result<(), String> {
+    let readd = format!("re-add with `thegn pr queue add --pr {number}` to verify it");
+    let Some(bound_url) = bound_url else {
+        return Err(format!(
+            "queued PR identity is unbound; fetched identity is {fetched_url} (#{fetched_number}); {readd}"
+        ));
+    };
+    let Some(bound) = crate::forge::model::repo_identity_from_pr_url(bound_url) else {
+        return Err(format!(
+            "queued PR identity {bound_url} is invalid; fetched identity is {fetched_url} (#{fetched_number}); {readd}"
+        ));
+    };
+    if fetched_number != number {
+        return Err(format!(
+            "queued PR identity {bound_url} (#{number}) differs from fetched identity {fetched_url} (#{fetched_number}); {readd}"
+        ));
+    }
+    let Some(fetched) = crate::forge::model::repo_identity_from_pr_url(fetched_url) else {
+        return Err(format!(
+            "queued PR identity {bound_url} (#{number}) differs from invalid fetched identity {fetched_url}; {readd}"
+        ));
+    };
+    if !bound.matches(&fetched) {
+        return Err(format!(
+            "queued PR identity {}:{} (#{number}) differs from fetched identity {}:{} (#{fetched_number}); {readd}",
+            bound.host, bound.path, fetched.host, fetched.path
+        ));
+    }
+    Ok(())
+}
+
 /// What is keeping a queued pull request from merging.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Blocker {
@@ -1031,5 +1069,34 @@ mod tests {
     #[test]
     fn merge_method_default_is_squash() {
         assert_eq!(PrQueueConfig::default().merge_method, PrMergeMethod::Squash);
+    }
+
+    #[test]
+    fn pr_identity_attestation_requires_matching_bound_repository_and_number() {
+        let bound = "https://github.com/acme/repo/pull/7";
+        let actual = "https://github.com/acme/repo/pull/7";
+        assert_eq!(attest_pr_identity(Some(bound), 7, actual, 7), Ok(()));
+        for (binding, url, number, expected) in [
+            (None, actual, 7, "unbound"),
+            (Some("not a URL"), actual, 7, "invalid"),
+            (Some(bound), actual, 8, "differs"),
+            (Some(bound), "bad URL", 7, "invalid fetched"),
+            (
+                Some(bound),
+                "https://github.com/other/repo/pull/7",
+                7,
+                "other/repo",
+            ),
+            (
+                Some(bound),
+                "https://gitlab.com/acme/repo/pull/7",
+                7,
+                "gitlab.com",
+            ),
+        ] {
+            let message = attest_pr_identity(binding, 7, url, number).unwrap_err();
+            assert!(message.contains(expected), "{message}");
+            assert!(message.contains("thegn pr queue add --pr 7"), "{message}");
+        }
     }
 }
