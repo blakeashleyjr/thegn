@@ -771,6 +771,12 @@ pub fn prepare_sandbox_env(
                 compose_miss = Some(m);
                 continue;
             }
+            if !spec.backend.is_oci() && spec.compose.is_some() {
+                warnings.push(format!(
+                    "sandbox {} does not support Compose; the Compose services were omitted",
+                    spec.backend.label()
+                ));
+            }
             // Say which hardening knobs this runtime can't express, rather than
             // shipping a quietly weaker profile than the config asked for.
             let dropped = thegn_core::sandbox::unsupported_hardening(&spec);

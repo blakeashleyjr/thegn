@@ -745,16 +745,24 @@ fn exposure_report(cfg: &Config) {
 /// One-line control-surface coverage summary (cells implemented / declared,
 /// gap count). The full per-surface ledger is `thegn api coverage`.
 fn local_control_security_json(cfg: &Config) -> serde_json::Value {
+    local_control_security_json_with_legacy_state(cfg, None)
+}
+
+fn local_control_security_json_with_legacy_state(
+    cfg: &Config,
+    legacy_state_override: Option<&str>,
+) -> serde_json::Value {
     let socket = crate::daemon::socket_path(&cfg.daemon);
     let endpoint = thegn_svc::ipc::IpcEndpoint::for_socket_path(&socket);
     let legacy_path = thegn_core::config_daemon::legacy_socket_path(
         &thegn_core::util::xdg_state_home().join("thegn"),
     );
-    let legacy_state = match crate::daemon::legacy_socket_state() {
-        crate::daemon::LegacySocketState::Live => "live",
-        crate::daemon::LegacySocketState::Stale => "stale",
-        crate::daemon::LegacySocketState::Absent => "absent",
-    };
+    let legacy_state =
+        legacy_state_override.unwrap_or_else(|| match crate::daemon::legacy_socket_state() {
+            crate::daemon::LegacySocketState::Live => "live",
+            crate::daemon::LegacySocketState::Stale => "stale",
+            crate::daemon::LegacySocketState::Absent => "absent",
+        });
     let legacy_socket = serde_json::json!({
         "path": legacy_path.display().to_string(),
         "state": legacy_state,
@@ -1551,7 +1559,7 @@ fn identification_json(cfg: &Config) -> serde_json::Value {
 pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
     let path = thegn_core::config::Config::path();
     let health = super::config_health::collect(&path, None);
-    doctor_json_with_health(cfg, &health)
+    doctor_json_with_health_and_overrides_and_legacy(cfg, &health, &[], Some("absent"))
 }
 
 pub(crate) fn doctor_json_with_health(cfg: &Config, health: &ConfigHealth) -> serde_json::Value {
@@ -1562,6 +1570,15 @@ fn doctor_json_with_health_and_overrides(
     cfg: &Config,
     health: &ConfigHealth,
     cli_overrides: &[String],
+) -> serde_json::Value {
+    doctor_json_with_health_and_overrides_and_legacy(cfg, health, cli_overrides, None)
+}
+
+fn doctor_json_with_health_and_overrides_and_legacy(
+    cfg: &Config,
+    health: &ConfigHealth,
+    cli_overrides: &[String],
+    legacy_state_override: Option<&str>,
 ) -> serde_json::Value {
     let env = TermEnv::from_env();
     let detected = thegn_core::termcaps::detect(&env);
@@ -1637,7 +1654,7 @@ fn doctor_json_with_health_and_overrides(
         "skills": super::skills_doctor::inspect(cfg, &super::resolve_worktree(None)),
         "mcp_serve": mcp_serve_scopes_json(cfg),
         "model_proxy": model_proxy_json(cfg),
-        "local_control": local_control_security_json(cfg),
+        "local_control": local_control_security_json_with_legacy_state(cfg, legacy_state_override),
         "remote_control": remote_control_transport_json(cfg),
         "lifecycle_hooks": lifecycle_hooks_json(cfg),
         "worktree_identity": worktree_identity_json(),
