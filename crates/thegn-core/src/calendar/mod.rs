@@ -32,7 +32,7 @@ pub use cursor::{CalCursor, CalNav};
 pub use grid::{DayCell, MonthGrid, WeekdayStyle, month_bounds, weekday_headers};
 pub use ics::{parse_ics, parse_ics_admitted, parse_ics_window};
 pub use locale::{resolve_time_format, resolve_week_start};
-pub use recur::{ByDay, Freq, RRule, RecurError, Recurrence};
+pub use recur::{ByDay, Freq, RRule, RecurError, Recurrence, UntilForm};
 pub use reminders::{DueReminder, next_event};
 pub use tz::{
     ClockFormat, ClockReading, GapPolicy, ResolvedClock, TzRef, read_clocks, resolve_zone,
@@ -901,7 +901,8 @@ impl CalEvent {
         let Some(seed) = recur::seed_of(&self.start, home) else {
             return Err(ExpansionError::InvalidSpan);
         };
-        let locals = recur::expand_local_bounded(rec, seed, rec_from, rec_to, budget)?;
+        let zone = Some(recur::series_zone(&self.start, home));
+        let locals = recur::expand_local_in(rec, seed, zone, rec_from, rec_to, budget)?;
         let mut out = Vec::new();
         for local in locals {
             // One transient instance at a time: nothing is retained (or

@@ -64,6 +64,20 @@ pub struct ByDay {
     pub weekday: Weekday,
 }
 
+/// The RFC 5545 value type an `UNTIL` was written in. It must be remembered:
+/// a `DATE` bound covers its whole day, a `UTC` bound is an absolute instant,
+/// and a floating bound is a wall time in the series' own zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UntilForm {
+    /// `UNTIL=20260821` — inclusive of that entire day.
+    Date,
+    /// `UNTIL=20260821T093000` — floating local time.
+    Floating,
+    /// `UNTIL=20260821T093000Z` — an absolute instant.
+    #[default]
+    Utc,
+}
+
 /// A parsed `RRULE`.
 ///
 /// Every `BY*` part is stored even when the expander doesn't act on it, so a
@@ -77,6 +91,9 @@ pub struct RRule {
     pub interval: u32,
     pub count: Option<u32>,
     pub until: Option<NaiveDateTime>,
+    /// The value type `until` was written in (meaningless while `until` is
+    /// `None`); drives both round-tripping and how the bound is compared.
+    pub until_form: UntilForm,
     pub by_second: Vec<u32>,
     pub by_minute: Vec<u32>,
     pub by_hour: Vec<u32>,
@@ -96,6 +113,7 @@ impl Default for RRule {
             interval: 1,
             count: None,
             until: None,
+            until_form: UntilForm::Utc,
             by_second: Vec::new(),
             by_minute: Vec::new(),
             by_hour: Vec::new(),
@@ -320,6 +338,7 @@ impl RRule {
                     r.until = Some(
                         parse_ics_datetime(v).ok_or_else(|| RecurError::BadValue(v.to_string()))?,
                     );
+                    r.until_form = until_form_of(v);
                 }
                 "BYSECOND" => r.by_second = checked_list("BYSECOND", v, 60, false)?,
                 "BYMINUTE" => r.by_minute = checked_list("BYMINUTE", v, 59, false)?,
@@ -354,7 +373,12 @@ impl RRule {
             parts.push(format!("COUNT={c}"));
         }
         if let Some(u) = self.until {
-            parts.push(format!("UNTIL={}", u.format("%Y%m%dT%H%M%SZ")));
+            let fmt = match self.until_form {
+                UntilForm::Date => "%Y%m%d",
+                UntilForm::Floating => "%Y%m%dT%H%M%S",
+                UntilForm::Utc => "%Y%m%dT%H%M%SZ",
+            };
+            parts.push(format!("UNTIL={}", u.format(fmt)));
         }
         let list = |name: &str, v: &[u32]| {
             (!v.is_empty()).then(|| {
@@ -431,6 +455,36 @@ fn wd_str(w: Weekday) -> &'static str {
     }
 }
 
+/// Which RFC 5545 value type an `UNTIL` string is: no `T` is a `DATE`, a
+/// trailing `Z` is UTC, anything else is floating.
+fn until_form_of(v: &str) -> UntilForm {
+    let t = v.trim();
+    if !t.contains('T') {
+        UntilForm::Date
+    } else if t.ends_with('Z') {
+        UntilForm::Utc
+    } else {
+        UntilForm::Floating
+    }
+}
+
+/// The `UNTIL` bound as a local wall time in the series zone, inclusive.
+///
+/// A `DATE` bound covers its whole day (so a 09:00 occurrence on the UNTIL
+/// date is kept); a `UTC` bound is converted into `zone` so it compares as the
+/// instant it names; a floating bound is already local.
+fn until_bound(r: &RRule, zone: Option<chrono_tz::Tz>) -> Option<NaiveDateTime> {
+    let u = r.until?;
+    Some(match r.until_form {
+        UntilForm::Date => u.date().and_hms_opt(23, 59, 59).unwrap_or(u),
+        UntilForm::Floating => u,
+        UntilForm::Utc => match zone {
+            Some(z) => u.and_utc().with_timezone(&z).naive_local(),
+            None => u,
+        },
+    })
+}
+
 /// Parse an iCalendar `DATE` or `DATE-TIME` (`20260821`, `20260821T093000`,
 /// `20260821T093000Z`).
 pub fn parse_ics_datetime(s: &str) -> Option<NaiveDateTime> {
@@ -488,6 +542,21 @@ pub fn expand_local_bounded(
     to: NaiveDate,
     budget: &mut ExpansionBudget,
 ) -> Result<Vec<NaiveDateTime>, ExpansionError> {
+    expand_local_in(rec, start, None, from, to, budget)
+}
+
+/// [`expand_local_bounded`] with the series' zone, so absolute values keep
+/// their meaning: a UTC `UNTIL`, `RDATE` or `EXDATE` is converted into `zone`
+/// (not read as a wall time), and a zoned one in a different zone is converted
+/// through its instant. `None` reads instants as UTC wall times.
+pub fn expand_local_in(
+    rec: &Recurrence,
+    start: NaiveDateTime,
+    zone: Option<chrono_tz::Tz>,
+    from: NaiveDate,
+    to: NaiveDate,
+    budget: &mut ExpansionBudget,
+) -> Result<Vec<NaiveDateTime>, ExpansionError> {
     if from > to {
         return Err(ExpansionError::InvalidWindow);
     }
@@ -500,11 +569,13 @@ pub fn expand_local_bounded(
     budget.recurrence_work(listed)?;
     let mut out: BTreeSet<NaiveDateTime> = BTreeSet::new();
     for rule in &rec.rules {
-        out.extend(expand_rule(rule, start, from, to, budget)?);
+        let mut eff = rule.clone();
+        eff.until = until_bound(rule, zone);
+        out.extend(expand_rule(&eff, start, from, to, budget)?);
     }
     // RDATEs are additional occurrences, independent of any rule.
     for r in &rec.rdates {
-        if let Some(dt) = local_of(r)
+        if let Some(dt) = local_of(r, zone)
             && dt.date() >= from
             && dt.date() <= to
         {
@@ -516,16 +587,49 @@ pub fn expand_local_bounded(
         out.insert(start);
     }
     // EXDATE matches the recurrence-id — the LOCAL value — not the instant.
-    let ex: BTreeSet<NaiveDateTime> = rec.exdates.iter().filter_map(local_of).collect();
-    Ok(out.into_iter().filter(|d| !ex.contains(d)).collect())
+    // A DATE exclusion removes every occurrence on that day; a date-time one
+    // matches the exact recurrence-id.
+    let mut ex: BTreeSet<NaiveDateTime> = BTreeSet::new();
+    let mut ex_days: BTreeSet<NaiveDate> = BTreeSet::new();
+    for t in &rec.exdates {
+        if let EventTime::Date { date } = t {
+            ex_days.insert(*date);
+        } else if let Some(dt) = local_of(t, zone) {
+            ex.insert(dt);
+        }
+    }
+    Ok(out
+        .into_iter()
+        .filter(|d| !ex.contains(d) && !ex_days.contains(&d.date()))
+        .collect())
 }
 
-/// The local wall time an `EventTime` denotes, for EXDATE/RDATE matching.
-fn local_of(t: &EventTime) -> Option<NaiveDateTime> {
+/// The wall time in the series zone an `EventTime` denotes, for
+/// EXDATE/RDATE matching. An instant is converted into `zone` (UTC when the
+/// series has none); a zoned time in another known zone goes through its
+/// instant; a zoned time in the series zone (or an unknown one) is itself.
+fn local_of(t: &EventTime, zone: Option<chrono_tz::Tz>) -> Option<NaiveDateTime> {
     match t {
         EventTime::Date { date } => date.and_hms_opt(0, 0, 0),
-        EventTime::Zoned { local, .. } => Some(*local),
-        EventTime::Instant { at } => Some(at.naive_utc()),
+        EventTime::Zoned { local, zone: z } => match (z.resolve(), zone) {
+            (Some(from), Some(to)) if from != to => {
+                let at = super::tz::resolve_local(*local, from, super::GapPolicy::ShiftForward)?;
+                Some(at.with_timezone(&to).naive_local())
+            }
+            _ => Some(*local),
+        },
+        EventTime::Instant { at } => Some(match zone {
+            Some(z) => at.with_timezone(&z).naive_local(),
+            None => at.naive_utc(),
+        }),
+    }
+}
+
+/// The zone a series' wall times live in: its own `TZID`, else `home`.
+pub(crate) fn series_zone(start: &EventTime, home: chrono_tz::Tz) -> chrono_tz::Tz {
+    match start {
+        EventTime::Zoned { zone, .. } => zone.resolve().unwrap_or(home),
+        _ => home,
     }
 }
 
@@ -1199,14 +1303,21 @@ pub fn occurrences(
     let Some(seed) = seed_of(start, home) else {
         return Vec::new();
     };
-    expand_local_bounded(rec, seed, from, to, &mut budget)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|local| instance_time(local, start, home))
-        // Under `GapPolicy::Skip` an occurrence that falls in a spring-forward
-        // gap genuinely does not happen, so it is dropped rather than nudged.
-        .filter(|t| t.is_all_day() || t.instant_in(home, gap).is_some())
-        .collect()
+    expand_local_in(
+        rec,
+        seed,
+        Some(series_zone(start, home)),
+        from,
+        to,
+        &mut budget,
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .map(|local| instance_time(local, start, home))
+    // Under `GapPolicy::Skip` an occurrence that falls in a spring-forward
+    // gap genuinely does not happen, so it is dropped rather than nudged.
+    .filter(|t| t.is_all_day() || t.instant_in(home, gap).is_some())
+    .collect()
 }
 
 #[cfg(test)]
