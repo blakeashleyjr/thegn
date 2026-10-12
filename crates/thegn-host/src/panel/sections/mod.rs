@@ -491,24 +491,36 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             if q.is_empty() {
                 vec![seg(g2(), "—")]
             } else {
-                let landed = q.iter().filter(|r| r.status == "landed").count();
-                let deferred = q
-                    .iter()
-                    .filter(|r| r.status == "deferred" || r.status == "gate_failed")
-                    .count();
-                let active = q
-                    .iter()
-                    .filter(|r| matches!(r.status.as_str(), "queued" | "folding" | "verifying"))
-                    .count();
+                let mut landed = 0;
+                let mut held = 0;
+                let mut active = 0;
+                for row in q {
+                    match thegn_core::attention::MqStatus::parse(&row.status) {
+                        Some(status) => match status {
+                            thegn_core::attention::MqStatus::Landed => landed += 1,
+                            thegn_core::attention::MqStatus::Deferred
+                            | thegn_core::attention::MqStatus::GateFailed
+                            | thegn_core::attention::MqStatus::GateError
+                            | thegn_core::attention::MqStatus::AgentBlocked
+                            | thegn_core::attention::MqStatus::NeedsHuman => held += 1,
+                            thegn_core::attention::MqStatus::Queued
+                            | thegn_core::attention::MqStatus::Folding
+                            | thegn_core::attention::MqStatus::Verifying
+                            | thegn_core::attention::MqStatus::AgentRunning
+                            | thegn_core::attention::MqStatus::Ready => active += 1,
+                        },
+                        None => held += 1,
+                    }
+                }
                 let mut v: Vec<crate::seg::Seg> = Vec::new();
                 if landed > 0 {
                     v.push(seg(hue(Hue::Green), format!("✓{landed}")));
                 }
-                if deferred > 0 {
+                if held > 0 {
                     if !v.is_empty() {
                         v.push(seg(g(), " "));
                     }
-                    v.push(seg(hue(Hue::Red), format!("⚑{deferred}")));
+                    v.push(seg(hue(Hue::Red), format!("⚑{held}")));
                 }
                 if active > 0 {
                     if !v.is_empty() {
@@ -1382,6 +1394,43 @@ mod spec {
         m.panel.alert_notifications = 1;
         let s = seg_text(&summary(Section::Notifications, &m));
         assert_eq!(s, "⚑ 1");
+    }
+
+    #[test]
+    fn merge_queue_summary_classifies_typed_statuses_and_unknowns() {
+        let seg_text = |segs: &[Seg]| segs.iter().map(|s| s.text.clone()).collect::<String>();
+        let mut model = FrameModel::default();
+        let row = |status: &str| thegn_core::db::MergeQueueRow {
+            worktree: "/repo/branch".into(),
+            branch: "branch".into(),
+            target_branch: "main".into(),
+            status: status.into(),
+            queued_at: 1,
+            updated_at: 1,
+            result_oid: None,
+            conflict_paths: None,
+            error_detail: None,
+            location: String::new(),
+            agent_attempts: 0,
+        };
+
+        model.panel.merge_queue = vec![row("needs_human")];
+        assert_eq!(seg_text(&summary(Section::MergeQueue, &model)), "⚑1");
+
+        model.panel.merge_queue = vec![row("agent_blocked"), row("gate_error")];
+        assert_eq!(seg_text(&summary(Section::MergeQueue, &model)), "⚑2");
+
+        model.panel.merge_queue = vec![row("agent_running")];
+        assert_eq!(seg_text(&summary(Section::MergeQueue, &model)), "●1");
+
+        for status in thegn_core::attention::MqStatus::ALL {
+            model.panel.merge_queue = vec![row(status.as_str())];
+            let rendered = seg_text(&summary(Section::MergeQueue, &model));
+            assert_ne!(rendered, "—", "status {} was hidden", status.as_str());
+        }
+
+        model.panel.merge_queue = vec![row("future_state")];
+        assert_eq!(seg_text(&summary(Section::MergeQueue, &model)), "⚑1");
     }
 
     #[test]
