@@ -364,36 +364,28 @@ pub fn index_symbol_matches(
 mod tests {
     use super::*;
     use std::fs;
-    use std::process::Output;
+    use std::process::ExitStatus;
 
-    fn git(root: &Path, args: &[&str]) -> Output {
+    fn git(root: &Path, args: &[&str]) -> ExitStatus {
         thegn_core::util::git_cmd(root)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(["-c", "commit.gpgsign=false"])
             .args(args)
-            .output()
+            .status()
             .unwrap()
     }
 
     #[test]
     fn crawl_prunes_git_removed_file_and_keeps_other_entities() {
         let temp = tempfile::tempdir().unwrap();
-        assert!(git(temp.path(), &["init", "-q"]).status.success());
+        assert!(git(temp.path(), &["init", "-q"]).success());
         let root = fs::canonicalize(temp.path()).unwrap();
-        assert!(
-            git(&root, &["config", "user.name", "Semantic Test"])
-                .status
-                .success()
-        );
-        assert!(
-            git(&root, &["config", "user.email", "semantic@example.invalid"])
-                .status
-                .success()
-        );
+        assert!(git(&root, &["config", "user.name", "Semantic Test"]).success());
+        assert!(git(&root, &["config", "user.email", "semantic@example.invalid"]).success());
         fs::write(root.join("a.rs"), "pub fn alpha() {}\n").unwrap();
         fs::write(root.join("b.rs"), "pub fn beta() {}\n").unwrap();
-        assert!(git(&root, &["add", "a.rs", "b.rs"]).status.success());
-        assert!(git(&root, &["commit", "-qm", "seed"]).status.success());
+        assert!(git(&root, &["add", "a.rs", "b.rs"]).success());
+        assert!(git(&root, &["commit", "-qm", "seed"]).success());
 
         let db = Db::open_memory().unwrap();
         let first = crawl_worktree(&root, 100, &db);
@@ -403,8 +395,8 @@ mod tests {
         assert!(initial.iter().any(|entity| entity.file.ends_with("/a.rs")));
         assert!(initial.iter().any(|entity| entity.file.ends_with("/b.rs")));
 
-        assert!(git(&root, &["rm", "-q", "b.rs"]).status.success());
-        assert!(git(&root, &["commit", "-qm", "remove b"]).status.success());
+        assert!(git(&root, &["rm", "-q", "b.rs"]).success());
+        assert!(git(&root, &["commit", "-qm", "remove b"]).success());
         let second = crawl_worktree(&root, 100, &db);
         assert!(
             second.changed,
