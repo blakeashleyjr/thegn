@@ -804,6 +804,105 @@ impl GitLoc {
         }
     }
 
+    /// Replace a gitdir file only while its exact current bytes still match
+    /// `expected`. The file must already exist.
+    pub fn write_git_path_if_unchanged(
+        &self,
+        rel: &str,
+        expected: &[u8],
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        let p = self
+            .resolve_git_path(rel)
+            .ok_or_else(|| std::io::Error::other(format!("cannot resolve git path {rel:?}")))?;
+        if let GitLoc::Local(_) = self {
+            let path = Path::new(&p);
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(std::io::Error::other(format!(
+                        "refusing to write git path {rel:?} through a symlink"
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) => return Err(error),
+            }
+            let nonce = GIT_PATH_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+            let temporary =
+                PathBuf::from(format!("{}.thegn-tmp.{}.{}", p, std::process::id(), nonce));
+            crate::fsperm::write_owner_only_new(&temporary, bytes)?;
+            let result = (|| {
+                let mut current = crate::fsperm::open_regular_file_nofollow(path)?;
+                let mut current_bytes = Vec::new();
+                std::io::Read::read_to_end(&mut current, &mut current_bytes)?;
+                if current_bytes != expected {
+                    return Err(std::io::Error::other(format!(
+                        "git path {rel:?} changed on disk"
+                    )));
+                }
+                crate::fsperm::rename_replace(&temporary, path)
+            })();
+            if let Err(error) = &result {
+                tracing::debug!(target: "thegn::remote", %error, "conditional git path replacement failed");
+                match std::fs::remove_file(&temporary) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::remote", %error, "could not remove temporary conditional git path write");
+                    }
+                }
+            }
+            return result;
+        }
+
+        let expected_len = expected.len();
+        let script = cas_git_path_write_script(&p, expected_len);
+        let mut cmd = match self {
+            GitLoc::Remote { ssh, .. } => {
+                self.ssh_command(ssh, cas_git_path_write_ssh_command(&p, expected_len))
+            }
+            GitLoc::Provider { control_prefix, .. } => {
+                self.provider_command(control_prefix, script)
+            }
+            GitLoc::Local(_) => unreachable!("handled above"),
+        };
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn()?;
+        let write_result = match child.stdin.take() {
+            Some(mut sink) => {
+                let mut result = std::io::Write::write_all(&mut sink, expected);
+                if result.is_ok() {
+                    result = std::io::Write::write_all(&mut sink, bytes);
+                }
+                result
+            }
+            None => Err(std::io::Error::other("git path writer has no stdin pipe")),
+        };
+        if let Err(error) = write_result {
+            reap_child(&mut child);
+            return Err(error);
+        }
+        let status = match child.wait() {
+            Ok(status) => status,
+            Err(error) => {
+                reap_child(&mut child);
+                return Err(error);
+            }
+        };
+        if status.success() {
+            Ok(())
+        } else if status.code() == Some(42) {
+            Err(std::io::Error::other(format!(
+                "git path {rel:?} changed on disk"
+            )))
+        } else {
+            Err(std::io::Error::other(format!(
+                "conditional write of git path {rel:?} failed"
+            )))
+        }
+    }
+
     /// Run a git command, returning trimmed stdout on success (None otherwise).
     pub fn git_out(&self, args: &[&str]) -> Option<String> {
         let out = self.git_command(args).output().ok()?;
@@ -929,6 +1028,26 @@ fn atomic_git_path_write_script(path: &str) -> String {
 
 fn atomic_git_path_write_ssh_command(path: &str) -> String {
     let script = atomic_git_path_write_script(path);
+    format!("sh -c {}", util::sh_quote(&script))
+}
+
+fn cas_git_path_write_script(path: &str, expected_len: usize) -> String {
+    let quoted = util::sh_quote(path);
+    format!(
+        "set -C; umask 077; p={quoted}; e=\"$p.thegn-cas.$$\"; t=\"$p.thegn-tmp.$$\"; \
+         [ ! -L \"$p\" ] && [ ! -d \"$p\" ] && [ -e \"$p\" ] || exit 1; \
+         ce=0; ct=0; trap 'if [ \"$ce\" = 1 ]; then rm -f -- \"$e\"; fi; if [ \"$ct\" = 1 ]; then rm -f -- \"$t\"; fi' 0; \
+         trap 'exit 1' HUP INT TERM; : > \"$e\" || exit 1; ce=1; : > \"$t\" || exit 1; ct=1; \
+         set +C; dd bs=1 count={expected_len} 2>/dev/null > \"$e\" || exit 1; \
+         [ \"$(wc -c < \"$e\")\" -eq {expected_len} ] || exit 1; cat > \"$t\" || exit 1; \
+         cmp -s -- \"$e\" \"$p\"; cmp_status=$?; \
+         if [ \"$cmp_status\" -eq 1 ]; then exit 42; fi; \
+         [ \"$cmp_status\" -eq 0 ] || exit 1; mv -f -- \"$t\" \"$p\""
+    )
+}
+
+fn cas_git_path_write_ssh_command(path: &str, expected_len: usize) -> String {
+    let script = cas_git_path_write_script(path, expected_len);
     format!("sh -c {}", util::sh_quote(&script))
 }
 
@@ -1089,6 +1208,13 @@ mod tests {
         assert_eq!(command, format!("sh -c {}", util::sh_quote(script)));
     }
 
+    #[test]
+    fn ssh_cas_write_script_is_explicitly_run_by_posix_shell() {
+        let command = cas_git_path_write_ssh_command("/work tree/todo", 7);
+        let script = "set -C; umask 077; p='/work tree/todo'; e=\"$p.thegn-cas.$$\"; t=\"$p.thegn-tmp.$$\"; [ ! -L \"$p\" ] && [ ! -d \"$p\" ] && [ -e \"$p\" ] || exit 1; ce=0; ct=0; trap 'if [ \"$ce\" = 1 ]; then rm -f -- \"$e\"; fi; if [ \"$ct\" = 1 ]; then rm -f -- \"$t\"; fi' 0; trap 'exit 1' HUP INT TERM; : > \"$e\" || exit 1; ce=1; : > \"$t\" || exit 1; ct=1; set +C; dd bs=1 count=7 2>/dev/null > \"$e\" || exit 1; [ \"$(wc -c < \"$e\")\" -eq 7 ] || exit 1; cat > \"$t\" || exit 1; cmp -s -- \"$e\" \"$p\"; cmp_status=$?; if [ \"$cmp_status\" -eq 1 ]; then exit 42; fi; [ \"$cmp_status\" -eq 0 ] || exit 1; mv -f -- \"$t\" \"$p\"";
+        assert_eq!(command, format!("sh -c {}", util::sh_quote(script)));
+    }
+
     fn provider_repo() -> (tempfile::TempDir, GitLoc) {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1101,6 +1227,99 @@ mod tests {
         assert!(init.success());
         let loc = GitLoc::provider(vec!["env".into()], dir.path().to_string_lossy());
         (dir, loc)
+    }
+
+    fn assert_no_cas_write_temps(gitdir: &Path) {
+        let leftovers = std::fs::read_dir(gitdir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.contains(".thegn-tmp.") || name.contains(".thegn-cas.")
+            })
+            .count();
+        assert_eq!(leftovers, 0, "temporary git path files were left behind");
+    }
+
+    #[test]
+    fn provider_conditional_write_replaces_only_matching_bytes_and_cleans_temps() {
+        let (dir, loc) = provider_repo();
+        let gitdir = dir.path().join(".git");
+        let target = gitdir.join("cas-target");
+        std::fs::write(&target, b"old").unwrap();
+        loc.write_git_path_if_unchanged("cas-target", b"old", b"new value")
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new value");
+        assert_no_cas_write_temps(&gitdir);
+    }
+
+    #[test]
+    fn provider_conditional_write_rejects_stale_bytes_without_changes_or_temps() {
+        let (dir, loc) = provider_repo();
+        let gitdir = dir.path().join(".git");
+        let target = gitdir.join("cas-target");
+        std::fs::write(&target, b"newer on disk").unwrap();
+        let error = loc
+            .write_git_path_if_unchanged("cas-target", b"old", b"replacement")
+            .expect_err("a stale expected value must be rejected");
+        assert!(error.to_string().contains("changed on disk"), "{error}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"newer on disk");
+        assert_no_cas_write_temps(&gitdir);
+    }
+
+    #[test]
+    fn provider_conditional_write_rejects_absent_and_symlink_targets() {
+        let (dir, loc) = provider_repo();
+        let gitdir = dir.path().join(".git");
+        assert!(
+            loc.write_git_path_if_unchanged("absent", b"old", b"replacement")
+                .is_err()
+        );
+        let outside = dir.path().join("outside-cas");
+        std::fs::write(&outside, b"protected").unwrap();
+        let link = gitdir.join("cas-link");
+        crate::fsperm::create_symlink(&outside, &link, false).unwrap();
+        assert!(
+            loc.write_git_path_if_unchanged("cas-link", b"protected", b"replacement")
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"protected");
+        assert_no_cas_write_temps(&gitdir);
+    }
+
+    #[test]
+    fn local_conditional_write_replaces_matching_bytes_and_rejects_stale_absent_and_symlink() {
+        let (dir, _) = provider_repo();
+        let gitdir = dir.path().join(".git");
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+        let target = gitdir.join("local-cas-target");
+        std::fs::write(&target, b"old").unwrap();
+        loc.write_git_path_if_unchanged("local-cas-target", b"old", b"replacement")
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+
+        std::fs::write(&target, b"newer on disk").unwrap();
+        assert!(
+            loc.write_git_path_if_unchanged("local-cas-target", b"old", b"replacement")
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"newer on disk");
+        assert!(
+            loc.write_git_path_if_unchanged("local-absent", b"old", b"replacement")
+                .is_err()
+        );
+
+        let outside = dir.path().join("outside-local-cas");
+        std::fs::write(&outside, b"protected").unwrap();
+        let link = gitdir.join("local-cas-link");
+        crate::fsperm::create_symlink(&outside, &link, false).unwrap();
+        assert!(
+            loc.write_git_path_if_unchanged("local-cas-link", b"protected", b"replacement")
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"protected");
+        assert_no_cas_write_temps(&gitdir);
     }
 
     #[test]
