@@ -1831,7 +1831,7 @@ impl LspClient {
     fn connect(
         reader: Box<dyn Read + Send>,
         writer: Box<dyn Write + Send>,
-        child: Option<Child>,
+        mut child: Option<Child>,
         root: &Path,
         language_id: String,
         diag_tx: DiagnosticsSender,
@@ -2844,6 +2844,7 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         let heartbeat = root.path().join("heartbeat.txt");
+        std::fs::write(&heartbeat, b"").unwrap();
         let (diagnostics, _) = diagnostics_channel();
         let generation = diagnostics.register(root.path(), "heartbeat").unwrap();
 
@@ -2855,6 +2856,32 @@ mod tests {
             "heartbeat".into(),
             generation,
             fail_lsp_thread_spawn,
+        );
+
+        assert!(matches!(result, Err(LspError::Spawn(_))));
+        assert_heartbeat_stopped(&heartbeat);
+        assert!(!diagnostics.is_current(root.path(), "heartbeat", generation));
+    }
+
+    #[test]
+    fn reader_spawn_failure_reaps_server_and_retires_generation() {
+        if !Path::new("/bin/sh").is_file() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let heartbeat = root.path().join("heartbeat.txt");
+        std::fs::write(&heartbeat, b"").unwrap();
+        let (diagnostics, _) = diagnostics_channel();
+        let generation = diagnostics.register(root.path(), "heartbeat").unwrap();
+
+        let result = LspClient::start_argv_with_context_and_spawner(
+            &heartbeat_argv(&heartbeat),
+            "fixture",
+            root.path(),
+            diagnostics.clone(),
+            "heartbeat".into(),
+            generation,
+            fail_lsp_reader_spawn,
         );
 
         assert!(matches!(result, Err(LspError::Spawn(_))));
