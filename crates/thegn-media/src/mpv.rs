@@ -21,6 +21,7 @@ pub struct MpvIpc {
 }
 
 /// Longest player-supplied reason kept in an error message.
+#[cfg_attr(not(unix), allow(dead_code))]
 const MAX_REASON: usize = 120;
 
 /// Per-request ceiling: a wedged mpv must not hang the poller.
@@ -34,6 +35,7 @@ fn is_absent_error(reason: &str) -> bool {
 }
 
 /// Strip control characters and bound the length of a player-supplied reason.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn sanitize_reason(reason: &str) -> String {
     reason
         .chars()
@@ -43,6 +45,7 @@ fn sanitize_reason(reason: &str) -> String {
 }
 
 /// The decoded reply to one IPC request.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug)]
 enum Reply {
     /// `error == "success"` with a `data` field.
@@ -54,6 +57,7 @@ enum Reply {
 }
 
 /// Decode a reply line already matched to our request id.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn decode_reply(msg: &Value) -> Result<Reply, MediaError> {
     match msg.get("error").and_then(Value::as_str) {
         Some("success") => Ok(match msg.get("data") {
@@ -147,8 +151,14 @@ impl MpvIpc {
             if n == 0 {
                 return Err(MediaError::Backend("mpv closed the socket".into()));
             }
-            let Ok(msg) = serde_json::from_str::<Value>(buf.trim()) else {
-                continue;
+            let msg = match serde_json::from_str::<Value>(buf.trim()) {
+                Ok(msg) => msg,
+                Err(_) if buf.contains("request_id") => {
+                    return Err(MediaError::Backend(
+                        "malformed mpv reply for request".into(),
+                    ));
+                }
+                Err(_) => continue,
             };
             // Skip async event lines; wait for our reply.
             if msg.get("request_id") == Some(&json!(1)) {
@@ -417,6 +427,19 @@ impl MediaBackend for MpvIpc {
                         "mpv playlist changed; stale queue selection".into(),
                     ));
                 }
+            } else {
+                // Legacy ids carry only an index, so still reject stale or
+                // out-of-range selections before writing playlist-pos.
+                let count = self
+                    .get("playlist-count")
+                    .await?
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| MediaError::Backend("mpv playlist count unavailable".into()))?;
+                if count <= 0 || idx >= count as usize {
+                    return Err(MediaError::Backend(
+                        "mpv playlist index out of range".into(),
+                    ));
+                }
             }
             self.command(json!(["set_property", "playlist-pos", idx as i64]))
                 .await
@@ -645,6 +668,14 @@ mod socket_tests {
     }
 
     #[tokio::test]
+    async fn malformed_reply_with_request_id_fails_immediately() {
+        let (_d, mpv, _s) = serve(|_| Some(vec![r#"{"request_id": 1, broken"#.into()]));
+        assert!(
+            matches!(mpv.next().await, Err(MediaError::Backend(message)) if message.contains("malformed"))
+        );
+    }
+
+    #[tokio::test]
     async fn reply_without_error_field_is_malformed() {
         let (_d, mpv, _s) = serve(|_| Some(vec![json!({"request_id": 1}).to_string()]));
         assert!(matches!(mpv.next().await, Err(MediaError::Backend(_))));
@@ -804,6 +835,33 @@ mod socket_tests {
             &json!(["set_property", "playlist-pos", 1])
         );
         assert!(mpv.play_queue_item("nope").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_queue_index_is_checked_against_playlist_count() {
+        let (_d, mpv, seen) = serve(|cmd| {
+            if cmd[0] == "get_property" && cmd[1] == "playlist-count" {
+                Some(vec![ok(json!(3))])
+            } else {
+                Some(vec![ok_nodata()])
+            }
+        });
+        assert!(matches!(
+            mpv.play_queue_item("3").await,
+            Err(MediaError::Backend(message)) if message.contains("out of range")
+        ));
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|command| command[0] != "set_property")
+        );
+
+        mpv.play_queue_item("2").await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap().last().unwrap(),
+            &json!(["set_property", "playlist-pos", 2])
+        );
     }
 
     #[tokio::test]
