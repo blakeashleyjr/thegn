@@ -80,7 +80,9 @@ pub(crate) fn fold_month(
         return;
     }
     if let Some(month) = &payload.events {
-        events.retain(|date, _| *date < payload.covered.0 || *date > payload.covered.1);
+        if payload.error.is_none() {
+            events.retain(|date, _| *date < payload.covered.0 || *date > payload.covered.1);
+        }
         for (date, evs) in month {
             events.insert(*date, evs.clone());
         }
@@ -330,6 +332,19 @@ mod tests {
         docs.merge(&payload(None, Some(failed)));
         assert_eq!(docs.events[&date].len(), 1);
         assert_eq!(docs.errors.get(&(2026, 8)), Some(&failed));
+    }
+
+    #[test]
+    fn incomplete_refresh_keeps_existing_dates_it_did_not_reach() {
+        let retained = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+        let mut docs = CalendarDocs::default();
+        docs.events.insert(retained, vec![event()]);
+
+        let incomplete = CalendarViewError::MalformedCache;
+        docs.merge(&payload(Some(Vec::new()), Some(incomplete)));
+
+        assert!(docs.events.contains_key(&retained));
+        assert_eq!(docs.errors.get(&(2026, 8)), Some(&incomplete));
     }
 
     #[test]

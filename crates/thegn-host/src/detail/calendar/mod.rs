@@ -365,7 +365,8 @@ pub fn apply_calendar(slot: &mut Option<super::DetailOverlay>, payload: Calendar
     if !crate::hydrate_calendar::calendar_payload_is_current(&payload) {
         return false;
     }
-    let periodic_refresh = payload.request.is_none() && c.st.loaded.contains(&payload.month);
+    let is_periodic = payload.request.is_none();
+    let periodic_refresh = is_periodic && c.st.loaded.contains(&payload.month);
     if c.st.pending != Some(payload.month) && !periodic_refresh {
         return false;
     }
@@ -375,7 +376,7 @@ pub fn apply_calendar(slot: &mut Option<super::DetailOverlay>, payload: Calendar
         &mut c.st.errors,
         &payload,
     );
-    if !periodic_refresh {
+    if !is_periodic {
         c.st.pending = None;
     }
     true
@@ -494,6 +495,29 @@ mod request_tests {
             };
             assert_eq!(calendar.st.pending, None);
         }
+    }
+
+    #[test]
+    fn periodic_delivery_does_not_clear_pending_navigation() {
+        let key = (2054, 5);
+        let request = crate::hydrate_calendar::register_month_request(key);
+        let mut slot = Some(overlay(key));
+        let mut periodic = payload(key, request);
+        periodic.request = None;
+
+        assert!(apply_calendar(&mut slot, periodic));
+        let super::super::DetailContent::Calendar(calendar) = &mut slot.as_mut().unwrap().content
+        else {
+            panic!("calendar overlay expected");
+        };
+        assert_eq!(calendar.st.pending, Some(key));
+
+        assert!(apply_calendar(&mut slot, payload(key, request)));
+        let super::super::DetailContent::Calendar(calendar) = &mut slot.as_mut().unwrap().content
+        else {
+            panic!("calendar overlay expected");
+        };
+        assert_eq!(calendar.st.pending, None);
     }
 }
 
