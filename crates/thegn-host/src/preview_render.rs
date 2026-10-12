@@ -75,25 +75,55 @@ pub fn notebook_lines(nb: &Notebook) -> Vec<String> {
     }
     let mut out = Vec::new();
     for (i, cell) in nb.cells.iter().enumerate() {
-        if i > 0 {
-            out.push(String::new());
+        if i > 0 && !push_notebook_line(&mut out, "") {
+            break;
         }
         let banner = match cell.kind {
             CellKind::Code => format!("── In [{}] ──────── code", i + 1),
             CellKind::Markdown => format!("── [{}] ─────────── markdown", i + 1),
             CellKind::Raw => format!("── [{}] ─────────── raw", i + 1),
         };
-        out.push(banner);
-        out.extend(cell.source.split('\n').map(str::to_string));
+        if !push_notebook_line(&mut out, &banner) {
+            break;
+        }
+        let mut truncated = false;
+        for line in cell.source.split('\n') {
+            if !push_notebook_line(&mut out, line) {
+                truncated = true;
+                break;
+            }
+        }
+        if truncated {
+            break;
+        }
         if cell.image_outputs > 0 {
             let n = cell.image_outputs;
             let plural = if n == 1 { "" } else { "s" };
-            out.push(format!(
-                "   [{n} image output{plural} — shown via graphics]"
-            ));
+            let note = format!("   [{n} image output{plural} — shown via graphics]");
+            if !push_notebook_line(&mut out, &note) {
+                break;
+            }
         }
     }
     out
+}
+
+/// Append a normalized line, replacing the last retained content line with a
+/// diagnostic marker if another line would exceed the shared preview cap.
+fn push_notebook_line(out: &mut Vec<String>, line: &str) -> bool {
+    if out.len() < crate::preview_pane::PREVIEW_MAX_LINES {
+        out.push(crate::preview_pane::bounded_line(line));
+        true
+    } else {
+        if let Some(last) = out.last_mut() {
+            *last = format!(
+                "{} (truncated at {} lines)",
+                crate::caps::active_glyphs().ellipsis,
+                crate::preview_pane::PREVIEW_MAX_LINES
+            );
+        }
+        false
+    }
 }
 
 #[cfg(test)]
@@ -169,5 +199,24 @@ mod tests {
     fn notebook_empty_is_placeholder() {
         let nb = Notebook { cells: vec![] };
         assert_eq!(notebook_lines(&nb), vec!["(empty notebook)".to_string()]);
+    }
+
+    #[test]
+    fn notebook_caps_source_lines_and_marks_truncation() {
+        let source = std::iter::repeat_n("x", 60_000)
+            .collect::<Vec<_>>()
+            .join("\\n");
+        let json = format!(r#"{{"cells":[{{"cell_type":"markdown","source":"{source}"}}]}}"#);
+        let nb = Notebook::parse(&json).unwrap();
+
+        let lines = notebook_lines(&nb);
+        assert!(lines.len() <= crate::preview_pane::PREVIEW_MAX_LINES);
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .starts_with(crate::caps::active_glyphs().ellipsis)
+        );
+        assert!(lines.last().unwrap().contains("truncated at 50000 lines"));
     }
 }
