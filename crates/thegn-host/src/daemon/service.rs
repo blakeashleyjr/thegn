@@ -29,6 +29,10 @@ use thegn_svc::git::{CliGit, CommitOps, GitBackend};
 use super::session::{IdleTransition, LiveMeta, ProbeReply, SessionMeta, SessionMsg};
 use super::tombstone::Tombstone;
 
+/// Normal actor teardown needs about 300 ms of PTY TERM grace, 2 s for
+/// recording finish, and 500 ms of output drain; the rest is scheduling slack.
+const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// One live session in the daemon's table.
 pub(crate) struct SessionEntry {
     pub msg_tx: mpsc::Sender<SessionMsg>,
@@ -120,6 +124,7 @@ impl DaemonService {
     pub(crate) async fn shutdown_sessions(&self) {
         self.accepting
             .store(false, std::sync::atomic::Ordering::Release);
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_DEADLINE;
         let senders = self
             .sessions
             .lock()
@@ -127,15 +132,42 @@ impl DaemonService {
             .values()
             .map(|entry| entry.msg_tx.clone())
             .collect::<Vec<_>>();
-        for tx in senders {
-            let _ = tx.send(SessionMsg::Kill).await;
-        }
-        while !self.sessions.lock().await.is_empty() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let tasks = std::mem::take(&mut *self.actor_tasks.lock().await);
-        for task in tasks {
-            let _ = task.await;
+        let mut tasks = Vec::new();
+        let drain = tokio::time::timeout_at(deadline, async {
+            for tx in senders {
+                if let Err(error) = tx.send(SessionMsg::Kill).await {
+                    tracing::debug!(%error, "could not send session shutdown message");
+                }
+            }
+            while !self.sessions.lock().await.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            tasks = std::mem::take(&mut *self.actor_tasks.lock().await);
+            for task in &mut tasks {
+                if let Err(error) = task.await {
+                    tracing::debug!(%error, "session actor task ended during shutdown");
+                }
+            }
+        })
+        .await;
+        if drain.is_err() {
+            let mut late_tasks = std::mem::take(&mut *self.actor_tasks.lock().await);
+            tasks.append(&mut late_tasks);
+            let session_ids = self
+                .sessions
+                .lock()
+                .await
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            tracing::warn!(
+                ?session_ids,
+                "session shutdown drain deadline expired; aborting remaining actors"
+            );
+            for task in tasks {
+                task.abort();
+            }
+            self.sessions.lock().await.clear();
         }
     }
 }
@@ -2654,6 +2686,83 @@ impl ControlApi for DaemonService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shutdown_test_entry(msg_tx: mpsc::Sender<SessionMsg>) -> SessionEntry {
+        SessionEntry {
+            msg_tx,
+            meta: SessionMeta {
+                id: "s1".into(),
+                worktree: None,
+                program: "test".into(),
+                cwd: None,
+                created_at_ms: 0,
+                pid: None,
+                forked_from: None,
+            },
+            live: Arc::new(Mutex::new(LiveMeta {
+                rows: 24,
+                cols: 80,
+                attached: 0,
+                ..Default::default()
+            })),
+            recipe: None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_deadline_aborts_actor_when_kill_mailbox_is_full() {
+        let (svc, _rx) = service(0);
+        let (msg_tx, _msg_rx) = mpsc::channel(1);
+        assert!(msg_tx.try_send(SessionMsg::Kill).is_ok());
+        svc.sessions
+            .lock()
+            .await
+            .insert("s1".into(), shutdown_test_entry(msg_tx));
+
+        let (actor_dropped_tx, actor_dropped_rx) = oneshot::channel();
+        svc.actor_tasks.lock().await.push(tokio::spawn(async move {
+            let _actor_dropped_tx = actor_dropped_tx;
+            std::future::pending::<()>().await;
+        }));
+
+        let result = tokio::time::timeout(
+            SHUTDOWN_DRAIN_DEADLINE + std::time::Duration::from_secs(1),
+            svc.shutdown_sessions(),
+        )
+        .await;
+        assert!(result.is_ok(), "shutdown must return at its drain deadline");
+        assert!(svc.sessions.lock().await.is_empty());
+        assert!(
+            actor_dropped_rx.await.is_err(),
+            "the outstanding actor task must be aborted"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_drains_killed_actor_and_is_idempotent() {
+        let (svc, _rx) = service(0);
+        let (msg_tx, mut msg_rx) = mpsc::channel(1);
+        svc.sessions
+            .lock()
+            .await
+            .insert("s1".into(), shutdown_test_entry(msg_tx));
+
+        let sessions = Arc::clone(&svc.sessions);
+        svc.actor_tasks.lock().await.push(tokio::spawn(async move {
+            if matches!(msg_rx.recv().await, Some(SessionMsg::Kill)) {
+                sessions.lock().await.remove("s1");
+            }
+        }));
+
+        let started = tokio::time::Instant::now();
+        svc.shutdown_sessions().await;
+        assert!(tokio::time::Instant::now() - started < SHUTDOWN_DRAIN_DEADLINE);
+        assert!(svc.sessions.lock().await.is_empty());
+        assert!(!svc.accepting.load(std::sync::atomic::Ordering::Acquire));
+
+        svc.shutdown_sessions().await;
+        assert!(svc.sessions.lock().await.is_empty());
+    }
 
     #[test]
     fn concurrent_creates_of_one_name_get_distinct_branches_and_release_on_drop() {
