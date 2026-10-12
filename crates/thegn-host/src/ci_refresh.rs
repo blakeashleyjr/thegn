@@ -12,6 +12,102 @@ use std::sync::Mutex;
 use termwiz::terminal::TerminalWaker;
 
 const MAX_LOG_INGEST_CALLS: usize = 32;
+const MAX_INGEST_MEMO_ENTRIES: usize = 512;
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct IngestMemoKey {
+    worktree: String,
+    run: String,
+    job: String,
+    sha: String,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct IngestMemoEntry {
+    failures: u32,
+    backoff_until: i64,
+    touched: u64,
+    complete: bool,
+}
+
+#[derive(Default)]
+struct IngestMemo {
+    entries: HashMap<IngestMemoKey, IngestMemoEntry>,
+    clock: u64,
+}
+
+fn ingest_memo() -> &'static Mutex<IngestMemo> {
+    static MEMO: std::sync::OnceLock<Mutex<IngestMemo>> = std::sync::OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(IngestMemo::default()))
+}
+
+impl IngestMemo {
+    fn touch(&mut self, key: IngestMemoKey, now: i64, poll_secs: u64, failed: bool) {
+        self.clock = self.clock.wrapping_add(1);
+        let touched = self.clock;
+        let entry = self.entries.entry(key).or_insert(IngestMemoEntry {
+            failures: 0,
+            backoff_until: 0,
+            touched,
+            complete: false,
+        });
+        entry.touched = touched;
+        if failed {
+            entry.failures = entry.failures.saturating_add(1);
+            entry.backoff_until = thegn_core::time_policy::deadline_seconds(
+                now,
+                backoff_secs(entry.failures, poll_secs),
+            )
+            .unwrap_or(i64::MAX);
+        } else {
+            entry.failures = 0;
+            entry.backoff_until = 0;
+        }
+        if self.entries.len() > MAX_INGEST_MEMO_ENTRIES
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.touched)
+                .map(|(key, _)| key.clone())
+        {
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn blocked(&self, key: &IngestMemoKey, now: i64) -> bool {
+        self.entries
+            .get(key)
+            .is_some_and(|entry| !entry.complete && now < entry.backoff_until)
+    }
+
+    fn complete(&self, key: &IngestMemoKey) -> bool {
+        self.entries.get(key).is_some_and(|entry| entry.complete)
+    }
+
+    fn mark_complete(&mut self, key: IngestMemoKey) {
+        self.clock = self.clock.wrapping_add(1);
+        self.entries.insert(
+            key,
+            IngestMemoEntry {
+                failures: 0,
+                backoff_until: 0,
+                touched: self.clock,
+                complete: true,
+            },
+        );
+        if self.entries.len() > MAX_INGEST_MEMO_ENTRIES
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.touched)
+                .map(|(key, _)| key.clone())
+        {
+            self.entries.remove(&oldest);
+        }
+    }
+}
 
 #[derive(Debug)]
 struct CallBudget {
@@ -260,21 +356,6 @@ fn refresh_ci_cache_for(
             return false;
         }
     }
-    let mut old_cache = db
-        .get_ci_cache(&key)
-        .ok()
-        .flatten()
-        .and_then(|(json, _)| thegn_core::ci::decode_run_cache(&json))
-        .unwrap_or_default();
-    let old_count = old_cache.runs.len();
-    old_cache
-        .runs
-        .retain(|run| thegn_svc::ci::validate_ci_id(&run.id).is_ok());
-    old_cache.discarded_rows += old_count - old_cache.runs.len();
-    if old_cache.discarded_rows > 0 {
-        tracing::warn!(target: "thegn::ci", discarded_rows = old_cache.discarded_rows, "discarded malformed cached CI run rows");
-    }
-    let old_runs = old_cache.runs;
     let Some(client) = thegn_svc::ci::provider_for(loc, cfg) else {
         return false;
     };
@@ -312,20 +393,27 @@ fn refresh_ci_cache_for(
                     runs: runs.clone(),
                     discarded_rows: result.discarded_rows,
                 }) && crate::hydrate_schedule::generation_is_current(generation.as_ref())
+                    && let Err(error) =
+                        db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json)
                 {
-                    let _ = db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                    tracing::debug!(target: "thegn::ci", %error, "could not update cached CI runs");
                 }
-                ingest_failed_logs(
+                let mut ingest_budget = CallBudget {
+                    remaining: MAX_LOG_INGEST_CALLS,
+                };
+                ingest_failed_logs_with(IngestArgs {
                     host_path,
                     loc,
+                    client: client.as_ref(),
                     cfg,
                     full,
-                    &db,
-                    &runs,
-                    &old_runs,
+                    db: &db,
+                    runs: &runs,
+                    budget: &mut ingest_budget,
                     waker,
-                    generation.clone(),
-                );
+                    generation: generation.clone(),
+                    now: thegn_core::util::now(),
+                });
             }
         }
         Err(e) => {
@@ -348,33 +436,45 @@ fn refresh_ci_cache_for(
     }
     if crate::hydrate_schedule::generation_is_current(generation.as_ref())
         && let Some(w) = waker
+        && let Err(error) = w.wake()
     {
-        let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        tracing::debug!(target: "thegn::ci", %error, "could not wake after CI refresh");
     }
     true
 }
 
-/// Populate the redacted per-job cache after a successful run-history fetch.
-/// Only terminal failed runs and only the configured number of recent terminal
-/// runs are expanded. Existing entries for the same run/head are reused, so a
-/// normal poll does not repeatedly download unchanged logs.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the refresh worker passes its immutable policy and cache context explicitly"
-)]
-fn ingest_failed_logs(
-    host_path: &std::path::Path,
-    loc: &thegn_core::remote::GitLoc,
-    cfg: &thegn_core::config::CiConfig,
-    full: &thegn_core::config::Config,
-    db: &thegn_core::db::Db,
-    runs: &[thegn_core::ci::CiRun],
-    old_runs: &[thegn_core::ci::CiRun],
-    waker: Option<&TerminalWaker>,
+/// Inputs for one bounded log-ingestion pass, grouped so tests exercise the
+/// same provider, cache and budget path used by refreshes.
+struct IngestArgs<'a> {
+    host_path: &'a std::path::Path,
+    loc: &'a thegn_core::remote::GitLoc,
+    client: &'a dyn thegn_svc::ci::CiProvider,
+    cfg: &'a thegn_core::config::CiConfig,
+    full: &'a thegn_core::config::Config,
+    db: &'a thegn_core::db::Db,
+    runs: &'a [thegn_core::ci::CiRun],
+    budget: &'a mut CallBudget,
+    waker: Option<&'a TerminalWaker>,
     generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
-) {
+    now: i64,
+}
+
+fn ingest_failed_logs_with(args: IngestArgs<'_>) {
     use thegn_core::ci::CiState;
     use thegn_core::store::CacheStore;
+    let IngestArgs {
+        host_path,
+        loc,
+        client,
+        cfg,
+        full,
+        db,
+        runs,
+        budget,
+        waker,
+        generation,
+        now,
+    } = args;
     let log_cache_runs = cfg
         .log_cache_runs
         .min(thegn_core::config_ci::MAX_CI_LOG_CACHE_RUNS);
@@ -388,59 +488,144 @@ fn ingest_failed_logs(
         .map(|r| r.id.clone())
         .collect();
     let retained = thegn_core::ci_log::retained_run_ids(&terminal_ids, log_cache_runs);
-    let old_ids: std::collections::HashSet<&str> = old_runs.iter().map(|r| r.id.as_str()).collect();
-    let mut call_budget = CallBudget {
-        remaining: MAX_LOG_INGEST_CALLS,
-    };
-    'runs: for run in runs
+    let call_budget = budget;
+    let mut ordered: Vec<&thegn_core::ci::CiRun> = runs
         .iter()
         .filter(|r| retained.contains(&r.id) && r.state == CiState::Fail)
-    {
+        .collect();
+    ordered.sort_by_key(|run| {
+        let run_key = IngestMemoKey {
+            worktree: key.clone(),
+            run: run.id.clone(),
+            job: String::new(),
+            sha: run.sha.clone(),
+            started_at: run.started_at.clone(),
+            finished_at: run.finished_at.clone(),
+        };
+        let memo = match ingest_memo().lock() {
+            Ok(memo) => Some(memo),
+            Err(error) => {
+                tracing::debug!(target: "thegn::ci", %error, "could not inspect CI ingestion memo");
+                None
+            }
+        };
+        if memo.as_ref().is_some_and(|m| m.complete(&run_key)) {
+            (2_u8, 0_i64)
+        } else if memo.as_ref().is_some_and(|m| {
+            m.entries.keys().any(|k| {
+                k.worktree == key
+                    && k.run == run.id
+                    && k.sha == run.sha
+                    && k.started_at == run.started_at
+                    && k.finished_at == run.finished_at
+            })
+        }) {
+            (1_u8, 0_i64)
+        } else {
+            (0_u8, 0_i64)
+        }
+    });
+    'runs: for run in ordered {
         if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
             return;
         }
-        let Some(client) = thegn_svc::ci::provider_for(loc, cfg) else {
-            break;
+        let run_key = IngestMemoKey {
+            worktree: key.clone(),
+            run: run.id.clone(),
+            job: String::new(),
+            sha: run.sha.clone(),
+            started_at: run.started_at.clone(),
+            finished_at: run.finished_at.clone(),
         };
+        if ingest_memo()
+            .lock()
+            .ok()
+            .is_some_and(|memo| memo.complete(&run_key))
+        {
+            continue;
+        }
+        if ingest_memo().lock().ok().is_some_and(|memo| {
+            memo.entries.iter().any(|(memo_key, entry)| {
+                memo_key.worktree == key
+                    && memo_key.run == run.id
+                    && memo_key.sha == run.sha
+                    && memo_key.started_at == run.started_at
+                    && memo_key.finished_at == run.finished_at
+                    && !entry.complete
+                    && now < entry.backoff_until
+            })
+        }) {
+            continue;
+        }
         if !call_budget.take() {
             tracing::debug!(target: "thegn::ci", budget = MAX_LOG_INGEST_CALLS, "CI log ingestion provider-call budget exhausted");
             break;
         }
         let detail = match client.run_detail(loc, &run.id) {
             Ok(detail) => detail,
-            Err(_) => continue,
+            Err(_) => {
+                if let Ok(mut memo) = ingest_memo().lock() {
+                    memo.touch(run_key, now, cfg.poll_interval_secs, true);
+                }
+                continue;
+            }
         };
         if detail.discarded_jobs > 0 {
             tracing::warn!(target: "thegn::ci", discarded_rows = detail.discarded_jobs, "CI detail omitted malformed job rows");
             // A partial matrix is not enough evidence for log ingestion or an autofix handoff.
+            if let Ok(mut memo) = ingest_memo().lock() {
+                memo.touch(run_key, now, cfg.poll_interval_secs, true);
+            }
             continue;
         }
-        // A run first seen on this refresh gets priority, while a previously
-        // seen run is still expanded when its cache is cold or its head moved.
-        let _new_run = !old_ids.contains(run.id.as_str());
         // A large matrix must not turn one refresh into an unbounded provider
         // fan-out. Four-at-a-time was the old drill policy; the cache worker
         // keeps the same finite work shape with a hard per-run ceiling.
-        for job in detail
+        let failed_jobs: Vec<&thegn_core::ci::CiJob> = detail
             .run
             .jobs
             .iter()
             .filter(|j| j.state == CiState::Fail)
             .take(16)
-        {
-            let cached = db.get_ci_log(&key, &run.id, &job.id).ok().flatten();
-            if cached
-                .as_ref()
-                .is_some_and(|old| old.head_sha == run.sha && !old.text.is_empty())
+            .collect();
+        let mut run_complete = true;
+        for job in failed_jobs {
+            let job_key = IngestMemoKey {
+                worktree: key.clone(),
+                run: run.id.clone(),
+                job: job.id.clone(),
+                sha: run.sha.clone(),
+                started_at: run.started_at.clone(),
+                finished_at: run.finished_at.clone(),
+            };
+            if ingest_memo()
+                .lock()
+                .ok()
+                .is_some_and(|memo| memo.blocked(&job_key, now))
             {
+                run_complete = false;
+                continue;
+            }
+            let cached = db.get_ci_log(&key, &run.id, &job.id).ok().flatten();
+            if cached.as_ref().is_some_and(|old| old.head_sha == run.sha) {
+                if let Ok(mut memo) = ingest_memo().lock() {
+                    memo.touch(job_key, now, cfg.poll_interval_secs, false);
+                }
                 continue;
             }
             if !call_budget.take() {
                 tracing::debug!(target: "thegn::ci", budget = MAX_LOG_INGEST_CALLS, "CI log ingestion provider-call budget exhausted");
                 break 'runs;
             }
-            let Ok(log) = client.logs(loc, &run.id, &job.id) else {
-                continue;
+            let log = match client.logs(loc, &run.id, &job.id) {
+                Ok(log) => log,
+                Err(_) => {
+                    run_complete = false;
+                    if let Ok(mut memo) = ingest_memo().lock() {
+                        memo.touch(job_key, now, cfg.poll_interval_secs, true);
+                    }
+                    continue;
+                }
             };
             let mut entry = thegn_core::ci_log::CiLogEntry::new(
                 &key,
@@ -456,27 +641,329 @@ fn ingest_failed_logs(
             );
             entry.truncated |= log.truncated;
             entry.head_sha = run.sha.clone();
-            if crate::hydrate_schedule::generation_is_current(generation.as_ref())
-                && db.put_ci_log(&entry).is_ok()
-                && crate::hydrate_schedule::generation_is_current(generation.as_ref())
-            {
-                ci_autofix::consider(full, db, &entry);
+            if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                run_complete = false;
+                continue;
             }
+            match db.put_ci_log(&entry) {
+                Ok(()) if crate::hydrate_schedule::generation_is_current(generation.as_ref()) => {
+                    ci_autofix::consider(full, db, &entry);
+                    if let Ok(mut memo) = ingest_memo().lock() {
+                        memo.touch(job_key, now, cfg.poll_interval_secs, false);
+                    }
+                }
+                Ok(()) => run_complete = false,
+                Err(error) => {
+                    tracing::debug!(target: "thegn::ci", %error, "could not cache fetched CI log");
+                    run_complete = false;
+                }
+            }
+        }
+        if run_complete && let Ok(mut memo) = ingest_memo().lock() {
+            memo.mark_complete(run_key);
         }
     }
     if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
         return;
     }
     let keep: Vec<String> = retained.into_iter().collect();
-    let _ = db.retain_ci_logs(&key, &keep);
-    if let Some(w) = waker {
-        let _ = w.wake();
+    if let Err(error) = db.retain_ci_logs(&key, &keep) {
+        tracing::debug!(target: "thegn::ci", %error, "could not prune cached CI logs");
+    }
+    if let Some(w) = waker
+        && let Err(error) = w.wake()
+    {
+        tracing::debug!(target: "thegn::ci", %error, "could not wake after CI log ingestion");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FakeCi {
+        log_failures: HashSet<String>,
+        detail_failures: HashSet<String>,
+        details: HashMap<String, thegn_svc::ci::CiRunDetail>,
+        detail_calls: AtomicUsize,
+        log_calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl FakeCi {
+        fn new(log_failures: &[&str]) -> Self {
+            Self {
+                log_failures: log_failures.iter().map(|id| (*id).to_string()).collect(),
+                detail_failures: HashSet::new(),
+                details: HashMap::new(),
+                detail_calls: AtomicUsize::new(0),
+                log_calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_detail(mut self, run_id: &str, sha: &str) -> Self {
+            self.details
+                .insert(run_id.to_string(), ci_detail(run_id, sha));
+            self
+        }
+
+        fn with_detail_failure(mut self, run_id: &str) -> Self {
+            self.detail_failures.insert(run_id.to_string());
+            self
+        }
+    }
+
+    impl thegn_svc::ci::CiProvider for FakeCi {
+        fn system(&self) -> thegn_core::ci::CiSystem {
+            thegn_core::ci::CiSystem::GithubActions
+        }
+
+        fn runs(
+            &self,
+            _: &thegn_core::remote::GitLoc,
+            _: Option<&str>,
+            _: usize,
+        ) -> Result<thegn_svc::ci::CiRunList, thegn_core::ci::CiError> {
+            Ok(thegn_svc::ci::CiRunList {
+                runs: Vec::new(),
+                discarded_rows: 0,
+            })
+        }
+
+        fn run_detail(
+            &self,
+            _: &thegn_core::remote::GitLoc,
+            run_id: &str,
+        ) -> Result<thegn_svc::ci::CiRunDetail, thegn_core::ci::CiError> {
+            self.detail_calls.fetch_add(1, Ordering::Relaxed);
+            if self.detail_failures.contains(run_id) {
+                return Err(thegn_core::ci::CiError::Offline);
+            }
+            self.details
+                .get(run_id)
+                .cloned()
+                .ok_or(thegn_core::ci::CiError::NotFound)
+        }
+
+        fn logs(
+            &self,
+            _: &thegn_core::remote::GitLoc,
+            run_id: &str,
+            job_id: &str,
+        ) -> Result<thegn_core::ci::CiLog, thegn_core::ci::CiError> {
+            self.log_calls
+                .lock()
+                .expect("log-call lock")
+                .push((run_id.to_string(), job_id.to_string()));
+            if self.log_failures.contains(run_id) {
+                Err(thegn_core::ci::CiError::Offline)
+            } else {
+                Ok(thegn_core::ci::CiLog::default())
+            }
+        }
+
+        fn workflows(
+            &self,
+            _: &thegn_core::remote::GitLoc,
+        ) -> Result<Vec<thegn_core::ci::CiWorkflow>, thegn_core::ci::CiError> {
+            Ok(Vec::new())
+        }
+
+        fn trigger(
+            &self,
+            _: &thegn_core::remote::GitLoc,
+            _: &str,
+            _: &[(String, String)],
+        ) -> Result<(), thegn_core::ci::CiError> {
+            Err(thegn_core::ci::CiError::NotConfigured)
+        }
+
+        fn rerun(
+            &self,
+            _: &thegn_core::remote::GitLoc,
+            _: &str,
+            _: thegn_core::ci::RerunScope,
+        ) -> Result<(), thegn_core::ci::CiError> {
+            Err(thegn_core::ci::CiError::NotConfigured)
+        }
+
+        fn cancel(
+            &self,
+            _: &thegn_core::remote::GitLoc,
+            _: &str,
+        ) -> Result<(), thegn_core::ci::CiError> {
+            Err(thegn_core::ci::CiError::NotConfigured)
+        }
+
+        fn caps(&self) -> thegn_core::ci::CiCaps {
+            thegn_core::ci::CiCaps::default()
+        }
+    }
+
+    impl thegn_core::seam::Probe for FakeCi {
+        fn probe(&self) -> thegn_core::seam::ProbeReport {
+            thegn_core::seam::ProbeReport::new("ci", "fake", thegn_core::seam::Availability::Ready)
+                .with_caps(&thegn_core::ci::CiCaps::default())
+        }
+    }
+
+    fn ci_run(id: &str, sha: &str) -> thegn_core::ci::CiRun {
+        thegn_core::ci::CiRun {
+            id: id.to_string(),
+            sha: sha.to_string(),
+            state: thegn_core::ci::CiState::Fail,
+            ..thegn_core::ci::CiRun::default()
+        }
+    }
+
+    fn ci_detail(run_id: &str, sha: &str) -> thegn_svc::ci::CiRunDetail {
+        let mut run = ci_run(run_id, sha);
+        run.jobs.push(thegn_core::ci::CiJob {
+            id: format!("job-{run_id}"),
+            name: "failing job".to_string(),
+            state: thegn_core::ci::CiState::Fail,
+            ..thegn_core::ci::CiJob::default()
+        });
+        thegn_svc::ci::CiRunDetail {
+            run,
+            discarded_jobs: 0,
+        }
+    }
+
+    fn ci_detail_with_job(run_id: &str, sha: &str, job_id: &str) -> thegn_svc::ci::CiRunDetail {
+        let mut detail = ci_detail(run_id, sha);
+        detail.run.jobs[0].id = job_id.to_string();
+        detail
+    }
+
+    fn ingest_test(
+        temp: &tempfile::TempDir,
+        client: &FakeCi,
+        runs: &[thegn_core::ci::CiRun],
+        budget_size: usize,
+        now: i64,
+    ) {
+        let db = thegn_core::db::Db::open_at(&temp.path().join("ci.db")).expect("temp DB");
+        let loc = thegn_core::remote::GitLoc::for_worktree(temp.path());
+        let cfg = thegn_core::config::CiConfig::default();
+        let full = thegn_core::config::Config::default();
+        let mut budget = CallBudget {
+            remaining: budget_size,
+        };
+        ingest_failed_logs_with(IngestArgs {
+            host_path: temp.path(),
+            loc: &loc,
+            client,
+            cfg: &cfg,
+            full: &full,
+            db: &db,
+            runs,
+            budget: &mut budget,
+            waker: None,
+            generation: None,
+            now,
+        });
+    }
+
+    fn private_tempdir() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("tempdir");
+        thegn_core::fsperm::restrict_dir_to_owner(temp.path()).expect("restrict tempdir");
+        temp
+    }
+
+    #[test]
+    fn failed_log_is_backed_off_across_same_time_refreshes() {
+        let temp = private_tempdir();
+        let provider = FakeCi::new(&["run"]).with_detail("run", "sha");
+        let runs = [ci_run("run", "sha")];
+        ingest_test(&temp, &provider, &runs, MAX_LOG_INGEST_CALLS, 10_000);
+        ingest_test(&temp, &provider, &runs, MAX_LOG_INGEST_CALLS, 10_000);
+        assert_eq!(provider.log_calls.lock().expect("calls").len(), 1);
+    }
+
+    #[test]
+    fn failed_detail_is_backed_off_across_same_time_refreshes() {
+        let temp = private_tempdir();
+        let provider = FakeCi::new(&[]).with_detail_failure("run");
+        let runs = [ci_run("run", "sha")];
+        ingest_test(&temp, &provider, &runs, MAX_LOG_INGEST_CALLS, 15_000);
+        ingest_test(&temp, &provider, &runs, MAX_LOG_INGEST_CALLS, 15_000);
+        assert_eq!(provider.detail_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn complete_cached_run_skips_detail_on_next_refresh() {
+        let temp = private_tempdir();
+        let provider = FakeCi::new(&[]).with_detail("run", "sha");
+        let runs = [ci_run("run", "sha")];
+        ingest_test(&temp, &provider, &runs, MAX_LOG_INGEST_CALLS, 20_000);
+        let details = provider.detail_calls.load(Ordering::Relaxed);
+        ingest_test(&temp, &provider, &runs, MAX_LOG_INGEST_CALLS, 20_000);
+        assert_eq!(provider.detail_calls.load(Ordering::Relaxed), details);
+    }
+
+    #[test]
+    fn completed_run_attempt_does_not_skip_provider_rerun() {
+        let temp = private_tempdir();
+        let mut provider = FakeCi::new(&[]).with_detail("run", "sha");
+        let mut first = ci_run("run", "sha");
+        first.finished_at = Some("2026-10-12T10:00:00Z".to_string());
+        ingest_test(
+            &temp,
+            &provider,
+            &[first.clone()],
+            MAX_LOG_INGEST_CALLS,
+            20_500,
+        );
+
+        provider.details.insert(
+            "run".to_string(),
+            ci_detail_with_job("run", "sha", "job-rerun"),
+        );
+        let mut rerun = first;
+        rerun.finished_at = Some("2026-10-12T10:05:00Z".to_string());
+        ingest_test(&temp, &provider, &[rerun], MAX_LOG_INGEST_CALLS, 20_500);
+
+        assert_eq!(provider.detail_calls.load(Ordering::Relaxed), 2);
+        assert!(
+            provider
+                .log_calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .any(|(_, job)| job == "job-rerun")
+        );
+    }
+
+    #[test]
+    fn untouched_older_run_gets_budget_before_backed_off_newer_run() {
+        let temp = private_tempdir();
+        let provider = FakeCi::new(&["newest"])
+            .with_detail("newest", "new-sha")
+            .with_detail("older", "old-sha");
+        let runs = [ci_run("newest", "new-sha"), ci_run("older", "old-sha")];
+        ingest_test(&temp, &provider, &runs, 2, 30_000);
+        ingest_test(&temp, &provider, &runs, 2, 30_000);
+        assert!(
+            provider
+                .log_calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .any(|(run, _)| run == "older")
+        );
+    }
+
+    #[test]
+    fn empty_log_is_cached_and_not_refetched() {
+        let temp = private_tempdir();
+        let provider = FakeCi::new(&[]).with_detail("run", "sha");
+        let runs = [ci_run("run", "sha")];
+        ingest_test(&temp, &provider, &runs, MAX_LOG_INGEST_CALLS, 40_000);
+        ingest_test(&temp, &provider, &runs, MAX_LOG_INGEST_CALLS, 40_000);
+        assert_eq!(provider.log_calls.lock().expect("calls").len(), 1);
+    }
 
     #[test]
     fn enormous_ttl_and_clock_rollback_keep_cached_ci_quiet() {
