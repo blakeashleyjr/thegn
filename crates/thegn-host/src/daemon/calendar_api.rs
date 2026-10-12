@@ -97,8 +97,6 @@ fn events_in_window(
     to: NaiveDate,
     home: Tz,
 ) -> ControlResult<CalendarEventsReply> {
-    use thegn_core::store::CalendarStore;
-
     let window = CalendarWindow::new(from, to, home).ok_or_else(|| {
         ControlError::InvalidArgument("the requested calendar window is not representable".into())
     })?;
@@ -197,7 +195,7 @@ mod tests {
     use super::*;
     use thegn_core::calendar::{EventTime, RRule, Recurrence};
     use thegn_core::db::Db;
-    use thegn_core::store::CalendarRow;
+    use thegn_core::store::{CalendarRow, CalendarStore};
 
     fn day(s: &str) -> NaiveDate {
         NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
