@@ -17,10 +17,12 @@ use crate::util;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Sequencer files and BISECT_LOG are tiny; cap remote/provider capture so a
 /// hostile or corrupted gitdir cannot stream unbounded data into host memory.
 const GIT_PATH_READ_LIMIT: usize = 8 * 1024 * 1024;
+static GIT_PATH_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshTarget {
@@ -747,7 +749,9 @@ impl GitLoc {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
-            let temporary = PathBuf::from(format!("{}.thegn-tmp.{}", p, std::process::id()));
+            let nonce = GIT_PATH_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+            let temporary =
+                PathBuf::from(format!("{}.thegn-tmp.{}.{}", p, std::process::id(), nonce));
             crate::fsperm::write_owner_only_new(&temporary, bytes)?;
             let result = crate::fsperm::rename_replace(&temporary, path);
             if let Err(error) = &result {
@@ -916,7 +920,7 @@ fn atomic_git_path_write_script(path: &str) -> String {
     let quoted = util::sh_quote(path);
     format!(
         "set -C; umask 077; p={quoted}; t=\"$p.thegn-tmp.$$\"; \
-         [ ! -L \"$p\" ] || exit 1; \
+         [ ! -L \"$p\" ] && [ ! -d \"$p\" ] || exit 1; \
          created=0; trap 'if [ \"$created\" = 1 ]; then rm -f -- \"$t\"; fi' 0; \
          trap 'exit 1' HUP INT TERM; : > \"$t\" || exit 1; created=1; \
          set +C; cat > \"$t\" && mv -f -- \"$t\" \"$p\""
@@ -1081,7 +1085,7 @@ mod tests {
     #[test]
     fn ssh_atomic_write_script_is_explicitly_run_by_posix_shell() {
         let command = atomic_git_path_write_ssh_command("/work tree/todo");
-        let script = "set -C; umask 077; p='/work tree/todo'; t=\"$p.thegn-tmp.$$\"; [ ! -L \"$p\" ] || exit 1; created=0; trap 'if [ \"$created\" = 1 ]; then rm -f -- \"$t\"; fi' 0; trap 'exit 1' HUP INT TERM; : > \"$t\" || exit 1; created=1; set +C; cat > \"$t\" && mv -f -- \"$t\" \"$p\"";
+        let script = "set -C; umask 077; p='/work tree/todo'; t=\"$p.thegn-tmp.$$\"; [ ! -L \"$p\" ] && [ ! -d \"$p\" ] || exit 1; created=0; trap 'if [ \"$created\" = 1 ]; then rm -f -- \"$t\"; fi' 0; trap 'exit 1' HUP INT TERM; : > \"$t\" || exit 1; created=1; set +C; cat > \"$t\" && mv -f -- \"$t\" \"$p\"";
         assert_eq!(command, format!("sh -c {}", util::sh_quote(script)));
     }
 
@@ -1160,6 +1164,33 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().contains(".thegn-tmp."))
             .count();
         assert_eq!(leftovers, 0, "temporary git path file was left behind");
+    }
+
+    #[test]
+    fn provider_write_refuses_directory_target() {
+        let (dir, loc) = provider_repo();
+        let target = dir.path().join(".git/write-target");
+        std::fs::create_dir(&target).unwrap();
+
+        assert!(loc.write_git_path("write-target", b"replacement").is_err());
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read_dir(target).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn local_write_uses_a_fresh_temp_name_when_pid_only_name_exists() {
+        let (dir, _) = provider_repo();
+        let gitdir = dir.path().join(".git");
+        let target = gitdir.join("write-target");
+        let stale = gitdir.join(format!("write-target.thegn-tmp.{}", std::process::id()));
+        std::fs::write(&stale, b"stale temporary file").unwrap();
+        let local = GitLoc::Local(dir.path().to_path_buf());
+
+        local
+            .write_git_path("write-target", b"replacement")
+            .unwrap();
+        assert_eq!(std::fs::read(target).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(stale).unwrap(), b"stale temporary file");
     }
 
     #[test]
