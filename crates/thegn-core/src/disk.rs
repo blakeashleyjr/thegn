@@ -46,8 +46,6 @@ const CHANGE_SENTINELS: &[&str] = &[
     "target",
     "target/debug/.cargo-lock",
     "target/release/.cargo-lock",
-    ".git/HEAD",
-    ".git/index",
 ];
 
 /// Cheap probe: is this worktree plausibly unchanged since `since` (Unix secs)?
@@ -87,17 +85,7 @@ pub fn likely_unchanged_since(path: &Path, since: i64) -> bool {
     if !path.is_dir() {
         return false;
     }
-    // A worktree that is GONE must never read as "unchanged". Every sentinel
-    // would be absent, and absent means "did not move" below — so without this
-    // the probe would report quiet and the caller would keep re-stamping a size
-    // for a directory that no longer exists. Caught by
-    // `a_vanished_worktree_forces_a_walk_rather_than_reporting_quiet`: the scan
-    // loop happens to test `is_dir()` before calling this, but a function that
-    // is only safe because of its caller is a trap for the next caller.
-    if !path.is_dir() {
-        return false;
-    }
-    !CHANGE_SENTINELS.iter().any(|rel| {
+    let worktree_changed = CHANGE_SENTINELS.iter().any(|rel| {
         let p = if rel.is_empty() {
             path.to_path_buf()
         } else {
@@ -114,7 +102,34 @@ pub fn likely_unchanged_since(path: &Path, since: i64) -> bool {
                 .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
                 .is_none_or(|d| d.as_secs() as i64 > since),
         }
-    })
+    });
+    if worktree_changed {
+        return false;
+    }
+
+    // In a linked worktree `.git` is a file pointing at the per-worktree git
+    // directory, so HEAD and index live there rather than under the checkout.
+    // An absent `.git` means there are no git sentinels to check; an existing
+    // but unresolvable one is uncertain and must force a walk.
+    match std::fs::symlink_metadata(path.join(".git")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        _ => {
+            let Some(git_dir) = crate::git_memo::git_dir(path) else {
+                return false;
+            };
+            !["HEAD", "index"].iter().any(|name| {
+                match std::fs::symlink_metadata(git_dir.join(name)) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(_) => true,
+                    Ok(meta) => meta
+                        .modified()
+                        .ok()
+                        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                        .is_none_or(|d| d.as_secs() as i64 > since),
+                }
+            })
+        }
+    }
 }
 
 /// Measure a worktree's disk usage in ONE parallel walk.
@@ -625,6 +640,8 @@ mod tests {
                 };
                 touch_at(&p, 1_000);
             }
+            touch_at(&d.path().join(".git/HEAD"), 1_000);
+            touch_at(&d.path().join(".git/index"), 1_000);
             assert!(
                 likely_unchanged_since(d.path(), 2_000),
                 "baseline should be quiet before moving {rel:?}"
@@ -640,6 +657,79 @@ mod tests {
                 "moving sentinel {rel:?} did not force a walk"
             );
         }
+
+        // Main checkouts keep HEAD and index under the `.git` directory.
+        for rel in [".git/HEAD", ".git/index"] {
+            let d = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(d.path().join(".git")).unwrap();
+            for name in ["HEAD", "index"] {
+                std::fs::write(d.path().join(".git").join(name), b"").unwrap();
+                touch_at(&d.path().join(".git").join(name), 1_000);
+            }
+            touch_at(d.path(), 1_000);
+            assert!(likely_unchanged_since(d.path(), 2_000));
+            touch_at(&d.path().join(rel), 5_000);
+            assert!(
+                !likely_unchanged_since(d.path(), 2_000),
+                "moving directory-layout sentinel {rel:?} did not force a walk"
+            );
+        }
+
+        // Linked worktrees store HEAD and index in the gitdir named by their
+        // `.git` file, not in `<worktree>/.git/`.
+        for name in ["HEAD", "index"] {
+            let (worktree, _common, git_dir) = linked_worktree_fixture();
+            assert!(likely_unchanged_since(worktree.path(), 2_000));
+            touch_at(&git_dir.join(name), 5_000);
+            assert!(
+                !likely_unchanged_since(worktree.path(), 2_000),
+                "moving linked-worktree sentinel {name:?} did not force a walk"
+            );
+        }
+    }
+
+    fn linked_worktree_fixture() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+        let worktree = tempfile::tempdir().unwrap();
+        let common = tempfile::tempdir().unwrap();
+        let git_dir = common.path().join("worktrees/wt");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        for name in ["HEAD", "index"] {
+            std::fs::write(git_dir.join(name), b"").unwrap();
+            touch_at(&git_dir.join(name), 1_000);
+        }
+        touch_at(worktree.path(), 1_000);
+        (worktree, common, git_dir)
+    }
+
+    #[test]
+    fn a_linked_worktree_with_a_dot_git_file_can_report_quiet() {
+        let (worktree, _common, git_dir) = linked_worktree_fixture();
+        assert!(likely_unchanged_since(worktree.path(), 2_000));
+        std::fs::remove_file(git_dir.join("HEAD")).unwrap();
+        assert!(
+            likely_unchanged_since(worktree.path(), 2_000),
+            "an absent git sentinel is not evidence of a change"
+        );
+    }
+
+    #[test]
+    fn a_linked_worktree_index_move_forces_a_walk() {
+        let (worktree, _common, git_dir) = linked_worktree_fixture();
+        touch_at(&git_dir.join("index"), 5_000);
+        assert!(!likely_unchanged_since(worktree.path(), 2_000));
+    }
+
+    #[test]
+    fn an_existing_unresolvable_dot_git_forces_a_walk() {
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(worktree.path().join(".git"), "gitdir: missing\n").unwrap();
+        touch_at(worktree.path(), 1_000);
+        assert!(!likely_unchanged_since(worktree.path(), 2_000));
     }
 
     #[test]
