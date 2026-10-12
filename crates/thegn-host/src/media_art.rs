@@ -348,7 +348,7 @@ pub(crate) fn spawn_fetch(
     art_url: String,
     cols: usize,
     rows: usize,
-    tx: tokio::sync::mpsc::UnboundedSender<ArtMosaic>,
+    tx: tokio::sync::watch::Sender<Option<ArtMosaic>>,
     waker: TerminalWaker,
 ) {
     let generation = LATEST.begin();
@@ -364,14 +364,39 @@ pub(crate) fn spawn_fetch(
             return;
         }
         let lines = mosaic(&raster, cols, rows);
-        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-        let _ = tx.send(ArtMosaic {
-            url: art_url,
-            lines,
-        });
-        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        if !LATEST.is_current(generation) {
+            return;
+        }
+        if tx.send_if_modified(|stored| {
+            *stored = Some(ArtMosaic {
+                url: art_url,
+                lines,
+            });
+            true
+        }) {
+            if let Err(error) = waker.wake() {
+                tracing::debug!(target: "thegn::media_art", %error, "cover art wake failed");
+            }
+        } else if tx.is_closed() {
+            tracing::debug!(target: "thegn::media_art", "cover art receiver closed");
+        }
     });
     replace_in_flight(&IN_FLIGHT, handle);
+}
+
+pub(crate) fn cancel_in_flight() {
+    cancel_slot(&LATEST, &IN_FLIGHT);
+}
+
+fn cancel_slot(latest: &Latest, slot: &Mutex<Option<tokio::task::JoinHandle<()>>>) {
+    latest.begin();
+    if let Some(previous) = slot
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
+    {
+        previous.abort();
+    }
 }
 
 fn replace_in_flight(
@@ -715,6 +740,33 @@ mod tests {
         let second = l.begin();
         assert!(!l.is_current(first), "older request is superseded");
         assert!(l.is_current(second));
+    }
+
+    #[tokio::test]
+    async fn cancel_invalidates_and_aborts_the_in_flight_task() {
+        use std::sync::atomic::AtomicBool;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let latest = Latest::default();
+        let slot = Mutex::new(None);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = DropFlag(task_dropped);
+            std::future::pending::<()>().await;
+        });
+        replace_in_flight(&slot, handle);
+        cancel_slot(&latest, &slot);
+        tokio::task::yield_now().await;
+
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(!latest.is_current(0));
     }
 
     #[test]
