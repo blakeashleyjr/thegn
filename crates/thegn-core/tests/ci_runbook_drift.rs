@@ -113,9 +113,9 @@ fn self_hosted_ci_runbook_matches_workflow_policy() {
         runbook.contains(RUNNER_EXPRESSION),
         "runbook runner selector must exactly match the workflow fallback"
     );
-    for job in optional_jobs {
+    for job in &optional_jobs {
         assert!(
-            runbook.contains(job),
+            runbook.contains(*job),
             "optional workflow job `{job}` must be named in the runbook"
         );
     }
@@ -147,7 +147,7 @@ fn self_hosted_ci_runbook_matches_workflow_policy() {
         "unset selector fallback must be documented accurately"
     );
     assert!(
-        runbook.contains("NIX_GITHUB_TOKEN is optional"),
+        runbook.contains("`NIX_GITHUB_TOKEN` is optional"),
         "runbook must state that NIX_GITHUB_TOKEN is optional"
     );
 

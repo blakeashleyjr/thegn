@@ -117,5 +117,5 @@ GH_PAT=<admin PAT> bash scripts/ci/ageless-runner-uninstall.sh
 
 The Linux `test` job sets global git identity on its runner account. Use a
 dedicated account so this does not affect interactive work. Self-hosted jobs
-queue while the runner is offline; deleting `CI_RUNS_ON` is the safe rollback
-to GitHub-hosted Linux runners.
+queue while the runner is offline; see the rollback section above to restore
+GitHub-hosted Linux runners.
