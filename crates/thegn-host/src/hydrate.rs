@@ -2758,10 +2758,7 @@ fn cache_panel_git_snapshot(
     stash_count
 }
 
-/// Build just the right-side panel for a worktree directory. This is the
-/// path-keyed core of model hydration: it touches only `cwd`/`db`/`hints`,
-/// never the session, so a background task can warm a not-yet-focused
-/// worktree's panel into the switch cache before the user lands on it.
+/// Build change rows; `None` means the diff read failed, so non-submodule rows use `DiffCount::Unavailable`.
 fn change_rows(
     status: &[thegn_svc::git::FileStatus],
     diff: Option<&[thegn_svc::git::DiffEntry]>,
@@ -2779,6 +2776,7 @@ fn change_rows(
     crate::panel::build_change_rows(status, diff, incoming)
 }
 
+/// Build diff files using the porcelain letter, `B` for binary, and `M` as the fallback.
 fn panel_diff_files(
     entries: &[thegn_svc::git::DiffEntry],
     status: &[thegn_svc::git::FileStatus],
@@ -2809,6 +2807,10 @@ fn panel_diff_files(
         .collect()
 }
 
+/// Build just the right-side panel for a worktree directory. This is the
+/// path-keyed core of model hydration: it touches only `cwd`/`db`/`hints`,
+/// never the session, so a background task can warm a not-yet-focused
+/// worktree's panel into the switch cache before the user lands on it.
 pub(crate) fn build_panel(
     cwd: &std::path::Path,
     db: &thegn_core::db::Db,
