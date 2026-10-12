@@ -685,6 +685,116 @@ mod tests {
     }
 
     #[test]
+    fn functional_keys_encode_super_alt_shift_and_ctrl_alt() {
+        let mods = [
+            Modifiers::SUPER,
+            Modifiers::ALT | Modifiers::SHIFT,
+            Modifiers::CTRL | Modifiers::ALT,
+        ];
+        let cases: &[(KeyCode, [&[u8]; 3])] = &[
+            (KeyCode::Enter, [b"\r", b"\x1b\r", b"\x1b\r"]),
+            (KeyCode::Backspace, [b"\x7f", b"\x1b\x7f", b"\x1b\x08"]),
+            (KeyCode::Escape, [b"\x1b", b"\x1b", b"\x1b"]),
+            (KeyCode::Tab, [b"\x1b[9;9u", b"\x1b[9;4u", b"\x1b[9;7u"]),
+            (
+                KeyCode::LeftArrow,
+                [b"\x1b[1;9D", b"\x1b[1;4D", b"\x1b[1;7D"],
+            ),
+            (
+                KeyCode::RightArrow,
+                [b"\x1b[1;9C", b"\x1b[1;4C", b"\x1b[1;7C"],
+            ),
+            (KeyCode::UpArrow, [b"\x1b[1;9A", b"\x1b[1;4A", b"\x1b[1;7A"]),
+            (
+                KeyCode::DownArrow,
+                [b"\x1b[1;9B", b"\x1b[1;4B", b"\x1b[1;7B"],
+            ),
+            (KeyCode::Home, [b"\x1b[1;9H", b"\x1b[1;4H", b"\x1b[1;7H"]),
+            (KeyCode::End, [b"\x1b[1;9F", b"\x1b[1;4F", b"\x1b[1;7F"]),
+            (KeyCode::Delete, [b"\x1b[3;9~", b"\x1b[3;4~", b"\x1b[3;7~"]),
+            (KeyCode::Insert, [b"\x1b[2;9~", b"\x1b[2;4~", b"\x1b[2;7~"]),
+            (KeyCode::PageUp, [b"\x1b[5;9~", b"\x1b[5;4~", b"\x1b[5;7~"]),
+            (
+                KeyCode::PageDown,
+                [b"\x1b[6;9~", b"\x1b[6;4~", b"\x1b[6;7~"],
+            ),
+            (
+                KeyCode::Function(1),
+                [b"\x1b[1;9P", b"\x1b[1;4P", b"\x1b[1;7P"],
+            ),
+            (
+                KeyCode::Function(2),
+                [b"\x1b[1;9Q", b"\x1b[1;4Q", b"\x1b[1;7Q"],
+            ),
+            (
+                KeyCode::Function(3),
+                [b"\x1b[1;9R", b"\x1b[1;4R", b"\x1b[1;7R"],
+            ),
+            (
+                KeyCode::Function(4),
+                [b"\x1b[1;9S", b"\x1b[1;4S", b"\x1b[1;7S"],
+            ),
+            (
+                KeyCode::Function(5),
+                [b"\x1b[15;9~", b"\x1b[15;4~", b"\x1b[15;7~"],
+            ),
+            (
+                KeyCode::Function(6),
+                [b"\x1b[17;9~", b"\x1b[17;4~", b"\x1b[17;7~"],
+            ),
+            (
+                KeyCode::Function(7),
+                [b"\x1b[18;9~", b"\x1b[18;4~", b"\x1b[18;7~"],
+            ),
+            (
+                KeyCode::Function(8),
+                [b"\x1b[19;9~", b"\x1b[19;4~", b"\x1b[19;7~"],
+            ),
+            (
+                KeyCode::Function(9),
+                [b"\x1b[20;9~", b"\x1b[20;4~", b"\x1b[20;7~"],
+            ),
+            (
+                KeyCode::Function(10),
+                [b"\x1b[21;9~", b"\x1b[21;4~", b"\x1b[21;7~"],
+            ),
+            (
+                KeyCode::Function(11),
+                [b"\x1b[23;9~", b"\x1b[23;4~", b"\x1b[23;7~"],
+            ),
+            (
+                KeyCode::Function(12),
+                [b"\x1b[24;9~", b"\x1b[24;4~", b"\x1b[24;7~"],
+            ),
+        ];
+        for (key, expected) in cases {
+            for (mods, want) in mods.into_iter().zip(expected) {
+                assert_eq!(
+                    key_bytes(key, mods).as_deref(),
+                    Some(*want),
+                    "{key:?} + {mods:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn f1_through_f4_are_ss3_with_or_without_decckm() {
+        for (n, final_byte) in (1..=4).zip(b"PQRS") {
+            let key = KeyCode::Function(n);
+            let want = [0x1b, b'O', *final_byte];
+            assert_eq!(
+                key_bytes_mode(&key, Modifiers::NONE, false).as_deref(),
+                Some(&want[..])
+            );
+            assert_eq!(
+                key_bytes_mode(&key, Modifiers::NONE, true).as_deref(),
+                Some(&want[..])
+            );
+        }
+    }
+
+    #[test]
     fn shift_tab_forwards_reverse_tab_sequence() {
         assert_eq!(
             key_bytes_mode(&KeyCode::Tab, Modifiers::SHIFT, false).unwrap(),
