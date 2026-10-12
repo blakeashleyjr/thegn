@@ -276,6 +276,47 @@ struct SchedEntry {
     next: Instant,
 }
 
+/// Build cadence entries from negotiated contributions. Resident callbacks
+/// remain contribution-scoped; a one-shot command has only plugin-level
+/// result attribution, so its interval contributions share one poll at the
+/// shortest requested cadence.
+fn build_schedule(loaded: &[LoadedState], now: Instant) -> Vec<SchedEntry> {
+    let mut sched: Vec<SchedEntry> = Vec::new();
+    for state in loaded {
+        let plugin = &state.plugin;
+        let id = plugin.spec.manifest.id.as_str().to_string();
+        for contribution in &state.negotiated.accepted_contributions {
+            let CadenceHint::Interval { millis } = contribution.cadence else {
+                continue;
+            };
+            let interval = Duration::from_millis(millis.max(1));
+            if plugin.spec.mode == PluginMode::OneShot {
+                if let Some(entry) = sched
+                    .iter_mut()
+                    .find(|entry| entry.plugin == id && entry.mode == PluginMode::OneShot)
+                {
+                    entry.interval = entry.interval.min(interval);
+                    continue;
+                }
+            }
+            sched.push(SchedEntry {
+                plugin: id.clone(),
+                mode: plugin.spec.mode,
+                command: plugin.spec.command.clone(),
+                env: plugin.spec.env.clone(),
+                cwd: plugin.effective_cwd(),
+                timeout: Duration::from_secs(plugin.spec.timeout_secs.max(1)),
+                surface: contribution.surface.clone(),
+                contribution: contribution.id.clone(),
+                interval,
+                // Due immediately: the first poll doubles as the initial view.
+                next: now,
+            });
+        }
+    }
+    sched
+}
+
 #[allow(clippy::too_many_arguments)]
 fn setup_and_schedule(
     supervisor: ResidentSupervisor,
@@ -333,7 +374,6 @@ fn setup_and_schedule_with_waker(
         }
     };
     let mut loaded: Vec<LoadedState> = Vec::new();
-    let mut sched: Vec<SchedEntry> = Vec::new();
     let now = Instant::now();
     for plugin in discovered {
         let id = plugin.spec.manifest.id.as_str().to_string();
@@ -367,29 +407,13 @@ fn setup_and_schedule_with_waker(
             },
             PluginMode::OneShot => None,
         };
-        for c in &negotiated.accepted_contributions {
-            if let CadenceHint::Interval { millis } = c.cadence {
-                sched.push(SchedEntry {
-                    plugin: id.clone(),
-                    mode: plugin.spec.mode,
-                    command: plugin.spec.command.clone(),
-                    env: plugin.spec.env.clone(),
-                    cwd: plugin.effective_cwd(),
-                    timeout: Duration::from_secs(plugin.spec.timeout_secs.max(1)),
-                    surface: c.surface.clone(),
-                    contribution: c.id.clone(),
-                    interval: Duration::from_millis(millis.max(1)),
-                    // Due immediately: the first poll doubles as the initial view.
-                    next: now,
-                });
-            }
-        }
         loaded.push(LoadedState {
             plugin,
             negotiated,
             writer,
         });
     }
+    let mut sched = build_schedule(&loaded, now);
 
     // One-shot plugins with no interval contribution still get exactly one
     // run, so their register/update messages produce an initial view.
@@ -500,10 +524,34 @@ fn setup_and_schedule_with_waker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thegn_core::plugin_api::{PluginId, PluginSpec};
+    use thegn_core::plugin_api::{ContributionId, PluginId, PluginSpec};
 
     fn example_spec() -> PluginSpec {
         toml::from_str(include_str!("../../../examples/plugins/hello/plugin.toml")).unwrap()
+    }
+
+    fn loaded_state(spec: PluginSpec) -> LoadedState {
+        let accepted_contributions = spec.manifest.contributions.clone();
+        LoadedState {
+            plugin: LoadedPlugin { spec, dir: None },
+            negotiated: NegotiatedManifest {
+                accepted_contributions,
+                ..Default::default()
+            },
+            writer: None,
+        }
+    }
+
+    fn spec_with_two_intervals(mode: PluginMode) -> PluginSpec {
+        let mut spec = example_spec();
+        spec.manifest.id = PluginId::new("cadenced");
+        spec.mode = mode;
+        let mut second = spec.manifest.contributions[0].clone();
+        second.id = ContributionId::new("hello.other");
+        spec.manifest.contributions[0].cadence = CadenceHint::Interval { millis: 800 };
+        second.cadence = CadenceHint::Interval { millis: 300 };
+        spec.manifest.contributions.push(second);
+        spec
     }
 
     #[test]
@@ -513,6 +561,29 @@ mod tests {
         assert_eq!(restart_delay(2), Some(Duration::from_secs(25)));
         assert_eq!(restart_delay(3), None);
         assert_eq!(restart_delay(17), None);
+    }
+
+    #[test]
+    fn one_shot_interval_contributions_share_the_shortest_plugin_poll() {
+        let now = Instant::now();
+        let one_shot = build_schedule(
+            &[loaded_state(spec_with_two_intervals(PluginMode::OneShot))],
+            now,
+        );
+        assert_eq!(one_shot.len(), 1);
+        assert_eq!(one_shot[0].plugin, "cadenced");
+        assert_eq!(one_shot[0].interval, Duration::from_millis(300));
+
+        let resident = build_schedule(
+            &[loaded_state(spec_with_two_intervals(PluginMode::Resident))],
+            now,
+        );
+        assert_eq!(resident.len(), 2);
+        assert!(
+            resident
+                .iter()
+                .all(|entry| entry.mode == PluginMode::Resident)
+        );
     }
 
     #[test]
