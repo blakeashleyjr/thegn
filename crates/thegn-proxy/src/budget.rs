@@ -1,13 +1,14 @@
 //! Per-agent identity, spend attribution, and budget enforcement (group V).
 //!
 //! A request authenticates with a virtual attribution key ([`thegn_core::proxy::
-//! attribution`]) that is self-describing: the caller-scope chain is baked in at
+//! attribution`]) that is host-signed: the caller-scope chain is baked in at
 //! mint time, so the proxy resolves the caller with no DB lookup. Spend is
 //! attributed to that scope plus every enclosing scope up to `global`, and a
 //! pre-routing check refuses (or downgrades) when a configured cap or the manual
 //! kill-switch is hit. Budget *ceilings* come from `[model_proxy.budget]`; the
 //! `model_proxy_budget_state` table holds only the rolling accumulators.
 
+use std::sync::OnceLock;
 use thegn_core::proxy::attribution;
 use thegn_core::store::ModelProxyStore;
 use thegn_core::{budget_alert::cap_breaches, budget_alert::window_lapsed};
@@ -21,6 +22,8 @@ pub struct Identity {
     /// Budget scope, e.g. `global`, `agent:<name>`, `worktree:<path>`,
     /// `workspace:<repo_path>`.
     pub scope: String,
+    /// Agent budget dimension bound into the signed key.
+    pub agent_scope: Option<String>,
     /// The enclosing workspace scope (`workspace:<repo_path>`).
     pub workspace: Option<String>,
     /// The worktree's zone scope (`zone:<name>`), when it belongs to one.
@@ -28,6 +31,15 @@ pub struct Identity {
     /// The virtual key's upstream-account binding: routing prefers this
     /// provider's lanes so a workspace's traffic sticks to its scoped account.
     pub upstream: Option<String>,
+    /// Authentication failure; checked before any budget lookup.
+    pub rejected: Option<String>,
+}
+
+static ATTRIBUTION_SECRET: OnceLock<Vec<u8>> = OnceLock::new();
+
+/// Installs the host-provided signing secret once per daemon process.
+pub fn install_attribution_secret(secret: Vec<u8>) -> Result<(), Vec<u8>> {
+    ATTRIBUTION_SECRET.set(secret)
 }
 
 impl Identity {
@@ -41,7 +53,10 @@ impl Identity {
 
     /// The `agent` label derived from an `agent:<name>` scope, for audit rows.
     pub fn agent(&self) -> Option<String> {
-        self.scope.strip_prefix("agent:").map(str::to_string)
+        self.agent_scope
+            .as_deref()
+            .and_then(|s| s.strip_prefix("agent:").map(str::to_string))
+            .or_else(|| self.scope.strip_prefix("agent:").map(str::to_string))
     }
 
     /// The `worktree` label derived from a `worktree:<path>` scope.
@@ -63,12 +78,16 @@ impl Identity {
     }
 
     /// The budget scopes this identity's spend rolls into, most specific first,
-    /// deduped: scope → workspace → zone → global.
+    /// deduped: scope → agent → workspace → zone → global.
     pub fn budget_scopes(&self) -> Vec<&str> {
         let mut out: Vec<&str> = vec![self.scope.as_str()];
-        for s in [self.workspace.as_deref(), self.zone.as_deref()]
-            .into_iter()
-            .flatten()
+        for s in [
+            self.agent_scope.as_deref(),
+            self.workspace.as_deref(),
+            self.zone.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
         {
             if !out.contains(&s) {
                 out.push(s);
@@ -82,10 +101,14 @@ impl Identity {
 }
 
 /// Resolves a virtual key (the bearer token presented to the proxy) into an
-/// identity. An absent or unparseable key falls back to the global scope.
+/// identity. Missing/invalid credentials fail closed; without an installed
+/// host secret every request is refused, never attributed to global.
 pub fn resolve_identity(virtual_key: Option<&str>) -> Identity {
+    let Some(secret) = ATTRIBUTION_SECRET.get() else {
+        return rejected_identity("proxy attribution secret is unavailable");
+    };
     if let Some(key) = virtual_key
-        && let Some(a) = attribution::decode(key)
+        && let Ok(a) = attribution::verify(key, secret, crate::shared::now_ms())
     {
         return Identity {
             scope: if a.scope.is_empty() {
@@ -93,12 +116,25 @@ pub fn resolve_identity(virtual_key: Option<&str>) -> Identity {
             } else {
                 a.scope
             },
+            agent_scope: a.agent,
             workspace: a.workspace,
             zone: a.zone,
             upstream: a.upstream,
+            rejected: None,
         };
     }
-    Identity::global()
+    rejected_identity(if virtual_key.is_none() {
+        "missing proxy attribution key"
+    } else {
+        "invalid or expired proxy attribution key"
+    })
+}
+
+fn rejected_identity(reason: &str) -> Identity {
+    Identity {
+        rejected: Some(reason.to_string()),
+        ..Identity::global()
+    }
 }
 
 /// The verdict of a pre-routing budget check.
@@ -155,6 +191,9 @@ pub fn check_budget(
     identity: &Identity,
     now_ms: i64,
 ) -> BudgetVerdict {
+    if let Some(reason) = &identity.rejected {
+        return BudgetVerdict::Refuse(reason.clone());
+    }
     for scope in identity.budget_scopes() {
         let Some((spent_tokens, spent_cost, killed)) =
             current_spend(db, scope, settings.window_len_ms, now_ms)
@@ -265,30 +304,83 @@ mod tests {
     }
 
     fn key(scope: &str, workspace: Option<&str>, zone: Option<&str>) -> String {
-        attribution::encode(&attribution::AttributionScope {
-            scope: scope.into(),
-            workspace: workspace.map(String::from),
-            zone: zone.map(String::from),
-            upstream: None,
-            nonce: "n".into(),
-        })
+        attribution::encode_signed(
+            &attribution::AttributionScope {
+                scope: scope.into(),
+                agent: None,
+                workspace: workspace.map(String::from),
+                zone: zone.map(String::from),
+                upstream: None,
+                nonce: "n".into(),
+                exp_ms: None,
+            },
+            TEST_SECRET,
+            crate::shared::now_ms() + 60_000,
+        )
+    }
+
+    const TEST_SECRET: &[u8] = b"budget-test-secret";
+    fn install_test_secret() {
+        assert_eq!(
+            ATTRIBUTION_SECRET
+                .get_or_init(|| TEST_SECRET.to_vec())
+                .as_slice(),
+            TEST_SECRET
+        );
     }
 
     #[test]
-    fn unknown_key_is_global() {
-        let id = resolve_identity(Some("garbage"));
-        assert_eq!(id.scope, "global");
-        assert!(resolve_identity(None).scope == "global");
+    fn invalid_missing_expired_and_unsigned_keys_refuse() {
+        install_test_secret();
+        let db = db();
+        let settings = BudgetSettings::default();
+        for key in [Some("garbage"), None, Some("mpk_7b")] {
+            let id = resolve_identity(key);
+            assert!(id.rejected.is_some());
+            assert!(matches!(
+                check_budget(&db, &settings, &id, 0),
+                BudgetVerdict::Refuse(_)
+            ));
+        }
+        let expired = attribution::encode_signed(
+            &attribution::AttributionScope {
+                scope: "agent:x".into(),
+                ..Default::default()
+            },
+            TEST_SECRET,
+            0,
+        );
+        assert!(matches!(
+            check_budget(&db, &settings, &resolve_identity(Some(&expired)), 0),
+            BudgetVerdict::Refuse(_)
+        ));
+        let forged = key("worktree:/forged", None, None).replacen("mpk2_", "mpk2_f", 1);
+        let wrong_secret = attribution::encode_signed(
+            &attribution::AttributionScope {
+                scope: "worktree:/repo".into(),
+                ..Default::default()
+            },
+            b"wrong-secret",
+            crate::shared::now_ms() + 60_000,
+        );
+        for token in [forged, wrong_secret] {
+            assert!(matches!(
+                check_budget(&db, &settings, &resolve_identity(Some(&token)), 0),
+                BudgetVerdict::Refuse(_)
+            ));
+        }
     }
 
     #[test]
     fn key_resolves_full_chain() {
+        install_test_secret();
         let id = resolve_identity(Some(&key(
             "worktree:/repo/wt",
             Some("workspace:/repo"),
             Some("zone:c"),
         )));
         assert_eq!(id.scope, "worktree:/repo/wt");
+        assert_eq!(id.agent_scope, None);
         assert_eq!(id.workspace.as_deref(), Some("workspace:/repo"));
         assert_eq!(id.zone.as_deref(), Some("zone:c"));
         assert_eq!(
@@ -296,6 +388,26 @@ mod tests {
             vec!["worktree:/repo/wt", "workspace:/repo", "zone:c", "global"]
         );
         assert_eq!(id.workspace_label().as_deref(), Some("/repo"));
+    }
+
+    #[test]
+    fn signed_agent_dimension_is_included_in_accounting_scopes() {
+        install_test_secret();
+        let token = attribution::encode_signed(
+            &attribution::AttributionScope {
+                scope: "worktree:/repo/wt".into(),
+                agent: Some("agent:reviewer".into()),
+                ..Default::default()
+            },
+            TEST_SECRET,
+            crate::shared::now_ms() + 60_000,
+        );
+        let identity = resolve_identity(Some(&token));
+        assert_eq!(identity.agent().as_deref(), Some("reviewer"));
+        assert_eq!(
+            identity.budget_scopes(),
+            vec!["worktree:/repo/wt", "agent:reviewer", "global"]
+        );
     }
 
     #[test]
