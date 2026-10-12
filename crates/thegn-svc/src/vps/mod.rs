@@ -708,8 +708,8 @@ impl VpsProvider {
                     remaining.min(crate::provider::CONTROL_TIMEOUT),
                 )
                 .await?;
-            let running = shaper.parse_get(&body).map(|s| s.running).unwrap_or(false);
-            if !running {
+            let running = shaper.parse_get(&body).map(|s| s.running);
+            if poll_stopped(running) {
                 return Ok(());
             }
             if start.elapsed() >= BUDGET {
@@ -801,6 +801,10 @@ impl VpsProvider {
         digitalocean::parse_latest_snapshot_id(&droplet)
             .ok_or_else(|| anyhow!("vps: no snapshot id on droplet {id} after snapshot"))
     }
+}
+
+fn poll_stopped(parsed_running: Option<bool>) -> bool {
+    matches!(parsed_running, Some(false))
 }
 
 impl RemoteProvider for VpsProvider {
@@ -906,6 +910,7 @@ impl RemoteProvider for VpsProvider {
 
     fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            registry::checked_name(id)?;
             let custody_account = thegn_core::managed_ssh::account_label(&self.spec.key_path);
             thegn_core::managed_ssh::read(self.spec.kind.as_str(), &custody_account, id)
                 .context("vps: validate managed SSH custody before destroy")?;
@@ -1183,5 +1188,31 @@ mod tests {
         let a = host_label();
         assert_eq!(a, host_label(), "stable per host");
         assert_eq!(a.len(), 10);
+    }
+
+    #[test]
+    fn malformed_shutdown_poll_is_not_treated_as_stopped() {
+        let parsed_running = hetzner::HetznerShaper.parse_get(&serde_json::json!({}));
+        assert!(!poll_stopped(parsed_running.map(|server| server.running)));
+    }
+
+    #[tokio::test]
+    async fn destroy_rejects_unsafe_name_before_custody_or_http() {
+        let provider = VpsProvider::new(VpsSpec {
+            kind: VpsKind::Hetzner,
+            api_base: "http://127.0.0.1:1".into(),
+            token: "unused".into(),
+            name: "safe-name".into(),
+            region: String::new(),
+            size: String::new(),
+            image: String::new(),
+            max_instances: 0,
+            max_lifetime_secs: 0,
+            key_path: "/tmp/nonexistent-managed-key".into(),
+            pubkey: TEST_PUBKEY.into(),
+            skip_ready_wait: true,
+        });
+        let error = provider.destroy("../x").await.unwrap_err();
+        assert!(error.to_string().contains("invalid provider name"));
     }
 }
