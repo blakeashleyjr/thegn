@@ -14,6 +14,9 @@ use crate::panel::media::{MediaQueueDelivery, MediaRequest, MediaSourcesDelivery
 const MAX_PENDING_MEDIA_OPS: usize = 8;
 const MEDIA_OP_BUDGET: Duration = Duration::from_secs(5);
 
+pub(crate) static MEDIA_DELIVERY_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 type MediaOpTail = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
 
 static MEDIA_OP_TAIL: LazyLock<MediaOpTail> = LazyLock::new(|| Arc::new(Mutex::new(None)));
@@ -92,13 +95,36 @@ where
 async fn snapshot_or_log(
     client: &thegn_media::MediaClient,
     operation: &'static str,
-) -> Option<thegn_core::media::MediaSnapshot> {
+) -> Result<Option<thegn_core::media::MediaSnapshot>, ()> {
     match client.snapshot_with_caps().await {
-        Ok(snapshot) => snapshot,
+        Ok(snapshot) => Ok(snapshot),
         Err(e) => {
             tracing::debug!(target: "thegn::media", error = %e, operation, "media snapshot failed after operation");
-            None
+            Err(())
         }
+    }
+}
+
+fn delivery_from_read(
+    generation: u64,
+    read: Result<Option<thegn_core::media::MediaSnapshot>, ()>,
+) -> Option<crate::media_watch::MediaSnapshotDelivery> {
+    read.ok()
+        .map(|snapshot| crate::media_watch::MediaSnapshotDelivery {
+            generation,
+            snapshot,
+        })
+}
+
+fn send_delivery(
+    tx: &tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
+    delivery: crate::media_watch::MediaSnapshotDelivery,
+) -> bool {
+    if tx.send(delivery).is_ok() {
+        MEDIA_DELIVERY_EPOCH.fetch_add(1, Ordering::AcqRel);
+        true
+    } else {
+        false
     }
 }
 
@@ -223,13 +249,13 @@ pub(crate) fn restart_media_watch(
         // push it here, or the last ▶ badge / Media section stick for the rest
         // of the session after `[media] enabled = false` (and activating the
         // badge opened a popup for a stale track).
-        if tx
-            .send(crate::media_watch::MediaSnapshotDelivery {
+        if send_delivery(
+            tx,
+            crate::media_watch::MediaSnapshotDelivery {
                 generation: generation_value,
                 snapshot: None,
-            })
-            .is_ok()
-        {
+            },
+        ) {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
         return;
@@ -255,7 +281,7 @@ pub(crate) fn spawn_media_op(
             let Some(client) = crate::media_secret::client_for(&cfg).await else {
                 return;
             };
-            let cur = snapshot_or_log(&client, "preflight").await;
+            let cur = snapshot_or_log(&client, "preflight").await.unwrap_or(None);
             let cur_state = cur.as_ref().map(|snapshot| &snapshot.state);
             let res = match op {
                 MediaOp::PlayPause => Some(client.play_pause().await),
@@ -290,11 +316,13 @@ pub(crate) fn spawn_media_op(
             if let Some(Err(e)) = res {
                 tracing::warn!(target: "thegn::media", error = %e, "media op {op:?} failed");
             }
-            let _ = tx.send(crate::media_watch::MediaSnapshotDelivery {
-                generation,
-                snapshot: snapshot_or_log(&client, "transport").await,
-            }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            if let Some(delivery) =
+                delivery_from_read(generation, snapshot_or_log(&client, "transport").await)
+                && send_delivery(&tx, delivery)
+                && let Err(error) = waker.wake()
+            {
+                tracing::debug!(target: "thegn::media", %error, "media transport wake failed");
+            }
         },
     );
     if !accepted {
@@ -347,11 +375,13 @@ pub(crate) fn spawn_media_playlist(
                 if let Err(e) = client.activate_playlist(&id).await {
                     tracing::warn!(target: "thegn::media", error = %e, "playlist {id} activation failed");
                 }
-                let _ = tx.send(crate::media_watch::MediaSnapshotDelivery {
-                    generation,
-                    snapshot: snapshot_or_log(&client, "playlist").await,
-                }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                if let Some(delivery) =
+                    delivery_from_read(generation, snapshot_or_log(&client, "playlist").await)
+                    && send_delivery(&tx, delivery)
+                    && let Err(error) = waker.wake()
+                {
+                    tracing::debug!(target: "thegn::media", %error, "media playlist wake failed");
+                }
             }
         },
     );
@@ -439,12 +469,22 @@ pub(crate) fn spawn_media_sources(
 #[cfg(test)]
 mod tests {
     use super::{
-        MediaPreflightError, chain_op, loop_target, replace_in_flight, shuffle_target,
-        within_media_budget,
+        MediaPreflightError, chain_op, delivery_from_read, loop_target, replace_in_flight,
+        shuffle_target, within_media_budget,
     };
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
     use thegn_core::media::{LoopMode, MediaSnapshot, MediaState};
+
+    #[test]
+    fn failed_post_operation_read_produces_no_delivery() {
+        assert!(delivery_from_read(3, Err(())).is_none());
+        assert_eq!(
+            delivery_from_read(3, Ok(None)).unwrap().snapshot,
+            None,
+            "a successful empty read remains an authoritative clear"
+        );
+    }
 
     #[test]
     fn shuffle_toggle_fails_closed_when_state_is_unknown() {
