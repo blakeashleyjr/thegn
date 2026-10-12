@@ -1327,25 +1327,6 @@ fn resume_conflict_payload() -> serde_json::Value {
     })
 }
 
-/// The previous session's final screen as non-blank lines. Best-effort by
-/// design: ANY failure — the row never opened a session, the daemon's
-/// tombstone was reaped, the daemon cannot answer — degrades to an empty
-/// tail, and the finisher prompt says the screen is unavailable rather than
-/// the resume failing over it. The previous screen is context, not evidence.
-async fn screen_tail_of(client: &ControlClient, session_id: Option<&str>) -> Vec<String> {
-    let Some(sid) = session_id else {
-        return Vec::new();
-    };
-    match client.snapshot(sid).await {
-        Ok((_, rows, cols, ansi)) => snapshot_text(rows, cols, &ansi)
-            .lines()
-            .map(|l| l.trim_end().to_string())
-            .filter(|l| !l.trim().is_empty())
-            .collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
 /// All inputs needed to render a resume worker's final prompt. Keeping the
 /// binding assembly here makes the identity invariant testable: `{artifact}`
 /// and `{row}` always name the new finisher row, while the source
@@ -1360,9 +1341,10 @@ struct ResumePromptInput<'a> {
     row_id: i64,
     source_artifact_exists: bool,
     source_artifact_tracked: bool,
+    source_row_id: i64,
+    source_exit_code: Option<i64>,
     git_status: &'a str,
     diff_stat: &'a str,
-    screen_tail: &'a [String],
 }
 
 fn render_resume_prompt(input: &ResumePromptInput<'_>) -> Result<String> {
@@ -1380,6 +1362,8 @@ fn render_resume_prompt(input: &ResumePromptInput<'_>) -> Result<String> {
     Ok(pipeline_resume::finisher_prompt(
         &pipeline_resume::FinisherInput {
             stage_name: &input.stage.name,
+            row_id: input.source_row_id,
+            exit_code: input.source_exit_code,
             stage_prompt: &stage_prompt,
             artifact: input.source_artifact,
             target_artifact: input.target_artifact,
@@ -1387,7 +1371,6 @@ fn render_resume_prompt(input: &ResumePromptInput<'_>) -> Result<String> {
             artifact_tracked: input.source_artifact_tracked,
             git_status: input.git_status,
             diff_stat: input.diff_stat,
-            screen_tail: input.screen_tail,
         },
     ))
 }
@@ -1433,17 +1416,12 @@ async fn resume_work(
         .to_string_lossy()
         .into_owned();
     let branch = resolve_branch(&wt);
-    // 4. Gather everything that belongs to the source attempt before claiming
-    //    the finisher: its artifact state and final screen are recovery
-    //    context, never the new row's completion target.
+    // 4. Gather facts from the source attempt before claiming the finisher.
     let facts = gather_issue_facts(client, stage, &row.issue_id, Some(&wt)).await?;
-    // 5. Finisher facts: the source row's artifact state (the same filesystem/git
-    //    read the done gate applies), the worktree's git state, and the
-    //    previous session's final screen.
+    // 5. Finisher facts: source artifact state and bounded-at-render git facts.
     let source_vf = crate::cmd::dispatch::verify_facts(&row);
     let git_status = git_out(Path::new(&wt), &["status", "--porcelain"]).unwrap_or_default();
     let diff_stat = git_out(Path::new(&wt), &["diff", "--stat"]).unwrap_or_default();
-    let screen_tail = screen_tail_of(client, row.session_id.as_deref()).await;
     // 6. Reconcile the source before competing for a fresh slot. Failed rows
     //    are already terminal/free; queued, parked, and positively exited rows
     //    are deliberately closed as superseded. A compare-and-set preserves a
@@ -1470,9 +1448,10 @@ async fn resume_work(
         row_id: new_row,
         source_artifact_exists: source_vf.exists,
         source_artifact_tracked: source_vf.tracked,
+        source_row_id: row.id,
+        source_exit_code: row.exit_code,
         git_status: &git_status,
         diff_stat: &diff_stat,
-        screen_tail: &screen_tail,
     }) {
         Ok(prompt) => prompt,
         Err(error) => {
@@ -1922,9 +1901,10 @@ mod resume_work_tests {
             row_id: 9,
             source_artifact_exists: true,
             source_artifact_tracked: true,
+            source_row_id: 7,
+            source_exit_code: Some(1),
             git_status: "",
             diff_stat: "",
-            screen_tail: &[],
         })
         .unwrap();
         assert!(prompt.contains(
@@ -1938,6 +1918,12 @@ mod resume_work_tests {
         ));
         assert!(!prompt.contains(
             "Leave the handoff artifact at `.thegn/pipeline/THE-121/code/7.md` committed"
+        ));
+        assert!(
+            prompt.contains("\"source_row_id\":{\"provenance\":\"pipeline roster\",\"value\":7}")
+        );
+        assert!(prompt.contains(
+            "\"exit_class\":{\"provenance\":\"pipeline roster exit_code\",\"value\":\"nonzero\"}"
         ));
     }
 

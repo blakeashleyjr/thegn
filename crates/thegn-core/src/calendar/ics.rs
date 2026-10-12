@@ -167,25 +167,114 @@ pub fn parse_line(line: &str) -> Option<ContentLine> {
     let (head, value) = line.split_at(colon);
     let value = &value[1..];
 
-    let mut parts = head.split(';');
+    let mut parts = split_outside_quotes(head, ';')?.into_iter();
     let name = parts.next()?.trim().to_ascii_uppercase();
     if name.is_empty() {
         return None;
     }
     let mut params = BTreeMap::new();
     for p in parts {
-        if let Some((k, v)) = p.split_once('=') {
-            params.insert(
-                k.trim().to_ascii_uppercase(),
-                v.trim().trim_matches('"').to_string(),
-            );
+        let (k, v) = p.split_once('=')?;
+        let key = k.trim().to_ascii_uppercase();
+        if key.is_empty() || key.contains([';', ':', '"', ',']) {
+            return None;
         }
+        // PARAM-VALUE allows a comma-separated list. Keep it as one string in
+        // ContentLine's compatibility map, but only treat commas outside
+        // quoted-string values as separators. Decode RFC 6868 on each member.
+        let values = split_outside_quotes(v.trim(), ',')?;
+        let decoded = values
+            .iter()
+            .map(|value| decode_param_value(value.trim()))
+            .collect::<Option<Vec<_>>>()?;
+        params.insert(key, decoded.join(","));
     }
+    let value = if is_text_property(&name) {
+        unescape(value)
+    } else {
+        value.to_string()
+    };
     Some(ContentLine {
         name,
         params,
-        value: unescape(value),
+        value,
     })
+}
+
+/// Split on a delimiter outside quoted-string values. An open quote makes the
+/// content line malformed. RFC 5545 quoted-string does not use backslash
+/// escaping; RFC 6868 caret encoding represents quote characters instead.
+fn split_outside_quotes(input: &str, delimiter: char) -> Option<Vec<&str>> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    for (i, c) in input.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            c if c == delimiter && !in_quotes => {
+                pieces.push(&input[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if in_quotes {
+        return None;
+    }
+    pieces.push(&input[start..]);
+    Some(pieces)
+}
+
+/// Parse one RFC 5545 paramtext or quoted-string and decode RFC 6868 escapes.
+fn decode_param_value(value: &str) -> Option<String> {
+    let value = if let Some(inner) = value.strip_prefix('"') {
+        inner.strip_suffix('"')?
+    } else {
+        if value.contains('"') {
+            return None;
+        }
+        value
+    };
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '^' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n' | 'N') => out.push('\n'),
+            Some('\'') => out.push('"'),
+            Some('^') => out.push('^'),
+            Some(other) => {
+                out.push('^');
+                out.push(other);
+            }
+            None => out.push('^'),
+        }
+    }
+    Some(out)
+}
+
+/// Known RFC 5545 TEXT properties, plus the common calendar name/description
+/// extensions, whose values receive TEXT unescaping. URI, CAL-ADDRESS,
+/// date/time, recurrence, status, and other extension values are retained
+/// byte-for-byte.
+fn is_text_property(name: &str) -> bool {
+    matches!(
+        name,
+        "UID"
+            | "SUMMARY"
+            | "DESCRIPTION"
+            | "LOCATION"
+            | "CATEGORIES"
+            | "COMMENT"
+            | "CONTACT"
+            | "RESOURCES"
+            | "TZNAME"
+            | "X-WR-CALNAME"
+            | "X-WR-CALDESC"
+    )
 }
 
 /// Undo RFC 5545 TEXT escaping (`\n`, `\,`, `\;`, `\\`).
