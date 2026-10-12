@@ -3,17 +3,16 @@
 //!
 //! The default sandbox mounts are path-preserving (`-v <local>:<local>`) and the
 //! worktree's `.git` points at the local object store — none of which exist on a
-//! remote box. So for a remote-placement OCI env we build a **fresh clone** on
-//! the remote instead: a `git bundle` of `HEAD`'s history (committed objects
+//! remote box. So for a remote-placement OCI env we build a self-contained
+//! clone on the remote: a `git bundle` of `HEAD`'s history (committed objects
 //! only — inherently excludes `target/` etc.), streamed over the placement's ssh
 //! control transport (which carries the configured `ProxyCommand`), `git clone`d
 //! there, then the working state (tracked diff + `.gitignore`-filtered untracked
 //! files) applied on top. Existing remote destinations are retained for explicit
-//! recovery, and a path is returned only after every materialization step
+//! recovery. Completed destinations are refreshed from the current local state
+//! on each sync, and a path is returned only after every materialization step
 //! succeeds.
 
-use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use thegn_svc::host::OciRunner;
@@ -22,14 +21,6 @@ use thegn_svc::host::OciRunner;
 /// The base sandbox image creates `/workspace`, so the container path is fixed
 /// and decoupled from the (remote, `$HOME`-relative) host path.
 const REMOTE_WORKTREE_DEST: &str = "/workspace";
-
-/// Worktrees already materialized on their remote this session → resolved remote
-/// path. `prepare_sandbox_env` runs more than once per open (host provisioning
-/// then the pane build); this makes the second call a cheap no-op that still
-/// yields the path to retarget the mount. A cache miss never replaces a remote
-/// destination; existing state must be reconciled outside this materializer.
-static SYNCED: LazyLock<Mutex<HashMap<String, String>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Guard a REMOTE placement that resolved to a bare `Backend::None`. A remote
 /// SSH placement has no container to hold the synced worktree, so degrading to
@@ -95,9 +86,13 @@ fn claim_command(slug: &str) -> String {
     format!(
         "set -e; d=\"$HOME/thegn-worktrees\"/{slug}; marker=\"$d.thegn-incomplete\"; \
          mkdir -p \"$(dirname \"$d\")\"; \
-         if mkdir \"$d\"; then set -C; : > \"$marker\"; printf 'NEW:%s' \"$d\"; \
+         set -C; \
+         if [ ! -e \"$d\" ] && : > \"$marker\" 2>/dev/null; then \
+              if mkdir \"$d\"; then printf 'NEW:%s' \"$d\"; \
+              else printf '%s' 'remote destination exists and was retained' >&2; exit 1; fi; \
          elif [ -d \"$d\" ] && [ ! -L \"$d\" ] && [ ! -e \"$marker\" ] && \
-              git -C \"$d\" rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
+              [ -e \"$d/.git\" ] && top=$(git -C \"$d\" rev-parse --show-cdup 2>/dev/null) && [ -z \"$top\" ] && \
+              : > \"$marker\" 2>/dev/null; then \
               printf 'REUSED:%s' \"$d\"; \
          else printf '%s' 'remote destination exists but is incomplete or not a Git checkout; retained for reconciliation' >&2; exit 1; fi",
         slug = q(slug),
@@ -136,6 +131,31 @@ fn restore_command(dir: &str, branch: &str, recursive_submodules: bool) -> Strin
         String::new()
     };
     format!("set -e; {restore}{init}rm -f {d}.bundle", d = q(dir))
+}
+
+fn refresh_command(dir: &str, branch: &str, recursive_submodules: bool) -> String {
+    let checkout = if branch.is_empty() || branch == "HEAD" {
+        format!("git -C {d} checkout -q --detach FETCH_HEAD; ", d = q(dir))
+    } else {
+        format!(
+            "git -C {d} checkout -qB {b} FETCH_HEAD; ",
+            d = q(dir),
+            b = q(branch)
+        )
+    };
+    let init = if recursive_submodules {
+        format!(
+            "git -c submodule.recurse=false -C {d} submodule update --init; ",
+            d = q(dir)
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "set -e; git -C {d} fetch -q {bundle} HEAD; {checkout}{init}rm -f {bundle}",
+        d = q(dir),
+        bundle = q(&format!("{dir}.bundle")),
+    )
 }
 
 /// Run a local `git -C <worktree> <args>` and return trimmed stdout on success.
@@ -241,14 +261,6 @@ pub(crate) fn sync_worktree(
     recursive_submodules: bool,
     warnings: &mut Vec<String>,
 ) -> Result<String, String> {
-    if let Some(p) = SYNCED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(worktree)
-    {
-        return Ok(p.clone());
-    }
-
     // 1. Claim the destination atomically. Never follow or remove an existing
     //    checkout, symlink, or interrupted attempt; those require reconciliation.
     let prep = claim_command(slug);
@@ -269,13 +281,8 @@ pub(crate) fn sync_worktree(
     };
     if reused {
         warnings.push(format!(
-            "reusing completed remote worktree at {dir}; local changes since its earlier materialization were not re-synced (remote checkout is authoritative)"
+            "reusing completed remote worktree at {dir} and syncing current local state"
         ));
-        SYNCED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(worktree.to_string(), dir.clone());
-        return Ok(dir);
     }
 
     // 2. Stream a bundle of HEAD's history, then clone it on the remote.
@@ -292,20 +299,27 @@ pub(crate) fn sync_worktree(
         &format!("set -C; cat > {}.bundle", q(&dir)),
         secs(600),
     )?;
-    let (ok, _o, err) = runner.host_exec(
-        &format!("git clone -q {d}.bundle {d}", d = q(&dir)),
-        secs(600),
-    )?;
-    if !ok {
-        // Retain the bundle as part of this interrupted attempt; the incomplete
-        // marker identifies the destination as requiring reconciliation.
-        return Err(format!("remote clone failed: {}", err.trim()));
+    if !reused {
+        let (ok, _o, err) = runner.host_exec(
+            &format!("git clone -q {d}.bundle {d}", d = q(&dir)),
+            secs(600),
+        )?;
+        if !ok {
+            // Retain the bundle as part of this interrupted attempt; the incomplete
+            // marker identifies the destination as requiring reconciliation.
+            return Err(format!("remote clone failed: {}", err.trim()));
+        }
     }
-    // Restore the branch name (clone lands on detached HEAD).
+    // Restore the branch name (clone lands on detached HEAD), or advance an
+    // existing checkout to the newly fetched local HEAD.
     let branch = local_git(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
         .ok_or_else(|| "could not determine local worktree branch".to_string())?;
     let (ok, _out, err) = runner.host_exec(
-        &restore_command(&dir, &branch, recursive_submodules),
+        &if reused {
+            refresh_command(&dir, &branch, recursive_submodules)
+        } else {
+            restore_command(&dir, &branch, recursive_submodules)
+        },
         secs(600),
     )?;
     if !ok {
@@ -362,16 +376,12 @@ pub(crate) fn sync_worktree(
                 ))
             }
         })?;
-    SYNCED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(worktree.to_string(), dir.clone());
     Ok(dir)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_command, restore_command, should_apply_tracked_diff};
+    use super::{claim_command, refresh_command, restore_command, should_apply_tracked_diff};
     use std::process::Command;
 
     fn temp_home(label: &str) -> std::path::PathBuf {
@@ -395,6 +405,8 @@ mod tests {
         Command::new("sh")
             .args(["-c", command])
             .env("HOME", home)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
             .unwrap()
     }
@@ -405,6 +417,8 @@ mod tests {
             .arg("-C")
             .arg(dir)
             .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
             .unwrap();
         assert!(
@@ -412,6 +426,24 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[expect(clippy::disallowed_methods, reason = "inspect a local Git fixture")]
+    fn run_git_output(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     #[test]
@@ -476,6 +508,67 @@ mod tests {
         assert!(
             home.join("thegn-worktrees/incomplete.thegn-incomplete")
                 .exists()
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn destination_claim_refuses_unmarked_directory_inside_home_repository() {
+        let home = temp_home("nested-claim");
+        run_git(&home, &["init", "-q"]);
+        let destination = home.join("thegn-worktrees/sandbox");
+        std::fs::create_dir_all(&destination).unwrap();
+
+        let result = run_sh(&home, &claim_command("sandbox"));
+        assert!(!result.status.success());
+        assert!(!destination.join(".git").exists());
+        assert!(
+            !home
+                .join("thegn-worktrees/sandbox.thegn-incomplete")
+                .exists()
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn reused_checkout_refreshes_to_new_local_commit() {
+        let home = temp_home("refresh");
+        let source = home.join("source");
+        let checkout = home.join("checkout");
+        std::fs::create_dir_all(&source).unwrap();
+        run_git(&source, &["init", "-q"]);
+        run_git(&source, &["config", "user.email", "thegn@example.invalid"]);
+        run_git(&source, &["config", "user.name", "thegn test"]);
+        let tracked = source.join("tracked.txt");
+        std::fs::write(&tracked, "first\n").unwrap();
+        run_git(&source, &["add", "tracked.txt"]);
+        run_git(&source, &["commit", "-qm", "first"]);
+        run_git(
+            &source,
+            &[
+                "clone",
+                "-q",
+                source.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+
+        std::fs::write(&tracked, "second commit\n").unwrap();
+        run_git(&source, &["add", "tracked.txt"]);
+        run_git(&source, &["commit", "-qm", "second"]);
+        let bundle = format!("{}.bundle", checkout.display());
+        run_git(&source, &["bundle", "create", &bundle, "HEAD"]);
+        let branch = run_git_output(&source, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let command = refresh_command(checkout.to_str().unwrap(), &branch, false);
+        let result = run_sh(&home, &command);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("tracked.txt")).unwrap(),
+            "second commit\n"
         );
         std::fs::remove_dir_all(home).unwrap();
     }
