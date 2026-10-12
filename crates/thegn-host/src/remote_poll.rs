@@ -400,7 +400,7 @@ pub(crate) fn poll(
     let cfg = cfg.clone();
     let refresh_tx = refresh_tx.clone();
     let waker = waker.clone();
-    crate::sched::spawn_bg(move || {
+    crate::sched::spawn_bg_replaceable(move || {
         let mut any = false;
         for target in targets {
             any |= poll_one(&target, &all, &cfg, &notify);

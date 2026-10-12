@@ -3695,12 +3695,20 @@ pub(crate) fn spawn_model_hydration(
 pub(crate) fn spawn_panel_prefetch(
     tx: tokio_mpsc::UnboundedSender<crate::handlers::switch_cache::PrefetchResult>,
     cwd: std::path::PathBuf,
+    generation: u64,
     hints: HydrateHints,
     waker: Option<TerminalWaker>,
-) {
+) -> crate::sched::Admission {
     // Prefetch is background warming — ride the background lane so it never
     // starves the active worktree's (ungated) interactive hydration.
     crate::sched::spawn_bg(move || {
+        let mut completion = PanelPrefetchCompletion {
+            tx: tx.clone(),
+            path: cwd.clone(),
+            generation,
+            waker: waker.clone(),
+            sent: false,
+        };
         if !cwd.is_dir() {
             return;
         }
@@ -3713,16 +3721,53 @@ pub(crate) fn spawn_panel_prefetch(
         if tx
             .send(crate::handlers::switch_cache::PrefetchResult {
                 path: cwd,
+                generation: Some(generation),
                 panel,
                 loc,
                 disk,
+                successful: true,
             })
             .is_ok()
-            && let Some(w) = &waker
         {
-            let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            completion.sent = true;
+            if let Some(w) = &waker {
+                let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            }
         }
     });
+}
+
+/// Guarantees a terminal prefetch result on early return or panic, releasing
+/// only the marker generation that dispatched this worker.
+struct PanelPrefetchCompletion {
+    tx: tokio_mpsc::UnboundedSender<crate::handlers::switch_cache::PrefetchResult>,
+    path: std::path::PathBuf,
+    generation: u64,
+    waker: Option<TerminalWaker>,
+    sent: bool,
+}
+
+impl Drop for PanelPrefetchCompletion {
+    fn drop(&mut self) {
+        if self.sent {
+            return;
+        }
+        if self
+            .tx
+            .send(crate::handlers::switch_cache::PrefetchResult {
+                path: self.path.clone(),
+                generation: Some(self.generation),
+                panel: crate::panel::PanelData::default(),
+                loc: None,
+                disk: None,
+                successful: false,
+            })
+            .is_ok()
+            && let Some(waker) = &self.waker
+        {
+            let _ = waker.wake(); // best-effort: the loop may already be shutting down
+        }
+    }
 }
 
 pub(crate) fn spawn_pr_cache_refresh(
@@ -3746,7 +3791,7 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
     let branch_waker = waker.clone();
     let branch_generation = generation.clone();
     let disk_cfg = cfg.disk.clone();
-    crate::sched::spawn_bg(move || {
+    crate::sched::spawn_bg_replaceable(move || {
         if !cwd.is_dir() {
             return;
         }
@@ -4009,7 +4054,7 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
     // The forge ladder (native HTTP → gh CLI) is a blocking seam, so it
     // runs on its own blocking thread — neither the subprocess fallback nor
     // the HTTP wait can ever touch the event loop.
-    crate::sched::spawn_bg(move || {
+    crate::sched::spawn_bg_replaceable(move || {
         if branch_generation
             .as_ref()
             .is_some_and(|(current, expected)| {
@@ -4526,7 +4571,7 @@ pub(crate) fn spawn_my_work_refresh(
     all: bool,
     waker: Option<TerminalWaker>,
 ) {
-    crate::sched::spawn_bg(move || {
+    crate::sched::spawn_bg_replaceable(move || {
         use thegn_core::work::{ALL_SCOPE, WorkGroup, WorkKind, WorkRow};
 
         if !cwd.is_dir() {

@@ -149,7 +149,7 @@ pub(crate) fn spawn_ci_cache_refresh_with_generation(
     force: bool,
     generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
 ) {
-    crate::sched::spawn_bg(move || {
+    crate::sched::spawn_bg_replaceable(move || {
         let cfg = full.ci.clone();
         let cwd = crate::hydrate::active_tab_path(&session);
         if cwd.is_dir() {

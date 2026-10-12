@@ -33,6 +33,9 @@ pub(crate) struct WorktreeSlice {
     pub placement_label: Option<String>,
     pub loc: Option<thegn_core::loc::LocReport>,
     pub disk: Option<u64>,
+    /// False means the worker ended before it could build a cache slice; the
+    /// result exists only to release the matching in-flight marker.
+    pub successful: bool,
     pub container_events: Vec<thegn_core::models::ContainerEvent>,
     pub timeline: Vec<thegn_core::models::TimelineEvent>,
     /// When this slice was last seeded/refreshed (`None` = never): drives the
@@ -109,9 +112,11 @@ impl WorktreeSlice {
 /// next full hydration lands.
 pub(crate) struct PrefetchResult {
     pub path: std::path::PathBuf,
+    pub generation: Option<u64>,
     pub panel: crate::panel::PanelData,
     pub loc: Option<thegn_core::loc::LocReport>,
     pub disk: Option<u64>,
+    pub successful: bool,
 }
 
 /// The two cached measurements for `cwd`, as cheap indexed reads. Both scans own
@@ -181,9 +186,11 @@ pub(crate) fn clear_and_fill(
         if tx
             .send(PrefetchResult {
                 path: cwd,
+                generation: None,
                 panel,
                 loc,
                 disk,
+                successful: true,
             })
             .is_ok()
         {
@@ -209,13 +216,22 @@ pub(crate) fn drain_prefetch_results(
     while let Ok(res) = rx.try_recv() {
         let PrefetchResult {
             path,
+            generation,
             panel,
             loc,
             disk,
+            successful,
         } = res;
         loop_perf.tick(crate::perf::WakeSource::Prefetch);
         // Release the dedupe guard: this path may warm again after its TTL.
-        inflight.finish(&path);
+        if let Some(generation) = generation
+            && !inflight.finish(&path, generation)
+        {
+            continue;
+        }
+        if !successful {
+            continue;
+        }
         // Keyed like the switch detection: a terminal never matches a dir's
         // prefetch, so the launch-dir worktree's panel can't paint onto it.
         let is_active = path == crate::hydrate::active_slice_key(session);
