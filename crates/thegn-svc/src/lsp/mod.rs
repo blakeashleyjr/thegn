@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -1465,7 +1465,7 @@ type Pending = Arc<Mutex<HashMap<i64, Sender<Result<Value, LspError>>>>>;
 /// `Read`/`Write` so the server may run locally (a child process) OR inside a
 /// sandbox/remote, driven over the resident bridge's stdio (see `from_io`).
 pub struct LspClient {
-    writer: SyncSender<WriterCommand>,
+    writer: Arc<SyncSender<WriterCommand>>,
     /// The local child, if any. `None` for a bridge/remote server (its lifecycle
     /// is owned by the bridge/exec channel, which closes when this drops).
     child: Mutex<Option<Child>>,
@@ -1689,6 +1689,26 @@ impl LspClient {
         server_identity: String,
         generation: u64,
     ) -> Result<LspClient, LspError> {
+        Self::start_argv_with_context_and_spawner(
+            argv,
+            language_id,
+            root,
+            diag_tx,
+            server_identity,
+            generation,
+            spawn_lsp_thread,
+        )
+    }
+
+    fn start_argv_with_context_and_spawner(
+        argv: &[String],
+        language_id: &str,
+        root: &Path,
+        diag_tx: DiagnosticsSender,
+        server_identity: String,
+        generation: u64,
+        spawn: LspThreadSpawner,
+    ) -> Result<LspClient, LspError> {
         let Some((cmd, rest)) = argv.split_first() else {
             diag_tx.retire(root, &server_identity, generation);
             return Err(LspError::Spawn("empty server argv".into()));
@@ -1726,11 +1746,14 @@ impl LspClient {
             root,
             language_id.to_string(),
             diag_tx,
-            Authority {
-                server_identity,
-                generation,
+            ConnectOptions {
+                authority: Authority {
+                    server_identity: server_identity.clone(),
+                    generation,
+                },
+                spawn,
             },
-        );
+        )?;
         // The command's file name, not the full path: `/nix/store/…/bin/gopls`
         // is a store hash in a status list, and the args can carry a project
         // path the user may not want on screen.
@@ -1767,11 +1790,14 @@ impl LspClient {
             root,
             language_id.to_string(),
             diagnostics,
-            Authority {
-                server_identity: language_id.to_string(),
-                generation,
+            ConnectOptions {
+                authority: Authority {
+                    server_identity: language_id.to_string(),
+                    generation,
+                },
+                spawn: spawn_lsp_thread,
             },
-        ))
+        )?)
     }
 
     /// [`LspClient::from_io`] under a supervisor-registered authority (see
@@ -1784,7 +1810,7 @@ impl LspClient {
         diagnostics: DiagnosticsSender,
         server_identity: String,
         generation: u64,
-    ) -> LspClient {
+    ) -> Result<LspClient, LspError> {
         Self::connect(
             reader,
             writer,
@@ -1792,9 +1818,12 @@ impl LspClient {
             root,
             language_id.to_string(),
             diagnostics,
-            Authority {
-                server_identity,
-                generation,
+            ConnectOptions {
+                authority: Authority {
+                    server_identity,
+                    generation,
+                },
+                spawn: spawn_lsp_thread,
             },
         )
     }
@@ -1806,8 +1835,9 @@ impl LspClient {
         root: &Path,
         language_id: String,
         diag_tx: DiagnosticsSender,
-        authority: Authority,
-    ) -> LspClient {
+        options: ConnectOptions,
+    ) -> Result<LspClient, LspError> {
+        let ConnectOptions { authority, spawn } = options;
         let Authority {
             server_identity,
             generation,
@@ -1817,9 +1847,10 @@ impl LspClient {
         let closed = Arc::new(AtomicBool::new(false));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let writer_pending = pending.clone();
-        let _writer_thread = thread::Builder::new()
-            .name("thegn-lsp-writer".into())
-            .spawn({
+        let writer_tx = Arc::new(writer_tx);
+        let writer_spawn = spawn(
+            "thegn-lsp-writer",
+            Box::new({
                 let writer_queued_bytes = queued_bytes.clone();
                 let writer_closed = closed.clone();
                 move || {
@@ -1831,13 +1862,25 @@ impl LspClient {
                         writer_pending,
                     )
                 }
-            })
-            .expect("LSP writer thread spawn");
-        let reader_thread = {
+            }),
+        );
+        let _writer_thread = match writer_spawn {
+            Ok(thread) => thread,
+            Err(error) => {
+                if let Some(child) = child.as_mut() {
+                    terminate_tree(child, None);
+                }
+                diag_tx.retire(root, &server_identity, generation);
+                return Err(LspError::Spawn(error.to_string()));
+            }
+        };
+        let reader_spawn = {
             let ctx = ReaderContext {
                 pending: pending.clone(),
                 diag_tx: diag_tx.clone(),
-                writer: writer_tx.clone(),
+                writer: Arc::downgrade(&writer_tx),
+                #[cfg(test)]
+                _writer_keepalive: None,
                 queued_bytes: queued_bytes.clone(),
                 root: root.to_path_buf(),
                 closed: closed.clone(),
@@ -1845,10 +1888,24 @@ impl LspClient {
                 generation,
                 sequence: AtomicU64::new(0),
             };
-            thread::spawn(move || reader_loop(reader, ctx))
+            spawn(
+                "thegn-lsp-reader",
+                Box::new(move || reader_loop(reader, ctx)),
+            )
+        };
+        let reader_thread = match reader_spawn {
+            Ok(thread) => thread,
+            Err(error) => {
+                drop(writer_tx);
+                if let Some(child) = child.as_mut() {
+                    terminate_tree(child, None);
+                }
+                diag_tx.retire(root, &server_identity, generation);
+                return Err(LspError::Spawn(error.to_string()));
+            }
         };
 
-        LspClient {
+        Ok(LspClient {
             writer: writer_tx,
             child: Mutex::new(child),
             next_id: AtomicI64::new(1),
@@ -1864,7 +1921,7 @@ impl LspClient {
             timeout: Duration::from_secs(10),
             _reader: reader_thread,
             _proc: None,
-        }
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -2167,17 +2224,16 @@ impl LspClient {
     /// Ask the server to shut down, send `exit`, then reap a local child.
     /// The protocol wait and process wait are each bounded by `grace`.
     pub fn shutdown(&self, grace: Duration) {
-        if self.is_closed() {
-            return;
+        if !self.is_closed() {
+            let deadline = std::time::Instant::now() + grace;
+            if let Err(error) = self.request_until("shutdown", Value::Null, deadline) {
+                tracing::debug!(target: "thegn::lsp", %error, "LSP shutdown request did not complete");
+            }
+            if let Err(error) = self.notify("exit", Value::Null) {
+                tracing::debug!(target: "thegn::lsp", %error, "LSP exit notification was not sent");
+            }
+            self.closed.store(true, Ordering::SeqCst);
         }
-        let deadline = std::time::Instant::now() + grace;
-        if let Err(error) = self.request_until("shutdown", Value::Null, deadline) {
-            tracing::debug!(target: "thegn::lsp", %error, "LSP shutdown request did not complete");
-        }
-        if let Err(error) = self.notify("exit", Value::Null) {
-            tracing::debug!(target: "thegn::lsp", %error, "LSP exit notification was not sent");
-        }
-        self.closed.store(true, Ordering::SeqCst);
 
         if let Ok(mut child) = self.child.lock()
             && let Some(child) = child.as_mut()
@@ -2185,6 +2241,16 @@ impl LspClient {
             terminate_tree(child, Some(std::time::Instant::now() + grace));
         }
     }
+}
+
+type LspThreadSpawner =
+    fn(&'static str, Box<dyn FnOnce() + Send>) -> std::io::Result<thread::JoinHandle<()>>;
+
+fn spawn_lsp_thread(
+    name: &'static str,
+    task: Box<dyn FnOnce() + Send>,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new().name(name.into()).spawn(task)
 }
 
 fn terminate_tree(child: &mut Child, deadline: Option<std::time::Instant>) {
@@ -2256,13 +2322,21 @@ struct Authority {
     generation: u64,
 }
 
+struct ConnectOptions {
+    authority: Authority,
+    spawn: LspThreadSpawner,
+}
+
 /// Everything a reader thread owns: the request table, the diagnostics bus,
-/// the write half (to answer server→client requests), and the stream identity
-/// it stamps (with a reader-assigned monotonic sequence) on publications.
+/// a weak write handle (to answer server→client requests while the client lives),
+/// and the stream identity it stamps (with a reader-assigned monotonic sequence)
+/// on publications.
 struct ReaderContext {
     pending: Pending,
     diag_tx: DiagnosticsSender,
-    writer: SyncSender<WriterCommand>,
+    writer: Weak<SyncSender<WriterCommand>>,
+    #[cfg(test)]
+    _writer_keepalive: Option<Arc<SyncSender<WriterCommand>>>,
     queued_bytes: Arc<AtomicUsize>,
     root: PathBuf,
     closed: Arc<AtomicBool>,
@@ -2343,7 +2417,7 @@ fn reject_unparsed(ctx: &ReaderContext, body: &[u8], reason: &str) {
 }
 
 fn dispatch(msg: &Value, ctx: &ReaderContext) {
-    let (pending, diag_tx, writer, root) = (&ctx.pending, &ctx.diag_tx, &ctx.writer, &ctx.root);
+    let (pending, diag_tx, root) = (&ctx.pending, &ctx.diag_tx, &ctx.root);
     let (server_identity, generation, sequence) =
         (ctx.server_identity.as_str(), ctx.generation, &ctx.sequence);
     let id = msg.get("id").and_then(Value::as_i64);
@@ -2387,8 +2461,12 @@ fn dispatch(msg: &Value, ctx: &ReaderContext) {
                 _ => Value::Null,
             };
             let body = json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
-            if let Err(error) = enqueue_body(writer, &ctx.queued_bytes, &body, None) {
-                tracing::debug!(target: "thegn::lsp", %error, "dropping server request reply because outbound queue is full");
+            if let Some(writer) = ctx.writer.upgrade() {
+                if let Err(error) = enqueue_body(&writer, &ctx.queued_bytes, &body, None) {
+                    tracing::debug!(target: "thegn::lsp", %error, "dropping server request reply because outbound queue is full");
+                }
+            } else {
+                tracing::debug!(target: "thegn::lsp", "dropping server request reply because client writer is closed");
             }
         }
         // Notification.
@@ -2729,6 +2807,134 @@ mod tests {
         );
     }
 
+    fn fail_lsp_thread_spawn(
+        _: &'static str,
+        _: Box<dyn FnOnce() + Send>,
+    ) -> std::io::Result<thread::JoinHandle<()>> {
+        thread::sleep(Duration::from_millis(200));
+        Err(std::io::Error::other("injected LSP thread spawn failure"))
+    }
+
+    fn fail_lsp_reader_spawn(
+        name: &'static str,
+        task: Box<dyn FnOnce() + Send>,
+    ) -> std::io::Result<thread::JoinHandle<()>> {
+        if name == "thegn-lsp-reader" {
+            thread::sleep(Duration::from_millis(200));
+            Err(std::io::Error::other("injected LSP reader spawn failure"))
+        } else {
+            spawn_lsp_thread(name, task)
+        }
+    }
+
+    fn heartbeat_argv(heartbeat: &Path) -> Vec<String> {
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            ": > \"$1\"; ( i=0; while [ $i -lt 200 ]; do echo x >> \"$1\"; i=$((i+1)); sleep 0.05; done ) & exec cat >/dev/null".into(),
+            "lsp-heartbeat".into(),
+            heartbeat.display().to_string(),
+        ]
+    }
+
+    #[test]
+    fn writer_spawn_failure_reaps_server_and_retires_generation() {
+        if !Path::new("/bin/sh").is_file() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let heartbeat = root.path().join("heartbeat.txt");
+        let (diagnostics, _) = diagnostics_channel();
+        let generation = diagnostics.register(root.path(), "heartbeat").unwrap();
+
+        let result = LspClient::start_argv_with_context_and_spawner(
+            &heartbeat_argv(&heartbeat),
+            "fixture",
+            root.path(),
+            diagnostics.clone(),
+            "heartbeat".into(),
+            generation,
+            fail_lsp_thread_spawn,
+        );
+
+        assert!(matches!(result, Err(LspError::Spawn(_))));
+        assert_heartbeat_stopped(&heartbeat);
+        assert!(!diagnostics.is_current(root.path(), "heartbeat", generation));
+    }
+
+    #[test]
+    fn reader_spawn_failure_closes_stream_writer() {
+        let (server_reader, client_writer) = std::io::pipe().unwrap();
+        let (client_reader, _server_writer) = std::io::pipe().unwrap();
+        let (diagnostics, _) = diagnostics_channel();
+        let generation = diagnostics
+            .register(Path::new("/fixture"), "fixture")
+            .unwrap();
+
+        let result = LspClient::connect(
+            Box::new(client_reader),
+            Box::new(client_writer),
+            None,
+            Path::new("/fixture"),
+            "fixture".into(),
+            diagnostics,
+            ConnectOptions {
+                authority: Authority {
+                    server_identity: "fixture".into(),
+                    generation,
+                },
+                spawn: fail_lsp_reader_spawn,
+            },
+        );
+        assert!(matches!(result, Err(LspError::Spawn(_))));
+
+        let (eof_tx, eof_rx) = mpsc::channel();
+        let _read_thread = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = std::io::Read::read_to_end(&mut Box::new(server_reader), &mut bytes);
+            eof_tx.send(result.map(|_| bytes)).unwrap();
+        });
+        assert!(
+            eof_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dropping_stream_client_closes_writer_after_exit() {
+        let (client_reader, _server_writer) = std::io::pipe().unwrap();
+        let (server_reader, client_writer) = std::io::pipe().unwrap();
+        let (diagnostics, _) = diagnostics_channel();
+        let client = LspClient::from_io(
+            Box::new(client_reader),
+            Box::new(client_writer),
+            "fixture",
+            Path::new("/fixture"),
+            diagnostics,
+        )
+        .unwrap();
+        let (read_tx, read_rx) = mpsc::channel();
+        let _read_thread = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = std::io::Read::read_to_end(&mut Box::new(server_reader), &mut bytes);
+            read_tx.send(result.map(|_| bytes)).unwrap();
+        });
+        drop(client);
+
+        let bytes = read_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(
+            String::from_utf8(bytes)
+                .unwrap()
+                .contains("\"method\":\"exit\"")
+        );
+    }
+
     #[test]
     fn shutdown_kills_server_descendants() {
         if !Path::new("/bin/sh").is_file() {
@@ -2737,6 +2943,38 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (client, heartbeat) = spawned_server_with_heartbeat(root.path());
         wait_for_heartbeat(&heartbeat);
+
+        client.shutdown(Duration::from_millis(200));
+
+        assert_heartbeat_stopped(&heartbeat);
+    }
+
+    #[test]
+    fn shutdown_after_reader_eof_still_kills_server_descendants() {
+        if !Path::new("/bin/sh").is_file() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let heartbeat = root.path().join("heartbeat.txt");
+        let (diagnostics, _) = diagnostics_channel();
+        let generation = diagnostics.register(root.path(), "heartbeat").unwrap();
+        let mut argv = heartbeat_argv(&heartbeat);
+        argv[2] = "exec >/dev/null; ( i=0; while [ $i -lt 200 ]; do echo x >> \"$1\"; i=$((i+1)); sleep 0.05; done ) & exec cat >/dev/null".into();
+        let client = LspClient::start_argv_with_identity(
+            &argv,
+            "fixture",
+            root.path(),
+            diagnostics,
+            "heartbeat".into(),
+            generation,
+        )
+        .unwrap();
+        wait_for_heartbeat(&heartbeat);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !client.is_closed() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(client.is_closed(), "reader observes closed stdout");
 
         client.shutdown(Duration::from_millis(200));
 
@@ -3123,6 +3361,7 @@ mod tests {
         stdin: Arc<Mutex<Box<dyn Write + Send>>>,
     ) -> ReaderContext {
         let (writer, reader) = mpsc::sync_channel(4);
+        let writer = Arc::new(writer);
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let closed = Arc::new(AtomicBool::new(false));
         let writer_obj = match Arc::try_unwrap(stdin) {
@@ -3148,7 +3387,8 @@ mod tests {
         ReaderContext {
             pending,
             diag_tx,
-            writer,
+            writer: Arc::downgrade(&writer),
+            _writer_keepalive: Some(writer),
             queued_bytes,
             root: PathBuf::from("/fixture"),
             closed,
