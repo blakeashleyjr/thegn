@@ -429,10 +429,8 @@ where
                     }
                     drop(routes);
                     drop(permit);
-                    if dial_failed {
-                        if let Err(error) = sink.send(encode(&Frame::Close(id))).await {
-                            tracing::debug!(target: "thegn::revtunnel", %error, "close reply dropped");
-                        }
+                    if dial_failed && let Err(error) = sink.send(encode(&Frame::Close(id))).await {
+                        tracing::debug!(target: "thegn::revtunnel", %error, "close reply dropped");
                     }
                 });
             }
