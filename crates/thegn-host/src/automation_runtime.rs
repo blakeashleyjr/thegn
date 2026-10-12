@@ -382,18 +382,19 @@ fn enrich_event(db: &thegn_core::db::Db, event: &mut AutomationEvent) {
         }
     }
     if event.agent_role.is_none() {
-        event.agent_role = db.list_dispatches().ok().and_then(|rows| {
-            rows.into_iter()
+        event.agent_role = if let Some(session) = event.session_id.as_deref() {
+            db.dispatch_by_session(session)
+                .ok()
+                .flatten()
                 .filter(|dispatch| dispatch.worktree_path == worktree)
-                .filter(|dispatch| {
-                    event
-                        .session_id
-                        .as_ref()
-                        .is_none_or(|session| dispatch.session_id.as_ref() == Some(session))
-                })
-                .max_by_key(|dispatch| dispatch.dispatched_at_ms)
                 .and_then(|dispatch| dispatch.stage)
-        });
+        } else {
+            db.dispatch_for_worktree(worktree)
+                .ok()
+                .flatten()
+                .and_then(|id| db.get_dispatch(id).ok().flatten())
+                .and_then(|dispatch| dispatch.stage)
+        };
     }
 }
 
@@ -571,6 +572,69 @@ mod tests {
         assert_eq!(event.repo.as_deref(), Some("/repo"));
         assert_eq!(event.branch.as_deref(), Some("tg/feature"));
         assert_eq!(event.agent_role.as_deref(), Some("code"));
+    }
+
+    fn event_for_dispatch(worktree: &str, session_id: Option<&str>) -> AutomationEvent {
+        let id = "dispatch-event";
+        AutomationEvent {
+            id: id.into(),
+            occurred_at: 1,
+            key: thegn_core::automation::EventKey(id.into()),
+            kind: thegn_core::automation::AutomationEventKind::AgentFinished,
+            target_rule: None,
+            workspace: None,
+            repo: None,
+            worktree: Some(worktree.into()),
+            branch: None,
+            agent_role: None,
+            notification_kind: None,
+            priority: None,
+            source_ref: None,
+            message: None,
+            session_id: session_id.map(str::to_owned),
+            pr_checks_passed: None,
+            pr_review_requested: None,
+            pr_merged: None,
+            origin: None,
+        }
+    }
+
+    fn put_dispatch(db: &thegn_core::db::Db, worktree: &str, session_id: &str, stage: &str) -> i64 {
+        db.put_agent_dispatch(thegn_core::issue::NewDispatch {
+            issue_id: "THE-259",
+            worktree_path: worktree,
+            agent_name: "codex",
+            stage: Some(stage),
+            parent_id: None,
+            session_id: Some(session_id),
+            artifact_path: None,
+            chunk_path: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn session_dispatch_enrichment_uses_its_row_instead_of_a_newer_worktree_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = thegn_core::db::Db::open_at(&dir.path().join("automation.db")).unwrap();
+        put_dispatch(&db, "/wt", "session-requested", "requested-stage");
+        put_dispatch(&db, "/wt", "other-session", "newer-stage");
+
+        let mut event = event_for_dispatch("/wt", Some("session-requested"));
+        enrich_event(&db, &mut event);
+        assert_eq!(event.agent_role.as_deref(), Some("requested-stage"));
+    }
+
+    #[test]
+    fn session_dispatch_enrichment_rejects_a_session_row_in_another_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = thegn_core::db::Db::open_at(&dir.path().join("automation.db")).unwrap();
+        put_dispatch(&db, "/wt", "session-requested", "older-stage");
+        put_dispatch(&db, "/wt/other", "session-requested", "wrong-stage");
+
+        let mut event = event_for_dispatch("/wt", Some("session-requested"));
+        enrich_event(&db, &mut event);
+        assert_eq!(event.agent_role, None);
     }
 
     #[test]
