@@ -61,7 +61,7 @@ fn read_doc(path: &Path) -> Result<(DocumentMut, Option<Vec<u8>>)> {
             Some(bytes)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+        Err(error) => return Err(config_path_error(path, error)),
     };
     let text = bytes
         .as_deref()
@@ -116,7 +116,7 @@ fn write_doc_fenced(path: &Path, doc: &DocumentMut, expected: Option<&[u8]>) -> 
             Some(bytes)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error).context("open config destination without following links"),
+        Err(error) => return Err(config_path_error(path, error)),
     };
     anyhow::ensure!(
         current.as_deref() == expected,
@@ -137,7 +137,7 @@ fn write_doc_fenced(path: &Path, doc: &DocumentMut, expected: Option<&[u8]>) -> 
     file.sync_all().context("sync config temporary")?;
     drop(file);
     // Recheck directly before replacement; a conflict preserves the old file.
-    let current = match crate::fsperm::open_regular_file_nofollow(path) {
+    let (current, existing_metadata) = match crate::fsperm::open_regular_file_nofollow(path) {
         Ok(mut file) => {
             let metadata = file
                 .metadata()
@@ -149,30 +149,46 @@ fn write_doc_fenced(path: &Path, doc: &DocumentMut, expected: Option<&[u8]>) -> 
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)
                 .context("recheck config generation")?;
-            Some(bytes)
+            (Some(bytes), Some(metadata))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error).context("recheck config destination"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+        Err(error) => return Err(config_path_error(path, error)),
     };
     anyhow::ensure!(
         current.as_deref() == expected,
         "config changed during edit; retry the operation"
     );
+    if let Some(metadata) = existing_metadata {
+        crate::fsperm::preserve_owner_only_permissions(&metadata, &tmp)
+            .context("preserve owner-only config permissions")?;
+    }
     crate::fsperm::rename_replace(&tmp, path).context("replace config")?;
     pending.0 = None;
-    crate::fsperm::sync_parent_dir(parent).context("sync config directory")?;
+    if let Err(error) = crate::fsperm::sync_parent_dir(parent) {
+        tracing::warn!(error = %error, path = %parent.display(), "config was written but its directory could not be synced");
+    }
     Ok(())
+}
+
+fn config_path_error(path: &Path, error: std::io::Error) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        anyhow::anyhow!(
+            "config path {} is a symlink or not a regular file; refusing to replace it - edit the link target directly",
+            path.display()
+        )
+    } else {
+        anyhow::Error::from(error).context(format!("access config {}", path.display()))
+    }
 }
 
 struct ConfigTemp(Option<std::path::PathBuf>);
 impl Drop for ConfigTemp {
     fn drop(&mut self) {
-        if let Some(path) = &self.0 {
-            if let Err(error) = std::fs::remove_file(path) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(error = %error, "could not remove config temporary");
-                }
-            }
+        if let Some(path) = &self.0
+            && let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(error = %error, "could not remove config temporary");
         }
     }
 }
@@ -486,6 +502,15 @@ mod tests {
 
     fn tmp(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("tg-cfgwrite-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn no_follow_config_errors_explain_symlink_refusal() {
+        let error = config_path_error(
+            Path::new("config.toml"),
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "is a symlink"),
+        );
+        assert!(error.to_string().contains("edit the link target directly"));
     }
 
     #[cfg(unix)]

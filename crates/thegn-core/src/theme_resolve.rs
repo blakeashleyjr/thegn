@@ -281,11 +281,15 @@ mod tests {
 
     #[test]
     fn duplicate_user_theme_names_never_select_the_first_entry() {
-        let mut first_palette = Palette::default();
-        first_palette.bg0 = "1;2;3".into();
+        let first_palette = Palette {
+            bg0: "1;2;3".into(),
+            ..Palette::default()
+        };
         let first = UserTheme::from_palette("duplicate", &first_palette);
-        let mut second_palette = Palette::default();
-        second_palette.bg0 = "9;8;7".into();
+        let second_palette = Palette {
+            bg0: "9;8;7".into(),
+            ..Palette::default()
+        };
         let second = UserTheme::from_palette("duplicate", &second_palette);
         let fallback = palette_with_config(
             "duplicate",
