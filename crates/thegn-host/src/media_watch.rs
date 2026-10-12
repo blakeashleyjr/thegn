@@ -559,7 +559,10 @@ mod tests {
                 .on_failure(failure_now + grace + grace, grace)
                 .is_none()
         );
-        assert_eq!(stale_grace(std::time::Duration::from_secs(4)), grace);
+        assert_eq!(
+            stale_grace(std::time::Duration::from_secs(4)),
+            std::time::Duration::from_secs(12)
+        );
         assert_eq!(
             stale_grace(std::time::Duration::from_secs(5)),
             std::time::Duration::from_secs(15)
