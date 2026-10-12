@@ -111,6 +111,7 @@ impl Recorder {
                     cols,
                     rows,
                     max_bytes,
+                    stamp,
                     worker_state.as_ref(),
                 );
                 if let Err(error) = result_tx.send(finished) {
@@ -127,22 +128,21 @@ impl Recorder {
         })
     }
 
-    /// Enqueue a raw PTY chunk without waiting for the disk. Chunks larger than
-    /// the fixed payload limit and full queues both stop recording explicitly.
+    /// Enqueue a raw PTY chunk without waiting for the disk.
     pub(crate) fn feed(&mut self, bytes: &[u8]) {
         if self.done() {
             return;
         }
-        if bytes.len() > MAX_CHUNK_BYTES {
-            self.state.fail(format!(
-                "recording truncated: PTY chunk exceeded {MAX_CHUNK_BYTES} byte limit"
-            ));
-            return;
+        let at = self.elapsed();
+        for chunk in bytes.chunks(MAX_CHUNK_BYTES) {
+            self.try_enqueue(Command::Output {
+                at,
+                bytes: chunk.to_vec(),
+            });
+            if self.done() {
+                break;
+            }
         }
-        self.try_enqueue(Command::Output {
-            at: self.elapsed(),
-            bytes: bytes.to_vec(),
-        });
     }
 
     /// Record a geometry change in the same ordered queue as output.
@@ -182,12 +182,36 @@ impl Recorder {
         self.state.done.load(Ordering::Acquire)
     }
 
+    pub(crate) fn capped(&self) -> bool {
+        self.state.capped()
+    }
+
+    pub(crate) fn failure(&self) -> Option<String> {
+        self.state
+            .failure
+            .lock()
+            .ok()
+            .and_then(|failure| failure.clone())
+    }
+
     /// Close admission and wait at most two seconds for queued writes and flush.
     /// On timeout, the still-running worker retains file ownership; status says
     /// truncated even though the detached worker may finish flushing later.
-    pub(crate) fn finish(mut self) -> Finished {
+    pub(crate) fn finish(self) -> Finished {
+        self.finish_with_timeout(FINISH_TIMEOUT)
+    }
+
+    fn finish_with_timeout(mut self, timeout: Duration) -> Finished {
+        self.close_admission();
+        self.wait_finished(timeout)
+    }
+
+    fn close_admission(&mut self) {
         drop(self.tx.take()); // disconnect after all accepted commands, preserving order
-        let outcome = self.result.recv_timeout(FINISH_TIMEOUT);
+    }
+
+    fn wait_finished(mut self, timeout: Duration) -> Finished {
+        let outcome = self.result.recv_timeout(timeout);
         match outcome {
             Ok(mut finished) => {
                 if self
@@ -200,9 +224,9 @@ impl Recorder {
                 }
                 finished
             }
-            Err(_) => {
+            Err(error) => {
                 drop(self.worker.take()); // worker keeps its file and finishes independently
-                let reason = if matches!(outcome, Err(mpsc::RecvTimeoutError::Timeout)) {
+                let reason = if matches!(error, mpsc::RecvTimeoutError::Timeout) {
                     "recording finalization timed out; writer may still be flushing"
                 } else {
                     "recording writer stopped without a completion result"
@@ -216,6 +240,21 @@ impl Recorder {
         }
     }
 
+    /// Close admission immediately and perform the bounded wait away from the
+    /// session actor. The actor receives completion through its own mailbox.
+    pub(crate) fn finish_background(
+        mut self,
+        completed: tokio::sync::mpsc::UnboundedSender<Finished>,
+    ) {
+        self.close_admission();
+        drop(tokio::task::spawn_blocking(move || {
+            let finished = self.wait_finished(FINISH_TIMEOUT);
+            if let Err(error) = completed.send(finished) {
+                tracing::debug!(target: "thegn::daemon", "recording completion receiver dropped: {error}");
+            }
+        }));
+    }
+
     fn elapsed(&self) -> f64 {
         self.start.elapsed().as_secs_f64()
     }
@@ -227,19 +266,10 @@ fn run_worker(
     cols: u16,
     rows: u16,
     max_bytes: u64,
+    stamp: i64,
     state: &WorkerState,
 ) -> Finished {
-    let initialized = (|| -> io::Result<CastWriter<BufWriter<std::fs::File>>> {
-        let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(dir)?;
-        crate::platform::restrict_dir_owner_only(dir);
-        let file = crate::platform::create_private_file(path)?;
-        let mut header = Header::new(cols, rows);
-        let stamp = now_ms();
-        header.timestamp = Some(stamp / 1000);
-        header.term = Some("thegn".to_string());
-        CastWriter::new(BufWriter::new(file), &header)
-    })();
+    let initialized = open_cast_writer(path, cols, rows, stamp);
     let writer = match initialized {
         Ok(writer) => writer,
         Err(error) => {
@@ -254,15 +284,44 @@ fn run_worker(
     run_writer(rx, path, max_bytes, state, writer)
 }
 
-#[cfg(test)]
-fn run_worker_with_writer<W: Write>(
-    rx: mpsc::Receiver<Command>,
+fn open_cast_writer(
     path: &Path,
-    max_bytes: u64,
-    state: &WorkerState,
-    writer: CastWriter<W>,
-) -> Finished {
-    run_writer(rx, path, max_bytes, state, writer)
+    cols: u16,
+    rows: u16,
+    stamp: i64,
+) -> io::Result<CastWriter<BufWriter<std::fs::File>>> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    crate::platform::restrict_dir_owner_only(dir);
+    let file = crate::platform::create_private_file(path)?;
+    let mut header = Header::new(cols, rows);
+    header.timestamp = Some(stamp / 1000);
+    header.term = Some("thegn".to_string());
+    CastWriter::new(BufWriter::new(file), &header)
+}
+
+#[cfg(test)]
+fn start_with_writer<W: Write + Send + 'static>(writer: CastWriter<W>) -> Recorder {
+    let (tx, rx) = mpsc::sync_channel(QUEUE_COMMANDS);
+    let (result_tx, result) = mpsc::channel();
+    let state = Arc::new(WorkerState::new());
+    let worker_state = Arc::clone(&state);
+    let path = PathBuf::from("injected.cast");
+    let worker_path = path.clone();
+    let worker = thread::spawn(move || {
+        let finished = run_writer(rx, &worker_path, 0, &worker_state, writer);
+        if let Err(error) = result_tx.send(finished) {
+            tracing::debug!(target: "thegn::daemon", "recording completion receiver dropped: {error}");
+        }
+    });
+    Recorder {
+        tx: Some(tx),
+        worker: Some(worker),
+        result,
+        state,
+        path,
+        start: Instant::now(),
+    }
 }
 
 fn run_writer<W: Write>(
@@ -381,65 +440,146 @@ mod tests {
     }
 
     #[test]
+    fn feed_splits_a_64k_chunk_and_recording_continues() {
+        let tmp = std::env::temp_dir().join(format!("thegn-rec-large-{}", now_ms()));
+        let mut cfg = Config::default();
+        cfg.recording.dir = tmp.to_string_lossy().into_owned();
+        let mut rec = Recorder::start("sess-large", 80, 24, &cfg).expect("start");
+        rec.feed(&vec![b'a'; 64 * 1024]);
+        assert!(
+            !rec.done(),
+            "a PTY sized 64 KiB chunk is split, not rejected"
+        );
+        rec.feed(b"continues");
+        let fin = rec.finish();
+        assert!(fin.truncated.is_none());
+        let text = std::fs::read_to_string(&fin.path).unwrap();
+        assert_eq!(
+            text.lines().count(),
+            6,
+            "header, four chunks, and later output"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn asynchronous_start_failure_marks_recorder_done() {
+        let blocker = std::env::temp_dir().join(format!("thegn-rec-file-{}", now_ms()));
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let mut cfg = Config::default();
+        cfg.recording.dir = blocker.to_string_lossy().into_owned();
+        let rec = Recorder::start("sess-fail", 80, 24, &cfg).expect("worker starts");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !rec.done() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(
+            rec.done(),
+            "startup I/O failure is visible while output is idle"
+        );
+        assert!(
+            rec.failure()
+                .as_deref()
+                .is_some_and(|reason| reason.contains("recording start failed"))
+        );
+        let finished = rec.finish();
+        assert!(finished.truncated.is_some());
+        std::fs::remove_file(blocker).unwrap();
+    }
+
+    #[test]
     fn slow_sink_does_not_block_admission_and_overflow_is_bounded() {
-        struct SlowWriter(mpsc::Sender<()>);
+        struct SlowWriter {
+            started: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            stalled: bool,
+        }
         impl Write for SlowWriter {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.0
-                    .send(())
-                    .map_err(|_| io::Error::other("test writer observer dropped"))?;
-                std::thread::sleep(Duration::from_millis(10));
+                if self.stalled {
+                    self.started
+                        .send(())
+                        .map_err(|_| io::Error::other("test writer observer dropped"))?;
+                    self.release
+                        .recv()
+                        .map_err(|_| io::Error::other("test writer stall released"))?;
+                    self.stalled = false;
+                }
                 Ok(bytes.len())
             }
             fn flush(&mut self) -> io::Result<()> {
-                std::thread::sleep(Duration::from_millis(10));
                 Ok(())
             }
         }
-        let path = PathBuf::from("slow.cast");
         let mut header = Header::new(80, 24);
         header.timestamp = Some(0);
         let (started_tx, started_rx) = mpsc::channel();
-        let writer = CastWriter::new(BufWriter::new(SlowWriter(started_tx)), &header)
-            .expect("buffered header");
-        let state = Arc::new(WorkerState::new());
-        let worker_state = Arc::clone(&state);
-        let (tx, rx) = mpsc::sync_channel(QUEUE_COMMANDS);
-        let worker = thread::spawn(move || run_writer(rx, &path, 0, &worker_state, writer));
-        tx.send(Command::Output {
-            at: 0.1,
-            bytes: vec![b'a'; MAX_CHUNK_BYTES],
-        })
-        .unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = CastWriter::new(
+            BufWriter::new(SlowWriter {
+                started: started_tx,
+                release: release_rx,
+                stalled: true,
+            }),
+            &header,
+        )
+        .expect("buffered header");
+        let mut rec = start_with_writer(writer);
+        rec.feed(&vec![b'a'; MAX_CHUNK_BYTES]);
         started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("slow sink was entered");
         let started = Instant::now();
-        for _ in 0..QUEUE_COMMANDS {
-            assert!(
-                tx.try_send(Command::Output {
-                    at: 0.2,
-                    bytes: vec![b'x'; MAX_CHUNK_BYTES]
-                })
-                .is_ok()
-            );
+        for _ in 0..=QUEUE_COMMANDS {
+            rec.feed(&vec![b'x'; MAX_CHUNK_BYTES]);
         }
-        assert!(matches!(
-            tx.try_send(Command::Output {
-                at: 0.3,
-                bytes: vec![b'x'; MAX_CHUNK_BYTES]
-            }),
-            Err(mpsc::TrySendError::Full(_))
-        ));
-        state.fail("recording truncated: bounded writer queue is full".to_string());
         assert!(started.elapsed() < Duration::from_millis(100));
-        assert_eq!(QUEUE_COMMANDS * MAX_CHUNK_BYTES, 1024 * 1024);
-        drop(tx);
-        let finished = worker.join().unwrap();
+        assert!(rec.done(), "feed marks the recorder done on queue overflow");
+        release_tx.send(()).unwrap();
+        let finished = rec.finish();
         assert!(
-            finished.truncated.is_some(),
-            "overflow must be observable as truncation"
+            finished
+                .truncated
+                .as_deref()
+                .is_some_and(|reason| reason.contains("queue is full")),
+            "feed overflow must report queue-full truncation"
         );
+        assert_eq!(QUEUE_COMMANDS * MAX_CHUNK_BYTES, 1024 * 1024);
+    }
+
+    #[test]
+    fn finish_timeout_reports_truncation() {
+        struct StalledWriter(mpsc::Receiver<()>);
+        impl Write for StalledWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0
+                    .recv()
+                    .map_err(|_| io::Error::other("stall released"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0
+                    .recv()
+                    .map_err(|_| io::Error::other("stall released"))
+            }
+        }
+        let mut header = Header::new(80, 24);
+        header.timestamp = Some(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = CastWriter::new(BufWriter::new(StalledWriter(release_rx)), &header)
+            .expect("buffered header");
+        let mut rec = start_with_writer(writer);
+        rec.feed(b"block on final flush");
+        let finished = rec.finish_with_timeout(Duration::from_millis(20));
+        assert!(
+            finished
+                .truncated
+                .as_deref()
+                .is_some_and(|reason| reason.contains("timed out")),
+            "a stalled worker must report the finish timeout"
+        );
+        release_tx.send(()).unwrap();
+        release_tx.send(()).unwrap();
     }
 
     #[test]
@@ -466,7 +606,7 @@ mod tests {
         })
         .unwrap();
         drop(tx);
-        let fin = run_worker_with_writer(rx, &path, 0, &state, writer);
+        let fin = run_writer(rx, &path, 0, &state, writer);
         assert!(
             fin.truncated.is_some(),
             "sink failure must not report a clean save"

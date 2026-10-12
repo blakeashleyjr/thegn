@@ -255,6 +255,8 @@ pub(crate) struct SessionActor {
     /// The active asciicast recorder, teed in `on_output`. `None` ⇒ the tee is
     /// a single null check (free when off).
     recorder: Option<super::record::Recorder>,
+    /// Completion mailbox for recorder workers detached from the actor path.
+    recording_done_tx: Option<mpsc::UnboundedSender<super::record::Finished>>,
     /// Path of the current or most-recently-finalized recording, so a `status`
     /// or `stop` call can report where it was written.
     record_last_path: Option<std::path::PathBuf>,
@@ -326,6 +328,7 @@ impl SessionActor {
             last_state: PaneAgentState::Idle,
             matchers: Vec::new(),
             recorder: None,
+            recording_done_tx: None,
             record_last_path: None,
             record_capped: false,
             record_truncated: None,
@@ -351,6 +354,8 @@ impl SessionActor {
         mut pane_rx: mpsc::Receiver<PaneEvent>,
         mut msg_rx: mpsc::Receiver<SessionMsg>,
     ) {
+        let (recording_done_tx, mut recording_done_rx) = mpsc::unbounded_channel();
+        self.recording_done_tx = Some(recording_done_tx);
         // PTY stdin rides a dedicated writer thread: `write_all` blocks once
         // the child stops draining stdin and the kernel's ~64KB PTY buffer
         // fills, and a blocked actor can neither fan out output nor process
@@ -392,6 +397,11 @@ impl SessionActor {
                     None => break (None, true), // reader gone ⇒ child already EOF'd
                 },
                 () = sleep_until_opt(next_tick) => self.observe_activity(),
+                finished = recording_done_rx.recv() => {
+                    if let Some(finished) = finished {
+                        self.recording_completed(finished);
+                    }
+                }
                 msg = msg_rx.recv() => match msg {
                     Some(SessionMsg::Attach { client_id, kind, rows, cols, history, reply }) => {
                         let r = self.on_attach(client_id, kind, rows, cols, history);
@@ -439,6 +449,7 @@ impl SessionActor {
                     Some(SessionMsg::Kill) | None => break (None, false),
                 },
             }
+            self.finalize_done_recording();
             next_tick = self.activity_deadline();
         };
 
@@ -471,7 +482,16 @@ impl SessionActor {
         // finished `.cast` path and `session list` reports it briefly after
         // death. Recording is owned by the actor, so a session exiting is the
         // last thing that stops it (see the spec: stop on exit).
-        self.finalize_recording();
+        if let Some(rec) = self.recorder.take() {
+            let finished = tokio::task::spawn_blocking(move || rec.finish())
+                .await
+                .unwrap_or_else(|error| super::record::Finished {
+                    path: self.record_last_path.clone().unwrap_or_default(),
+                    capped: self.record_capped,
+                    truncated: Some(format!("recording finalization task failed: {error}")),
+                });
+            self.recording_completed(finished);
+        }
 
         // Bury the corpse BEFORE anything observable. The ordering is the whole
         // fix for a real, reproduced bug: a `wait` woken by the exit event
@@ -824,10 +844,21 @@ impl SessionActor {
 
     /// When the observer next wants waking, as a tokio deadline.
     fn activity_deadline(&self) -> Option<tokio::time::Instant> {
-        let secs = self
+        let now = tokio::time::Instant::now();
+        let activity = self
             .activity
-            .next_tick(&self.cfg.activity, unix_now_secs())?;
-        Some(tokio::time::Instant::now() + std::time::Duration::from_secs_f64(secs))
+            .next_tick(&self.cfg.activity, unix_now_secs())
+            .map(|secs| now + std::time::Duration::from_secs_f64(secs));
+        let recording = self
+            .recorder
+            .as_ref()
+            .map(|_| now + std::time::Duration::from_millis(250));
+        match (activity, recording) {
+            (Some(activity), Some(recording)) => Some(activity.min(recording)),
+            (Some(activity), None) => Some(activity),
+            (None, Some(recording)) => Some(recording),
+            (None, None) => None,
+        }
     }
 
     /// Broadcast a state transition. **Edge-triggered**: a working agent
@@ -1079,6 +1110,7 @@ impl SessionActor {
     /// Handle a `sessions.record` request (start/stop/status). Owned by the
     /// actor so recording is unaffected by client attach/detach.
     fn on_record(&mut self, spec: RecordSpec) -> Result<RecordStatus, ControlError> {
+        self.finalize_done_recording();
         match spec {
             RecordSpec::Start => {
                 if self.recorder.is_some() {
@@ -1110,35 +1142,64 @@ impl SessionActor {
         }
     }
 
-    /// Stop and finalize the active recording, if any — flushing the file and
-    /// clearing the live "recording" flag. Called on stop, size-cap, and exit.
+    /// Stop admission and detach finalization from the actor. The worker's
+    /// bounded wait completes off-runtime and reports back through the mailbox.
     fn finalize_recording(&mut self) {
         if let Some(rec) = self.recorder.take() {
-            let fin = rec.finish();
-            self.record_capped = fin.capped;
-            // A recording that could not be flushed is truncated; say so on the
-            // status reply (and in the log) instead of reporting it as saved.
-            if let Some(reason) = &fin.truncated {
-                tracing::warn!(
-                    target: "thegn::daemon",
-                    session = %self.meta.id,
-                    path = %fin.path.display(),
-                    reason = %reason,
-                    "recording could not be finalized — the .cast file is truncated"
-                );
-            }
-            self.record_truncated = fin.truncated;
-            self.record_last_path = Some(fin.path);
+            self.record_capped = rec.capped();
+            self.record_truncated = rec.failure();
+            self.record_last_path = Some(rec.path().to_path_buf());
             if let Ok(mut live) = self.live.lock() {
                 live.recording = None;
             }
             let _ = self.events.send(Arc::new(EventFrame::Sessions)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+            if let Some(completed) = self.recording_done_tx.as_ref() {
+                rec.finish_background(completed.clone());
+            }
         }
+    }
+
+    fn finalize_done_recording(&mut self) {
+        if self.recorder.as_ref().is_some_and(|rec| rec.done()) {
+            self.finalize_recording();
+        }
+    }
+
+    fn recording_completed(&mut self, fin: super::record::Finished) {
+        if self
+            .record_last_path
+            .as_ref()
+            .is_some_and(|path| path != &fin.path)
+            || self
+                .recorder
+                .as_ref()
+                .is_some_and(|rec| rec.path() != fin.path)
+        {
+            return;
+        }
+        self.recorder.take();
+        self.record_capped = fin.capped;
+        if let Some(reason) = &fin.truncated {
+            tracing::warn!(
+                target: "thegn::daemon",
+                session = %self.meta.id,
+                path = %fin.path.display(),
+                reason = %reason,
+                "recording could not be finalized — the .cast file is truncated"
+            );
+        }
+        self.record_truncated = fin.truncated;
+        self.record_last_path = Some(fin.path);
+        if let Ok(mut live) = self.live.lock() {
+            live.recording = None;
+        }
+        let _ = self.events.send(Arc::new(EventFrame::Sessions)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
     }
 
     /// The current recording state for a `sessions.record` reply — status and
     /// path only, never the recorded contents.
-    fn record_status(&self) -> RecordStatus {
+    fn record_status(&mut self) -> RecordStatus {
+        self.finalize_done_recording();
         RecordStatus {
             recording: self.recorder.is_some(),
             path: self
