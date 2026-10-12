@@ -935,6 +935,12 @@ pub struct PerfSnapshot {
     pub hot_source: &'static str,
     pub hot_items_per_s: f64,
     pub pty_chunks_per_s: f64,
+    /// Pending log records in the bounded ingress at this rollup.
+    pub log_pending: usize,
+    /// Cumulative records dropped by log ingress overload.
+    pub log_dropped_total: u64,
+    /// Age of the oldest pending log record in milliseconds (zero when empty).
+    pub log_oldest_ms: u64,
     /// Per-subsystem CPU ms this interval, in [`Subsys::ALL`] order.
     #[allow(dead_code)] // surfaced by the Telemetry overlay's per-subsystem breakdown
     pub cpu_ms: [f64; Subsys::N],
@@ -945,7 +951,13 @@ impl LoopPerf {
     /// warning if idle but pulsing), drain the CPU ledger, reset, and return a
     /// snapshot for the live overlay. Called by the loop when [`due`](Self::due)
     /// — never on its own timer (that would add a wake source).
-    pub fn rollup(&mut self, boundary: Instant) -> PerfSnapshot {
+    pub fn rollup(
+        &mut self,
+        boundary: Instant,
+        log_pending: usize,
+        log_dropped_total: u64,
+        log_oldest_ms: u64,
+    ) -> PerfSnapshot {
         let secs = boundary
             .saturating_duration_since(self.report_t0)
             .as_secs_f64()
@@ -1003,6 +1015,9 @@ impl LoopPerf {
             hot_source: hot.label(),
             hot_items_per_s: hot_items as f64 / secs,
             pty_chunks_per_s: self.pty_chunks as f64 / secs,
+            log_pending,
+            log_dropped_total,
+            log_oldest_ms,
             cpu_ms,
         };
 
@@ -1015,6 +1030,9 @@ impl LoopPerf {
             target: "thegn::perf",
             metric_version = 2,
             interval_seconds = snap.interval_seconds,
+            log_pending = snap.log_pending,
+            log_dropped_total = snap.log_dropped_total,
+            log_oldest_ms = snap.log_oldest_ms,
             frame_samples = snap.frame_samples,
             input_samples = snap.input_samples,
             input_events = snap.input_events,
@@ -1292,19 +1310,22 @@ mod tests {
         lp.resync(Duration::from_micros(200));
         lp.add_busy(Duration::from_millis(3));
         let boundary = start + Duration::from_millis(10);
-        let snapshot = lp.rollup(boundary);
+        let snapshot = lp.rollup(boundary, 7, 13, 42);
         assert_eq!(snapshot.frame_samples, 1);
         assert_eq!(snapshot.input_samples, 1);
         assert_eq!(snapshot.input_events, 2);
         assert_eq!(snapshot.input_coalesced_events, 1);
         assert_eq!(snapshot.resync_samples, 1);
         assert_eq!(snapshot.interval_seconds, 0.01);
+        assert_eq!(snapshot.log_pending, 7);
+        assert_eq!(snapshot.log_dropped_total, 13);
+        assert_eq!(snapshot.log_oldest_ms, 42);
         assert!((snapshot.idle_ratio - 0.7).abs() < 1e-9);
         assert_eq!(lp.report_t0, boundary);
         assert_eq!(lp.input_events, 0);
         // Publication/dispatch after the boundary belongs to the new interval.
         lp.add_busy(Duration::from_millis(4));
-        let next = lp.rollup(boundary + Duration::from_millis(10));
+        let next = lp.rollup(boundary + Duration::from_millis(10), 0, 0, 0);
         assert!((next.idle_ratio - 0.6).abs() < 1e-9);
         assert_eq!(next.input_samples, 0);
         set_enabled(false);
