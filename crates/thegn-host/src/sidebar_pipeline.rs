@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn hostile_lane_labels_are_safe_while_identities_stay_raw() {
         let issue = "THE-1\r\n\x1b]52;c;QQ==\x07\u{202e}";
-        let worktree = "/wt/a\nb\u{2028}";
+        let worktree = "/wt/a\nb\u{2028}c";
         let out = lanes(&[dispatch(
             1,
             issue,
@@ -231,7 +231,7 @@ mod tests {
         assert_safe_cell(&out[0].label);
         assert_safe_cell(&out[0].worktrees[0].name);
 
-        let fallback_path = "/wt/a\nb\u{2028}";
+        let fallback_path = "/wt/a\nb\u{2028}c";
         let fallback = lanes(&[dispatch(
             2,
             "  ",
@@ -239,7 +239,7 @@ mod tests {
             AgentDispatchStatus::Running,
             2_000,
         )]);
-        assert_eq!(fallback[0].key, "a\nb\u{2028}");
+        assert_eq!(fallback[0].key, "a\nb\u{2028}c");
         assert_eq!(fallback[0].worktrees[0].path, fallback_path);
         assert_safe_cell(&fallback[0].label);
         assert_safe_cell(&fallback[0].worktrees[0].name);
