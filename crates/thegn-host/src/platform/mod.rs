@@ -18,6 +18,20 @@ mod unix;
 #[cfg(unix)]
 pub use unix::*;
 
+/// Mark an extracted agent hook executable without leaking OS-specific mode
+/// handling into host provisioning. Windows relies on its native file policy.
+pub(crate) fn set_owner_executable(_path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(())
+    }
+}
+
 /// Bind a PTY child's process-tree identity before its reaper starts. Failure
 /// is represented as `None`; callers then use the child's own killer handle.
 #[cfg(unix)]
