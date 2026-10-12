@@ -597,14 +597,31 @@ fn deserializing_a_malformed_rule_is_an_error_not_a_panic() {
 #[test]
 fn a_whole_recurrence_round_trips_through_json() {
     let rec = Recurrence {
-        rules: vec![RRule::parse("FREQ=MONTHLY;BYDAY=-1FR").unwrap()],
-        rdates: vec![EventTime::Date {
-            date: d(2026, 8, 1),
-        }],
-        exdates: vec![EventTime::Zoned {
-            local: dt(2026, 9, 25, 9, 0),
-            zone: TzRef::new("UTC"),
-        }],
+        rules: vec![
+            RRule::parse("FREQ=MONTHLY;BYDAY=-1FR;UNTIL=20260831").unwrap(),
+            RRule::parse("FREQ=WEEKLY;UNTIL=20260925T090000").unwrap(),
+            RRule::parse("FREQ=DAILY;UNTIL=20261001T000000Z").unwrap(),
+        ],
+        rdates: vec![
+            EventTime::Date {
+                date: d(2026, 8, 1),
+            },
+            EventTime::Zoned {
+                local: dt(2026, 8, 2, 9, 0),
+                zone: TzRef::new("America/Chicago"),
+            },
+            utc(2026, 8, 3, 14, 0),
+        ],
+        exdates: vec![
+            EventTime::Date {
+                date: d(2026, 9, 24),
+            },
+            EventTime::Zoned {
+                local: dt(2026, 9, 25, 9, 0),
+                zone: TzRef::new("UTC"),
+            },
+            utc(2026, 9, 26, 14, 0),
+        ],
     };
     let s = serde_json::to_string(&rec).unwrap();
     assert_eq!(serde_json::from_str::<Recurrence>(&s).unwrap(), rec);
@@ -1482,7 +1499,7 @@ fn until_keeps_its_value_type_through_a_round_trip() {
 }
 
 #[test]
-fn an_instant_series_uses_utc_while_a_date_series_uses_the_home_zone() {
+fn instant_and_date_series_use_utc_while_unknown_zoned_series_use_home() {
     let home = chrono_tz::America::Chicago;
     assert_eq!(series_zone(&utc(2026, 8, 3, 14, 0), home), chrono_tz::UTC);
     assert_eq!(
@@ -1492,14 +1509,14 @@ fn an_instant_series_uses_utc_while_a_date_series_uses_the_home_zone() {
             },
             home
         ),
-        home
+        chrono_tz::UTC
     );
     let unknown = EventTime::Zoned {
         local: dt(2026, 8, 3, 9, 0),
         zone: TzRef::new("Nowhere/Land"),
     };
     assert_eq!(series_zone(&unknown, home), home);
-    // An all-day series excludes a UTC EXDATE by its home-zone date.
+    // A timed EXDATE does not match the DATE recurrence-id's UTC midnight.
     let rec = Recurrence {
         rules: vec![RRule::parse("FREQ=DAILY").unwrap()],
         exdates: vec![utc(2026, 8, 5, 3, 0)], // 22:00 CDT on Aug 4
@@ -1519,5 +1536,47 @@ fn an_instant_series_uses_utc_while_a_date_series_uses_the_home_zone() {
         got.len(),
         3,
         "an instant EXDATE does not match a date id: {got:?}"
+    );
+}
+
+#[test]
+fn a_date_series_utc_until_is_independent_of_the_home_zone() {
+    let rec = Recurrence {
+        rules: vec![RRule::parse("FREQ=DAILY;UNTIL=20261015T030000Z").unwrap()],
+        ..Default::default()
+    };
+    let start = EventTime::Date {
+        date: d(2026, 10, 12),
+    };
+    let homes = [
+        chrono_tz::Asia::Tokyo,
+        chrono_tz::America::Los_Angeles,
+        chrono_tz::UTC,
+    ];
+    let by_home: Vec<_> = homes
+        .into_iter()
+        .map(|home| {
+            occurrences(
+                &rec,
+                &start,
+                d(2026, 10, 10),
+                d(2026, 10, 20),
+                home,
+                GapPolicy::ShiftForward,
+            )
+        })
+        .collect();
+    assert_eq!(by_home[0], by_home[1]);
+    assert_eq!(by_home[0], by_home[2]);
+    assert!(by_home[0].contains(&EventTime::Date {
+        date: d(2026, 10, 15),
+    }));
+    assert_eq!(
+        by_home[0],
+        (12..=15)
+            .map(|day| EventTime::Date {
+                date: d(2026, 10, day),
+            })
+            .collect::<Vec<_>>()
     );
 }
