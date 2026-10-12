@@ -8,6 +8,21 @@ use std::path::Path;
 
 use crate::agent::block_on_provider;
 
+fn nonempty(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len() > 0)
+        .unwrap_or(false)
+}
+
+fn output_tail(output: &str) -> &str {
+    const MAX_BYTES: usize = 2 * 1024;
+    let mut start = output.len().saturating_sub(MAX_BYTES);
+    while !output.is_char_boundary(start) {
+        start += 1;
+    }
+    &output[start..]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplayStage {
     Exec,
@@ -116,11 +131,7 @@ pub(crate) fn apply_local_parity(
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
-        && bundle_file
-            .as_file()
-            .metadata()
-            .map(|m| m.len() > 0)
-            .unwrap_or(false);
+        && nonempty(bundle_file.path());
 
     // 2. Uncommitted tracked changes (staged + unstaged vs HEAD), incl. deletions.
     let patch = git_cmd(wt)
@@ -152,11 +163,7 @@ pub(crate) fn apply_local_parity(
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false)
-            && tar_file
-                .as_file()
-                .metadata()
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
+            && nonempty(tar_file.path())
     } else {
         false
     };
@@ -195,10 +202,12 @@ pub(crate) fn apply_local_parity(
     let (code, output) =
         block_on_provider(|| async { provider.run_exec(id, &argv, None, exec_env).await })
             .map_err(|e| {
+                let error_detail = e.to_string();
                 anyhow::Error::new(ReplayFailure {
                     stage: ReplayStage::Exec,
                     detail: format!(
-                        "{e}; uploaded artifacts retained at /tmp/{STEM}.{{bundle,patch,tar}}"
+                        "{}; uploaded artifacts retained at /tmp/{STEM}.{{bundle,patch,tar}}",
+                        output_tail(&error_detail)
                     ),
                 })
             })?;
@@ -206,7 +215,16 @@ pub(crate) fn apply_local_parity(
         return Err(anyhow::Error::new(ReplayFailure {
             stage: ReplayStage::from_marker(&output).unwrap_or(ReplayStage::Exec),
             detail: format!(
-                "{output}; uploaded artifacts retained at /tmp/{STEM}.{{bundle,patch,tar}}"
+                "{}{}; uploaded artifacts retained at /tmp/{STEM}.{{bundle,patch,tar}}",
+                ReplayStage::from_marker(&output)
+                    .and_then(|_| {
+                        output
+                            .lines()
+                            .find(|line| line.trim().starts_with("TG-PARITY-ERROR:"))
+                    })
+                    .map(|line| format!("{line}\n"))
+                    .unwrap_or_default(),
+                output_tail(&output)
             ),
         }));
     }
@@ -215,6 +233,56 @@ pub(crate) fn apply_local_parity(
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
+    use super::nonempty;
+
+    #[test]
+    fn bundle_path_metadata_sees_git_atomic_replace() {
+        let repo = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-c")
+                .arg("commit.gpgsign=false")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap()
+        };
+        assert!(run_git(&["init", "-q"]).status.success());
+        assert!(
+            run_git(&["config", "user.name", "Parity Test"])
+                .status
+                .success()
+        );
+        assert!(
+            run_git(&["config", "user.email", "parity@example.invalid"])
+                .status
+                .success()
+        );
+        std::fs::write(repo.path().join("tracked.txt"), "one\n").unwrap();
+        assert!(run_git(&["add", "tracked.txt"]).status.success());
+        assert!(run_git(&["commit", "-m", "initial"]).status.success());
+
+        let bundle = tempfile::Builder::new()
+            .suffix(".bundle")
+            .tempfile_in(repo.path())
+            .unwrap();
+        assert!(
+            run_git(&[
+                "bundle",
+                "create",
+                bundle.path().to_str().unwrap(),
+                "HEAD",
+                "--not",
+                "--remotes"
+            ])
+            .status
+            .success()
+        );
+        assert!(nonempty(bundle.path()));
+    }
+
     #[test]
     fn replay_failure_marker_identifies_its_typed_stage() {
         use super::{ReplayStage, ReplayStage::Patch};
@@ -223,5 +291,13 @@ mod tests {
             Some(Patch)
         );
         assert_eq!(ReplayStage::from_marker("unrelated output"), None);
+    }
+
+    #[test]
+    fn output_tail_is_bounded_on_a_character_boundary() {
+        let output = format!("{}🦀{}", "a".repeat(2047), "b".repeat(2045));
+        let tail = super::output_tail(&output);
+        assert!(tail.len() <= 2 * 1024);
+        assert!(tail.starts_with('b'));
     }
 }

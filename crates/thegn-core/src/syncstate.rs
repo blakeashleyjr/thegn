@@ -185,7 +185,7 @@ pub fn replay_script(
         String::new()
     };
     format!(
-        "fail() {{ printf 'TG-PARITY-ERROR:%s\\n' \"$1\" >&2; exit 70; }}; \
+        "fail() {{ printf 'TG-PARITY-ERROR:%s\\n' \"$1\"; exit 70; }}; \
          cd {wd} || fail checkout; {reset}{apply_patch}{untar}\
          if ! rm -f {bundle} {patch} {tar}; then fail cleanup; fi; \
          echo {}",
@@ -278,7 +278,7 @@ mod tests {
         assert!(full.contains("TG-PARITY-ERROR:extraction"));
         assert!(!full.contains("|| true"));
         assert!(full.contains("exit 70;"));
-        assert!(full.find("exit 70;").unwrap() < full.find("rm -f").unwrap());
+        assert!(!full.contains("\" >&2"));
         assert!(
             full.contains("rm -f /tmp/tg-parity.bundle /tmp/tg-parity.patch /tmp/tg-parity.tar")
         );
@@ -291,6 +291,75 @@ mod tests {
         assert!(!none.contains("tar xf"));
         // Artifacts are still consumed even when nothing replays.
         assert!(none.contains("rm -f /tmp/tg-parity.bundle"));
+    }
+
+    #[test]
+    fn patch_failure_reports_on_stdout_and_preserves_artifact() {
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let repo = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-c")
+                .arg("commit.gpgsign=false")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap()
+        };
+        assert!(run_git(&["init", "-q"]).status.success());
+        assert!(
+            run_git(&["config", "user.name", "Parity Test"])
+                .status
+                .success()
+        );
+        assert!(
+            run_git(&["config", "user.email", "parity@example.invalid"])
+                .status
+                .success()
+        );
+        std::fs::write(repo.path().join("tracked.txt"), "actual\n").unwrap();
+        assert!(run_git(&["add", "tracked.txt"]).status.success());
+        assert!(run_git(&["commit", "-m", "initial"]).status.success());
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stem = format!("tg-parity-test-{}-{nanos}", std::process::id());
+        let bundle_path = artifact_path(&stem, "bundle");
+        let patch_path = artifact_path(&stem, "patch");
+        let tar_path = artifact_path(&stem, "tar");
+        let bad_patch = "diff --git a/tracked.txt b/tracked.txt\n\
+            index 1234567..89abcde 100644\n\
+            --- a/tracked.txt\n\
+            +++ b/tracked.txt\n\
+            @@ -1 +1 @@\n\
+            -old\n\
+            +new\n";
+        std::fs::write(&patch_path, bad_patch).unwrap();
+        std::fs::write(&bundle_path, "unused bundle artifact").unwrap();
+        std::fs::write(&tar_path, "unused tar artifact").unwrap();
+
+        let script = replay_script(
+            repo.path().to_str().unwrap(),
+            &stem,
+            None,
+            true,
+            false,
+            "done",
+        );
+        let output = Command::new("sh").arg("-c").arg(script).output().unwrap();
+        assert_eq!(output.status.code(), Some(70));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("TG-PARITY-ERROR:patch"), "stdout: {stdout}");
+        assert!(std::path::Path::new(&bundle_path).exists());
+        assert!(std::path::Path::new(&patch_path).exists());
+        assert!(std::path::Path::new(&tar_path).exists());
+        std::fs::remove_file(bundle_path).unwrap();
+        std::fs::remove_file(patch_path).unwrap();
+        std::fs::remove_file(tar_path).unwrap();
     }
 
     #[test]
