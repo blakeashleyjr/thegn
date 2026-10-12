@@ -1301,16 +1301,14 @@ pub(crate) fn migrate_v79(conn: &Connection) -> Result<()> {
     let rows = {
         let mut stmt =
             conn.prepare("SELECT id, status, status_changed_at_ms FROM agent_dispatches")?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
     };
     conn.execute_batch(
         "DROP TABLE IF EXISTS temp.v79_dispatch_status_stamps;
