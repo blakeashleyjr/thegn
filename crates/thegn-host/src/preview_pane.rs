@@ -28,6 +28,12 @@ type Rendered = (Result<Vec<String>, String>, Option<(Vec<u8>, u32, u32)>);
 /// generation, so a handful of slots is never exceeded while the loop drains.
 pub const RESULT_CAP: usize = 4;
 
+/// Maximum lines retained by any text preview route.
+pub(crate) const PREVIEW_MAX_LINES: usize = 50_000;
+/// Maximum UTF-8 bytes retained for a rendered preview line, including its
+/// truncation marker when present.
+pub(crate) const PREVIEW_MAX_LINE_BYTES: usize = 4096;
+
 /// Read a file off the loop for the inline Files preview and route it by
 /// content type, sending text lines (always) and — when `kitty` and the route
 /// is graphical — a decoded raster. `rel` tags both results so a fast
@@ -105,7 +111,12 @@ fn route_and_render(
     match route(abs) {
         PreviewRoute::Text => (read_text(abs), None),
         PreviewRoute::Csv => (
-            read_capped(abs).map(|s| crate::preview_render::csv_lines(&CsvTable::parse(abs, &s))),
+            read_capped(abs).map(|s| {
+                crate::preview_render::csv_lines(&CsvTable::parse(abs, &s))
+                    .into_iter()
+                    .map(|line| bounded_line(&line))
+                    .collect()
+            }),
             None,
         ),
         PreviewRoute::Jupyter => (
@@ -126,7 +137,7 @@ fn route_and_render(
             || crate::rasterize::mermaid(abs, cancel),
             || {
                 // Fallback: show the Mermaid source as text.
-                read_capped(abs).map(|s| s.lines().map(str::to_string).collect())
+                read_text(abs)
             },
         ),
         PreviewRoute::Pdf => graphical(
@@ -136,8 +147,8 @@ fn route_and_render(
             || {
                 // Fallback: extracted text, or a truthful note on why there is none.
                 Ok(match crate::rasterize::pdf_text(abs, cancel) {
-                    Ok(t) => t.lines().map(str::to_string).collect(),
-                    Err(why) => vec![format!("(PDF — {why})")],
+                    Ok(t) => bounded_lines(&t),
+                    Err(why) => vec![bounded_line(&format!("(PDF — {why})"))],
                 })
             },
         ),
@@ -208,13 +219,8 @@ pub fn prepare_preview(bytes: &[u8]) -> Result<Vec<String>, String> {
     if bytes.contains(&0) {
         return Err("binary file".into());
     }
-    const MAX_LINES: usize = 50_000;
     let text = String::from_utf8_lossy(bytes);
-    let mut lines: Vec<String> = text
-        .split('\n')
-        .take(MAX_LINES)
-        .map(|l| l.trim_end_matches('\r').replace('\t', "    "))
-        .collect();
+    let mut lines = bounded_lines(&text);
     // A trailing newline splits into a spurious empty final element — drop it,
     // but keep a single empty line for a genuinely empty file.
     if text.ends_with('\n') && lines.last().is_some_and(|l| l.is_empty()) {
@@ -224,6 +230,44 @@ pub fn prepare_preview(bytes: &[u8]) -> Result<Vec<String>, String> {
         lines.push(String::new());
     }
     Ok(lines)
+}
+
+/// Split text lazily under the shared line-count and rendered-line limits.
+pub(crate) fn bounded_lines(text: &str) -> Vec<String> {
+    text.split('\n')
+        .take(PREVIEW_MAX_LINES)
+        .map(bounded_line)
+        .collect()
+}
+
+/// Normalize and cap one line, keeping UTF-8 intact and reserving room for the
+/// active terminal's ellipsis only when truncation is needed.
+pub(crate) fn bounded_line(line: &str) -> String {
+    let mut out = String::new();
+    let mut chars = line.trim_end_matches('\r').chars();
+    let mut truncated = false;
+    for ch in chars.by_ref() {
+        let mut encoded = [0; 4];
+        let rendered = if ch == '\t' {
+            "    "
+        } else {
+            ch.encode_utf8(&mut encoded)
+        };
+        if out.len().saturating_add(rendered.len()) > PREVIEW_MAX_LINE_BYTES {
+            truncated = true;
+            break;
+        }
+        out.push_str(rendered);
+    }
+    if truncated {
+        let ellipsis = crate::caps::active_glyphs().ellipsis;
+        let content_limit = PREVIEW_MAX_LINE_BYTES.saturating_sub(ellipsis.len());
+        while out.len() > content_limit {
+            out.pop();
+        }
+        out.push_str(ellipsis);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -253,6 +297,32 @@ mod tests {
     #[test]
     fn prepare_preview_empty_file_is_one_blank_line() {
         assert_eq!(prepare_preview(b"").unwrap(), vec![String::new()]);
+    }
+
+    #[test]
+    fn bounded_lines_truncates_a_single_long_line_within_byte_cap() {
+        let lines = bounded_lines(&"x".repeat(100_000));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].len() <= PREVIEW_MAX_LINE_BYTES);
+        assert!(lines[0].ends_with(crate::caps::active_glyphs().ellipsis));
+    }
+
+    #[test]
+    fn mermaid_source_fallback_obeys_shared_line_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many-lines.mmd");
+        let contents = "x\n".repeat(60_000);
+        std::fs::write(&path, contents).unwrap();
+
+        let (text, raster) =
+            route_and_render(&path, false, &std::sync::atomic::AtomicBool::new(false));
+        assert!(raster.is_none());
+        let lines = text.unwrap();
+        assert!(
+            lines.len() <= PREVIEW_MAX_LINES,
+            "retained {} lines",
+            lines.len()
+        );
     }
 
     #[test]
