@@ -100,14 +100,11 @@ fn run(rx: Receiver<Msg>, open: impl Fn() -> anyhow::Result<Db>, state: Arc<Queu
                 drain_retained(&mut db, &mut warned, &open, &mut retained, &state);
             }
             Msg::RunLatest { key } => {
-                let job = {
-                    let mut latest = state
-                        .latest
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let job = latest.remove(&key);
-                    job
-                };
+                let job = state
+                    .latest
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&key);
                 if let Some(job) = job {
                     retain_job(&mut retained, job, &state);
                     drain_retained(&mut db, &mut warned, &open, &mut retained, &state);
@@ -296,10 +293,14 @@ pub(crate) fn shutdown_notice(flush: &ShutdownFlush) -> Option<String> {
     if flush.drained && flush.dropped == 0 {
         return None;
     }
-    let mut details = Vec::new();
-    if !flush.drained {
-        details.push(format!("{} write(s) still pending", flush.pending));
+    if flush.drained {
+        return Some(format!(
+            "thegn: {} best-effort database write(s) were dropped this session",
+            flush.dropped
+        ));
     }
+    let mut details = Vec::new();
+    details.push(format!("{} write(s) still pending", flush.pending));
     if flush.dropped > 0 {
         details.push(format!("{} write(s) dropped", flush.dropped));
     }
@@ -534,7 +535,10 @@ mod tests {
             dropped: 2,
         })
         .unwrap();
-        assert!(dropped.contains("2 write(s) dropped"));
+        assert_eq!(
+            dropped,
+            "thegn: 2 best-effort database write(s) were dropped this session"
+        );
     }
 
     #[test]
