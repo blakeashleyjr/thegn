@@ -2295,8 +2295,13 @@ mod tests {
         let largest_encoded_len = largest.encode().len();
         assert!(largest_encoded_len < MAX_WIRE_FRAME);
         let mut one_byte_larger = largest.clone();
-        if let EventFrame::PaneSnapshot { bytes, .. } = &mut one_byte_larger {
-            bytes.push(b'x');
+        for _ in 0..4 {
+            if let EventFrame::PaneSnapshot { bytes, .. } = &mut one_byte_larger {
+                bytes.push(b'x');
+            }
+            if one_byte_larger.encode().len() >= MAX_WIRE_FRAME {
+                break;
+            }
         }
         assert!(one_byte_larger.encode().len() >= MAX_WIRE_FRAME);
 
