@@ -198,7 +198,9 @@ mod db_open_memo;
 /// allowance has been reserved (additive nullable column).
 /// v75: `calendar_events.href`, the opaque provider resource key for cached
 /// calendar components (additive nullable column).
-pub const SCHEMA_VERSION: i64 = 75;
+/// v76: `agent_dispatches.report_head_oid`, the HEAD captured when a report is
+/// filed (additive nullable column).
+pub const SCHEMA_VERSION: i64 = 76;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1493,6 +1495,7 @@ impl Db {
                     db_open_memo::count_verification();
                     crate::db_migrate::verify_v69_schema(&conn)?;
                     crate::db_migrate::verify_v75_schema(&conn)?;
+                    crate::db_migrate::verify_v76_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2152,6 +2155,7 @@ impl Db {
         crate::db_migrate::migrate_v73(&conn)?;
         crate::db_migrate::migrate_v74(&conn)?;
         crate::db_migrate::migrate_v75(&conn)?;
+        crate::db_migrate::migrate_v76(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2165,6 +2169,7 @@ impl Db {
             crate::db_migrate::verify_v73_schema(&conn)?;
             crate::db_migrate::verify_v74_schema(&conn)?;
             crate::db_migrate::verify_v75_schema(&conn)?;
+            crate::db_migrate::verify_v76_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can
