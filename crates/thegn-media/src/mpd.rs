@@ -18,6 +18,69 @@ use crate::model::{LoopMode, MediaState};
 use crate::mpd_parse::{self, Pair};
 use crate::{MediaBackend, MediaCaps, MediaError, MediaWatch};
 
+/// Maximum bytes in the `OK MPD <version>` greeting line.
+const MAX_GREETING_BYTES: usize = 256;
+/// Maximum bytes in any single reply line (tags can be long, but not unbounded).
+const MAX_LINE_BYTES: usize = 16 * 1024;
+/// Maximum total bytes accepted for one command's reply.
+const MAX_RESPONSE_BYTES: usize = 512 * 1024;
+/// Maximum `key: value` rows accepted for one command's reply.
+const MAX_RESPONSE_PAIRS: usize = 4096;
+/// Deadline for the greeting after the transport connects.
+const GREETING_TIMEOUT: Duration = Duration::from_secs(5);
+/// Deadline for writing one command frame.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Total budget (write + every reply line) for a finite command. `idle` is the
+/// one long poll and is exempt from this, but not from the size caps.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum characters of peer-supplied text echoed into an error.
+const MAX_DIAG_CHARS: usize = 120;
+
+/// Peer text made safe for an error or log: control chars replaced, length capped.
+fn sanitize_diag(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .take(MAX_DIAG_CHARS)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    if s.chars().count() > MAX_DIAG_CHARS {
+        out.push_str("...");
+    }
+    out
+}
+
+/// Read one `\n`-terminated line of at most `max` bytes (terminator excluded)
+/// without ever buffering more than `max` bytes. `Ok(None)` is a clean EOF.
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    io: &mut R,
+    max: usize,
+) -> Result<Option<String>, String> {
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let buf = io.fill_buf().await.map_err(|e| e.to_string())?;
+        if buf.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Err("unterminated line before EOF".into())
+            };
+        }
+        let nl = buf.iter().position(|b| *b == b'\n');
+        let take = nl.unwrap_or(buf.len());
+        if line.len() + take > max {
+            return Err(format!("line exceeds {max} bytes"));
+        }
+        line.extend_from_slice(&buf[..take]);
+        let consumed = nl.map_or(take, |i| i + 1);
+        io.consume(consumed);
+        if nl.is_some() {
+            return String::from_utf8(line)
+                .map(Some)
+                .map_err(|_| "line is not valid UTF-8".to_string());
+        }
+    }
+}
+
 /// Any bidirectional MPD transport (TCP or unix socket), boxed so one code path
 /// drives both.
 trait Duplex: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
@@ -105,55 +168,96 @@ impl MpdConn {
         let mut conn = MpdConn {
             io: BufReader::new(stream),
         };
-        // Greeting: `OK MPD <version>`.
-        let mut line = String::new();
-        conn.io
-            .read_line(&mut line)
-            .await
-            .map_err(|e| MediaError::Unavailable(format!("mpd greeting: {e}")))?;
+        // Greeting: `OK MPD <version>`, bounded in size and time.
+        let line = tokio::time::timeout(
+            GREETING_TIMEOUT,
+            read_bounded_line(&mut conn.io, MAX_GREETING_BYTES),
+        )
+        .await
+        .map_err(|_| MediaError::Unavailable("mpd greeting timed out".into()))?
+        .map_err(|e| MediaError::Unavailable(format!("mpd greeting: {e}")))?
+        .unwrap_or_default();
         if !line.starts_with("OK MPD") {
             return Err(MediaError::Backend(format!(
-                "unexpected MPD greeting: {line:?}"
+                "unexpected MPD greeting: {:?}",
+                sanitize_diag(&line)
             )));
         }
         if let Some(pw) = &ep.password {
             // Best-effort auth; a rejection surfaces on the first real command.
             let mut auth_command = zeroize::Zeroizing::new(String::from("password "));
-            quote_into(&mut auth_command, pw.expose());
+            quote_into(&mut auth_command, pw.expose())?;
             conn.command(&auth_command).await?;
         }
         Ok(conn)
     }
 
-    /// Run one command and collect its `key: value` reply up to the terminating
-    /// `OK` (an `ACK …` line becomes a [`MediaError::Backend`]).
+    /// Run one finite command under [`COMMAND_TIMEOUT`] and collect its
+    /// `key: value` reply up to the terminating `OK` (an `ACK …` line becomes a
+    /// [`MediaError::Backend`]).
     async fn command(&mut self, cmd: &str) -> Result<Vec<Pair>, MediaError> {
+        self.command_budget(cmd, Some(COMMAND_TIMEOUT)).await
+    }
+
+    /// Like [`command`](Self::command) with an explicit total budget; `None` is
+    /// the `idle` long poll (no deadline, but still size-capped; dropping the
+    /// future/connection cancels it).
+    async fn command_budget(
+        &mut self,
+        cmd: &str,
+        budget: Option<Duration>,
+    ) -> Result<Vec<Pair>, MediaError> {
+        // One command is exactly one frame: no embedded line breaks or NUL.
+        if cmd.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+            return Err(MediaError::Backend(
+                "mpd command contains a forbidden control character".into(),
+            ));
+        }
+        match budget {
+            Some(d) => tokio::time::timeout(d, self.command_inner(cmd))
+                .await
+                .map_err(|_| MediaError::Backend("mpd command timed out".into()))?,
+            None => self.command_inner(cmd).await,
+        }
+    }
+
+    async fn command_inner(&mut self, cmd: &str) -> Result<Vec<Pair>, MediaError> {
         let line = zeroize::Zeroizing::new(format!("{cmd}\n"));
-        self.io
-            .get_mut()
-            .write_all(line.as_bytes())
+        tokio::time::timeout(WRITE_TIMEOUT, self.io.get_mut().write_all(line.as_bytes()))
             .await
+            .map_err(|_| MediaError::Backend("mpd write timed out".into()))?
             .map_err(|e| MediaError::Backend(format!("mpd write: {e}")))?;
         let mut pairs = Vec::new();
-        let mut buf = String::new();
+        let mut total = 0usize;
         loop {
-            buf.clear();
-            let n = self
-                .io
-                .read_line(&mut buf)
+            let Some(buf) = read_bounded_line(&mut self.io, MAX_LINE_BYTES)
                 .await
-                .map_err(|e| MediaError::Backend(format!("mpd read: {e}")))?;
-            if n == 0 {
+                .map_err(|e| MediaError::Backend(format!("mpd read: {e}")))?
+            else {
                 return Err(MediaError::Backend("mpd closed the connection".into()));
+            };
+            total += buf.len() + 1;
+            if total > MAX_RESPONSE_BYTES {
+                return Err(MediaError::Backend(format!(
+                    "mpd response exceeds {MAX_RESPONSE_BYTES} bytes"
+                )));
             }
-            let t = buf.trim_end_matches(['\r', '\n']);
+            let t = buf.trim_end_matches('\r');
             if t == "OK" {
                 return Ok(pairs);
             }
             if let Some(err) = t.strip_prefix("ACK") {
-                return Err(MediaError::Backend(format!("mpd ACK{err}")));
+                return Err(MediaError::Backend(format!(
+                    "mpd ACK{}",
+                    sanitize_diag(err)
+                )));
             }
             if let Some(p) = mpd_parse::parse_line(t) {
+                if pairs.len() >= MAX_RESPONSE_PAIRS {
+                    return Err(MediaError::Backend(format!(
+                        "mpd response exceeds {MAX_RESPONSE_PAIRS} rows"
+                    )));
+                }
                 pairs.push(p);
             }
         }
@@ -185,7 +289,15 @@ fn quote(s: &str) -> String {
     }
 }
 
-fn quote_into(out: &mut String, s: &str) {
+/// Append one quoted-if-needed command argument. Rejects every control
+/// character (CR, LF, NUL, ...) before anything is written, so an argument can
+/// never end the frame. The error never includes the value.
+fn quote_into(out: &mut String, s: &str) -> Result<(), MediaError> {
+    if s.chars().any(char::is_control) {
+        return Err(MediaError::Backend(
+            "mpd argument contains a forbidden control character".into(),
+        ));
+    }
     if s.bytes()
         .any(|b| b.is_ascii_whitespace() || b == b'"' || b == b'\\')
     {
@@ -200,6 +312,7 @@ fn quote_into(out: &mut String, s: &str) {
     } else {
         out.push_str(s);
     }
+    Ok(())
 }
 
 /// The native MPD backend. Owns one credential-bearing endpoint and dials per read.
@@ -396,7 +509,7 @@ impl MediaWatch for MpdWatch {
             let Some(conn) = self.conn.as_mut() else {
                 return false;
             };
-            match conn.command("idle player mixer options").await {
+            match conn.command_budget("idle player mixer options", None).await {
                 Ok(changed) => {
                     tracing::debug!(target: "thegn::media", ?changed, "MPD idle tick");
                     true
@@ -477,5 +590,98 @@ mod tests {
         assert_eq!(quote("hunter2"), "hunter2");
         assert_eq!(quote("two words"), "\"two words\"");
         assert_eq!(quote("a\"b"), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn quote_into_rejects_control_chars_without_echoing() {
+        for bad in ["a\nOK", "a\rb", "a\0b", "tab\there", "x\u{7f}"] {
+            let mut out = String::from("password ");
+            let err = quote_into(&mut out, bad).unwrap_err().to_string();
+            assert_eq!(out, "password ");
+            assert!(!err.contains("OK"));
+        }
+        let mut out = String::new();
+        quote_into(&mut out, "two words").unwrap();
+        assert_eq!(out, "\"two words\"");
+    }
+
+    #[test]
+    fn sanitize_diag_caps_and_strips_controls() {
+        let long = format!("a\x1b[31m{}", "b".repeat(500));
+        let d = sanitize_diag(&long);
+        assert!(!d.contains('\x1b'));
+        assert!(d.chars().count() <= MAX_DIAG_CHARS + 3);
+    }
+
+    #[tokio::test]
+    async fn bounded_line_rejects_unterminated_overlong_input() {
+        let data = vec![b'a'; 10_000];
+        let mut r = BufReader::new(&data[..]);
+        assert!(read_bounded_line(&mut r, 64).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_line_splits_and_rejects_bad_utf8() {
+        let mut r = BufReader::new(&b"one\ntwo\n"[..]);
+        assert_eq!(read_bounded_line(&mut r, 16).await.unwrap().unwrap(), "one");
+        assert_eq!(read_bounded_line(&mut r, 16).await.unwrap().unwrap(), "two");
+        assert!(read_bounded_line(&mut r, 16).await.unwrap().is_none());
+        let mut bad = BufReader::new(&[0xff, 0xfe, b'\n'][..]);
+        assert!(read_bounded_line(&mut bad, 16).await.is_err());
+    }
+
+    /// Serve `script` to the first TCP client after sending `greeting`, then
+    /// keep the socket open (silent) until the test ends.
+    async fn fake_server(greeting: Vec<u8>, reply: Vec<u8>) -> MpdEndpoint {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(&greeting).await.unwrap();
+            let mut buf = [0u8; 256];
+            if sock.read(&mut buf).await.is_err() {
+                return;
+            }
+            if sock.write_all(&reply).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        MpdEndpoint::resolve(&format!("127.0.0.1:{port}"), None)
+    }
+
+    #[tokio::test]
+    async fn oversized_greeting_is_rejected() {
+        let ep = fake_server(vec![b'x'; 4096], Vec::new()).await;
+        assert!(MpdConn::dial(&ep).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn endless_rows_hit_the_pair_cap() {
+        let reply = "a: b\n".repeat(MAX_RESPONSE_PAIRS + 10).into_bytes();
+        let ep = fake_server(b"OK MPD 0.23.0\n".to_vec(), reply).await;
+        let mut c = MpdConn::dial(&ep).await.unwrap();
+        let err = c.command("status").await.unwrap_err().to_string();
+        assert!(err.contains("rows"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn silent_peer_times_out_within_budget() {
+        let ep = fake_server(b"OK MPD 0.23.0\n".to_vec(), Vec::new()).await;
+        let mut c = MpdConn::dial(&ep).await.unwrap();
+        let err = c
+            .command_budget("status", Some(Duration::from_millis(100)))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn command_with_line_break_is_refused_before_writing() {
+        let ep = fake_server(b"OK MPD 0.23.0\n".to_vec(), b"OK\n".to_vec()).await;
+        let mut c = MpdConn::dial(&ep).await.unwrap();
+        assert!(c.command("status\nclear").await.is_err());
     }
 }
