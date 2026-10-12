@@ -33,7 +33,8 @@
 //! # Cadence
 //!
 //! A slow timer, deliberately unlike [`super::HEARTBEAT_SECS`]: each pass reads
-//! every active row's worktree and shells out to `git` twice per row, so it
+//! every active artifact-bearing row's worktree and may run four `git`
+//! commands per row (index, root, artifact diff, and status), so it
 //! runs on its own long interval and does that work inside `spawn_blocking` —
 //! never on the runtime, and never on the compositor's loop (this is the
 //! daemon process; the 0%-idle contract still applies to the host).
