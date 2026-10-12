@@ -1242,6 +1242,49 @@ mod tests {
     }
 
     #[test]
+    fn remote_todo_rewrite_refuses_a_symlink_without_touching_its_target() {
+        let r = linear("edit-remote-symlink-todo");
+        let c2 = r.sha_of("c2");
+        assert_eq!(
+            CliGit
+                .rebase_retag(&r.loc(), &c2, &[&c2], TodoAction::Edit, &opts())
+                .unwrap(),
+            RebaseOutcome::Paused
+        );
+        let remote = GitLoc::provider(vec!["env".into()], r.dir.to_string_lossy());
+        let todo_path = r.dir.join(".git/rebase-merge/git-rebase-todo");
+        let outside = r.dir.join("outside-remote-todo");
+        std::fs::rename(&todo_path, &outside).unwrap();
+        match thegn_core::fsperm::create_symlink(&outside, &todo_path, false) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("create todo symlink: {error}"),
+        }
+        let original = std::fs::read(&outside).unwrap();
+        let baseline = CliGit.rebase_status(&remote).unwrap().unwrap().remaining;
+        let edited: Vec<TodoEntry> = baseline
+            .iter()
+            .filter(|entry| entry.subject != "c3")
+            .cloned()
+            .collect();
+
+        assert!(CliGit.rewrite_pending_todo(&remote, &edited).is_err());
+        assert!(
+            CliGit
+                .rewrite_pending_todo_checked(&remote, &edited, &baseline)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), original);
+    }
+
+    #[test]
     fn checked_local_todo_rewrite_refuses_non_utf8_without_changing_bytes() {
         let r = linear("edit-non-utf8-todo");
         let c2 = r.sha_of("c2");
