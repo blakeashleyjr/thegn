@@ -32,7 +32,10 @@ case "$2" in
   reopen) printf OPEN > "$state_file" ;;
   edit)
     [ -f "$fail_edit" ] && exit 1
-    printf '%s' "$5" > "$title_file" ;;
+    title="$5"
+    title="${title#"${title%%[![:space:]]*}"}"
+    title="${title%"${title##*[![:space:]]}"}"
+    printf '%s' "$title" > "$title_file" ;;
   view)
 repo=""; num="$3"
 while [ $# -gt 0 ]; do [ "$1" = "--repo" ] && repo="$2"; shift; done
@@ -168,6 +171,24 @@ async fn compound_update_checks_github_postconditions() {
     assert_eq!(updated.status, IssueStatus::Done);
     assert_eq!(updated.title, "Renamed");
     assert_eq!(calls(d.path()).len(), 3);
+}
+
+#[tokio::test]
+async fn title_postcondition_accepts_github_whitespace_normalization() {
+    let d = tempfile::tempdir().unwrap();
+    let gh = fake_gh(d.path(), "");
+    let b = backend(d.path(), gh, &["--repo", "acct/default"], true);
+    let updated = b
+        .update_issue(
+            "github:acct/default#3",
+            &IssuePatch {
+                title: Some(" Fix ".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.title, "Fix");
 }
 
 #[tokio::test]
