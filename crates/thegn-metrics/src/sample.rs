@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use sysinfo::{
     Components, CpuRefreshKind, Disks, MemoryRefreshKind, Networks, Pid, ProcessRefreshKind,
-    ProcessesToUpdate, RefreshKind, System,
+    ProcessStatus, ProcessesToUpdate, RefreshKind, System,
 };
 
 use crate::gpu_monitor::GpuMonitor;
@@ -334,9 +334,46 @@ impl StatsSampler {
             let pids = refresh_pid_list(self.self_pid, self.daemon_pid, &self.tracked);
             self.sys.refresh_processes_specifics(
                 ProcessesToUpdate::Some(&pids),
-                false, // keep entries whose delta we still want next tick
+                true, // remove requested PIDs that exited since the last sample
                 ProcessRefreshKind::nothing().with_cpu().with_memory(),
             );
+            // Registrations can outlive their processes. Remove those entries
+            // from the source set as well as sysinfo's table, so future ticks
+            // stop reopening their /proc handles. sysinfo has no public
+            // per-entry removal API for a PID that still appears as a zombie;
+            // rebuild its table in that rare case, then re-prime live CPU
+            // deltas below. Ordinary reaped processes take the targeted path
+            // above and do not disturb other PIDs' delta history.
+            let had_terminal_entry = self.tracked.iter().any(|tracked| {
+                self.sys
+                    .process(Pid::from_u32(tracked.pid))
+                    .is_some_and(|process| {
+                        matches!(
+                            process.status(),
+                            ProcessStatus::Zombie | ProcessStatus::Dead
+                        )
+                    })
+            });
+            self.tracked.retain(|tracked| {
+                self.sys
+                    .process(Pid::from_u32(tracked.pid))
+                    .is_some_and(|process| {
+                        !matches!(
+                            process.status(),
+                            ProcessStatus::Zombie | ProcessStatus::Dead
+                        )
+                    })
+            });
+            if had_terminal_entry {
+                self.sys = System::new_with_specifics(RefreshKind::nothing());
+                let live_pids = refresh_pid_list(self.self_pid, self.daemon_pid, &self.tracked);
+                self.sys.refresh_processes_specifics(
+                    ProcessesToUpdate::Some(&live_pids),
+                    true,
+                    ProcessRefreshKind::nothing().with_cpu().with_memory(),
+                );
+                self.proc_primed = false;
+            }
             if let Some(p) = self.sys.process(self.self_pid) {
                 snap.self_rss_bytes = Some(p.memory());
                 if self.proc_primed {
@@ -583,6 +620,77 @@ mod tests {
             sorted.dedup();
             assert_eq!(sorted.len(), pids.len(), "duplicate PID in {pids:?}");
         }
+    }
+
+    #[test]
+    fn reaped_tracked_process_is_pruned_and_its_proc_fd_is_released() {
+        // This exercises sysinfo's Linux /proc handle cache. Other platforms
+        // have no /proc fd links to inspect, and the targeted refresh behavior
+        // is already covered by the platform-independent sampler tests.
+        let fd_dir = std::path::Path::new("/proc/self/fd");
+        if !fd_dir.is_dir() {
+            return;
+        }
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .expect("spawn short-lived tracked process");
+        let pid = child.id();
+        let mut sampler = StatsSampler::new(std::env::temp_dir());
+        sampler.set_tracked(vec![spec(pid, "test-child")]);
+        let first = sampler.sample();
+        let first_has_child = first
+            .children
+            .iter()
+            .any(|group| group.group == "test-child");
+
+        let stat_path = format!("/proc/{pid}/stat");
+        let cached_fds = || {
+            std::fs::read_dir(fd_dir)
+                .expect("read own fd directory")
+                .filter_map(|entry| match entry {
+                    Ok(entry) => match std::fs::read_link(entry.path()) {
+                        Ok(target) => Some(target),
+                        Err(_) => None,
+                    },
+                    Err(_) => None,
+                })
+                .filter(|target| target == std::path::Path::new(&stat_path))
+                .count()
+        };
+        let process_was_cached = sampler.sys.process(Pid::from_u32(pid)).is_some();
+        let cached_fd_count = cached_fds();
+
+        child.kill().expect("kill tracked process");
+        child.wait().expect("reap tracked process");
+        let after = sampler.sample();
+
+        assert!(
+            first_has_child,
+            "the live child should appear in the rollup"
+        );
+        assert!(process_was_cached, "sysinfo should track the live child");
+        assert!(
+            cached_fd_count > 0,
+            "sysinfo should cache the child's stat fd"
+        );
+        assert!(
+            !after
+                .children
+                .iter()
+                .any(|group| group.group == "test-child"),
+            "an exited child must disappear from the snapshot"
+        );
+        assert!(
+            sampler.tracked.is_empty(),
+            "a reaped registration must be removed from the tracked set"
+        );
+        assert!(
+            sampler.sys.process(Pid::from_u32(pid)).is_none(),
+            "sysinfo must drop the exited process entry"
+        );
+        assert_eq!(cached_fds(), 0, "the cached /proc stat fd must be closed");
     }
 
     #[test]
