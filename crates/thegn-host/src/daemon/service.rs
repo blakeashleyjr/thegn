@@ -892,7 +892,7 @@ impl ControlApi for DaemonService {
                 {
                     Ok(true) => {
                         let detail = match self.kill(&id).await {
-                            Ok(()) => "the unbound worker was stopped".to_string(),
+                            Ok(()) => "stop requested for the unbound worker".to_string(),
                             Err(error) => format!("stopping the unbound worker failed: {error}"),
                         };
                         return Err(ControlError::Conflict(format!(
@@ -2923,6 +2923,29 @@ mod tests {
         .expect("insert dispatch")
     }
 
+    async fn wait_for_live_sessions(
+        svc: &DaemonService,
+        expected: impl Fn(&[SessionInfo]) -> bool,
+    ) -> Vec<SessionInfo> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let sessions = svc.list_sessions().await.expect("list sessions");
+            let live: Vec<_> = sessions
+                .into_iter()
+                .filter(|session| session.exited_at_ms.is_none())
+                .collect();
+            if expected(&live) {
+                return live;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "live session set did not reach the expected state: {:?}",
+                live.iter().map(|session| &session.id).collect::<Vec<_>>()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn terminal_pipeline_row_refuses_and_stops_a_late_open() {
         let (_state, _env) = isolated_state();
@@ -2941,7 +2964,8 @@ mod tests {
             .await
             .expect_err("terminal pipeline row must refuse launch");
         assert!(matches!(&error, ControlError::Conflict(_)), "{error}");
-        assert!(svc.list_sessions().await.expect("list sessions").is_empty());
+        let live = wait_for_live_sessions(&svc, |sessions| sessions.is_empty()).await;
+        assert!(live.is_empty(), "the refused worker has stopped");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2962,8 +2986,11 @@ mod tests {
             .await
             .expect_err("duplicate row launch must refuse");
         assert!(matches!(&error, ControlError::Conflict(_)), "{error}");
-        let sessions = svc.list_sessions().await.expect("list sessions");
-        assert_eq!(sessions.len(), 1, "the refused duplicate is torn down");
+        let sessions = wait_for_live_sessions(&svc, |sessions| {
+            sessions.len() == 1 && sessions[0].id == first.id
+        })
+        .await;
+        assert_eq!(sessions.len(), 1, "only the original worker remains live");
         assert_eq!(sessions[0].id, first.id);
         svc.kill(&first.id).await.expect("stop first worker");
     }
