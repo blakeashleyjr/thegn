@@ -869,13 +869,14 @@ fn past_until(
 }
 
 /// The zone a series' recurrence candidates live in: its own `TZID`, UTC for
-/// an absolute DTSTART or a floating DATE, else `home` for unknown TZIDs.
+/// an absolute DTSTART or a floating DATE, and `None` for unknown explicit TZIDs.
 /// Dates have no zone, so the fixed UTC frame keeps UTC-form UNTIL and timed
 /// RDATE/EXDATE normalization independent of the configured display zone.
-pub(crate) fn series_zone(start: &EventTime, home: chrono_tz::Tz) -> chrono_tz::Tz {
+pub(crate) fn series_zone(start: &EventTime, home: chrono_tz::Tz) -> Option<chrono_tz::Tz> {
     match start {
-        EventTime::Zoned { zone, .. } => zone.resolve().unwrap_or(home),
-        EventTime::Instant { .. } | EventTime::Date { .. } => chrono_tz::UTC,
+        EventTime::Zoned { zone, .. } if zone.as_str().trim().is_empty() => Some(home),
+        EventTime::Zoned { zone, .. } => zone.resolve(),
+        EventTime::Instant { .. } | EventTime::Date { .. } => Some(chrono_tz::UTC),
     }
 }
 
@@ -1565,7 +1566,7 @@ pub fn occurrences(
     expand_local_with_gap(
         rec,
         seed,
-        Some(series_zone(start, home)),
+        Some(series_zone(start, home)?),
         from,
         to,
         &mut budget,
