@@ -19,11 +19,16 @@ pub mod secret;
 
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, StreamExt};
+use std::future::Future;
 use std::sync::Arc;
 use thegn_core::config::{IssueAccount, IssueProviderKind, IssuesConfig, expand_env_ref};
 use thegn_core::issue::{Issue, IssueDetail, IssueDraft, IssueFilter, IssuePatch};
 use thegn_core::seam::{ErrorClass, SeamError};
 
+/// Four account reads bound network fan-out without serializing normal configs.
+/// `buffered` is load-bearing: unlike `buffer_unordered`, it preserves config
+/// order while reads overlap. The plugin issue backend's `list_issues` calls
+/// blocking `self.op`, so it yields no overlap and gets no benefit from this.
 const MAX_CONCURRENT_ACCOUNTS: usize = 4;
 
 pub use capabilities::IssueCaps;
@@ -653,14 +658,12 @@ impl IssueRouter {
     /// and report the per-account `Err`s (see `cmd::issue::list_tracker_issues`).
     pub async fn list_issues(&self, filter: &IssueFilter) -> Result<Vec<Issue>, IssueError> {
         let mut all = Vec::new();
-        let results = stream::iter(
-            self.inner
-                .iter()
-                .map(|b| async move { (b, b.inner.list_issues(filter).await) }),
-        )
-        .buffered(MAX_CONCURRENT_ACCOUNTS)
-        .collect::<Vec<_>>()
-        .await;
+        let futures = self
+            .inner
+            .iter()
+            .map(|b| async move { (b, b.inner.list_issues(filter).await) })
+            .collect();
+        let results = fan_out(futures).await;
         for (b, result) in results {
             match result {
                 Ok(issues) => match validate_issues(issues) {
@@ -709,14 +712,16 @@ impl IssueRouter {
         &self,
         filter: &IssueFilter,
     ) -> Vec<(String, &str, Result<Vec<Issue>, IssueError>)> {
-        stream::iter(self.inner.iter().map(|b| async move {
-            // Keep PartialList as an error so cache refreshes never persist it as complete.
-            let result = b.inner.list_issues(filter).await.and_then(validate_issues);
-            (b.account.clone(), b.inner.provider_id(), result)
-        }))
-        .buffered(MAX_CONCURRENT_ACCOUNTS)
-        .collect::<Vec<_>>()
-        .await
+        let futures = self
+            .inner
+            .iter()
+            .map(|b| async move {
+                // Keep PartialList as an error so cache refreshes never persist it as complete.
+                let result = b.inner.list_issues(filter).await.and_then(validate_issues);
+                (b.account.clone(), b.inner.provider_id(), result)
+            })
+            .collect();
+        fan_out(futures).await
     }
 
     pub async fn get_issue(&self, id: &str) -> Result<IssueDetail, IssueError> {
@@ -791,14 +796,12 @@ impl IssueRouter {
     /// configuration order.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Issue>, IssueError> {
         let mut all = Vec::new();
-        let results = stream::iter(
-            self.inner
-                .iter()
-                .map(|b| async move { (b, b.inner.search(query, limit).await) }),
-        )
-        .buffered(MAX_CONCURRENT_ACCOUNTS)
-        .collect::<Vec<_>>()
-        .await;
+        let futures = self
+            .inner
+            .iter()
+            .map(|b| async move { (b, b.inner.search(query, limit).await) })
+            .collect();
+        let results = fan_out(futures).await;
         for (b, result) in results {
             match result {
                 Ok(issues) => match validate_issues(issues) {
@@ -814,6 +817,16 @@ impl IssueRouter {
         }
         Ok(all)
     }
+}
+
+async fn fan_out<T, Fut>(futures: Vec<Fut>) -> Vec<T>
+where
+    Fut: Future<Output = T>,
+{
+    stream::iter(futures)
+        .buffered(MAX_CONCURRENT_ACCOUNTS)
+        .collect()
+        .await
 }
 
 fn validate_issues(issues: Vec<Issue>) -> Result<Vec<Issue>, IssueError> {
@@ -1181,7 +1194,6 @@ mod spec {
         notify: Option<Arc<tokio::sync::Notify>>,
         notify_signal: bool,
         issue: Issue,
-        delay: std::time::Duration,
     }
 
     impl IssueBackend for BarrierBackend {
@@ -1198,7 +1210,6 @@ mod spec {
             _filter: &'a IssueFilter,
         ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
             Box::pin(async move {
-                tokio::time::sleep(self.delay).await;
                 if let Some(notify) = &self.notify {
                     if self.notify_signal {
                         notify.notify_one();
@@ -1243,15 +1254,9 @@ mod spec {
         }
     }
 
-    fn barrier_router(
-        barrier: Arc<tokio::sync::Barrier>,
-        delay_first: std::time::Duration,
-    ) -> IssueRouter {
+    fn barrier_router(barrier: Arc<tokio::sync::Barrier>) -> IssueRouter {
         let mut router = IssueRouter::from_config(&IssuesConfig::default());
-        for (account, suffix, delay) in [
-            ("A", "1", delay_first),
-            ("B", "2", std::time::Duration::ZERO),
-        ] {
+        for (account, suffix) in [("A", "1"), ("B", "2")] {
             let issue = Issue {
                 id: format!("linear:ABC-{suffix}"),
                 number: suffix.into(),
@@ -1270,7 +1275,6 @@ mod spec {
                         notify: None,
                         notify_signal: false,
                         issue,
-                        delay,
                     }),
                 )
                 .unwrap();
@@ -1300,12 +1304,22 @@ mod spec {
                         notify: Some(notify.clone()),
                         notify_signal,
                         issue,
-                        delay: std::time::Duration::ZERO,
                     }),
                 )
                 .unwrap();
         }
         router
+    }
+
+    #[test]
+    fn fan_out_futures_are_send() {
+        fn assert_send<T: Send>(_: &T) {}
+
+        let router = barrier_router(Arc::new(tokio::sync::Barrier::new(2)));
+        let filter = IssueFilter::default();
+        assert_send(&router.list_per_provider(&filter));
+        assert_send(&router.list_issues(&filter));
+        assert_send(&router.search("query", 10));
     }
 
     #[test]
@@ -1315,10 +1329,7 @@ mod spec {
             .build()
             .unwrap();
         let filter = IssueFilter::default();
-        let list_router = barrier_router(
-            Arc::new(tokio::sync::Barrier::new(2)),
-            std::time::Duration::ZERO,
-        );
+        let list_router = barrier_router(Arc::new(tokio::sync::Barrier::new(2)));
         let listed = runtime.block_on(tokio::time::timeout(
             std::time::Duration::from_secs(2),
             list_router.list_issues(&filter),
@@ -1329,10 +1340,7 @@ mod spec {
         );
         assert_eq!(listed.unwrap().unwrap().len(), 2);
 
-        let provider_router = barrier_router(
-            Arc::new(tokio::sync::Barrier::new(2)),
-            std::time::Duration::ZERO,
-        );
+        let provider_router = barrier_router(Arc::new(tokio::sync::Barrier::new(2)));
         let providers = runtime.block_on(tokio::time::timeout(
             std::time::Duration::from_secs(2),
             provider_router.list_per_provider(&filter),
@@ -1370,10 +1378,7 @@ mod spec {
             .enable_all()
             .build()
             .unwrap();
-        let router = barrier_router(
-            Arc::new(tokio::sync::Barrier::new(2)),
-            std::time::Duration::ZERO,
-        );
+        let router = barrier_router(Arc::new(tokio::sync::Barrier::new(2)));
         let searched = runtime.block_on(tokio::time::timeout(
             std::time::Duration::from_secs(2),
             router.search("query", 10),
