@@ -189,15 +189,9 @@ fn get_issue_comments_selection_matches_recorded_schema() {
     let comments = selection_after(&query, "comments");
     let mut errors = Vec::new();
     check_selection(
-        &selection_after(&comments, "nodes"),
-        "Comment",
-        "Issue.comments.nodes",
-        &mut errors,
-    );
-    check_selection(
-        &selection_after(&comments, "pageInfo"),
-        "PageInfo",
-        "Issue.comments.pageInfo",
+        &comments,
+        "CommentConnection",
+        "Issue.comments",
         &mut errors,
     );
     assert!(
