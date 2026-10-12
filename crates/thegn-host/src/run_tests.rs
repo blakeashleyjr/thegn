@@ -277,7 +277,13 @@ fn test_run_waits_for_pending_cache_then_overwrites_cached_status() {
         ui.tests.merge_results(&[result]);
     }
     assert_eq!(ui.tests.history.len(), 1);
-    assert_eq!(ui.tests.nodes[0].state, TestState::Fail);
+    let case = ui
+        .tests
+        .nodes
+        .iter()
+        .find(|node| node.id == "unit::case")
+        .expect("run result should replace the cached case");
+    assert_eq!(case.state, TestState::Fail);
 }
 
 #[test]
