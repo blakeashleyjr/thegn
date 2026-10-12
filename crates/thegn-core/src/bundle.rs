@@ -1407,7 +1407,7 @@ mod tests {
 
         assert_eq!(materialize_dotfiles(&spec, &home), 1);
         assert_eq!(
-            std::fs::read(real.join("bundles/work/home/.bashrc")).unwrap(),
+            std::fs::read_to_string(real.join("bundles/work/home/.bashrc")).unwrap(),
             "test"
         );
     }
@@ -1429,7 +1429,10 @@ mod tests {
         };
 
         assert_eq!(materialize_dotfiles(&spec, &home), 1);
-        assert_eq!(std::fs::read(home.join(".bashrc")).unwrap(), "test");
+        assert_eq!(
+            std::fs::read_to_string(home.join(".bashrc")).unwrap(),
+            "test"
+        );
     }
 
     #[cfg(unix)]
