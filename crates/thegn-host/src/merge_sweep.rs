@@ -207,13 +207,13 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
         {
             Ok(candidate) => candidate,
             Err(error) => {
-                if force || merge_sweep::is_due(row.updated_at, util::now(), mq.merged_ttl_secs) {
+                if force {
                     report.kept.push((
                         row.branch.clone(),
                         format!("repository identity unavailable; row left untouched: {error}"),
                     ));
                 } else {
-                    tracing::debug!(branch = %row.branch, %error, "landed row identity unavailable; leaving it untouched until its TTL expires");
+                    tracing::debug!(branch = %row.branch, %error, "landed row identity unavailable; leaving it untouched");
                 }
                 continue;
             }
@@ -682,22 +682,22 @@ mod tests {
         rusqlite::Connection::open(&db_path)
             .unwrap()
             .execute(
-                "UPDATE merge_queue SET worktree=?1, result_oid=NULL, queued_at=1, updated_at=?3 WHERE worktree=?2",
-                rusqlite::params![
-                    missing.to_string_lossy().into_owned(),
-                    wt.to_string_lossy().into_owned(),
-                    util::now()
-                ],
+                    "UPDATE merge_queue SET worktree=?1, result_oid=NULL, queued_at=1, updated_at=1 WHERE worktree=?2",
+                    rusqlite::params![
+                        missing.to_string_lossy().into_owned(),
+                        wt.to_string_lossy().into_owned()
+                    ],
             )
             .unwrap();
 
         let mut cfg = local_config();
         cfg.merge_queue.on_landed = OnLanded::Expire;
+        cfg.merge_queue.merged_ttl_secs = 1;
         cfg.merge_queue.target_branch = "main".into();
         let startup = sweep_with_db(&cfg, &root, false, &db);
         assert!(
             startup.kept.is_empty(),
-            "recent unknown row must not nag at startup"
+            "expired unknown row must not nag at startup"
         );
         assert!(startup.collected.is_empty());
         let report = sweep_with_db(&cfg, &root, true, &db);

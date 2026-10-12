@@ -69,6 +69,8 @@ fn sample_vanished_tabs(
 ) -> anyhow::Result<Vec<String>> {
     let (rows, workspaces) = load_registry()?;
     let mut gone = Vec::new();
+    let mut unregistered_count = 0;
+    let mut first_unregistered_path = None;
     for path in paths {
         let is_workspace_root = workspaces
             .iter()
@@ -78,7 +80,10 @@ fn sample_vanished_tabs(
             Some(_) => false,
             None if is_workspace_root => true,
             None => {
-                tracing::debug!(path, "skipping vanished-tab probe for unregistered path");
+                unregistered_count += 1;
+                if first_unregistered_path.is_none() {
+                    first_unregistered_path = Some(path.as_str());
+                }
                 continue;
             }
         };
@@ -89,6 +94,13 @@ fn sample_vanished_tabs(
         if !Path::new(path).is_dir() {
             gone.push(path.clone());
         }
+    }
+    if let Some(first_path) = first_unregistered_path {
+        tracing::info!(
+            count = unregistered_count,
+            first_path,
+            "skipped vanished-tab probes for unregistered paths"
+        );
     }
     Ok(gone)
 }
