@@ -4246,6 +4246,7 @@ fn forced_chunk_overlap_requires_and_records_a_reason() {
             },
             3,
             None,
+            None,
             Some(" \t"),
         )
         .is_err(),

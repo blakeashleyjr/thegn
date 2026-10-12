@@ -74,6 +74,8 @@ pub enum Action {
         /// The gate prepares its scope before admission and compares it with
         /// active siblings' admitted snapshots. A legacy sibling without a
         /// snapshot blocks admission until finished, abandoned, or overridden.
+        /// Follow-up (release note): session moves and resumes of legacy rows
+        /// can also leave snapshots NULL until those writers propagate scope.
         #[arg(long)]
         chunk: Option<String>,
         /// Dispatch even though the chunk-scope gate refused (a scope

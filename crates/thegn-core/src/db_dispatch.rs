@@ -910,8 +910,8 @@ impl Db {
                             })?
                         } else {
                             return Ok(Err(DispatchAdmissionDecision::ScopeRefused(format!(
-                                "active sibling row {} ({path}) has no admitted scope snapshot, so its ownership is unknown; finish or abandon that row, or override with --force <reason>",
-                                row.id
+                                "active sibling row {} ({path}) has no admitted scope snapshot, so its ownership is unknown; close it with `thegn dispatch set-status {} abandoned` (or `failed`), or override with `thegn dispatch claim … --allow-scope-overlap <REASON>` / `thegn dispatch put … --force --force-reason <REASON>`",
+                                row.id, row.id
                             ))));
                         };
                         active.push(crate::pipeline_chunk::ActiveScope {
@@ -1574,7 +1574,15 @@ mod tests {
         assert!(reason.contains(&sibling.id.to_string()), "{reason}");
         assert!(reason.contains("a.md"), "{reason}");
         assert!(reason.contains("ownership is unknown"), "{reason}");
-        assert!(reason.contains("--force <reason>"), "{reason}");
+        assert!(reason.contains("thegn dispatch set-status"), "{reason}");
+        assert!(
+            reason.contains("--allow-scope-overlap <REASON>"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("--force --force-reason <REASON>"),
+            "{reason}"
+        );
         assert_eq!(db.list_dispatches().unwrap().len(), 1);
     }
 
