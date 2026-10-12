@@ -26,15 +26,13 @@ pub struct CiLogEntry {
     pub text: String,
     #[serde(default)]
     pub truncated: bool,
-    #[serde(default = "default_true")]
+    /// True when the current redaction pass was applied; it does not prove
+    /// that every possible secret shape was recognized.
+    #[serde(default)]
     pub redacted: bool,
     pub fetched_at: i64,
     #[serde(default)]
     pub head_sha: String,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// The identity used to deduplicate an autofix handoff.
@@ -68,7 +66,7 @@ impl CiLogEntry {
             job_name: job_name.into(),
             text: bounded,
             truncated,
-            redacted: redacted_text != text,
+            redacted: true,
             fetched_at,
             head_sha: String::new(),
         }
@@ -151,7 +149,21 @@ static PROVIDER_TOKEN: Lazy<Regex> = Lazy::new(|| {
 pub fn redact(text: &str) -> String {
     // Replace PEM contents line-by-line so a stack of log lines remains a
     // stack of log lines and neither the header nor the key material survives.
-    let mut in_pem = false;
+    // A tail can begin after the BEGIN delimiter was evicted by an upstream
+    // provider. If the first PEM framing marker is END, conservatively treat
+    // the entire preceding prefix as key material.
+    let mut seen_begin = false;
+    let mut unmatched_end = false;
+    for part in text.split_inclusive('\n') {
+        let line = part.strip_suffix('\n').unwrap_or(part);
+        if line.trim_start().starts_with("-----BEGIN ") {
+            seen_begin = true;
+        } else if line.trim_start().starts_with("-----END ") && !seen_begin {
+            unmatched_end = true;
+            break;
+        }
+    }
+    let mut in_pem = unmatched_end;
     let mut pem_safe = String::with_capacity(text.len());
     for part in text.split_inclusive('\n') {
         let line = part.strip_suffix('\n').unwrap_or(part);
@@ -183,6 +195,35 @@ pub fn redact(text: &str) -> String {
     PROVIDER_TOKEN
         .replace_all(&s, REDACTION_MARKER)
         .into_owned()
+}
+
+/// Redact one complete provider line while preserving PEM framing state across
+/// lines. The caller must bound the line before calling this helper.
+pub fn redact_stream_line(line: &[u8], in_pem: &mut bool) -> String {
+    let Ok(line) = std::str::from_utf8(line) else {
+        return format!(
+            "{REDACTION_MARKER}{}",
+            if line.ends_with(b"\n") { "\n" } else { "" }
+        );
+    };
+    let (body, newline) = line
+        .strip_suffix('\n')
+        .map_or((line, ""), |body| (body, "\n"));
+    let (body, cr) = body
+        .strip_suffix('\r')
+        .map_or((body, ""), |body| (body, "\r"));
+    if body.trim_start().starts_with("-----BEGIN ") {
+        *in_pem = true;
+    }
+    let result = if *in_pem {
+        REDACTION_MARKER.to_string()
+    } else {
+        redact(body)
+    };
+    if *in_pem && body.trim_start().starts_with("-----END ") {
+        *in_pem = false;
+    }
+    format!("{result}{cr}{newline}")
 }
 
 /// Select the terminal run identities retained by a configured cache policy.
@@ -251,6 +292,55 @@ mod tests {
         assert!(out.contains("ordinary diagnostic"));
         assert!(out.contains("ordinary-diagnostic"));
         assert_eq!(out.lines().count(), text.lines().count());
+    }
+
+    #[test]
+    fn streaming_pem_state_redacts_body_before_tail_eviction() {
+        let mut in_pem = false;
+        let lines = [
+            b"old diagnostic\n".as_slice(),
+            b"-----BEGIN PRIVATE KEY-----\n".as_slice(),
+            b"SYNTHETIC_PRIVATE_KEY_BODY\n".as_slice(),
+            b"-----END PRIVATE KEY-----\n".as_slice(),
+            b"ordinary failure\n".as_slice(),
+        ];
+        let redacted = lines
+            .iter()
+            .map(|line| redact_stream_line(line, &mut in_pem))
+            .collect::<String>();
+        let (tail, _) = bounded_tail(&redacted, 2, 256);
+        assert!(!tail.contains("SYNTHETIC_PRIVATE_KEY_BODY"));
+        assert!(tail.contains("ordinary failure"));
+        assert!(tail.contains(REDACTION_MARKER));
+    }
+
+    #[test]
+    fn unmatched_pem_end_redacts_unknown_prefix_conservatively() {
+        let text =
+            "SYNTHETIC_UNKNOWN_PREFIX_SECRET\n-----END PRIVATE KEY-----\nuseful diagnostic\n";
+        let redacted = redact(text);
+        assert!(!redacted.contains("SYNTHETIC_UNKNOWN_PREFIX_SECRET"));
+        assert!(redacted.contains("useful diagnostic"));
+    }
+
+    #[test]
+    fn streaming_redaction_handles_invalid_utf8_and_crlf_pem() {
+        let mut in_pem = false;
+        assert_eq!(
+            redact_stream_line(b"\xff\xfe\n", &mut in_pem),
+            format!("{REDACTION_MARKER}\n")
+        );
+        for line in ["-----BEGIN X-----\r\n", "body\r\n", "-----END X-----\r\n"] {
+            assert_eq!(
+                redact_stream_line(line.as_bytes(), &mut in_pem),
+                format!("{REDACTION_MARKER}\r\n")
+            );
+        }
+        assert!(!in_pem);
+        assert_eq!(
+            redact_stream_line(b"ordinary\r\n", &mut in_pem),
+            "ordinary\r\n"
+        );
     }
 
     #[test]
