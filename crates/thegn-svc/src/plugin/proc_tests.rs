@@ -30,6 +30,69 @@ fn a_verb_with_no_params_is_accepted() {
 }
 
 #[test]
+fn strict_frame_decoder_accepts_only_canonical_rpc_frames() {
+    use thegn_core::plugin_api::{Frame, RpcErrorCode};
+
+    let valid_message = decode_frame(r#"{"id":7,"method":"ping","params":{"x":1}}"#).unwrap();
+    assert!(matches!(valid_message, Frame::Message(message) if message.id == Some(7)));
+    let bare_message = decode_frame(r#"{"method":"ping"}"#).unwrap();
+    assert!(matches!(bare_message, Frame::Message(message) if message.params.is_null()));
+    let valid_response = decode_frame(r#"{"id":7,"result":null}"#).unwrap();
+    assert!(
+        matches!(valid_response, Frame::Response(response) if response.result == Some(serde_json::Value::Null))
+    );
+    let valid_error =
+        decode_frame(r#"{"id":7,"error":{"code":"invalid","message":"bad"}}"#).unwrap();
+    assert!(
+        matches!(valid_error, Frame::Response(response) if response.error.as_ref().is_some_and(|error| error.code == RpcErrorCode::Invalid))
+    );
+
+    let overlong_method = format!(r#"{{"method":"{}"}}"#, "m".repeat(MAX_METHOD_BYTES + 1));
+    let rejected = [
+        (
+            r#"{"id":7,"result":1,"error":{"code":"invalid","message":"bad"}}"#,
+            FrameReject::ResponseArms,
+        ),
+        (r#"{"id":7}"#, FrameReject::ResponseArms),
+        (r#"{"method":"x","result":1}"#, FrameReject::Mixed),
+        (r#"{"method":"x","error":{}}"#, FrameReject::Mixed),
+        (r#"{"method":"x","bogus":1}"#, FrameReject::Member),
+        (r#"{"method":"x","method":"y"}"#, FrameReject::Member),
+        (r#"{"method":"x","id":null}"#, FrameReject::Id),
+        (r#"{"method":"x","id":-1}"#, FrameReject::Id),
+        (r#"{"method":"x","id":"1"}"#, FrameReject::Id),
+        (r#"{"method":""}"#, FrameReject::Method),
+        (overlong_method.as_str(), FrameReject::Method),
+        ("[]", FrameReject::NotObject),
+    ];
+    for (text, expected) in rejected {
+        assert_eq!(decode_frame(text).unwrap_err(), expected, "frame {text:?}");
+    }
+}
+
+#[test]
+fn malformed_frames_are_junk_and_do_not_stop_later_messages() {
+    for malformed in [
+        r#"printf '%s\n' '{"method":"x","result":1}'"#,
+        r#"printf '%s\n' '{"method":"x","bogus":1}'"#,
+        r#"printf '{"method":"\377"}\n'"#,
+    ] {
+        let script = format!("{malformed}; printf '%s\\n' '{{\"method\":\"after\"}}'");
+        let out = run(&script).unwrap();
+        assert_eq!(out.messages.len(), 1, "script: {script}");
+        assert_eq!(out.messages[0].method, "after");
+        assert_eq!(out.junk.len(), 1, "script: {script}");
+    }
+}
+
+#[test]
+fn one_shot_response_frames_are_junk() {
+    let out = run(r#"printf '%s\n' '{"id":1,"result":null}'"#).unwrap();
+    assert!(out.messages.is_empty());
+    assert_eq!(out.junk, vec![r#"{"id":1,"result":null}"#.to_string()]);
+}
+
+#[test]
 fn stray_non_json_output_is_kept_as_junk_not_silently_dropped() {
     // A leftover `echo debugging` is the most common plugin mistake; surfacing
     // it is the difference between a two-minute fix and a mystery.

@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use thegn_core::plugin_api::RpcMessage;
+use thegn_core::plugin_api::{Frame, RpcError, RpcErrorCode, RpcMessage, RpcResponse};
 
 /// Longest single line accepted. A plugin that writes more than this is
 /// malfunctioning, and buffering it would be the OOM.
@@ -22,6 +22,8 @@ pub const MAX_LINES: usize = 20_000;
 pub const MAX_RUN_BYTES: usize = 8 << 20;
 /// Bytes of stderr kept for the error message.
 pub const MAX_STDERR: usize = 8 << 10;
+/// Maximum UTF-8 bytes in a plugin RPC method name.
+const MAX_METHOD_BYTES: usize = 128;
 /// Maximum time to wait for a killed leader and its pipe readers to finish.
 const READER_GRACE: Duration = Duration::from_millis(500);
 
@@ -78,6 +80,126 @@ pub trait NdjsonSink: Send + 'static {
     /// [`MAX_LINE_BYTES`]. Return `false` to stop receiving lines; the pipe is
     /// still drained to EOF so the plugin never sees a SIGPIPE.
     fn line(&mut self, text: &str) -> bool;
+
+    /// One non-empty line whose original bytes were not valid UTF-8. The
+    /// default preserves the historical lossy behavior for other sinks.
+    fn invalid_utf8(&mut self, lossy: &str) -> bool {
+        self.line(lossy)
+    }
+}
+
+/// Why a plugin frame was rejected by the strict one-shot decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameReject {
+    Syntax,
+    InvalidUtf8,
+    NotObject,
+    Mixed,
+    Method,
+    Id,
+    ResponseArms,
+    ResponseFrame,
+    Member,
+}
+
+/// Decode one canonical RPC frame. Classification uses a JSON value so mixed
+/// request/response members and invalid IDs are rejected before typed decode;
+/// the typed decode then catches unknown and duplicate members.
+pub(crate) fn decode_frame(text: &str) -> Result<Frame, FrameReject> {
+    use serde::Deserialize;
+    use serde_json::Value;
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Message {
+        #[serde(default)]
+        id: Option<u64>,
+        method: String,
+        #[serde(default)]
+        params: Value,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Error {
+        code: RpcErrorCode,
+        message: String,
+        #[serde(default)]
+        data: Value,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Response {
+        id: u64,
+        #[serde(default)]
+        result: Value,
+        #[serde(default)]
+        error: Option<Error>,
+    }
+
+    let value: Value = serde_json::from_str(text).map_err(|_| FrameReject::Syntax)?;
+    let object = value.as_object().ok_or(FrameReject::NotObject)?;
+    let has_method = object.contains_key("method");
+    let has_result = object.contains_key("result");
+    let has_error = object.contains_key("error");
+
+    if has_method && (has_result || has_error) {
+        return Err(FrameReject::Mixed);
+    }
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "id" | "method" | "params" | "result" | "error"
+        )
+    }) {
+        return Err(FrameReject::Member);
+    }
+
+    if has_method {
+        let method = object
+            .get("method")
+            .and_then(Value::as_str)
+            .ok_or(FrameReject::Method)?;
+        if method.is_empty() || method.len() > MAX_METHOD_BYTES {
+            return Err(FrameReject::Method);
+        }
+        if let Some(id) = object.get("id")
+            && id.as_u64().is_none()
+        {
+            return Err(FrameReject::Id);
+        }
+        let message: Message = serde_json::from_str(text).map_err(|_| FrameReject::Member)?;
+        return Ok(Frame::Message(RpcMessage {
+            id: message.id,
+            method: message.method,
+            params: message.params,
+        }));
+    }
+
+    if has_result == has_error {
+        return Err(FrameReject::ResponseArms);
+    }
+    if object.get("id").and_then(Value::as_u64).is_none() {
+        return Err(FrameReject::Id);
+    }
+    let response: Response = serde_json::from_str(text).map_err(|_| FrameReject::Member)?;
+    if has_result {
+        Ok(Frame::Response(RpcResponse::ok(
+            response.id,
+            response.result,
+        )))
+    } else {
+        let error = response.error.ok_or(FrameReject::ResponseArms)?;
+        Ok(Frame::Response(RpcResponse::err(
+            response.id,
+            RpcError {
+                code: error.code,
+                message: error.message,
+                data: error.data,
+            },
+        )))
+    }
 }
 
 /// What a streamed run produced besides the sink's own state.
@@ -98,17 +220,13 @@ struct Collect {
 
 impl NdjsonSink for Collect {
     fn line(&mut self, text: &str) -> bool {
-        let retained_bytes = match serde_json::from_str::<RpcMessage>(text) {
-            Ok(m) => {
-                self.run.messages.push(m);
+        let retained_bytes = match decode_frame(text) {
+            Ok(Frame::Message(message)) => {
+                self.run.messages.push(message);
                 text.len()
             }
-            Err(_) => {
-                let kept: String = text.chars().take(200).collect();
-                let bytes = kept.len();
-                self.run.junk.push(kept);
-                bytes
-            }
+            Ok(Frame::Response(_)) => self.keep_junk(text, FrameReject::ResponseFrame),
+            Err(reason) => self.keep_junk(text, reason),
         };
         self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
         if self.retained_bytes > MAX_RUN_BYTES {
@@ -116,6 +234,30 @@ impl NdjsonSink for Collect {
             return false;
         }
         true
+    }
+
+    fn invalid_utf8(&mut self, lossy: &str) -> bool {
+        let retained_bytes = self.keep_junk(lossy, FrameReject::InvalidUtf8);
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        if self.retained_bytes > MAX_RUN_BYTES {
+            self.run.truncated = true;
+            return false;
+        }
+        true
+    }
+}
+
+impl Collect {
+    fn keep_junk(&mut self, text: &str, reason: FrameReject) -> usize {
+        tracing::debug!(
+            target: "thegn::plugin",
+            ?reason,
+            "discarding rejected plugin frame"
+        );
+        let kept: String = text.chars().take(200).collect();
+        let bytes = kept.len();
+        self.run.junk.push(kept);
+        bytes
     }
 }
 
@@ -402,8 +544,17 @@ fn deliver_line<S: NdjsonSink>(sink: &mut S, line: &[u8], accepting: &mut bool, 
     if !*accepting || *lines >= MAX_LINES {
         return;
     }
-    let text = String::from_utf8_lossy(line);
-    let text = text.trim();
+    let Ok(valid) = std::str::from_utf8(line) else {
+        let lossy = String::from_utf8_lossy(line);
+        let text = lossy.trim();
+        if text.is_empty() {
+            return;
+        }
+        *lines += 1;
+        *accepting = sink.invalid_utf8(text);
+        return;
+    };
+    let text = valid.trim();
     if text.is_empty() {
         return;
     }
