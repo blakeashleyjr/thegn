@@ -653,6 +653,43 @@ impl WorktreeAuxStore for Db {
         Ok(())
     }
 
+    fn enqueue_bound_pr(
+        &self,
+        repo_root: &str,
+        number: u64,
+        worktree: Option<&str>,
+        branch: &str,
+        base_branch: &str,
+        forge: &str,
+        pr_url: &str,
+    ) -> Result<()> {
+        let now = util::now();
+        let key = crate::db::PrQueueRow::make_key(repo_root, number);
+        self.conn().execute(
+            "INSERT INTO pr_queue(key,repo_root,number,worktree,branch,base_branch,forge,
+                                  status,blocker,detail,agent_attempts,last_head_oid,
+                                  queued_at,updated_at,pr_url)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,'watching',NULL,NULL,0,NULL,?8,?8,?9)
+             ON CONFLICT(key) DO UPDATE SET
+               worktree=excluded.worktree, branch=excluded.branch,
+               base_branch=excluded.base_branch, forge=excluded.forge,
+               pr_url=excluded.pr_url, status='watching', blocker=NULL,
+               detail=NULL, agent_attempts=0, updated_at=excluded.updated_at",
+            params![
+                key,
+                repo_root,
+                number as i64,
+                worktree,
+                branch,
+                base_branch,
+                forge,
+                now,
+                pr_url
+            ],
+        )?;
+        Ok(())
+    }
+
     fn update_pr_status(
         &self,
         key: &str,
@@ -719,7 +756,7 @@ impl WorktreeAuxStore for Db {
     fn list_pr_queue(&self) -> Result<Vec<PrQueueRow>> {
         let mut stmt = self.conn().prepare(
             r#"SELECT key,repo_root,number,worktree,branch,base_branch,forge,status,
-                      blocker,detail,agent_attempts,ci_rerun_head,last_head_oid,queued_at,updated_at
+                      blocker,detail,agent_attempts,ci_rerun_head,last_head_oid,queued_at,updated_at,pr_url
                FROM pr_queue ORDER BY queued_at"#,
         )?;
         let rows = stmt.query_map([], |r| {
@@ -739,6 +776,7 @@ impl WorktreeAuxStore for Db {
                 last_head_oid: r.get(12)?,
                 queued_at: r.get(13)?,
                 updated_at: r.get(14)?,
+                pr_url: r.get(15)?,
             })
         })?;
         let mut v = Vec::new();
