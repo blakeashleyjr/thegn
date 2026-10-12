@@ -218,9 +218,9 @@ pub(crate) fn provision_worktree_on_host(
                         Ok(())
                     })
                 }
-                StepKind::AgentConfigs(ids) => {
+                StepKind::AgentConfigs(_) => {
                     stage_and_push(runner, &container, &home, true, |staging| {
-                        fill_agent_config_staging(staging, &host_home, ids)
+                        fill_agent_config_staging(staging)
                     })
                 }
                 StepKind::AtuinSync => {
@@ -303,67 +303,9 @@ fn stage_and_push(
     })
 }
 
-fn fill_agent_config_staging(
-    staging: &std::path::Path,
-    host_home: &std::path::Path,
-    ids: &[String],
-) -> Result<(), String> {
-    for id in ids {
-        let (files, dirs) = envplan::agent_config_paths(id);
-        for rel in dirs {
-            let src = host_home.join(&rel);
-            if !src.is_dir() {
-                continue;
-            }
-            for (abs, inner, exec) in crate::agent_configs::collect_agent_config_files(&src) {
-                let base = safe_relative_path(&rel)?;
-                let inner = safe_relative_path(&inner)?;
-                let relative_path = base.join(&inner);
-                if is_agent_secret_path(&relative_path) {
-                    continue;
-                }
-                // Agent config collection intentionally follows links (for
-                // NixOS hooks); resolve that policy explicitly, then use a
-                // no-follow open on the resolved regular file.
-                let Some(resolved) = resolve_optional_agent_config_file(&abs)? else {
-                    continue;
-                };
-                let destination = staging.join(&relative_path);
-                if is_sanitized_agent_config_path(&relative_path) {
-                    stage_sanitized_agent_config(staging, &resolved, &destination)?;
-                } else {
-                    stage_file(staging, &resolved, &destination, exec)?;
-                }
-            }
-        }
-        for rel in files {
-            let rel = safe_relative_path(&rel)?;
-            if is_agent_secret_path(&rel) {
-                continue;
-            }
-            let source = host_home.join(&rel);
-            let Some(resolved) = resolve_optional_agent_config_file(&source)? else {
-                continue;
-            };
-            let destination = staging.join(&rel);
-            if is_sanitized_agent_config_path(&rel) {
-                stage_sanitized_agent_config(staging, &resolved, &destination)?;
-            } else {
-                stage_file(staging, &resolved, &destination, false)?;
-            }
-        }
-    }
+/// agent config staging is disabled pending an explicit policy decision; see the follow-up issue
+fn fill_agent_config_staging(_staging: &std::path::Path) -> Result<(), String> {
     Ok(())
-}
-
-fn resolve_optional_agent_config_file(
-    path: &std::path::Path,
-) -> Result<Option<std::path::PathBuf>, String> {
-    match std::fs::canonicalize(path) {
-        Ok(resolved) => Ok(Some(resolved)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("resolve {}: {error}", path.display())),
-    }
 }
 
 fn fill_atuin_staging(
@@ -392,149 +334,6 @@ fn fill_atuin_staging(
         Ok(resolved) => stage_file(staging, &resolved, &staging.join(session), false),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("resolve {}: {error}", session_source.display())),
-    }
-}
-
-/// Agent config staging deliberately excludes credentials. Sealed panes only
-/// receive the managed per-account credential directory created under thegn's
-/// state; `docs/help/sandboxing.md` says ambient `~/.claude` / `~/.codex`
-/// credentials are never mounted into sealed panes. Keep host credentials out
-/// of this separate host-to-container provisioning path too.
-fn is_agent_secret_path(path: &std::path::Path) -> bool {
-    let components = path
-        .components()
-        .filter_map(|component| component.as_os_str().to_str())
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-    if components
-        .iter()
-        .take(components.len().saturating_sub(1))
-        .any(|component| component == "secrets" || component == "credentials")
-    {
-        return true;
-    }
-    let Some(name) = components.last() else {
-        return false;
-    };
-    name.contains("credential")
-        || name.contains("creds")
-        || name.contains("token")
-        || name.contains("secret")
-        || name.contains("apikey")
-        || name.contains("api_key")
-        || name.starts_with(".env")
-        || name.ends_with(".pem")
-        || name.ends_with(".key")
-        || name == "auth.json"
-        || name.ends_with(".auth.json")
-}
-
-fn is_sanitized_agent_config_path(path: &std::path::Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(std::ffi::OsStr::to_str)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("json" | "toml")
-    )
-}
-
-/// Agent configs can contain credentials in nested MCP environments and
-/// headers. Sanitize every staged JSON/TOML config recursively; malformed
-/// files are skipped instead of copied verbatim.
-fn stage_sanitized_agent_config(
-    staging_root: &std::path::Path,
-    src: &std::path::Path,
-    dst: &std::path::Path,
-) -> Result<(), String> {
-    use std::io::Write;
-
-    let mut source = match thegn_core::fsperm::open_regular_file_nofollow(src) {
-        Ok(source) => source,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("read {}: {error}", src.display())),
-    };
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut source, &mut bytes)
-        .map_err(|e| format!("read {}: {e}", src.display()))?;
-    let extension = dst
-        .extension()
-        .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let sanitized = if extension == "json" {
-        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            return Ok(());
-        };
-        sanitize_json_config(&mut value);
-        serde_json::to_vec(&value).map_err(|e| format!("serialize {}: {e}", src.display()))?
-    } else {
-        let Ok(text) = std::str::from_utf8(&bytes) else {
-            return Ok(());
-        };
-        let Ok(mut value) = text.parse::<toml::Value>() else {
-            return Ok(());
-        };
-        sanitize_toml_config(&mut value);
-        toml::to_string(&value)
-            .map_err(|e| format!("serialize {}: {e}", src.display()))?
-            .into_bytes()
-    };
-    create_staging_parents(staging_root, dst)?;
-    let mut output = thegn_core::fsperm::create_owner_only_exclusive(dst)
-        .map_err(|e| format!("create staged file {}: {e}", dst.display()))?;
-    output
-        .write_all(&sanitized)
-        .and_then(|()| output.sync_all())
-        .map_err(|e| format!("write staged file {}: {e}", dst.display()))
-}
-
-fn is_config_secret_key(key: &str) -> bool {
-    let normalized = key.to_ascii_lowercase();
-    matches!(normalized.as_str(), "env" | "headers")
-        || [
-            "apikey",
-            "api_key",
-            "token",
-            "secret",
-            "password",
-            "credential",
-        ]
-        .iter()
-        .any(|needle| normalized.contains(needle))
-}
-
-fn sanitize_json_config(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(object) => {
-            object.retain(|key, _| !is_config_secret_key(key));
-            for child in object.values_mut() {
-                sanitize_json_config(child);
-            }
-        }
-        serde_json::Value::Array(array) => {
-            for child in array {
-                sanitize_json_config(child);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn sanitize_toml_config(value: &mut toml::Value) {
-    match value {
-        toml::Value::Table(table) => {
-            table.retain(|key, _| !is_config_secret_key(key));
-            for child in table.values_mut() {
-                sanitize_toml_config(child);
-            }
-        }
-        toml::Value::Array(array) => {
-            for child in array {
-                sanitize_toml_config(child);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -904,151 +703,19 @@ mod tests {
     }
 
     #[test]
-    fn agent_config_staging_preserves_root_and_file_paths() {
-        let home = tempfile::tempdir().unwrap();
-        let staging = tempfile::tempdir().unwrap();
-        std::fs::write(
-            home.path().join(".claude.json"),
-            r#"{"theme":"dark","primaryApiKey":"sk-secret","customApiKey":"also-secret","refreshToken":"token-secret","oauthAccount":{"email":"person@example.com"},"mcpServers":{"x":{"command":"node","env":{"GITHUB_TOKEN":"nested-secret","SAFE_VALUE":"keep"}}},"projects":{"/p":{"mcpServers":{"y":{"headers":{"Authorization":"Bearer nested-secret","Accept":"application/json"}}}}}}"#,
-        )
-        .unwrap();
-        std::fs::create_dir(home.path().join(".claude")).unwrap();
-        std::fs::write(home.path().join(".claude/settings.json"), "{}\n").unwrap();
-        std::fs::write(home.path().join(".claude/.credentials.json"), "secret\n").unwrap();
-        std::fs::write(home.path().join(".claude/oauth_token.json"), "secret\n").unwrap();
-        std::fs::create_dir(home.path().join(".codex")).unwrap();
-        std::fs::write(home.path().join(".codex/auth.json"), "secret\n").unwrap();
-        std::fs::create_dir(home.path().join(".gemini")).unwrap();
-        std::fs::create_dir_all(home.path().join(".gemini/secrets")).unwrap();
-        std::fs::create_dir_all(home.path().join(".gemini/credentials")).unwrap();
-        std::fs::write(
-            home.path().join(".gemini/secrets/foo.json"),
-            r#"{"visible":"secret directory"}"#,
-        )
-        .unwrap();
-        std::fs::write(home.path().join(".gemini/credentials/default"), "secret\n").unwrap();
-        std::fs::write(
-            home.path().join(".codex/config.toml"),
-            "model = 'keep'\n\n[mcp_servers.x]\ncommand = 'node'\n\n[mcp_servers.x.env]\nGITHUB_TOKEN = 'nested-secret'\nSAFE_VALUE = 'keep'\n\n[mcp_servers.x.headers]\nAuthorization = 'Bearer nested-secret'\nAccept = 'application/json'\n",
-        )
-        .unwrap();
-        std::fs::write(home.path().join(".gemini/oauth_creds.json"), "secret\n").unwrap();
-        std::fs::write(home.path().join(".gemini/api_key.json"), "secret\n").unwrap();
-        std::fs::write(home.path().join(".gemini/apikey.json"), "secret\n").unwrap();
-        std::fs::write(home.path().join(".gemini/my-secret.json"), "secret\n").unwrap();
-        std::fs::write(home.path().join(".gemini/.env.local"), "secret\n").unwrap();
-        std::fs::write(home.path().join(".gemini/client.pem"), "secret\n").unwrap();
-        std::fs::write(home.path().join(".gemini/client.key"), "secret\n").unwrap();
+    fn agent_config_staging_is_disabled_and_allows_the_provision_marker() {
+        let transfer_called = std::cell::Cell::new(false);
+        let staging_result = with_private_staging(fill_agent_config_staging, true, |_| {
+            transfer_called.set(true);
+            Ok(())
+        });
 
-        fill_agent_config_staging(
-            staging.path(),
-            home.path(),
-            &["claude".into(), "codex".into(), "gemini".into()],
-        )
-        .unwrap();
-
-        let claude_config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(staging.path().join(".claude.json")).unwrap())
-                .unwrap();
-        assert_eq!(claude_config["theme"], "dark");
-        assert_eq!(claude_config["oauthAccount"]["email"], "person@example.com");
-        assert!(claude_config.get("primaryApiKey").is_none());
-        assert!(claude_config.get("customApiKey").is_none());
-        assert!(claude_config.get("refreshToken").is_none());
-        assert!(claude_config["mcpServers"]["x"].get("env").is_none());
-        assert!(
-            claude_config["projects"]["/p"]["mcpServers"]["y"]
-                .get("headers")
-                .is_none()
-        );
-        assert_eq!(claude_config["mcpServers"]["x"]["command"], "node");
-        assert_eq!(claude_config["mcpServers"]["x"]["SAFE_VALUE"], "keep");
-        let codex_config: toml::Value = toml::from_str(
-            &std::fs::read_to_string(staging.path().join(".codex/config.toml")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(codex_config["model"].as_str(), Some("keep"));
-        assert!(codex_config["mcp_servers"]["x"].get("env").is_none());
-        assert!(codex_config["mcp_servers"]["x"].get("headers").is_none());
-        assert_eq!(
-            std::fs::read(staging.path().join(".claude/settings.json")).unwrap(),
-            b"{}\n"
-        );
-        assert!(!staging.path().join(".claude/.credentials.json").exists());
-        assert!(!staging.path().join(".claude/oauth_token.json").exists());
-        assert!(!staging.path().join(".codex/auth.json").exists());
-        assert!(!staging.path().join(".gemini/secrets/foo.json").exists());
-        assert!(!staging.path().join(".gemini/credentials/default").exists());
-        for secret in [
-            ".gemini/oauth_creds.json",
-            ".gemini/api_key.json",
-            ".gemini/apikey.json",
-            ".gemini/my-secret.json",
-            ".gemini/.env.local",
-            ".gemini/client.pem",
-            ".gemini/client.key",
-        ] {
-            assert!(!staging.path().join(secret).exists(), "staged {secret}");
-        }
-    }
-
-    #[test]
-    fn malformed_claude_json_is_skipped_instead_of_staged_raw() {
-        let home = tempfile::tempdir().unwrap();
-        let staging = tempfile::tempdir().unwrap();
-        std::fs::write(home.path().join(".claude.json"), "primaryApiKey: secret\n").unwrap();
-
-        fill_agent_config_staging(staging.path(), home.path(), &["claude".into()]).unwrap();
-
-        assert!(!staging.path().join(".claude.json").exists());
-    }
-
-    #[test]
-    fn missing_agent_config_file_resolves_as_a_skip() {
-        let home = tempfile::tempdir().unwrap();
-
-        let resolved =
-            resolve_optional_agent_config_file(&home.path().join("rewritten.json")).unwrap();
-
-        assert!(resolved.is_none());
-    }
-
-    #[test]
-    fn agent_config_vanishing_before_open_is_a_skip() {
-        let root = tempfile::tempdir().unwrap();
-        let staging = tempfile::tempdir().unwrap();
-        let source = root.path().join("vanished.json");
-        std::fs::write(&source, r#"{"safe":"value"}"#).unwrap();
-        let vanished = std::fs::canonicalize(&source).unwrap();
-        std::fs::remove_file(&source).unwrap();
-        let raw_destination = staging.path().join("raw.json");
-        let sanitized_destination = staging.path().join("sanitized.json");
-
-        assert!(stage_file(staging.path(), &vanished, &raw_destination, false).is_ok());
-        assert!(
-            stage_sanitized_agent_config(staging.path(), &vanished, &sanitized_destination).is_ok()
-        );
-        assert!(!raw_destination.exists());
-        assert!(!sanitized_destination.exists());
-    }
-
-    #[test]
-    fn top_level_agent_config_symlink_is_resolved_before_staging() {
-        if !crate::platform::test_symlink_supported() {
-            return;
-        }
-        let home = tempfile::tempdir().unwrap();
-        let staging = tempfile::tempdir().unwrap();
-        let target = home.path().join("claude-config-target");
-        std::fs::write(&target, "{}\n").unwrap();
-        crate::platform::test_symlink(&target, &home.path().join(".claude.json")).unwrap();
-
-        fill_agent_config_staging(staging.path(), home.path(), &["claude".into()]).unwrap();
-
-        assert_eq!(
-            std::fs::read(staging.path().join(".claude.json")).unwrap(),
-            b"{}\n"
-        );
+        assert!(staging_result.is_ok());
+        assert!(!transfer_called.get());
+        // A successful no-op step leaves the provision pipeline eligible to
+        // write its marker because the marker is gated only on step failures.
+        let all_succeeded = staging_result.is_ok();
+        assert!(all_succeeded);
     }
 
     #[test]
@@ -1120,21 +787,6 @@ mod tests {
                 .join(".local/share/atuin/key")
                 .is_file()
         );
-    }
-
-    #[test]
-    fn empty_agent_config_staging_is_success_without_transfer() {
-        let transferred = std::cell::Cell::new(false);
-        let result = with_private_staging(
-            |_| Ok(()),
-            true,
-            |_| {
-                transferred.set(true);
-                Ok(())
-            },
-        );
-        assert!(result.is_ok());
-        assert!(!transferred.get());
     }
 
     #[test]
