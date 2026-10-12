@@ -1504,6 +1504,7 @@ mod tests {
         let mut cfg = cfg();
         cfg.watch = vec![PrWatchKind::Ci];
         cfg.agent_command = "true {prompt}".into();
+        cfg.own_prs_only = false;
         let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(1);
         {
             let db = Db::open_at(&path).unwrap();
@@ -1531,6 +1532,35 @@ mod tests {
                     .count(),
                 1
             );
+
+            let mut pending = failing_ci_pr("abc");
+            pending.status_check_rollup[0].status = "IN_PROGRESS".into();
+            pending.status_check_rollup[0].conclusion = None;
+            *forge.pr.lock().unwrap() = Some(pending);
+            let row = db.list_pr_queue().unwrap().remove(0);
+            let out = drive_queue(
+                &cfg,
+                &Config::default(),
+                &forge,
+                Path::new("/repo"),
+                &db,
+                vec![PrItem::from(&row)],
+                |_| {},
+            );
+            assert!(out.blocked.is_empty());
+            assert!(out.needs_human.is_empty());
+            assert_eq!(db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+            assert_eq!(
+                forge
+                    .calls()
+                    .iter()
+                    .filter(|call| call.starts_with("rerun"))
+                    .count(),
+                1,
+                "in-flight checks wait without spending another rerun or agent attempt"
+            );
+
+            *forge.pr.lock().unwrap() = Some(failing_ci_pr("abc"));
         }
 
         let db = Db::open_at(&path).unwrap();
@@ -1564,6 +1594,8 @@ mod tests {
         let mut cfg = cfg();
         cfg.watch = vec![PrWatchKind::Ci];
         cfg.pause_on_foreign_push = false;
+        cfg.agent_command = "true {prompt}".into();
+        cfg.own_prs_only = false;
         db.enqueue_pr("/repo", 7, Some("/w/feat"), "feat", "main", "github")
             .unwrap();
         let row = db.list_pr_queue().unwrap().remove(0);
@@ -1602,6 +1634,8 @@ mod tests {
         let mut cfg = cfg();
         cfg.watch = vec![PrWatchKind::Ci];
         cfg.pause_on_foreign_push = false;
+        cfg.agent_command = "true {prompt}".into();
+        cfg.own_prs_only = false;
         db.enqueue_pr("/repo", 7, Some("/w/feat"), "feat", "main", "github")
             .unwrap();
         let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(1);
@@ -1663,6 +1697,8 @@ mod tests {
                     let db = Db::open_at(&path).unwrap();
                     let mut cfg = cfg();
                     cfg.watch = vec![PrWatchKind::Ci];
+                    cfg.agent_command = "true {prompt}".into();
+                    cfg.own_prs_only = false;
                     barrier.wait();
                     drive_queue(
                         &cfg,
