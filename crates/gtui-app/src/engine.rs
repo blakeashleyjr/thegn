@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, MissedTickBehavior, interval};
+use tokio::task::JoinSet;
+use tokio::time::{Duration, MissedTickBehavior, interval, timeout};
 
 use gtui_core::dashboard::Dashboard;
 use gtui_core::datasource::{DataSource, Query, QueryError, TimeRange};
@@ -148,6 +149,11 @@ pub struct QueryEngine {
     gate: Arc<WakeGate>,
 }
 
+/// Bound dashboard fan-out independently of dashboard size.
+const MAX_CONCURRENT_PANELS: usize = 4;
+/// A panel that does not finish cannot hold the next refresh forever.
+const PANEL_DEADLINE: Duration = Duration::from_secs(15);
+
 impl QueryEngine {
     /// Spawn the engine on `rt` and return the command sender + result receiver.
     /// The task lives until the command sender is dropped (tab closed).
@@ -276,39 +282,49 @@ impl QueryEngine {
         }
     }
 
-    /// Query every panel sequentially, emitting each result (and waking the loop)
-    /// as it completes so the UI fills in incrementally. Awaiting here parks the
-    /// task, never the UI thread.
+    /// Query panels in fixed-size batches, emitting each result as it completes.
+    /// The UI thread is never involved in the waits and fan-out is capped.
     async fn query_all(&mut self) {
-        // Resolve once before iterating panels. In particular, do not call the
-        // clock from the target mapper: sequential panels must share one range.
+        // Resolve once so every panel in a refresh sees an identical window.
         let time_range = self.resolve_window();
-        for panel in &self.dashboard.panels {
-            let result = match self.resolve_source(&panel.datasource) {
-                Some(source) => {
-                    let queries: Vec<Query> = panel
-                        .targets
-                        .iter()
-                        .map(|t| Query {
-                            ref_id: t.ref_id.clone(),
-                            expr: t.expr.clone(),
-                            time_range: time_range.clone(),
-                        })
-                        .collect();
-                    source.query(queries).await
+        let jobs: Vec<_> = self
+            .dashboard
+            .panels
+            .iter()
+            .map(|panel| {
+                let source = self.resolve_source(&panel.datasource);
+                let queries = panel
+                    .targets
+                    .iter()
+                    .map(|t| Query {
+                        ref_id: t.ref_id.clone(),
+                        expr: t.expr.clone(),
+                        time_range: time_range.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                (panel.id, panel.datasource.clone(), source, queries)
+            })
+            .collect();
+        for batch in jobs.chunks(MAX_CONCURRENT_PANELS) {
+            let mut pending = JoinSet::new();
+            for (panel_id, datasource, source, queries) in batch.iter().cloned() {
+                pending.spawn(async move {
+                    let result = match source {
+                        Some(source) => timeout(PANEL_DEADLINE, source.query(queries))
+                            .await
+                            .unwrap_or(Err(QueryError::Timeout)),
+                        None => Err(QueryError::Other(format!("no datasource '{datasource}'"))),
+                    };
+                    (panel_id, result)
+                });
+            }
+            while let Some(joined) = pending.join_next().await {
+                if let Ok((panel_id, result)) = joined {
+                    // Best-effort: the UI may be gone during shutdown.
+                    let _ = self.frames_tx.send(PanelUpdate { panel_id, result });
+                    self.gate.wake(&self.waker);
                 }
-                None => Err(QueryError::Other(format!(
-                    "no datasource '{}'",
-                    panel.datasource
-                ))),
-            };
-            // Best-effort: if the receiver is gone the tab is closing.
-            let _ = self.frames_tx.send(PanelUpdate {
-                // best-effort: UI may be gone during shutdown
-                panel_id: panel.id,
-                result,
-            });
-            self.gate.wake(&self.waker);
+            }
         }
     }
 
@@ -483,6 +499,90 @@ mod tests {
                 .expect("timed out waiting for the real refresh path")
                 .expect("query engine exited before delivering a panel update");
         }
+    }
+
+    struct ConcurrentSource {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DataSource for ConcurrentSource {
+        fn query(
+            &self,
+            _queries: Vec<Query>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>, QueryError>> + Send>> {
+            let active = self.active.clone();
+            let peak = self.peak.clone();
+            Box::pin(async move {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn panel_queries_are_concurrent_and_capped() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source: Arc<dyn DataSource> = Arc::new(ConcurrentSource {
+            active,
+            peak: peak.clone(),
+        });
+        let sources = HashMap::from([("test".to_string(), source)]);
+        let (cmd, mut updates) = QueryEngine::spawn_with_window(
+            Handle::current(),
+            dashboard(11),
+            sources,
+            RelativeWindow::new(std::time::Duration::from_secs(60)),
+            Duration::from_secs(3600),
+            Arc::new(Utc::now),
+            Arc::new(|| {}),
+            WakeGate::new(true),
+        );
+        receive_updates(&mut updates, 11).await;
+        assert!(peak.load(Ordering::SeqCst) > 1, "panels should overlap");
+        assert!(peak.load(Ordering::SeqCst) <= MAX_CONCURRENT_PANELS);
+        drop(cmd);
+    }
+
+    struct OneHungPanelSource;
+
+    impl DataSource for OneHungPanelSource {
+        fn query(
+            &self,
+            queries: Vec<Query>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>, QueryError>> + Send>> {
+            if queries[0].expr == "hang" {
+                Box::pin(std::future::pending())
+            } else {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_panels_progress_while_a_sibling_is_hung() {
+        let mut dashboard = dashboard(4);
+        dashboard.panels[0].targets[0].expr = "hang".into();
+        let sources = HashMap::from([(
+            "test".to_string(),
+            Arc::new(OneHungPanelSource) as Arc<dyn DataSource>,
+        )]);
+        let (cmd, mut updates) = QueryEngine::spawn_with_window(
+            Handle::current(),
+            dashboard,
+            sources,
+            RelativeWindow::new(std::time::Duration::from_secs(60)),
+            Duration::from_secs(3600),
+            Arc::new(Utc::now),
+            Arc::new(|| {}),
+            WakeGate::new(true),
+        );
+        receive_updates(&mut updates, 3).await;
+        drop(cmd);
     }
 
     fn recorded_ranges(queries: &Arc<Mutex<Vec<Vec<Query>>>>) -> Vec<TimeRange> {

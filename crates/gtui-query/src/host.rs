@@ -21,6 +21,8 @@ use thegn_metrics::{StatsSampler, StatsSnapshot};
 
 /// How many samples to retain (≈ this many seconds at the 1 Hz sample rate).
 const RING_CAP: usize = 600;
+/// Retain at most ten minutes of host samples, matching the ring's 1 Hz cap.
+const RETENTION_SECS: f64 = 600.0;
 
 type Ring = Arc<Mutex<VecDeque<(f64, StatsSnapshot)>>>;
 
@@ -123,6 +125,7 @@ impl HostSource {
                     break;
                 }
                 if let Ok(mut r) = ring_bg.lock() {
+                    r.retain(|(sample_ts, _)| ts - *sample_ts <= RETENTION_SECS);
                     r.push_back((ts, snap));
                     while r.len() > RING_CAP {
                         r.pop_front();
@@ -147,7 +150,7 @@ impl HostSource {
 
     /// Build a `(time, value)` frame for `expr` from the ring, keeping only
     /// samples where the metric is present.
-    fn frame_for(&self, expr: &str) -> Frame {
+    fn frame_for(&self, expr: &str, range: &gtui_core::datasource::TimeRange) -> Frame {
         let extract: fn(&StatsSnapshot) -> Option<f64> = match expr {
             "host_cpu_pct" => |s| s.cpu_pct.map(|v| v as f64),
             "host_mem_used" => |s| s.mem_gib.map(|(used, _total)| used as f64),
@@ -156,9 +159,18 @@ impl HostSource {
         };
         let mut times = Vec::new();
         let mut values = Vec::new();
+        let from = range.from.timestamp() as f64
+            + f64::from(range.from.timestamp_subsec_nanos()) / 1_000_000_000.0;
+        let to = range.to.timestamp() as f64
+            + f64::from(range.to.timestamp_subsec_nanos()) / 1_000_000_000.0;
         if let Ok(r) = self.ring.lock() {
             for (ts, snap) in r.iter() {
-                if let Some(v) = extract(snap) {
+                // Both endpoints are inclusive; host samples and query ranges
+                // share the UNIX wall-clock/UTC time domain.
+                if *ts >= from
+                    && *ts <= to
+                    && let Some(v) = extract(snap)
+                {
                     times.push(*ts);
                     values.push(v);
                 }
@@ -219,7 +231,10 @@ impl DataSource for HostSource {
         &self,
         queries: Vec<Query>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>, QueryError>> + Send>> {
-        let frames: Vec<Frame> = queries.iter().map(|q| self.frame_for(&q.expr)).collect();
+        let frames: Vec<Frame> = queries
+            .iter()
+            .map(|q| self.frame_for(&q.expr, &q.time_range))
+            .collect();
         Box::pin(async move { Ok(frames) })
     }
 }
@@ -272,6 +287,30 @@ mod tests {
         let source = HostSource::try_new().unwrap();
         let res = source.query(vec![q("nope")]).await.unwrap();
         assert_eq!(res[0].fields[1].len(), 0);
+    }
+
+    #[test]
+    fn query_uses_inclusive_requested_range_and_preserves_sample_order() {
+        let source = HostSource::try_new().unwrap();
+        let mut ring = source.ring.lock().unwrap();
+        for (ts, cpu) in [(10.0, 10), (20.0, 20), (20.0, 21), (30.0, 30)] {
+            ring.push_back((
+                ts,
+                StatsSnapshot {
+                    cpu_pct: Some(cpu),
+                    ..Default::default()
+                },
+            ));
+        }
+        drop(ring);
+
+        let range = TimeRange {
+            from: chrono::DateTime::from_timestamp(20, 0).unwrap(),
+            to: chrono::DateTime::from_timestamp(20, 0).unwrap(),
+        };
+        let frame = source.frame_for("host_cpu_pct", &range);
+        assert_eq!(frame.fields[0].floats(), &[20.0, 20.0]);
+        assert_eq!(frame.fields[1].floats(), &[20.0, 21.0]);
     }
 
     #[tokio::test]
@@ -362,7 +401,8 @@ mod tests {
             panic!("inject ring lock poisoning");
         });
         assert!(poisoner.join().is_err());
-        let frame = source.frame_for("host_cpu_pct");
+        let query = q("host_cpu_pct");
+        let frame = source.frame_for("host_cpu_pct", &query.time_range);
         assert_eq!(frame.fields[0].len(), 0);
         assert_eq!(frame.fields[1].len(), 0);
     }
