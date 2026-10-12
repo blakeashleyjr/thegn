@@ -24,8 +24,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use thegn_core::config::Config;
 use thegn_svc::lsp::{
@@ -53,6 +53,41 @@ enum ClientSlot {
         generation: u64,
     },
     Unavailable,
+    Starting {
+        cell: Arc<StartCell>,
+        generation: u64,
+    },
+    Failed {
+        until: Instant,
+        failures: u32,
+    },
+}
+
+struct StartCell {
+    result: Mutex<Option<Result<Arc<LspClient>, LspError>>>,
+    ready: Condvar,
+}
+
+impl StartCell {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn finish(&self, result: Result<Arc<LspClient>, LspError>) {
+        *self.result.lock().unwrap() = Some(result);
+        self.ready.notify_all();
+    }
+
+    fn wait(&self) -> Result<Arc<LspClient>, LspError> {
+        let mut result = self.result.lock().unwrap();
+        while result.is_none() {
+            result = self.ready.wait(result).unwrap();
+        }
+        result.as_ref().unwrap().clone()
+    }
 }
 
 /// Keying on the registry key (not the tree-sitter `Lang`) is what lets an
@@ -181,65 +216,141 @@ impl LspInner {
         {
             return Err(LspError::Bounded("LSP authority identity limit".into()));
         }
-        let mut state = self
-            .clients
-            .lock()
-            .map_err(|_| LspError::Protocol("LSP client map poisoned".into()))?;
-        if state.live.as_ref().is_some_and(|live| !live.contains(root)) {
-            // The worktree is closed (or not yet known): never respawn behind
-            // a reconcile. Not cached — reopening the root re-enables it.
-            return Err(LspError::NotAvailable);
-        }
-        let clients = &mut state.map;
         let map_key = (root.to_path_buf(), key.to_string());
-        if let Some(slot) = clients.get(&map_key) {
-            return match slot {
-                ClientSlot::Live { client, .. } => Ok(client.clone()),
-                ClientSlot::Unavailable => Err(LspError::NotAvailable),
-            };
-        }
-        let root_known = clients.keys().any(|(existing, _)| existing == root);
-        if !root_known
-            && clients
-                .keys()
-                .map(|(existing, _)| existing)
-                .collect::<HashSet<_>>()
-                .len()
-                >= limits::MAX_ROOTS
-        {
-            return Err(LspError::Bounded("LSP root limit reached".into()));
-        }
-        if clients
-            .keys()
-            .filter(|(existing, _)| existing == root)
-            .count()
-            >= limits::MAX_SERVERS_PER_ROOT
-        {
-            return Err(LspError::Bounded(
-                "LSP servers-per-root limit reached".into(),
-            ));
-        }
-        let generation = self.diag_tx.register(root, key)?;
-        match start(root, key, self.diag_tx.clone(), generation) {
-            Ok(client) => {
-                clients.insert(
-                    map_key,
-                    ClientSlot::Live {
-                        client: client.clone(),
-                        generation,
-                    },
-                );
-                Ok(client)
+        let (cell, generation, previous_failures, stale_client) = {
+            let mut state = self
+                .clients
+                .lock()
+                .map_err(|_| LspError::Protocol("LSP client map poisoned".into()))?;
+            if state.live.as_ref().is_some_and(|live| !live.contains(root)) {
+                return Err(LspError::NotAvailable);
             }
-            Err(e) => {
-                self.diag_tx.retire(root, key, generation);
-                // Cache "no server" so we don't try to spawn on every request.
-                if e == LspError::NotAvailable {
-                    clients.insert(map_key, ClientSlot::Unavailable);
+            let mut previous_failures = 0;
+            let mut stale_client = None;
+            if let Some(slot) = state.map.get(&map_key) {
+                match slot {
+                    ClientSlot::Live { client, .. } if !client.is_closed() => {
+                        return Ok(client.clone());
+                    }
+                    ClientSlot::Live { .. } => {
+                        if let Some(ClientSlot::Live { client, generation }) =
+                            state.map.remove(&map_key)
+                        {
+                            self.diag_tx.retire(root, key, generation);
+                            stale_client = Some(client);
+                        }
+                    }
+                    ClientSlot::Unavailable => return Err(LspError::NotAvailable),
+                    ClientSlot::Starting { cell, .. } => {
+                        let waiting = cell.clone();
+                        drop(state);
+                        return waiting.wait();
+                    }
+                    ClientSlot::Failed { until, .. } if Instant::now() < *until => {
+                        return Err(LspError::Protocol("LSP start backoff active".into()));
+                    }
+                    ClientSlot::Failed { failures, .. } => {
+                        previous_failures = *failures;
+                        state.map.remove(&map_key);
+                    }
                 }
-                Err(e)
             }
+            let root_known = state.map.keys().any(|(existing, _)| existing == root);
+            if !root_known
+                && state
+                    .map
+                    .keys()
+                    .map(|(existing, _)| existing)
+                    .collect::<HashSet<_>>()
+                    .len()
+                    >= limits::MAX_ROOTS
+            {
+                return Err(LspError::Bounded("LSP root limit reached".into()));
+            }
+            if state
+                .map
+                .keys()
+                .filter(|(existing, _)| existing == root)
+                .count()
+                >= limits::MAX_SERVERS_PER_ROOT
+            {
+                return Err(LspError::Bounded(
+                    "LSP servers-per-root limit reached".into(),
+                ));
+            }
+            let generation = self.diag_tx.register(root, key)?;
+            let cell = Arc::new(StartCell::new());
+            state.map.insert(
+                map_key.clone(),
+                ClientSlot::Starting {
+                    cell: cell.clone(),
+                    generation,
+                },
+            );
+            (cell, generation, previous_failures, stale_client)
+        };
+        if let Some(client) = stale_client {
+            teardown_off_loop(vec![client]);
         }
+
+        // Only the caller that installed this cell runs startup. All map I/O
+        // and process startup happen after the global lock has been released.
+        let started = start(root, key, self.diag_tx.clone(), generation);
+        let result = match started {
+            Ok(client) => match self.clients.lock() {
+                Ok(mut state) => {
+                    let same_cell = matches!(state.map.get(&map_key), Some(ClientSlot::Starting { cell: existing, .. }) if Arc::ptr_eq(existing, &cell));
+                    let root_live = state.live.as_ref().is_none_or(|live| live.contains(root));
+                    if same_cell && root_live {
+                        state.map.insert(
+                            map_key,
+                            ClientSlot::Live {
+                                client: client.clone(),
+                                generation,
+                            },
+                        );
+                        Ok(client)
+                    } else {
+                        self.diag_tx.retire(root, key, generation);
+                        teardown_off_loop(vec![client]);
+                        Err(LspError::NotAvailable)
+                    }
+                }
+                Err(_) => {
+                    self.diag_tx.retire(root, key, generation);
+                    teardown_off_loop(vec![client]);
+                    Err(LspError::Protocol("LSP client map poisoned".into()))
+                }
+            },
+            Err(error) => {
+                self.diag_tx.retire(root, key, generation);
+                if let Ok(mut state) = self.clients.lock() {
+                    let same_cell = matches!(state.map.get(&map_key), Some(ClientSlot::Starting { cell: existing, .. }) if Arc::ptr_eq(existing, &cell));
+                    let root_live = state.live.as_ref().is_none_or(|live| live.contains(root));
+                    if same_cell && root_live {
+                        if error == LspError::NotAvailable {
+                            state.map.insert(map_key, ClientSlot::Unavailable);
+                        } else {
+                            let failures = previous_failures.saturating_add(1);
+                            let shift = failures.saturating_sub(1).min(6);
+                            let seconds = limits::START_BACKOFF_INITIAL_SECS
+                                .saturating_mul(1u64 << shift)
+                                .min(limits::START_BACKOFF_MAX_SECS);
+                            state.map.insert(
+                                map_key,
+                                ClientSlot::Failed {
+                                    until: Instant::now() + Duration::from_secs(seconds),
+                                    failures,
+                                },
+                            );
+                        }
+                    }
+                }
+                Err(error)
+            }
+        };
+        cell.finish(result.clone());
+        result
     }
 
     /// Retire `(root, key)`'s stream and tear its client down off-loop. A late
@@ -251,16 +362,22 @@ impl LspInner {
             .lock()
             .ok()
             .and_then(|mut state| state.map.remove(&(root.to_path_buf(), key.to_string())));
-        if let Some(ClientSlot::Live { client, generation }) = removed {
-            self.diag_tx.retire(root, key, generation);
-            teardown_off_loop(vec![client]);
+        match removed {
+            Some(ClientSlot::Live { client, generation }) => {
+                self.diag_tx.retire(root, key, generation);
+                teardown_off_loop(vec![client]);
+            }
+            Some(ClientSlot::Starting { generation, .. }) => {
+                self.diag_tx.retire(root, key, generation);
+            }
+            _ => {}
         }
     }
 
     /// Retire every server (and negative-cache slot) whose worktree is no
     /// longer in `live_roots`, releasing registry capacity; subprocess
-    /// teardown happens on a worker thread. Blocks on the client map (which a
-    /// concurrent spawn may hold) — call off the event loop.
+    /// teardown happens on a worker thread. This only briefly takes the map
+    /// lock; an in-progress spawn does not hold it.
     ///
     /// `epoch` orders concurrent calls: the host bumps it on every root-set
     /// change, and a call whose epoch is not newer than the applied one is a
@@ -285,9 +402,15 @@ impl LspInner {
                     continue;
                 };
                 released += 1;
-                if let ClientSlot::Live { client, generation } = slot {
-                    self.diag_tx.retire(&map_key.0, &map_key.1, generation);
-                    teardown.push(client);
+                match slot {
+                    ClientSlot::Live { client, generation } => {
+                        self.diag_tx.retire(&map_key.0, &map_key.1, generation);
+                        teardown.push(client);
+                    }
+                    ClientSlot::Starting { generation, .. } => {
+                        self.diag_tx.retire(&map_key.0, &map_key.1, generation);
+                    }
+                    _ => {}
                 }
             }
             state.live = Some(live_roots);
@@ -1487,12 +1610,166 @@ mod tests {
         )))
     }
 
+    fn live_fake_client(
+        root: &Path,
+        key: &str,
+        diagnostics: DiagnosticsSender,
+        generation: u64,
+    ) -> Result<Arc<LspClient>, LspError> {
+        let (reader, server_writer) = std::io::pipe().unwrap();
+        // Keep the server side open so this fixture remains a valid cache hit.
+        std::mem::forget(server_writer);
+        Ok(Arc::new(LspClient::from_io_with_identity(
+            Box::new(reader),
+            Box::new(std::io::sink()),
+            key,
+            root,
+            diagnostics,
+            key.to_string(),
+            generation,
+        )))
+    }
+
     fn enabled_inner() -> (Arc<LspInner>, DiagnosticsReceiver) {
         let mut cfg = Config::default();
         cfg.lsp.enabled = true;
         let mut sup = LspSupervisor::from_config(&cfg);
         let rx = sup.take_diagnostics_rx().unwrap();
         (sup.handle(), rx)
+    }
+
+    #[test]
+    fn blocked_start_does_not_stall_another_root_and_same_key_is_single_flight() {
+        let (inner, _rx) = enabled_inner();
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let a_inner = inner.clone();
+        let a_starts = starts.clone();
+        let first = std::thread::spawn(move || {
+            a_inner.client_with(Path::new("/a"), "rust", move |root, key, tx, generation| {
+                a_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                live_fake_client(root, key, tx, generation)
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let started = Instant::now();
+        let (b_tx, b_rx) = std::sync::mpsc::channel();
+        let b_inner = inner.clone();
+        let b_thread = std::thread::spawn(move || {
+            b_tx.send(b_inner.client_with(Path::new("/b"), "rust", fake_client))
+                .unwrap();
+        });
+        let b_result = b_rx.recv_timeout(Duration::from_millis(500));
+        if b_result.is_err() {
+            release_tx.send(()).unwrap();
+            first.join().unwrap().unwrap();
+            b_thread.join().unwrap();
+            panic!("root B startup waited behind root A's blocked initialization");
+        }
+        let b = b_result.unwrap().unwrap();
+        b_thread.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "root B starts independently"
+        );
+        drop(b);
+
+        let waiter_inner = inner.clone();
+        let waiter = std::thread::spawn(move || {
+            waiter_inner.client_with(Path::new("/a"), "rust", live_fake_client)
+        });
+        release_tx.send(()).unwrap();
+        let first = first.join().unwrap().unwrap();
+        let second = waiter.join().unwrap().unwrap();
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn closing_root_during_start_retires_its_generation_and_stream() {
+        let (inner, rx) = enabled_inner();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let starter_inner = inner.clone();
+        let start = std::thread::spawn(move || {
+            starter_inner.client_with(
+                Path::new("/closing"),
+                "rust",
+                move |root, key, tx, generation| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    fake_client(root, key, tx, generation)
+                },
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (reconciled_tx, reconciled_rx) = std::sync::mpsc::channel();
+        let reconcile_inner = inner.clone();
+        let reconcile = std::thread::spawn(move || {
+            reconciled_tx
+                .send(reconcile_inner.reconcile_roots(1, HashSet::new()))
+                .unwrap();
+        });
+        let reconciled = reconciled_rx.recv_timeout(Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+        reconcile.join().unwrap();
+        assert_eq!(
+            reconciled.unwrap(),
+            1,
+            "root close does not wait for startup"
+        );
+        assert_eq!(start.join().unwrap().err(), Some(LspError::NotAvailable));
+        assert!(inner.clients.lock().unwrap().map.is_empty());
+        assert_eq!(rx.footprint().active_streams, 0);
+    }
+
+    #[test]
+    fn closed_cached_client_restarts_with_a_new_generation() {
+        let (inner, _rx) = enabled_inner();
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+        let first = inner
+            .client_with(Path::new("/dead"), "rust", |root, key, tx, generation| {
+                starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                fake_client(root, key, tx, generation)
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !first.is_closed() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(first.is_closed(), "fixture reader reached EOF");
+        let old_generation = first.generation();
+        let second = inner
+            .client_with(Path::new("/dead"), "rust", |root, key, tx, generation| {
+                starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                fake_client(root, key, tx, generation)
+            })
+            .unwrap();
+        assert!(second.generation() > old_generation);
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn failed_start_is_backoff_cached() {
+        let (inner, _rx) = enabled_inner();
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+        let start = |_: &Path, _: &str, _: DiagnosticsSender, _: u64| {
+            starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(LspError::Spawn("missing fixture binary".into()))
+        };
+        assert!(matches!(
+            inner.client_with(Path::new("/failed"), "rust", start),
+            Err(LspError::Spawn(_))
+        ));
+        assert!(matches!(
+            inner.client_with(Path::new("/failed"), "rust", |_, _, _, _| panic!("backoff must not retry")),
+            Err(LspError::Protocol(message)) if message == "LSP start backoff active"
+        ));
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     fn stamped(
