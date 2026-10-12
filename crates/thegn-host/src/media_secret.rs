@@ -65,14 +65,11 @@ fn effective_socket(configured: &str) -> (String, Option<SecretRef>) {
     if host.is_empty() {
         return (configured.to_string(), None);
     }
-    let port = std::env::var("MPD_PORT")
-        .ok()
-        .and_then(|port| port.trim().parse::<u16>().ok())
-        .unwrap_or(6600);
-    parse_host(&host, port)
+    let port = std::env::var("MPD_PORT").unwrap_or_else(|_| "6600".to_string());
+    parse_host(&host, &port)
 }
 
-fn parse_host(value: &str, port: u16) -> (String, Option<SecretRef>) {
+fn parse_host(value: &str, port: &str) -> (String, Option<SecretRef>) {
     let (host, reference) = match value.split_once('@') {
         Some((password, host)) if !password.is_empty() => (
             host.to_string(),
@@ -84,6 +81,10 @@ fn parse_host(value: &str, port: u16) -> (String, Option<SecretRef>) {
     };
     let socket = if host.starts_with('/') {
         host
+    } else if host.starts_with('[') {
+        format!("{host}:{port}")
+    } else if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
     } else {
         format!("{host}:{port}")
     };
@@ -97,7 +98,7 @@ mod tests {
     #[test]
     fn embedded_host_password_is_parsed_as_a_redacted_literal() {
         let password = "must-not-leak-test-secret";
-        let (socket, reference) = parse_host(&format!("{password}@music.example"), 6602);
+        let (socket, reference) = parse_host(&format!("{password}@music.example"), "6602");
         assert_eq!(socket, "music.example:6602");
         let reference = reference.unwrap();
         assert!(reference.is_literal());
@@ -106,10 +107,28 @@ mod tests {
 
     #[test]
     fn explicit_host_and_abstract_prefix_never_parse_as_a_password() {
-        assert_eq!(parse_host("music.example", 6600).0, "music.example:6600");
-        let (socket, reference) = parse_host("@music.example", 6600);
+        assert_eq!(parse_host("music.example", "6600").0, "music.example:6600");
+        let (socket, reference) = parse_host("@music.example", "6600");
         assert_eq!(socket, "@music.example:6600");
         assert!(reference.is_none());
+    }
+
+    #[test]
+    fn ipv6_mpd_hosts_are_bracketed_once() {
+        assert_eq!(parse_host("::1", "6600").0, "[::1]:6600");
+        let (socket, reference) = parse_host("pw@::1", "6600");
+        assert_eq!(socket, "[::1]:6600");
+        assert!(reference.unwrap().is_literal());
+        assert_eq!(parse_host("[::1]", "6600").0, "[::1]:6600");
+    }
+
+    #[test]
+    fn invalid_mpd_port_is_preserved_as_an_invalid_endpoint() {
+        for port in ["abc", "0", "99999"] {
+            let (socket, _) = parse_host("music.example", port);
+            assert_eq!(socket, format!("music.example:{port}"));
+            assert!(thegn_media::mpd::MpdEndpoint::resolve(&socket, None).is_err());
+        }
     }
 
     #[test]
