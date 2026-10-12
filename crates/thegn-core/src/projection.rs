@@ -36,6 +36,12 @@ pub struct ProjectionSpec {
 
 impl ProjectionSpec {
     /// The pre-digest mountpoint for ssh placements, if it is safe to target.
+    ///
+    /// The legacy slug collapses distinct `(host, path)` pairs, which is why
+    /// current mountpoints include a digest. Teardown may therefore target a
+    /// colliding pre-upgrade mount belonging to another env. A non-lazy
+    /// `fusermount3 -u` refuses a busy mount, so this is safe; do not make it
+    /// lazy (`-uz`).
     pub fn legacy_mountpoint(&self) -> Option<String> {
         let Placement::Ssh(ssh) = &self.placement else {
             return None;
