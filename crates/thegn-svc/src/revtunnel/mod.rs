@@ -227,7 +227,14 @@ async fn pump_conn(
 }
 
 /// Shared per-connection routing table: id → inbound payload sender.
-type Conns = Arc<Mutex<HashMap<u32, Sender<Vec<u8>>>>>;
+struct Route {
+    inbound: Sender<Vec<u8>>,
+    // Keep cleanup identity separate: a sender clone here would keep the
+    // inbound receiver alive after `Close` removes the route.
+    identity: Arc<()>,
+}
+
+type Conns = Arc<Mutex<HashMap<u32, Route>>>;
 
 /// Render a bounded byte preview for logs: printable ASCII verbatim, everything
 /// else as `.`. So a skipped preamble/garbage run shows up readably.
@@ -306,7 +313,11 @@ where
                         // across an await. A full inbound channel backpressures
                         // this read loop, which stalls the shared stream read and
                         // so throttles the peer's send rate for this connection.
-                        let tx = conns.lock().await.get(&id).cloned();
+                        let tx = conns
+                            .lock()
+                            .await
+                            .get(&id)
+                            .map(|route| route.inbound.clone());
                         if let Some(tx) = tx {
                             let _ = tx.send(d).await; // best-effort: connection may be gone
                         }
@@ -393,20 +404,35 @@ where
                     }
                     return;
                 }
-                let mine = in_tx.clone();
-                drop(routes.insert(id, in_tx));
+                let identity = Arc::new(());
+                let mine = identity.clone();
+                drop(routes.insert(
+                    id,
+                    Route {
+                        inbound: in_tx,
+                        identity,
+                    },
+                ));
                 drop(routes);
                 tasks.lock().await.spawn(async move {
-                    let _permit = permit;
-                    match dialer.dial().await {
-                        Ok(local) => pump_conn(id, local, in_rx, sink.clone()).await,
-                        Err(_) => {
-                            let _ = sink.send(encode(&Frame::Close(id))).await; // best-effort: remote may be gone
-                        }
+                    let dial_result = dialer.dial().await;
+                    let dial_failed = dial_result.is_err();
+                    if let Ok(local) = dial_result {
+                        pump_conn(id, local, in_rx, sink.clone()).await;
                     }
                     let mut routes = conns.lock().await;
-                    if routes.get(&id).is_some_and(|tx| tx.same_channel(&mine)) {
+                    if routes
+                        .get(&id)
+                        .is_some_and(|route| Arc::ptr_eq(&route.identity, &mine))
+                    {
                         drop(routes.remove(&id));
+                    }
+                    drop(routes);
+                    drop(permit);
+                    if dial_failed {
+                        if let Err(error) = sink.send(encode(&Frame::Close(id))).await {
+                            tracing::debug!(target: "thegn::revtunnel", %error, "close reply dropped");
+                        }
                     }
                 });
             }
@@ -471,8 +497,15 @@ where
             };
             let id = acc_ids.fetch_add(1, Ordering::Relaxed);
             let (in_tx, in_rx) = channel::<Vec<u8>>(CHANNEL_DEPTH);
-            let mine = in_tx.clone();
-            acc_conns.lock().await.insert(id, in_tx);
+            let identity = Arc::new(());
+            let mine = identity.clone();
+            acc_conns.lock().await.insert(
+                id,
+                Route {
+                    inbound: in_tx,
+                    identity,
+                },
+            );
             if acc_sink.send(encode(&Frame::Open(id))).await.is_err() {
                 drop(acc_conns.lock().await.remove(&id));
                 break;
@@ -483,7 +516,10 @@ where
                 let _permit = permit;
                 pump_conn(id, Box::new(sock), in_rx, sink).await;
                 let mut routes = conns.lock().await;
-                if routes.get(&id).is_some_and(|tx| tx.same_channel(&mine)) {
+                if routes
+                    .get(&id)
+                    .is_some_and(|route| Arc::ptr_eq(&route.identity, &mine))
+                {
                     drop(routes.remove(&id));
                 }
             });
