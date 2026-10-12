@@ -205,7 +205,7 @@ fn stderr_with_timeout_stdin(
                     .unwrap_or_default();
                 return Some((
                     feeder_succeeded && status.success() && waited.success(),
-                    redact_stderr(err, &redactions),
+                    redact_payload_stderr(err, &redactions),
                 ));
             }
             Ok(None) if Instant::now() >= deadline => {
@@ -253,7 +253,7 @@ fn stderr_wait_after_input(
                     .unwrap_or_default();
                 return Some((
                     status.success() && waited.success(),
-                    redact_stderr(err, &redactions),
+                    redact_payload_stderr(err, &redactions),
                 ));
             }
             Ok(None) if Instant::now() >= deadline => {
@@ -274,6 +274,15 @@ fn redact_stderr(mut stderr: String, secrets: &[String]) -> String {
         if secret.len() >= 8 {
             stderr = stderr.replace(secret, "[REDACTED]");
         }
+    }
+    stderr
+}
+
+/// Redact values delivered through the secret stdin payload, including short
+/// values that the general diagnostic redactor treats as too common to mask.
+fn redact_payload_stderr(mut stderr: String, secrets: &[String]) -> String {
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        stderr = stderr.replace(secret.as_str(), "[REDACTED]");
     }
     stderr
 }
