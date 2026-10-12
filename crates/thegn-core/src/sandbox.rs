@@ -2127,10 +2127,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
         // `docker compose -f … -p <name> up -d [service runServices…]`. The
         // project name is the sandbox name, so the pane's `compose exec` (see
         // `enter_argv`) targets the same project.
-        let argv = crate::sandbox_compose::up_argv(&spec.name, &compose);
-        let _ = std::process::Command::new(&argv[0])
-            .args(&argv[1..])
-            .output()?;
+        crate::sandbox_compose::up_and_verify(&spec.name, &compose)?;
         return Ok(());
     }
 
@@ -2163,15 +2160,19 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     emit(SandboxPhase::ContainerCreate {
         backend: spec.backend.label(),
     });
-    let ssh_secret_env = ssh_oci_secret_env(spec);
-    let (argv, stdin) = oci_create_argv_and_stdin(spec, oci_create_opts(spec)?, &ssh_secret_env);
+    let remote_stdin_secret_env = remote_stdin_oci_secret_env(spec);
+    let (argv, stdin) =
+        oci_create_argv_and_stdin(spec, oci_create_opts(spec)?, &remote_stdin_secret_env);
     // Keep the create's stderr: it is the only place the runtime says WHY, and
     // for the commonest macOS failure (a bind the VM cannot resolve) it names the
     // exact path. `run_control_owned` would drop it.
+    let envfile_dir = util::xdg_state_home().join("thegn/sandbox-env");
+    let envfile = oci_env_file_arg(&argv);
     let create_result = match stdin {
         Some(input) => stderr_with_timeout_stdin(&argv, RUN_TIMEOUT, input),
         None => stderr_with_timeout(&argv, RUN_TIMEOUT),
     };
+    cleanup_oci_env_file(&envfile_dir, envfile.as_deref());
     let create_err = create_result.map(|(_, e)| e).unwrap_or_default();
     // Don't trust the exit code of `podman run -d`: on NixOS with broken
     // --userns keep-id, crun exits 0 but leaves the container in "created"
@@ -2211,12 +2212,14 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
         let (retry, stdin) = oci_create_argv_and_stdin(
             spec,
             oci_create_opts_with_keep_id(spec, false)?,
-            &ssh_secret_env,
+            &remote_stdin_secret_env,
         );
+        let retry_envfile = oci_env_file_arg(&retry);
         match stdin {
             Some(input) => drop(stderr_with_timeout_stdin(&retry, RUN_TIMEOUT, input)),
             None => drop(stderr_with_timeout(&retry, RUN_TIMEOUT)),
         }
+        cleanup_oci_env_file(&envfile_dir, retry_envfile.as_deref());
         if container_status(spec).0 {
             msg::warn(
                 "podman --userns keep-id failed; continuing with rootless podman default user namespace",
@@ -2821,7 +2824,7 @@ fn backend_enter_argv_with_env(
             // stay inline as `--setenv K=V`. (Remote specs keep everything
             // inline — see `partition_secret_env`.)
             let (inline_env, secret_env) = partition_secret_env(spec);
-            if let Some(envfile) = write_secret_env_file(&spec.name, &secret_env) {
+            if let Some(envfile) = write_secret_env_file(&spec.name, &secret_env, false) {
                 v.extend([
                     "-p".into(),
                     format!("EnvironmentFile={}", envfile.display()),
@@ -2893,8 +2896,8 @@ fn partition_secret_env(spec: &SandboxSpec) -> (EnvPairs<'_>, EnvPairs<'_>) {
     (inline, secret)
 }
 
-fn ssh_oci_secret_env(spec: &SandboxSpec) -> EnvPairs<'_> {
-    if !matches!(spec.placement, Placement::Ssh(_)) {
+fn remote_stdin_oci_secret_env(spec: &SandboxSpec) -> EnvPairs<'_> {
+    if !spec.placement.control_forwards_stdin() {
         return Vec::new();
     }
     spec.env
@@ -2905,7 +2908,7 @@ fn ssh_oci_secret_env(spec: &SandboxSpec) -> EnvPairs<'_> {
 }
 
 /// Add the final run command and wrap it for its placement. The returned stdin
-/// is present only for SSH OCI host-sourced secrets, and is consumed by the
+/// is present only for stdin-capable remote OCI host-sourced secrets, and is consumed by the
 /// same control call that carries the command.
 fn oci_create_argv_and_stdin(
     spec: &SandboxSpec,
@@ -2934,39 +2937,75 @@ fn oci_create_argv_and_stdin(
 
 /// Write host-sourced secret env pairs to a 0600 per-sandbox env-file and return
 /// its path. On failure, callers omit secrets instead of leaking them to argv.
-fn write_secret_env_file(name: &str, secret: &[(&String, &String)]) -> Option<PathBuf> {
+fn write_secret_env_file(
+    name: &str,
+    secret: &[(&String, &String)],
+    generation: bool,
+) -> Option<PathBuf> {
     if secret.is_empty() {
         return None;
     }
     let dir = util::xdg_state_home().join("thegn/sandbox-env");
-    write_secret_env_file_in(&dir, name, secret)
+    write_secret_env_file_in(&dir, name, secret, generation)
 }
 
 fn write_secret_env_file_in(
     dir: &std::path::Path,
     name: &str,
     secret: &[(&String, &String)],
+    generation: bool,
 ) -> Option<PathBuf> {
     if secret.is_empty() {
         return None;
     }
     crate::fsperm::ensure_private_dir(dir).ok()?;
-    let path = dir.join(format!("{name}.env"));
+    let file_name = if generation {
+        static NEXT_ENV_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_ENV_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{name}-{}-{id}.env", std::process::id())
+    } else {
+        format!("{name}.env")
+    };
+    let path = dir.join(file_name);
     let body: String = secret.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
     crate::fsperm::write_owner_only_atomic(&path, body.as_bytes()).ok()?;
     Some(path)
 }
 
+fn oci_env_file_arg(argv: &[String]) -> Option<PathBuf> {
+    argv.windows(2)
+        .find(|pair| pair[0] == "--env-file")
+        .map(|pair| PathBuf::from(&pair[1]))
+}
+
+fn remove_oci_env_file_in(dir: &std::path::Path, path: &std::path::Path) -> std::io::Result<bool> {
+    if path.parent() != Some(dir)
+        || path.extension().and_then(std::ffi::OsStr::to_str) != Some("env")
+    {
+        return Ok(false);
+    }
+    std::fs::remove_file(path)?;
+    Ok(true)
+}
+
+fn cleanup_oci_env_file(dir: &std::path::Path, path: Option<&std::path::Path>) {
+    if let Some(path) = path
+        && let Err(error) = remove_oci_env_file_in(dir, path)
+    {
+        tracing::debug!(target: "thegn::sandbox", %error, "unable to remove OCI secret env-file");
+    }
+}
+
 /// OCI `run` options shared by the keep-alive container: mounts, network, env,
 /// and uid mapping so bind-mounted files stay host-owned.
 fn oci_create_opts(spec: &SandboxSpec) -> Result<Vec<String>, VolumeAdmissionError> {
-    let ssh_secret_env = ssh_oci_secret_env(spec);
-    oci_create_opts_with_ssh_secrets(spec, &ssh_secret_env)
+    let remote_stdin_secret_env = remote_stdin_oci_secret_env(spec);
+    oci_create_opts_with_remote_stdin_secrets(spec, &remote_stdin_secret_env)
 }
 
-fn oci_create_opts_with_ssh_secrets(
+fn oci_create_opts_with_remote_stdin_secrets(
     spec: &SandboxSpec,
-    ssh_secret_env: &[(&String, &String)],
+    remote_stdin_secret_env: &[(&String, &String)],
 ) -> Result<Vec<String>, VolumeAdmissionError> {
     admit_volumes(spec)?;
     let spec = &*sealed_view(spec);
@@ -3093,20 +3132,20 @@ fn oci_create_opts_with_ssh_secrets(
         v.extend(["-v".into(), "/nix:/nix:ro".into()]);
     }
     // Host-sourced secrets stay off argv. Local creates use a protected file;
-    // SSH creates feed the env-file body over the control process stdin. Other
-    // remote placement kinds keep their existing inline delivery.
+    // Stdin-capable remote placements feed the env-file body over the control
+    // process stdin. Other remote placement kinds keep their existing inline delivery.
     let (inline_env, secret_env) = partition_secret_env(spec);
-    let inline_env: EnvPairs<'_> = if ssh_secret_env.is_empty() {
+    let inline_env: EnvPairs<'_> = if remote_stdin_secret_env.is_empty() {
         inline_env
     } else {
         inline_env
             .into_iter()
-            .filter(|pair| !ssh_secret_env.contains(pair))
+            .filter(|pair| !remote_stdin_secret_env.contains(pair))
             .collect()
     };
-    if matches!(spec.placement, Placement::Ssh(_)) && !ssh_secret_env.is_empty() {
+    if spec.placement.control_forwards_stdin() && !remote_stdin_secret_env.is_empty() {
         v.extend(["--env-file".into(), "/dev/stdin".into()]);
-    } else if let Some(envfile) = write_secret_env_file(&spec.name, &secret_env) {
+    } else if let Some(envfile) = write_secret_env_file(&spec.name, &secret_env, true) {
         v.extend(["--env-file".into(), envfile.to_string_lossy().into_owned()]);
     } else if !secret_env.is_empty() {
         // Never put host-sourced secrets back on argv if the protected file
@@ -3203,14 +3242,14 @@ fn oci_create_opts_with_keep_id(
     spec: &SandboxSpec,
     keep_id: bool,
 ) -> Result<Vec<String>, VolumeAdmissionError> {
-    let ssh_secret_env = ssh_oci_secret_env(spec);
-    oci_create_opts_with_keep_id_and_ssh_secrets(spec, keep_id, &ssh_secret_env)
+    let remote_stdin_secret_env = remote_stdin_oci_secret_env(spec);
+    oci_create_opts_with_keep_id_and_remote_stdin_secrets(spec, keep_id, &remote_stdin_secret_env)
 }
 
-fn oci_create_opts_with_keep_id_and_ssh_secrets(
+fn oci_create_opts_with_keep_id_and_remote_stdin_secrets(
     spec: &SandboxSpec,
     keep_id: bool,
-    ssh_secret_env: &[(&String, &String)],
+    remote_stdin_secret_env: &[(&String, &String)],
 ) -> Result<Vec<String>, VolumeAdmissionError> {
     admit_volumes(spec)?;
     let mut v = Vec::new();
@@ -3238,7 +3277,7 @@ fn oci_create_opts_with_keep_id_and_ssh_secrets(
     // All other opts (network, mounts, env, volumes, gpu, limits, ports) are
     // identical to oci_create_opts — delegate by temporarily re-routing:
     // build via oci_create_opts and strip the userns flag if present.
-    let mut full = oci_create_opts_with_ssh_secrets(spec, ssh_secret_env)?;
+    let mut full = oci_create_opts_with_remote_stdin_secrets(spec, remote_stdin_secret_env)?;
     if spec.backend == Backend::Podman && !keep_id {
         // Drop "--userns" and "keep-id" (two consecutive entries).
         let mut out = Vec::with_capacity(full.len());

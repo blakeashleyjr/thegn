@@ -330,6 +330,26 @@ fn checked_by_day(v: &str) -> Result<Vec<ByDay>, RecurError> {
         .collect()
 }
 
+fn is_rule_part(name: &str) -> bool {
+    matches!(
+        name,
+        "FREQ"
+            | "COUNT"
+            | "UNTIL"
+            | "INTERVAL"
+            | "BYSECOND"
+            | "BYMINUTE"
+            | "BYHOUR"
+            | "BYDAY"
+            | "BYMONTHDAY"
+            | "BYYEARDAY"
+            | "BYWEEKNO"
+            | "BYMONTH"
+            | "BYSETPOS"
+            | "WKST"
+    )
+}
+
 impl RRule {
     /// Parse an `RRULE` value (with or without the `RRULE:` prefix).
     pub fn parse(input: &str) -> Result<RRule, RecurError> {
@@ -339,12 +359,20 @@ impl RRule {
             .unwrap_or_else(|| input.trim());
         let mut r = RRule::default();
         let mut saw_freq = false;
+        let mut seen_parts = BTreeSet::new();
         for part in body.split(';') {
             let Some((k, v)) = part.split_once('=') else {
+                let name = part.trim().to_ascii_uppercase();
+                if is_rule_part(&name) {
+                    return Err(RecurError::BadValue(name));
+                }
                 continue;
             };
             let key = k.trim().to_ascii_uppercase();
             let v = v.trim();
+            if is_rule_part(&key) && !seen_parts.insert(key.clone()) {
+                return Err(RecurError::BadValue(format!("duplicate {key}")));
+            }
             match key.as_str() {
                 "FREQ" => {
                     r.freq = Freq::parse(v).ok_or_else(|| RecurError::BadFreq(v.to_string()))?;
@@ -391,6 +419,9 @@ impl RRule {
         }
         if !saw_freq {
             return Err(RecurError::BadFreq(body.to_string()));
+        }
+        if r.count.is_some() && r.until.is_some() {
+            return Err(RecurError::BadValue("COUNT with UNTIL".to_string()));
         }
         Ok(r)
     }

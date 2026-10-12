@@ -531,6 +531,7 @@ impl VpsProvider {
 
     /// Find one managed instance by name.
     async fn find_by_name(&self, name: &str) -> Result<Option<VpsInstance>> {
+        registry::checked_name(name)?;
         Ok(self
             .list_detailed()
             .await?
@@ -570,6 +571,7 @@ impl VpsProvider {
 
     /// Resolve the instance's public IP: cache → registry → API (then persist).
     pub async fn resolve_ip(&self, name: &str) -> Result<String> {
+        registry::checked_name(name)?;
         if let Some(ip) = self.ip.lock().unwrap().clone().filter(|i| !i.is_empty()) {
             return Ok(ip);
         }
@@ -587,7 +589,7 @@ impl VpsProvider {
         let ip = inst
             .ip
             .ok_or_else(|| anyhow!("vps: instance {name} has no public IPv4 yet"))?;
-        let _ = registry::write(&registry::VpsRecord {
+        if let Err(error) = registry::write(&registry::VpsRecord {
             // best-effort: registry is a cache; write failure just means no resurrection row
             name: name.to_string(),
             provider: self.spec.kind.as_str().into(),
@@ -595,7 +597,9 @@ impl VpsProvider {
             instance_id: inst.id,
             ip: ip.clone(),
             created_at: inst.created.unwrap_or_else(thegn_core::util::now),
-        });
+        }) {
+            tracing::debug!(target: "thegn::vps", %error, "registry cache write failed");
+        }
         *self.ip.lock().unwrap() = Some(ip.clone());
         Ok(ip)
     }
@@ -1228,6 +1232,42 @@ mod tests {
         });
         let error = provider.destroy("../x").await.unwrap_err();
         assert!(error.to_string().contains("invalid provider name"));
+    }
+
+    #[tokio::test]
+    async fn resolve_ip_rejects_unsafe_name_before_http() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let provider = VpsProvider::new(VpsSpec {
+            kind: VpsKind::Hetzner,
+            api_base: base,
+            token: "unused".into(),
+            name: "safe-name".into(),
+            region: String::new(),
+            size: String::new(),
+            image: String::new(),
+            max_instances: 0,
+            max_lifetime_secs: 0,
+            key_path: "/tmp/nonexistent-managed-key".into(),
+            pubkey: TEST_PUBKEY.into(),
+            skip_ready_wait: true,
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            provider.resolve_ip("../x"),
+        )
+        .await;
+        let error = match result {
+            Ok(Err(error)) => error,
+            other => panic!("unsafe name should fail before timeout: {other:?}"),
+        };
+        assert!(error.to_string().contains("invalid provider name"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[tokio::test]

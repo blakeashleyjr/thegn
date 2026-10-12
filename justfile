@@ -783,7 +783,7 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test: contract-ratchets test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend
+test: contract-ratchets test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata
     cargo nextest run --workspace
 
 # Doctest pass. Split out of `test` (and therefore off pre-push) because it is
@@ -1175,6 +1175,10 @@ test-heredoc-guard:
 # freshness without rebuilding the application.
 test-build-metadata:
     python3 -B test/build_metadata_test.py
+
+# Nix package identity and license metadata drift regression; pure Python.
+test-nix-metadata:
+    python3 -B test/nix_metadata_test.py
 
 # Backend overlay preservation regression; uses throwaway Git + HOME fixtures.
 test-apply-backend:

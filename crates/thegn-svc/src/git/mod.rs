@@ -32,7 +32,11 @@ pub use bisect::BisectOps;
 pub use branch::{BranchOps, ForceMode};
 pub use cherry::CherryOps;
 pub use commit::{CommitOps, ResetMode};
-pub use custom::CustomOps;
+pub use custom::{
+    CUSTOM_COMMAND_TIMEOUT_SECS, CUSTOM_OUTCOME_CLEANUP, CUSTOM_OUTCOME_EXITED,
+    CUSTOM_OUTCOME_READ, CUSTOM_OUTCOME_SPAWN, CUSTOM_OUTCOME_TIMEOUT, CUSTOM_OUTCOME_WAIT,
+    CustomOps,
+};
 pub use patch::PatchOps;
 pub use plumbing::{CasOutcome, MergeTreeOutcome, PlumbingOps};
 pub use rebase::{PauseReason, RebaseOps, RebaseOpts, RebaseOutcome, RebaseStatus};

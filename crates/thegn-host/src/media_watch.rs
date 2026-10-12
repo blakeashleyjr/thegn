@@ -42,11 +42,28 @@ pub(crate) fn spawn(
     generation: u64,
     tx: tokio_mpsc::UnboundedSender<MediaSnapshotDelivery>,
     waker: TerminalWaker,
+    previous: Option<tokio::task::JoinHandle<()>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.enabled {
         return None;
     }
-    Some(tokio::spawn(run(cfg, generation, tx, waker)))
+    Some(tokio::spawn(async move {
+        abort_and_join(previous).await;
+        run(cfg, generation, tx, waker).await;
+    }))
+}
+
+/// Abort the prior generation and wait for its task to finish before starting
+/// another watcher. This also works when the prior task is waiting silently.
+pub(crate) async fn abort_and_join(previous: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(previous) = previous {
+        previous.abort();
+        if let Err(error) = previous.await
+            && error.is_panic()
+        {
+            tracing::warn!(target: "thegn::media", error = %error, "previous media watcher panicked while stopping");
+        }
+    }
 }
 
 /// Grace applied on the badge active→inactive edge before we believe a player
@@ -303,8 +320,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        FlapAction, MediaSnapshotDelivery, STREAM_STABILITY, backoff_after_stream, drain_snapshots,
-        flap_action,
+        FlapAction, MediaSnapshotDelivery, STREAM_STABILITY, abort_and_join, backoff_after_stream,
+        drain_snapshots, flap_action,
     };
     use thegn_core::media::{MediaCaps, MediaSnapshot, MediaState};
 
@@ -336,6 +353,34 @@ mod tests {
             std::time::Duration::from_secs(1),
             "only a stream that meets the stability window resets backoff"
         );
+    }
+
+    #[tokio::test]
+    async fn watcher_replacement_joins_the_aborted_task_before_continuing() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let previous = tokio::spawn(async move {
+            let _guard = DropFlag(task_dropped);
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        abort_and_join(Some(previous)).await;
+
+        // This is the first operation the replacement watcher performs after
+        // the join helper returns.
+        assert!(dropped.load(Ordering::Acquire));
     }
 
     #[test]

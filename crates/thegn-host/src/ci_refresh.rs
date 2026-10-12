@@ -11,6 +11,24 @@ use std::sync::Mutex;
 
 use termwiz::terminal::TerminalWaker;
 
+const MAX_LOG_INGEST_CALLS: usize = 32;
+
+#[derive(Debug)]
+struct CallBudget {
+    remaining: usize,
+}
+
+impl CallBudget {
+    fn take(&mut self) -> bool {
+        if self.remaining == 0 {
+            false
+        } else {
+            self.remaining -= 1;
+            true
+        }
+    }
+}
+
 #[path = "ci_autofix.rs"]
 pub(crate) mod ci_autofix;
 
@@ -263,7 +281,11 @@ fn refresh_ci_cache_for(
     let branch = loc
         .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
         .filter(|b| !b.is_empty());
-    match client.runs(loc, branch.as_deref(), cfg.max_runs) {
+    match client.runs(
+        loc,
+        branch.as_deref(),
+        cfg.max_runs.min(thegn_core::config_ci::MAX_CI_RUNS),
+    ) {
         Ok(result) => {
             let runs = result.runs;
             if result.discarded_rows > 0 {
@@ -353,7 +375,10 @@ fn ingest_failed_logs(
 ) {
     use thegn_core::ci::CiState;
     use thegn_core::store::CacheStore;
-    if cfg.log_cache_runs == 0 {
+    let log_cache_runs = cfg
+        .log_cache_runs
+        .min(thegn_core::config_ci::MAX_CI_LOG_CACHE_RUNS);
+    if log_cache_runs == 0 {
         return;
     }
     let key = thegn_core::remote::GitLoc::worktree_cache_key(host_path);
@@ -362,9 +387,12 @@ fn ingest_failed_logs(
         .filter(|r| r.state.is_terminal())
         .map(|r| r.id.clone())
         .collect();
-    let retained = thegn_core::ci_log::retained_run_ids(&terminal_ids, cfg.log_cache_runs);
+    let retained = thegn_core::ci_log::retained_run_ids(&terminal_ids, log_cache_runs);
     let old_ids: std::collections::HashSet<&str> = old_runs.iter().map(|r| r.id.as_str()).collect();
-    for run in runs
+    let mut call_budget = CallBudget {
+        remaining: MAX_LOG_INGEST_CALLS,
+    };
+    'runs: for run in runs
         .iter()
         .filter(|r| retained.contains(&r.id) && r.state == CiState::Fail)
     {
@@ -374,6 +402,10 @@ fn ingest_failed_logs(
         let Some(client) = thegn_svc::ci::provider_for(loc, cfg) else {
             break;
         };
+        if !call_budget.take() {
+            tracing::debug!(target: "thegn::ci", budget = MAX_LOG_INGEST_CALLS, "CI log ingestion provider-call budget exhausted");
+            break;
+        }
         let detail = match client.run_detail(loc, &run.id) {
             Ok(detail) => detail,
             Err(_) => continue,
@@ -402,6 +434,10 @@ fn ingest_failed_logs(
                 .is_some_and(|old| old.head_sha == run.sha && !old.text.is_empty())
             {
                 continue;
+            }
+            if !call_budget.take() {
+                tracing::debug!(target: "thegn::ci", budget = MAX_LOG_INGEST_CALLS, "CI log ingestion provider-call budget exhausted");
+                break 'runs;
             }
             let Ok(log) = client.logs(loc, &run.id, &job.id) else {
                 continue;
@@ -459,6 +495,15 @@ mod tests {
         // …and is clamped to ≥ 5s (a provider subprocess per tick).
         assert_eq!(ci_every_slots(0), 10);
         assert_eq!(ci_every_slots(1), 10);
+    }
+
+    #[test]
+    fn log_ingestion_call_budget_stops_at_its_cap() {
+        let mut budget = CallBudget { remaining: 2 };
+        assert!(budget.take());
+        assert!(budget.take());
+        assert!(!budget.take());
+        assert!(!budget.take());
     }
 
     #[test]

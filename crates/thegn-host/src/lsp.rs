@@ -202,8 +202,11 @@ impl LspSupervisor {
     }
 }
 
-/// Drop clients on a worker thread: `LspClient::drop` kills and reaps a child,
-/// which must never run on the render/input thread.
+/// Grace for the LSP shutdown request and for the child's exit before kill.
+const LSP_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Gracefully close and drop clients on a worker thread, never the render/input
+/// thread.
 fn teardown_off_loop(clients: Vec<Arc<LspClient>>) {
     if clients.is_empty() {
         return;
@@ -212,6 +215,9 @@ fn teardown_off_loop(clients: Vec<Arc<LspClient>>) {
         .name("thegn-lsp-teardown".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            for client in &clients {
+                client.shutdown(LSP_CLOSE_GRACE);
+            }
             drop(clients);
         });
     if let Err(error) = spawned {

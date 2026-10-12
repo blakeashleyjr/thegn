@@ -1433,27 +1433,10 @@ pub fn try_lock_git_mutations(worktree: &Path) -> std::io::Result<GitLock> {
     Ok(GitLock(file))
 }
 
-/// Legacy best-effort wrapper. New required mutations should use
-/// [`try_lock_git_mutations`] and refuse to proceed when acquisition fails.
-/// The lock is advisory among thegn callers; ordinary Git does not honor it.
-#[cfg(not(windows))]
-pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
-    match try_lock_git_mutations(worktree) {
-        Ok(lock) => Some(lock),
-        Err(error) => {
-            tracing::warn!(
-                target: "thegn::git",
-                worktree = %worktree.display(),
-                error = %error,
-                "could not acquire git-mutation lock"
-            );
-            None
-        }
-    }
-}
-
 #[cfg(windows)]
-pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
+/// Acquire the per-repo git-mutation lock using an exclusive Windows handle.
+/// This reports failures so required mutations can refuse to run.
+pub fn try_lock_git_mutations(worktree: &Path) -> std::io::Result<GitLock> {
     let path = git_common_dir(worktree).join("thegn-git.lock");
     // On Windows, opening a file with `share_read=false` and `share_write=false`
     // creates an exclusive lock at the filesystem level.
@@ -1468,9 +1451,26 @@ pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
         // unix arm above (which spells the same intent out).
         .truncate(false)
         .share_mode(0) // 0 = exclusive lock
-        .open(&path)
-        .ok()?;
-    Some(GitLock(file))
+        .open(&path)?;
+    Ok(GitLock(file))
+}
+
+/// Legacy best-effort wrapper. New required mutations should use
+/// [`try_lock_git_mutations`] and refuse to proceed when acquisition fails.
+/// The lock is advisory among thegn callers; ordinary Git does not honor it.
+pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
+    match try_lock_git_mutations(worktree) {
+        Ok(lock) => Some(lock),
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::git",
+                worktree = %worktree.display(),
+                error = %error,
+                "could not acquire git-mutation lock"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(not(windows))]

@@ -12,6 +12,7 @@
 use anyhow::{Result, bail};
 use thegn_core::ci::{self, CiJob, CiRun, CiState, RerunScope};
 use thegn_core::config::Config;
+use thegn_core::config_ci::MAX_CI_RUNS;
 use thegn_core::db::Db;
 use thegn_core::remote::GitLoc;
 use thegn_core::store::CacheStore;
@@ -163,6 +164,11 @@ fn runs(
         thegn_svc::ci::validate_branch_ref(branch)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     }
+    if let Some(limit) = limit
+        && (limit == 0 || limit > MAX_CI_RUNS)
+    {
+        bail!("--limit must be between 1 and {MAX_CI_RUNS}");
+    }
     // `runs` is a READ verb: unlike the mutation verbs, listing when no CI
     // provider resolves is graceful degradation, not an error — emit an empty
     // JSON array (valid for scripts) / a friendly note and exit 0.
@@ -177,7 +183,7 @@ fn runs(
         outln!("no CI provider for this worktree (set [ci] provider, or check the remote)");
         return Ok(());
     };
-    let limit = limit.unwrap_or(cfg.ci.max_runs);
+    let limit = limit.unwrap_or(cfg.ci.max_runs.min(MAX_CI_RUNS));
     let branch_q = branch.as_deref();
     match client.runs(&loc, branch_q, limit) {
         Ok(result) => {

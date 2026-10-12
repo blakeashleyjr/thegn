@@ -481,7 +481,7 @@ fn gate_path_is_quarantined(path: &Path) -> bool {
         .any(|(workspace, _)| workspace == path)
 }
 
-fn record_external_quarantine(workspace: &Path, reason: &str) {
+pub(super) fn record_external_quarantine(workspace: &Path, reason: &str) {
     let root = util::xdg_state_home().join("thegn/gate");
     let recorded = (|| -> Result<()> {
         std::fs::create_dir_all(&root)?;
