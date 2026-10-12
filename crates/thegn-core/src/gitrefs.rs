@@ -2,10 +2,10 @@
 //! commits, rich branches, stashes, tags, bisect state, git version.
 //!
 //! Pure parsing; the svc layer runs the commands and hands the stdout here.
-//! Record formats lean on the `%x1f` unit-separator idiom (see
-//! `parse_log_graph` in thegn-svc): fields can hold anything but `\u{1f}`
-//! and `\n`, so splitting is unambiguous. Tolerant of malformed input:
-//! unparseable records are dropped, never panicked on.
+//! Commit records use NUL-delimited fields, which cannot collide with Git
+//! identity or message data. Ref records use unit separators because Git ref
+//! names cannot contain control bytes. Parsers reject malformed rows as a
+//! whole rather than silently returning partial repository state.
 
 /// One commit from `git log` (see [`parse_commits`] for the format).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,36 +23,60 @@ pub struct Commit {
     pub refs: String,
 }
 
-/// Parse `git log --format=%x1f%H%x1f%h%x1f%an%x1f%ae%x1f%ct%x1f%P%x1f%D%x1f%s`
-/// output: each record starts with the 0x1f unit separator, fields are
-/// 0x1f-separated, records are newline-separated. The subject rides last so
-/// it can hold anything but `\n`. Lines that don't begin with the separator
-/// or are missing fields are skipped.
-pub fn parse_commits(out: &str) -> Vec<Commit> {
-    out.lines()
-        .filter_map(|line| {
-            let rest = line.strip_prefix('\u{1f}')?;
-            let mut it = rest.splitn(8, '\u{1f}');
-            let sha = it.next()?.to_string();
-            let short = it.next()?.to_string();
-            let author = it.next()?.to_string();
-            let email = it.next()?.to_string();
-            let date = it.next()?.parse().ok()?;
-            let parents = it.next()?.split_whitespace().map(String::from).collect();
-            let refs = it.next()?.to_string();
-            let subject = it.next()?.to_string();
-            Some(Commit {
-                sha,
-                short,
-                author,
-                email,
-                date,
-                subject,
-                parents,
-                refs,
-            })
-        })
-        .collect()
+/// Parse the eight NUL-delimited fields emitted by
+/// `git log -z --format=%H%x00%h%x00%an%x00%ae%x00%ct%x00%P%x00%D%x00%s`.
+/// Exactly one final empty chunk is accepted as the record terminator.
+pub fn parse_commits(out: &str) -> anyhow::Result<Vec<Commit>> {
+    if out.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut fields: Vec<&str> = out.split('\0').collect();
+    if fields.last() == Some(&"") {
+        fields.pop();
+    }
+    anyhow::ensure!(!fields.is_empty(), "empty commit record terminator");
+    anyhow::ensure!(fields.len() % 8 == 0, "malformed commit record field count");
+    let mut commits = Vec::with_capacity(fields.len() / 8);
+    let mut seen = std::collections::HashSet::new();
+    for row in fields.chunks_exact(8) {
+        let sha = row[0];
+        let short = row[1];
+        anyhow::ensure!(valid_oid(sha), "malformed commit object id");
+        anyhow::ensure!(seen.insert(sha), "duplicate commit object id");
+        anyhow::ensure!(
+            !short.is_empty()
+                && short.len() <= sha.len()
+                && short.bytes().all(|b| b.is_ascii_hexdigit())
+                && sha.starts_with(short),
+            "malformed abbreviated commit object id"
+        );
+        let date = row[4]
+            .parse::<i64>()
+            .map_err(|_| anyhow::anyhow!("malformed commit timestamp"))?;
+        let parents = row[5]
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            parents.iter().all(|parent| valid_oid(parent)),
+            "malformed parent object id"
+        );
+        commits.push(Commit {
+            sha: sha.to_owned(),
+            short: short.to_owned(),
+            author: row[2].to_owned(),
+            email: row[3].to_owned(),
+            date,
+            parents,
+            refs: row[6].to_owned(),
+            subject: row[7].to_owned(),
+        });
+    }
+    Ok(commits)
+}
+
+fn valid_oid(oid: &str) -> bool {
+    matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// One local branch with tracking info (see [`parse_branches`]).
@@ -75,41 +99,89 @@ pub struct BranchInfo {
 /// Decompose an `%(upstream:track)` field — `""` | `"[ahead N]"` |
 /// `"[behind M]"` | `"[ahead N, behind M]"` | `"[gone]"` — into
 /// `(ahead, behind, gone)`.
-fn parse_track(track: &str) -> (usize, usize, bool) {
-    let inner = track.trim().trim_start_matches('[').trim_end_matches(']');
+fn parse_track(track: &str) -> anyhow::Result<(usize, usize, bool)> {
+    if track.is_empty() {
+        return Ok((0, 0, false));
+    }
+    let inner = track
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .ok_or_else(|| anyhow::anyhow!("malformed upstream tracking field"))?;
     if inner == "gone" {
-        return (0, 0, true);
+        return Ok((0, 0, true));
     }
     let (mut ahead, mut behind) = (0, 0);
+    let (mut saw_ahead, mut saw_behind) = (false, false);
     for part in inner.split(',') {
         let mut words = part.split_whitespace();
-        match (words.next(), words.next().and_then(|n| n.parse().ok())) {
-            (Some("ahead"), Some(n)) => ahead = n,
-            (Some("behind"), Some(n)) => behind = n,
-            _ => {}
+        let field = words
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("empty upstream tracking count"))?;
+        let count = words
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing upstream tracking count"))?
+            .parse::<usize>()
+            .map_err(|_| anyhow::anyhow!("invalid upstream tracking count"))?;
+        anyhow::ensure!(words.next().is_none(), "extra upstream tracking field data");
+        match field {
+            "ahead" if !saw_ahead => {
+                ahead = count;
+                saw_ahead = true;
+            }
+            "behind" if !saw_behind => {
+                behind = count;
+                saw_behind = true;
+            }
+            _ => anyhow::bail!("unknown or duplicate upstream tracking count"),
         }
     }
-    (ahead, behind, false)
+    anyhow::ensure!(saw_ahead || saw_behind, "empty upstream tracking field");
+    Ok((ahead, behind, false))
 }
 
 /// Parse `git for-each-ref refs/heads --sort=-committerdate --format=
 /// %(HEAD)%x1f%(refname:short)%x1f%(upstream:short)%x1f%(upstream:track)%x1f%(objectname)%x1f%(committerdate:unix)%x1f%(contents:subject)`
 /// output. `%(HEAD)` is "*" on the current branch (detached HEAD simply emits
 /// no starred row). An empty `%(upstream:short)` means no upstream.
-pub fn parse_branches(out: &str) -> Vec<BranchInfo> {
-    out.lines()
-        .filter_map(|line| {
+pub fn parse_branches(out: &str) -> anyhow::Result<Vec<BranchInfo>> {
+    let mut names = std::collections::HashSet::new();
+    out.split_terminator('\n')
+        .enumerate()
+        .map(|(line_no, line)| {
+            let malformed = || anyhow::anyhow!("malformed branch row {}", line_no + 1);
             let mut it = line.splitn(7, '\u{1f}');
-            let is_head = it.next()? == "*";
-            let name = it.next()?.to_string();
-            let upstream = Some(it.next()?).filter(|u| !u.is_empty()).map(String::from);
-            let (ahead, behind, upstream_gone) = parse_track(it.next()?);
-            let sha = it.next()?.to_string();
-            let date = it.next()?.parse().ok()?;
-            let subject = it.next()?.to_string();
-            Some(BranchInfo {
+            let head = it.next().ok_or_else(malformed)?;
+            anyhow::ensure!(
+                head == "*" || head == " ",
+                "malformed branch marker on row {}",
+                line_no + 1
+            );
+            let name = it.next().ok_or_else(malformed)?.to_string();
+            anyhow::ensure!(!name.is_empty(), "empty branch name on row {}", line_no + 1);
+            anyhow::ensure!(
+                names.insert(name.clone()),
+                "duplicate branch name on row {}",
+                line_no + 1
+            );
+            let upstream = Some(it.next().ok_or_else(malformed)?)
+                .filter(|u| !u.is_empty())
+                .map(String::from);
+            let (ahead, behind, upstream_gone) = parse_track(it.next().ok_or_else(malformed)?)?;
+            let sha = it.next().ok_or_else(malformed)?.to_string();
+            anyhow::ensure!(
+                valid_oid(&sha),
+                "malformed branch object id on row {}",
+                line_no + 1
+            );
+            let date = it
+                .next()
+                .ok_or_else(malformed)?
+                .parse()
+                .map_err(|_| malformed())?;
+            let subject = it.next().ok_or_else(malformed)?.to_string();
+            Ok(BranchInfo {
                 name,
-                is_head,
+                is_head: head == "*",
                 upstream,
                 ahead,
                 behind,
@@ -135,22 +207,45 @@ pub struct StashEntry {
 }
 
 /// Parse `git stash list --format=%gd%x1f%H%x1f%ct%x1f%gs` output. `%gd` is
-/// the selector "stash@{N}"; rows whose selector doesn't fit that shape are
-/// skipped.
-pub fn parse_stashes(out: &str) -> Vec<StashEntry> {
-    out.lines()
-        .filter_map(|line| {
+/// the selector "stash@{N}"; any row whose selector or other field is
+/// malformed makes the complete parse fail.
+pub fn parse_stashes(out: &str) -> anyhow::Result<Vec<StashEntry>> {
+    let mut indexes = std::collections::HashSet::new();
+    out.split_terminator('\n')
+        .enumerate()
+        .map(|(line_no, line)| {
+            let malformed = || anyhow::anyhow!("malformed stash row {}", line_no + 1);
             let mut it = line.splitn(4, '\u{1f}');
-            let index = it
-                .next()?
-                .strip_prefix("stash@{")?
-                .strip_suffix('}')?
+            let selector = it.next().ok_or_else(malformed)?;
+            let index = selector
+                .strip_prefix("stash@{")
+                .and_then(|v| v.strip_suffix('}'))
+                .ok_or_else(malformed)?
                 .parse()
-                .ok()?;
-            let sha = it.next()?.to_string();
-            let date = it.next()?.parse().ok()?;
-            let message = it.next()?.to_string();
-            Some(StashEntry {
+                .map_err(|_| malformed())?;
+            anyhow::ensure!(
+                indexes.insert(index),
+                "duplicate stash selector on row {}",
+                line_no + 1
+            );
+            let sha = it.next().ok_or_else(malformed)?.to_string();
+            anyhow::ensure!(
+                valid_oid(&sha),
+                "malformed stash object id on row {}",
+                line_no + 1
+            );
+            let date = it
+                .next()
+                .ok_or_else(malformed)?
+                .parse()
+                .map_err(|_| malformed())?;
+            let message = it.next().ok_or_else(malformed)?.to_string();
+            anyhow::ensure!(
+                it.next().is_none(),
+                "extra stash fields on row {}",
+                line_no + 1
+            );
+            Ok(StashEntry {
                 index,
                 sha,
                 date,
@@ -174,17 +269,45 @@ pub struct TagInfo {
 /// --format=%(refname:short)%x1f%(objectname)%x1f%(objecttype)` output.
 /// Object type "tag" means annotated; "commit" (or anything else a tag can
 /// point at) means lightweight.
-pub fn parse_tags(out: &str) -> Vec<TagInfo> {
-    out.lines()
-        .filter_map(|line| {
+pub fn parse_tags(out: &str) -> anyhow::Result<Vec<TagInfo>> {
+    let mut names = std::collections::HashSet::new();
+    out.split_terminator('\n')
+        .enumerate()
+        .map(|(line_no, line)| {
+            let malformed = || anyhow::anyhow!("malformed tag row {}", line_no + 1);
             let mut it = line.splitn(3, '\u{1f}');
-            let name = it.next()?.to_string();
-            let sha = it.next()?.to_string();
-            let annotated = it.next()? == "tag";
-            Some(TagInfo {
+            let name = it.next().ok_or_else(malformed)?.to_string();
+            let sha = it.next().ok_or_else(malformed)?.to_string();
+            let kind = it.next().ok_or_else(malformed)?;
+            anyhow::ensure!(
+                it.next().is_none(),
+                "extra tag fields on row {}",
+                line_no + 1
+            );
+            anyhow::ensure!(
+                !name.is_empty() && !sha.is_empty(),
+                "empty tag field on row {}",
+                line_no + 1
+            );
+            anyhow::ensure!(
+                valid_oid(&sha),
+                "malformed tag object id on row {}",
+                line_no + 1
+            );
+            anyhow::ensure!(
+                matches!(kind, "tag" | "commit" | "tree" | "blob"),
+                "unknown tag object type on row {}",
+                line_no + 1
+            );
+            anyhow::ensure!(
+                names.insert(name.clone()),
+                "duplicate tag name on row {}",
+                line_no + 1
+            );
+            Ok(TagInfo {
                 name,
                 sha,
-                annotated,
+                annotated: kind == "tag",
             })
         })
         .collect()
@@ -297,16 +420,16 @@ mod tests {
 
     const US: char = '\u{1f}';
 
-    /// Join fields into one `%x1f`-prefixed log record.
+    /// Join fields into one NUL-delimited commit record.
     fn rec(fields: &[&str]) -> String {
-        format!("{US}{}", fields.join(&US.to_string()))
+        fields.join("\0")
     }
 
     // --- parse_commits ---
 
     #[test]
     fn commits_empty_input() {
-        assert_eq!(parse_commits(""), Vec::<Commit>::new());
+        assert_eq!(parse_commits("").unwrap(), Vec::<Commit>::new());
     }
 
     #[test]
@@ -328,7 +451,7 @@ mod tests {
                 "Bob",
                 "b@e",
                 "200",
-                "p1 p2",
+                &format!("{} {}", "d".repeat(40), "e".repeat(40)),
                 "HEAD -> main, origin/main",
                 "merge two",
             ]),
@@ -338,18 +461,18 @@ mod tests {
                 "Cy",
                 "c@e",
                 "300",
-                "p1 p2 p3",
+                &format!("{} {} {}", "f".repeat(40), "1".repeat(40), "2".repeat(40)),
                 "",
                 "octopus",
             ]),
         ]
-        .join("\n");
-        let v = parse_commits(&out);
+        .join("\0");
+        let v = parse_commits(&out).unwrap();
         assert_eq!(v.len(), 3);
         assert!(v[0].parents.is_empty());
         assert_eq!(v[0].refs, "");
         assert_eq!(v[0].date, 100);
-        assert_eq!(v[1].parents, vec!["p1", "p2"]);
+        assert_eq!(v[1].parents, vec!["d".repeat(40), "e".repeat(40)]);
         assert_eq!(v[1].refs, "HEAD -> main, origin/main");
         assert_eq!(v[1].author, "Bob");
         assert_eq!(v[1].email, "b@e");
@@ -360,31 +483,70 @@ mod tests {
 
     #[test]
     fn commits_subject_keeps_unicode_and_edge_whitespace() {
-        let out = rec(&["s", "sh", "Ann", "a@e", "1", "", "", "  héllo → wörld  "]);
-        let v = parse_commits(&out);
+        let out = rec(&[
+            &"a".repeat(40),
+            "a",
+            "Ann",
+            "a@e",
+            "1",
+            "",
+            "",
+            "  héllo → wörld  ",
+        ]);
+        let v = parse_commits(&out).unwrap();
         assert_eq!(v[0].subject, "  héllo → wörld  ");
     }
 
     #[test]
-    fn commits_malformed_rows_are_dropped() {
-        // No leading separator, too few fields, non-numeric date — all skipped;
-        // the good row survives.
-        let out = [
-            "garbage without separator".to_string(),
-            rec(&["sha", "sh", "Ann"]),
-            rec(&["sha", "sh", "Ann", "a@e", "not-a-date", "", "", "subj"]),
-            rec(&["sha", "sh", "Ann", "a@e", "7", "", "", "kept"]),
-        ]
-        .join("\n");
-        let v = parse_commits(&out);
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].subject, "kept");
+    fn commits_control_bytes_round_trip_and_malformed_records_fail_closed() {
+        let first = rec(&[
+            &"a".repeat(40),
+            "a",
+            "A\u{1f}nn",
+            "a@e",
+            "7",
+            "",
+            "",
+            "first",
+        ]);
+        let second = rec(&[&"b".repeat(40), "b", "Bob", "b@e", "8", "", "", "second"]);
+        let parsed = parse_commits(&format!("{first}\0{second}\0")).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].author, "A\u{1f}nn");
+        assert_eq!(parsed[1].email, "b@e");
+        for malformed in [
+            "\0".to_string(),
+            format!(
+                "{}\0x",
+                rec(&[&"a".repeat(40), "a", "A", "a@e", "7", "", "", "s"])
+            ),
+            rec(&["not-a-hash", "a", "A", "a@e", "7", "", "", "s"]),
+            rec(&[&"a".repeat(40), "z", "A", "a@e", "7", "", "", "s"]),
+            rec(&[&"a".repeat(40), "a", "A", "a@e", "bad", "", "", "s"]),
+            rec(&[&"a".repeat(40), "a", "A", "a@e", "7", "not-an-oid", "", "s"]),
+            format!(
+                "{}\0{}",
+                rec(&[&"a".repeat(40), "a", "A", "a@e", "7", "", "", "s"]),
+                rec(&[&"a".repeat(40), "a", "A", "a@e", "7", "", "", "s"])
+            ),
+        ] {
+            assert!(parse_commits(&malformed).is_err());
+        }
     }
 
     // --- parse_branches ---
 
     fn branch_row(head: &str, name: &str, upstream: &str, track: &str) -> String {
-        [head, name, upstream, track, "deadbeef", "42", "subject"].join(&US.to_string())
+        [
+            head,
+            name,
+            upstream,
+            track,
+            &"d".repeat(40),
+            "42",
+            "subject",
+        ]
+        .join(&US.to_string())
     }
 
     #[test]
@@ -397,12 +559,12 @@ mod tests {
             branch_row(" ", "old", "origin/old", "[gone]"),
         ]
         .join("\n");
-        let v = parse_branches(&out);
+        let v = parse_branches(&out).unwrap();
         assert_eq!(v.len(), 5);
         assert!(v[0].is_head);
         assert_eq!((v[0].ahead, v[0].behind, v[0].upstream_gone), (0, 0, false));
         assert_eq!(v[0].upstream.as_deref(), Some("origin/main"));
-        assert_eq!(v[0].sha, "deadbeef");
+        assert_eq!(v[0].sha, "d".repeat(40));
         assert_eq!(v[0].date, 42);
         assert_eq!(v[0].subject, "subject");
         assert_eq!((v[1].ahead, v[1].behind), (1, 0));
@@ -421,7 +583,7 @@ mod tests {
             branch_row("*", "release-1.2.x", "origin/release-1.2.x", "[ahead 3]"),
         ]
         .join("\n");
-        let v = parse_branches(&out);
+        let v = parse_branches(&out).unwrap();
         assert_eq!(v[0].name, "feature/deep/dotted.name");
         assert_eq!(v[0].upstream, None);
         assert!(!v[0].upstream_gone);
@@ -432,10 +594,20 @@ mod tests {
 
     #[test]
     fn branches_empty_and_malformed() {
-        assert_eq!(parse_branches(""), Vec::<BranchInfo>::new());
-        // Too few fields / bad date → dropped.
+        assert_eq!(parse_branches("").unwrap(), Vec::<BranchInfo>::new());
+        // Too few fields / bad date fail the entire parse.
         let out = format!("*{US}only-two\n{}", branch_row(" ", "x", "", "")).replace("42", "NaN");
-        assert_eq!(parse_branches(&out), Vec::<BranchInfo>::new());
+        assert!(parse_branches(&out).is_err());
+        assert!(parse_branches(&branch_row(" ", "x", "", "").replace("42", "NaN")).is_err());
+        assert!(parse_branches(&branch_row(" ", "x", "", "[ahead many]")).is_err());
+        assert!(
+            parse_branches(&format!(
+                "{}\n{}",
+                branch_row(" ", "same", "", ""),
+                branch_row(" ", "same", "", "")
+            ))
+            .is_err()
+        );
     }
 
     // --- parse_stashes ---
@@ -443,40 +615,84 @@ mod tests {
     #[test]
     fn stashes_indices_and_messy_messages() {
         let out = [
-            format!("stash@{{0}}{US}s0{US}10{US}WIP on main: abc123 fix: thing {{x}}"),
-            format!("stash@{{1}}{US}s1{US}20{US}On feat: msg: with: colons"),
-            format!("stash@{{2}}{US}s2{US}30{US}plain"),
+            format!(
+                "stash@{{0}}{US}{}{US}10{US}WIP on main: abc123 fix: thing {{x}}",
+                "a".repeat(40)
+            ),
+            format!(
+                "stash@{{1}}{US}{}{US}20{US}On feat: msg: with: colons",
+                "b".repeat(40)
+            ),
+            format!("stash@{{2}}{US}{}{US}30{US}plain", "c".repeat(40)),
         ]
         .join("\n");
-        let v = parse_stashes(&out);
+        let v = parse_stashes(&out).unwrap();
         assert_eq!(v.len(), 3);
         assert_eq!(v[0].index, 0);
         assert_eq!(v[0].message, "WIP on main: abc123 fix: thing {x}");
         assert_eq!(v[1].index, 1);
         assert_eq!(v[1].message, "On feat: msg: with: colons");
         assert_eq!((v[2].index, v[2].date), (2, 30));
-        assert_eq!(v[2].sha, "s2");
+        assert_eq!(v[2].sha, "c".repeat(40));
     }
 
     #[test]
     fn stashes_empty_and_malformed() {
-        assert_eq!(parse_stashes(""), Vec::<StashEntry>::new());
-        let out = format!("not-a-selector{US}s{US}1{US}m\nstash@{{x}}{US}s{US}1{US}m");
-        assert_eq!(parse_stashes(&out), Vec::<StashEntry>::new());
+        assert_eq!(parse_stashes("").unwrap(), Vec::<StashEntry>::new());
+        let out = format!(
+            "not-a-selector{US}{}{US}1{US}m\nstash@{{x}}{US}{}{US}1{US}m",
+            "a".repeat(40),
+            "b".repeat(40)
+        );
+        assert!(parse_stashes(&out).is_err());
+        assert!(parse_stashes(&format!("stash@{{0}}{US}{}{US}bad{US}m", "a".repeat(40))).is_err());
+        assert!(
+            parse_stashes(&format!(
+                "stash@{{0}}{US}{}{US}1{US}a\nstash@{{0}}{US}{}{US}2{US}b",
+                "a".repeat(40),
+                "b".repeat(40)
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_stashes(&format!(
+                "stash@{{0}}{US}{}{US}1{US}a\nstash@{{1}}{US}{}{US}2{US}b",
+                "bad",
+                "b".repeat(40)
+            ))
+            .is_err()
+        );
     }
 
     // --- parse_tags ---
 
     #[test]
     fn tags_annotated_vs_lightweight() {
-        let out = format!("v1.0{US}t1{US}tag\nv1.1{US}c1{US}commit\nbad-line");
-        let v = parse_tags(&out);
+        let out = format!(
+            "v1.0{US}{}{US}tag\nv1.1{US}{}{US}commit",
+            "a".repeat(40),
+            "b".repeat(40)
+        );
+        let v = parse_tags(&out).unwrap();
         assert_eq!(v.len(), 2);
         assert!(v[0].annotated);
-        assert_eq!((v[0].name.as_str(), v[0].sha.as_str()), ("v1.0", "t1"));
+        assert_eq!(
+            (v[0].name.as_str(), v[0].sha.as_str()),
+            ("v1.0", "a".repeat(40).as_str())
+        );
         assert!(!v[1].annotated);
         assert_eq!(v[1].name, "v1.1");
-        assert_eq!(parse_tags(""), Vec::<TagInfo>::new());
+        assert_eq!(parse_tags("").unwrap(), Vec::<TagInfo>::new());
+        assert!(parse_tags(&format!("{out}\nbad-line")).is_err());
+        assert!(
+            parse_tags(&format!(
+                "v1{US}{}{US}commit\nv1{US}{}{US}commit",
+                "a".repeat(40),
+                "b".repeat(40)
+            ))
+            .is_err()
+        );
+        assert!(parse_tags(&format!("v1{US}a{US}commit\nv1{US}b{US}commit")).is_err());
     }
 
     // --- parse_bisect / find_culprit ---
