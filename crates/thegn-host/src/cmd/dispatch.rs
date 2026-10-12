@@ -602,7 +602,7 @@ fn read_chunk_file(worktree: &str, chunk_path: &str) -> std::io::Result<String> 
     {
         return Err(invalid());
     }
-    let mut file = thegn_core::fsperm::open_regular_file_nofollow(&resolved)?;
+    let file = thegn_core::fsperm::open_regular_file_nofollow(&resolved)?;
     let mut bytes = Vec::new();
     file.take(MAX_CHUNK_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_CHUNK_BYTES {
