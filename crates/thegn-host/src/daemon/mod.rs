@@ -1134,6 +1134,34 @@ mod tests {
 
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
+
+        // The real Unix app merges the HTTP router with tonic's router. Its
+        // fallback returns HTTP 200 with an empty gRPC response for an
+        // unknown path, so an older daemon reports a protocol parse error,
+        // not an HTTP 404.
+        let legacy_socket = temp.path().join("legacy-daemon.sock");
+        let legacy_listener = thegn_svc::ipc::IpcListener::Unix(
+            tokio::net::UnixListener::bind(&legacy_socket).unwrap(),
+        );
+        let legacy_app =
+            axum::Router::new().merge(tonic::service::Routes::default().into_axum_router());
+        let legacy_server = tokio::spawn(async move {
+            axum::serve(
+                legacy_listener,
+                legacy_app.into_make_service_with_connect_info::<thegn_svc::ipc::IpcConnectInfo>(),
+            )
+            .await
+            .unwrap();
+        });
+        let legacy_client = ControlClient::new(ControlAddr::Unix(legacy_socket));
+
+        assert_eq!(
+            client::check_daemon_scope(&legacy_client, &["v1-aaa".into()]).await,
+            client::ScopeCheck::Unknown
+        );
+
+        legacy_server.abort();
+        assert!(legacy_server.await.unwrap_err().is_cancelled());
     }
 
     #[cfg(unix)]

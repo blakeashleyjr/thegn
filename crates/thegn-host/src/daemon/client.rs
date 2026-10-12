@@ -48,6 +48,21 @@ fn classify_scope_reply(reply: Result<Value>, expected: &[String]) -> ScopeCheck
             {
                 return ScopeCheck::Unknown;
             }
+            if error
+                .downcast_ref::<thegn_svc::control::client::ControlProtocolError>()
+                .is_some_and(|protocol| {
+                    matches!(
+                        protocol,
+                        thegn_svc::control::client::ControlProtocolError::EmptySuccessBody
+                            | thegn_svc::control::client::ControlProtocolError::MissingJsonContentType
+                    )
+                })
+            {
+                // A pre-route Unix daemon includes tonic's gRPC fallback,
+                // which answers unknown paths with HTTP 200 and an empty,
+                // non-JSON body rather than an HTTP 404.
+                return ScopeCheck::Unknown;
+            }
             return ScopeCheck::NotOurs;
         }
     };
@@ -62,7 +77,15 @@ fn classify_scope_reply(reply: Result<Value>, expected: &[String]) -> ScopeCheck
 }
 
 pub(super) async fn check_daemon_scope(client: &ControlClient, expected: &[String]) -> ScopeCheck {
-    let result = client.call_raw("GET", super::SCOPE_PATH, None).await;
+    let result = match tokio::time::timeout(
+        Duration::from_secs(5),
+        client.call_raw("GET", super::SCOPE_PATH, None),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => return ScopeCheck::NotOurs,
+    };
     let check = classify_scope_reply(result, expected);
     if check == ScopeCheck::Unknown {
         tracing::debug!(target: "thegn::daemon", "daemon has no scope endpoint; accepting legacy daemon");
@@ -741,6 +764,33 @@ mod tests {
             classify_scope_reply(
                 Err(anyhow::Error::new(
                     thegn_svc::control::client::ControlRequestError::new(500, ""),
+                )),
+                &expected
+            ),
+            ScopeCheck::NotOurs
+        );
+        assert_eq!(
+            classify_scope_reply(
+                Err(anyhow::Error::new(
+                    thegn_svc::control::client::ControlProtocolError::EmptySuccessBody,
+                )),
+                &expected
+            ),
+            ScopeCheck::Unknown
+        );
+        assert_eq!(
+            classify_scope_reply(
+                Err(anyhow::Error::new(
+                    thegn_svc::control::client::ControlProtocolError::MissingJsonContentType,
+                )),
+                &expected
+            ),
+            ScopeCheck::Unknown
+        );
+        assert_eq!(
+            classify_scope_reply(
+                Err(anyhow::Error::new(
+                    thegn_svc::control::client::ControlProtocolError::InvalidJson,
                 )),
                 &expected
             ),
