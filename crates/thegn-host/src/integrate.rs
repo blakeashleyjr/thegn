@@ -1219,9 +1219,7 @@ fn bisect_offender(
             return Ok(None);
         };
         let verdict = diagnosed_gate(repo_root, base, cfg, "base", diagnostics, &adapter.history);
-        budget
-            .base_verdicts
-            .insert(base.to_owned(), verdict.clone());
+        budget.remember_base_verdict(base, &verdict);
         verdict
     };
     match base_verdict {
@@ -1293,6 +1291,12 @@ impl DiagnosisBudget {
         }
         self.gates_left -= 1;
         Some(())
+    }
+
+    fn remember_base_verdict(&mut self, base: &str, verdict: &GateVerdict) {
+        if matches!(verdict, GateVerdict::Passed | GateVerdict::Failed { .. }) {
+            self.base_verdicts.insert(base.to_owned(), verdict.clone());
+        }
     }
 
     fn record_exhaustion(&mut self, diagnostics: &mut String) {
@@ -3605,6 +3609,27 @@ mod tests {
         assert_eq!(result, None, "budget exhaustion must blame no branch");
         assert_eq!(std::fs::read_to_string(counter).unwrap().len(), 2);
         assert!(diagnostics.contains("[diagnosis] failure not localized within budget"));
+    }
+
+    #[test]
+    fn base_gate_errors_are_not_cached_but_determinate_verdicts_are() {
+        let mut budget = DiagnosisBudget::new(DIAGNOSIS_GATE_LIMIT, DIAGNOSIS_TIME_LIMIT);
+        let base = "base-oid";
+        let error = GateVerdict::Error {
+            reason: "gate capture unavailable".into(),
+            log: String::new(),
+        };
+
+        budget.remember_base_verdict(base, &error);
+        assert!(!budget.base_verdicts.contains_key(base));
+
+        let passed = GateVerdict::Passed;
+        budget.remember_base_verdict(base, &passed);
+        assert_eq!(budget.base_verdicts.get(base), Some(&passed));
+
+        let failed = GateVerdict::Failed { log: "red".into() };
+        budget.remember_base_verdict(base, &failed);
+        assert_eq!(budget.base_verdicts.get(base), Some(&failed));
     }
 
     #[test]
