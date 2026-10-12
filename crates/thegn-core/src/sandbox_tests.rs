@@ -2380,7 +2380,11 @@ fn secret_env_file_tightens_owned_group_writable_state_directory() {
         "GH_TOKEN=canary-secret\n"
     );
     assert_eq!(
-        std::fs::metadata(intermediate).unwrap().mode() & 0o777,
+        std::fs::metadata(intermediate)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
         0o755
     );
 }
