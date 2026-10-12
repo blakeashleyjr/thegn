@@ -539,14 +539,19 @@ mod tests {
             .await
             .unwrap();
         first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert_eq!(TEST_SLOT.available_permits(), 0);
 
         let second_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let second_started_in_job = second_started.clone();
-        let second = tokio::spawn(admitted_blocking(&TEST_SLOT, move || {
+        let mut second = tokio::spawn(admitted_blocking(&TEST_SLOT, move || {
             second_started_in_job.store(true, Ordering::SeqCst);
         }));
-        tokio::task::yield_now().await;
-        assert!(!second_started.load(Ordering::SeqCst));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second)
+                .await
+                .is_err()
+        );
         release_tx.send(()).unwrap();
         second.await.unwrap().unwrap();
         assert!(second_started.load(Ordering::SeqCst));
@@ -563,7 +568,12 @@ mod tests {
             replace_in_flight(&slot, handle);
         }
         tokio::task::yield_now().await;
-        assert!(previous.iter().all(tokio::task::AbortHandle::is_finished));
+        assert!(
+            previous[..previous.len() - 1]
+                .iter()
+                .all(tokio::task::AbortHandle::is_finished)
+        );
+        assert!(!previous.last().unwrap().is_finished());
         assert!(
             slot.lock()
                 .unwrap()
