@@ -7,7 +7,8 @@ standalone binary via the [`standalone::run`] harness.
 By default it depends on neither tokio, termwiz, nor `thegn-core`, so a
 standalone app links it without pulling in thegn's stack. The opt-in
 `host-presets` feature links `thegn-core` so every named `[theme] preset`
-resolves to the host's exact palette.
+resolves to the host's exact palette. Without `host-presets`, any non-Prism
+named preset resolves to Prism and reports `UnresolvedPreset`.
 
 ## What it provides
 
