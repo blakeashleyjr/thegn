@@ -20,8 +20,8 @@ use gtui_core::frame::{Field, FieldType, Frame};
 use thegn_metrics::{StatsSampler, StatsSnapshot};
 
 /// Bound host retention by time and memory: at 1 Hz, a full day is about 2.7 MiB
-/// of compact samples. The 24-hour window matches `embed.rs::adjust_window`'s
-/// maximum supported query range.
+/// of samples (about 4 MiB of deque capacity). The 24-hour window matches
+/// `embed.rs::adjust_window`'s maximum supported query range.
 const RING_CAP: usize = 86_400;
 const RETENTION_SECS: f64 = 86_400.0;
 
