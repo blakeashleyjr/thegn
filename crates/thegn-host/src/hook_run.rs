@@ -346,6 +346,7 @@ fn prune_logs_with(
     max_age_secs: u64,
     max_total_bytes: u64,
 ) {
+    let mut emptied_candidates = std::collections::HashSet::new();
     let Ok(root_meta) = std::fs::symlink_metadata(root) else {
         return;
     };
@@ -397,24 +398,33 @@ fn prune_logs_with(
             now_secs.max(0) as u64,
         );
         for name in remove {
-            if let Err(error) = std::fs::remove_file(path.join(name)) {
-                tracing::debug!(%error, "could not remove expired hook log");
+            let file_path = path.join(name);
+            match std::fs::remove_file(&file_path) {
+                Ok(()) => {
+                    emptied_candidates.insert(path.clone());
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "could not remove expired hook log");
+                }
             }
         }
     }
 
     let retained = collect_direct_logs(root);
     for path in plan_total_byte_prune(&retained, max_total_bytes) {
-        if let Err(error) = std::fs::remove_file(&path) {
-            tracing::debug!(%error, path = %path.display(), "could not remove hook log over total byte cap");
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    emptied_candidates.insert(parent.to_path_buf());
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, path = %path.display(), "could not remove hook log over total byte cap");
+            }
         }
     }
 
-    let Ok(slugs) = std::fs::read_dir(root) else {
-        return;
-    };
-    for slug in slugs.flatten() {
-        let path = slug.path();
+    for path in emptied_candidates {
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
@@ -868,7 +878,9 @@ mod tests {
         ];
         for (path, modified_secs) in &logs {
             std::fs::write(path, b"0123456789").unwrap();
-            std::fs::File::open(path)
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
                 .unwrap()
                 .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(*modified_secs))
                 .unwrap();
@@ -889,6 +901,21 @@ mod tests {
             .map(|log| log.bytes)
             .sum();
         assert!(total_bytes <= 35);
+    }
+
+    #[test]
+    fn prune_logs_removes_only_slug_directories_emptied_by_this_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let emptied = dir.path().join("emptied");
+        let already_empty = dir.path().join("already-empty");
+        std::fs::create_dir_all(&emptied).unwrap();
+        std::fs::create_dir_all(&already_empty).unwrap();
+        std::fs::write(emptied.join("old.log"), b"log").unwrap();
+
+        prune_logs_with(dir.path(), 200, 20, 14 * 86_400, 0);
+
+        assert!(!emptied.exists());
+        assert!(already_empty.is_dir());
     }
 
     #[test]
