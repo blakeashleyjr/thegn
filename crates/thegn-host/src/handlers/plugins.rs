@@ -159,8 +159,15 @@ fn host_verb_check(spec: &PluginSpec, verb: HostVerb) -> Result<(), RpcError> {
 /// Apply the pure scope decision and record it in the plugin runtime's audit
 /// stream before any control dispatch. Both successful and denied calls use
 /// this path, including unknown or deliberately unexposed capabilities.
-fn authorize_host_call(entry: &mut PluginEntry, cap: &str) -> Result<(), RpcError> {
+fn authorize_host_call(
+    entry: &mut PluginEntry,
+    cap: &str,
+    params: &serde_json::Value,
+) -> Result<(), RpcError> {
     let result = host_call_check(&entry.plugin.spec, cap);
+    let target = (cap == "merge.add")
+        .then(|| params.get("worktree").and_then(serde_json::Value::as_str))
+        .flatten();
     entry.runtime.record_host_call_decision(
         entry.plugin.spec.manifest.id.clone(),
         cap,
@@ -169,6 +176,7 @@ fn authorize_host_call(entry: &mut PluginEntry, cap: &str) -> Result<(), RpcErro
         } else {
             AuditDecision::Denied
         },
+        target,
     );
     result
 }
@@ -496,6 +504,7 @@ pub(crate) fn drain(
                 match writer {
                     Some(w) => {
                         let entry = state.plugins.get_mut(&plugin).expect("checked above");
+                        entry.runtime.begin_generation();
                         entry.feed_bridge = None;
                         if entry
                             .contributions
@@ -867,16 +876,16 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
         );
         return PluginDamage::None;
     };
-    if let Err(e) = authorize_host_call(entry, &cap) {
-        tracing::debug!(target: "thegn::plugin", plugin = %plugin, cap = %cap, error = %e.message, "host.call denied");
-        respond(entry, RpcResponse::err(id, e));
-        return PluginDamage::None;
-    }
     let params = msg
         .params
         .get("params")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    if let Err(e) = authorize_host_call(entry, &cap, &params) {
+        tracing::debug!(target: "thegn::plugin", plugin = %plugin, cap = %cap, error = %e.message, "host.call denied");
+        respond(entry, RpcResponse::err(id, e));
+        return PluginDamage::None;
+    }
     // The event feed is a stream, not a request/response: `events.subscribe`
     // starts an off-loop bridge that forwards feed frames as `on_event`
     // notifications, and the host.call itself is acknowledged immediately.
@@ -1691,12 +1700,14 @@ mod tests {
         let err = host_call_check(&bare, "sessions.list").unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Denied);
         let mut entry = build_entry(loaded_state(bare.clone()));
-        let err = authorize_host_call(&mut entry, "sessions.list").unwrap_err();
+        let err =
+            authorize_host_call(&mut entry, "sessions.list", &serde_json::Value::Null).unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Denied);
         let audit = entry.runtime.audit_log().last().unwrap();
         assert_eq!(audit.decision, AuditDecision::Denied);
         assert_eq!(audit.operation, "host.call");
         assert_eq!(audit.capability.as_str(), "host:sessions.list");
+        assert_eq!(audit.target, None);
         // Read scope → every read-verb plugin cap passes the scope check.
         let read = spec("p", Vec::new(), vec![Scope::Read]);
         for cap in thegn_core::plugin_api::plugin_host_call_caps() {
@@ -1734,6 +1745,34 @@ mod tests {
             let err = host_call_check(&admin, cap).unwrap_err();
             assert_eq!(err.code, RpcErrorCode::Unsupported, "{cap}");
         }
+    }
+
+    #[test]
+    fn merge_add_audit_records_only_its_worktree_target_for_allowed_and_denied_calls() {
+        let target = serde_json::json!({ "worktree": "wt-a" });
+        let git = spec("p", Vec::new(), vec![Scope::Git]);
+        let mut allowed = build_entry(loaded_state(git));
+        authorize_host_call(&mut allowed, "merge.add", &target).unwrap();
+        let audit = allowed.runtime.audit_log().last().unwrap();
+        assert_eq!(audit.decision, AuditDecision::Granted);
+        assert_eq!(audit.target.as_deref(), Some("wt-a"));
+
+        let bare = seg_spec("p");
+        let mut denied = build_entry(loaded_state(bare));
+        assert!(authorize_host_call(&mut denied, "merge.add", &target).is_err());
+        let audit = denied.runtime.audit_log().last().unwrap();
+        assert_eq!(audit.decision, AuditDecision::Denied);
+        assert_eq!(audit.target.as_deref(), Some("wt-a"));
+
+        let read = spec("p", Vec::new(), vec![Scope::Read]);
+        let mut unrelated = build_entry(loaded_state(read));
+        authorize_host_call(
+            &mut unrelated,
+            "sessions.list",
+            &serde_json::json!({ "secret": "must-not-be-copied" }),
+        )
+        .unwrap();
+        assert_eq!(unrelated.runtime.audit_log().last().unwrap().target, None);
     }
 
     #[test]

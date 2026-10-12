@@ -38,6 +38,7 @@ pub struct IcsBackend {
 enum ReadFailure {
     Io(std::io::Error),
     Admission(AdmissionError),
+    Document,
 }
 
 impl IcsBackend {
@@ -103,7 +104,8 @@ impl IcsBackend {
                     ))),
                     Ok(text) => {
                         check_deadline(deadline).map_err(ReadFailure::Io)?;
-                        thegn_core::calendar::ics::parse_ics_window_checked(
+                        let mut report = thegn_core::calendar::ics::IcsReport::default();
+                        thegn_core::calendar::ics::parse_ics_window_reported(
                             &text,
                             zone,
                             Some(window),
@@ -114,10 +116,15 @@ impl IcsBackend {
                                     AdmissionError::new(AdmissionLimit::SourceDeadline)
                                 })
                             },
+                            &mut report,
                         )
                         .map_err(ReadFailure::Admission)?;
-                        check_deadline(deadline).map_err(ReadFailure::Io)?;
-                        Ok(count)
+                        if report.is_document_failure() {
+                            Err(ReadFailure::Document)
+                        } else {
+                            check_deadline(deadline).map_err(ReadFailure::Io)?;
+                            Ok(count)
+                        }
                     }
                 }
             }
@@ -150,6 +157,12 @@ impl IcsBackend {
                     return Err(CalendarError::Io(format!("{}: {e}", self.path)));
                 }
                 Err(ReadFailure::Admission(e)) => return Err(e.into()),
+                Err(ReadFailure::Document) => {
+                    return Err(CalendarError::Parse(format!(
+                        "{}: calendar document is incomplete or structurally malformed",
+                        self.path
+                    )));
+                }
             }
             return EventPage::from_meter(
                 meter,
@@ -221,6 +234,12 @@ impl IcsBackend {
                     return Err(CalendarError::Io(format!("{}: {e}", path.display())));
                 }
                 Err(ReadFailure::Admission(e)) => return Err(e.into()),
+                Err(ReadFailure::Document) => {
+                    return Err(CalendarError::Parse(format!(
+                        "{}: calendar document is incomplete or structurally malformed",
+                        path.display()
+                    )));
+                }
             }
         }
         EventPage::from_meter(meter, PageMode::Snapshot, out, Vec::new(), String::new())

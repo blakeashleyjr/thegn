@@ -1787,6 +1787,22 @@ fn an_ics_file_is_parsed() {
     assert_eq!(page.events()[0].title, "Standup");
 }
 
+#[test]
+fn a_truncated_ics_file_fails_the_whole_account() {
+    let t = Tmp::new("ics-truncated");
+    let path = t.0.join("calendar.ics");
+    std::fs::write(
+        &path,
+        "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:partial\nDTSTART:20260821T090000Z\n",
+    )
+    .unwrap();
+    let (from, to) = window();
+    let err =
+        block_on(ics_backend(&path.display().to_string()).list_events(from, to, "")).unwrap_err();
+    assert!(matches!(err, CalendarError::Parse(_)), "{err:?}");
+    assert!(err.to_string().contains(&path.display().to_string()));
+}
+
 #[cfg(unix)]
 #[test]
 fn local_ics_symlinks_are_refused_as_incomplete_sources() {
@@ -2584,6 +2600,46 @@ async fn a_remote_feed_over_the_budget_never_advances_its_etag() {
     assert!(page.reserved().1 < 1 << 20);
     drop(page);
     assert_eq!(pool.in_use(), (0, 0));
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_structurally_failed_remote_ics_feed_is_not_a_snapshot() {
+    let truncated = ics_feed(2).replace(
+        "END:VCALENDAR\r\n",
+        "BEGIN:VEVENT\r\nUID:cut\r\nDTSTART:20260821T090000Z\r\n",
+    );
+    let mismatched = ics_feed(2).replace("END:VEVENT\r\n", "END:VTODO\r\n");
+    let (from, to) = window();
+
+    for body in [truncated, mismatched] {
+        let (address, _hits, server) =
+            serve_fixed(axum::http::StatusCode::OK, "text/calendar", body).await;
+        let backend = ics_url::IcsUrlBackend::new(
+            &CalendarAccount {
+                url: format!("http://{address}/feed.ics"),
+                allow_private_network: true,
+                ..account("r", CalendarProviderKind::IcsUrl)
+            },
+            adm(),
+        );
+        let error = backend.list_events(from, to, "").await.unwrap_err();
+        assert!(matches!(error, CalendarError::Parse(_)), "{error:?}");
+        server.abort();
+    }
+
+    let (address, _hits, server) =
+        serve_fixed(axum::http::StatusCode::OK, "text/calendar", ics_feed(2)).await;
+    let backend = ics_url::IcsUrlBackend::new(
+        &CalendarAccount {
+            url: format!("http://{address}/feed.ics"),
+            allow_private_network: true,
+            ..account("r", CalendarProviderKind::IcsUrl)
+        },
+        adm(),
+    );
+    let page = backend.list_events(from, to, "").await.unwrap();
+    assert_eq!(page.events().len(), 2);
     server.abort();
 }
 

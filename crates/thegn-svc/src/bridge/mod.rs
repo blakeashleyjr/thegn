@@ -20,7 +20,9 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, TrySendError, channel, sync_channel};
+use std::sync::mpsc::{
+    Receiver, Sender, SyncSender, TryRecvError, TrySendError, channel, sync_channel,
+};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -33,6 +35,8 @@ use thegn_core::remote::GitLoc;
 const MAX_BRIDGE_WORK: usize = 8;
 /// Bounded FIFO for short bursts that arrive while all workers are occupied.
 const MAX_QUEUED_BRIDGE_WORK: usize = 32;
+/// Maximum time a bridge RPC may wait behind active work (matches the default read timeout).
+const MAX_QUEUED_WAIT: Duration = Duration::from_secs(20);
 /// Per-stream capture ceiling. Readers continue draining after this limit.
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 /// Worst-case JSON escaping expands captured control bytes sixfold. Five
@@ -43,6 +47,8 @@ const MAX_ARGV_ITEMS: usize = 256;
 const MAX_ARGV_BYTES: usize = 256 * 1024;
 const MAX_ENV_PAIRS: usize = 128;
 const MAX_ENV_BYTES: usize = 64 * 1024;
+/// Per-process client backlog: 256 × 8 KiB output chunks (about 2 MiB).
+const PROC_EVENT_DEPTH: usize = 256;
 /// Stateful notification producers are bounded per connection.
 #[cfg(not(test))]
 const MAX_WATCHERS_PER_CONNECTION: usize = 16;
@@ -54,7 +60,9 @@ type BridgeWork = Box<dyn FnOnce() + Send + 'static>;
 
 struct AdmissionJob {
     cancel: Arc<AtomicBool>,
+    queued_at: Instant,
     work: BridgeWork,
+    on_expire: Box<dyn FnOnce() + Send + 'static>,
 }
 
 #[derive(Default)]
@@ -63,10 +71,20 @@ struct AdmissionQueue {
     jobs: VecDeque<AdmissionJob>,
 }
 
-#[derive(Default)]
 struct AdmissionLimiter {
     active: std::sync::atomic::AtomicUsize,
     queue: Mutex<AdmissionQueue>,
+    queue_wait: Duration,
+}
+
+impl Default for AdmissionLimiter {
+    fn default() -> Self {
+        Self {
+            active: std::sync::atomic::AtomicUsize::default(),
+            queue: Mutex::new(AdmissionQueue::default()),
+            queue_wait: MAX_QUEUED_WAIT,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -76,15 +94,27 @@ enum AdmissionError {
 }
 
 impl AdmissionLimiter {
+    #[cfg(test)]
     fn submit(
         self: &Arc<Self>,
         cancel: Arc<AtomicBool>,
         work: impl FnOnce() + Send + 'static,
     ) -> std::result::Result<(), AdmissionError> {
+        self.submit_expiring(cancel, work, || {})
+    }
+
+    fn submit_expiring(
+        self: &Arc<Self>,
+        cancel: Arc<AtomicBool>,
+        work: impl FnOnce() + Send + 'static,
+        on_expire: impl FnOnce() + Send + 'static,
+    ) -> std::result::Result<(), AdmissionError> {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         let job = AdmissionJob {
             cancel,
+            queued_at: Instant::now(),
             work: Box::new(work),
+            on_expire: Box::new(on_expire),
         };
         if queue.active >= MAX_BRIDGE_WORK {
             if queue.jobs.len() >= MAX_QUEUED_BRIDGE_WORK {
@@ -111,17 +141,23 @@ impl AdmissionLimiter {
     }
 
     fn run_worker(limiter: Arc<Self>, first: AdmissionJob) {
-        let mut next = Some(first);
+        let mut next = Some((first, false));
         loop {
-            if let Some(job) = next.take()
+            if let Some((job, was_queued)) = next.take()
                 && !job.cancel.load(Ordering::Acquire)
-                && std::panic::catch_unwind(std::panic::AssertUnwindSafe(job.work)).is_err()
             {
-                tracing::error!(target: "thegn::bridge", "bridge RPC worker panicked");
+                let callback = if was_queued && job.queued_at.elapsed() > limiter.queue_wait {
+                    job.on_expire
+                } else {
+                    job.work
+                };
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)).is_err() {
+                    tracing::error!(target: "thegn::bridge", "bridge RPC worker panicked");
+                }
             }
             let mut queue = limiter.queue.lock().unwrap_or_else(PoisonError::into_inner);
             match queue.jobs.pop_front() {
-                Some(job) => next = Some(job),
+                Some(job) => next = Some((job, true)),
                 None => {
                     queue.active -= 1;
                     limiter.active.fetch_sub(1, Ordering::AcqRel);
@@ -142,6 +178,14 @@ impl AdmissionLimiter {
         queue.active += 1;
         self.active.fetch_add(1, Ordering::AcqRel);
         Some(AdmissionPermit(self.clone()))
+    }
+
+    #[cfg(test)]
+    fn with_queue_wait(queue_wait: Duration) -> Self {
+        Self {
+            queue_wait,
+            ..Self::default()
+        }
     }
 }
 
@@ -411,7 +455,7 @@ type Pending = Arc<Mutex<HashMap<u64, Sender<std::result::Result<serde_json::Val
 /// Active `fs.watch` subscriptions: watch_id → the channel delivering its events.
 type Subs = Arc<Mutex<HashMap<u64, Sender<FsEvent>>>>;
 /// Active streaming-process channels: chan → the channel delivering its events.
-type Procs = Arc<Mutex<HashMap<u64, Sender<ProcEvent>>>>;
+type Procs = Arc<Mutex<HashMap<u64, SyncSender<ProcEvent>>>>;
 
 /// The host side of the bridge: spawn-over-transport happens by the caller (it
 /// hands us the connected stream's reader+writer), then `exec()` issues blocking
@@ -749,14 +793,16 @@ impl BridgeClient {
     /// channel id and a receiver of [`ProcEvent`]s (output chunks + exit); feed
     /// its stdin with [`proc_stdin`](Self::proc_stdin), end it with
     /// [`proc_kill`](Self::proc_kill). Events flow until the process exits or the
-    /// connection drops.
+    /// connection drops. The output backlog is bounded; `Disconnected` without
+    /// an `Exit` means the backlog overflowed, and the caller should stop the
+    /// remote process with [`proc_kill`](Self::proc_kill).
     pub fn spawn_proc(
         &self,
         argv: &[&str],
         cwd: Option<&str>,
         env: &[(String, String)],
     ) -> Result<(u64, Receiver<ProcEvent>)> {
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(PROC_EVENT_DEPTH);
         let chan = self.next_chan.fetch_add(1, Ordering::SeqCst);
         // Register before the request so early output can't race the insert.
         self.procs.lock().unwrap().insert(chan, tx);
@@ -907,7 +953,9 @@ fn fail_all(pending: &Pending, subs: &Subs, procs: &Procs, closed: &AtomicBool) 
         }
     }
     for (_, tx) in procs.lock().unwrap_or_else(PoisonError::into_inner).drain() {
-        let _ = tx.send(ProcEvent::Exit { code: -1 }); // best-effort: shutdown, receivers may be gone
+        if let Err(error) = tx.try_send(ProcEvent::Exit { code: -1 }) {
+            tracing::debug!(target: "thegn::bridge", %error, "could not deliver proc.exit during shutdown");
+        }
     }
     // Dropping the Senders disconnects each fs.watch receiver's `recv()`.
     subs.lock().unwrap_or_else(PoisonError::into_inner).clear();
@@ -1045,12 +1093,24 @@ fn reader_loop(
                         // the stream alive.
                         match B64.decode(&note.data) {
                             Ok(data) => {
-                                if let Some(tx) = procs.lock().unwrap().get(&note.chan) {
-                                    let _ = tx.send(ProcEvent::Out {
-                                        // best-effort: subscriber may be gone
+                                let mut channels =
+                                    procs.lock().unwrap_or_else(PoisonError::into_inner);
+                                let send_result = channels.get(&note.chan).map(|tx| {
+                                    tx.try_send(ProcEvent::Out {
                                         stream: note.stream,
                                         data,
-                                    });
+                                    })
+                                });
+                                match send_result {
+                                    Some(Ok(())) | None => {}
+                                    Some(Err(TrySendError::Full(_))) => {
+                                        channels.remove(&note.chan);
+                                        tracing::warn!(target: "thegn::bridge", chan = note.chan, "proc.out backlog full; dropping subscription");
+                                    }
+                                    Some(Err(TrySendError::Disconnected(_))) => {
+                                        channels.remove(&note.chan);
+                                        tracing::debug!(target: "thegn::bridge", chan = note.chan, "proc.out subscriber disconnected");
+                                    }
                                 }
                             }
                             Err(e) => tracing::warn!(
@@ -1068,8 +1128,13 @@ fn reader_loop(
                         .and_then(|p| serde_json::from_value::<ProcExitNote>(p).ok())
                     {
                         // Final event, then drop the sub so the receiver ends.
-                        if let Some(tx) = procs.lock().unwrap().remove(&note.chan) {
-                            let _ = tx.send(ProcEvent::Exit { code: note.code }); // best-effort: subscriber may be gone
+                        if let Some(tx) = procs
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .remove(&note.chan)
+                            && let Err(error) = tx.try_send(ProcEvent::Exit { code: note.code })
+                        {
+                            tracing::debug!(target: "thegn::bridge", chan = note.chan, %error, "could not deliver proc.exit");
                         }
                     }
                     continue;
@@ -1269,14 +1334,27 @@ pub fn serve(reader: impl Read, writer: impl Write + Send + 'static) {
                 "exec" | "exec.batch" | "proc.list" => {
                     let (w, worker_cancel) = (writer.clone(), cancel.clone());
                     let req_id = req.id;
-                    let result = bridge_admission().submit(worker_cancel.clone(), move || {
-                        let resp = match req.method.as_str() {
-                            "exec" => exec_response(&req, &worker_cancel),
-                            "exec.batch" => exec_batch_response(&req, &worker_cancel),
-                            _ => proc_response(&req),
-                        };
-                        write_frame(&w, &resp);
-                    });
+                    let expiry_writer = w.clone();
+                    let result = bridge_admission().submit_expiring(
+                        worker_cancel.clone(),
+                        move || {
+                            let resp = match req.method.as_str() {
+                                "exec" => exec_response(&req, &worker_cancel),
+                                "exec.batch" => exec_batch_response(&req, &worker_cancel),
+                                _ => proc_response(&req),
+                            };
+                            write_frame(&w, &resp);
+                        },
+                        move || {
+                            write_frame(
+                                &expiry_writer,
+                                &resp_err(
+                                    req_id,
+                                    "bridge busy: queued past admission deadline".into(),
+                                ),
+                            );
+                        },
+                    );
                     match result {
                         Ok(()) => {}
                         Err(AdmissionError::Busy) => write_frame(
@@ -2188,7 +2266,7 @@ mod tests {
         let pending: Pending = Arc::new(Mutex::new(HashMap::from([(7, request_tx)])));
         let (fs_tx, fs_rx) = std::sync::mpsc::channel();
         let subs: Subs = Arc::new(Mutex::new(HashMap::from([(1, fs_tx)])));
-        let (proc_tx, proc_rx) = std::sync::mpsc::channel();
+        let (proc_tx, proc_rx) = sync_channel(PROC_EVENT_DEPTH);
         let procs: Procs = Arc::new(Mutex::new(HashMap::from([(1, proc_tx)])));
         let closed = Arc::new(AtomicBool::new(false));
         let mut wire = vec![b'x'; framing::MAX_HEADER_BYTES];
@@ -2212,6 +2290,44 @@ mod tests {
         ));
         assert!(pending.lock().unwrap().is_empty());
         assert!(subs.lock().unwrap().is_empty());
+        assert!(procs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn proc_out_backlog_overflow_drops_subscription_without_blocking_reader() {
+        let (proc_tx, proc_rx) = sync_channel(PROC_EVENT_DEPTH);
+        let procs: Procs = Arc::new(Mutex::new(HashMap::from([(1, proc_tx)])));
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let subs: Subs = Arc::new(Mutex::new(HashMap::new()));
+        let closed = Arc::new(AtomicBool::new(false));
+        let body = serde_json::json!({
+            "method": "proc.out",
+            "params": {"chan": 1, "stream": "stdout", "data": B64.encode(b"x")}
+        })
+        .to_string();
+        let frame = framing::encode(&body);
+        let mut wire = Vec::new();
+        for _ in 0..PROC_EVENT_DEPTH + 50 {
+            wire.extend_from_slice(&frame);
+        }
+
+        reader_loop(
+            std::io::Cursor::new(wire),
+            pending,
+            subs,
+            procs.clone(),
+            closed,
+        );
+
+        let mut received = 0;
+        while let Ok(ProcEvent::Out { .. }) = proc_rx.try_recv() {
+            received += 1;
+        }
+        assert_eq!(received, PROC_EVENT_DEPTH);
+        assert!(matches!(
+            proc_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
         assert!(procs.lock().unwrap().is_empty());
     }
 
@@ -2948,7 +3064,7 @@ mod tests {
         });
         let sock = TcpStream::connect(addr).unwrap();
         let c = BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap();
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(PROC_EVENT_DEPTH);
         c.procs.lock().unwrap().insert(1, tx);
         go_tx.send(()).unwrap();
         // Only the valid frame arrives; the corrupt one was dropped.
@@ -2992,7 +3108,7 @@ mod tests {
         });
         let sock = TcpStream::connect(addr).unwrap();
         let c = BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap();
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(PROC_EVENT_DEPTH);
         c.procs.lock().unwrap().insert(1, tx);
         go_tx.send(()).unwrap();
         (c, rx)
@@ -3060,7 +3176,7 @@ mod tests {
         let c = BridgeClient::new(sock.try_clone().unwrap(), sock).unwrap();
         // Register a proc subscriber directly (no real proc.spawn round-trip; the
         // server here never answers).
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(PROC_EVENT_DEPTH);
         c.procs.lock().unwrap().insert(7, tx);
         let start = Instant::now();
         match rx.recv_timeout(Duration::from_secs(10)) {
@@ -3236,6 +3352,92 @@ mod tests {
         {
             std::thread::sleep(Duration::from_millis(5));
         }
+        assert_eq!(limiter.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn bridge_admission_expires_stale_queued_work_and_runs_fresh_work() {
+        let limiter = Arc::new(AdmissionLimiter::with_queue_wait(Duration::from_millis(50)));
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (started_tx, started_rx) = channel();
+        for _ in 0..MAX_BRIDGE_WORK {
+            let gate = gate.clone();
+            let started = started_tx.clone();
+            limiter
+                .submit(Arc::new(AtomicBool::new(false)), move || {
+                    started.send(()).unwrap();
+                    let (lock, cv) = &*gate;
+                    let open = lock.lock().unwrap();
+                    drop(cv.wait_while(open, |open| !*open).unwrap());
+                })
+                .unwrap();
+        }
+        for _ in 0..MAX_BRIDGE_WORK {
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_job = ran.clone();
+        let (expired_tx, expired_rx) = channel();
+        limiter
+            .submit_expiring(
+                Arc::new(AtomicBool::new(false)),
+                move || ran_job.store(true, Ordering::Release),
+                move || expired_tx.send(()).unwrap(),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        expired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let start = Instant::now();
+        while limiter.active.load(Ordering::Acquire) != 0
+            && start.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!ran.load(Ordering::Acquire));
+        assert_eq!(limiter.active.load(Ordering::Acquire), 0);
+
+        let limiter = Arc::new(AdmissionLimiter::with_queue_wait(Duration::from_secs(30)));
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (started_tx, started_rx) = channel();
+        for _ in 0..MAX_BRIDGE_WORK {
+            let gate = gate.clone();
+            let started = started_tx.clone();
+            limiter
+                .submit(Arc::new(AtomicBool::new(false)), move || {
+                    started.send(()).unwrap();
+                    let (lock, cv) = &*gate;
+                    let open = lock.lock().unwrap();
+                    drop(cv.wait_while(open, |open| !*open).unwrap());
+                })
+                .unwrap();
+        }
+        for _ in 0..MAX_BRIDGE_WORK {
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let (ran_tx, ran_rx) = channel();
+        let expired = Arc::new(AtomicBool::new(false));
+        let expired_job = expired.clone();
+        limiter
+            .submit_expiring(
+                Arc::new(AtomicBool::new(false)),
+                move || ran_tx.send(()).unwrap(),
+                move || expired_job.store(true, Ordering::Release),
+            )
+            .unwrap();
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        ran_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let start = Instant::now();
+        while limiter.active.load(Ordering::Acquire) != 0
+            && start.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!expired.load(Ordering::Acquire));
         assert_eq!(limiter.active.load(Ordering::Acquire), 0);
     }
 

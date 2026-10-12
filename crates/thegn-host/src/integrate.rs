@@ -30,8 +30,6 @@ use thegn_core::util;
 use thegn_svc::git::{CasOutcome, CliGit, GitBackend, MergeTreeOutcome, PlumbingOps};
 
 const DRIVER_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(600);
-const DIAGNOSIS_GATE_LIMIT: usize = 8;
-const DIAGNOSIS_TIME_LIMIT: Duration = Duration::from_secs(60 * 60);
 
 #[path = "integrate_candidates.rs"]
 mod candidates;
@@ -198,9 +196,9 @@ impl FoldGit for PlumbingAdapter {
         self.history
             .checked(|| match CliGit.merge_tree(&self.loc, ours, theirs)? {
                 MergeTreeOutcome::Clean { tree } => Ok(MergeOutcome::Clean { tree }),
-                MergeTreeOutcome::Conflict { paths, .. } => {
+                MergeTreeOutcome::Conflict { tree, paths } => {
                     let base = CliGit.merge_base(&self.loc, ours, theirs)?;
-                    Ok(self.resolve_conflict(base.as_deref(), ours, theirs, paths))
+                    Ok(self.resolve_conflict(base.as_deref(), ours, theirs, tree, paths))
                 }
             })
     }
@@ -268,11 +266,11 @@ impl PlumbingAdapter {
     ///
     /// 1. A conflict confined to regenerable artifacts (e.g. `Cargo.lock`) is
     ///    rebuilt via the throwaway-worktree path and landed.
-    /// 2. When a conflicted path is governed by a custom `.gitattributes
-    ///    merge=<driver>` — which the object-DB `merge-tree` may not honor — or
-    ///    when `rerere` is on, the branch is merged in a throwaway worktree where
-    ///    a real `git merge` runs the driver and rerere can auto-apply a recorded
-    ///    resolution. A clean result feeds the fold; anything else defers.
+    /// 2. When the plumbing merge reports a conflict on a path governed by a
+    ///    custom `.gitattributes merge=<driver>`, or when `rerere` is on, the
+    ///    branch is merged in a throwaway worktree where a real `git merge` runs
+    ///    the driver and rerere can auto-apply a recorded resolution. A clean
+    ///    result feeds the fold; anything else defers.
     ///
     /// Clean folds never reach here, so they pay none of this cost.
     fn resolve_conflict(
@@ -280,6 +278,7 @@ impl PlumbingAdapter {
         base: Option<&str>,
         ours: &str,
         theirs: &str,
+        conflict_tree: String,
         paths: Vec<String>,
     ) -> MergeOutcome {
         // A gitlink is an atomic pointer owned by the superproject. Partition it
@@ -317,6 +316,8 @@ impl PlumbingAdapter {
                 &self.repo_root,
                 ours,
                 theirs,
+                &conflict_tree,
+                &paths,
                 self.rerere,
                 DRIVER_SUBPROCESS_TIMEOUT,
             )
@@ -360,6 +361,8 @@ fn driver_merge(
     repo_root: &Path,
     ours: &str,
     theirs: &str,
+    conflict_tree: &str,
+    approved_paths: &[String],
     rerere: bool,
     timeout: Duration,
 ) -> Option<String> {
@@ -444,6 +447,13 @@ fn driver_merge(
         scratch.verify().ok()?;
         let tree = util::git_out(&tmp, &["write-tree"])?;
         let tree = tree.trim().to_string();
+        if !tree_changes_confined(&tmp, conflict_tree, &tree, approved_paths) {
+            warn_driver_merge_failure(
+                "driver/rerere merge changed paths outside the conflict set",
+                "written tree diff exceeded the approved conflict paths",
+            );
+            return None;
+        }
         (!tree.is_empty()).then_some(tree)
     })();
     if !preserve_scratch {
@@ -696,29 +706,7 @@ fn regenerate_merge(
         scratch.verify().ok()?;
         let tree = util::git_out(&tmp, &["write-tree"])?;
         let tree = tree.trim().to_string();
-        let diff = util::git_cmd(&tmp)
-            .args([
-                "diff-tree",
-                "--no-commit-id",
-                "--name-only",
-                "--no-renames",
-                "-r",
-                "-z",
-                &baseline_tree,
-                &tree,
-            ])
-            .output()
-            .ok()?;
-        if !diff.status.success() {
-            return None;
-        }
-        let approved: HashSet<&[u8]> = conflict_paths.iter().map(|path| path.as_bytes()).collect();
-        if diff
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-            .any(|path| !approved.contains(path))
-        {
+        if !tree_changes_confined(&tmp, &baseline_tree, &tree, conflict_paths) {
             return None;
         }
         (!tree.is_empty()).then_some(tree)
@@ -733,6 +721,36 @@ fn regenerate_merge(
         ));
     }
     tree
+}
+
+/// Return whether a tree diff is confined to the explicitly approved paths.
+/// Any invalid tree or failed Git probe rejects the result.
+#[expect(clippy::disallowed_methods)]
+fn tree_changes_confined(dir: &Path, baseline_tree: &str, tree: &str, approved: &[String]) -> bool {
+    let diff = util::git_cmd(dir)
+        .args([
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "--no-renames",
+            "-r",
+            "-z",
+            baseline_tree,
+            tree,
+        ])
+        .output();
+    let Ok(diff) = diff else {
+        return false;
+    };
+    if !diff.status.success() {
+        return false;
+    }
+    let approved: HashSet<&[u8]> = approved.iter().map(|path| path.as_bytes()).collect();
+    !diff
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .any(|path| !approved.contains(path))
 }
 
 /// What the test-gate decided about the folded tip.
@@ -1221,14 +1239,28 @@ fn bisect_offender(
         let Some(()) = budget.take_gate(diagnostics) else {
             return Ok(None);
         };
-        let verdict = diagnosed_gate(repo_root, base, cfg, "base", diagnostics, &adapter.history);
+        let verdict = diagnosed_gate(
+            repo_root,
+            base,
+            cfg,
+            "base",
+            diagnostics,
+            &adapter.history,
+            Some(budget),
+        );
         budget.remember_base_verdict(base, &verdict);
         verdict
     };
     match base_verdict {
         GateVerdict::Passed => {}
         GateVerdict::Failed { .. } => return Ok(None),
-        verdict @ GateVerdict::Error { .. } => return Err(BisectAborted(verdict).into()),
+        verdict @ GateVerdict::Error { .. } => {
+            if budget.deadline_reached() {
+                budget.record_exhaustion(diagnostics);
+                return Ok(None);
+            }
+            return Err(BisectAborted(verdict).into());
+        }
     }
     let mut prefix: Vec<Branch> = Vec::new();
     for branch in landed {
@@ -1253,13 +1285,20 @@ fn bisect_offender(
                 &format!("prefix {}", prefix.len()),
                 diagnostics,
                 &adapter.history,
+                Some(budget),
             );
             match verdict {
                 GateVerdict::Passed => {}
                 GateVerdict::Failed { .. } => return Ok(Some(branch.name.clone())),
                 // Environmental: identical at every prefix, so stop rather than
                 // blame this candidate for a missing binary.
-                v @ GateVerdict::Error { .. } => return Err(BisectAborted(v).into()),
+                v @ GateVerdict::Error { .. } => {
+                    if budget.deadline_reached() {
+                        budget.record_exhaustion(diagnostics);
+                        return Ok(None);
+                    }
+                    return Err(BisectAborted(v).into());
+                }
             }
         }
     }
@@ -1290,6 +1329,14 @@ impl DiagnosisBudget {
 
     fn exhausted(&self) -> bool {
         self.gates_left == 0 || Instant::now() >= self.deadline
+    }
+
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    fn deadline_reached(&self) -> bool {
+        self.remaining().is_zero()
     }
 
     fn take_gate(&mut self, diagnostics: &mut String) -> Option<()> {
@@ -1331,15 +1378,41 @@ fn diagnosed_gate(
     phase: &str,
     diagnostics: &mut String,
     history: &CanonicalHistory,
+    budget: Option<&DiagnosisBudget>,
 ) -> GateVerdict {
+    let bounded_cfg = budget.map_or_else(
+        || cfg.clone(),
+        |budget| MergeQueueConfig {
+            gate_timeout_secs: diagnosis_timeout(cfg.gate_timeout_secs, budget.remaining()),
+            gate_setup_timeout_secs: diagnosis_timeout(
+                cfg.gate_setup_timeout_secs,
+                budget.remaining(),
+            ),
+            ..cfg.clone()
+        },
+    );
     let verdict = history
-        .checked(|| gate_tip(repo_root, tip, cfg))
+        .checked(|| gate_tip(repo_root, tip, &bounded_cfg))
         .unwrap_or_else(|error| GateVerdict::Error {
             reason: "gate preparation unavailable".into(),
             log: tail(&format!("{error:#}"), 4000),
         });
     record_gate(diagnostics, phase, &verdict);
     verdict
+}
+
+/// Bound a gate phase by the remaining diagnosis budget. A configured zero
+/// means unbounded outside diagnosis, so the diagnosis budget supplies it.
+fn diagnosis_timeout(configured_secs: u64, remaining: Duration) -> u64 {
+    let remaining_secs = remaining
+        .as_secs()
+        .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+        .max(1);
+    if configured_secs == 0 {
+        remaining_secs
+    } else {
+        configured_secs.min(remaining_secs)
+    }
 }
 
 /// A bisect that stopped because the gate could not run. Carries the verdict so
@@ -1577,7 +1650,10 @@ fn run_fold_admitted(
     let mut gate_offenders: Vec<String> = Vec::new();
     let mut cas_attempts = 0u32;
     let mut diagnostics = String::new();
-    let mut diagnosis_budget = DiagnosisBudget::new(DIAGNOSIS_GATE_LIMIT, DIAGNOSIS_TIME_LIMIT);
+    let mut diagnosis_budget = DiagnosisBudget::new(
+        cfg.diagnosis_max_gates,
+        Duration::from_secs(cfg.diagnosis_timeout_secs),
+    );
 
     loop {
         if let Err(error) = adapter.history.revalidate() {
@@ -1677,6 +1753,7 @@ fn run_fold_admitted(
                 "union",
                 &mut diagnostics,
                 &adapter.history,
+                None,
             );
             record_gate_sources(&mut diagnostics, &base, &plan);
             // The gate could not run: report the environment and hold everything
@@ -2796,7 +2873,6 @@ mod tests {
             "printf x >> {}; printf stray > stray.txt; true %O %A %B %L %P",
             thegn_core::util::sh_quote(&counter.to_string_lossy()),
         );
-        git(&repo.dir, &["config", "merge.takeours.driver", &driver]);
         repo.commit(".gitattributes", "data.txt merge=takeours\n", "attrs");
         repo.commit("data.txt", "base\n", "seed");
         // Two textually-conflicting edits to the driver-governed file.
@@ -2805,9 +2881,18 @@ mod tests {
         git(&repo.dir, &["checkout", "-q", "main"]);
         repo.commit("data.txt", "main\n", "main edit");
 
-        // merge-tree conflicts (it does not run a custom *command* driver), so the
-        // fold routes the branch through a throwaway-worktree real merge where the
-        // driver runs → the branch LANDS instead of deferring.
+        let ours = repo.out(&["rev-parse", "main"]);
+        let theirs = repo.out(&["rev-parse", "feat"]);
+        assert!(matches!(
+            CliGit
+                .merge_tree(&GitLoc::Local(repo.dir.clone()), &ours, &theirs)
+                .unwrap(),
+            MergeTreeOutcome::Conflict { .. }
+        ));
+        git(&repo.dir, &["config", "merge.takeours.driver", &driver]);
+
+        // The fold routes the conflict through a throwaway-worktree real merge,
+        // where the custom driver runs and the branch lands instead of deferring.
         let report = run_fold(&cfg(""), &repo.dir, repo.branch_set()).unwrap();
         assert!(report.advanced, "{report:?}");
         assert_eq!(report.landed.len(), 1, "driver-resolved branch should land");
@@ -2824,21 +2909,177 @@ mod tests {
     }
 
     #[test]
+    fn tree_change_confinement_requires_successful_approved_diff() {
+        let repo = Repo::new("tree-confinement");
+        let baseline = repo.out(&["rev-parse", "HEAD^{tree}"]);
+        repo.commit("approved.txt", "approved\n", "approved change");
+        let approved_tree = repo.out(&["rev-parse", "HEAD^{tree}"]);
+        assert!(tree_changes_confined(
+            &repo.dir,
+            &baseline,
+            &approved_tree,
+            &["approved.txt".into()]
+        ));
+
+        repo.commit("stray.txt", "stray\n", "unapproved change");
+        let stray_tree = repo.out(&["rev-parse", "HEAD^{tree}"]);
+        assert!(!tree_changes_confined(
+            &repo.dir,
+            &approved_tree,
+            &stray_tree,
+            &["approved.txt".into()]
+        ));
+        assert!(!tree_changes_confined(
+            &repo.dir,
+            &baseline,
+            "not-a-tree-oid",
+            &["approved.txt".into()]
+        ));
+    }
+
+    #[test]
+    fn driver_merge_rejects_missing_merge_head_and_unresolved_rerere() {
+        let repo = Repo::new("driver-invalid-state");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        let ancestor = repo.out(&["rev-parse", "main"]);
+        repo.feature("feat", "other.txt", "other\n");
+        let ours = repo.out(&["rev-parse", "main"]);
+        let ours_tree = repo.out(&["rev-parse", "main^{tree}"]);
+        assert!(
+            driver_merge(
+                &repo.dir,
+                &ours,
+                &ancestor,
+                &ours_tree,
+                &[],
+                false,
+                Duration::from_secs(3),
+            )
+            .is_none()
+        );
+
+        repo.feature("conflict", "base.txt", "feature\n");
+        repo.commit("base.txt", "mainline\n", "main conflict");
+        let ours = repo.out(&["rev-parse", "main"]);
+        let theirs = repo.out(&["rev-parse", "conflict"]);
+        let MergeTreeOutcome::Conflict { tree, paths } = CliGit
+            .merge_tree(&GitLoc::Local(repo.dir.clone()), &ours, &theirs)
+            .unwrap()
+        else {
+            panic!("fixture must produce a merge-tree conflict");
+        };
+        assert!(
+            driver_merge(
+                &repo.dir,
+                &ours,
+                &theirs,
+                &tree,
+                &paths,
+                true,
+                Duration::from_secs(3),
+            )
+            .is_none()
+        );
+        let worktrees = repo.out(&["worktree", "list", "--porcelain"]);
+        assert!(!worktrees.contains("tg-drivermerge-"), "{worktrees}");
+    }
+
+    #[test]
+    fn driver_merge_rejects_resolved_paths_outside_approval_set() {
+        let repo = Repo::new("driver-unapproved-output");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.commit(".gitattributes", "data.txt merge=stage-stray\n", "attrs");
+        repo.commit("data.txt", "base\n", "seed");
+        git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
+        repo.commit("data.txt", "feature\n", "feature edit");
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit("data.txt", "mainline\n", "main edit");
+        let ours = repo.out(&["rev-parse", "main"]);
+        let theirs = repo.out(&["rev-parse", "feat"]);
+        #[expect(clippy::disallowed_methods)]
+        let merge_tree = util::git_cmd(&repo.dir)
+            .args(["merge-tree", "--write-tree", &ours, &theirs])
+            .output()
+            .unwrap();
+        assert_eq!(
+            merge_tree.status.code(),
+            Some(1),
+            "fixture must produce a merge-tree conflict: {}",
+            String::from_utf8_lossy(&merge_tree.stderr)
+        );
+        let MergeTreeOutcome::Conflict { tree, paths } = CliGit
+            .merge_tree(&GitLoc::Local(repo.dir.clone()), &ours, &theirs)
+            .unwrap()
+        else {
+            panic!("fixture must produce a merge-tree conflict");
+        };
+        git(
+            &repo.dir,
+            &[
+                "config",
+                "merge.stage-stray.driver",
+                "printf stray > stray.txt; true %O %A %B %L %P",
+            ],
+        );
+        assert!(
+            driver_merge(
+                &repo.dir,
+                &ours,
+                &theirs,
+                &tree,
+                &paths,
+                false,
+                Duration::from_secs(3),
+            )
+            .is_some(),
+            "the driver should resolve the approved conflict path",
+        );
+        assert!(
+            driver_merge(
+                &repo.dir,
+                &ours,
+                &theirs,
+                &tree,
+                &[],
+                false,
+                Duration::from_secs(3),
+            )
+            .is_none(),
+            "the resolved data.txt change must be rejected when no paths are approved",
+        );
+        let worktrees = repo.out(&["worktree", "list", "--porcelain"]);
+        assert!(!worktrees.contains("tg-drivermerge-"), "{worktrees}");
+    }
+
+    #[test]
     fn failing_custom_driver_defers_and_removes_its_scratch_worktree() {
         let repo = Repo::new("driver-failure");
         if !repo.history_supported_or_refused() {
             return;
         }
-        git(
-            &repo.dir,
-            &["config", "merge.fail.driver", "false %O %A %B %L %P"],
-        );
         repo.commit(".gitattributes", "data.txt merge=fail\n", "attrs");
         repo.commit("data.txt", "base\n", "seed");
         git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
         repo.commit("data.txt", "feat\n", "feature edit");
         git(&repo.dir, &["checkout", "-q", "main"]);
         repo.commit("data.txt", "main\n", "main edit");
+
+        let ours = repo.out(&["rev-parse", "main"]);
+        let theirs = repo.out(&["rev-parse", "feat"]);
+        assert!(matches!(
+            CliGit
+                .merge_tree(&GitLoc::Local(repo.dir.clone()), &ours, &theirs)
+                .unwrap(),
+            MergeTreeOutcome::Conflict { .. }
+        ));
+        git(
+            &repo.dir,
+            &["config", "merge.fail.driver", "false %O %A %B %L %P"],
+        );
 
         let report = run_fold(&cfg(""), &repo.dir, repo.branch_set()).unwrap();
         assert_eq!(
@@ -2860,14 +3101,6 @@ mod tests {
         if !repo.history_supported_or_refused() {
             return;
         }
-        git(
-            &repo.dir,
-            &[
-                "config",
-                "merge.slow.driver",
-                "sleep 30; true %O %A %B %L %P",
-            ],
-        );
         repo.commit(".gitattributes", "data.txt merge=slow\n", "attrs");
         repo.commit("data.txt", "base\n", "seed");
         git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
@@ -2877,8 +3110,44 @@ mod tests {
 
         let ours = repo.out(&["rev-parse", "main"]);
         let theirs = repo.out(&["rev-parse", "feat"]);
+        #[expect(clippy::disallowed_methods)]
+        let merge_tree = util::git_cmd(&repo.dir)
+            .args(["merge-tree", "--write-tree", &ours, &theirs])
+            .output()
+            .unwrap();
+        assert_eq!(
+            merge_tree.status.code(),
+            Some(1),
+            "fixture must produce a merge-tree conflict: {}",
+            String::from_utf8_lossy(&merge_tree.stderr)
+        );
+        let MergeTreeOutcome::Conflict { tree, paths } = CliGit
+            .merge_tree(&GitLoc::Local(repo.dir.clone()), &ours, &theirs)
+            .unwrap()
+        else {
+            panic!("fixture must produce a merge-tree conflict");
+        };
+        git(
+            &repo.dir,
+            &[
+                "config",
+                "merge.slow.driver",
+                "sleep 30; true %O %A %B %L %P",
+            ],
+        );
         let started = Instant::now();
-        assert!(driver_merge(&repo.dir, &ours, &theirs, false, Duration::from_secs(1)).is_none());
+        assert!(
+            driver_merge(
+                &repo.dir,
+                &ours,
+                &theirs,
+                &tree,
+                &paths,
+                false,
+                Duration::from_secs(1),
+            )
+            .is_none()
+        );
         assert!(started.elapsed() < Duration::from_secs(10));
         let worktrees = repo.out(&["worktree", "list", "--porcelain"]);
         assert!(!worktrees.contains("tg-drivermerge-"), "{worktrees}");
@@ -3567,7 +3836,7 @@ mod tests {
             &land_opts(&config, "main"),
             &mut DiagnosisState {
                 diagnostics: &mut diagnostics,
-                budget: &mut DiagnosisBudget::new(DIAGNOSIS_GATE_LIMIT, DIAGNOSIS_TIME_LIMIT),
+                budget: &mut DiagnosisBudget::new(8, Duration::from_secs(3600)),
             },
         )
         .unwrap_err();
@@ -3606,7 +3875,7 @@ mod tests {
             rerere: false,
         };
         let mut diagnostics = String::new();
-        let mut budget = DiagnosisBudget::new(2, DIAGNOSIS_TIME_LIMIT);
+        let mut budget = DiagnosisBudget::new(2, Duration::from_secs(3600));
         let result = bisect_offender(
             &repo.dir,
             &adapter,
@@ -3626,8 +3895,62 @@ mod tests {
     }
 
     #[test]
+    fn diagnosis_deadline_bounds_an_active_prefix_gate() {
+        let repo = Repo::new("prefix-deadline");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "slow.txt", "slow\n");
+        let config = cfg("test ! -e slow.txt || sleep 30");
+        if !repo.gate_supported_or_refused(&config) {
+            return;
+        }
+        let adapter = PlumbingAdapter {
+            history: CanonicalHistory::capture(&repo.dir).unwrap(),
+            loc: GitLoc::Local(repo.dir.clone()),
+            repo_root: repo.dir.clone(),
+            regenerate_paths: Vec::new(),
+            regenerate_command: String::new(),
+            sign: false,
+            rerere: false,
+        };
+        let config = MergeQueueConfig {
+            gate_timeout_secs: 0,
+            gate_setup_timeout_secs: 0,
+            ..config
+        };
+        let mut diagnostics = String::new();
+        let mut budget = DiagnosisBudget::new(8, Duration::from_secs(2));
+        let started = Instant::now();
+        let result = bisect_offender(
+            &repo.dir,
+            &adapter,
+            &repo.out(&["rev-parse", "main"]),
+            &repo.branch_set(),
+            &config,
+            &land_opts(&config, "main"),
+            &mut DiagnosisState {
+                diagnostics: &mut diagnostics,
+                budget: &mut budget,
+            },
+        )
+        .unwrap();
+        assert_eq!(result, None, "a budget timeout must blame no branch");
+        assert!(started.elapsed() < Duration::from_secs(15));
+        assert!(diagnostics.contains("[diagnosis] failure not localized within budget"));
+    }
+
+    #[test]
+    fn diagnosis_timeout_uses_the_smaller_nonzero_limit_and_rounds_up() {
+        assert_eq!(diagnosis_timeout(0, Duration::from_millis(1)), 1);
+        assert_eq!(diagnosis_timeout(0, Duration::from_millis(1001)), 2);
+        assert_eq!(diagnosis_timeout(5, Duration::from_secs(2)), 2);
+        assert_eq!(diagnosis_timeout(1, Duration::from_secs(2)), 1);
+    }
+
+    #[test]
     fn base_gate_errors_are_not_cached_but_determinate_verdicts_are() {
-        let mut budget = DiagnosisBudget::new(DIAGNOSIS_GATE_LIMIT, DIAGNOSIS_TIME_LIMIT);
+        let mut budget = DiagnosisBudget::new(8, Duration::from_secs(3600));
         let base = "base-oid";
         let error = GateVerdict::Error {
             reason: "gate capture unavailable".into(),

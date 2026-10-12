@@ -58,6 +58,67 @@ fn collect(rx: &mpsc::Receiver<SessionEvent>) -> Vec<SessionEvent> {
 }
 
 #[test]
+fn resident_parser_uses_strict_rpc_frames_and_bounds_junk() {
+    for rejected in [
+        r#"{"id":1,"method":"m","result":1}"#,
+        r#"{"method":"m","x":1}"#,
+        r#"{"id":7}"#,
+        r#"{"id":7,"result":1,"error":{"code":"invalid","message":"m"}}"#,
+        r#"{"method":"a","method":"b"}"#,
+        r#"{"id":"7","method":"m"}"#,
+    ] {
+        assert!(
+            matches!(parse_line(rejected), SessionEvent::Junk(_)),
+            "accepted non-canonical resident frame: {rejected}"
+        );
+    }
+    assert!(matches!(
+        parse_line(r#"{"method":"update","params":{}}"#),
+        SessionEvent::Message(message) if message.method == "update"
+    ));
+    assert!(matches!(
+        parse_line(r#"{"id":7,"result":null}"#),
+        SessionEvent::Response(response) if response.id == 7
+    ));
+
+    let oversized_junk = parse_line(&"x".repeat(10_000));
+    assert!(matches!(
+        oversized_junk,
+        SessionEvent::Junk(text) if text.chars().count() <= 200
+    ));
+}
+
+#[test]
+fn rejected_resident_frame_does_not_stop_later_messages() {
+    let (tx, rx) = mpsc::channel();
+    let fixture = FixtureSupervisor::new();
+    let _session = fixture
+        .spawn(
+            &sh(r#"printf '%s\n' '{"id":1,"method":"m","result":1}' '{"method":"update","params":{"surface":"s"}}'"#),
+            &BTreeMap::new(),
+            None,
+            move |ev| {
+                drop(tx.send(ev)); // best-effort: test receiver may be gone
+            },
+        )
+        .unwrap();
+
+    let events = collect(&rx);
+    assert!(
+        matches!(events.first(), Some(SessionEvent::Junk(text)) if text.contains("method")),
+        "{events:?}"
+    );
+    assert!(
+        matches!(events.get(1), Some(SessionEvent::Message(message)) if message.method == "update"),
+        "{events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(SessionEvent::Exit { code: Some(0) })),
+        "{events:?}"
+    );
+}
+
+#[test]
 fn round_trips_a_callback_and_classifies_lines() {
     let (tx, rx) = mpsc::channel();
     // The child echoes an update verb for every line it reads, plus one
