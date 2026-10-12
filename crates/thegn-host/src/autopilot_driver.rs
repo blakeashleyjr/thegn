@@ -278,6 +278,7 @@ fn drive_claim(
             return;
         }
     };
+    let vars = issue_vars(issue, &branch, &wt);
     let template = if !policy.agent_command.trim().is_empty() {
         policy.agent_command.clone()
     } else {
@@ -539,6 +540,11 @@ fn issue_prompt(
     branch: &str,
     worktree: &str,
 ) -> Result<String, thegn_core::agent_task::TemplateError> {
+    let vars = issue_vars(issue, branch, worktree);
+    render_kind_prompt(TaskKind::Issue, default_prompt(TaskKind::Issue), &vars)
+}
+
+fn issue_vars(issue: &thegn_core::issue::Issue, branch: &str, worktree: &str) -> TaskVars {
     let vars = TaskVars::new()
         .set("issue_number", &issue.number)
         .set("issue_title", &issue.title)
@@ -546,7 +552,7 @@ fn issue_prompt(
         .set("issue_url", &issue.url)
         .set("branch", branch)
         .set("worktree", worktree);
-    render_kind_prompt(TaskKind::Issue, default_prompt(TaskKind::Issue), &vars)
+    vars
 }
 
 /// Keep writes routed to the same named tracker account that supplied the
