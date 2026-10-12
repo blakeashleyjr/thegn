@@ -1300,7 +1300,8 @@ mod tests {
         std::fs::create_dir_all(root.join(".devcontainer")).unwrap();
         std::fs::write(&outside, "FROM scratch").unwrap();
         symlink(&outside, root.join(".devcontainer/Dockerfile")).unwrap();
-        let config_dir = root.join(".devcontainer").to_string_lossy();
+        let config_dir_path = root.join(".devcontainer");
+        let config_dir = config_dir_path.to_string_lossy();
         let dc = parse_with_dir(
             r#"{ "build": { "dockerfile": "Dockerfile", "context": "." } }"#,
             config_dir.as_ref(),
@@ -1323,7 +1324,8 @@ mod tests {
         std::fs::create_dir_all(root.join(".devcontainer")).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         symlink(&outside, root.join(".devcontainer/sub")).unwrap();
-        let config_dir = root.join(".devcontainer").to_string_lossy();
+        let config_dir_path = root.join(".devcontainer");
+        let config_dir = config_dir_path.to_string_lossy();
         let dc = parse_with_dir(
             r#"{ "build": { "dockerfile": "sub/Dockerfile", "context": "." } }"#,
             config_dir.as_ref(),
