@@ -120,18 +120,45 @@ pub fn resolve_server_command(cmd: &str, path: Option<&OsStr>) -> Result<PathBuf
         return Ok(configured.to_path_buf());
     }
     let Some(path) = path else {
-        return Err(LspError::NotAvailable);
+        return Err(LspError::Spawn(format!(
+            "{cmd} not found on absolute PATH entries"
+        )));
     };
     for entry in std::env::split_paths(path).filter(|entry| entry.is_absolute()) {
         let candidate = entry.join(cmd);
         let Ok(canonical) = candidate.canonicalize() else {
             continue;
         };
-        if canonical.is_file() {
-            return Ok(canonical);
+        let Ok(metadata) = canonical.metadata() else {
+            continue;
+        };
+        if metadata.is_file() && is_executable_file(&metadata) {
+            tracing::debug!(
+                target: "thegn::lsp",
+                command = %candidate.display(),
+                canonical_path = %canonical.display(),
+                "resolved language server executable"
+            );
+            // Preserve the candidate's final path component for argv[0]-based
+            // shims such as mise, rustup, volta, and busybox.
+            return Ok(candidate);
         }
     }
-    Err(LspError::NotAvailable)
+    Err(LspError::Spawn(format!(
+        "{cmd} not found on absolute PATH entries"
+    )))
+}
+
+#[cfg(unix)]
+fn is_executable_file(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(_metadata: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// The LSP resource contract.  These are protocol safety limits, not user
@@ -2268,25 +2295,69 @@ mod tests {
 
     #[test]
     fn resolves_bare_commands_only_from_absolute_path_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let executable = dir.path().join("srv");
-        std::fs::write(&executable, "fixture").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix(".lsp-resolve-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let shadow = dir.path().join("shadow");
+        let absolute = dir.path().join("absolute");
+        std::fs::create_dir(&shadow).unwrap();
+        std::fs::create_dir(&absolute).unwrap();
+        let shadow_executable = shadow.join("srv");
+        let executable = absolute.join("srv");
+        std::fs::write(&shadow_executable, "relative shadow").unwrap();
+        std::fs::write(&executable, "absolute executable").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&shadow_executable, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let relative_shadow = shadow.strip_prefix(&cwd).unwrap();
         let path = std::env::join_paths([
             Path::new("").to_path_buf(),
             Path::new(".").to_path_buf(),
-            Path::new("relative").to_path_buf(),
-            dir.path().to_path_buf(),
+            relative_shadow.to_path_buf(),
+            absolute.clone(),
         ])
         .unwrap();
 
         assert_eq!(
             resolve_server_command("srv", Some(&path)).unwrap(),
-            executable.canonicalize().unwrap()
+            executable
         );
         assert!(matches!(
             resolve_server_command("missing-lsp-server", Some(&path)),
-            Err(LspError::NotAvailable)
+            Err(LspError::Spawn(message))
+                if message == "missing-lsp-server not found on absolute PATH entries"
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_executable_path_candidate_does_not_shadow_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        let allowed = dir.path().join("allowed");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::create_dir(&allowed).unwrap();
+        let non_executable = blocked.join("srv");
+        let executable = allowed.join("srv");
+        std::fs::write(&non_executable, "not executable").unwrap();
+        std::fs::write(&executable, "executable").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([blocked, allowed]).unwrap();
+
+        assert_eq!(
+            resolve_server_command("srv", Some(&path)).unwrap(),
+            executable
+        );
     }
 
     #[test]
@@ -2315,7 +2386,7 @@ mod tests {
             &[
                 shell.display().to_string(),
                 "-c".into(),
-                "env > \"$1\"; exec cat >/dev/null".into(),
+                "env > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec cat >/dev/null".into(),
                 "lsp-env-capture".into(),
                 capture.display().to_string(),
             ],

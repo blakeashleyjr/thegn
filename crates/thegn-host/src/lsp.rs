@@ -243,7 +243,6 @@ impl LspInner {
                 &spec.command,
                 std::env::var_os("PATH").as_deref(),
             )?;
-            tracing::debug!(target: "thegn::lsp", command = %resolved.display(), "resolved language server executable");
             let resolved = resolved.to_str().ok_or_else(|| {
                 LspError::Spawn("resolved language server path is not valid UTF-8".into())
             })?;
