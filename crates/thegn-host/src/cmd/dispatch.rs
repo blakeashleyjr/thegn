@@ -524,6 +524,9 @@ fn chunk_gate(
     let conflicts = match pipeline_chunk::verdict(&scope, &active_scopes, &done) {
         pipeline_chunk::ScopeVerdict::Ok => Vec::new(),
         pipeline_chunk::ScopeVerdict::Conflict { overlaps } => overlaps,
+        pipeline_chunk::ScopeVerdict::Unknown(error) => {
+            anyhow::bail!("chunk scope matching refused: {error:?}")
+        }
         pipeline_chunk::ScopeVerdict::UnmetAfter(_) => Vec::new(),
     };
     let unmet = pipeline_chunk::after_unmet(&scope.after, &done);
@@ -567,18 +570,84 @@ fn chunk_gate(
     );
 }
 
-/// Resolve `chunk_path` against `worktree` (absolute paths as-is, everything
-/// else joined) and read it. The caller decides what a miss means — for the
-/// NEW row's file it is a refusal; for a sibling's it degrades to an empty
-/// scope.
+/// Validate and resolve a repository-relative chunk path, then read a bounded
+/// regular file without following its final component. Admission callers fail
+/// closed on a new or active sibling read failure; display enrichment may omit
+/// unavailable derived scope data.
 fn read_chunk_file(worktree: &str, chunk_path: &str) -> std::io::Result<String> {
-    let p = std::path::Path::new(chunk_path);
-    let p = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        std::path::Path::new(worktree).join(p)
+    use std::io::Read;
+    const MAX_CHUNK_BYTES: u64 = 1024 * 1024;
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "chunk path must be a canonical repository-relative path",
+        )
     };
-    std::fs::read_to_string(p)
+    let path = std::path::Path::new(chunk_path);
+    if chunk_path.len() > 1024
+        || path.is_absolute()
+        || chunk_path.contains('\\')
+        || chunk_path.contains(':')
+        || chunk_path.bytes().any(|b| b < 0x20 || b == 0x7f)
+    {
+        return Err(invalid());
+    }
+    let normalized = chunk_path.strip_prefix("./").unwrap_or(chunk_path);
+    if normalized.is_empty()
+        || normalized.split('/').count() > 64
+        || normalized.split('/').any(|s| {
+            s.is_empty()
+                || s == "."
+                || s == ".."
+                || s.ends_with('.')
+                || s.ends_with(' ')
+                || s.bytes()
+                    .any(|b| matches!(b, b'?' | b'<' | b'>' | b'"' | b'|' | b'*'))
+                || windows_reserved_chunk_component(s)
+        })
+    {
+        return Err(invalid());
+    }
+    let root = std::fs::canonicalize(worktree)?;
+    let candidate = root.join(normalized);
+    let resolved = std::fs::canonicalize(&candidate)?;
+    if !resolved.starts_with(&root) {
+        return Err(invalid());
+    }
+    if std::fs::symlink_metadata(&candidate)?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(invalid());
+    }
+    let mut file = thegn_core::fsperm::open_regular_file_nofollow(&resolved)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_CHUNK_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CHUNK_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "chunk file exceeds 1 MiB limit",
+        ));
+    }
+    let line_count = bytes.iter().filter(|byte| **byte == b'\n').count()
+        + usize::from(!bytes.is_empty() && bytes.last() != Some(&b'\n'));
+    if line_count > 8192 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "chunk file exceeds 8192 line limit",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn windows_reserved_chunk_component(segment: &str) -> bool {
+    let base = segment.split('.').next().unwrap_or(segment);
+    ["CON", "PRN", "AUX", "NUL"]
+        .iter()
+        .any(|name| base.eq_ignore_ascii_case(name))
+        || ["COM", "LPT"].iter().any(|prefix| {
+            (1..=9).any(|digit| base.eq_ignore_ascii_case(&format!("{prefix}{digit}")))
+        })
 }
 
 /// The chunk NAME a `files:`/`overlaps:`/`after:` reference resolves to: the
@@ -2075,6 +2144,37 @@ mod tests {
         }
         let wt = dir.path().to_string_lossy().into_owned();
         (dir, wt)
+    }
+
+    #[test]
+    fn chunk_file_reads_reject_traversal_and_absolute_paths_and_cap_bytes() {
+        let (_dir, wt) = chunk_wt(&[("scope.md", "---\nfiles: [src/*.rs]\n---\n")]);
+        assert!(
+            read_chunk_file(&wt, "./scope.md")
+                .unwrap()
+                .contains("files:")
+        );
+        assert!(read_chunk_file(&wt, "../outside.md").is_err());
+        assert!(read_chunk_file(&wt, &format!("{wt}/scope.md")).is_err());
+        for alias in [
+            "dir//scope.md",
+            "dir/./scope.md",
+            "dir\\scope.md",
+            "scope*.md",
+            "CON.md",
+        ] {
+            assert!(read_chunk_file(&wt, alias).is_err(), "accepted {alias}");
+        }
+
+        let large = std::path::Path::new(&wt).join("large.md");
+        std::fs::write(&large, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        assert!(read_chunk_file(&wt, "large.md").is_err());
+        std::fs::write(
+            std::path::Path::new(&wt).join("many-lines.md"),
+            vec![b'\n'; 8193],
+        )
+        .unwrap();
+        assert!(read_chunk_file(&wt, "many-lines.md").is_err());
     }
 
     /// One queued (active) sibling row carrying `chunk` in worktree `wt`.
