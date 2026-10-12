@@ -640,8 +640,8 @@ pub(crate) fn spawn_media_sources(
 mod tests {
     use super::{
         MediaGeneration, MediaOpOutcome, MediaPreflightError, chain_op, chain_op_with_outcome,
-        delivery_from_read, generation_is_current, loop_target, record_outcome, record_refusal,
-        replace_in_flight, shuffle_target, take_outcome, within_media_budget,
+        delivery_from_read, generation_is_current, loop_target, record_refusal, replace_in_flight,
+        shuffle_target, take_outcome, within_media_budget,
     };
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
