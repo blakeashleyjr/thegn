@@ -324,6 +324,26 @@ mod tests {
     }
 
     #[test]
+    fn streaming_redaction_handles_invalid_utf8_and_crlf_pem() {
+        let mut in_pem = false;
+        assert_eq!(
+            redact_stream_line(b"\xff\xfe\n", &mut in_pem),
+            format!("{REDACTION_MARKER}\n")
+        );
+        for line in ["-----BEGIN X-----\r\n", "body\r\n", "-----END X-----\r\n"] {
+            assert_eq!(
+                redact_stream_line(line.as_bytes(), &mut in_pem),
+                format!("{REDACTION_MARKER}\r\n")
+            );
+        }
+        assert!(!in_pem);
+        assert_eq!(
+            redact_stream_line(b"ordinary\r\n", &mut in_pem),
+            "ordinary\r\n"
+        );
+    }
+
+    #[test]
     fn candidate_identity_includes_head_sha() {
         let a = CiLogCandidate {
             worktree: "w".into(),

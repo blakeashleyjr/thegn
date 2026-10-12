@@ -482,7 +482,10 @@ fn rerun(cfg: &Config, worktree: Option<String>, run_id: &str, failed: bool) -> 
         } else {
             "re-running"
         }),
-        Err(e) => msg::die(&format!("ci rerun failed: {e}")),
+        Err(e) => msg::die(&format!(
+            "ci rerun failed: {}",
+            thegn_svc::lsp::sanitize_for_terminal(&e.to_string())
+        )),
     }
     Ok(())
 }
@@ -508,7 +511,10 @@ fn trigger(
         .collect();
     match client.trigger(&loc, workflow, &inputs) {
         Ok(()) => msg::info(&format!("triggered {workflow}")),
-        Err(e) => msg::die(&format!("ci trigger failed: {e}")),
+        Err(e) => msg::die(&format!(
+            "ci trigger failed: {}",
+            thegn_svc::lsp::sanitize_for_terminal(&e.to_string())
+        )),
     }
     Ok(())
 }
@@ -521,7 +527,10 @@ fn cancel(cfg: &Config, worktree: Option<String>, run_id: &str) -> Result<()> {
     }
     match client.cancel(&loc, run_id) {
         Ok(()) => msg::info("cancelled"),
-        Err(e) => msg::die(&format!("ci cancel failed: {e}")),
+        Err(e) => msg::die(&format!(
+            "ci cancel failed: {}",
+            thegn_svc::lsp::sanitize_for_terminal(&e.to_string())
+        )),
     }
     Ok(())
 }

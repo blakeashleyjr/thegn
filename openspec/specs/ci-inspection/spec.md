@@ -62,3 +62,16 @@ Failure explanation SHALL be a log scan that marks the first failure line (error
 
 - **WHEN** the host fetches runs from `spawn_blocking`
 - **THEN** it calls the provider directly with no `block_on`
+
+### Requirement: CI run JSON reports degraded provider results
+
+`thegn ci runs --json` SHALL emit a JSON array when the provider returns a
+complete run list. On a provider error it SHALL emit a JSON error object; when
+the provider returns malformed rows it SHALL emit an error object containing
+`discarded_rows`. Both degraded outcomes SHALL retain exit code 0.
+
+#### Scenario: Provider returns malformed rows
+
+- **WHEN** `thegn ci runs --json` receives a partial run list
+- **THEN** stdout contains a JSON error object with `discarded_rows` and the
+  command exits 0

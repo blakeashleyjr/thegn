@@ -272,36 +272,39 @@ fn refresh_ci_cache_for(
                     result.discarded_rows
                 );
                 tracing::warn!(target: "thegn::ci", discarded_rows = result.discarded_rows, "{message}");
+                if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                    return false;
+                }
                 record_failure(&key, &message, now, cfg.poll_interval_secs);
-                return true;
+            } else {
+                if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                    return false;
+                }
+                record_success(&key);
+                // A CI round trip got through — online evidence for the app-wide holder.
+                if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
+                    return false;
+                }
+                thegn_core::connectivity::report_success();
+                if let Ok(json) = serde_json::to_string(&thegn_core::ci::CiRunCache {
+                    runs: runs.clone(),
+                    discarded_rows: result.discarded_rows,
+                }) && crate::hydrate_schedule::generation_is_current(generation.as_ref())
+                {
+                    let _ = db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                }
+                ingest_failed_logs(
+                    host_path,
+                    loc,
+                    cfg,
+                    full,
+                    &db,
+                    &runs,
+                    &old_runs,
+                    waker,
+                    generation.clone(),
+                );
             }
-            if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
-                return false;
-            }
-            record_success(&key);
-            // A CI round trip got through — online evidence for the app-wide holder.
-            if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
-                return false;
-            }
-            thegn_core::connectivity::report_success();
-            if let Ok(json) = serde_json::to_string(&thegn_core::ci::CiRunCache {
-                runs: runs.clone(),
-                discarded_rows: result.discarded_rows,
-            }) && crate::hydrate_schedule::generation_is_current(generation.as_ref())
-            {
-                let _ = db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-            }
-            ingest_failed_logs(
-                host_path,
-                loc,
-                cfg,
-                full,
-                &db,
-                &runs,
-                &old_runs,
-                waker,
-                generation.clone(),
-            );
         }
         Err(e) => {
             if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
