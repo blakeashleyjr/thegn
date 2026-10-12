@@ -9777,9 +9777,9 @@ async fn event_loop<T: Terminal>(
             }
         }
 
-        // Bank background hunk previews. Strays from before a worktree switch
-        // are dropped (`hunks_gen` records the acceptance cutoff); a fetch
-        // outliving an ordinary refresh is fine — same worktree, same diff.
+        // Bank a hunk preview only while its ownership token still owns the
+        // path and its generation passes the acceptance cutoff. Completions
+        // from before a refresh or worktree switch are dropped.
         while let Ok((generation, token, path, hunks)) = hunk_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Hunk);
             let owns_path = hunk_inflight.finish(&path, token);
@@ -10566,16 +10566,11 @@ async fn event_loop<T: Terminal>(
             model.ctrl_digits_reportable = ctrl_digits_reportable;
             model.notification_delivery = notification_delivery;
             model.notification_delivery_configured = notification_delivery_configured;
-            if active_submodules_enabled && !model.panel.changes.is_empty() {
-                if let Some(token) = submodule_scans.request() {
-                    spawn_submodule_scan(
-                        hydration_gen,
-                        token,
-                        &session,
-                        &submodule_scan_tx,
-                        &waker,
-                    );
-                }
+            if active_submodules_enabled
+                && !model.panel.changes.is_empty()
+                && let Some(token) = submodule_scans.request()
+            {
+                spawn_submodule_scan(hydration_gen, token, &session, &submodule_scan_tx, &waker);
             }
             // The tab strip is LOOP-owned: `build_model` derived it from the
             // session snapshot the hydration thread was handed, which predates
