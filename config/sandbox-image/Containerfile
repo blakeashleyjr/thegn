@@ -29,10 +29,10 @@ ENV HOME=/home/thegn \
     PATH=/home/thegn/.nix-profile/bin:/home/thegn/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 
 # Determinate installer, single-user (`--init none`: containers have no init),
-# flakes on, sig checks relaxed to match the provisioner's substitution model.
+# flakes on; Nix signature checks stay enabled.
 RUN curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix \
       | sh -s -- install linux --init none --no-confirm --extra-conf \
-        "experimental-features = nix-command flakes" --extra-conf "require-sigs = false" \
+        "experimental-features = nix-command flakes" \
  || curl -L https://nixos.org/nix/install | sh -s -- --no-daemon
 
 # direnv + devenv + node + Claude Code + rustup with a warmed stable toolchain

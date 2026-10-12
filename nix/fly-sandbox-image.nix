@@ -98,7 +98,7 @@
     sshd:x:74:
     nogroup:x:65534:
     EOF
-    printf 'experimental-features = nix-command flakes\nrequire-sigs = false\nbuild-users-group =\n' > $out/etc/nix/nix.conf
+    printf 'experimental-features = nix-command flakes\nrequire-sigs = true\nbuild-users-group =\n' > $out/etc/nix/nix.conf
   '';
 in
   pkgs.dockerTools.streamLayeredImage {
