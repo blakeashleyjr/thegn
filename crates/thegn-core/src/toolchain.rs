@@ -10,6 +10,7 @@
 //! nothing here executes.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use crate::config::{config_enum, config_warn};
 use crate::envplan::Language;
@@ -82,18 +83,130 @@ pub struct ToolchainConfig {
     pub extra: Vec<String>,
 }
 
+const MAX_NIX_ATTR_PATH_BYTES: usize = 128;
+const MAX_NIX_ATTR_SEGMENTS: usize = 8;
+const MAX_SYNTH_PACKAGES: usize = 256;
+const MAX_SYNTH_PACKAGE_SCAN: usize = 512;
+const MAX_SYNTH_FLAKE_BYTES: usize = 40_000;
+
+/// Parse one bounded nixpkgs attribute path, returning its trimmed form.
+pub fn parse_nix_attr_path(raw: &str) -> Result<String, String> {
+    let path = raw.trim();
+    if path.len() > MAX_NIX_ATTR_PATH_BYTES {
+        return Err(format!(
+            "package path exceeds {MAX_NIX_ATTR_PATH_BYTES} bytes"
+        ));
+    }
+    if path.is_empty() {
+        return Err("empty package path".to_string());
+    }
+    let segments: Vec<&str> = path.split('.').collect();
+    if segments.len() > MAX_NIX_ATTR_SEGMENTS {
+        return Err(format!(
+            "package path has more than {MAX_NIX_ATTR_SEGMENTS} segments"
+        ));
+    }
+    const KEYWORDS: &[&str] = &[
+        "if", "then", "else", "assert", "with", "let", "in", "rec", "inherit", "or",
+    ];
+    for segment in segments {
+        let mut chars = segment.chars();
+        let Some(first) = chars.next() else {
+            return Err("package path contains an empty segment".to_string());
+        };
+        if !(first.is_ascii_alphabetic() || first == '_')
+            || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '\'' | '-'))
+        {
+            return Err(
+                "package path contains characters outside the Nix attribute grammar".to_string(),
+            );
+        }
+        if KEYWORDS.contains(&segment) {
+            return Err("package path contains a Nix keyword".to_string());
+        }
+    }
+    Ok(path.to_string())
+}
+
+fn push_package_list(
+    name: &str,
+    values: &[String],
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let mut warning_sent = false;
+    for raw in values.iter().take(MAX_SYNTH_PACKAGE_SCAN) {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        match parse_nix_attr_path(raw) {
+            Ok(package) => {
+                if !seen.contains(&package) && out.len() == MAX_SYNTH_PACKAGES {
+                    if !warning_sent {
+                        config_warn(&format!(
+                            "toolchain.{name}: package limit of {MAX_SYNTH_PACKAGES} reached; remaining entries ignored"
+                        ));
+                    }
+                    warning_sent = true;
+                    break;
+                }
+                if seen.insert(package.clone()) {
+                    out.push(package);
+                }
+            }
+            Err(reason) => {
+                if !warning_sent {
+                    let shown = raw.chars().take(48).collect::<String>();
+                    config_warn(&format!(
+                        "toolchain.{name}: rejected package value {shown:?}: {reason}"
+                    ));
+                    warning_sent = true;
+                }
+            }
+        }
+    }
+    if values.len() > MAX_SYNTH_PACKAGE_SCAN && !warning_sent {
+        config_warn(&format!(
+            "toolchain.{name}: scanned only the first {MAX_SYNTH_PACKAGE_SCAN} entries"
+        ));
+    }
+}
+
+fn language_name(language: &Language) -> &'static str {
+    match language {
+        Language::Python => "python",
+        Language::Node => "node",
+        Language::Deno => "deno",
+        Language::Jvm => "jvm",
+        Language::Go => "go",
+        Language::Ruby => "ruby",
+        Language::Rust => "rust",
+    }
+}
+
+fn admit_synth_packages(packages: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(packages.len().min(MAX_SYNTH_PACKAGES));
+    let mut seen = HashSet::with_capacity(packages.len().min(MAX_SYNTH_PACKAGES));
+    for raw in packages.iter().take(MAX_SYNTH_PACKAGE_SCAN) {
+        if let Ok(package) = parse_nix_attr_path(raw)
+            && seen.insert(package.clone())
+        {
+            out.push(package);
+            if out.len() == MAX_SYNTH_PACKAGES {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// The nixpkgs packages to synthesize into the devShell for the detected
 /// `languages` under config `tc`: built-in defaults per language (Rust is empty
 /// — rustup ships in the base image), replaced wholesale by the matching
 /// non-empty override list; deduped, stable order; `extra` appended last.
 pub fn packages_for(languages: &[Language], tc: &ToolchainConfig) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let mut push = |p: &str| {
-        let p = p.trim();
-        if !p.is_empty() && !out.iter().any(|x| x == p) {
-            out.push(p.to_string());
-        }
-    };
+    let mut seen = HashSet::new();
     for lang in languages {
         let (defaults, over): (&[&str], &[String]) = match lang {
             Language::Python => (&["python3", "uv"], &tc.python),
@@ -106,14 +219,16 @@ pub fn packages_for(languages: &[Language], tc: &ToolchainConfig) -> Vec<String>
             Language::Rust => (&[], &[]),
         };
         if over.is_empty() {
-            defaults.iter().for_each(|p| push(p));
+            let defaults = defaults
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect::<Vec<_>>();
+            push_package_list(language_name(lang), &defaults, &mut out, &mut seen);
         } else {
-            over.iter().for_each(|p| push(p));
+            push_package_list(language_name(lang), over, &mut out, &mut seen);
         }
     }
-    for p in &tc.extra {
-        push(p);
-    }
+    push_package_list("extra", &tc.extra, &mut out, &mut seen);
     out
 }
 
@@ -121,13 +236,15 @@ pub fn packages_for(languages: &[Language], tc: &ToolchainConfig) -> Vec<String>
 /// = a `mkShell` with `packages`. Deterministic over its input (golden-tested):
 /// the same package list always renders byte-identical output, so the
 /// idempotence `cmp` in [`synth_dir_script`] holds across re-provisions.
+/// Invalid paths and entries beyond the bounded admission limit are omitted.
 pub fn synth_flake(packages: &[String]) -> String {
-    let list = packages
+    let admitted = admit_synth_packages(packages);
+    let list = admitted
         .iter()
         .map(|p| format!("pkgs.{p}"))
         .collect::<Vec<_>>()
         .join(" ");
-    format!(
+    let flake = format!(
         "{{\n  \
            description = \"thegn synthesized toolchain\";\n  \
            inputs.nixpkgs.url = \"github:NixOS/nixpkgs/nixos-unstable\";\n  \
@@ -141,14 +258,18 @@ pub fn synth_flake(packages: &[String]) -> String {
                }});\n    \
              }};\n\
          }}\n"
-    )
+    );
+    debug_assert!(flake.len() <= MAX_SYNTH_FLAKE_BYTES);
+    flake
 }
 
 /// The stable synth directory for this package set (12-char [`crate::util::short_hash`]
 /// of the joined list): `$HOME/.thegn/synth/<hash>`. A literal sh string —
 /// `$HOME` expands in the sandbox (used verbatim by the pane-entry hook).
+/// Hashes the same bounded, validated package list that [`synth_flake`] renders.
 pub fn synth_dir(packages: &[String]) -> String {
-    format!("$HOME/.thegn/synth/{}", synth_hash(packages))
+    let admitted = admit_synth_packages(packages);
+    format!("$HOME/.thegn/synth/{}", synth_hash(&admitted))
 }
 
 fn synth_hash(packages: &[String]) -> String {
@@ -299,7 +420,136 @@ mod tests {
             extra: v(&["", "  ", "just"]),
             ..Default::default()
         };
-        assert_eq!(packages_for(&[], &tc), v(&["just"]));
+        let (packages, warnings, _) =
+            crate::config_diagnostics::capture_quiet(|| packages_for(&[], &tc));
+        assert_eq!(packages, v(&["just"]));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn nix_attr_path_accepts_bounded_package_identifiers_and_dotted_sets() {
+        assert_eq!(
+            parse_nix_attr_path("  nodePackages.typescript  ").unwrap(),
+            "nodePackages.typescript"
+        );
+        assert_eq!(
+            parse_nix_attr_path("python3Packages.pip").unwrap(),
+            "python3Packages.pip"
+        );
+        assert_eq!(parse_nix_attr_path("scala-cli").unwrap(), "scala-cli");
+        assert_eq!(parse_nix_attr_path("foo'bar_2").unwrap(), "foo'bar_2");
+        assert!(parse_nix_attr_path("").is_err());
+        assert!(parse_nix_attr_path(".a").is_err());
+        assert!(parse_nix_attr_path("a.").is_err());
+        assert!(parse_nix_attr_path("a..b").is_err());
+        assert!(parse_nix_attr_path("a.b.c.d.e.f.g.h").is_ok());
+        assert!(parse_nix_attr_path("a.b.c.d.e.f.g.h.i").is_err());
+        assert!(parse_nix_attr_path(&"a".repeat(MAX_NIX_ATTR_PATH_BYTES)).is_ok());
+        assert!(parse_nix_attr_path(&"a".repeat(MAX_NIX_ATTR_PATH_BYTES + 1)).is_err());
+        let padded = format!("{}a{}", " ".repeat(MAX_NIX_ATTR_PATH_BYTES), " ");
+        assert_eq!(parse_nix_attr_path(&padded).unwrap(), "a");
+        for keyword in [
+            "if", "then", "else", "assert", "with", "let", "in", "rec", "inherit", "or",
+        ] {
+            assert!(parse_nix_attr_path(keyword).is_err(), "{keyword}");
+        }
+        assert!(parse_nix_attr_path("a.or").is_err());
+        for invalid in [
+            "a b", "a;b", "a]", "a${x}", "\"a\"", "a#c", "a/*", "1a", "a+", "é",
+        ] {
+            assert!(parse_nix_attr_path(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn packages_for_rejects_expression_syntax_and_keeps_valid_dotted_paths() {
+        let tc = ToolchainConfig {
+            extra: v(&[
+                "a b",
+                "a;b",
+                "a]",
+                "a${x}",
+                "\"a\"",
+                "a#c",
+                "a/*",
+                "a..b",
+                ".a",
+                "a.",
+                "if",
+                "a.or",
+                "é",
+                "nodePackages.typescript",
+                "python3Packages.pip",
+            ]),
+            ..Default::default()
+        };
+        let got = packages_for(&[], &tc);
+        assert_eq!(got, v(&["nodePackages.typescript", "python3Packages.pip"]));
+        let flake = synth_flake(&tc.extra);
+        assert!(flake.contains("pkgs.nodePackages.typescript"));
+        assert!(flake.contains("pkgs.python3Packages.pip"));
+        for bad in ["pkgs.a b", "pkgs.a;", "pkgs.a${x}", "pkgs.\"a\""] {
+            assert!(!flake.contains(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn package_and_render_limits_are_enforced_at_both_boundaries() {
+        let mut items = (0..MAX_SYNTH_PACKAGES)
+            .map(|i| format!("pkg_{i}"))
+            .collect::<Vec<_>>();
+        let config = ToolchainConfig {
+            extra: items.clone(),
+            ..Default::default()
+        };
+        assert_eq!(packages_for(&[], &config).len(), MAX_SYNTH_PACKAGES);
+        items.push("one_too_many".to_string());
+        let config = ToolchainConfig {
+            extra: items.clone(),
+            ..Default::default()
+        };
+        assert_eq!(packages_for(&[], &config).len(), MAX_SYNTH_PACKAGES);
+        assert_eq!(admit_synth_packages(&items).len(), MAX_SYNTH_PACKAGES);
+        let rendered = synth_flake(&items);
+        assert!(rendered.len() <= MAX_SYNTH_FLAKE_BYTES);
+        assert!(rendered.contains("pkgs.pkg_255"));
+        assert!(!rendered.contains("pkgs.one_too_many"));
+    }
+
+    #[test]
+    fn package_scan_stops_at_the_hard_input_bound() {
+        let mut items = vec!["bad;value".to_string(); MAX_SYNTH_PACKAGE_SCAN];
+        items.push("after_scan_limit".to_string());
+        let config = ToolchainConfig {
+            extra: items.clone(),
+            ..Default::default()
+        };
+        assert!(packages_for(&[], &config).is_empty());
+        assert!(!synth_flake(&items).contains("pkgs.after_scan_limit"));
+    }
+
+    #[test]
+    fn package_limit_warning_suppresses_scan_warning() {
+        let items = (0..=MAX_SYNTH_PACKAGE_SCAN)
+            .map(|i| format!("scan_pkg_{i}"))
+            .collect::<Vec<_>>();
+        let config = ToolchainConfig {
+            extra: items,
+            ..Default::default()
+        };
+        let (admitted, warnings, _) =
+            crate::config_diagnostics::capture_quiet(|| packages_for(&[], &config));
+        assert_eq!(admitted.len(), MAX_SYNTH_PACKAGES);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("package limit"));
+    }
+
+    #[test]
+    fn synth_directory_and_flake_use_the_same_admitted_package_list() {
+        let raw = v(&["safe.path", "evil; injected", "safe.path"]);
+        let admitted = v(&["safe.path"]);
+        assert_eq!(synth_dir(&raw), synth_dir(&admitted));
+        assert_eq!(synth_flake(&raw), synth_flake(&admitted));
     }
 
     #[test]
