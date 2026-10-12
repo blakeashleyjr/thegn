@@ -183,7 +183,7 @@ fn lock_config_writer(path: &Path) -> Result<std::fs::File> {
 /// Create an exact-byte config seed under the same writer lock as edits.
 /// Existing destinations are left untouched; only a missing parent is created
 /// private, matching the fenced writer's parent policy.
-pub fn seed_if_absent(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn seed_if_absent(path: &Path, bytes: &[u8]) -> Result<bool> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -199,7 +199,8 @@ pub fn seed_if_absent(path: &Path, bytes: &[u8]) -> Result<()> {
 
     let _writer_lock = lock_config_writer(path)?;
     match std::fs::symlink_metadata(path) {
-        Ok(_) => return Ok(()),
+        Ok(metadata) if metadata.file_type().is_file() => return Ok(false),
+        Ok(_) => anyhow::bail!("config path exists but is not a regular file"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
     }
@@ -211,7 +212,7 @@ pub fn seed_if_absent(path: &Path, bytes: &[u8]) -> Result<()> {
             parent.display()
         ));
     }
-    Ok(())
+    Ok(true)
 }
 
 fn write_doc_fenced(
@@ -754,6 +755,49 @@ mod tests {
 
         assert!(seed_if_absent(&p, b"picker = \"list\"\n").is_err());
         assert!(!p.exists(), "a rejected seed must leave config absent");
+    }
+
+    #[test]
+    fn seed_creates_missing_parent_privately_and_leaves_existing_bytes_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("new");
+        let path = parent.join("config.toml");
+        let bytes = b"# exact seed bytes\npicker = \"list\"\n";
+
+        assert!(seed_if_absent(&path, bytes).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(matches!(
+            crate::fsperm::mode_bits(&path).unwrap(),
+            None | Some(0o600)
+        ));
+        assert!(matches!(
+            crate::fsperm::mode_bits(&parent).unwrap(),
+            None | Some(0o700)
+        ));
+
+        std::fs::write(&path, b"existing bytes\n").unwrap();
+        assert!(!seed_if_absent(&path, bytes).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing bytes\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seed_rejects_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let target = dir.path().join("missing-target.toml");
+        symlink(&target, &path).unwrap();
+
+        let error = seed_if_absent(&path, b"picker = \"list\"\n").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("config path exists but is not a regular file")
+        );
+        assert!(!target.exists());
     }
 
     #[cfg(unix)]
