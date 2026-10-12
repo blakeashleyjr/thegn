@@ -415,9 +415,14 @@ mod tests {
         png[20..24].copy_from_slice(&60000u32.to_be_bytes());
         let crc = crc32fast::hash(&png[12..29]);
         png[29..33].copy_from_slice(&crc.to_be_bytes());
-        let first = decode_and_fit(&png, PREVIEW_LIMITS).unwrap_err();
+        let first = decode_and_fit(&png, PREVIEW_LIMITS)
+            .err()
+            .expect("dimension bomb must be rejected");
         for _ in 0..50 {
-            assert_eq!(decode_and_fit(&png, PREVIEW_LIMITS).unwrap_err(), first);
+            let error = decode_and_fit(&png, PREVIEW_LIMITS)
+                .err()
+                .expect("dimension bomb must be rejected");
+            assert_eq!(error, first);
         }
     }
 
