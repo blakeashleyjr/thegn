@@ -490,5 +490,14 @@ fn parse_line(text: &str) -> SessionEvent {
         }
     }
 }
+
+/// Lossily decode a rejected line and keep diagnostics small and UTF-8 safe.
+pub(super) fn junk_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .trim()
+        .chars()
+        .take(200)
+        .collect()
+}
 #[cfg(test)]
 pub(crate) mod tests;
