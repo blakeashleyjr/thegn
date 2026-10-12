@@ -46,6 +46,11 @@ pub fn set_palette(p: theme::Palette) {
     }
 }
 
+/// Snapshot the palette currently used by chrome.
+pub fn palette_snapshot() -> theme::Palette {
+    PALETTE.read().expect("palette lock").clone()
+}
+
 /// A palette slot, resolvable to a live color via [`col`]. Kept complete even
 /// where a slot has no call site yet, so new chrome picks from one vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
