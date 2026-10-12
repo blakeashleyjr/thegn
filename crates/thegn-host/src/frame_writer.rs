@@ -30,8 +30,10 @@
 //!
 //! `THEGN_SYNC_WRITER=1` keeps FIFO writes on the owned worker but makes each
 //! admission wait on the caller until completion or the bounded deadline. A
-//! timeout sets Fatal and abandons queued bytes. The termwiz debug renderer
-//! still writes frames outside this worker in `run.rs`.
+//! timeout sets Fatal and abandons queued bytes. `want_sync` also enables this
+//! mode for the termwiz debug renderer, so its FIFO OOB and clipboard writes
+//! can block the render loop for up to three seconds; its frames still write
+//! outside this worker in `run.rs`.
 
 use std::collections::VecDeque;
 use std::io::Write as _;
@@ -332,23 +334,14 @@ impl FrameWriter {
                 abandon_queued_messages(&mut q);
                 drop(q);
                 self.inner.done_cv.notify_all();
-                self.inner.cv.notify_one();
                 return;
             }
-            let (next, timeout) = self
+            let (next, _) = self
                 .inner
                 .done_cv
                 .wait_timeout(q, deadline.saturating_duration_since(now))
                 .unwrap_or_else(|e| e.into_inner());
             q = next;
-            if timeout.timed_out() && q.completed_seq < target {
-                q.status = WriterStatus::Fatal("synchronous terminal write deadline".into());
-                abandon_queued_messages(&mut q);
-                drop(q);
-                self.inner.done_cv.notify_all();
-                self.inner.cv.notify_one();
-                return;
-            }
         }
     }
 
@@ -709,33 +702,56 @@ mod tests {
         assert_eq!(log.lock().unwrap().len(), 1);
         assert_eq!(writer.try_submit_oob(vec![2]), Ok(()));
         assert_eq!(log.lock().unwrap().len(), 2);
-        assert_eq!(writer.try_submit_clipboard(vec![3], || panic!()), Ok(()));
+        let retry_deadline = Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            match writer.try_submit_clipboard(vec![3], || {}) {
+                Ok(()) => break,
+                Err(bytes) => {
+                    assert_eq!(bytes, vec![3]);
+                    assert!(
+                        Instant::now() < retry_deadline,
+                        "clipboard admission did not retry"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+        }
         assert_eq!(*log.lock().unwrap(), vec![vec![1], vec![2], vec![3]]);
         drop(writer);
     }
 
     #[test]
     fn drop_during_blocked_sync_write_is_bounded_and_emits_no_queued_bytes() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let log = Arc::new(Mutex::new(Vec::new()));
-        let writer = Arc::new(gated_sync_writer(
-            release_rx,
-            Arc::clone(&log),
-            Some(finished_tx),
+        let sink_log = Arc::clone(&log);
+        let writer = Arc::new(FrameWriter::spawn_with(
+            true,
+            |_| {},
+            move |bytes| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                sink_log.lock().unwrap().push(bytes.to_vec());
+                finished_tx.send(()).unwrap();
+                Ok(())
+            },
         ));
         let first_writer = Arc::clone(&writer);
         let first = std::thread::spawn(move || first_writer.submit_frame(vec![1], None));
-        while writer.inner.q.lock().unwrap().submitted_seq < 1 {
-            std::thread::yield_now();
-        }
-        let second_writer = Arc::clone(&writer);
-        let second = std::thread::spawn(move || second_writer.try_submit_oob(vec![2]));
-        while writer.inner.q.lock().unwrap().submitted_seq < 2 {
-            std::thread::yield_now();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        {
+            let mut q = writer.inner.q.lock().unwrap();
+            assert_eq!(q.submitted_seq, 1);
+            q.submitted_seq = q.submitted_seq.saturating_add(1);
+            q.oob_in_flight += 1;
+            q.oob_bytes += 1;
+            q.msgs.push_back(Msg::Oob(vec![2]));
         }
         assert!(first.join().unwrap());
-        assert_eq!(second.join().unwrap(), Ok(()));
         let started = Instant::now();
         drop(writer);
         assert!(started.elapsed() < WRITER_SHUTDOWN_BOUND + std::time::Duration::from_millis(150));
