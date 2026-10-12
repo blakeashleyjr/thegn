@@ -367,6 +367,7 @@ impl LspInner {
                             generation,
                             started_at,
                             failures,
+                            ..
                         }) = state.map.remove(&map_key)
                         {
                             self.diag_tx.retire(root, key, generation);
