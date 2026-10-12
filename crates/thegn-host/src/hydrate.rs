@@ -2748,13 +2748,14 @@ fn cache_panel_git_snapshot(
             None
         }
     };
+    let stash_count = reads.stash_count.unwrap_or_default();
     if let Some(key) = key
         && !cached_reads
         && reads_ok
     {
         crate::panel_git_cache::put(cwd, key, reads);
     }
-    reads.stash_count.unwrap_or_default()
+    stash_count
 }
 
 /// Build just the right-side panel for a worktree directory. This is the
