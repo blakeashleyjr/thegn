@@ -829,11 +829,17 @@ mod tests {
                         "status={}, watched={watched}, moved={moved}, pause={pause}: {got:?}",
                         status.as_str()
                     );
-                    if !watched {
-                        assert!(got.unwrap_err().contains("CI is not in [pr_queue] watch"));
+                    if !status_allows {
+                        assert!(got.as_ref().unwrap_err().contains(status.as_str()));
+                    } else if !watched {
+                        assert!(
+                            got.as_ref()
+                                .unwrap_err()
+                                .contains("CI is not in [pr_queue] watch")
+                        );
                     }
                     if moved && pause && watched && status_allows {
-                        assert!(got.unwrap_err().contains("someone else pushed"));
+                        assert!(got.as_ref().unwrap_err().contains("someone else pushed"));
                     }
                 }
             }
@@ -886,6 +892,31 @@ mod tests {
                 .contains("closed")
         );
         assert!(admit_agent_dispatch("ready", &Blocker::None, &facts(), "abc", &cfg()).is_err());
+
+        let mut ci_only = cfg();
+        ci_only.watch = vec![PrWatchKind::Ci];
+        assert!(
+            admit_agent_dispatch(
+                "blocked_conflict",
+                &Blocker::Conflict,
+                &facts(),
+                "abc",
+                &ci_only
+            )
+            .unwrap_err()
+            .contains("conflict is not in [pr_queue] watch")
+        );
+        assert!(
+            admit_agent_dispatch(
+                "blocked_review",
+                &Blocker::ChangesRequested,
+                &facts(),
+                "abc",
+                &ci_only
+            )
+            .unwrap_err()
+            .contains("review is not in [pr_queue] watch")
+        );
     }
 
     #[test]

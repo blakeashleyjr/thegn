@@ -340,14 +340,31 @@ fn consider_candidate_with_forge(
     } else {
         "exit failed"
     };
+    restamp_after_agent(db, &item.key, outcome);
+}
+
+fn restamp_after_agent(db: &thegn_core::db::Db, key: &str, outcome: &str) {
+    let rows = match db.list_pr_queue() {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(target: "thegn::ci_autofix", %error, "could not re-read PR queue row after CI autofix");
+            return;
+        }
+    };
+    let Some(row) = rows.into_iter().find(|row| row.key == key) else {
+        return;
+    };
+    if row.status != PrqStatus::AgentRunning.as_str() {
+        return;
+    }
     if let Err(error) = db.update_pr_status(
-        &item.key,
+        key,
         PrqStatus::BlockedCi.as_str(),
         Some("ci"),
         Some(&format!(
             "CI autofix finished ({outcome}); awaiting the next PR refresh"
         )),
-        Some(entry.head_sha.as_str()),
+        None,
     ) {
         tracing::warn!(target: "thegn::ci_autofix", %error, "could not record completed CI autofix status");
     }
@@ -370,6 +387,44 @@ mod authorship_tests {
     use super::*;
     use crate::pr_authorship::tests::Fixture;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn completed_agent_does_not_rearm_a_settled_row_or_replace_its_head() {
+        let fixture = Fixture::new();
+        let path = fixture.dir.path().to_str().unwrap();
+        let db = thegn_core::db::Db::open_at(&fixture.dir.path().join("ci.db")).unwrap();
+        db.enqueue_pr(path, 7, Some(path), "fixture", "main", "github")
+            .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        db.update_pr_status(
+            &row.key,
+            PrqStatus::Merged.as_str(),
+            Some("ci"),
+            None,
+            Some("newer-head"),
+        )
+        .unwrap();
+
+        restamp_after_agent(&db, &row.key, "exit ok");
+
+        let current = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(current.status, PrqStatus::Merged.as_str());
+        assert_eq!(current.last_head_oid.as_deref(), Some("newer-head"));
+
+        db.update_pr_status(
+            &row.key,
+            PrqStatus::AgentRunning.as_str(),
+            Some("ci"),
+            None,
+            None,
+        )
+        .unwrap();
+        restamp_after_agent(&db, &row.key, "exit failed");
+
+        let current = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(current.status, PrqStatus::BlockedCi.as_str());
+        assert_eq!(current.last_head_oid.as_deref(), Some("newer-head"));
+    }
 
     #[test]
     fn foreign_author_never_claims_or_spends_a_ci_attempt() {
