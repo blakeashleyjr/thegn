@@ -87,6 +87,33 @@ fn a_hung_plugin_is_killed_at_its_timeout() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_child_handed_to_the_reaper_is_eventually_reaped() {
+    let mut command = std::process::Command::new("sh");
+    command.args(["-c", "sleep 30"]);
+    set_process_group(&mut command);
+    let child = command.spawn().unwrap();
+    let pid = child.id() as i32;
+    kill_group(child.id());
+    hand_off_unreaped_child(child);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        // A zombie still answers kill(pid, 0); ESRCH proves the detached
+        // waiter reaped the child rather than merely dropping its handle.
+        let result = unsafe { libc::kill(pid, 0) };
+        if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached reaper left child {pid} unreaped"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn the_environment_is_passed_through() {
     let mut env = BTreeMap::new();
