@@ -287,7 +287,7 @@ fn io_error_with_path_context(
 /// unlinking without this lock can race another daemon endpoint.
 #[cfg(unix)]
 fn bind_lock(sock: &Path) -> io::Result<std::fs::File> {
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
     let mut path = sock.as_os_str().to_owned();
     path.push(".lock");
@@ -300,23 +300,44 @@ fn bind_lock(sock: &Path) -> io::Result<std::fs::File> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(std::path::Path::new(&path))
         .map_err(|error| io_error_with_path_context(error, "open control socket lock", sock))?;
-    let metadata = file
+    let mut metadata = file
         .metadata()
         .map_err(|error| io_error_with_path_context(error, "inspect control socket lock", sock))?;
-    let mode = metadata.mode() & 0o777;
-    if !metadata.is_file() || metadata.uid() != effective_uid().unwrap_or_default() || mode != 0o600
-    {
+    if !metadata.is_file() || metadata.uid() != effective_uid().unwrap_or_default() {
+        let mode = metadata.mode() & 0o777;
         return Err(io_error_with_path_context(
             io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
-                    "control socket lock must be owner-owned regular file mode 0600 (found uid {}, mode {mode:04o})",
+                    "control socket lock must be an owner-owned regular file (found uid {}, mode {mode:04o})",
                     metadata.uid()
                 ),
             ),
             "verify control socket lock",
             sock,
         ));
+    }
+    if metadata.mode() & 0o777 != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                io_error_with_path_context(error, "restrict control socket lock", sock)
+            })?;
+        metadata = file.metadata().map_err(|error| {
+            io_error_with_path_context(error, "recheck control socket lock", sock)
+        })?;
+        if !metadata.is_file()
+            || metadata.uid() != effective_uid().unwrap_or_default()
+            || metadata.mode() & 0o777 != 0o600
+        {
+            return Err(io_error_with_path_context(
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "control socket lock could not be restricted to owner mode 0600",
+                ),
+                "verify control socket lock",
+                sock,
+            ));
+        }
     }
     file.lock()
         .map_err(|error| io_error_with_path_context(error, "lock control socket", sock))?;
@@ -402,7 +423,8 @@ impl IpcListener {
                                 "control socket has no parent directory",
                             )
                         })?;
-                        if std::fs::symlink_metadata(parent)?.file_type().is_symlink() {
+                        let parent_metadata = std::fs::symlink_metadata(parent)?;
+                        if parent_metadata.file_type().is_symlink() {
                             return Err(io_error_with_path_context(
                                 io::Error::new(
                                     io::ErrorKind::PermissionDenied,
@@ -412,7 +434,7 @@ impl IpcListener {
                                 parent,
                             ));
                         }
-                        verify_unix_owner_mode(parent, 0o700, true)?;
+                        verify_unix_bind_parent(parent, &parent_metadata)?;
                         let _lock = bind_lock(&sock)?;
                         if sock.exists() {
                             use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
@@ -702,6 +724,25 @@ pub fn control_endpoint_hardening(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn verify_unix_bind_parent(path: &Path, metadata: &std::fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mode = metadata.mode() & 0o777;
+    let expected_uid = effective_uid().expect("unix has an effective uid");
+    if !metadata.is_dir() || metadata.uid() != expected_uid || mode & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} must be an owner-owned directory without group/other write permission (found uid {}, mode {mode:04o})",
+                path.display(),
+                metadata.uid(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn verify_unix_owner_mode(path: &Path, expected_mode: u32, directory: bool) -> io::Result<()> {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
     let metadata = std::fs::metadata(path)?;
@@ -837,7 +878,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("thegn-ipc-unremovable-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
-        std::fs::create_dir_all(&dir).unwrap();
+        prepare_control_directory(&dir, false).unwrap();
         let sock = dir.join("d.sock");
         let ep = IpcEndpoint::for_socket_path(&sock);
         let listener = match IpcListener::bind_exclusive(&ep).await.unwrap() {
@@ -975,6 +1016,50 @@ mod tests {
         assert!(
             !lock_sock.exists(),
             "failed lock acquisition must not create the endpoint"
+        );
+
+        let regular_sock = dir.join("regular.sock");
+        std::fs::write(&regular_sock, b"leave this file alone").unwrap();
+        let regular_ep = IpcEndpoint::for_socket_path(&regular_sock);
+        let regular_error = match IpcListener::bind_exclusive(&regular_ep).await {
+            Err(error) => error,
+            Ok(_) => panic!("bind must reject a regular file at the socket path"),
+        };
+        assert_eq!(regular_error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read(&regular_sock).unwrap(),
+            b"leave this file alone"
+        );
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_restricts_an_existing_broad_control_lock() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir =
+            std::env::temp_dir().join(format!("thegn-ipc-lock-upgrade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        prepare_control_directory(&dir, false).unwrap();
+        let sock = dir.join("d.sock");
+        let lock = dir.join("d.sock.lock");
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let listener = match IpcListener::bind_exclusive(&IpcEndpoint::for_socket_path(&sock))
+            .await
+            .unwrap()
+        {
+            BindOutcome::Bound(listener) => listener,
+            BindOutcome::AlreadyRunning => panic!("fresh path must bind"),
+        };
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "bind must tighten the preexisting lock before using it"
         );
 
         drop(listener);
