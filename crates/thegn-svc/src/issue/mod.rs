@@ -19,8 +19,10 @@ pub mod secret;
 
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, StreamExt};
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use thegn_core::config::{IssueAccount, IssueProviderKind, IssuesConfig, expand_env_ref};
 use thegn_core::issue::{Issue, IssueDetail, IssueDraft, IssueFilter, IssuePatch};
 use thegn_core::seam::{ErrorClass, SeamError};
@@ -28,8 +30,12 @@ use thegn_core::seam::{ErrorClass, SeamError};
 /// Four account reads bound network fan-out without serializing normal configs.
 /// `buffered` is load-bearing: unlike `buffer_unordered`, it preserves config
 /// order while reads overlap. The plugin issue backend's `list_issues` calls
-/// blocking `self.op`, so it yields no overlap and gets no benefit from this.
+/// blocking `self.op`, so it yields no overlap and gets no benefit from this;
+/// Tokio's timeout also cannot pre-empt synchronous blocking on a current-thread
+/// runtime.
 const MAX_CONCURRENT_ACCOUNTS: usize = 4;
+/// One total budget for an issue read across every configured account.
+const FANOUT_DEADLINE: Duration = Duration::from_secs(30);
 
 pub use capabilities::IssueCaps;
 
@@ -657,17 +663,24 @@ impl IssueRouter {
     /// empty tracker. Use [`list_per_provider`](Self::list_per_provider) there
     /// and report the per-account `Err`s (see `cmd::issue::list_tracker_issues`).
     pub async fn list_issues(&self, filter: &IssueFilter) -> Result<Vec<Issue>, IssueError> {
-        let mut all = Vec::new();
+        let mut per_account = Vec::new();
         let futures = self
             .inner
             .iter()
-            .map(|b| async move { (b, b.inner.list_issues(filter).await) })
+            .map(|b| (b, async move { b.inner.list_issues(filter).await }))
             .collect();
-        let results = fan_out(futures).await;
+        let results = fan_out_until(futures, FANOUT_DEADLINE).await;
         for (b, result) in results {
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!(account = %b.account, provider = b.inner.provider_id(), error = %error, "issue list account exceeded fan-out deadline");
+                    continue;
+                }
+            };
             match result {
                 Ok(issues) => match validate_issues(issues) {
-                    Ok(mut valid) => all.append(&mut valid),
+                    Ok(valid) => per_account.push(valid),
                     Err(e) => {
                         tracing::warn!(provider = b.inner.provider_id(), error = %e, "issue identity rejected")
                     }
@@ -695,14 +708,14 @@ impl IssueRouter {
                         reason,
                         "issue list is partial; retaining rows without caching it as complete"
                     );
-                    all.extend(valid);
+                    per_account.push(valid);
                 }
                 Err(e) => {
                     tracing::warn!(account = %b.account, provider = b.inner.provider_id(), error = %e, "issue list failed")
                 }
             }
         }
-        Ok(all)
+        Ok(merge_fair(per_account, filter.limit))
     }
 
     /// Per-account results in configuration order, so callers (the cache
@@ -715,13 +728,22 @@ impl IssueRouter {
         let futures = self
             .inner
             .iter()
-            .map(|b| async move {
-                // Keep PartialList as an error so cache refreshes never persist it as complete.
-                let result = b.inner.list_issues(filter).await.and_then(validate_issues);
-                (b.account.clone(), b.inner.provider_id(), result)
+            .map(|b| {
+                let metadata = (b.account.clone(), b.inner.provider_id());
+                (metadata, async move {
+                    // Keep PartialList as an error so cache refreshes never persist it as complete.
+                    b.inner.list_issues(filter).await.and_then(validate_issues)
+                })
             })
             .collect();
-        fan_out(futures).await
+        fan_out_until(futures, FANOUT_DEADLINE)
+            .await
+            .into_iter()
+            .map(|((account, provider), result)| {
+                let result = result.unwrap_or_else(Err);
+                (account, provider, result)
+            })
+            .collect()
     }
 
     pub async fn get_issue(&self, id: &str) -> Result<IssueDetail, IssueError> {
@@ -792,20 +814,27 @@ impl IssueRouter {
         self.inner.iter().find_map(|b| b.inner.as_kaneo())
     }
 
-    /// Search across all accounts concurrently with bounded reads, merging in
-    /// configuration order.
+    /// Search across all accounts concurrently with bounded reads, then
+    /// interleave ranked rows in configuration order with one global cap.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Issue>, IssueError> {
-        let mut all = Vec::new();
         let futures = self
             .inner
             .iter()
-            .map(|b| async move { (b, b.inner.search(query, limit).await) })
+            .map(|b| (b, async move { b.inner.search(query, limit).await }))
             .collect();
-        let results = fan_out(futures).await;
+        let results = fan_out_until(futures, FANOUT_DEADLINE).await;
+        let mut per_account = Vec::new();
         for (b, result) in results {
+            let result = match result {
+                Err(error) => {
+                    tracing::warn!(account = %b.account, provider = b.inner.provider_id(), error = %error, "issue search account exceeded fan-out deadline");
+                    continue;
+                }
+                Ok(result) => result,
+            };
             match result {
                 Ok(issues) => match validate_issues(issues) {
-                    Ok(mut valid) => all.append(&mut valid),
+                    Ok(valid) => per_account.push(valid),
                     Err(e) => {
                         tracing::warn!(provider = b.inner.provider_id(), error = %e, "issue identity rejected")
                     }
@@ -815,18 +844,54 @@ impl IssueRouter {
                 }
             }
         }
-        Ok(all)
+        Ok(merge_fair(per_account, limit))
     }
 }
 
-async fn fan_out<T, Fut>(futures: Vec<Fut>) -> Vec<T>
+async fn fan_out_until<M, T, Fut>(
+    futures: Vec<(M, Fut)>,
+    deadline: Duration,
+) -> Vec<(M, Result<T, IssueError>)>
 where
     Fut: Future<Output = T>,
 {
-    stream::iter(futures)
-        .buffered(MAX_CONCURRENT_ACCOUNTS)
-        .collect()
-        .await
+    let deadline_at = tokio::time::Instant::now() + deadline;
+    stream::iter(futures.into_iter().map(|(metadata, future)| async move {
+        let result = tokio::time::timeout_at(deadline_at, future)
+            .await
+            .map_err(|_| IssueError::Timeout("account read exceeded fan-out deadline"));
+        (metadata, result)
+    }))
+    .buffered(MAX_CONCURRENT_ACCOUNTS)
+    .collect()
+    .await
+}
+
+/// Interleave account-ranked rows fairly, retaining the first row for each
+/// stable issue id. A zero limit means unbounded, matching provider semantics.
+fn merge_fair(per_account: Vec<Vec<Issue>>, limit: usize) -> Vec<Issue> {
+    let mut positions = vec![0; per_account.len()];
+    let mut seen = HashSet::new();
+    let mut merged = Vec::new();
+    loop {
+        let mut advanced = false;
+        for (account, issues) in per_account.iter().enumerate() {
+            let Some(issue) = issues.get(positions[account]) else {
+                continue;
+            };
+            positions[account] += 1;
+            advanced = true;
+            if seen.insert(issue.id.clone()) {
+                merged.push(issue.clone());
+                if limit > 0 && merged.len() == limit {
+                    return merged;
+                }
+            }
+        }
+        if !advanced {
+            return merged;
+        }
+    }
 }
 
 fn validate_issues(issues: Vec<Issue>) -> Result<Vec<Issue>, IssueError> {
@@ -1196,6 +1261,106 @@ mod spec {
         issue: Issue,
     }
 
+    struct FixedBackend {
+        id: String,
+        issues: Vec<Issue>,
+        pending: bool,
+    }
+
+    impl IssueBackend for FixedBackend {
+        fn provider_id(&self) -> &str {
+            &self.id
+        }
+
+        fn caps(&self) -> IssueCaps {
+            IssueCaps::default()
+        }
+
+        fn list_issues<'a>(
+            &'a self,
+            filter: &'a IssueFilter,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async move {
+                if self.pending {
+                    std::future::pending().await
+                } else {
+                    let mut issues = self.issues.clone();
+                    if filter.limit > 0 {
+                        issues.truncate(filter.limit);
+                    }
+                    Ok(issues)
+                }
+            })
+        }
+
+        fn get_issue<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+
+        fn create_issue<'a>(
+            &'a self,
+            _draft: &'a IssueDraft,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+
+        fn update_issue<'a>(
+            &'a self,
+            _id: &'a str,
+            _patch: &'a IssuePatch,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            limit: usize,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async move {
+                if self.pending {
+                    std::future::pending().await
+                } else {
+                    let mut issues = self.issues.clone();
+                    if limit > 0 {
+                        issues.truncate(limit);
+                    }
+                    Ok(issues)
+                }
+            })
+        }
+    }
+
+    fn fixed_issue(id: &str) -> Issue {
+        Issue {
+            id: format!("linear:{id}"),
+            number: id.into(),
+            provider: "linear".into(),
+            title: id.into(),
+            status: thegn_core::issue::IssueStatus::Todo,
+            priority: thegn_core::issue::IssuePriority::Low,
+            url: format!("https://linear.app/acme/issue/{id}"),
+            ..Default::default()
+        }
+    }
+
+    fn fixed_router(accounts: Vec<(&str, Vec<Issue>)>) -> IssueRouter {
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        for (account, issues) in accounts {
+            router
+                .push_backend(
+                    account.into(),
+                    Box::new(FixedBackend {
+                        id: "linear".into(),
+                        issues,
+                        pending: false,
+                    }),
+                )
+                .unwrap();
+        }
+        router
+    }
+
     impl IssueBackend for BarrierBackend {
         fn provider_id(&self) -> &str {
             "linear"
@@ -1400,6 +1565,127 @@ mod spec {
             "search calls must overlap to release the barrier"
         );
         assert_eq!(searched.unwrap().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn search_caps_dedups_and_interleaves_accounts() {
+        let router = fixed_router(vec![
+            (
+                "A",
+                vec![
+                    fixed_issue("a1"),
+                    fixed_issue("a2"),
+                    fixed_issue("a3"),
+                    fixed_issue("dup"),
+                ],
+            ),
+            ("B", vec![fixed_issue("b1"), fixed_issue("dup")]),
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let capped = runtime.block_on(router.search("q", 3)).unwrap();
+        assert_eq!(
+            capped
+                .iter()
+                .map(|issue| issue.number.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a1", "b1", "a2"]
+        );
+        let unbounded = runtime.block_on(router.search("q", 0)).unwrap();
+        assert_eq!(unbounded.len(), 5);
+        assert_eq!(
+            unbounded
+                .iter()
+                .filter(|issue| issue.number == "dup")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn list_issues_applies_one_final_cap() {
+        let router = fixed_router(vec![
+            (
+                "A",
+                vec![fixed_issue("a1"), fixed_issue("a2"), fixed_issue("a3")],
+            ),
+            (
+                "B",
+                vec![fixed_issue("b1"), fixed_issue("b2"), fixed_issue("b3")],
+            ),
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let issues = runtime
+            .block_on(router.list_issues(&IssueFilter::my_open(2)))
+            .unwrap();
+        assert_eq!(issues.len(), 2);
+    }
+
+    #[test]
+    fn limit_exactly_equal_to_available_rows_and_single_account_keep_order() {
+        let two_accounts = fixed_router(vec![
+            (
+                "A",
+                vec![fixed_issue("a1"), fixed_issue("a2"), fixed_issue("a3")],
+            ),
+            (
+                "B",
+                vec![fixed_issue("b1"), fixed_issue("b2"), fixed_issue("b3")],
+            ),
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let all = runtime.block_on(two_accounts.search("q", 6)).unwrap();
+        assert_eq!(all.len(), 6);
+        assert_eq!(
+            all.iter()
+                .map(|issue| issue.number.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a1", "b1", "a2", "b2", "a3", "b3"]
+        );
+
+        let one_account = fixed_router(vec![(
+            "A",
+            vec![fixed_issue("a1"), fixed_issue("a2"), fixed_issue("a3")],
+        )]);
+        let ordered = runtime.block_on(one_account.search("q", 3)).unwrap();
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|issue| issue.number.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a1", "a2", "a3"]
+        );
+    }
+
+    #[test]
+    fn hung_account_is_reported_as_timeout_without_blocking_healthy_ones() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let healthy: BoxFuture<'static, usize> = Box::pin(async { 7 });
+        let hung: BoxFuture<'static, usize> = Box::pin(std::future::pending());
+        let results = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                fan_out_until(vec![("A", healthy), ("B", hung)], Duration::from_millis(50)),
+            )
+            .await
+        });
+        let results = results.expect("fan-out deadline must bound the hung account");
+        assert_eq!(results[0].0, "A");
+        assert!(matches!(&results[0].1, Ok(7)));
+        assert_eq!(results[1].0, "B");
+        assert!(matches!(&results[1].1, Err(IssueError::Timeout(_))));
     }
 
     #[test]
