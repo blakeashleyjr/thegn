@@ -730,8 +730,15 @@ fn sealed_launch_refuses_compose_backed_specs() {
             && err.to_string().contains("sealed home"),
         "{err}"
     );
-    // Non-sealed compose is unaffected by this gate.
+    // A non-sealed Compose spec still refuses restrictions it cannot enforce.
     s.seal_home = None;
+    let err = enter_argv(&s, "true").unwrap_err();
+    assert!(err.to_string().contains("read_only_root"), "{err}");
+
+    // An open spec with no unenforceable restrictions remains launchable.
+    s.read_only_root = false;
+    s.no_new_privileges = false;
+    s.network = Network::Nat;
     assert!(enter_argv(&s, "true").is_ok());
 }
 
