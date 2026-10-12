@@ -1139,9 +1139,9 @@ fn set_status_on(
     let row = db
         .get_dispatch(id)?
         .ok_or_else(|| anyhow::anyhow!("no dispatch with id {id}"))?;
-    if !thegn_core::db_dispatch::set_status_transition_allowed(row.status, parsed) {
+    if !thegn_core::db::set_status_transition_allowed(row.status, parsed) {
         return Err(anyhow::Error::new(
-            thegn_core::db_dispatch::DispatchTransitionConflict::Illegal {
+            thegn_core::db::DispatchTransitionConflict::Illegal {
                 id,
                 from: row.status,
                 to: parsed,
@@ -2264,14 +2264,12 @@ mod tests {
 
         let err = set_status_on(&db, id, AgentDispatchStatus::Done, false, None, true).unwrap_err();
         assert!(matches!(
-            err.downcast_ref::<thegn_core::db_dispatch::DispatchTransitionConflict>(),
-            Some(
-                thegn_core::db_dispatch::DispatchTransitionConflict::Illegal {
-                    from: AgentDispatchStatus::Merged,
-                    to: AgentDispatchStatus::Done,
-                    ..
-                }
-            )
+            err.downcast_ref::<thegn_core::db::DispatchTransitionConflict>(),
+            Some(thegn_core::db::DispatchTransitionConflict::Illegal {
+                from: AgentDispatchStatus::Merged,
+                to: AgentDispatchStatus::Done,
+                ..
+            })
         ));
     }
 

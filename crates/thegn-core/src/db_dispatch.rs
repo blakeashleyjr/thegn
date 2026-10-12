@@ -839,7 +839,7 @@ impl Db {
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<std::result::Result<i64, DispatchAdmissionDecision>> {
-            let rows = self.admission_rows(&new.issue_id, &new.worktree_path)?;
+            let rows = self.admission_rows(new.issue_id, new.worktree_path)?;
             if let Some(parent_id) = new.parent_id
                 && !self.dispatch_parent_exists(parent_id)?
             {
@@ -1092,7 +1092,7 @@ impl Db {
                     )?;
                 }
 
-                let rows = self.admission_rows(&new.issue_id, &new.worktree_path)?;
+                let rows = self.admission_rows(new.issue_id, new.worktree_path)?;
                 let decision = decide(&rows, &req, limit);
                 if !decision.granted() {
                     return Ok(Err(decision));
