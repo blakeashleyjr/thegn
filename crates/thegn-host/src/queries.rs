@@ -490,6 +490,7 @@ mod tests {
                 | crate::kitty_relay::Piece::GfxOther(bytes) => {
                     query_replies.extend(parser.feed(&bytes, (4, 9), (24, 80), COLORS));
                 }
+                crate::kitty_relay::Piece::Rejected => {}
             },
         );
         assert!(relay_replies.starts_with(b"\x1b_Gi=31;"));
