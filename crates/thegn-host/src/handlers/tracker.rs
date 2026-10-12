@@ -18,6 +18,19 @@ use crate::chrome::FrameModel;
 use crate::hydrate::active_tab_path;
 use crate::naming::issue_branch_tail;
 
+pub(crate) fn panel_issue_router(
+    app_cfg: &thegn_core::config::Config,
+    repo_root: &Path,
+    cwd: &Path,
+) -> thegn_svc::issue::IssueRouter {
+    let mut router = thegn_svc::issue::IssueRouter::from_config_at(
+        &app_cfg.repo_issues(Some(repo_root)),
+        Some(cwd),
+    );
+    crate::plugin_providers::extend_issue_router(&mut router);
+    router
+}
+
 /// The loop locals the tracker keys need, borrowed for one keypress.
 pub(crate) struct TrackerCtx<'a> {
     pub model: &'a mut FrameModel,
@@ -181,14 +194,14 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
         'a' => {
             // Self-assign the cursor issue.
             if let Some(issue) = cursor_issue(ctx) {
-                let cfg = ctx.live_cfg.issues.clone();
                 let full_cfg = ctx.live_cfg.clone();
                 let waker2 = ctx.waker.clone();
                 let cwd2 = active_tab_path(ctx.session);
                 tokio::task::spawn_blocking(move || {
                     use thegn_core::issue::IssuePatch;
-                    use thegn_svc::issue::IssueRouter;
-                    let router = IssueRouter::from_config_at(&cfg, Some(&cwd2));
+                    let repo_root =
+                        thegn_core::repo::main_worktree(&cwd2).unwrap_or_else(|| cwd2.clone());
+                    let router = panel_issue_router(&full_cfg, &repo_root, &cwd2);
                     if !router.is_configured() {
                         return;
                     }
@@ -340,16 +353,15 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             // its task rather than only the `THEGN_ISSUE_*` env below. Rendering
             // (not shell-quoting) is correct here: the value rides an env var,
             // where the shell never re-parses it.
-            use thegn_core::agent_task::{TaskKind, TaskVars, default_prompt, render_prompt};
-            let vars = TaskVars::new()
-                .set("issue_number", issue_number.clone())
-                .set("issue_title", issue_title.clone())
-                .set("issue_body", issue_body.clone())
-                .set("issue_url", issue_url.clone())
-                .set("branch", branch.clone())
-                .set("worktree", wt_str.clone());
-            let rendered_prompt =
-                render_prompt(default_prompt(TaskKind::Issue), &vars).unwrap_or_default();
+            use thegn_core::agent_task::{TaskKind, bound_text, input_max_bytes};
+            let rendered_prompt = issue_dispatch_prompt(
+                &issue_number,
+                &issue_title,
+                &issue_body,
+                &issue_url,
+                &branch,
+                &wt_str,
+            );
 
             let mut spec = match crate::direnv_warm::launch_spec_synced_with(
                 &cfg2,
@@ -379,12 +391,14 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                 }
             };
 
-            // Inject issue context for the agent.
-            spec.env.push(("THEGN_ISSUE_ID".into(), issue_id.clone()));
-            spec.env
-                .push(("THEGN_ISSUE_TITLE".into(), issue_title.clone()));
-            spec.env.push(("THEGN_ISSUE_BODY".into(), issue_body));
-            spec.env.push(("THEGN_ISSUE_URL".into(), issue_url));
+            // Inject issue context for the agent, with each value bounded by
+            // the same per-kind limits used before prompt rendering.
+            spec.env.extend(bounded_issue_env(
+                &issue_id,
+                &issue_title,
+                &issue_body,
+                &issue_url,
+            ));
 
             let root_s = root.to_string_lossy();
 
@@ -493,6 +507,54 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
     }
 }
 
+fn issue_dispatch_prompt(
+    issue_number: &str,
+    issue_title: &str,
+    issue_body: &str,
+    issue_url: &str,
+    branch: &str,
+    worktree: &str,
+) -> String {
+    use thegn_core::agent_task::{TaskKind, TaskVars, default_prompt, render_kind_prompt};
+
+    let vars = TaskVars::new()
+        .set("issue_number", issue_number)
+        .set("issue_title", issue_title)
+        .set("issue_body", issue_body)
+        .set("issue_url", issue_url)
+        .set("branch", branch)
+        .set("worktree", worktree);
+    render_kind_prompt(TaskKind::Issue, default_prompt(TaskKind::Issue), &vars).unwrap_or_default()
+}
+
+fn bounded_issue_env(
+    issue_id: &str,
+    issue_title: &str,
+    issue_body: &str,
+    issue_url: &str,
+) -> [(String, String); 4] {
+    use thegn_core::agent_task::{TaskKind, bound_text, input_max_bytes};
+
+    [
+        (
+            "THEGN_ISSUE_ID".into(),
+            bound_text(issue_id, input_max_bytes(TaskKind::Issue, "issue_number")),
+        ),
+        (
+            "THEGN_ISSUE_TITLE".into(),
+            bound_text(issue_title, input_max_bytes(TaskKind::Issue, "issue_title")),
+        ),
+        (
+            "THEGN_ISSUE_BODY".into(),
+            bound_text(issue_body, input_max_bytes(TaskKind::Issue, "issue_body")),
+        ),
+        (
+            "THEGN_ISSUE_URL".into(),
+            bound_text(issue_url, input_max_bytes(TaskKind::Issue, "issue_url")),
+        ),
+    ]
+}
+
 /// Branch-from-issue completion: link the freshly created worktree to the
 /// issue it was branched from, so its tab carries the issue badge. Called
 /// from the wizard `CreateEvent::Done` arm; leaves a non-matching pending
@@ -513,3 +575,7 @@ pub(crate) fn on_worktree_created(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tracker_tests.rs"]
+mod tests;

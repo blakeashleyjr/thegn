@@ -144,9 +144,12 @@ fn execute(
         &worktree,
         request.feedback.clone(),
     );
-    let prompt =
-        thegn_core::agent_task::render_prompt(queue.prompts.resolve(TaskKind::PrReview), &vars)
-            .map_err(|_| "review handoff held: configured review prompt is invalid")?;
+    let prompt = thegn_core::agent_task::render_kind_prompt(
+        TaskKind::PrReview,
+        queue.prompts.resolve(TaskKind::PrReview),
+        &vars,
+    )
+    .map_err(|_| "review handoff held: configured review prompt is invalid")?;
     if let Some((db, forge, permit, pr)) = &admitted {
         pr_authorship::revalidate(Some(permit), db, *forge, &loc, pr, false)?;
     }
