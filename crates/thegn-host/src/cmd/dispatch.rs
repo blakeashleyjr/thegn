@@ -1334,6 +1334,10 @@ fn verify_facts_with_report_head(
 }
 
 /// Return Some(true/false) for git exit 0/1; any spawn or other exit failure is unknown.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "dispatch verify, set-status, and wait are CLI paths off the compositor loop"
+)]
 fn git_exit_0_or_1(worktree: &std::path::Path, args: &[&str]) -> Option<bool> {
     let output = thegn_core::util::git_cmd(worktree)
         .args(args)
