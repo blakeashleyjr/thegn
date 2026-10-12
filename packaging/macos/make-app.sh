@@ -102,7 +102,7 @@ if [[ ! $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ || $name == . || $name == .. 
   echo "make-app.sh: --name must be 1-64 ASCII letters, digits, dots, underscores, or hyphens and start with a letter or digit" >&2
   exit 2
 fi
-for kv in "${envs[@]}"; do
+for kv in ${envs+"${envs[@]}"}; do
   env_key="${kv%%=*}"
   if [[ ! $env_key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
     echo "make-app.sh: invalid --env key: $env_key" >&2
