@@ -146,6 +146,7 @@ nix.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 [dev-dependencies]
+crc32fast = "1"
 rusqlite.workspace = true
 tracing-subscriber.workspace = true
 # The architecture ratchets (`test/*-ratchet.txt`) share one helper.
