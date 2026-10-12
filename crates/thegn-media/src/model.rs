@@ -191,36 +191,42 @@ fn percent_decode(value: &str) -> Option<String> {
 
 /// Normalize provider-controlled text before it is displayed in terminal UI.
 /// C0/C1 controls become spaces; bidi and zero-width formatting controls drop.
+/// Output is capped at `MAX_LABEL_CHARS` normalized characters, with `...` when visible text is
+/// omitted.
 pub fn display_text(value: &str) -> String {
     display_text_parts(&[value])
+}
+
+fn normalize_display_char(ch: char) -> Option<char> {
+    match ch {
+        '\u{061c}'
+        | '\u{200e}'
+        | '\u{200f}'
+        | '\u{202a}'..='\u{202e}'
+        | '\u{2066}'..='\u{2069}'
+        | '\u{200b}'..='\u{200d}'
+        | '\u{feff}' => None,
+        ch if ch.is_control() => Some(' '),
+        ch => Some(ch),
+    }
 }
 
 fn display_text_parts(parts: &[&str]) -> String {
     let mut chars = parts.iter().flat_map(|part| part.chars());
     let mut output = String::with_capacity(MAX_LABEL_CHARS + 3);
     let mut count = 0;
-    while let Some(ch) = chars.next() {
-        let normalized = match ch {
-            '\u{061c}'
-            | '\u{200e}'
-            | '\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{200b}'..='\u{200d}'
-            | '\u{feff}' => None,
-            ch if ch.is_control() => Some(' '),
-            ch => Some(ch),
-        };
+    for ch in chars.by_ref() {
+        let normalized = normalize_display_char(ch);
         if let Some(normalized) = normalized {
             output.push(normalized);
             count += 1;
             if count == MAX_LABEL_CHARS {
-                if chars.next().is_some() {
-                    output.push_str("...");
-                }
                 break;
             }
         }
+    }
+    if count == MAX_LABEL_CHARS && chars.any(|ch| normalize_display_char(ch).is_some()) {
+        output.push_str("...");
     }
     output
 }
@@ -455,6 +461,12 @@ mod tests {
         let normalized = display_text(&"x".repeat(1024 * 1024));
         assert!(normalized.chars().count() <= MAX_LABEL_CHARS + 3);
         assert!(normalized.ends_with("..."));
+    }
+
+    #[test]
+    fn display_text_does_not_mark_dropped_tail_as_truncated() {
+        let value = format!("{}\u{200b}", "x".repeat(MAX_LABEL_CHARS));
+        assert_eq!(display_text(&value), "x".repeat(MAX_LABEL_CHARS));
     }
 
     #[test]
