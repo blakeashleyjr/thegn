@@ -194,11 +194,14 @@ struct LinearIssueDetail {
 #[derive(Deserialize, Default)]
 struct LinearCommentList {
     nodes: Vec<LinearComment>,
+    #[serde(default, rename = "pageInfo")]
+    page_info: Option<LinearPageInfo>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LinearComment {
+    id: String,
     body: String,
     user: Option<LinearUser>,
     created_at: String,
@@ -552,9 +555,35 @@ fn build_get_query(identifier: &str) -> String {
     format!(
         r#"query {{ issue(id: "{identifier}") {{
                 {ISSUE_FIELDS}
-                comments {{ nodes {{ body user {{ name }} createdAt }} }}
+                comments(first: {MAX_PAGE_SIZE}) {{
+                    nodes {{ id body user {{ name }} createdAt }}
+                    pageInfo {{ hasNextPage endCursor }}
+                }}
             }} }}"#
     )
+}
+
+fn build_comments_page_query(identifier: &str, after: &str) -> String {
+    let identifier = escape_graphql_str(identifier);
+    let after = escape_graphql_str(after);
+    format!(
+        r#"query {{ issue(id: "{identifier}") {{
+                comments(first: {MAX_PAGE_SIZE}, after: "{after}") {{
+                    nodes {{ id body user {{ name }} createdAt }}
+                    pageInfo {{ hasNextPage endCursor }}
+                }}
+            }} }}"#
+    )
+}
+
+#[derive(Deserialize)]
+struct LinearIssueComments {
+    issue: LinearCommentDetail,
+}
+
+#[derive(Deserialize)]
+struct LinearCommentDetail {
+    comments: Option<LinearCommentList>,
 }
 
 impl IssueBackend for LinearBackend {
@@ -666,11 +695,48 @@ impl IssueBackend for LinearBackend {
             let query = build_get_query(identifier);
             let data: LinearIssueWithComments = Self::gql(&mut op, &query, Vars {}).await?;
             let li = data.issue;
-            let comments = li
-                .comments
-                .unwrap_or_default()
-                .nodes
+            let mut comment_page = li.comments.ok_or_else(|| {
+                IssueError::Parse("Linear comment pagination incomplete: missing comments".into())
+            })?;
+            let mut comments = comment_page.nodes;
+            let mut seen_cursors = std::collections::HashSet::new();
+            for page in 0..MAX_LIST_PAGES {
+                let info = comment_page.page_info.ok_or_else(|| {
+                    IssueError::Parse(
+                        "Linear comment pagination incomplete: missing pagination metadata".into(),
+                    )
+                })?;
+                if !info.has_next_page {
+                    break;
+                }
+                let cursor = info.end_cursor.ok_or_else(|| {
+                    IssueError::Parse(
+                        "Linear comment pagination incomplete: missing end cursor".into(),
+                    )
+                })?;
+                if !seen_cursors.insert(cursor.clone()) {
+                    return Err(IssueError::Parse(
+                        "Linear comment pagination incomplete: repeated cursor".into(),
+                    ));
+                }
+                if page + 1 == MAX_LIST_PAGES {
+                    return Err(IssueError::Parse(
+                        "Linear comment pagination incomplete: page cap reached".into(),
+                    ));
+                }
+                let query = build_comments_page_query(identifier, &cursor);
+                let data: LinearIssueComments = Self::gql(&mut op, &query, Vars {}).await?;
+                comment_page = data.issue.comments.ok_or_else(|| {
+                    IssueError::Parse(
+                        "Linear comment pagination incomplete: missing comments".into(),
+                    )
+                })?;
+                comments.append(&mut comment_page.nodes);
+            }
+            let mut seen_comments = std::collections::HashSet::new();
+            let comments = comments
                 .into_iter()
+                .filter(|comment| seen_comments.insert(comment.id.clone()))
                 .map(|c| IssueComment {
                     author: c.user.map(|u| u.name).unwrap_or_else(|| "unknown".into()),
                     body: c.body,
@@ -1023,6 +1089,146 @@ mod tests {
             assert!(queries[0].contains("pageInfo { hasNextPage endCursor }"));
             assert!(queries[1].contains("after: \"cursor-1\""), "{}", queries[1]);
         }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn get_issue_follows_comment_cursors_in_order() {
+        use std::sync::Mutex;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let route_queries = Arc::clone(&queries);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let route_calls = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |request: Request| {
+                let route_queries = Arc::clone(&route_queries);
+                let route_calls = Arc::clone(&route_calls);
+                async move {
+                    let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    route_queries
+                        .lock()
+                        .unwrap()
+                        .push(request["query"].as_str().unwrap().to_string());
+                    let call = route_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let payload = if call == 0 {
+                        let mut issue = list_item(1);
+                        issue["comments"] = json!({
+                            "nodes": [
+                                {"id": "comment-1", "body": "first", "user": {"name": "Ada"}, "createdAt": "2026-09-01T00:00:00Z"},
+                                {"id": "comment-2", "body": "second", "user": {"name": "Lin"}, "createdAt": "2026-09-02T00:00:00Z"}
+                            ],
+                            "pageInfo": {"hasNextPage": true, "endCursor": "c-1"}
+                        });
+                        json!({"data": {"issue": issue}})
+                    } else {
+                        json!({"data": {"issue": {"comments": {
+                            "nodes": [
+                                {"id": "comment-2", "body": "second duplicate", "user": {"name": "Lin"}, "createdAt": "2026-09-02T00:00:00Z"},
+                                {"id": "comment-3", "body": "third", "user": {"name": "Grace"}, "createdAt": "2026-09-03T00:00:00Z"}
+                            ],
+                            "pageInfo": {"hasNextPage": false, "endCursor": null}
+                        }}}})
+                    };
+                    let mut response =
+                        (StatusCode::OK, Body::from(payload.to_string())).into_response();
+                    response.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend = LinearBackend::new_for_test(
+            "linear-secret".into(),
+            None,
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+            &format!("http://{address}"),
+        );
+
+        let detail = backend.get_issue("linear:ABC-1").await.unwrap();
+        assert_eq!(
+            detail
+                .comments
+                .iter()
+                .map(|comment| comment.body.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        {
+            let queries = queries.lock().unwrap();
+            assert!(
+                queries[0].contains("comments(first: 250)"),
+                "{}",
+                queries[0]
+            );
+            assert!(queries[1].contains("after: \"c-1\""), "{}", queries[1]);
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn get_issue_rejects_repeated_comment_cursor() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let route_calls = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |request: Request| {
+                let route_calls = Arc::clone(&route_calls);
+                async move {
+                    let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let call = route_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let page = json!({
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": true, "endCursor": "same-cursor"}
+                    });
+                    let payload = if call == 0 {
+                        let mut issue = list_item(1);
+                        issue["comments"] = page;
+                        json!({"data": {"issue": issue}})
+                    } else {
+                        json!({"data": {"issue": {"comments": page}}})
+                    };
+                    assert!(request["query"].as_str().unwrap().contains("comments"));
+                    let mut response =
+                        (StatusCode::OK, Body::from(payload.to_string())).into_response();
+                    response.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend = LinearBackend::new_for_test(
+            "linear-secret".into(),
+            None,
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+            &format!("http://{address}"),
+        );
+
+        let result = backend.get_issue("linear:ABC-1").await;
+        assert!(matches!(
+            result,
+            Err(IssueError::Parse(message))
+                if message == "Linear comment pagination incomplete: repeated cursor"
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
     }
