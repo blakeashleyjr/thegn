@@ -119,6 +119,24 @@ struct GlyphPartitionConfig<'a> {
     active_floor: Duration,
 }
 
+fn may_live_scan_for_location<E: std::fmt::Display>(
+    path: &str,
+    location: Result<Option<String>, E>,
+    is_active: bool,
+) -> bool {
+    let location = match location {
+        Ok(location) => location,
+        Err(error) => {
+            tracing::debug!(target: "thegn::hydrate", path = %path, %error, "worktree location lookup failed; treating location as local for glyph scan");
+            None
+        }
+    };
+    let loc = thegn_core::remote::GitLoc::from_db(path, location.as_deref());
+    let remote = loc.is_remote();
+    let warm = remote && thegn_svc::bridge::for_loc(&loc).is_some();
+    thegn_core::lifecycle::should_live_scan(remote, warm, is_active)
+}
+
 #[allow(clippy::type_complexity)]
 fn partition_glyph_paths(
     paths: &[String],
@@ -1694,22 +1712,11 @@ fn collect_sidebar_status(
         paths
             .iter()
             .map(|p| {
-                let may_scan = match db.location_for(p) {
-                    Ok(location) => {
-                        let loc = GitLoc::from_db(p, location.as_deref());
-                        let remote = loc.is_remote();
-                        let warm = remote && thegn_svc::bridge::for_loc(&loc).is_some();
-                        thegn_core::lifecycle::should_live_scan(
-                            remote,
-                            warm,
-                            active_path.as_deref() == Some(p.as_str()),
-                        )
-                    }
-                    Err(error) => {
-                        tracing::debug!(target: "thegn::hydrate", path = %p, %error, "worktree location lookup failed; skipping glyph scan");
-                        false
-                    }
-                };
+                let may_scan = may_live_scan_for_location(
+                    p,
+                    db.location_for(p),
+                    active_path.as_deref() == Some(p.as_str()),
+                );
                 (p.clone(), may_scan)
             })
             .collect()
@@ -2149,8 +2156,12 @@ fn branch_fetch_needed(
     branches_open: bool,
     cached_age: Option<std::time::Duration>,
     ttl: std::time::Duration,
+    last_failure_age: Option<std::time::Duration>,
 ) -> bool {
     if !want {
+        return false;
+    }
+    if last_failure_age.is_some_and(|age| age < ttl) {
         return false;
     }
     if branches_open {
@@ -2160,23 +2171,78 @@ fn branch_fetch_needed(
     }
 }
 
-/// Resolve a repo-wide branch observation without allowing a failed fetch to
-/// replace last-known-good cache contents.
-fn resolve_branches(
+const BRANCH_FAILURE_CACHE_CAPACITY: usize = 256;
+
+fn branch_failure_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Instant>> {
+    static FAILURES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Instant>>,
+    > = std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn branch_failure_age(root: &Path, now: Instant) -> Option<Duration> {
+    branch_failure_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(root)
+        .map(|failed_at| now.saturating_duration_since(*failed_at))
+}
+
+fn record_branch_failure(root: &Path, now: Instant) {
+    let mut failures = branch_failure_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    failures.retain(|_, failed_at| {
+        now.saturating_duration_since(*failed_at) < crate::branch_cache::BRANCH_CACHE_TTL
+    });
+    if !failures.contains_key(root) && failures.len() >= BRANCH_FAILURE_CACHE_CAPACITY {
+        if let Some(oldest) = failures
+            .iter()
+            .min_by_key(|(_, failed_at)| **failed_at)
+            .map(|(path, _)| path.clone())
+        {
+            failures.remove(&oldest);
+        }
+    }
+    failures.insert(root.to_path_buf(), now);
+}
+
+fn clear_branch_failure(root: &Path) {
+    branch_failure_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(root);
+}
+
+/// Apply a repo-wide branch refresh, preserving last-known-good shared cache
+/// contents on failure and throttling repeated failed subprocesses per repo.
+fn apply_branch_refresh(
+    root: Option<&Path>,
     need_fetch: bool,
-    fetched: Option<std::result::Result<Vec<thegn_core::gitrefs::BranchInfo>, ()>>,
+    fetched: Option<std::result::Result<Vec<thegn_core::gitrefs::BranchInfo>, String>>,
     cached: Option<Vec<thegn_core::gitrefs::BranchInfo>>,
-) -> (
-    Vec<thegn_core::gitrefs::BranchInfo>,
-    Option<Vec<thegn_core::gitrefs::BranchInfo>>,
-) {
+) -> Vec<thegn_core::gitrefs::BranchInfo> {
     if need_fetch {
         match fetched {
-            Some(Ok(branches)) => (branches.clone(), Some(branches)),
-            Some(Err(())) | None => (cached.unwrap_or_default(), None),
+            Some(Ok(branches)) => {
+                if let Some(root) = root {
+                    crate::branch_cache::put(root, branches.clone());
+                    clear_branch_failure(root);
+                }
+                branches
+            }
+            Some(Err(error)) => {
+                tracing::debug!(target: "thegn::hydrate", %error, "branch refresh failed; keeping cached observation");
+                if let Some(root) = root {
+                    record_branch_failure(root, Instant::now());
+                }
+                cached.unwrap_or_default()
+            }
+            None => cached.unwrap_or_default(),
         }
     } else {
-        (cached.unwrap_or_default(), None)
+        cached.unwrap_or_default()
     }
 }
 
@@ -2709,11 +2775,15 @@ pub(crate) fn build_panel(
     let repo_root = want_branches
         .then(|| thegn_core::repo::main_worktree(cwd).unwrap_or_else(|| cwd.to_path_buf()));
     let cached_branches = repo_root.as_deref().and_then(crate::branch_cache::get);
+    let failure_age = repo_root
+        .as_deref()
+        .and_then(|root| branch_failure_age(root, Instant::now()));
     let need_branch_fetch = branch_fetch_needed(
         want_branches,
         branches_open,
         cached_branches.as_ref().map(|(_, age)| *age),
         crate::branch_cache::BRANCH_CACHE_TTL,
+        failure_age,
     );
 
     // THE-718: `status`, `diff HEAD` (+ its entity summary) and the stash count
@@ -2925,17 +2995,12 @@ pub(crate) fn build_panel(
 
     // Resolve the branch list: a fresh fetch refreshes the shared repo cache;
     // otherwise reuse the warm entry populated by this (or a sibling) worktree.
-    if let Some(Err(error)) = fetched_branches.as_ref() {
-        tracing::debug!(target: "thegn::hydrate", %error, "branch refresh failed; keeping cached observation");
-    }
-    let (branches_raw, branches_to_cache) = resolve_branches(
+    let branches_raw = apply_branch_refresh(
+        repo_root.as_deref(),
         need_branch_fetch,
-        fetched_branches.map(|result| result.map_err(|_| ())),
+        fetched_branches,
         cached_branches.map(|(branches, _)| branches),
     );
-    if let (Some(root), Some(branches)) = (repo_root.as_deref(), branches_to_cache) {
-        crate::branch_cache::put(root, branches);
-    }
 
     // Per-worktree cache key: the HOST path, never `loc.path()` (which
     // collides across sandboxed worktrees — see `worktree_cache_key`).

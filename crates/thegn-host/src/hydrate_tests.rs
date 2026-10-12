@@ -69,6 +69,13 @@ fn glyph_partition_keeps_suspended_cache_skips_uncached_and_scans_active() {
     let cached_row = glyph_row(true, 2, 1, Some("feature"), "/repo", 3, 1, Some((8, 2)));
     let mut cache = HashMap::new();
     cache.insert(suspended.clone(), (cached_row.clone(), now));
+    cache.insert(
+        active.clone(),
+        (
+            cached_row.clone(),
+            now.checked_sub(Duration::from_secs(5)).unwrap(),
+        ),
+    );
     let mut may_scan = HashMap::new();
     may_scan.insert(suspended.clone(), false);
     may_scan.insert(absent.clone(), false);
@@ -89,6 +96,18 @@ fn glyph_partition_keeps_suspended_cache_skips_uncached_and_scans_active() {
     assert_eq!(to_scan, vec![active.clone()], "active path live-scans");
     assert_eq!(reused, vec![(suspended, cached_row.clone())]);
     assert_eq!(prior.get(&active), Some(&cached_row));
+}
+
+#[test]
+fn glyph_location_lookup_failure_falls_back_to_local_scan_policy() {
+    let path = "/repo/local";
+    let on_lookup_error = may_live_scan_for_location(path, Err("database unavailable"), false);
+    let on_local_miss = may_live_scan_for_location(path, Ok(None), false);
+    assert!(
+        on_lookup_error,
+        "a DB error must retain local live scanning"
+    );
+    assert_eq!(on_lookup_error, on_local_miss);
 }
 
 #[test]
@@ -1398,19 +1417,43 @@ fn branch_fetch_needed_open_follows_ttl_warm_only_cold_miss() {
     let stale = Some(ttl + Duration::from_secs(1));
 
     // Nothing wanted → never fetch, regardless of cache state.
-    assert!(!branch_fetch_needed(false, true, None, ttl));
-    assert!(!branch_fetch_needed(false, false, None, ttl));
+    assert!(!branch_fetch_needed(false, true, None, ttl, None));
+    assert!(!branch_fetch_needed(false, false, None, ttl, None));
 
     // Open section: TTL refresh — cold or stale fetches, fresh skips.
-    assert!(branch_fetch_needed(true, true, None, ttl));
-    assert!(branch_fetch_needed(true, true, stale, ttl));
-    assert!(!branch_fetch_needed(true, true, fresh, ttl));
+    assert!(branch_fetch_needed(true, true, None, ttl, None));
+    assert!(branch_fetch_needed(true, true, stale, ttl, None));
+    assert!(!branch_fetch_needed(true, true, fresh, ttl, None));
 
     // Warm-only: cold miss ONLY — a cached list is reused even when stale, so the
     // repo-global `branches_full` subprocess never runs on the ticker.
-    assert!(branch_fetch_needed(true, false, None, ttl));
-    assert!(!branch_fetch_needed(true, false, stale, ttl));
-    assert!(!branch_fetch_needed(true, false, fresh, ttl));
+    assert!(branch_fetch_needed(true, false, None, ttl, None));
+    assert!(!branch_fetch_needed(true, false, stale, ttl, None));
+    assert!(!branch_fetch_needed(true, false, fresh, ttl, None));
+}
+
+#[test]
+fn branch_fetch_failure_backoff_suppresses_warm_and_open_refreshes() {
+    use std::time::Duration;
+
+    let ttl = crate::branch_cache::BRANCH_CACHE_TTL;
+    let inside_backoff = ttl - Duration::from_millis(1);
+    assert!(!branch_fetch_needed(
+        true,
+        false,
+        None,
+        ttl,
+        Some(inside_backoff)
+    ));
+    assert!(!branch_fetch_needed(
+        true,
+        true,
+        Some(ttl),
+        ttl,
+        Some(inside_backoff)
+    ));
+    assert!(branch_fetch_needed(true, false, None, ttl, Some(ttl)));
+    assert!(branch_fetch_needed(true, true, Some(ttl), ttl, Some(ttl)));
 }
 
 fn test_branch(name: &str) -> thegn_core::gitrefs::BranchInfo {
@@ -1430,18 +1473,16 @@ fn test_branch(name: &str) -> thegn_core::gitrefs::BranchInfo {
 #[test]
 fn failed_branch_fetch_preserves_cached_observation() {
     let good = vec![test_branch("main")];
-    let (branches, to_cache) = resolve_branches(true, Some(Err(())), Some(good.clone()));
+    let branches =
+        apply_branch_refresh(None, true, Some(Err("failure".into())), Some(good.clone()));
     assert_eq!(branches, good);
-    assert!(to_cache.is_none(), "failed result must not be cached");
 
-    let (branches, to_cache) = resolve_branches(true, Some(Err(())), None);
+    let branches = apply_branch_refresh(None, true, Some(Err("failure".into())), None);
     assert!(branches.is_empty(), "cold failure has no fabricated data");
-    assert!(to_cache.is_none());
 
     let fresh = vec![test_branch("feature")];
-    let (branches, to_cache) = resolve_branches(true, Some(Ok(fresh.clone())), None);
+    let branches = apply_branch_refresh(None, true, Some(Ok(fresh.clone())), None);
     assert_eq!(branches, fresh);
-    assert_eq!(to_cache, Some(fresh));
 }
 
 #[test]
@@ -1450,11 +1491,23 @@ fn failed_branch_fetch_does_not_poison_shared_cache() {
     let root = dir.path();
     let good = vec![test_branch("main")];
     crate::branch_cache::put(root, good.clone());
-    let (branches, to_cache) = resolve_branches(true, Some(Err(())), Some(good.clone()));
+    let branches = apply_branch_refresh(
+        Some(root),
+        true,
+        Some(Err("malformed branch row".into())),
+        crate::branch_cache::get(root).map(|(branches, _)| branches),
+    );
     assert_eq!(branches, good);
-    assert!(to_cache.is_none());
+    assert!(branch_failure_age(root, std::time::Instant::now()).is_some());
     let (cached, _) = crate::branch_cache::get(root).expect("good cache entry survives failure");
     assert_eq!(cached, good);
+
+    let fresh = vec![test_branch("feature")];
+    let branches = apply_branch_refresh(Some(root), true, Some(Ok(fresh.clone())), None);
+    assert_eq!(branches, fresh);
+    assert!(branch_failure_age(root, std::time::Instant::now()).is_none());
+    let (cached, _) = crate::branch_cache::get(root).expect("successful refresh updates cache");
+    assert_eq!(cached, fresh);
 }
 
 #[test]
