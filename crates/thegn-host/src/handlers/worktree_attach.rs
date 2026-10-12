@@ -410,7 +410,7 @@ mod tests {
                     }
                 });
                 dcfg.socket = path.to_string_lossy().into_owned();
-                Some(())
+                Some(socket_dir)
             }
         };
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -446,6 +446,7 @@ mod tests {
                 "the probe must BOUND the wait, not hang: {elapsed:?}"
             );
         }
+        drop(listener);
         targets
     }
 
