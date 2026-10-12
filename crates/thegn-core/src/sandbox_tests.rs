@@ -1937,3 +1937,29 @@ fn oci_create_stamps_the_seal_label() {
             .contains("--label thegn.seal_home=1")
     );
 }
+
+#[test]
+fn bwrap_resolver_bind_is_skipped_for_no_network_and_covered_dirs() {
+    let dir = std::path::Path::new("/run/systemd/resolve");
+    let mut s = spec(Backend::Bwrap);
+    s.network = Network::Nat;
+    assert_eq!(
+        resolver_bind_filter(&s, &[], dir).as_deref(),
+        Some("/run/systemd/resolve")
+    );
+    // network = none: fail closed, no resolver mount.
+    s.network = Network::None;
+    assert_eq!(resolver_bind_filter(&s, &[], dir), None);
+    // The user's `/run/systemd/resolve:ro` workaround (or a parent): no duplicate.
+    s.network = Network::Nat;
+    s.mounts.push(Mount {
+        host: "/run/systemd/resolve".into(),
+        dest: "/run/systemd/resolve".into(),
+        ro: true,
+        cache: false,
+    });
+    assert_eq!(resolver_bind_filter(&s, &[], dir), None);
+    // Already under a hardcoded parent.
+    let s2 = spec(Backend::Bwrap);
+    assert_eq!(resolver_bind_filter(&s2, &["/run/systemd"], dir), None);
+}

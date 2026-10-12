@@ -686,6 +686,28 @@ pub fn mount_path_unsafe(p: &str) -> bool {
         .any(|c| c.is_whitespace() || c.is_control() || matches!(c, ':' | '"' | '\'' | '\\'))
 }
 
+/// The directory that must be bound read-only for `link` (normally
+/// `/etc/resolv.conf`) to resolve inside a bwrap sandbox whose `/etc` is bound
+/// but whose `/run` is not (THE-730). On a systemd-resolved host the chain is
+/// `/etc/resolv.conf -> /etc/static/resolv.conf -> /run/systemd/resolve/
+/// stub-resolv.conf`, which dangles in the sandbox without that directory.
+///
+/// Fail closed: `None` unless the fully-resolved target lies strictly below
+/// `runtime_root` (`/run`), in a directory at least one level below it, and
+/// outside every `substrate` path already bound. Only the target's parent
+/// directory is returned, never `runtime_root` itself.
+pub fn resolver_bind_dir(link: &Path, runtime_root: &Path, substrate: &[&str]) -> Option<PathBuf> {
+    let target = link.canonicalize().ok()?;
+    let dir = target.parent()?;
+    if dir == runtime_root || !dir.starts_with(runtime_root) {
+        return None;
+    }
+    if substrate.iter().any(|s| dir.starts_with(s)) {
+        return None;
+    }
+    Some(dir.to_path_buf())
+}
+
 /// Canonicalize `p`, tolerating a missing tail (canonicalize the deepest
 /// existing ancestor, re-append the rest) so a not-yet-created destination is
 /// still resolved through any symlinked parent.
@@ -813,6 +835,63 @@ pub fn sealed_home_allowlist(home: &Path) -> Vec<Mount> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn resolver_bind_dir_follows_the_symlink_chain_to_the_run_dir() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().canonicalize().unwrap();
+        let run = root.join("run");
+        let resolve = run.join("systemd").join("resolve");
+        std::fs::create_dir_all(&resolve).unwrap();
+        std::fs::write(resolve.join("stub-resolv.conf"), "nameserver 127.0.0.53\n").unwrap();
+        let etc = root.join("etc");
+        std::fs::create_dir_all(etc.join("static")).unwrap();
+        std::os::unix::fs::symlink(
+            resolve.join("stub-resolv.conf"),
+            etc.join("static").join("resolv.conf"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            etc.join("static").join("resolv.conf"),
+            etc.join("resolv.conf"),
+        )
+        .unwrap();
+        let etc_s = etc.to_string_lossy().into_owned();
+        assert_eq!(
+            resolver_bind_dir(&etc.join("resolv.conf"), &run, &[etc_s.as_str()]),
+            Some(resolve.clone())
+        );
+        // Already covered by a bound substrate path: nothing extra to bind.
+        let resolve_s = resolve.to_string_lossy().into_owned();
+        assert_eq!(
+            resolver_bind_dir(&etc.join("resolv.conf"), &run, &[resolve_s.as_str()]),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolver_bind_dir_refuses_targets_outside_the_runtime_root() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().canonicalize().unwrap();
+        let run = root.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        // A plain file under /etc (the non-resolved case): nothing to bind.
+        let plain = root.join("resolv.conf");
+        std::fs::write(&plain, "nameserver 1.1.1.1\n").unwrap();
+        assert_eq!(resolver_bind_dir(&plain, &run, &[]), None);
+        // A target directly in the runtime root would bind all of /run.
+        let direct = run.join("resolv.conf");
+        std::fs::write(&direct, "x").unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&direct, &link).unwrap();
+        assert_eq!(resolver_bind_dir(&link, &run, &[]), None);
+        // Dangling link: unresolvable, so refused.
+        let dangling = root.join("dangling");
+        std::os::unix::fs::symlink(run.join("gone").join("x"), &dangling).unwrap();
+        assert_eq!(resolver_bind_dir(&dangling, &run, &[]), None);
+    }
 
     #[test]
     fn carveouts_are_rw_existing_paths_under_home() {
