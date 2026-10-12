@@ -14532,10 +14532,8 @@ async fn event_loop<T: Terminal>(
             // child update for replay after the overlay clears.
             if corner.is_some() && corner_kitty {
                 let occluded_now = overlays.any();
-                if occluded_now {
-                    if !corner_occluded {
-                        pending_corner_oob.require_delete();
-                    }
+                if occluded_now && !corner_occluded {
+                    pending_corner_oob.require_delete();
                 }
                 let draw = if corner_gfx.is_empty() {
                     Vec::new()
