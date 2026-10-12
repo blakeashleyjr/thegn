@@ -1035,6 +1035,44 @@ mod tests {
         );
     }
 
+    /// THE-257: transport exhaustion is stamped and parked after late publication.
+    #[tokio::test]
+    async fn exit_before_roster_publication_is_stamped_and_parked() {
+        let mut config = thegn_core::config::Config::default();
+        config.pipeline.transport_retry.max_attempts = 0;
+        config.pipeline.transport_retry.backoff_ms = 0;
+        let (svc, _profile) = test_service(config);
+        let row_id = running_row(&svc, "linear:THE-257", "aider");
+        let session = "s-published-late";
+        bury(
+            &svc,
+            session,
+            b"Connection error. SDK retry budget exhausted",
+            1,
+        )
+        .await;
+        let attempts = Arc::new(Mutex::new(HashMap::new()));
+
+        publish_late(&svc, row_id, session, &attempts).await;
+
+        let row = svc
+            .db
+            .lock()
+            .unwrap()
+            .get_dispatch(row_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.exit_code, Some(1), "exit is durably stamped");
+        assert!(row.exited_at_ms.is_some());
+        assert_eq!(row.status, St::WaitingHuman, "transport failure classified");
+        assert!(
+            row.note
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("transport")
+        );
+    }
+
     /// A usage limit is parked without consuming transport retry budget.
     #[tokio::test]
     async fn limit_exit_before_publication_is_stamped_and_parked() {
