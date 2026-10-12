@@ -344,8 +344,8 @@ clock_format = "%H:%M"
 # provider at all — only the agenda depends on [[calendar.accounts]].
 [calendar]
 enabled = true              # false stops event fetching; grid + clocks remain
-week_start = "auto"         # "auto" (from $LC_TIME) | "monday" | "sunday" | "saturday"
-time_format = "auto"        # "auto" | "12" | "24" — agenda times and inherited world clocks
+week_start = "auto"         # "auto" (territory of $LC_TIME via a CLDR snapshot; Monday if unknown) | "monday" | "sunday" | "saturday"
+time_format = "auto"        # "auto" (same source; 24-hour if unknown) | "12" | "24" — agenda times and inherited world clocks
 home_zone = ""              # IANA zone treated as "home"; "" = the system zone
 show_week_numbers = false   # configured-start week-number gutter; week 1 contains Jan 4
 # Monday-first is ISO-8601; Sunday/Saturday (including auto-resolved starts)

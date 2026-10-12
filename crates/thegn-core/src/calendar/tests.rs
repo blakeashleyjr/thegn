@@ -903,6 +903,40 @@ fn time_format_auto_follows_the_locale_region() {
     assert!(resolve_time_format(Some(true), Some("de_DE.UTF-8")));
 }
 
+#[test]
+fn auto_locale_handles_script_tags_extensions_and_cldr_regions() {
+    // en_GB is 24-hour, Monday-first; en_AU is 12-hour, Sunday-first;
+    // en_NZ is 12-hour, Monday-first.
+    assert!(!resolve_time_format(None, Some("en_GB.UTF-8")));
+    assert!(resolve_time_format(None, Some("en_AU")));
+    assert!(resolve_time_format(None, Some("en_NZ")));
+    assert_eq!(resolve_week_start(None, Some("en_AU")), Weekday::Sun);
+    assert_eq!(resolve_week_start(None, Some("en_NZ")), Weekday::Mon);
+    // Script subtags are not regions.
+    assert_eq!(resolve_week_start(None, Some("zh-Hant-TW")), Weekday::Sun);
+    assert!(resolve_time_format(None, Some("zh-Hant-TW")));
+    assert_eq!(resolve_week_start(None, Some("sr-Latn-RS")), Weekday::Mon);
+    assert!(!resolve_time_format(None, Some("sr-Latn-RS")));
+    assert_eq!(resolve_week_start(None, Some("zh-Hant")), Weekday::Mon);
+    // Unicode extensions outrank the territory; explicit config outranks both.
+    assert!(!resolve_time_format(None, Some("en-US-u-hc-h23")));
+    assert!(resolve_time_format(None, Some("de-DE-u-hc-h12")));
+    assert_eq!(
+        resolve_week_start(None, Some("en-US-u-fw-mon")),
+        Weekday::Mon
+    );
+    assert!(resolve_time_format(Some(true), Some("en-US-u-hc-h23")));
+    assert_eq!(
+        resolve_week_start(Some(Weekday::Sat), Some("en-US-u-fw-mon")),
+        Weekday::Sat
+    );
+    // C / POSIX / missing fall back to ISO.
+    for l in [None, Some("C"), Some("POSIX")] {
+        assert_eq!(resolve_week_start(None, l), Weekday::Mon);
+        assert!(!resolve_time_format(None, l));
+    }
+}
+
 // --- occurrences and day bucketing ------------------------------------------
 
 #[test]

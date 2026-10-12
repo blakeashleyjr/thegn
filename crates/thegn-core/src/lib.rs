@@ -189,6 +189,7 @@ pub mod keymap;
 pub mod layout_import;
 pub mod lifecycle;
 pub mod loc;
+pub mod locale_tag;
 pub mod log;
 pub mod log_redact;
 pub mod log_trace;
