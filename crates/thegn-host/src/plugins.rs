@@ -290,14 +290,13 @@ fn build_schedule(loaded: &[LoadedState], now: Instant) -> Vec<SchedEntry> {
                 continue;
             };
             let interval = Duration::from_millis(millis.max(1));
-            if plugin.spec.mode == PluginMode::OneShot {
-                if let Some(entry) = sched
+            if plugin.spec.mode == PluginMode::OneShot
+                && let Some(entry) = sched
                     .iter_mut()
                     .find(|entry| entry.plugin == id && entry.mode == PluginMode::OneShot)
-                {
-                    entry.interval = entry.interval.min(interval);
-                    continue;
-                }
+            {
+                entry.interval = entry.interval.min(interval);
+                continue;
             }
             sched.push(SchedEntry {
                 plugin: id.clone(),
