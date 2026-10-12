@@ -262,7 +262,7 @@ pub(crate) fn validate_api_base(raw: &str) -> Result<String> {
     Ok(base)
 }
 
-fn authority_key(base: &str) -> Result<String> {
+pub(crate) fn authority_key(base: &str) -> Result<String> {
     let url = reqwest::Url::parse(base).map_err(|_| anyhow!("invalid provider api_base"))?;
     let host = url
         .host_str()

@@ -82,13 +82,36 @@ pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
         std::process::id(),
         counter
     ));
-    let file = std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&tmp)
         .with_context(|| format!("write {}", tmp.display()))?;
-    serde_json::to_writer_pretty(file, rec)?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
+    let publish = (|| -> Result<()> {
+        serde_json::to_writer_pretty(&mut file, rec)?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
+        if let Ok(dir) = std::fs::File::open(d)
+            && let Err(error) = dir.sync_all()
+        {
+            tracing::warn!(
+                %error,
+                path = %d.display(),
+                "VPS registry record was published but its directory could not be synced"
+            );
+        }
+        Ok(())
+    })();
+    if let Err(error) = publish {
+        match std::fs::remove_file(&tmp) {
+            Ok(()) => return Err(error),
+            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => return Err(error),
+            Err(cleanup) => {
+                return Err(error.context(format!("also failed to remove staging file: {cleanup}")));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -127,7 +150,13 @@ pub fn list_at(d: &Path) -> Vec<VpsRecord> {
     entries
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-        .filter_map(|e| serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok())
+        .filter_map(|e| {
+            let path = e.path();
+            let stem = path.file_stem()?.to_str()?;
+            checked_name(stem).ok()?;
+            let rec: VpsRecord = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            (rec.name == stem && checked_name(&rec.name).is_ok()).then_some(rec)
+        })
         .collect()
 }
 
@@ -187,6 +216,70 @@ mod tests {
         assert_eq!(names, vec!["a"]);
         // A missing dir lists empty, not an error.
         assert!(list_at(&d.join("nope")).is_empty());
+    }
+
+    #[test]
+    fn list_skips_records_with_mismatched_or_unsafe_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        write_at(d, &rec("valid", "ready")).unwrap();
+        std::fs::write(
+            d.join("a.json"),
+            serde_json::to_vec(&rec("b", "ready")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("c.json"),
+            serde_json::to_vec(&rec("../x", "ready")).unwrap(),
+        )
+        .unwrap();
+        let names: Vec<String> = list_at(d).into_iter().map(|r| r.name).collect();
+        assert_eq!(names, vec!["valid"]);
+    }
+
+    #[test]
+    fn failed_rename_removes_staging_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        std::fs::create_dir(d.join("blocked.json")).unwrap();
+        std::fs::write(d.join("blocked.json/child"), b"keep directory nonempty").unwrap();
+        assert!(write_at(d, &rec("blocked", "ready")).is_err());
+        assert!(std::fs::read_dir(d).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|x| x == "tmp")
+        }));
+    }
+
+    #[test]
+    fn concurrent_writes_publish_complete_record_without_staging_debris() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().to_path_buf();
+        let workers: Vec<_> = (0..8)
+            .map(|index| {
+                let d = d.clone();
+                std::thread::spawn(move || {
+                    let mut record = rec("shared", "ready");
+                    record.instance_id = index.to_string();
+                    write_at(&d, &record).unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let record = read_at(&d, "shared").unwrap();
+        assert_eq!(record.name, "shared");
+        assert_eq!(record.state, "ready");
+        assert!(std::fs::read_dir(d).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|x| x == "tmp")
+        }));
     }
 
     #[test]
