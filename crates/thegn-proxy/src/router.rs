@@ -295,18 +295,27 @@ async fn try_chain(
                 .try_acquire(&ident, backend.rate, Instant::now());
         }
         let backend_body = apply_transforms(backend, parsed, body);
-        let attempt = state
-            .upstreams
-            .for_backend(backend)
-            .dispatch(&state.client, backend, &backend_body)
-            .await;
+        let attempt = tokio::time::timeout(
+            state.deadlines.buffered_total,
+            state
+                .upstreams
+                .for_backend(backend)
+                .dispatch(&state.client, backend, &backend_body),
+        )
+        .await;
 
         let resp = match attempt {
-            Ok(r) => r,
-            Err(e) => {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 tracing::warn!(backend = %ident, error = %e, "backend request error");
                 state.metrics.inc_backend_attempt(&ident, "network_error");
                 state.metrics.inc_fallthrough(&ident, "network_error");
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(backend = %ident, "backend request exceeded total deadline");
+                state.metrics.inc_backend_attempt(&ident, "total_timeout");
+                state.metrics.inc_fallthrough(&ident, "total_timeout");
                 continue;
             }
         };
@@ -970,6 +979,13 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     fn proxy_state(relay: crate::relay::RelayConfig) -> SharedState {
+        proxy_state_with_deadlines(relay, crate::state::UpstreamDeadlines::default())
+    }
+
+    fn proxy_state_with_deadlines(
+        relay: crate::relay::RelayConfig,
+        deadlines: crate::state::UpstreamDeadlines,
+    ) -> SharedState {
         let config = ProxyConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             routes: Vec::new(),
@@ -982,7 +998,7 @@ mod tests {
             budget: crate::model::BudgetSettings::default(),
         };
         let db = Arc::new(Mutex::new(Db::open_memory().unwrap()));
-        crate::state::AppState::new(config, db, 0)
+        crate::state::AppState::with_deadlines(config, db, 0, deadlines)
     }
 
     fn streaming_route(backend: Backend) -> Route {
@@ -1021,6 +1037,22 @@ mod tests {
         tokio::spawn(async move {
             let (_socket, _) = listener.accept().await.unwrap();
             tokio::time::sleep(delay).await;
+        });
+        format!("http://{addr}")
+    }
+
+    async fn completion_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let body = br#"{"choices":[{"message":{"content":"ok"}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
         });
         format!("http://{addr}")
     }
@@ -1283,5 +1315,87 @@ mod tests {
 
         assert!(matches!(outcome, StreamOutcome::Failed));
         assert!(started.elapsed() < Duration::from_millis(180));
+    }
+
+    #[tokio::test]
+    async fn buffered_total_deadline_falls_through_and_releases_permit() {
+        let stalled_url = stalled_header_server(Duration::from_millis(500)).await;
+        let success_url = completion_server().await;
+        let mut stalled = lane("stalled", "", None);
+        stalled.base_url = stalled_url;
+        stalled.inflight_cap = 1;
+        let stalled_identity = stalled.identity();
+        let mut success = lane("success", "", None);
+        success.base_url = success_url;
+        let route = route_with(vec![stalled, success.clone()], RoutingStrategy::Sequential);
+        let state = proxy_state_with_deadlines(
+            crate::relay::RelayConfig::default(),
+            crate::state::UpstreamDeadlines {
+                connect: Duration::from_secs(1),
+                buffered_total: Duration::from_millis(60),
+            },
+        );
+        let started = tokio::time::Instant::now();
+
+        let result = route_nonstreaming(
+            &state,
+            &Identity::global(),
+            "openai",
+            &route,
+            br#"{"model":"m","messages":[]}"#,
+            false,
+        )
+        .await;
+
+        assert_eq!(result.served_by, success.identity());
+        assert!(started.elapsed() < Duration::from_millis(300));
+        assert_eq!(state.inflight.get(&stalled_identity), 0);
+        assert!(state.metrics.render().contains("reason=\"total_timeout\""));
+    }
+
+    #[tokio::test]
+    async fn buffered_connect_deadline_falls_through() {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(1).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let std_listener = listener.into_std().unwrap();
+        let mut queued_connections = Vec::new();
+        for _ in 0..8 {
+            match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+                Ok(connection) => queued_connections.push(connection),
+                Err(_) => break,
+            }
+        }
+
+        let success_url = completion_server().await;
+        let mut stalled = lane("connect-stalled", "", None);
+        stalled.base_url = format!("http://{addr}");
+        let mut success = lane("success", "", None);
+        success.base_url = success_url;
+        let route = route_with(vec![stalled, success.clone()], RoutingStrategy::Sequential);
+        let state = proxy_state_with_deadlines(
+            crate::relay::RelayConfig::default(),
+            crate::state::UpstreamDeadlines {
+                connect: Duration::from_millis(50),
+                buffered_total: Duration::from_secs(5),
+            },
+        );
+        let started = tokio::time::Instant::now();
+
+        let result = route_nonstreaming(
+            &state,
+            &Identity::global(),
+            "openai",
+            &route,
+            br#"{"model":"m","messages":[]}"#,
+            false,
+        )
+        .await;
+
+        assert_eq!(result.served_by, success.identity());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(std_listener);
+        drop(queued_connections);
     }
 }
