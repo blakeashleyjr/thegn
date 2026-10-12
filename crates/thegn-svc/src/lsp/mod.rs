@@ -1783,7 +1783,7 @@ impl LspClient {
         diagnostics: DiagnosticsSender,
     ) -> Result<LspClient, LspError> {
         let generation = diagnostics.register(root, language_id)?;
-        Ok(Self::connect(
+        Self::connect(
             reader,
             writer,
             None,
@@ -1797,7 +1797,7 @@ impl LspClient {
                 },
                 spawn: spawn_lsp_thread,
             },
-        )?)
+        )
     }
 
     /// [`LspClient::from_io`] under a supervisor-registered authority (see
