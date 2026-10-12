@@ -97,6 +97,12 @@ impl InputRouter {
         self.reader_alive = false;
     }
 
+    fn reader_spawn_finished(&mut self, should_spawn: bool, spawned: bool) {
+        if should_spawn && !spawned {
+            self.reader_stopped();
+        }
+    }
+
     fn park(&mut self, event: Event) {
         if self.pending.len() < PENDING_EVENT_CAPACITY {
             self.pending.push_back(event);
@@ -151,13 +157,6 @@ pub fn run(
     }
 
     install_panic_hook_once();
-    if spawn_reader && let Err(error) = std::thread::Builder::new().spawn(input_reader) {
-        let mut input = INPUT
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        input.reader_stopped();
-        return Err(error.into());
-    }
 
     let hook_tx = tx.clone();
     let hook: ChangeHook = std::sync::Arc::new(move || {
@@ -167,11 +166,29 @@ pub fn run(
         }
     });
 
-    let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let tile = build(hook)?;
+    let mut spawned = false;
+    let result = (|| {
+        let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        let tile = build(hook)?;
 
-    let mut ops = CrosstermTerminalOps;
-    run_lifecycle(&mut ops, tile, |tile| event_loop(tile, &mut term, &rx))
+        let mut ops = CrosstermTerminalOps;
+        run_lifecycle(&mut ops, tile, |tile| {
+            // Start blocking input only after terminal setup succeeded.
+            if spawn_reader {
+                std::thread::Builder::new()
+                    .name("tg-kit-input".into())
+                    .spawn(input_reader)?;
+                spawned = true;
+            }
+            event_loop(tile, &mut term, &rx)
+        })
+    })();
+
+    let mut input = INPUT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    input.reader_spawn_finished(spawn_reader, spawned);
+    result
 }
 
 fn input_reader() {
@@ -689,5 +706,20 @@ mod tests {
             input.park(key_a());
         }
         assert_eq!(input.pending.len(), PENDING_EVENT_CAPACITY);
+    }
+
+    #[test]
+    fn failed_reader_spawn_allows_next_run_to_spawn() {
+        let mut input = InputRouter::default();
+        let (tx, _rx) = mpsc::channel();
+        let first = input.attach(tx).unwrap();
+        assert!(first.spawn_reader);
+
+        input.reader_spawn_finished(first.spawn_reader, false);
+        input.detach();
+
+        let (tx, _rx) = mpsc::channel();
+        let second = input.attach(tx).unwrap();
+        assert!(second.spawn_reader);
     }
 }
