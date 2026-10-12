@@ -607,8 +607,8 @@ pub(crate) fn upload_agent_accounts(
             if !acct.authed || !acct.dir.is_dir() {
                 continue;
             }
-            let slug = thegn_core::util::slugify(&acct.name);
-            let dest_root = format!("{base}/.thegn/accounts/{}/{}", p.id, slug);
+            let identity = thegn_core::account::home_component(&acct.name);
+            let dest_root = format!("{base}/.thegn/accounts/{}/{}", p.id, identity);
             let is_claude = p.id == "claude";
             for (abs, rel, exec) in collect_agent_config_files(&acct.dir) {
                 if let Ok(data) = std::fs::read(&abs) {
@@ -675,14 +675,16 @@ pub(crate) fn account_pane_env_exports(cfg: &thegn_core::config::Config, worktre
         else {
             continue;
         };
-        out.push_str(&format!(
-            "export {}=\"$HOME/.thegn/accounts/{}/{}\"; ",
-            p.home_env,
-            p.id,
-            thegn_core::util::slugify(&name),
-        ));
+        out.push_str(&account_export(p.home_env, p.id, &name));
     }
     out
+}
+
+fn account_export(home_env: &str, provider_id: &str, name: &str) -> String {
+    format!(
+        "export {home_env}=\"$HOME/.thegn/accounts/{provider_id}/{}\"; ",
+        thegn_core::account::home_component(name),
+    )
 }
 
 /// Upload the present host dotfiles/dotdirs into the sandbox's `$HOME` (`/root`).
@@ -805,6 +807,13 @@ pub(crate) fn upload_atuin_creds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_exports_use_distinct_lossless_home_components() {
+        let first = account_export("CODEX_HOME", "codex", "work/a");
+        let second = account_export("CODEX_HOME", "codex", "work-a");
+        assert_ne!(first, second);
+    }
 
     #[test]
     fn strip_sandbox_hooks_drops_hooks_from_claude_settings() {
