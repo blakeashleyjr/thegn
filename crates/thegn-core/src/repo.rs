@@ -171,6 +171,15 @@ pub fn repo_slug(root: &Path) -> String {
         .unwrap_or(base)
 }
 
+/// Resolve a repo slug using a specific state database. This is for workers
+/// whose caller already selected an isolated database path (notably tests and
+/// alternate state profiles); it must not silently consult the default DB.
+pub fn repo_slug_at(root: &Path, db_path: &Path) -> String {
+    crate::db::Db::open_at(db_path)
+        .map(|db| repo_slug_with(&db, root))
+        .unwrap_or_else(|_| slug_base(&repo_name_from_path(root)))
+}
+
 /// Canonical slug for a repo via an existing DB handle — same contract as
 /// [`repo_slug`] but without opening a second connection or spawning git
 /// (the name is path-derived, so `root` must already be a repo root).
@@ -322,6 +331,26 @@ mod tests {
                 .success(),
             "git {args:?}"
         );
+    }
+
+    #[test]
+    fn repo_slug_at_persists_to_the_supplied_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("same-name");
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = dir.path().join("isolated/thegn.db");
+        let db = crate::db::Db::open_at(&db_path).unwrap();
+        db.slug_for_repo("/another/same-name", "same-name").unwrap();
+
+        assert_eq!(repo_slug_at(&root, &db_path), "same-name-2");
+        assert_eq!(
+            db.slug_for_repo(&root.to_string_lossy(), "same-name")
+                .unwrap(),
+            "same-name-2"
+        );
+        let bad = dir.path().join("dir-not-db");
+        std::fs::create_dir_all(&bad).unwrap();
+        assert_eq!(repo_slug_at(&root, &bad), "same-name");
     }
 
     #[test]

@@ -598,7 +598,7 @@ mod tests {
             .progress
             .insert(2, CreationProgress::new("current".into()));
         inflight.wizard_gen = Some(2);
-        let mut wizard = Some(NewWorktreeWizard::new(
+        let mut wizard = Some(NewWorktreeWizard::new_isolated_for_test(
             std::env::temp_dir(),
             &Default::default(),
         ));
@@ -1136,7 +1136,7 @@ mod tests {
         let mut cfg = thegn_core::config::Config::default();
         cfg.sandbox.default_env = "machine0".into();
         let root = std::env::temp_dir();
-        let w = crate::wizard::NewWorktreeWizard::new(root.clone(), &cfg);
+        let w = crate::wizard::NewWorktreeWizard::new_isolated_for_test(root.clone(), &cfg);
         let progress = CreationProgress::new("tg-lively-orbit".to_string());
         let key = (
             thegn_core::repo::branch_tab(&w.repo_slug, &progress.branch),

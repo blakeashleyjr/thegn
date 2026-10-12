@@ -62,11 +62,16 @@ impl HookRunResult {
     }
 }
 
-/// Run one hook. Callers must invoke this from a worker, never from the
-/// compositor loop: the CPU wrapper probes the host and the child wait blocks.
+/// Callers must invoke this from a worker, never from the compositor loop: the
+/// CPU wrapper probes the host and the child wait blocks.
 #[expect(clippy::disallowed_methods)]
-pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult {
-    let log_path = log_path(&context.worktree, context.event);
+fn run_with_log_root(
+    spec: &HookSpec,
+    context: &HookContext,
+    cwd: &Path,
+    log_root: &Path,
+) -> HookRunResult {
+    let log_path = log_path(log_root, &context.worktree, context.event);
     let (mut child, group) = match spawn(spec, context, cwd) {
         Ok(child) => child,
         Err(error) => {
@@ -284,7 +289,7 @@ fn join_pipe(pipe: Option<PipeReader>, deadline: Instant) -> String {
 static LOG_INDICES: OnceLock<Mutex<std::collections::HashMap<(String, String), u64>>> =
     OnceLock::new();
 
-fn log_path(worktree: &str, event: thegn_core::hooks::HookEvent) -> PathBuf {
+fn log_path(log_root: &Path, worktree: &str, event: thegn_core::hooks::HookEvent) -> PathBuf {
     let worktree_slug = thegn_core::util::slugify(worktree);
     let slug = if worktree_slug.is_empty() {
         "worktree".to_string()
@@ -304,10 +309,7 @@ fn log_path(worktree: &str, event: thegn_core::hooks::HookEvent) -> PathBuf {
         .get(&(slug.clone(), event_name.clone()))
         .copied()
         .unwrap_or_else(|| {
-            let dir = thegn_core::util::xdg_state_home()
-                .join("thegn")
-                .join("hooks")
-                .join(&slug);
+            let dir = log_root.join(&slug);
             std::fs::read_dir(dir)
                 .ok()
                 .into_iter()
@@ -325,11 +327,7 @@ fn log_path(worktree: &str, event: thegn_core::hooks::HookEvent) -> PathBuf {
     let next = next + 1;
     indices.insert((slug.clone(), event_name.clone()), next);
     drop(indices);
-    thegn_core::util::xdg_state_home()
-        .join("thegn")
-        .join("hooks")
-        .join(slug)
-        .join(format!("{event_name}-{next}.log"))
+    log_root.join(slug).join(format!("{event_name}-{next}.log"))
 }
 
 const FAILURE_TAIL_BYTES: usize = 4096;
@@ -431,9 +429,27 @@ pub fn run_all(
     cwd: &Path,
     mode: thegn_core::hooks::HookExecutionMode,
 ) -> Vec<HookRunResult> {
+    run_all_with_log_root(
+        specs,
+        context,
+        cwd,
+        mode,
+        &thegn_core::util::xdg_state_home()
+            .join("thegn")
+            .join("hooks"),
+    )
+}
+
+fn run_all_with_log_root(
+    specs: &[HookSpec],
+    context: &HookContext,
+    cwd: &Path,
+    mode: thegn_core::hooks::HookExecutionMode,
+    log_root: &Path,
+) -> Vec<HookRunResult> {
     let mut results = Vec::with_capacity(specs.len());
     for spec in specs {
-        let result = run(spec, context, cwd);
+        let result = run_with_log_root(spec, context, cwd, log_root);
         let failed = !result.succeeded();
         results.push(result);
         if failed && spec.blocks_failure(mode) {
@@ -468,16 +484,41 @@ mod tests {
         }
     }
 
+    fn run_isolated(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult {
+        run_with_log_root(spec, context, cwd, cwd)
+    }
+
     #[test]
     fn command_uses_curated_context_environment() {
         let dir = tempfile::tempdir().unwrap();
-        let result = run(
+        let result = run_isolated(
             &spec("printf '%s' \"$THEGN_EVENT:$THEGN_BRANCH:$GH_TOKEN\"", 2),
             &context(),
             dir.path(),
         );
         assert_eq!(result.state, HookRunState::Succeeded);
         assert_eq!(result.stdout, "post_create:feature:");
+    }
+
+    #[test]
+    fn hook_log_uses_injected_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut context = context();
+        context.worktree = format!("/isolated-hook-log-{}", std::process::id());
+
+        let result = run_with_log_root(
+            &spec("printf 'logged'", 2),
+            &context,
+            cwd.path(),
+            dir.path(),
+        );
+
+        assert!(result.succeeded());
+        assert!(result.log_error.is_none());
+        assert!(result.log_path.starts_with(dir.path()));
+        let contents = std::fs::read_to_string(&result.log_path).unwrap();
+        assert!(contents.contains("stdout:\nlogged"));
     }
 
     #[test]
@@ -498,21 +539,21 @@ mod tests {
     #[test]
     fn timeout_kills_the_process_group() {
         let dir = tempfile::tempdir().unwrap();
-        let result = run(&spec("sleep 2", 1), &context(), dir.path());
+        let result = run_isolated(&spec("sleep 2", 1), &context(), dir.path());
         assert_eq!(result.state, HookRunState::TimedOut);
     }
 
     #[test]
     fn maximum_timeout_value_does_not_panic() {
         let dir = tempfile::tempdir().unwrap();
-        let result = run(&spec("true", u64::MAX), &context(), dir.path());
+        let result = run_isolated(&spec("true", u64::MAX), &context(), dir.path());
         assert_eq!(result.state, HookRunState::Succeeded);
     }
 
     #[test]
     fn background_descendant_cannot_hold_hook_completion_open() {
         let dir = tempfile::tempdir().unwrap();
-        let result = run(&spec("sleep 2 &", 5), &context(), dir.path());
+        let result = run_isolated(&spec("sleep 2 &", 5), &context(), dir.path());
         assert_eq!(result.state, HookRunState::Succeeded);
         // The marker is emitted only when the bounded drain wins the race
         // against EOF. Its presence proves completion was reported while the
@@ -530,11 +571,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut first = spec("exit 7", 2);
         first.on_failure = HookFailure::Block;
-        let results = run_all(
+        let results = run_all_with_log_root(
             &[first, spec("printf unreachable", 2)],
             &context(),
             dir.path(),
             thegn_core::hooks::HookExecutionMode::User,
+            dir.path(),
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].state, HookRunState::Failed);
@@ -560,7 +602,7 @@ mod tests {
     #[test]
     fn hook_output_is_capped_while_the_pipe_is_drained() {
         let dir = tempfile::tempdir().unwrap();
-        let result = run(&spec("yes x | head -c 2000000", 2), &context(), dir.path());
+        let result = run_isolated(&spec("yes x | head -c 2000000", 2), &context(), dir.path());
         assert_eq!(result.state, HookRunState::Succeeded);
         assert!(result.stdout.len() <= MAX_CAPTURE_BYTES + "\n[hook output truncated]".len());
         assert!(result.stdout.contains("[hook output truncated]"));
