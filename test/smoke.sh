@@ -27,6 +27,11 @@ TMP="$(mktemp -d)"
 # the job. Never let cleanup decide the verdict.
 cleanup() {
   local rc=$?
+  [[ -d "$TMP/.local/share/containers" ]] && podman unshare rm -rf "$TMP/.local/share/containers" >/dev/null 2>&1 || true
+  local pause_pid_file="${XDG_RUNTIME_DIR:-}/libpod/tmp/pause.pid"
+  if [[ -f $pause_pid_file ]]; then
+    kill "$(cat "$pause_pid_file" 2>/dev/null)" 2>/dev/null || true
+  fi
   rm -rf "$TMP" 2>/dev/null || true
   exit "$rc"
 }
@@ -2143,6 +2148,20 @@ fi
 # above ran daemon-less; no socket may exist on either default path.
 check "CLI verbs never spawn a daemon" \
   "[[ ! -S \"$XDG_RUNTIME_DIR/thegn/daemon.sock\" && ! -S \"$XDG_STATE_HOME/thegn/run/daemon.sock\" ]]"
+FALLBACK_ENDPOINT="$(env -u XDG_RUNTIME_DIR "$SZ" doctor --json | sed -n 's/.*"endpoint"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+FALLBACK_PARENT="$(dirname "$FALLBACK_ENDPOINT")"
+FALLBACK_PARENT_BEFORE=0
+if [[ -n $FALLBACK_ENDPOINT && $FALLBACK_PARENT == "/tmp/thegn-$(id -u)-"* ]]; then
+  rm -rf "$FALLBACK_PARENT"
+fi
+[[ -d $FALLBACK_PARENT ]] && FALLBACK_PARENT_BEFORE=1
+env -u XDG_RUNTIME_DIR "$SZ" doctor --json >/dev/null
+check "doctor resolves an absent fallback socket without creating it" \
+  "[[ -n \"$FALLBACK_ENDPOINT\" && ! -S \"$FALLBACK_ENDPOINT\" && ( ( $FALLBACK_PARENT_BEFORE -eq 1 && -d \"$FALLBACK_PARENT\" ) || ( $FALLBACK_PARENT_BEFORE -eq 0 && ! -e \"$FALLBACK_PARENT\" ) ) ]]"
+if [[ ! -d "/run/user/$(id -u)" ]]; then
+  check "doctor fallback endpoint is uid-scoped under /tmp" \
+    "[[ \"$FALLBACK_ENDPOINT\" == *\"thegn-$(id -u)-\"* ]]"
+fi
 
 # Explicit close kills: DELETE on a session ends its child (the close-a-pane
 # contract at the API level). The row itself lingers briefly — `daemon/
