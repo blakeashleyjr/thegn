@@ -142,6 +142,10 @@ impl MediaPanelState {
         self.art_requested = None;
     }
 
+    pub(crate) fn cancel_art_request(&mut self) {
+        self.art_requested = None;
+    }
+
     pub(crate) fn take_queue_request(
         &mut self,
         state: Option<&MediaState>,

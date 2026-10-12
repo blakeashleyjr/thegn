@@ -131,6 +131,7 @@ impl Drop for PendingOp {
 
 /// Queue one operation behind the current tail. The reservation bounds both
 /// running and queued work, and the tail lock defines the operation order.
+#[cfg(test)]
 fn chain_op<F>(tail: &MediaOpTail, pending: &Arc<AtomicUsize>, cap: usize, future: F) -> bool
 where
     F: Future<Output = ()> + Send + 'static,
