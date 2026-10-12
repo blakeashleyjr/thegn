@@ -801,10 +801,14 @@ mod tests {
     }
 
     fn test_writer() -> FrameWriter {
+        test_writer_with_worker_frames(true)
+    }
+
+    fn test_writer_with_worker_frames(worker_frames: bool) -> FrameWriter {
         FrameWriter {
             inner: Arc::new(Inner {
                 q: Mutex::new(q()),
-                worker_frames: true,
+                worker_frames,
                 cv: Condvar::new(),
                 done_cv: Condvar::new(),
                 metrics_deferrals: AtomicU64::new(0),
@@ -1263,7 +1267,7 @@ mod tests {
 
     #[test]
     fn termwiz_parity_drops_failed_oob_without_a_worker_frame() {
-        let writer = FrameWriter::spawn_with(false, false, |_| {}, |_| Ok(()));
+        let writer = test_writer_with_worker_frames(false);
         assert!(writer.try_submit_oob(vec![b'A']).is_ok());
         let oob = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
         assert!(
