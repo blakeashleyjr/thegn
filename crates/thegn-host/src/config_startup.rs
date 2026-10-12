@@ -27,7 +27,7 @@
 //! Blocking file/SQLite work: call from startup before the input/render loop
 //! or from an off-loop thread, never from a loop handler.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use thegn_core::config_admission::{AdmissionHealth, AdmittedConfig};
 use thegn_core::config_admission_store::{AdmissionStore, FailureReport, StoreHealth};
@@ -52,11 +52,28 @@ struct Notes {
 /// One process's frozen capture plus its live generation store.
 pub(crate) struct ProcessAdmission {
     seed: Mutex<ConfigCaptureSeed>,
+    reload: Mutex<ReloadFlight>,
+    reload_changed: Condvar,
     actor: thegn_core::db::MigrationActor,
     store: AdmissionStore,
     /// The `[database]` policy installed at startup (process-lifetime).
     startup_database: thegn_core::config::DatabaseConfig,
     notes: Mutex<Notes>,
+}
+
+#[derive(Default)]
+struct ReloadFlight {
+    sequence: u64,
+    active: bool,
+    pending: bool,
+    waiters: usize,
+    completed: Option<(u64, FlightResult)>,
+}
+
+#[derive(Clone)]
+enum FlightResult {
+    Published(Arc<AdmittedConfig>),
+    Failed,
 }
 
 /// `install_policy` is true exactly once per process: at startup.
@@ -99,6 +116,8 @@ impl ProcessAdmission {
         let (admitted, hosts_unavailable) = admit(&seed, actor, true)?.into_parts();
         let process = Self {
             seed: Mutex::new(seed),
+            reload: Mutex::new(ReloadFlight::default()),
+            reload_changed: Condvar::new(),
             actor,
             store: AdmissionStore::new(),
             startup_database: admitted.config().database.clone(),
@@ -121,6 +140,87 @@ impl ProcessAdmission {
     }
 
     fn reload_with(&self, admit: &Admit<'_>) -> ReloadOutcome {
+        let (sequence, owner) = {
+            let mut flight = self
+                .reload
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if flight.active {
+                let Some(target) = flight.sequence.checked_add(1) else {
+                    return ReloadOutcome::Unavailable;
+                };
+                let Some(waiters) = flight.waiters.checked_add(1) else {
+                    return ReloadOutcome::Unavailable;
+                };
+                flight.pending = true;
+                flight.waiters = waiters;
+                while flight.active && flight.sequence < target {
+                    flight = self
+                        .reload_changed
+                        .wait(flight)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                flight.waiters -= 1;
+                if flight.sequence == target && !flight.active && flight.pending {
+                    flight.pending = false;
+                    flight.active = true;
+                    flight.sequence = target;
+                    (target, true)
+                } else if flight.sequence == target && flight.active {
+                    (target, false)
+                } else if let Some((done, result)) = &flight.completed
+                    && *done == target
+                {
+                    return outcome_for_joiner(result);
+                } else {
+                    return ReloadOutcome::Unavailable;
+                }
+            } else {
+                let Some(sequence) = flight.sequence.checked_add(1) else {
+                    return ReloadOutcome::Unavailable;
+                };
+                flight.pending = false;
+                flight.sequence = sequence;
+                flight.active = true;
+                (sequence, true)
+            }
+        };
+
+        if !owner {
+            let mut flight = self
+                .reload
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while flight.active && flight.sequence == sequence {
+                flight = self
+                    .reload_changed
+                    .wait(flight)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            return flight
+                .completed
+                .as_ref()
+                .filter(|(done, _)| *done == sequence)
+                .map_or(ReloadOutcome::Unavailable, |(_, result)| {
+                    outcome_for_joiner(result)
+                });
+        }
+
+        let guard = ReloadFlightGuard {
+            process: self,
+            sequence,
+            completed: false,
+        };
+        let outcome = self.reload_capture(admit);
+        let result = match &outcome {
+            ReloadOutcome::Published(published) => FlightResult::Published(Arc::clone(published)),
+            _ => FlightResult::Failed,
+        };
+        guard.complete(result);
+        outcome
+    }
+
+    fn reload_capture(&self, admit: &Admit<'_>) -> ReloadOutcome {
         // The CAS base is the generation current when capture BEGINS, so a
         // slower concurrent reload can never overwrite a newer publication.
         let observed = self
@@ -171,6 +271,14 @@ impl ProcessAdmission {
         }
     }
 
+    #[cfg(test)]
+    fn reload_waiters(&self) -> usize {
+        self.reload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiters
+    }
+
     pub(crate) fn store(&self) -> &AdmissionStore {
         &self.store
     }
@@ -195,6 +303,45 @@ impl ProcessAdmission {
             }),
             StoreHealth::Empty => None,
         }
+    }
+}
+
+struct ReloadFlightGuard<'a> {
+    process: &'a ProcessAdmission,
+    sequence: u64,
+    completed: bool,
+}
+
+impl ReloadFlightGuard<'_> {
+    fn complete(mut self, result: FlightResult) {
+        self.finish(result);
+        self.completed = true;
+    }
+
+    fn finish(&self, result: FlightResult) {
+        let mut flight = self
+            .process
+            .reload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        flight.completed = Some((self.sequence, result));
+        flight.active = false;
+        self.process.reload_changed.notify_all();
+    }
+}
+
+impl Drop for ReloadFlightGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.finish(FlightResult::Failed);
+        }
+    }
+}
+
+fn outcome_for_joiner(result: &FlightResult) -> ReloadOutcome {
+    match result {
+        FlightResult::Published(published) => ReloadOutcome::Published(Arc::clone(published)),
+        FlightResult::Failed => ReloadOutcome::FailedCoalesced,
     }
 }
 

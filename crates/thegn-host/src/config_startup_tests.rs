@@ -4,6 +4,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 use thegn_core::config::Config;
 use thegn_core::config_admission_store::{StaleConfigReason, StoreHealth};
 use thegn_core::host_definition_snapshot::HostDefinitionsSnapshot;
@@ -74,6 +77,224 @@ fn sources(body: &str) -> Sources {
     Sources {
         bodies: RefCell::new([(base_path(), body.as_bytes().to_vec())].into()),
     }
+}
+
+struct ConcurrentSources {
+    bodies: Mutex<BTreeMap<PathBuf, Vec<u8>>>,
+    next_read_gate: Mutex<Option<Arc<Gate>>>,
+}
+
+impl ConcurrentSources {
+    fn new(body: &str) -> Self {
+        Self {
+            bodies: Mutex::new([(base_path(), body.as_bytes().to_vec())].into()),
+            next_read_gate: Mutex::new(None),
+        }
+    }
+
+    fn block_next_read(&self, gate: Arc<Gate>) {
+        *self
+            .next_read_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate);
+    }
+
+    fn set(&self, body: &str) {
+        self.bodies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(base_path(), body.as_bytes().to_vec());
+    }
+}
+
+impl ConfigSourceReader for ConcurrentSources {
+    fn read_bounded(&self, path: &Path, _: usize) -> Result<Option<Vec<u8>>, ConfigFileReadError> {
+        let bytes = self
+            .bodies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(path)
+            .cloned();
+        if let Some(gate) = self
+            .next_read_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            gate.block();
+        }
+        Ok(bytes)
+    }
+}
+
+#[derive(Default)]
+struct Gate {
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+impl Gate {
+    fn block(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.0 = true;
+        self.changed.notify_all();
+        while !state.1 {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn wait_entered(&self) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !state.0 {
+            assert!(Instant::now() < deadline, "reader did not enter gate");
+            let (next, timeout) = self
+                .changed
+                .wait_timeout(state, Duration::from_millis(10))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            assert!(!timeout.timed_out() || Instant::now() < deadline);
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.1 = true;
+        self.changed.notify_all();
+    }
+}
+
+fn wait_for_waiters(process: &ProcessAdmission, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while process.reload_waiters() != count {
+        assert!(Instant::now() < deadline, "waiters did not register");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn concurrent_reload_requests_share_one_follow_up_capture() {
+    fn assert_send<T: Send>() {}
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send::<ConfigCaptureSeed>();
+    assert_send_sync::<CapturedConfig>();
+
+    let sources = Arc::new(ConcurrentSources::new("branch_prefix = \"one/\"\n"));
+    let gate = Arc::new(Gate::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let admit = {
+        let sources = Arc::clone(&sources);
+        let calls = Arc::clone(&calls);
+        move |seed: &ConfigCaptureSeed, _: thegn_core::db::MigrationActor, _: bool| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            concurrent_admit(seed, &sources)
+        }
+    };
+    let (process, _) = ProcessAdmission::admit_initial(
+        seed(),
+        thegn_core::db::MigrationActor::Controller,
+        &|seed, _, _| concurrent_admit(seed, &sources),
+    )
+    .unwrap();
+    assert_eq!(process.store().display().unwrap().revision().generation, 1);
+    sources.set("branch_prefix = \"two/\"\n");
+    sources.block_next_read(Arc::clone(&gate));
+
+    std::thread::scope(|scope| {
+        let leader = scope.spawn(|| process.reload_with(&admit));
+        gate.wait_entered();
+        let joiners: Vec<_> = (0..16)
+            .map(|_| scope.spawn(|| process.reload_with(&admit)))
+            .collect();
+        wait_for_waiters(&process, 16);
+        sources.set("branch_prefix = \"three/\"\n");
+        gate.release();
+
+        let ReloadOutcome::Published(leader_result) = leader.join().unwrap() else {
+            panic!("the leader publishes its capture");
+        };
+        assert_eq!(leader_result.revision().generation, 2);
+        assert_eq!(leader_result.config().branch_prefix, "two/");
+        for joiner in joiners {
+            let ReloadOutcome::Published(result) = joiner.join().unwrap() else {
+                panic!("all joiners share the follow-up publication");
+            };
+            assert_eq!(result.revision().generation, 3);
+            assert_eq!(result.config().branch_prefix, "three/");
+        }
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn panicking_reload_releases_joiners_and_allows_a_later_capture() {
+    let sources = Arc::new(ConcurrentSources::new("branch_prefix = \"one/\"\n"));
+    let (process, _) = ProcessAdmission::admit_initial(
+        seed(),
+        thegn_core::db::MigrationActor::Controller,
+        &|seed, _, _| concurrent_admit(seed, &sources),
+    )
+    .unwrap();
+    let gate = Arc::new(Gate::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let admit = {
+        let sources = Arc::clone(&sources);
+        let gate = Arc::clone(&gate);
+        let calls = Arc::clone(&calls);
+        move |seed: &ConfigCaptureSeed, _: thegn_core::db::MigrationActor, _: bool| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                gate.block();
+                panic!("controlled reader panic");
+            }
+            concurrent_admit(seed, &sources)
+        }
+    };
+    std::thread::scope(|scope| {
+        let leader = scope.spawn(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process.reload_with(&admit)))
+        });
+        gate.wait_entered();
+        let joiners: Vec<_> = (0..4)
+            .map(|_| scope.spawn(|| process.reload_with(&admit)))
+            .collect();
+        wait_for_waiters(&process, 4);
+        gate.release();
+        assert!(leader.join().unwrap().is_err());
+        for joiner in joiners {
+            let ReloadOutcome::Published(result) = joiner.join().unwrap() else {
+                panic!("a joiner must run or join the recovery capture");
+            };
+            assert_eq!(result.revision().generation, 2);
+        }
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        process.reload_with(&|seed, _, _| concurrent_admit(seed, &sources)),
+        ReloadOutcome::Published(_)
+    ));
+}
+
+fn concurrent_admit(
+    seed: &ConfigCaptureSeed,
+    sources: &ConcurrentSources,
+) -> Result<CapturedConfig, CaptureFailure> {
+    seed.admit_staged(sources, |_| {
+        Ok(HostLayer::Admitted(HostDefinitionsSnapshot::empty(
+            thegn_core::db::SCHEMA_VERSION,
+        )))
+    })
 }
 
 #[test]
