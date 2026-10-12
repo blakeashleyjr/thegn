@@ -4,7 +4,33 @@
 
 use std::time::Duration;
 
+use crate::MediaError;
 use crate::model::{LoopMode, PlaybackState};
+
+/// Convert an explicit SMTC refusal into a backend error rather than success.
+pub(crate) fn accepted(operation: &str, accepted: bool) -> Result<(), MediaError> {
+    if accepted {
+        Ok(())
+    } else {
+        Err(MediaError::Backend(format!(
+            "{operation} rejected by the player"
+        )))
+    }
+}
+
+/// Calculate a relative seek target in WinRT ticks. Negative current positions
+/// are malformed; forward overflow is rejected, while backward seeks clamp at
+/// the beginning of the track.
+pub(crate) fn seek_target(current: i64, delta: i64, forward: bool) -> Option<i64> {
+    if current < 0 || delta < 0 {
+        return None;
+    }
+    if forward {
+        current.checked_add(delta)
+    } else {
+        Some(current.saturating_sub(delta).max(0))
+    }
+}
 
 /// Map a `GlobalSystemMediaTransportControlsSessionPlaybackStatus` discriminant
 /// onto the normalized axis. WinRT values: Closed=0, Opened=1, Changing=2,
@@ -49,6 +75,24 @@ pub(crate) fn duration_from_ticks(ticks: i64) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_refusal_is_an_error() {
+        assert_eq!(accepted("next", true), Ok(()));
+        assert_eq!(
+            accepted("next", false),
+            Err(MediaError::Backend("next rejected by the player".into()))
+        );
+    }
+
+    #[test]
+    fn relative_seek_checks_overflow_and_clamps_underflow() {
+        assert_eq!(seek_target(i64::MAX - 1, 10, true), None);
+        assert_eq!(seek_target(5, 10, false), Some(0));
+        assert_eq!(seek_target(5, 2, false), Some(3));
+        assert_eq!(seek_target(5, 2, true), Some(7));
+        assert_eq!(seek_target(-1, 1, true), None);
+    }
 
     #[test]
     fn status_maps_active_states() {
