@@ -576,21 +576,28 @@ fn regenerate_merge(
         // left in the worktree, or any untracked output, is outside the exact
         // conflict set and makes this repair unsafe to accept.
         scratch.verify().ok()?;
-        let status = util::git_out_allow_empty(
-            &tmp,
-            &[
+        // With -z, rename records include a second NUL field containing only
+        // the old path. Disable rename detection so every field has a status.
+        let status = util::git_cmd(&tmp)
+            .args([
                 "status",
                 "--porcelain=v1",
                 "-z",
                 "--untracked-files=all",
                 "--ignored=no",
-            ],
-        )?;
+                "--no-renames",
+            ])
+            .output()
+            .ok()?;
+        if !status.status.success() {
+            return None;
+        }
         if status
-            .split('\0')
+            .stdout
+            .split(|byte| *byte == 0)
             .filter(|entry| !entry.is_empty())
             .any(|entry| {
-                let bytes = entry.as_bytes();
+                let bytes = entry;
                 bytes.len() < 3
                     || bytes[2] != b' '
                     || bytes[0] == b'?' && bytes[1] == b'?'
@@ -629,7 +636,7 @@ fn regenerate_merge(
             .stdout
             .split(|byte| *byte == 0)
             .filter(|path| !path.is_empty())
-            .any(|path| !approved.iter().any(|approved_path| *approved_path == path))
+            .any(|path| !approved.contains(path))
         {
             return None;
         }
@@ -690,7 +697,7 @@ pub struct FoldReport {
     pub final_tip: String,
     pub advanced: bool,
     pub landed: Vec<LandedReport>,
-    /// Exact ordered source tips included in and gated as part of this fold.
+    /// Exact ordered source tips included in the fold (gated when a gate ran).
     pub gated_sources: Vec<(String, String)>,
     /// Object-DB folds not committed to the target. Never authorizes cleanup.
     pub prepared: Vec<LandedReport>,
@@ -773,7 +780,8 @@ fn record_gate(diagnostics: &mut String, phase: &str, verdict: &GateVerdict) {
 fn record_gate_sources(diagnostics: &mut String, base: &str, plan: &FoldPlan) {
     const MAX_LINE: usize = 4000;
     const MAX_DIAGNOSTICS: usize = 32 * 1024;
-    if diagnostics.ends_with("\n[additional gate diagnostics omitted]\n") {
+    const TRUNCATED: &str = "\n[additional gate diagnostics omitted]\n";
+    if diagnostics.ends_with(TRUNCATED) {
         return;
     }
     let mut line = format!("[union provenance] target base {base}; sources");
@@ -789,6 +797,14 @@ fn record_gate_sources(diagnostics: &mut String, base: &str, plan: &FoldPlan) {
     line.push('\n');
     if diagnostics.len() + line.len() <= MAX_DIAGNOSTICS {
         diagnostics.push_str(&line);
+    } else {
+        let keep = MAX_DIAGNOSTICS - TRUNCATED.len();
+        let mut boundary = keep;
+        while !diagnostics.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        diagnostics.truncate(boundary);
+        diagnostics.push_str(TRUNCATED);
     }
 }
 
@@ -1670,6 +1686,11 @@ fn run_fold_admitted(
                 &diagnostics,
             );
             report.advanced = true;
+            tracing::info!(
+                target: "thegn::integrate",
+                sources = ?report.gated_sources,
+                "fold advanced with captured source tips"
+            );
             report.landed = std::mem::take(&mut report.prepared);
             report.resyncs = resyncs;
             return Ok(report);
@@ -3444,6 +3465,17 @@ mod tests {
     }
 
     #[test]
+    fn union_provenance_reserves_a_truncation_marker() {
+        let mut diagnostics = "x".repeat(32 * 1024 - 10);
+        let plan = empty_plan("tip");
+
+        record_gate_sources(&mut diagnostics, "base", &plan);
+
+        assert!(diagnostics.len() <= 32 * 1024);
+        assert!(diagnostics.ends_with("\n[additional gate diagnostics omitted]\n"));
+    }
+
+    #[test]
     fn gate_diagnostics_drop_bidi_formatting_and_preserve_readable_unicode() {
         for c in [
             '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
@@ -3546,6 +3578,35 @@ mod tests {
         assert_eq!(repo.out(&["show", "main:Cargo.lock"]), "regenerated");
         let files = repo.out(&["ls-tree", "-r", "--name-only", "main"]);
         assert!(files.contains("a.txt"), "{files}");
+    }
+
+    #[test]
+    fn regeneration_lands_when_incoming_branch_renames_a_tracked_file() {
+        let repo = Repo::new("regen-rename");
+        repo.commit("Cargo.lock", "base\n", "c0 lock");
+        git(&repo.dir, &["checkout", "-q", "-b", "b1"]);
+        git(&repo.dir, &["mv", "base.txt", "renamed.txt"]);
+        repo.commit("a.txt", "a\n", "b1 add");
+        repo.commit("Cargo.lock", "b1\n", "b1 lock");
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit("Cargo.lock", "mainline\n", "main lock");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        let mut c = cfg("");
+        c.regenerate_command = "printf 'regenerated\\n' > Cargo.lock".into();
+
+        let report = run_fold(&c, &repo.dir, repo.branch_set()).unwrap();
+
+        assert!(
+            report.advanced,
+            "rename must not block lockfile regeneration"
+        );
+        assert_eq!(report.landed.len(), 1);
+        assert_eq!(report.landed[0].branch, "b1");
+        let files = repo.out(&["ls-tree", "-r", "--name-only", "main"]);
+        assert!(files.lines().any(|path| path == "renamed.txt"), "{files}");
+        assert!(!files.lines().any(|path| path == "base.txt"), "{files}");
     }
 
     #[test]
