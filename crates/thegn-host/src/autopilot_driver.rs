@@ -491,13 +491,14 @@ fn drive_claim(
         return;
     }
     if cfg.repo_pr_queue(repo_root).enabled {
-        if let Err(e) = db.enqueue_pr(
+        if let Err(e) = db.enqueue_bound_pr(
             &root_s,
             pr.number,
             Some(&wt),
             &pr.head_ref_name,
             &pr.base_ref_name,
             forge.id(),
+            &pr.url,
         ) {
             mark_needs_human(
                 db,

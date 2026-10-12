@@ -203,7 +203,8 @@ mod db_open_memo;
 /// v77: `agent_dispatches.chunk_scope`, the immutable admitted file scope.
 /// v78: bounded pipeline leases and an expiry index.
 /// v79: canonical dispatch statuses and admission lookup indexes.
-pub const SCHEMA_VERSION: i64 = 79;
+/// v80: bind PR queue rows to the forge PR URL observed at enqueue.
+pub const SCHEMA_VERSION: i64 = 80;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -978,6 +979,8 @@ pub struct PrQueueRow {
     pub base_branch: String,
     /// Which forge owns it (`github` today; the seam is a trait).
     pub forge: String,
+    /// Canonical PR URL observed when the row was queued. Legacy rows are unbound.
+    pub pr_url: Option<String>,
     pub status: String,
     /// The classified blocker word, or `None` before the first refresh.
     pub blocker: Option<String>,
@@ -1526,6 +1529,7 @@ impl Db {
                     crate::db_migrate::verify_v77_schema(&conn)?;
                     crate::db_migrate::verify_v78_schema(&conn)?;
                     crate::db_migrate::verify_v79_schema(&conn)?;
+                    crate::db_migrate::verify_v80_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2189,6 +2193,7 @@ impl Db {
         crate::db_migrate::migrate_v77(&conn)?;
         crate::db_migrate::migrate_v78(&conn)?;
         crate::db_migrate::migrate_v79(&conn)?;
+        crate::db_migrate::migrate_v80(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2206,6 +2211,7 @@ impl Db {
             crate::db_migrate::verify_v77_schema(&conn)?;
             crate::db_migrate::verify_v78_schema(&conn)?;
             crate::db_migrate::verify_v79_schema(&conn)?;
+            crate::db_migrate::verify_v80_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can
