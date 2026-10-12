@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::db::Db;
@@ -30,8 +30,25 @@ fn parse_span(s: &str) -> (u32, u32) {
 }
 
 impl SemanticStore for Db {
+    /// Replace file entities and remove edges for ids that vanished in the parse.
     fn replace_file_entities(&self, file: &str, entities: &[SemEntityRow]) -> Result<()> {
         let tx = self.conn().unchecked_transaction()?;
+        // Edges for ids that disappear in this parse would otherwise keep
+        // contributing to caller_degrees even though callers_of cannot resolve
+        // them. Surviving ids keep their edges for the graph builder to refresh.
+        let retained_ids: HashSet<&str> =
+            entities.iter().map(|entity| entity.id.as_str()).collect();
+        let vanished_ids = {
+            let mut stmt = tx.prepare("SELECT id FROM sem_entity WHERE file=?1")?;
+            let rows = stmt.query_map(params![file], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for id in vanished_ids {
+            if !retained_ids.contains(id.as_str()) {
+                tx.execute("DELETE FROM sem_edge WHERE src_id=?1", params![id])?;
+                tx.execute("DELETE FROM sem_edge WHERE dst_id=?1", params![id])?;
+            }
+        }
         tx.execute("DELETE FROM sem_entity WHERE file=?1", params![file])?;
         for e in entities {
             tx.execute(
@@ -405,11 +422,43 @@ mod tests {
         let db = Db::open_memory().unwrap();
         let a = entity_id("/wt", "/wt/f.rs", "a", EntityKind::Function);
         let b = entity_id("/wt", "/wt/f.rs", "b", EntityKind::Function);
+        let x = entity_id("/wt", "/wt/g.rs", "x", EntityKind::Function);
+        let y = entity_id("/wt", "/wt/h.rs", "y", EntityKind::Function);
         db.replace_file_entities(
             "/wt/f.rs",
             &[
                 row(&a, "/wt/f.rs", "a", EntityKind::Function, "h1"),
                 row(&b, "/wt/f.rs", "b", EntityKind::Function, "h1"),
+            ],
+        )
+        .unwrap();
+        db.upsert_entity(&row(&x, "/wt/g.rs", "x", EntityKind::Function, "h1"))
+            .unwrap();
+        db.upsert_entity(&row(&y, "/wt/h.rs", "y", EntityKind::Function, "h1"))
+            .unwrap();
+        db.replace_edges_for_dsts(
+            &[x.clone(), b.clone(), a.clone()],
+            &[
+                SemEdgeRow {
+                    src_id: b.clone(),
+                    dst_id: x.clone(),
+                    kind: "call".to_string(),
+                },
+                SemEdgeRow {
+                    src_id: x.clone(),
+                    dst_id: b.clone(),
+                    kind: "call".to_string(),
+                },
+                SemEdgeRow {
+                    src_id: a.clone(),
+                    dst_id: x.clone(),
+                    kind: "call".to_string(),
+                },
+                SemEdgeRow {
+                    src_id: y.clone(),
+                    dst_id: a.clone(),
+                    kind: "call".to_string(),
+                },
             ],
         )
         .unwrap();
@@ -423,15 +472,31 @@ mod tests {
             db.file_source_hash("/wt/f.rs").unwrap(),
             Some("h2".to_string())
         );
-        // `b` no longer resolvable as a caller.
-        db.upsert_entity(&row(
-            &entity_id("/wt", "/wt/g.rs", "callee", EntityKind::Function),
-            "/wt/g.rs",
-            "callee",
-            EntityKind::Function,
-            "h3",
-        ))
-        .unwrap();
+        let degrees = db.caller_degrees().unwrap();
+        assert_eq!(
+            degrees.iter().find(|(id, _)| id == &x).map(|(_, n)| *n),
+            Some(1)
+        );
+        let dangling_b_edges: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sem_edge WHERE src_id=?1 OR dst_id=?1",
+                params![b],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling_b_edges, 0);
+        for (src_id, dst_id) in [(&a, &x), (&y, &a)] {
+            let edge_count: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM sem_edge WHERE src_id=?1 AND dst_id=?2",
+                    params![src_id, dst_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(edge_count, 1, "edge {src_id} -> {dst_id} should survive");
+        }
     }
 
     #[test]
