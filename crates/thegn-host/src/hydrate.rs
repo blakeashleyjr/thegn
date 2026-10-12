@@ -109,6 +109,72 @@ pub(crate) fn should_rescan_glyphs(
     }
 }
 
+/// Partition glyph paths using only in-memory observations. Location and
+/// bridge lookups are resolved before the shared cache lock is acquired.
+struct GlyphPartitionConfig<'a> {
+    active_path: Option<&'a str>,
+    gate_remote_scans: bool,
+    now: Instant,
+    ttl: Duration,
+    active_floor: Duration,
+}
+
+fn may_live_scan_for_location<E: std::fmt::Display>(
+    path: &str,
+    location: Result<Option<String>, E>,
+    is_active: bool,
+) -> bool {
+    let location = match location {
+        Ok(location) => location,
+        Err(error) => {
+            tracing::debug!(target: "thegn::hydrate", path = %path, %error, "worktree location lookup failed; treating location as local for glyph scan");
+            None
+        }
+    };
+    let loc = thegn_core::remote::GitLoc::from_db(path, location.as_deref());
+    let remote = loc.is_remote();
+    let warm = remote && thegn_svc::bridge::for_loc(&loc).is_some();
+    thegn_core::lifecycle::should_live_scan(remote, warm, is_active)
+}
+
+#[allow(clippy::type_complexity)]
+fn partition_glyph_paths(
+    paths: &[String],
+    cache: &std::collections::HashMap<String, (GlyphRow, Instant)>,
+    may_live_scan: &std::collections::HashMap<String, bool>,
+    config: GlyphPartitionConfig<'_>,
+) -> (
+    Vec<String>,
+    Vec<(String, GlyphRow)>,
+    std::collections::HashMap<String, GlyphRow>,
+) {
+    let mut to_scan = Vec::new();
+    let mut reused = Vec::new();
+    let mut prior_for_scan = std::collections::HashMap::new();
+    for p in paths {
+        let is_active = config.active_path == Some(p.as_str());
+        let cached = cache.get(p);
+        if config.gate_remote_scans && !may_live_scan.get(p).copied().unwrap_or(false) {
+            if let Some((row, _)) = cached {
+                reused.push((p.clone(), row.clone()));
+            }
+            continue;
+        }
+        let age = cached.map(|(_, ts)| config.now.saturating_duration_since(*ts));
+        if should_rescan_glyphs(is_active, age, config.ttl, config.active_floor) {
+            if let Some((row, _)) = cached {
+                prior_for_scan.insert(p.clone(), row.clone());
+            }
+            to_scan.push(p.clone());
+        } else if let Some((row, _)) = cached {
+            reused.push((p.clone(), row.clone()));
+        } else {
+            to_scan.push(p.clone());
+        }
+    }
+    (to_scan, reused, prior_for_scan)
+}
+
 /// Merge a freshly-attempted git scan against the worktree's last-known-good
 /// row. Pure, so it's unit-tested. A live `gix` read (dirty / ahead-behind /
 /// branch) can return `Err` when it races a concurrent `.git` mutation — the
@@ -1639,52 +1705,41 @@ fn collect_sidebar_status(
     let ttl = bg_glyph_ttl();
     let active_floor = crate::hydrate_tuning::active_glyph_floor();
     let now = Instant::now();
-    let mut to_scan: Vec<String> = Vec::new();
-    let mut reused: Vec<(String, GlyphRow)> = Vec::new();
-    // Last-known-good rows for the paths we're about to rescan, so a scan that
-    // hits a transient gix error can reuse the prior value instead of dropping
-    // the glyph to zero/clean (see `merge_glyph_scan`).
-    let mut prior_for_scan: std::collections::HashMap<String, GlyphRow> =
-        std::collections::HashMap::new();
-    {
+    // Resolve DB-backed location and bridge state before taking the UI-shared
+    // glyph cache mutex. Reuse this hydration's Db instead of opening/querying
+    // SQLite once per path while holding the cache lock.
+    let may_live_scan: std::collections::HashMap<String, bool> = if gate_remote_scans {
+        paths
+            .iter()
+            .map(|p| {
+                let may_scan = may_live_scan_for_location(
+                    p,
+                    db.location_for(p),
+                    active_path.as_deref() == Some(p.as_str()),
+                );
+                (p.clone(), may_scan)
+            })
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+    // Cache lock now protects only map lookups and cloning. Suspended remote
+    // paths with no row remain absent instead of being fabricated clean.
+    let (to_scan, reused, prior_for_scan) = {
         let cache = glyph_cache().lock().unwrap();
-        for p in &paths {
-            let is_active = active_path.as_deref() == Some(p.as_str());
-            let cached = cache.get(p);
-            // Budget gate: never wake a suspended provider sandbox just to refresh
-            // the sidebar. A remote worktree that isn't active and has no live
-            // bridge is suspended — serve its last-known glyphs (or a placeholder)
-            // rather than running an in-sandbox `git status` that wakes it. The
-            // active worktree (and any warm one) still live-scans.
-            if gate_remote_scans {
-                let loc = GitLoc::for_worktree(std::path::Path::new(p));
-                let is_remote = loc.is_remote();
-                let warm = is_remote && thegn_svc::bridge::for_loc(&loc).is_some();
-                if !thegn_core::lifecycle::should_live_scan(is_remote, warm, is_active) {
-                    // No cached row: leave the glyph ABSENT (renders blank,
-                    // same as never-scanned) instead of fabricating an
-                    // all-zero "clean" state for a worktree that was never
-                    // actually scanned — a dirty suspended sandbox must not
-                    // read as clean.
-                    if let Some((row, _)) = cached {
-                        reused.push((p.clone(), row.clone()));
-                    }
-                    continue;
-                }
-            }
-            let age = cached.map(|(_, ts)| now.saturating_duration_since(*ts));
-            if should_rescan_glyphs(is_active, age, ttl, active_floor) {
-                if let Some((row, _)) = cached {
-                    prior_for_scan.insert(p.clone(), row.clone());
-                }
-                to_scan.push(p.clone());
-            } else if let Some((row, _)) = cached {
-                reused.push((p.clone(), row.clone()));
-            } else {
-                to_scan.push(p.clone());
-            }
-        }
-    }
+        partition_glyph_paths(
+            &paths,
+            &cache,
+            &may_live_scan,
+            GlyphPartitionConfig {
+                active_path: active_path.as_deref(),
+                gate_remote_scans,
+                now,
+                ttl,
+                active_floor,
+            },
+        )
+    };
 
     // (path, GlyphRow, clean) — git only, no DB access in the scope. `repo_root`
     // is the main-worktree root shared by every linked worktree of the repo; it
@@ -2101,14 +2156,93 @@ fn branch_fetch_needed(
     branches_open: bool,
     cached_age: Option<std::time::Duration>,
     ttl: std::time::Duration,
+    last_failure_age: Option<std::time::Duration>,
 ) -> bool {
     if !want {
+        return false;
+    }
+    if last_failure_age.is_some_and(|age| age < ttl) {
         return false;
     }
     if branches_open {
         crate::branch_cache::should_refetch(cached_age, ttl)
     } else {
         cached_age.is_none()
+    }
+}
+
+const BRANCH_FAILURE_CACHE_CAPACITY: usize = 256;
+
+fn branch_failure_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Instant>> {
+    static FAILURES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Instant>>,
+    > = std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn branch_failure_age(root: &Path, now: Instant) -> Option<Duration> {
+    branch_failure_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(root)
+        .map(|failed_at| now.saturating_duration_since(*failed_at))
+}
+
+fn record_branch_failure(root: &Path, now: Instant) {
+    let mut failures = branch_failure_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    failures.retain(|_, failed_at| {
+        now.saturating_duration_since(*failed_at) < crate::branch_cache::BRANCH_CACHE_TTL
+    });
+    if !failures.contains_key(root)
+        && failures.len() >= BRANCH_FAILURE_CACHE_CAPACITY
+        && let Some(oldest) = failures
+            .iter()
+            .min_by_key(|(_, failed_at)| **failed_at)
+            .map(|(path, _)| path.clone())
+    {
+        failures.remove(&oldest);
+    }
+    failures.insert(root.to_path_buf(), now);
+}
+
+fn clear_branch_failure(root: &Path) {
+    branch_failure_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(root);
+}
+
+/// Apply a repo-wide branch refresh, preserving last-known-good shared cache
+/// contents on failure and throttling repeated failed subprocesses per repo.
+fn apply_branch_refresh(
+    root: Option<&Path>,
+    need_fetch: bool,
+    fetched: Option<std::result::Result<Vec<thegn_core::gitrefs::BranchInfo>, String>>,
+    cached: Option<Vec<thegn_core::gitrefs::BranchInfo>>,
+) -> Vec<thegn_core::gitrefs::BranchInfo> {
+    if need_fetch {
+        match fetched {
+            Some(Ok(branches)) => {
+                if let Some(root) = root {
+                    crate::branch_cache::put(root, branches.clone());
+                    clear_branch_failure(root);
+                }
+                branches
+            }
+            Some(Err(error)) => {
+                tracing::debug!(target: "thegn::hydrate", %error, "branch refresh failed; keeping cached observation");
+                if let Some(root) = root {
+                    record_branch_failure(root, Instant::now());
+                }
+                cached.unwrap_or_default()
+            }
+            None => cached.unwrap_or_default(),
+        }
+    } else {
+        cached.unwrap_or_default()
     }
 }
 
@@ -2641,11 +2775,15 @@ pub(crate) fn build_panel(
     let repo_root = want_branches
         .then(|| thegn_core::repo::main_worktree(cwd).unwrap_or_else(|| cwd.to_path_buf()));
     let cached_branches = repo_root.as_deref().and_then(crate::branch_cache::get);
+    let failure_age = repo_root
+        .as_deref()
+        .and_then(|root| branch_failure_age(root, Instant::now()));
     let need_branch_fetch = branch_fetch_needed(
         want_branches,
         branches_open,
         cached_branches.as_ref().map(|(_, age)| *age),
         crate::branch_cache::BRANCH_CACHE_TTL,
+        failure_age,
     );
 
     // THE-718: `status`, `diff HEAD` (+ its entity summary) and the stash count
@@ -2781,7 +2919,7 @@ pub(crate) fn build_panel(
                 let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
                 crate::git_handle::get()
                     .branches_full(&loc)
-                    .unwrap_or_default()
+                    .map_err(|error| error.to_string())
             })
         });
         let h_stashes = want_stashes.then(|| {
@@ -2824,7 +2962,7 @@ pub(crate) fn build_panel(
             merge_res,
             h_stash_count.join().unwrap(),
             h_log.map(|h| h.join().unwrap()).unwrap_or_default(),
-            h_branches.map(|h| h.join().unwrap()).unwrap_or_default(),
+            h_branches.map(|h| h.join().unwrap()),
             h_stashes.map(|h| h.join().unwrap()).unwrap_or_default(),
             h_ls.and_then(|h| h.join().unwrap()),
             incoming_set,
@@ -2857,14 +2995,12 @@ pub(crate) fn build_panel(
 
     // Resolve the branch list: a fresh fetch refreshes the shared repo cache;
     // otherwise reuse the warm entry populated by this (or a sibling) worktree.
-    let branches_raw = if need_branch_fetch {
-        if let Some(root) = repo_root.as_deref() {
-            crate::branch_cache::put(root, fetched_branches.clone());
-        }
-        fetched_branches
-    } else {
-        cached_branches.map(|(v, _)| v).unwrap_or_default()
-    };
+    let branches_raw = apply_branch_refresh(
+        repo_root.as_deref(),
+        need_branch_fetch,
+        fetched_branches,
+        cached_branches.map(|(branches, _)| branches),
+    );
 
     // Per-worktree cache key: the HOST path, never `loc.path()` (which
     // collides across sandboxed worktrees — see `worktree_cache_key`).
@@ -3476,9 +3612,9 @@ fn plan_log_scan(prev_len: u64, cur_len: u64) -> LogScanPlan {
     }
 }
 
-/// Count ERROR lines in a byte slice of (possibly partial-line-bounded) log text.
-/// The `offset` reads always start at a stored line boundary, so full lines
-/// parse cleanly; `parse_log_line` already drops any blank/partial trailing line.
+/// Count ERROR lines in complete log records only. A logger may append while
+/// this bounded read is in progress, so an unterminated tail is retained for
+/// the next pass rather than advancing the scan offset into that record.
 fn count_error_lines(bytes: &[u8]) -> usize {
     String::from_utf8_lossy(bytes)
         .lines()
@@ -3487,14 +3623,30 @@ fn count_error_lines(bytes: &[u8]) -> usize {
         .count()
 }
 
-/// Fold the ERROR lines appended since the last pass into the running total and
-/// return it. Reads only `[offset, cur_len)` on a plain append (or the whole
-/// file on first scan / after rotation), so cost tracks appended bytes, not file
-/// size. Best-effort: a read error leaves the total unchanged.
-fn update_log_error_total(log_path: &std::path::Path, cur_len: u64) -> usize {
+fn commit_log_scan(
+    state: &std::sync::Mutex<(u64, usize)>,
+    snapshot: (u64, usize),
+    updated: (u64, usize),
+) -> bool {
+    let mut current = state.lock().unwrap_or_else(|e| e.into_inner());
+    if *current != snapshot {
+        return false;
+    }
+    *current = updated;
+    true
+}
+
+/// Fold complete ERROR records into a caller-owned scan state. The mutex only
+/// protects snapshot/commit; file I/O and parsing run without it. A competing
+/// scan wins by changing the snapshot, in which case this result is discarded.
+fn update_log_error_total_in(
+    state: &std::sync::Mutex<(u64, usize)>,
+    log_path: &std::path::Path,
+    cur_len: u64,
+) -> usize {
     use std::io::{Read, Seek, SeekFrom};
-    let mut st = log_scan_state().lock().unwrap();
-    let (prev_len, total) = *st;
+    let snapshot = *state.lock().unwrap_or_else(|e| e.into_inner());
+    let (prev_len, total) = snapshot;
     match plan_log_scan(prev_len, cur_len) {
         LogScanPlan::Unchanged => total,
         plan => {
@@ -3502,21 +3654,36 @@ fn update_log_error_total(log_path: &std::path::Path, cur_len: u64) -> usize {
                 LogScanPlan::Append { offset } => (offset, total),
                 _ => (0, 0), // FromStart: reset the running total
             };
-            let scanned = std::fs::File::open(log_path)
-                .and_then(|mut f| {
-                    f.seek(SeekFrom::Start(offset))?;
-                    let mut buf = Vec::new();
-                    f.take(cur_len.saturating_sub(offset))
-                        .read_to_end(&mut buf)?;
-                    Ok(buf)
-                })
-                .map(|buf| count_error_lines(&buf))
-                .unwrap_or(0);
-            let new_total = base + scanned;
-            *st = (cur_len, new_total);
+            let bytes = std::fs::File::open(log_path).and_then(|mut f| {
+                f.seek(SeekFrom::Start(offset))?;
+                let mut buf = Vec::new();
+                f.take(cur_len.saturating_sub(offset))
+                    .read_to_end(&mut buf)?;
+                Ok(buf)
+            });
+            let Ok(bytes) = bytes else {
+                return state.lock().unwrap_or_else(|e| e.into_inner()).1;
+            };
+            let complete_len = bytes
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index as u64 + 1);
+            let complete = &bytes[..complete_len as usize];
+            let new_total = base + count_error_lines(complete);
+            let new_len = offset + complete_len;
+            if !commit_log_scan(state, snapshot, (new_len, new_total)) {
+                return state.lock().unwrap_or_else(|e| e.into_inner()).1;
+            }
             new_total
         }
     }
+}
+
+/// Fold ERROR lines appended since the last pass into the process-wide total.
+/// Only the small state snapshot/commit is mutex-protected; reading and parsing
+/// the file happens unlocked. Failed reads leave the stored offset untouched.
+fn update_log_error_total(log_path: &std::path::Path, cur_len: u64) -> usize {
+    update_log_error_total_in(log_scan_state(), log_path, cur_len)
 }
 
 /// Read the last `max_bytes` of the log and parse them into lines, snapping to

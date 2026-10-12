@@ -158,6 +158,24 @@ fn public_endpoint_parsing_canonicalizes_and_rejects_ambiguous_input() {
         "http://[2001:db8::1]:8080"
     );
     assert!(PublicEndpoint::parse_url("https://xn--bcher-kva.example").is_some());
+    for numeric in [
+        "http://127.1",
+        "http://2130706433",
+        "http://0x7f.1",
+        "http://1.2.3.4.5",
+    ] {
+        assert!(
+            PublicEndpoint::parse_url(numeric).is_none(),
+            "accepted {numeric}"
+        );
+    }
+    assert!(PublicEndpoint::parse_url("http://[::ffff:127.0.0.1]:8080").is_some());
+    assert!(PublicEndpoint::parse_url("http://[fe80::1%25eth0]").is_none());
+    assert!(PublicEndpoint::parse_fixed("127.1:80").is_none());
+    assert!(PublicEndpoint::parse_fixed("::1:80").is_none());
+    assert!(PublicEndpoint::parse_fixed("ab--cd.example:80").is_none());
+    assert!(PublicEndpoint::parse_fixed("[::ffff:127.0.0.1]:8080").is_some());
+    assert!(PublicEndpoint::parse_fixed("xn--bcher-kva.example:443").is_some());
     for bad in [
         "https://user@example.test",
         "https://example.test/#fragment",
@@ -169,6 +187,7 @@ fn public_endpoint_parsing_canonicalizes_and_rejects_ambiguous_input() {
         "https://example.test:80;evil",
         "https://-bad.example",
         "https://例え.テスト",
+        "https://ab--cd.example",
     ] {
         assert!(PublicEndpoint::parse_url(bad).is_none(), "accepted {bad:?}");
     }
@@ -267,11 +286,94 @@ fn share_state_identity_is_bounded_canonical_and_manifest_owned() {
     let missing_worktree = repo.join("remote-or-deleted-worktree");
     assert!(
         share_state_dir_at(&base, &missing_worktree, "bore", 3002, 1).is_ok(),
-        "missing worktree paths retain their raw identity"
+        "missing worktree paths retain a usable identity"
+    );
+    let relative = std::path::PathBuf::from(format!("missing-share-wt-{}", std::process::id()));
+    let absolute = std::env::current_dir()
+        .expect("current directory")
+        .join(&relative);
+    assert_eq!(
+        share_state_dir_at(&base, &relative, "bore", 3003, 1).expect("relative identity"),
+        share_state_dir_at(&base, &absolute, "bore", 3003, 1).expect("absolute identity")
     );
 
     std::fs::write(a.join("owner.manifest"), b"foreign owner").expect("tamper manifest");
     assert!(share_state_dir_at(&base, &nested, "bore", 3000, 1).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn share_state_identity_resolves_symlink_aliases() {
+    let temp = tempfile::tempdir().expect("temporary root");
+    let base = temp.path().join("state");
+    let worktree = temp.path().join("worktree");
+    let alias = temp.path().join("alias");
+    std::fs::create_dir(&worktree).expect("worktree fixture");
+    std::os::unix::fs::symlink(&worktree, &alias).expect("symlink alias");
+    assert_eq!(
+        share_state_dir_at(&base, &worktree, "bore", 3000, 1).expect("real identity"),
+        share_state_dir_at(&base, &alias, "bore", 3000, 1).expect("alias identity")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn share_state_identity_preserves_non_utf8_path_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = tempfile::tempdir().expect("temporary root");
+    let base = temp.path().join("state");
+    let non_utf8 = temp.path().join(std::ffi::OsStr::from_bytes(b"wt-\xff"));
+    let replacement = temp.path().join("wt--");
+    std::fs::create_dir(&non_utf8).expect("non-UTF-8 worktree");
+    std::fs::create_dir(&replacement).expect("replacement worktree");
+    let actual =
+        share_state_dir_at(&base, &non_utf8, "bore", 3000, 1).expect("non-UTF-8 share identity");
+    let other = share_state_dir_at(&base, &replacement, "bore", 3000, 1)
+        .expect("replacement share identity");
+    assert!(actual.is_dir());
+    assert_ne!(actual, other);
+}
+
+#[test]
+fn share_state_identity_distinguishes_unicode_normalization_when_supported() {
+    let temp = tempfile::tempdir().expect("temporary root");
+    let base = temp.path().join("state");
+    let nfc = temp.path().join("caf\u{e9}");
+    let nfd = temp.path().join("cafe\u{301}");
+    std::fs::create_dir(&nfc).expect("NFC worktree");
+    match std::fs::create_dir(&nfd) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return,
+        Err(error) => panic!("create NFD worktree: {error}"),
+    }
+    assert_ne!(
+        share_state_dir_at(&base, &nfc, "bore", 3000, 1).expect("NFC identity"),
+        share_state_dir_at(&base, &nfd, "bore", 3000, 1).expect("NFD identity")
+    );
+}
+
+#[test]
+fn foreign_manifest_collision_blocks_reuse_and_cleanup() {
+    let temp = tempfile::tempdir().expect("temporary root");
+    let base = temp.path().join("state");
+    let worktree = temp.path().join("worktree");
+    std::fs::create_dir(&worktree).expect("worktree fixture");
+    let state =
+        share_state_dir_at(&base, &worktree, "bore", 3000, 1).expect("owned state directory");
+    let manifest = state.join("owner.manifest");
+    let expected = std::fs::read(&manifest).expect("original manifest");
+    std::fs::write(&manifest, b"different canonical identity").expect("simulated hash collision");
+    assert!(share_state_dir_at(&base, &worktree, "bore", 3000, 1).is_err());
+    cleanup_state_files(&state, &[], Some(&expected));
+    assert!(
+        state.is_dir(),
+        "cleanup must retain a foreign-owned directory"
+    );
+    assert_eq!(
+        std::fs::read(manifest).expect("foreign manifest remains"),
+        b"different canonical identity"
+    );
 }
 
 #[test]
@@ -830,6 +932,57 @@ fn start_keeps_draining_so_child_survives_post_return() {
     let _ = std::fs::remove_dir_all(&tmp); // best-effort: test tmp cleanup
 }
 
+#[cfg(unix)]
+#[test]
+fn running_share_reports_endpoint_mutation_after_startup_window() {
+    let state = tempfile::tempdir().expect("private temporary state");
+    let script = "echo 'public: first.example:4123'; sleep 0.3; echo 'public: first.example:4123'; echo 'public: first.example:4123'; echo 'public: first.example:4123'; echo 'public: second.example:4123'; sleep 2";
+    let plan = SharePlan {
+        program: "sh".into(),
+        args: vec!["-c".into(), script.into()],
+        env: Vec::new(),
+        files: Vec::new(),
+        url_rule: UrlRule::AfterMarker {
+            marker: "public: ".into(),
+            scheme: "https".into(),
+        },
+    };
+    let running = start(&plan, state.path(), Duration::from_secs(2)).expect("start share");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !running.endpoint_conflict() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        running.endpoint_conflict(),
+        "later changed endpoint must be sticky"
+    );
+    running.stop();
+}
+
+#[cfg(unix)]
+#[test]
+fn running_share_accepts_post_startup_identical_announcements() {
+    let state = tempfile::tempdir().expect("private temporary state");
+    let script = "echo 'public: first.example:4123'; sleep 0.3; echo 'public: first.example:4123'; echo 'public: first.example:4123'; echo 'public: first.example:4123'; sleep 2";
+    let plan = SharePlan {
+        program: "sh".into(),
+        args: vec!["-c".into(), script.into()],
+        env: Vec::new(),
+        files: Vec::new(),
+        url_rule: UrlRule::AfterMarker {
+            marker: "public: ".into(),
+            scheme: "https".into(),
+        },
+    };
+    let running = start(&plan, state.path(), Duration::from_secs(2)).expect("start share");
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(
+        !running.endpoint_conflict(),
+        "identical endpoint repeats are harmless"
+    );
+    running.stop();
+}
+
 #[test]
 fn bounded_reader_retries_interrupted_and_emits_eof_url() {
     struct InterruptOnce {
@@ -860,6 +1013,7 @@ fn bounded_reader_retries_interrupted_and_emits_eof_url() {
             marker: "listening at ".into(),
             scheme: "http".into(),
         },
+        super::EndpointTracker::default(),
     );
     assert_eq!(
         url_rx
@@ -888,6 +1042,7 @@ fn bounded_reader_discards_oversized_line_but_keeps_following_url() {
             marker: "listening at ".into(),
             scheme: "http".into(),
         },
+        super::EndpointTracker::default(),
     );
     assert_eq!(
         url_rx.recv().expect("URL after oversized line").canonical(),
@@ -912,6 +1067,7 @@ fn bounded_reader_keeps_url_when_diagnostics_receiver_is_gone() {
             marker: "listening at ".into(),
             scheme: "http".into(),
         },
+        super::EndpointTracker::default(),
     );
     assert_eq!(
         url_rx
@@ -1017,6 +1173,7 @@ fn bounded_reader_prioritizes_late_url_over_full_diagnostic_queue() {
             marker: "listening at ".into(),
             scheme: "http".into(),
         },
+        super::EndpointTracker::default(),
     );
     assert_eq!(
         url_rx.recv().expect("late URL signal").canonical(),

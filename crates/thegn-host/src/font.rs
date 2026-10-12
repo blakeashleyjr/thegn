@@ -1,9 +1,11 @@
 use crate::palette::PaletteItem;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const RECOMMENDED_FONTS: &[&str] = &[
@@ -549,7 +551,7 @@ fn collect_font_families(dir: &Path, depth: usize, cancel: &AtomicBool, st: &mut
             continue;
         }
         let family = family_from_font_filename(stem);
-        if !family.is_empty() && !is_short_nerd_font_alias(&family) {
+        if validate_family(&family).is_ok() && !is_short_nerd_font_alias(&family) {
             st.families.insert(family);
         }
     }
@@ -637,6 +639,7 @@ fn rank_families(families: BTreeSet<String>) -> Vec<FontRow> {
 
     let mut rows: Vec<_> = families
         .into_iter()
+        .filter(|family| validate_family(family).is_ok())
         .map(|family| {
             let recommended_idx = recommended_order.get(&normalize_family(&family)).copied();
             let label = if recommended_idx.is_some() {
@@ -664,20 +667,45 @@ fn rank_families(families: BTreeSet<String>) -> Vec<FontRow> {
 /// (set by the `.app` launcher, but only when Alacritty is the terminal that
 /// actually runs), else Alacritty's own XDG location.
 ///
-/// `None` when neither exists — the caller must decline rather than guess. The
-/// previous default was the **relative** path `config/alacritty.toml`, resolved
-/// against the process CWD: in a compositor whose CWD is whichever worktree tab
-/// is focused, that either failed to open or silently edited a file in some
-/// unrelated checkout (the thegn repo itself, most often).
+/// `None` when neither a usable override nor an existing XDG config exists —
+/// the caller must decline rather than guess. An absolute override is returned
+/// even when its file is missing so a typo is reported against that path. Empty
+/// and relative overrides are ignored; a relative path must never resolve
+/// against the process CWD, which may be whichever worktree tab is focused.
 pub fn alacritty_config_path() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("THEGN_ALACRITTY_CONFIG") {
-        return Some(PathBuf::from(p));
+    alacritty_config_path_with(
+        std::env::var_os("THEGN_ALACRITTY_CONFIG"),
+        &thegn_core::util::xdg_config_home(),
+        |path| path.is_file(),
+    )
+}
+
+fn alacritty_config_path_with(
+    env: Option<OsString>,
+    xdg_config_home: &Path,
+    is_file: impl FnOnce(&Path) -> bool,
+) -> Option<PathBuf> {
+    let is_override = env
+        .as_ref()
+        .is_some_and(|value| PathBuf::from(value).is_absolute());
+    let candidate = alacritty_config_path_from(env, xdg_config_home)?;
+    if is_override {
+        Some(candidate)
+    } else {
+        is_file(&candidate).then_some(candidate)
+    }
+}
+
+/// Use only absolute overrides. Ignore empty and relative values, falling back
+/// to Alacritty's XDG location so the process CWD can never select the config.
+fn alacritty_config_path_from(env: Option<OsString>, xdg_config_home: &Path) -> Option<PathBuf> {
+    if let Some(p) = env.map(PathBuf::from).filter(|p| p.is_absolute()) {
+        return Some(p);
     }
     // Alacritty reads `$XDG_CONFIG_HOME/alacritty/alacritty.toml` on every
     // platform (and also `~/.config/...` on macOS, which is where thegn's own
     // `xdg_config_home` points by default).
-    let candidate = thegn_core::util::xdg_config_home().join("alacritty/alacritty.toml");
-    candidate.is_file().then_some(candidate)
+    Some(xdg_config_home.join("alacritty/alacritty.toml"))
 }
 
 /// The terminal the font picker is being asked to reconfigure.
@@ -821,11 +849,13 @@ pub fn apply_font_family_for(kind: TerminalKind, family: &str) -> Result<PathBuf
 /// the same as editing it.
 fn write_simple_key(path: &Path, key: &str, new_line: &str, family: &str) -> Result<(), String> {
     validate_family(family)?;
-    let current = match std::fs::read_to_string(path) {
-        Ok(current) => current,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("read {} failed: {e}", path.display())),
+    let (observed, observed_exists) = match read_config(path) {
+        Ok(bytes) => (bytes, true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), false),
+        Err(e) => return Err(config_read_error(path, e)),
     };
+    let current = String::from_utf8(observed.clone())
+        .map_err(|e| format!("read {} failed: {e}", path.display()))?;
     let mut out: Vec<String> = Vec::new();
     let mut replaced = false;
     for line in current.lines() {
@@ -845,20 +875,113 @@ fn write_simple_key(path: &Path, key: &str, new_line: &str, family: &str) -> Res
     if !replaced {
         out.push(new_line.to_string());
     }
+    let mut body = out.join("\n");
+    body.push('\n');
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("create {} failed: {e}", dir.display()))?;
     }
-    let mut body = out.join("\n");
-    body.push('\n');
-    std::fs::write(path, body).map_err(|e| format!("write {} failed: {e}", path.display()))
+    replace_config(path, &observed, observed_exists, body.as_bytes())
 }
 
 fn apply_font_family_to_path(path: &Path, family: &str) -> Result<(), String> {
-    let current = std::fs::read_to_string(path)
+    let observed = read_config(path).map_err(|e| config_read_error(path, e))?;
+    let current = String::from_utf8(observed.clone())
         .map_err(|e| format!("read {} failed: {e}", path.display()))?;
     let patched = patch_alacritty_font_family(&current, family)?;
-    std::fs::write(path, patched).map_err(|e| format!("write {} failed: {e}", path.display()))
+    replace_config(path, &observed, true, patched.as_bytes())
+}
+
+fn read_config(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut file = thegn_core::fsperm::open_regular_file_nofollow(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn config_read_error(path: &Path, error: std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::InvalidInput
+        && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        format!(
+            "{} is a symlink (managed dotfile?) — edit its target",
+            path.display()
+        )
+    } else {
+        format!("read {} failed: {error}", path.display())
+    }
+}
+
+/// Publish only if the no-follow destination still has the bytes we observed.
+/// The staged write is private, same-directory, synced and atomically renamed.
+fn replace_config(
+    path: &Path,
+    observed: &[u8],
+    observed_exists: bool,
+    new: &[u8],
+) -> Result<(), String> {
+    let (current, metadata) = match thegn_core::fsperm::open_regular_file_nofollow(path) {
+        Ok(mut file) => {
+            let metadata = file
+                .metadata()
+                .map_err(|e| format!("inspect {} failed: {e}", path.display()))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|e| format!("read {} failed: {e}", path.display()))?;
+            (bytes, Some(metadata))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !observed_exists => {
+            (Vec::new(), None)
+        }
+        Err(e) => return Err(config_read_error(path, e)),
+    };
+    if current != observed || metadata.is_some() != observed_exists {
+        return Err(format!("{} changed while editing; retry", path.display()));
+    }
+    if metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.permissions().readonly())
+    {
+        return Err(format!("{} is read-only; not modified", path.display()));
+    }
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", path.display()))?
+        .to_string_lossy();
+    let counter = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temporary = parent.join(format!(
+        ".{name}.tmp-{}-{nanos}-{counter}",
+        std::process::id()
+    ));
+    thegn_core::fsperm::write_owner_only_new(&temporary, new)
+        .map_err(|e| format!("stage {} failed: {e}", path.display()))?;
+    if let Err(error) = thegn_core::fsperm::rename_replace(&temporary, path) {
+        let cleanup = std::fs::remove_file(&temporary);
+        return match cleanup {
+            Ok(()) => Err(format!("replace {} failed: {error}", path.display())),
+            Err(cleanup_error) => Err(format!(
+                "replace {} failed: {error}; remove staging file {} failed: {cleanup_error}",
+                path.display(),
+                temporary.display()
+            )),
+        };
+    }
+    if let Some(metadata) = metadata {
+        std::fs::set_permissions(path, metadata.permissions())
+            .map_err(|e| format!("preserve permissions for {} failed: {e}", path.display()))?;
+    }
+    thegn_core::fsperm::sync_parent_dir(parent)
+        .map_err(|e| format!("sync {} failed: {e}", parent.display()))?;
+    Ok(())
 }
 
 pub fn patch_alacritty_font_family(input: &str, family: &str) -> Result<String, String> {
@@ -1074,6 +1197,161 @@ mod tests {
             write_simple_key(&directory, "font_family", "font_family Hack", "Hack").unwrap_err();
         assert!(err.starts_with("read "), "{err}");
         assert!(directory.is_dir());
+    }
+
+    #[test]
+    fn relative_alacritty_override_falls_through_to_xdg_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let xdg = tmp.path();
+        assert_eq!(
+            alacritty_config_path_from(Some(OsString::from("config/alacritty.toml")), xdg),
+            Some(xdg.join("alacritty/alacritty.toml"))
+        );
+        assert_eq!(
+            alacritty_config_path_from(Some(OsString::new()), xdg),
+            Some(xdg.join("alacritty/alacritty.toml"))
+        );
+        assert_eq!(
+            alacritty_config_path_from(Some(xdg.join("override.toml").into_os_string()), xdg),
+            Some(xdg.join("override.toml"))
+        );
+        let missing_override = xdg.join("missing-override.toml");
+        assert_eq!(
+            alacritty_config_path_with(
+                Some(missing_override.clone().into_os_string()),
+                xdg,
+                |_| false,
+            ),
+            Some(missing_override)
+        );
+        assert_eq!(
+            alacritty_config_path_with(None, xdg, |_| false),
+            None,
+            "a missing XDG default should still be ignored"
+        );
+    }
+
+    #[test]
+    fn config_replacement_refuses_symlinks_and_preserves_the_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.conf");
+        let link = tmp.path().join("config.conf");
+        let original = b"font_family Menlo\n";
+        std::fs::write(&target, original).unwrap();
+        if thegn_core::fsperm::create_symlink(&target, &link, false).is_err() {
+            return;
+        }
+
+        let error = write_simple_key(&link, "font_family", "font_family Hack", "Hack").unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+    }
+
+    #[test]
+    fn config_replacement_rejects_a_newer_observed_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        let observed = b"font_family Menlo\n";
+        let newer = b"font_family Iosevka\n";
+        std::fs::write(&config, newer).unwrap();
+
+        let error = replace_config(&config, observed, true, b"font_family Hack\n").unwrap_err();
+        assert!(error.contains("changed while editing; retry"), "{error}");
+        assert_eq!(std::fs::read(&config).unwrap(), newer);
+    }
+
+    #[test]
+    fn config_replacement_distinguishes_absence_from_an_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        std::fs::write(&config, b"").unwrap();
+
+        let error = replace_config(&config, b"", false, b"font_family Hack\n").unwrap_err();
+        assert!(error.contains("changed while editing; retry"), "{error}");
+        assert_eq!(std::fs::read(&config).unwrap(), b"");
+    }
+
+    #[test]
+    fn config_replacement_is_atomic_and_leaves_no_staging_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        let observed = b"font_family Menlo\n";
+        std::fs::write(&config, observed).unwrap();
+
+        replace_config(&config, observed, true, b"font_family Hack\n").unwrap();
+
+        assert_eq!(std::fs::read(&config).unwrap(), b"font_family Hack\n");
+        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+    }
+
+    #[test]
+    fn config_replacement_refuses_readonly_permissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        let observed = b"font_family Menlo\n";
+        std::fs::write(&config, observed).unwrap();
+        let mut permissions = std::fs::metadata(&config).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&config, permissions).unwrap();
+        let expected_permissions = std::fs::metadata(&config).unwrap().permissions();
+
+        let error = replace_config(&config, observed, true, b"font_family Hack\n").unwrap_err();
+        assert!(error.contains("is read-only; not modified"), "{error}");
+        assert_eq!(std::fs::read(&config).unwrap(), observed);
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().permissions(),
+            expected_permissions
+        );
+    }
+
+    #[test]
+    fn config_replacement_preserves_writable_permissions_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        let observed = b"font_family Menlo\n";
+        std::fs::write(&config, observed).unwrap();
+        let expected_permissions = std::fs::metadata(&config).unwrap().permissions();
+        assert!(!expected_permissions.readonly());
+
+        replace_config(&config, observed, true, b"font_family Hack\n").unwrap();
+
+        assert_eq!(std::fs::read(&config).unwrap(), b"font_family Hack\n");
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().permissions(),
+            expected_permissions
+        );
+    }
+
+    #[test]
+    fn discovery_drops_control_bearing_families() {
+        let rows = font_rows_from_fc_list(
+            "/f.ttf: Evil\u{1b}]0;x\u{7}Name:style=Regular\n/g.ttf: Hack:style=Regular\n",
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.family.as_str())
+                .collect::<Vec<_>>(),
+            ["Hack"]
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let hostile = tmp.path().join("Evil\tFamily-Regular.ttf");
+        if std::fs::write(&hostile, b"").is_ok() {
+            let scan = font_rows_from_dirs(&[tmp.path().to_path_buf()], &AtomicBool::new(false));
+            assert!(scan.rows.is_empty(), "{:?}", scan.rows);
+        }
     }
 
     #[test]

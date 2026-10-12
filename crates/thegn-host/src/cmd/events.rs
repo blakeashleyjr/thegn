@@ -10,7 +10,7 @@ use clap::Subcommand;
 use thegn_core::config::Config;
 use thegn_core::control_wire::{EventFrame, FeedFilter};
 use thegn_core::outln;
-use thegn_svc::control::client::frame_json;
+use thegn_svc::control::client::{AttachStream, StreamEnd, frame_json};
 
 #[derive(Subcommand, Clone)]
 pub enum Action {
@@ -58,11 +58,30 @@ async fn run_async(cfg: &Config, action: Action) -> Result<()> {
             return Err(error);
         }
     };
-    let mut stream = client.subscribe_events_opts(&filter).await?;
+    let stream = client.subscribe_events_opts(&filter).await?;
+    drain(stream, json).await
+}
+
+async fn drain(mut stream: AttachStream, json: bool) -> Result<()> {
     while let Some(frame) = stream.frames.recv().await {
         outln!("{}", format_frame(&frame, json)?);
     }
-    Ok(())
+    let end = stream.end.await.unwrap_or_else(|_| {
+        StreamEnd::TransportLost("stream ended without a terminal outcome".into())
+    });
+    match end {
+        StreamEnd::CleanClose => Ok(()),
+        StreamEnd::Protocol(message) => Err(anyhow!("event stream protocol error: {message}")),
+        StreamEnd::IdentityMismatch { expected, got } => Err(anyhow!(
+            "event stream identity mismatch: expected {expected}, got {got}"
+        )),
+        StreamEnd::SequenceGap { expected, got } => Err(anyhow!(
+            "event stream sequence gap: expected {expected}, got {got}"
+        )),
+        StreamEnd::TransportLost(message) => Err(anyhow!("event stream transport lost: {message}")),
+        StreamEnd::LivenessTimeout => Err(anyhow!("event stream liveness timeout")),
+        StreamEnd::ConsumerGone => Err(anyhow!("event stream consumer disappeared")),
+    }
 }
 
 /// Format every feed frame through the shared client JSON projection. JSON
@@ -150,6 +169,44 @@ mod tests {
     use clap::Parser;
     use thegn_core::control::Scope;
     use thegn_core::control_wire::{Hello, LeaseEventKind, PairingState};
+
+    #[tokio::test]
+    async fn drain_uses_typed_terminal_outcome() {
+        let (frames, frame_rx) = tokio::sync::mpsc::channel(1);
+        let (control, _control_rx) = tokio::sync::mpsc::channel(1);
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+        drop(frames);
+        end_tx
+            .send(StreamEnd::Protocol("bad frame".into()))
+            .unwrap();
+        let error = drain(
+            AttachStream {
+                frames: frame_rx,
+                control,
+                end: end_rx,
+            },
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("protocol error"));
+
+        let (frames, frame_rx) = tokio::sync::mpsc::channel(1);
+        let (control, _control_rx) = tokio::sync::mpsc::channel(1);
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+        drop(frames);
+        end_tx.send(StreamEnd::CleanClose).unwrap();
+        drain(
+            AttachStream {
+                frames: frame_rx,
+                control,
+                end: end_rx,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn human_formatter_keeps_greeting_and_lag_visible() {

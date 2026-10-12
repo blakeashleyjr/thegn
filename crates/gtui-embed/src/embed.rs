@@ -89,7 +89,7 @@ impl ObserveTile {
             from: to - chrono::Duration::minutes(15),
             to,
         };
-        let refresh = Duration::from_secs(cfg.refresh_interval_secs.max(1));
+        let refresh = refresh_period(cfg.refresh_interval_secs);
 
         let app = ObserveApp::new(rt, dashboard, sources, time_range, refresh, hook);
         Ok(Self {
@@ -228,8 +228,22 @@ impl AppTile for ObserveTile {
 
 /// Maximum custom dashboard size accepted at the load boundary (1 MiB).
 pub const MAX_DASHBOARD_BYTES: u64 = 1024 * 1024;
+/// Maximum number of panels accepted in a custom dashboard.
 const MAX_DASHBOARD_PANELS: usize = 64;
+/// Maximum number of query targets in one panel.
+const MAX_PANEL_TARGETS: usize = 16;
+/// Maximum bytes in a target expression.
+const MAX_EXPR_BYTES: usize = 4096;
+/// Maximum bytes in dashboard and panel labels, descriptions, and ref ids.
+const MAX_LABEL_BYTES: usize = 256;
+/// Refresh cadence is clamped to [1 second, one hour].
+const MAX_REFRESH_SECS: u64 = 3600;
+/// Maximum vertical extent of a panel grid.
 const MAX_DASHBOARD_ROWS: u32 = 10_000;
+
+fn refresh_period(secs: u64) -> Duration {
+    Duration::from_secs(secs.clamp(1, MAX_REFRESH_SECS))
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DashboardLoadError {
@@ -345,11 +359,27 @@ fn validate_dashboard(
             "panel count exceeds {MAX_DASHBOARD_PANELS}"
         )));
     }
+    if dashboard.title.len() > MAX_LABEL_BYTES
+        || dashboard
+            .description
+            .as_ref()
+            .is_some_and(|description| description.len() > MAX_LABEL_BYTES)
+    {
+        return Err(DashboardLoadError::Invalid(format!(
+            "dashboard title or description exceeds {MAX_LABEL_BYTES} bytes"
+        )));
+    }
     let mut ids = HashSet::new();
     for panel in &dashboard.panels {
         if !ids.insert(panel.id) {
             return Err(DashboardLoadError::Invalid(format!(
                 "duplicate panel id {}",
+                panel.id
+            )));
+        }
+        if panel.title.len() > MAX_LABEL_BYTES {
+            return Err(DashboardLoadError::Invalid(format!(
+                "panel {} title exceeds {MAX_LABEL_BYTES} bytes",
                 panel.id
             )));
         }
@@ -380,6 +410,33 @@ fn validate_dashboard(
             }
         } else if !source_ids.contains(&panel.datasource) {
             return Err(DashboardLoadError::UnknownSource(panel.datasource.clone()));
+        }
+        if panel.targets.len() > MAX_PANEL_TARGETS {
+            return Err(DashboardLoadError::Invalid(format!(
+                "panel {} target count exceeds {MAX_PANEL_TARGETS}",
+                panel.id
+            )));
+        }
+        let mut ref_ids = HashSet::new();
+        for target in &panel.targets {
+            if target.expr.len() > MAX_EXPR_BYTES {
+                return Err(DashboardLoadError::Invalid(format!(
+                    "panel {} expression exceeds {MAX_EXPR_BYTES} bytes",
+                    panel.id
+                )));
+            }
+            if target.ref_id.len() > MAX_LABEL_BYTES {
+                return Err(DashboardLoadError::Invalid(format!(
+                    "panel {} ref_id exceeds {MAX_LABEL_BYTES} bytes",
+                    panel.id
+                )));
+            }
+            if !ref_ids.insert(&target.ref_id) {
+                return Err(DashboardLoadError::Invalid(format!(
+                    "panel {} has duplicate ref_id",
+                    panel.id
+                )));
+            }
         }
     }
     Ok(())
@@ -590,18 +647,28 @@ fn block_msg(rect: Rect, buf: &mut Buffer, title: &str, msg: &str, token: Tok, t
 mod tests {
     use super::*;
     use gtui_core::frame::{Field, FieldType};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_FILE: AtomicUsize = AtomicUsize::new(0);
 
     fn dashboard_file(contents: &[u8]) -> String {
-        let path = std::env::temp_dir().join(format!(
+        let dir = std::env::temp_dir().join(format!(
             "gtui-dashboard-{}-{}.toml",
             std::process::id(),
             NEXT_FILE.fetch_add(1, Ordering::Relaxed),
         ));
+        std::fs::create_dir(&dir).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("dashboard.toml");
         std::fs::write(&path, contents).unwrap();
         path.to_string_lossy().into_owned()
+    }
+
+    fn remove_dashboard_file(path: &str) {
+        std::fs::remove_dir_all(std::path::Path::new(path).parent().unwrap()).unwrap();
     }
 
     fn config_for(path: String) -> ObserveConfig {
@@ -645,7 +712,7 @@ mod tests {
             load_dashboard(&cfg, &source_ids),
             Err(DashboardLoadError::TooLarge(_))
         ));
-        std::fs::remove_file(oversized_path).unwrap();
+        remove_dashboard_file(&oversized_path);
 
         let invalid_path = dashboard_file(b"not = [toml");
         cfg.dashboard_path = invalid_path.clone();
@@ -653,7 +720,7 @@ mod tests {
             load_dashboard(&cfg, &source_ids),
             Err(DashboardLoadError::InvalidToml(_))
         ));
-        std::fs::remove_file(invalid_path).unwrap();
+        remove_dashboard_file(&invalid_path);
 
         let schema_path = dashboard_file(b"title = \"missing panels\"");
         cfg.dashboard_path = schema_path.clone();
@@ -661,7 +728,7 @@ mod tests {
             load_dashboard(&cfg, &source_ids),
             Err(DashboardLoadError::Invalid(reason)) if reason == "schema"
         ));
-        std::fs::remove_file(schema_path).unwrap();
+        remove_dashboard_file(&schema_path);
 
         let duplicate_path = dashboard_file(
             format!("{}{}", valid_toml(1, "host"), valid_toml(1, "host")).as_bytes(),
@@ -670,14 +737,14 @@ mod tests {
         assert!(
             matches!(load_dashboard(&cfg, &source_ids), Err(DashboardLoadError::Invalid(message)) if message.contains("duplicate panel id"))
         );
-        std::fs::remove_file(duplicate_path).unwrap();
+        remove_dashboard_file(&duplicate_path);
 
         let unknown_path = dashboard_file(valid_toml(1, "typo").as_bytes());
         cfg.dashboard_path = unknown_path.clone();
         assert!(
             matches!(load_dashboard(&cfg, &source_ids), Err(DashboardLoadError::UnknownSource(id)) if id == "typo")
         );
-        std::fs::remove_file(unknown_path).unwrap();
+        remove_dashboard_file(&unknown_path);
 
         let ambiguous_path = dashboard_file(valid_toml(1, "").as_bytes());
         cfg.dashboard_path = ambiguous_path.clone();
@@ -685,7 +752,86 @@ mod tests {
             load_dashboard(&cfg, &make_source_ids(&["host", "prometheus"])),
             Err(DashboardLoadError::AmbiguousSource)
         ));
-        std::fs::remove_file(ambiguous_path).unwrap();
+        remove_dashboard_file(&ambiguous_path);
+    }
+
+    #[test]
+    fn custom_dashboard_rejects_unbounded_targets_labels_and_expressions() {
+        let source_ids = make_source_ids(&["host"]);
+        let too_many_targets = format!(
+            "{}{}",
+            valid_toml(1, "host"),
+            (0..MAX_PANEL_TARGETS)
+                .map(|index| format!(
+                    "[[panels.targets]]\nexpr = \"x{index}\"\nref_id = \"{index}\"\n"
+                ))
+                .collect::<String>()
+        );
+        let oversized_expr = valid_toml(1, "host").replace(
+            "expr = \"x\"",
+            &format!("expr = \"{}\"", "x".repeat(MAX_EXPR_BYTES + 1)),
+        );
+        let oversized_title = valid_toml(1, "host").replace(
+            "title = \"p\"",
+            &format!("title = \"{}\"", "x".repeat(MAX_LABEL_BYTES + 1)),
+        );
+        let duplicate_ref = valid_toml(1, "host").replace(
+            "ref_id = \"A\"",
+            "ref_id = \"A\"\n[[panels.targets]]\nexpr = \"y\"\nref_id = \"A\"",
+        );
+
+        for (toml, expected) in [
+            (too_many_targets, "target count"),
+            (oversized_expr, "expression"),
+            (oversized_title, "title"),
+            (duplicate_ref, "duplicate ref_id"),
+        ] {
+            let path = dashboard_file(toml.as_bytes());
+            let result = load_dashboard(&config_for(path.clone()), &source_ids);
+            assert!(
+                matches!(result, Err(DashboardLoadError::Invalid(reason)) if reason.contains(expected))
+            );
+            remove_dashboard_file(&path);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denied_dashboard_load_is_visible_when_filesystem_denies_open() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "gtui-dashboard-denied-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let path = dir.join("dashboard.toml");
+        std::fs::write(&path, valid_toml(1, "host")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        assert!(matches!(
+            load_dashboard(
+                &config_for(path.to_string_lossy().into_owned()),
+                &make_source_ids(&["host"])
+            ),
+            Err(DashboardLoadError::Denied(_))
+        ));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refresh_period_clamps_both_ends() {
+        assert_eq!(refresh_period(0), Duration::from_secs(1));
+        assert_eq!(
+            refresh_period(u64::MAX),
+            Duration::from_secs(MAX_REFRESH_SECS)
+        );
     }
 
     #[test]

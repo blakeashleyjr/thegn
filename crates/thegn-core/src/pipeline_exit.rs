@@ -35,7 +35,7 @@ pub enum ExitClass {
 }
 
 /// The substring lists a screen is classified against. Case-insensitive;
-/// transport is tested before limit; the first match wins.
+/// limits are tested before transport so ambiguous mixed evidence fails closed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExitSignatures {
     /// Retryable transport-failure markers (a connection error, an HTTP 5xx).
@@ -89,14 +89,9 @@ pub const DEFAULT_TRANSPORT_SIGNATURES: &[&str] = &[
     "econnreset",
     "econnrefused",
     "etimedout",
-    "timed out",
-    "timeout",
     "overloaded_error",
-    "overloaded",
     "bad gateway",
     "service unavailable",
-    "internal server error",
-    "http 429",
     "http 500",
     "http 502",
     "http 503",
@@ -115,7 +110,13 @@ pub const DEFAULT_LIMIT_SIGNATURES: &[&str] = &[
     "credit balance",
     "billing",
     "payment required",
+    "http 429",
 ];
+
+/// Number of final non-empty screen lines inspected by the daemon classifier.
+/// The harness writes its own exit banner at the end of the screen; older
+/// issue, source, and build output is advisory context, not retry authority.
+pub const CLASSIFY_TAIL_LINES: usize = 8;
 
 /// Backoff ceiling for [`decide`]: `backoff_ms * 2^(n-1)` never waits longer
 /// than this, however many attempts a row has burned.
@@ -132,20 +133,14 @@ pub const RETRY_NUDGE: &str =
 /// `failed` is the exit gate: `false` (exit 0) classifies as `None` whatever
 /// the screen says — the artifact gate owns exit-0 verdicts, and a success
 /// must never be re-read as a failure by substring matching. `screen` is the
-/// flattened final screen (ANSI stripped); matching is substring,
-/// case-insensitive, transport before limit, first match wins.
+/// flattened final screen (ANSI stripped); matching is substring and
+/// case-insensitive. Limits are checked before transport, and the first match
+/// within each category wins.
 pub fn classify(failed: bool, screen: &str, sig: &ExitSignatures) -> Option<ExitClass> {
     if !failed {
         return None;
     }
     let hay = screen.to_lowercase();
-    for s in &sig.transport {
-        if hay.contains(&s.to_lowercase()) {
-            return Some(ExitClass::Transport {
-                signature: s.clone(),
-            });
-        }
-    }
     for s in &sig.limit {
         if hay.contains(&s.to_lowercase()) {
             return Some(ExitClass::Limit {
@@ -153,7 +148,39 @@ pub fn classify(failed: bool, screen: &str, sig: &ExitSignatures) -> Option<Exit
             });
         }
     }
+    for s in &sig.transport {
+        if hay.contains(&s.to_lowercase()) {
+            return Some(ExitClass::Transport {
+                signature: s.clone(),
+            });
+        }
+    }
     None
+}
+
+/// Classify only the final `max_lines` non-empty lines of a failed worker's
+/// screen. Earlier screen contents can include user-controlled text and cannot
+/// authorize an automatic retry.
+pub fn classify_tail(
+    failed: bool,
+    screen: &str,
+    sig: &ExitSignatures,
+    max_lines: usize,
+) -> Option<ExitClass> {
+    if !failed || max_lines == 0 {
+        return None;
+    }
+    let tail = screen
+        .lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .take(max_lines)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    classify(true, &tail, sig)
 }
 
 /// What the daemon does with a classified exit. Every outcome parks the row
@@ -244,18 +271,59 @@ mod tests {
     }
 
     #[test]
-    fn transport_is_tested_before_limit() {
-        // A screen mentioning both is a transport failure — the retryable
-        // class wins, so a flaky connection carrying a limit warning in its
-        // scrollback still retries.
+    fn limit_dominates_a_mixed_screen() {
+        // Mixed evidence must take the spend-safe path and park for review.
         let s = ExitSignatures {
             transport: vec!["connection reset".into()],
             limit: vec!["usage limit".into()],
         };
         assert!(matches!(
             classify(true, "usage limit hit after connection reset", &s),
+            Some(ExitClass::Limit { .. })
+        ));
+    }
+
+    #[test]
+    fn default_signatures_ignore_ordinary_user_and_build_text() {
+        let d = ExitSignatures::defaults();
+        for screen in [
+            "test foo ... FAILED: timed out after 60s",
+            "assert_eq!(err, \"timeout\")",
+            "// handle overloaded queue",
+            "500 Internal Server Error in fixture",
+        ] {
+            assert_eq!(classify(true, screen, &d), None, "{screen}");
+        }
+        assert!(matches!(
+            classify(true, "HTTP 429 Too Many Requests", &d),
+            Some(ExitClass::Limit { .. })
+        ));
+    }
+
+    #[test]
+    fn tail_classification_ignores_earlier_user_content() {
+        let d = ExitSignatures::defaults();
+        let mut screen = String::from("connection reset in echoed issue body\n");
+        for line in 0..CLASSIFY_TAIL_LINES {
+            screen.push_str(&format!("compile output {line}\n"));
+        }
+        assert_eq!(classify_tail(true, &screen, &d, CLASSIFY_TAIL_LINES), None);
+        screen.push_str("connection reset\n");
+        assert!(matches!(
+            classify_tail(true, &screen, &d, CLASSIFY_TAIL_LINES),
             Some(ExitClass::Transport { .. })
         ));
+    }
+
+    #[test]
+    fn tail_classification_ignores_blank_lines_and_zero_window() {
+        let d = ExitSignatures::defaults();
+        assert!(matches!(
+            classify_tail(true, "compile output\n\nconnection reset\n\n", &d, 1),
+            Some(ExitClass::Transport { .. })
+        ));
+        assert_eq!(classify_tail(true, "connection reset", &d, 0), None);
+        assert_eq!(classify_tail(false, "connection reset", &d, 1), None);
     }
 
     #[test]

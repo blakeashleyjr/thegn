@@ -309,6 +309,8 @@ pub const MAX_RENDERED_PROMPT_BYTES: usize = 64 * 1024;
 const TEXT_OMISSION_MARKER: &str = "\n... task data omitted ...\n";
 const MAX_PATH_ITEMS: usize = 200;
 const MAX_PATH_BYTES: usize = 16 * 1024;
+const MAX_SUBMODULE_ITEMS: usize = 200;
+const MAX_SUBMODULE_BYTES: usize = 16 * 1024;
 
 /// Bound text by UTF-8 bytes, retaining useful context from both ends.
 /// The returned string never exceeds `max_bytes` and always ends on a char boundary.
@@ -629,7 +631,35 @@ pub fn format_paths(paths: &[String]) -> String {
 /// Format typed gitlink conflicts for a merge prompt. Raw paths remain
 /// available through [`format_paths`] for git commands and ordinary conflicts.
 pub fn format_submodule_conflicts(conflicts: &[crate::submodule::SubmoduleConflict]) -> String {
-    crate::submodule::format_submodule_conflicts(conflicts)
+    let mut out = String::new();
+    let mut included = 0;
+    for conflict in conflicts.iter().take(MAX_SUBMODULE_ITEMS) {
+        let record = crate::submodule::format_submodule_conflict(conflict);
+        let separator_bytes = usize::from(included > 0);
+        let line_bytes = record.len().saturating_add(separator_bytes);
+        if out.len().saturating_add(line_bytes) > MAX_SUBMODULE_BYTES {
+            break;
+        }
+        if included > 0 {
+            out.push('\n');
+        }
+        out.push_str(&record);
+        included += 1;
+    }
+    let omitted = conflicts.len().saturating_sub(included);
+    if omitted > 0 {
+        let note = format!("... {omitted} more submodule conflict(s) omitted");
+        let separator_bytes = usize::from(!out.is_empty());
+        let required_bytes = separator_bytes.saturating_add(note.len());
+        if out.len().saturating_add(required_bytes) > MAX_SUBMODULE_BYTES {
+            out = bound_text(&out, MAX_SUBMODULE_BYTES.saturating_sub(required_bytes));
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&note);
+    }
+    out
 }
 
 /// Every task kind, for exhaustive iteration in tests and config validation.
@@ -1839,6 +1869,22 @@ mod tests {
         let rendered = format_paths(&near_limit);
         assert!(rendered.len() <= MAX_PATH_BYTES);
         assert!(rendered.contains("1 more path(s) omitted"));
+    }
+
+    #[test]
+    fn format_submodule_conflicts_caps_item_count_and_bytes_with_omission_count() {
+        let many: Vec<_> = (0..10_000)
+            .map(|i| crate::submodule::SubmoduleConflict {
+                path: format!("submodule-{i}"),
+                ours_sha: "ours".into(),
+                theirs_sha: "theirs".into(),
+            })
+            .collect();
+        let rendered = format_submodule_conflicts(&many);
+        assert!(rendered.len() <= MAX_SUBMODULE_BYTES);
+        assert!(rendered.contains("submodule-0"));
+        assert!(rendered.contains("more submodule conflict(s) omitted"));
+        assert!(rendered.contains("9800 more"));
     }
 
     #[test]

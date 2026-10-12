@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thegn_core::config::Config;
 use thegn_core::config_pipeline::PipelineStage;
+use thegn_core::issue::AgentDispatchStatus;
 
 use crate::monitor_pipeline::{PipelineRow, UNSTAGED, stage_sequence};
 
@@ -155,7 +156,12 @@ impl Board {
 /// conversion clamps, so an absurd `timeout_secs` reads as "never stalled"
 /// rather than wrapping into "always stalled".
 pub(crate) fn stalled(row: &PipelineRow, timeout_secs: u64, now_ms: i64) -> bool {
-    if timeout_secs == 0 || !row.status.is_active() {
+    if timeout_secs == 0
+        || !matches!(
+            row.status,
+            AgentDispatchStatus::Spawning | AgentDispatchStatus::Running
+        )
+    {
         return false;
     }
     let budget_ms = i64::try_from(timeout_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
@@ -749,6 +755,29 @@ mod tests {
         assert!(!stalled(&fin, 60, i64::MAX), "a finished row is not late");
         // A clock behind the row reads as fresh, never as a huge negative age.
         assert!(!stalled(r, 60, -1));
+
+        let status_expectations = [
+            (AgentDispatchStatus::Queued, false),
+            (AgentDispatchStatus::Spawning, true),
+            (AgentDispatchStatus::Running, true),
+            (AgentDispatchStatus::WaitingHuman, false),
+            (AgentDispatchStatus::PrOpen, false),
+            (AgentDispatchStatus::Merged, false),
+            (AgentDispatchStatus::Abandoned, false),
+            (AgentDispatchStatus::Done, false),
+            (AgentDispatchStatus::Failed, false),
+            (AgentDispatchStatus::Unknown, false),
+        ];
+        for (status, expected) in status_expectations {
+            let mut dispatch = d(2, Some("code"), None, 0);
+            dispatch.status = status;
+            let row = fold(&[dispatch], &stages, 0).remove(0);
+            assert_eq!(
+                stalled(&row, 60, 60_001),
+                expected,
+                "unexpected stall result for {status:?}"
+            );
+        }
     }
 
     #[test]
