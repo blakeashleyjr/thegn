@@ -4263,6 +4263,8 @@ gate_reuse_worktree = true    # reuse a stable per-repo gate worktree + target d
                               # false = throwaway /tmp worktree each fold (cold; use for concurrent gates)
 gate_target_dir = ""          # CARGO_TARGET_DIR for the gate; "" = $XDG_STATE_HOME/thegn/gate/<repo>/target
 bisect_on_red = true          # on a red gate, defer just the offending branch
+diagnosis_max_gates = 8       # maximum gate attempts to localize a red batch; 0 disables diagnosis
+diagnosis_timeout_secs = 3600 # aggregate diagnosis wall-time cap; 0 disables diagnosis
 #
 # Fold ONLY branches someone explicitly enqueued (`thegn merge add`), instead of
 # every "eligible" worktree branch. Eligible is a much wider net than it reads:
