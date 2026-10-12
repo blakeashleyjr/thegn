@@ -44,6 +44,8 @@
 //! capability replies. Transmit and placement commands never receive synthetic
 //! acknowledgements. Every command sent outward is rebuilt with `q=2`; child
 //! quiet-mode choices cannot cause replies to enter the host input stream.
+//! Images are scaled to the full content rect when the child omits `c`/`r`;
+//! child cursor offsets are ignored to keep placement inside that rect.
 
 const ESC: u8 = 0x1b;
 const ST: &[u8] = b"\x1b\\"; // String Terminator (ESC \)
@@ -293,7 +295,7 @@ fn canonical_graphics(
     let control = Control::parse(ctrl)?;
     let get = |key: &[u8]| control.get(key);
     let action = get(b"a").unwrap_or(b"");
-    if get(b"i").is_some_and(|id| parse_positive(id).is_none()) {
+    if get(b"i").is_some_and(|id| parse_u32_positive(id).is_none()) {
         return None;
     }
     if action == b"q" {
@@ -442,9 +444,6 @@ fn canonical_graphics(
             return None;
         }
     } else if action == b"T" {
-        if get(b"t").is_some_and(|t| t != b"d") {
-            return None;
-        }
         let format = get(b"f")?;
         let width = parse_positive(get(b"s")?)?;
         let height = parse_positive(get(b"v")?)?;
@@ -501,16 +500,22 @@ fn canonical_graphics(
             b"q" => out.extend_from_slice(b"2"),
             b"C" => out.extend_from_slice(b"1"),
             b"z" => out.extend_from_slice(b"-1"),
-            b"c" => out.extend_from_slice(if cell_cols == 0 {
-                cols.to_string().as_bytes()
-            } else {
-                value
-            }),
-            b"r" => out.extend_from_slice(if cell_rows == 0 {
-                rows.to_string().as_bytes()
-            } else {
-                value
-            }),
+            b"c" => {
+                let cols_s = cols.to_string();
+                out.extend_from_slice(if cell_cols == 0 {
+                    cols_s.as_bytes()
+                } else {
+                    value
+                });
+            }
+            b"r" => {
+                let rows_s = rows.to_string();
+                out.extend_from_slice(if cell_rows == 0 {
+                    rows_s.as_bytes()
+                } else {
+                    value
+                });
+            }
             b"i" | b"s" | b"v" | b"m" | b"x" | b"y" | b"w" | b"h" | b"X" | b"Y" => {
                 out.extend_from_slice(parse_num(value)?.to_string().as_bytes())
             }
@@ -559,6 +564,10 @@ fn parse_positive(value: &[u8]) -> Option<usize> {
     let n = parse_num(value)?;
     (n > 0).then_some(n)
 }
+fn parse_u32_positive(value: &[u8]) -> Option<u32> {
+    let n = u32::try_from(parse_positive(value)?).ok()?;
+    (n > 0).then_some(n)
+}
 fn parse_signed(value: &[u8]) -> Option<i64> {
     std::str::from_utf8(value).ok()?.parse().ok()
 }
@@ -568,7 +577,7 @@ fn valid_base64_alphabet(bytes: &[u8]) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
 }
 fn decode_base64(bytes: &[u8]) -> Option<Vec<u8>> {
-    if bytes.len() > MAX_APC_BYTES || bytes.len() % 4 != 0 {
+    if bytes.len() > MAX_APC_BYTES || !bytes.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len().saturating_mul(3) / 4);
@@ -776,8 +785,9 @@ mod tests {
                 relay.feed(b"\\safe"),
                 vec![Piece::Emulator(b"safe".to_vec())]
             );
-            assert!(
-                matches!(relay.feed(&apc("Ga=d"))[..], [Piece::GfxOther(bytes)] if bytes == apc("Ga=d,q=2;"))
+            assert_eq!(
+                relay.feed(&apc("Ga=d")),
+                vec![Piece::GfxOther(apc("Ga=d,q=2;"))]
             );
         }
     }
@@ -1025,5 +1035,14 @@ mod tests {
             panic!("accepted command expected")
         };
         assert!(bytes.windows(3).any(|part| part == b"C=1"));
+    }
+
+    #[test]
+    fn image_ids_must_fit_the_kitty_u32_protocol() {
+        assert_eq!(relayed("Ga=d,i=4294967296;", (8, 5)), [Piece::Rejected]);
+        assert_eq!(
+            relayed("Ga=d,i=4294967295;", (8, 5)),
+            [Piece::GfxOther(apc("Ga=d,i=4294967295,q=2;"))]
+        );
     }
 }
