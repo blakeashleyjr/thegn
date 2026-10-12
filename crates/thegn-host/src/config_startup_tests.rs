@@ -239,6 +239,49 @@ fn concurrent_reload_requests_share_one_follow_up_capture() {
 }
 
 #[test]
+fn single_joiner_owns_follow_up_capture_after_leader_completes() {
+    let sources = Arc::new(ConcurrentSources::new("branch_prefix = \"one/\"\n"));
+    let (process, _) = ProcessAdmission::admit_initial(
+        seed(),
+        thegn_core::db::MigrationActor::Controller,
+        &|seed, _, _| concurrent_admit(seed, &sources),
+    )
+    .unwrap();
+    let gate = Arc::new(Gate::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let admit = {
+        let sources = Arc::clone(&sources);
+        let calls = Arc::clone(&calls);
+        move |seed: &ConfigCaptureSeed, _: thegn_core::db::MigrationActor, _: bool| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            concurrent_admit(seed, &sources)
+        }
+    };
+
+    sources.set("branch_prefix = \"two/\"\n");
+    sources.block_next_read(Arc::clone(&gate));
+    std::thread::scope(|scope| {
+        let leader = scope.spawn(|| process.reload_with(&admit));
+        gate.wait_entered();
+        let joiner = scope.spawn(|| process.reload_with(&admit));
+        wait_for_waiters(&process, 1);
+        sources.set("branch_prefix = \"three/\"\n");
+        gate.release();
+
+        let ReloadOutcome::Published(leader_result) = leader.join().unwrap() else {
+            panic!("the leader publishes its capture");
+        };
+        assert_eq!(leader_result.revision().generation, 2);
+        let ReloadOutcome::Published(joiner_result) = joiner.join().unwrap() else {
+            panic!("the joiner owns the pending follow-up capture");
+        };
+        assert_eq!(joiner_result.revision().generation, 3);
+        assert_eq!(joiner_result.config().branch_prefix, "three/");
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
 fn panicking_reload_releases_joiners_and_allows_a_later_capture() {
     let sources = Arc::new(ConcurrentSources::new("branch_prefix = \"one/\"\n"));
     let (process, _) = ProcessAdmission::admit_initial(

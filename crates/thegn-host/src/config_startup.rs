@@ -73,6 +73,8 @@ struct ReloadFlight {
 #[derive(Clone)]
 enum FlightResult {
     Published(Arc<AdmittedConfig>),
+    Superseded,
+    Unavailable,
     Failed,
 }
 
@@ -161,7 +163,10 @@ impl ProcessAdmission {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
                 flight.waiters -= 1;
-                if flight.sequence == target && !flight.active && flight.pending {
+                if !flight.active
+                    && flight.pending
+                    && flight.sequence.checked_add(1) == Some(target)
+                {
                     flight.pending = false;
                     flight.active = true;
                     flight.sequence = target;
@@ -169,7 +174,7 @@ impl ProcessAdmission {
                 } else if flight.sequence == target && flight.active {
                     (target, false)
                 } else if let Some((done, result)) = &flight.completed
-                    && *done == target
+                    && *done >= target
                 {
                     return outcome_for_joiner(result);
                 } else {
@@ -200,7 +205,7 @@ impl ProcessAdmission {
             return flight
                 .completed
                 .as_ref()
-                .filter(|(done, _)| *done == sequence)
+                .filter(|(done, _)| *done >= sequence)
                 .map_or(ReloadOutcome::Unavailable, |(_, result)| {
                     outcome_for_joiner(result)
                 });
@@ -214,6 +219,8 @@ impl ProcessAdmission {
         let outcome = self.reload_capture(admit);
         let result = match &outcome {
             ReloadOutcome::Published(published) => FlightResult::Published(Arc::clone(published)),
+            ReloadOutcome::Superseded => FlightResult::Superseded,
+            ReloadOutcome::Unavailable => FlightResult::Unavailable,
             _ => FlightResult::Failed,
         };
         guard.complete(result);
@@ -341,6 +348,8 @@ impl Drop for ReloadFlightGuard<'_> {
 fn outcome_for_joiner(result: &FlightResult) -> ReloadOutcome {
     match result {
         FlightResult::Published(published) => ReloadOutcome::Published(Arc::clone(published)),
+        FlightResult::Superseded => ReloadOutcome::Superseded,
+        FlightResult::Unavailable => ReloadOutcome::Unavailable,
         FlightResult::Failed => ReloadOutcome::FailedCoalesced,
     }
 }
