@@ -2733,6 +2733,31 @@ pub(crate) fn build_model(
     }
 }
 
+fn cache_panel_git_snapshot(
+    cwd: &std::path::Path,
+    key: Option<crate::panel_git_cache::PanelKey>,
+    cached_reads: bool,
+    reads_ok: bool,
+    mut reads: crate::panel_git_cache::GitReads,
+    stash_count: anyhow::Result<usize>,
+) -> usize {
+    reads.stash_count = match stash_count {
+        Ok(count) => Some(count),
+        Err(error) => {
+            tracing::debug!(%error, "stash count unavailable for panel snapshot");
+            None
+        }
+    };
+    let stash_count = reads.stash_count.unwrap_or_default();
+    if let Some(key) = key
+        && !cached_reads
+        && reads_ok
+    {
+        crate::panel_git_cache::put(cwd, key, reads);
+    }
+    stash_count
+}
+
 /// Build just the right-side panel for a worktree directory. This is the
 /// path-keyed core of model hydration: it touches only `cwd`/`db`/`hints`,
 /// never the session, so a background task can warm a not-yet-focused
@@ -2892,14 +2917,10 @@ pub(crate) fn build_panel(
         });
         let h_stash_count = s.spawn(|| {
             if let Some(c) = &cached_reads {
-                return c.stash_count;
+                return Ok(c.stash_count.unwrap_or_default());
             }
             let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
-            let count = crate::git_handle::get().stash_count(&loc);
-            if count.is_err() {
-                reads_ok.store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-            count.unwrap_or(0)
+            crate::git_handle::get().stash_count(&loc)
         });
         // Section-gated heavy reads: spawned only when their section is open, so
         // an idle panel pays nothing. The branch PR-badge join is DB-backed and
@@ -2974,24 +2995,22 @@ pub(crate) fn build_panel(
         reused_snapshot = cached_reads.is_some(),
         "panel git fan-out done"
     );
-    // Remember a fully successful read set under the print taken before it. A
-    // partial failure is never stored: it would pin an empty answer until the
-    // next change.
-    if let Some(print) = watch_print
-        && cached_reads.is_none()
-        && reads_ok.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        crate::panel_git_cache::put(
-            cwd,
-            print,
-            crate::panel_git_cache::GitReads {
-                diff_entries: diff_entries.clone(),
-                entities: entities.clone(),
-                status: status.clone(),
-                stash_count,
-            },
-        );
-    }
+    // Remember status and diff under the print taken before them. A stash
+    // count failure remains unknown but does not invalidate this snapshot; a
+    // status or diff failure still prevents caching the partial answer.
+    let stash_count = cache_panel_git_snapshot(
+        cwd,
+        watch_print,
+        cached_reads.is_some(),
+        reads_ok.load(std::sync::atomic::Ordering::Relaxed),
+        crate::panel_git_cache::GitReads {
+            diff_entries: diff_entries.clone(),
+            entities: entities.clone(),
+            status: status.clone(),
+            stash_count: None,
+        },
+        stash_count,
+    );
 
     // Resolve the branch list: a fresh fetch refreshes the shared repo cache;
     // otherwise reuse the warm entry populated by this (or a sibling) worktree.
