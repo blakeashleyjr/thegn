@@ -200,6 +200,20 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
             }
             continue;
         }
+        // A non-local worktree identifier is opaque. Do not pass it to Git or
+        // treat it as a filesystem path while trying to infer repository
+        // ownership; remote rows cannot be cleaned by this local sweep.
+        if !row.location.is_empty() && row.location != "local" {
+            if force {
+                report.kept.push((
+                    row.branch.clone(),
+                    "remote/unknown worktree location".into(),
+                ));
+            } else {
+                tracing::debug!(branch = %row.branch, location = %row.location, "landed row has non-local worktree location; leaving it untouched");
+            }
+            continue;
+        }
         // A global queue may contain the same target name in unrelated repos.
         // Unknown/missing worktree identity cannot be safely assigned this
         // repository's policy and must be refused before backfill or cleanup.
@@ -239,13 +253,6 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
             .find(|r| r.worktree == entry.worktree)
             .expect("projected row");
         let mut row = snapshot.clone();
-        if !row.location.is_empty() && row.location != "local" {
-            report.kept.push((
-                entry.branch.clone(),
-                "remote/unknown worktree location".into(),
-            ));
-            continue;
-        }
         if row.result_oid.as_deref().is_none_or(str::is_empty) {
             let derived = match derive_missing_landed_oid(repo_root, &row.branch, &target) {
                 Ok(derived) => derived,
@@ -566,6 +573,68 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().any(|r| Path::new(&r.worktree) == foreign));
         assert!(rows.iter().any(|r| Path::new(&r.worktree) == root));
+    }
+
+    #[test]
+    fn remote_location_is_refused_before_probing_its_worktree_as_a_local_path() {
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let db_path = parent.join("shared.db");
+        let db = Db::open_at(&db_path).unwrap();
+        let (root_one, worktree_one) = fixture(&parent, "one", &db, &isolation);
+        let (root_two, worktree_two) = fixture(&parent, "two", &db, &isolation);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "DELETE FROM merge_queue WHERE worktree=?1",
+            [worktree_two.to_str().unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE merge_queue SET location='remote-placement', worktree=?1 WHERE worktree=?2",
+            [
+                worktree_two.to_str().unwrap(),
+                worktree_one.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut cfg = local_config();
+        cfg.merge_queue.on_landed = OnLanded::Expire;
+        cfg.merge_queue.target_branch = "main".into();
+        let report = sweep_with_db(&cfg, &root_one, true, &db);
+
+        assert!(report.collected.is_empty());
+        assert_eq!(report.kept.len(), 1);
+        assert_eq!(report.kept[0].0, "feature");
+        assert!(
+            report.kept[0]
+                .1
+                .contains("remote/unknown worktree location")
+        );
+        assert!(worktree_one.join("tracked").exists());
+        assert!(worktree_two.join("tracked").exists());
+        let rows = db.list_merge_queue().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].worktree, worktree_two.to_str().unwrap());
+        assert_eq!(rows[0].location, "remote-placement");
+        assert_eq!(rows[0].status, "landed");
+        assert!(root_one.join("tracked").exists() && root_two.join("tracked").exists());
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE merge_queue SET error_detail=?1 WHERE worktree=?2",
+            [
+                merge_sweep::CleanupHold::BranchRetained.marker(),
+                worktree_two.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        let held_report = sweep_with_db(&cfg, &root_one, true, &db);
+        assert_eq!(held_report.kept.len(), 1);
+        assert!(held_report.kept[0].1.contains("previously collected"));
     }
 
     #[test]
