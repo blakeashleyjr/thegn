@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use termwiz::terminal::TerminalWaker;
 use thegn_core::attention::MqStatus;
 use thegn_core::config::Config;
-use thegn_core::db::Db;
+use thegn_core::db::{Db, MergeQueueRow};
 use thegn_core::merge_lifecycle::LifecycleEvent;
 use thegn_core::notification::NotificationKind;
 use thegn_core::store::{MergeStatusFields, WorktreeAuxStore};
@@ -840,7 +840,6 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
             let sweep_cfg = ctx.cfg.clone();
             let sweep_root = ctx.active_wt.clone();
             tokio::task::spawn_blocking(move || {
-                let n = landed.len();
                 let Some(root) = crate::integrate::main_checkout(&sweep_root) else {
                     note.send(
                         "Clear refused: repository identity unavailable; retry records retained"
@@ -848,20 +847,39 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
                     );
                     return;
                 };
-                let swept = crate::merge_sweep::sweep(&sweep_cfg, &root, true);
+                let db = match Db::open() {
+                    Ok(db) => db,
+                    Err(error) => {
+                        note.send(format!(
+                            "Clear failed: {}",
+                            crate::merge_sweep::safe_display(&error.to_string())
+                        ));
+                        return;
+                    }
+                };
+                let repo_landed = landed_in_repo(&db, &root, &landed);
+                let n = repo_landed.len();
+                if repo_landed.is_empty() {
+                    note.send("Merge queue: nothing landed to clear in this project".into());
+                    return;
+                }
                 let expire = sweep_cfg.repo_merge_queue(&root).on_landed
                     == thegn_core::config::OnLanded::Expire;
+                let swept = if expire {
+                    crate::merge_sweep::sweep(&sweep_cfg, &root, true)
+                } else {
+                    crate::merge_sweep::SweepReport::default()
+                };
                 let ok = if expire {
                     // Only successful collector writes are ours to report;
                     // a concurrently revoked/missing row is not a deletion.
                     Ok(swept
                         .cleared_rows
                         .iter()
-                        .filter(|path| landed.iter().any(|row| &row.worktree == *path))
+                        .filter(|path| repo_landed.iter().any(|row| &row.worktree == *path))
                         .count())
                 } else {
-                    Db::open()
-                        .and_then(|db| crate::merge_sweep::clear_selected_landed(&db, &landed))
+                    clear_landed_in_repo(&db, &root, &repo_landed)
                 };
                 let tail = if swept.collected.is_empty() {
                     String::new()
@@ -1330,9 +1348,58 @@ fn append_write_error(message: String, write: Result<(), String>) -> String {
     }
 }
 
+fn landed_in_repo(db: &Db, repo_root: &Path, selected: &[MergeQueueRow]) -> Vec<MergeQueueRow> {
+    let repo_worktrees = crate::hydrate::repo_worktree_paths(db, repo_root);
+    selected
+        .iter()
+        .filter(|row| repo_worktrees.contains(&row.worktree))
+        .cloned()
+        .collect()
+}
+
+fn clear_landed_in_repo(
+    db: &Db,
+    repo_root: &Path,
+    selected: &[MergeQueueRow],
+) -> anyhow::Result<usize> {
+    let scoped = landed_in_repo(db, repo_root, selected);
+    crate::merge_sweep::clear_selected_landed(db, &scoped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::store::WorkspaceStore;
+
+    #[test]
+    fn clear_landed_in_repo_preserves_other_repositories() {
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("a", "/repo/a", "/repo/a/wt", "feature-a", None, None)
+            .unwrap();
+        db.put_worktree("b", "/repo/b", "/repo/b/wt", "feature-b", None, None)
+            .unwrap();
+        for (worktree, branch) in [("/repo/a/wt", "feature-a"), ("/repo/b/wt", "feature-b")] {
+            db.enqueue_merge(worktree, branch, "main").unwrap();
+            db.update_merge_status(worktree, "landed", Some("oid"), None, None)
+                .unwrap();
+        }
+
+        let selected = db.list_merge_queue().unwrap();
+        assert_eq!(
+            clear_landed_in_repo(&db, Path::new("/repo/a"), &selected).unwrap(),
+            1
+        );
+
+        let remaining = db.list_merge_queue().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].worktree, "/repo/b/wt");
+        assert_eq!(remaining[0].status, "landed");
+        assert_eq!(
+            clear_landed_in_repo(&db, Path::new("/repo/a"), &remaining).unwrap(),
+            0
+        );
+        assert_eq!(db.list_merge_queue().unwrap(), remaining);
+    }
 
     #[test]
     fn landed_bookkeeping_failure_keeps_ref_details_and_is_degraded() {
