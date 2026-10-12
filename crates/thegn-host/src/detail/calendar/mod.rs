@@ -110,6 +110,10 @@ pub(crate) struct CalendarDetail {
 #[derive(Debug, Clone)]
 pub struct CalendarPayload {
     pub month: (i32, u32),
+    /// Inclusive local-date bounds represented by this snapshot.
+    pub covered: (NaiveDate, NaiveDate),
+    /// Latest navigation request for this month, or `None` for periodic data.
+    pub request: Option<u64>,
     /// The month's per-day buckets, sharing each occurrence's payload; `None`
     /// when the month could not be produced (the last valid snapshot stays).
     pub events: Option<Vec<(NaiveDate, Vec<Arc<CalEvent>>)>>,
@@ -358,7 +362,11 @@ pub fn apply_calendar(slot: &mut Option<super::DetailOverlay>, payload: Calendar
     let super::DetailContent::Calendar(c) = &mut ov.content else {
         return false;
     };
-    if c.st.pending != Some(payload.month) {
+    if !crate::hydrate_calendar::calendar_payload_is_current(&payload) {
+        return false;
+    }
+    let periodic_refresh = payload.request.is_none() && c.st.loaded.contains(&payload.month);
+    if c.st.pending != Some(payload.month) && !periodic_refresh {
         return false;
     }
     crate::calendar_docs::fold_month(
@@ -367,7 +375,9 @@ pub fn apply_calendar(slot: &mut Option<super::DetailOverlay>, payload: Calendar
         &mut c.st.errors,
         &payload,
     );
-    c.st.pending = None;
+    if !periodic_refresh {
+        c.st.pending = None;
+    }
     true
 }
 
@@ -400,6 +410,91 @@ pub fn retick_open(
     c.st.today = today;
     c.st.weather = weather.cloned();
     changed
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    fn overlay(month: (i32, u32)) -> super::super::DetailOverlay {
+        let today = NaiveDate::from_ymd_opt(month.0, month.1, 1).unwrap();
+        let st = CalState {
+            cursor: CalCursor::new(today),
+            today,
+            pane: CalPane::Grid,
+            agenda_sel: 0,
+            events: BTreeMap::new(),
+            loaded: BTreeSet::new(),
+            errors: BTreeMap::new(),
+            pending: Some(month),
+            clocks: Vec::new(),
+            now: today.and_hms_opt(12, 0, 0).unwrap().and_utc(),
+            home: chrono_tz::UTC,
+            ui: CalUiCfg::default(),
+            weather: None,
+            wx: WxUiCfg::default(),
+        };
+        super::super::DetailOverlay {
+            title: TITLE.into(),
+            content: super::super::DetailContent::Calendar(Box::new(CalendarDetail { st })),
+            cols: 1,
+            rows: 1,
+            placement: super::super::Placement::Center,
+            scroll: 0,
+            sel: 0,
+            hint: None,
+            pending_ci: None,
+            monitor_tab: None,
+            live_ci: None,
+            ci_autofix: None,
+        }
+    }
+
+    fn payload(month: (i32, u32), request: u64) -> CalendarPayload {
+        let (from, to) = thegn_core::calendar::month_bounds(month.0, month.1).unwrap();
+        let covered = crate::hydrate_calendar::widen(from, to);
+        CalendarPayload {
+            month,
+            covered,
+            request: Some(request),
+            events: Some(Vec::new()),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn only_the_newest_same_month_result_applies_and_clears_pending() {
+        for (year, month) in [(2052, 3), (2053, 4)] {
+            let key = (year, month);
+            let old_request = crate::hydrate_calendar::register_month_request(key);
+            let new_request = crate::hydrate_calendar::register_month_request(key);
+            let mut older_first = Some(overlay(key));
+            assert!(!apply_calendar(&mut older_first, payload(key, old_request)));
+            let super::super::DetailContent::Calendar(calendar) =
+                &mut older_first.as_mut().unwrap().content
+            else {
+                panic!("calendar overlay expected");
+            };
+            assert_eq!(calendar.st.pending, Some(key));
+            assert!(apply_calendar(&mut older_first, payload(key, new_request)));
+            let super::super::DetailContent::Calendar(calendar) =
+                &mut older_first.as_mut().unwrap().content
+            else {
+                panic!("calendar overlay expected");
+            };
+            assert_eq!(calendar.st.pending, None);
+
+            let mut newer_first = Some(overlay(key));
+            assert!(apply_calendar(&mut newer_first, payload(key, new_request)));
+            assert!(!apply_calendar(&mut newer_first, payload(key, old_request)));
+            let super::super::DetailContent::Calendar(calendar) =
+                &mut newer_first.as_mut().unwrap().content
+            else {
+                panic!("calendar overlay expected");
+            };
+            assert_eq!(calendar.st.pending, None);
+        }
+    }
 }
 
 #[cfg(test)]
