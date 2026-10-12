@@ -21,7 +21,8 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 use thegn_core::config::{
     BoreConfig, FrpConfig, FrpProxyType, IrohShareConfig, TailscaleShareConfig, expand_env_ref,
@@ -122,19 +123,7 @@ impl PublicEndpoint {
             if let Ok(ip) = host.parse::<IpAddr>() {
                 (ip.to_string(), port)
             } else {
-                let valid = host.split('.').all(|label| {
-                    !label.is_empty()
-                        && label.len() <= 63
-                        && label.as_bytes()[0].is_ascii_alphanumeric()
-                        && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
-                        && label
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                });
-                if !valid {
-                    return None;
-                }
-                (host.to_ascii_lowercase(), port)
+                (validate_dns_host(host)?, port)
             }
         };
         let path = &rest[authority.len()..];
@@ -197,21 +186,7 @@ impl PublicEndpoint {
                 IpAddr::V6(_) => return None,
             }
         } else {
-            if host.len() > 253
-                || !host.is_ascii()
-                || !host.split('.').all(|label| {
-                    !label.is_empty()
-                        && label.len() <= 63
-                        && label.as_bytes()[0].is_ascii_alphanumeric()
-                        && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
-                        && label
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                })
-            {
-                return None;
-            }
-            host.to_ascii_lowercase()
+            validate_dns_host(host)?
         };
         Some(Self {
             kind: EndpointKind::SocketAddr(format!("{canonical_host}:{port}")),
@@ -240,6 +215,48 @@ impl PublicEndpoint {
             EndpointKind::Ticket(_) => PublicEndpointKind::Ticket,
         }
     }
+}
+
+/// Validate an ASCII DNS name without accepting browser-numeric shorthands or
+/// malformed IDNA A-labels that a browser could interpret differently.
+fn validate_dns_host(host: &str) -> Option<String> {
+    if host.is_empty() || host.len() > 253 || !host.is_ascii() {
+        return None;
+    }
+    let labels = host.split('.').collect::<Vec<_>>();
+    if !labels.iter().all(|label| {
+        let bytes = label.as_bytes();
+        !bytes.is_empty()
+            && bytes.len() <= 63
+            && bytes[0].is_ascii_alphanumeric()
+            && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+            && !(bytes.len() >= 4
+                && bytes[2] == b'-'
+                && bytes[3] == b'-'
+                && !label.starts_with("xn--"))
+    }) {
+        return None;
+    }
+    let last = labels.iter().rev().find(|label| !label.is_empty())?;
+    let numeric = last.bytes().all(|b| b.is_ascii_digit())
+        || last
+            .strip_prefix("0x")
+            .or_else(|| last.strip_prefix("0X"))
+            .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()));
+    if numeric {
+        return None;
+    }
+    let canonical = host.to_ascii_lowercase();
+    if canonical.split('.').any(|label| label.starts_with("xn--")) {
+        match url::Host::parse(host) {
+            Ok(url::Host::Domain(domain)) if domain == canonical => {}
+            _ => return None,
+        }
+    }
+    Some(canonical)
 }
 
 fn valid_percent_encoding(value: &str) -> bool {
@@ -883,6 +900,7 @@ fn serve_dns_name(rt: &OciRuntime, sidecar: &str) -> Result<String> {
 pub struct RunningShare {
     pub child: Child,
     pub public_url: PublicEndpoint,
+    endpoint_tracker: EndpointTracker,
     cleanup: Option<(std::path::PathBuf, Vec<String>, Option<Vec<u8>>)>,
 }
 
@@ -896,6 +914,12 @@ impl fmt::Debug for RunningShare {
 }
 
 impl RunningShare {
+    /// Whether the provider announced a different public endpoint after its
+    /// first accepted endpoint. This remains sticky for the share lifetime.
+    pub fn endpoint_conflict(&self) -> bool {
+        self.endpoint_tracker.conflict.load(Ordering::Acquire)
+    }
+
     /// Best-effort terminate the child.
     pub fn stop(mut self) {
         let _ = self.child.kill(); // best-effort: child may already have exited
@@ -913,6 +937,30 @@ impl RunningShare {
     fn cleanup_files(&mut self) {
         if let Some((dir, files, manifest)) = self.cleanup.take() {
             cleanup_state_files(&dir, &files, manifest.as_deref());
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct EndpointTracker {
+    accepted: Arc<OnceLock<String>>,
+    conflict: Arc<AtomicBool>,
+}
+
+impl EndpointTracker {
+    fn observe(&self, endpoint: &PublicEndpoint) {
+        let canonical = endpoint.canonical();
+        if let Some(accepted) = self.accepted.get() {
+            if accepted != &canonical {
+                self.conflict.store(true, Ordering::Release);
+            }
+        } else if self.accepted.set(canonical.clone()).is_err()
+            && self
+                .accepted
+                .get()
+                .is_some_and(|accepted| accepted != &canonical)
+        {
+            self.conflict.store(true, Ordering::Release);
         }
     }
 }
@@ -948,7 +996,10 @@ fn share_state_dir_at(
     port: u16,
     generation: u64,
 ) -> Result<std::path::PathBuf> {
-    let canonical = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+    let canonical = match std::fs::canonicalize(worktree) {
+        Ok(path) => path,
+        Err(_) => std::path::absolute(worktree).context("share: absolutize worktree identity")?,
+    };
     let path_bytes = canonical.as_os_str().as_encoded_bytes();
     let repo_bytes = repository_identity(&canonical);
     let mut identity = format!(
@@ -1242,6 +1293,7 @@ fn start_inner(
     // URL discovery has a separate bounded signal so noisy diagnostics cannot
     // consume the only startup result.
     let (url_tx, url_rx) = mpsc::sync_channel::<PublicEndpoint>(2);
+    let endpoint_tracker = EndpointTracker::default();
     for stream in [
         child.stdout.take().map(Streamable::Out),
         child.stderr.take().map(Streamable::Err),
@@ -1251,9 +1303,10 @@ fn start_inner(
     {
         let tx = tx.clone();
         let url_tx = url_tx.clone();
+        let endpoint_tracker = endpoint_tracker.clone();
         let url_rule = plan.url_rule.clone();
         std::thread::spawn(move || {
-            drain_stream(stream, tx, url_tx, url_rule);
+            drain_stream(stream, tx, url_tx, url_rule, endpoint_tracker);
         });
     }
     drop(tx);
@@ -1274,6 +1327,7 @@ fn start_inner(
         return Ok(RunningShare {
             child,
             public_url: url,
+            endpoint_tracker,
             cleanup: None,
         });
     }
@@ -1294,9 +1348,14 @@ fn start_inner(
                 abort_child(child);
                 return Err(error);
             }
+            if endpoint_tracker.conflict.load(Ordering::Acquire) {
+                abort_child(child);
+                anyhow::bail!("share: provider reported multiple public endpoints");
+            }
             return Ok(RunningShare {
                 child,
                 public_url: url,
+                endpoint_tracker,
                 cleanup: None,
             });
         }
@@ -1312,9 +1371,14 @@ fn start_inner(
                         abort_child(child);
                         return Err(error);
                     }
+                    if endpoint_tracker.conflict.load(Ordering::Acquire) {
+                        abort_child(child);
+                        anyhow::bail!("share: provider reported multiple public endpoints");
+                    }
                     return Ok(RunningShare {
                         child,
                         public_url: url,
+                        endpoint_tracker,
                         cleanup: None,
                     });
                 }
@@ -1465,10 +1529,11 @@ fn drain_stream(
     tx: mpsc::SyncSender<String>,
     url_tx: mpsc::SyncSender<PublicEndpoint>,
     url_rule: UrlRule,
+    endpoint_tracker: EndpointTracker,
 ) {
     match stream {
-        Streamable::Out(reader) => drain_reader(reader, tx, url_tx, url_rule),
-        Streamable::Err(reader) => drain_reader(reader, tx, url_tx, url_rule),
+        Streamable::Out(reader) => drain_reader(reader, tx, url_tx, url_rule, endpoint_tracker),
+        Streamable::Err(reader) => drain_reader(reader, tx, url_tx, url_rule, endpoint_tracker),
     }
 }
 
@@ -1477,6 +1542,7 @@ fn drain_reader<R: Read>(
     tx: mpsc::SyncSender<String>,
     url_tx: mpsc::SyncSender<PublicEndpoint>,
     url_rule: UrlRule,
+    endpoint_tracker: EndpointTracker,
 ) {
     let mut bytes = [0_u8; 1024];
     let mut line = Vec::with_capacity(MAX_PROVIDER_LINE);
@@ -1484,7 +1550,14 @@ fn drain_reader<R: Read>(
     loop {
         let count = match reader.read(&mut bytes) {
             Ok(0) => {
-                emit_line(&mut line, &mut oversized, &tx, &url_tx, &url_rule);
+                emit_line(
+                    &mut line,
+                    &mut oversized,
+                    &tx,
+                    &url_tx,
+                    &url_rule,
+                    &endpoint_tracker,
+                );
                 return;
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1493,7 +1566,14 @@ fn drain_reader<R: Read>(
         };
         for byte in &bytes[..count] {
             if *byte == b'\n' {
-                emit_line(&mut line, &mut oversized, &tx, &url_tx, &url_rule);
+                emit_line(
+                    &mut line,
+                    &mut oversized,
+                    &tx,
+                    &url_tx,
+                    &url_rule,
+                    &endpoint_tracker,
+                );
             } else if !oversized {
                 if line.len() == MAX_PROVIDER_LINE {
                     oversized = true;
@@ -1525,10 +1605,12 @@ fn emit_line(
     tx: &mpsc::SyncSender<String>,
     url_tx: &mpsc::SyncSender<PublicEndpoint>,
     url_rule: &UrlRule,
+    endpoint_tracker: &EndpointTracker,
 ) {
     if !*oversized && !line.is_empty() {
         let text = bounded_lossy(line);
         if let Some(url) = url_rule.apply(&text) {
+            endpoint_tracker.observe(&url);
             let _ = url_tx.try_send(url);
         }
         let _ = tx.try_send(text);
