@@ -720,6 +720,42 @@ mod tests {
     }
 
     #[test]
+    fn verify_report_rejects_stale_and_unknown_bindings_and_warns_for_legacy() {
+        let mut f = facts(Some("a.md"), true, true, false);
+
+        f.report_commit_binding = ReportCommitBinding::Stale;
+        let stale = verify_report(&f);
+        assert!(!stale.ok);
+        assert!(
+            stale
+                .reasons
+                .iter()
+                .any(|why| why.contains("older or changed artifact commit"))
+        );
+
+        f.report_commit_binding = ReportCommitBinding::Unknown;
+        let unknown = verify_report(&f);
+        assert!(!unknown.ok);
+        assert!(
+            unknown
+                .reasons
+                .iter()
+                .any(|why| why.contains("could not verify the report's commit binding"))
+        );
+
+        f.report_commit_binding = ReportCommitBinding::Unbound;
+        let legacy = verify_report(&f);
+        assert!(legacy.ok);
+        assert!(legacy.reasons.is_empty());
+        assert!(
+            legacy
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("legacy row"))
+        );
+    }
+
+    #[test]
     fn an_unknown_worktree_status_is_reported_without_changing_the_gate() {
         let mut f = facts_report(Some("a.md"), true, true, false, true);
         f.worktree_state = Some(WorktreeState::Unknown);

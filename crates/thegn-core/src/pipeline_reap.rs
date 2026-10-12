@@ -192,7 +192,7 @@ pub fn classify(row: &AgentDispatch, facts: &ReapFacts) -> ReapVerdict {
                 },
             }
         }
-        (true, false, _) => ReapVerdict::NeedsDecision {
+        (true, _, _) => ReapVerdict::NeedsDecision {
             why: "worker is gone and its artifact IS committed, but its report is missing or \
                   claims PASS without a successful gate citation — read the artifact and close \
                   it yourself; auto-closing would mean forcing the gate or inventing evidence",

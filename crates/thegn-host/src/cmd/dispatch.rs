@@ -1191,6 +1191,7 @@ fn set_status(id: i64, status: &str, force: bool, why: Option<&str>, json: bool)
 /// it). Pane-exit auto-stamps (`pty_drain.rs:855-895`) bypass the gate
 /// entirely — that path writes the typed status for attribution, not as a
 /// handoff verdict, so it is not subject to either check.
+#[cfg(test)]
 fn done_gate(row: &AgentDispatch) -> Result<()> {
     let report = pipeline_run::verify_report(&verify_facts(row));
     require_done_report(row.id, report)
@@ -1307,6 +1308,11 @@ fn verify_facts_with_report_head(
         report_commit_binding: pipeline_run::ReportCommitBinding::Unbound,
     };
     if report_present && let Some(report_head) = report_head {
+        if !is_hex_oid(report_head) {
+            facts.report_commit_binding =
+                pipeline_run::report_commit_binding(Some(report_head), None, None, None);
+            return facts;
+        }
         let head = git_out_allow_empty(wt, &["rev-parse", "--verify", "HEAD"])
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
@@ -1329,9 +1335,8 @@ fn verify_facts_with_report_head(
 
 /// Return Some(true/false) for git exit 0/1; any spawn or other exit failure is unknown.
 fn git_exit_0_or_1(worktree: &std::path::Path, args: &[&str]) -> Option<bool> {
-    let output = std::process::Command::new("git")
+    let output = thegn_core::util::git_cmd(worktree)
         .args(args)
-        .current_dir(worktree)
         .output()
         .ok()?;
     match output.status.code() {
@@ -1339,6 +1344,13 @@ fn git_exit_0_or_1(worktree: &std::path::Path, args: &[&str]) -> Option<bool> {
         Some(1) => Some(false),
         _ => None,
     }
+}
+
+fn is_hex_oid(value: &str) -> bool {
+    (40..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn worktree_state_from_status(status: Option<&str>) -> pipeline_run::WorktreeState {
@@ -2176,6 +2188,15 @@ fn handoff_message(outcome: pipeline_run::HandoffOutcome) -> &'static str {
 mod tests {
     use super::*;
     use thegn_core::store::NotificationStore;
+
+    #[test]
+    fn report_head_revision_must_be_a_hex_oid() {
+        assert!(is_hex_oid(&"a".repeat(40)));
+        assert!(is_hex_oid(&"f".repeat(64)));
+        assert!(!is_hex_oid("HEAD"));
+        assert!(!is_hex_oid(&format!("{}g", "a".repeat(39))));
+        assert!(!is_hex_oid(&format!("-{}", "a".repeat(40))));
+    }
 
     fn db(name: &str) -> (tempfile::TempDir, Db) {
         let dir = tempfile::tempdir().unwrap();
