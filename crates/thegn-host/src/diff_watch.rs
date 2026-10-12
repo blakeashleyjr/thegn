@@ -517,9 +517,78 @@ impl Reviver {
     }
 }
 
+/// Add one path-based ignore source, rooted according to its containing directory.
+fn add_ignore_source(builder: &mut ignore::gitignore::GitignoreBuilder, path: &Path) {
+    if !path.is_file() {
+        return;
+    }
+    let source = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Some(error) = builder.add(&source) {
+        tracing::debug!(
+            target: "thegn::hydrate",
+            source = %source.display(),
+            %error,
+            "could not fully load git ignore source"
+        );
+    }
+}
+
+/// `.git/info/exclude` and `core.excludesFile` patterns are rooted at the
+/// worktree for this matcher. `GitignoreBuilder::add` roots patterns at the
+/// source file's parent, which is correct for `.gitignore` but not these files.
+/// Delegate pattern parsing to the builder while supplying the worktree root.
+fn add_rooted_ignore_source(builder: &mut ignore::gitignore::GitignoreBuilder, path: &Path) {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for (line_no, line) in contents.lines().enumerate() {
+        let line = if line_no == 0 {
+            line.trim_start_matches('\u{feff}')
+        } else {
+            line
+        };
+        if let Err(error) = builder.add_line(None, line) {
+            tracing::debug!(
+                target: "thegn::hydrate",
+                source = %path.display(),
+                %error,
+                "could not fully load git ignore source"
+            );
+        }
+    }
+}
+
+/// Add nested `.gitignore` files while walking only directories not already
+/// excluded by the root and git-level ignore sources. Each newly loaded file
+/// affects the next level, as Git's per-directory ignore rules do.
+fn collect_nested_gitignores(
+    dir: &Path,
+    builder: &mut ignore::gitignore::GitignoreBuilder,
+    inherited: &ignore::gitignore::Gitignore,
+) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let child = entry.path();
+            if crate::git_watch::in_dot_git(&child)
+                || crate::git_watch::prune_dir(&child, inherited)
+            {
+                continue;
+            }
+            add_ignore_source(builder, &child.join(".gitignore"));
+            let current = builder
+                .build()
+                .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty());
+            collect_nested_gitignores(&child, builder, &current);
+        }
+    }
+}
+
 /// Build + register the diff fs-watcher for `cwd` (blocking: registration walks
-/// the tree and runs two `git rev-parse` calls — call it off the loop). `None`
-/// when no usable watcher could be attached.
+/// the tree and runs git commands — call it off the loop). `None` when no usable
+/// watcher could be attached or the directory-watch cap selects ticker fallback.
 pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<RecommendedWatcher> {
     let cwd = cwd.to_path_buf();
     let RefreshSink { tx, wake, revive } = sink;
@@ -553,16 +622,8 @@ pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<Recomm
         .unwrap_or_else(Instant::now);
     let wake = wake.clone();
     let roots = git_roots.clone();
-    // Drop watcher events for gitignored paths (`target/`, `node_modules/`,
-    // build outputs): a change to an ignored file can never alter
-    // `git diff HEAD`, so firing a model rebuild for it is pure waste — yet a
-    // cargo/sccache/agent running inside the worktree churns these constantly,
-    // which was the dominant source of redundant ~Hz hydrations. Built once
-    // per retarget from the worktree's root `.gitignore` (nested `.gitignore`s
-    // are rare for the high-churn dirs we care about; revisit only if
-    // profiling shows residual churn). A missing/unreadable `.gitignore`
-    // yields an empty matcher → every path passes → unchanged behavior, so
-    // remote/provider worktrees with no local `.gitignore` are unaffected.
+    // Drop watcher events for every git ignore source: a change to an ignored
+    // file cannot alter `git diff HEAD`, and build trees can churn constantly.
     // NOTE: a force-added (`git add -f`) or negate-pattern (`!keep`) ignored
     // file *can* appear in the diff and would be dropped here; that's rare,
     // and the safety-net ticker still rebuilds the panel within a few seconds.
@@ -570,18 +631,76 @@ pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<Recomm
     // paths) while the `.gitignore` it reads is addressed from the real cwd —
     // on macOS those differ under any symlinked prefix, and a matcher rooted
     // at `/tmp/wt` matches nothing FSEvents delivers from `/private/tmp/wt`.
-    let ignore = {
-        let mut b =
-            ignore::gitignore::GitignoreBuilder::new(crate::git_watch::watch_canonical(&cwd));
-        let _ = b.add(cwd.join(".gitignore")); // best-effort: a malformed/missing .gitignore just means fewer ignores; the scan below still works
-        b.build()
-            .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
-    };
+    let canonical_cwd = crate::git_watch::watch_canonical(&cwd);
+    let mut ignore_builder = ignore::gitignore::GitignoreBuilder::new(&canonical_cwd);
+    add_ignore_source(&mut ignore_builder, &cwd.join(".gitignore"));
+    if let Some(git_dir) = &git_dir {
+        add_rooted_ignore_source(&mut ignore_builder, &git_dir.join("info/exclude"));
+    }
+    if let Some(global_excludes) =
+        thegn_core::util::git_out(&cwd, &["config", "--path", "--get", "core.excludesFile"])
+    {
+        add_rooted_ignore_source(&mut ignore_builder, Path::new(global_excludes.trim()));
+    }
+    let initial_ignore = ignore_builder
+        .build()
+        .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty());
+    collect_nested_gitignores(&canonical_cwd, &mut ignore_builder, &initial_ignore);
+    let ignore = ignore_builder
+        .build()
+        .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty());
+    // Account for the linked-worktree gitdir watches too: they sit outside the
+    // worktree plan but consume the same process-wide inotify quota.
+    let mut external_watch_count = 0usize;
+    for root in [git_dir.as_ref(), common_dir.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|p| crate::git_watch::watch_canonical(p))
+    {
+        if root.starts_with(&canonical_cwd) {
+            continue;
+        }
+        external_watch_count = external_watch_count.saturating_add(1);
+        for child in [root.join("logs"), root.join("refs")] {
+            if child.is_dir() {
+                let Some(count) = crate::git_watch::count_recursive_watches(
+                    &child,
+                    &ignore,
+                    crate::git_watch::MAX_DIFF_WATCHES.saturating_sub(external_watch_count),
+                ) else {
+                    external_watch_count = crate::git_watch::MAX_DIFF_WATCHES.saturating_add(1);
+                    break;
+                };
+                external_watch_count = external_watch_count.saturating_add(count);
+            }
+        }
+    }
+    if external_watch_count >= crate::git_watch::MAX_DIFF_WATCHES {
+        tracing::warn!(
+            target: "thegn::hydrate",
+            worktree = %cwd.display(),
+            cap = crate::git_watch::MAX_DIFF_WATCHES,
+            "diff fs-watch directory cap reached — using the diff ticker"
+        );
+        return None;
+    }
     // Plan the registration BEFORE the matcher moves into the event closure.
     // This is the filesystem walk the old blanket `RecursiveMode::Recursive`
     // did internally — same shape, minus the gitignored subtrees, so it is
     // strictly cheaper than what it replaces.
-    let plan = crate::git_watch::plan_watches(&crate::git_watch::watch_canonical(&cwd), &ignore);
+    let Some(plan) = crate::git_watch::plan_watches_with_cap(
+        &canonical_cwd,
+        &ignore,
+        crate::git_watch::MAX_DIFF_WATCHES - external_watch_count,
+    ) else {
+        tracing::warn!(
+            target: "thegn::hydrate",
+            worktree = %cwd.display(),
+            cap = crate::git_watch::MAX_DIFF_WATCHES,
+            "diff fs-watch directory cap reached — using the diff ticker"
+        );
+        return None;
+    };
     let nonrec: std::collections::HashSet<PathBuf> = plan
         .iter()
         .filter(|e| !e.recursive)
@@ -859,6 +978,46 @@ pub(crate) fn build_diff_watcher(cwd: &Path, sink: RefreshSink) -> Option<Recomm
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_ignore_source_roots_prune_their_worktree_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let excluded = root.join(".claude/worktrees/agent/node_modules");
+        let nested_ignored = root.join("vendor/generated");
+        std::fs::create_dir_all(&excluded).unwrap();
+        std::fs::create_dir_all(&nested_ignored).unwrap();
+        std::fs::create_dir_all(root.join("generated-global")).unwrap();
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        std::fs::create_dir_all(root.join("vendor")).unwrap();
+        std::fs::write(root.join(".git/info/exclude"), ".claude/worktrees/\n").unwrap();
+        std::fs::write(root.join("global-ignore"), "/generated-global/\n").unwrap();
+        std::fs::write(root.join("vendor/.gitignore"), "generated/\n").unwrap();
+
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(&root);
+        add_rooted_ignore_source(&mut builder, &root.join(".git/info/exclude"));
+        add_rooted_ignore_source(&mut builder, &root.join("global-ignore"));
+        let initial = builder.build().unwrap();
+        collect_nested_gitignores(&root, &mut builder, &initial);
+        let matcher = builder.build().unwrap();
+
+        assert!(
+            crate::git_watch::prune_dir(&root.join(".claude/worktrees"), &matcher),
+            "info/exclude must be rooted at the worktree, not .git/info"
+        );
+        assert!(
+            crate::git_watch::prune_dir(&nested_ignored, &matcher),
+            "nested .gitignore patterns must be loaded before watch planning"
+        );
+        assert!(crate::git_watch::prune_dir(
+            &root.join("generated-global"),
+            &matcher
+        ));
+        assert!(
+            !crate::git_watch::prune_dir(&root.join("src"), &matcher),
+            "unmatched worktree directories remain watchable"
+        );
+    }
 
     // test code: fixture setup, never on the event loop.
     #[expect(clippy::disallowed_methods)]
