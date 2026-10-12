@@ -645,6 +645,7 @@ mod tests {
         rows[1].agent_name = "worker".into();
         rows[2].agent_name = "plain".into();
         rows[3].agent_name = "bad-harness".into();
+        rows[4].agent_name = "worker".into();
         let b = board(&rows, &cfg, 200, 0, false);
 
         assert_eq!(
