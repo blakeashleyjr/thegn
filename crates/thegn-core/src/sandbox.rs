@@ -33,6 +33,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+#[path = "sandbox_proc.rs"]
+pub(crate) mod proc;
+
 /// Ceiling for fast control-plane probes (`image exists`, `container
 /// inspect`, health checks). A wedged runtime (stuck podman machine, broken
 /// overlay storage) must FAIL the candidate quickly so the backend chain
@@ -63,51 +66,15 @@ pub(crate) fn status_with_timeout(argv: &[String], timeout: Duration) -> Option<
 /// Like [`status_with_timeout`] but also captures stdout. Returns
 /// `(success, stdout)` or `None` on spawn failure or timeout.
 pub(crate) fn output_with_timeout(argv: &[String], timeout: Duration) -> Option<(bool, String)> {
-    use std::process::Stdio;
-    let mut child = Command::new(&argv[0])
-        .args(&argv[1..])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // stdout is available once the process has exited.
-                let stdout = child
-                    .stdout
-                    .take()
-                    .and_then(|mut r| {
-                        use std::io::Read;
-                        let mut s = String::new();
-                        r.read_to_string(&mut s).ok().map(|_| s)
-                    })
-                    .unwrap_or_default();
-                return Some((status.success(), stdout));
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill(); // best-effort: probe teardown: force-kill the wedged child at the deadline
-                // Reap on a DETACHED thread, never inline: a probe subprocess
-                // wedged in an uninterruptible syscall (dead daemon socket,
-                // stalled DNS, hung NFS) doesn't die the instant SIGKILL lands
-                // — the kernel delivers it only when the task leaves the
-                // syscall, so a synchronous `wait()` here blocks for as long as
-                // the wedge lasts. That is exactly how one hung `podman`/`docker`
-                // probe turned a 5s deadline into a multi-minute freeze on the
-                // sandbox-resolution path (which pane spawns sit behind). Hand
-                // the child off and return at the deadline; the zombie is
-                // reaped whenever it finally dies.
-                std::thread::spawn(move || {
-                    let _ = child.wait(); // best-effort: detached reap: the probe must not block on a wedged child
-                });
-                return None;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(_) => return None,
-        }
-    }
+    proc::run_bounded(
+        argv,
+        timeout,
+        proc::Capture {
+            stdout: Some(256 * 1024),
+            stderr: None,
+        },
+    )
+    .into_stdout()
 }
 
 /// Run `argv` and return its **stderr**, whether or not it succeeded.
@@ -123,44 +90,15 @@ pub(crate) fn output_with_timeout(argv: &[String], timeout: Duration) -> Option<
 /// the same three-state shape as its sibling, so a timeout is never mistaken for
 /// a clean run.
 pub(crate) fn stderr_with_timeout(argv: &[String], timeout: Duration) -> Option<(bool, String)> {
-    use std::process::Stdio;
-    let mut child = Command::new(&argv[0])
-        .args(&argv[1..])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let err = child
-                    .stderr
-                    .take()
-                    .and_then(|mut r| {
-                        use std::io::Read;
-                        let mut s = String::new();
-                        r.read_to_string(&mut s).ok().map(|_| s)
-                    })
-                    .unwrap_or_default();
-                return Some((status.success(), err));
-            }
-            // Detached reap, for the reason spelled out in `output_with_timeout`:
-            // a wedged runtime does not die the instant SIGKILL lands, and a
-            // synchronous wait here would block the pane-spawn path for as long
-            // as the wedge lasts.
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill(); // best-effort: probe teardown: force-kill the wedged child at the deadline
-                std::thread::spawn(move || {
-                    let _ = child.wait(); // best-effort: detached reap: the probe must not block on a wedged child
-                });
-                return None;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(_) => return None,
-        }
-    }
+    proc::run_bounded(
+        argv,
+        timeout,
+        proc::Capture {
+            stdout: None,
+            stderr: Some(256 * 1024),
+        },
+    )
+    .into_stderr()
 }
 
 /// Run a control command while delivering a bounded secret payload on stdin.
