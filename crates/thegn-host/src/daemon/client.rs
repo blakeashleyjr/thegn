@@ -11,9 +11,11 @@ use serde_json::Value;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use thegn_core::config::DaemonConfig;
-use thegn_core::control_wire::EventFrame;
+use thegn_core::control_wire::{EventFrame, MAX_WIRE_FRAME};
 use thegn_core::db::Db;
-use thegn_svc::control::client::{AttachControl, AttachStream, ControlAddr, ControlClient};
+use thegn_svc::control::client::{
+    AttachControl, AttachStream, ByteBudget, ControlAddr, ControlClient, StreamEnd,
+};
 use thegn_svc::control::{OpenSpec, SessionInfo};
 use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession, ExecSpec};
 
@@ -513,6 +515,9 @@ impl ExecSource for DaemonSource {
 /// exit code. 254 avoids the shell's 126/127/128+N conventions.
 const EXIT_STATUS_UNKNOWN: i32 = 254;
 
+/// Maximum bytes retained in the pane adapter's output queue.
+const ADAPTER_BYTE_BUDGET: usize = 4 * MAX_WIRE_FRAME;
+
 /// Lower a daemon exit report onto the `ExecFrame::Exit` integer contract.
 fn exec_exit_code(code: Option<i32>) -> i32 {
     code.unwrap_or(EXIT_STATUS_UNKNOWN)
@@ -530,6 +535,7 @@ fn adapt(session_id: String, stream: AttachStream) -> ExecSession {
         end: mut end_rx,
     } = stream;
     let (out_tx, out_rx) = tokio_mpsc::channel::<ExecFrame>(256);
+    let mut budget = ByteBudget::new(ADAPTER_BYTE_BUDGET);
     let (in_tx, mut in_rx) = tokio_mpsc::channel::<ExecControl>(64);
     let (sid_tx, sid_rx) = tokio::sync::watch::channel(Some(session_id.clone()));
 
@@ -546,6 +552,7 @@ fn adapt(session_id: String, stream: AttachStream) -> ExecSession {
                         if !forward_frame_while_servicing_control(
                             &out_tx,
                             ExecFrame::Stdout(bytes),
+                            &mut budget,
                             &mut in_rx,
                             &control,
                         )
@@ -555,7 +562,9 @@ fn adapt(session_id: String, stream: AttachStream) -> ExecSession {
                         }
                     }
                     Some(EventFrame::SessionExit { code, .. }) => {
-                        let _ = out_tx.send(ExecFrame::Exit(exec_exit_code(code))).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                        if let Err(error) = out_tx.send(ExecFrame::Exit(exec_exit_code(code))).await {
+                            tracing::debug!(target: "thegn::daemon", %error, "pane exit could not be delivered");
+                        }
                         return;
                     }
                     Some(_) => {} // Hello / feed frames: not pane bytes
@@ -563,6 +572,21 @@ fn adapt(session_id: String, stream: AttachStream) -> ExecSession {
                         match tokio::time::timeout(Duration::from_secs(1), &mut end_rx).await {
                             Ok(Ok(end)) if end.reconnects() => {
                                 tracing::debug!(target: "thegn::daemon", session = %session_id, ?end, "pane attach stream ended");
+                            }
+                            Ok(Ok(end @ StreamEnd::Protocol(_)))
+                            | Ok(Ok(end @ StreamEnd::IdentityMismatch { .. })) => {
+                                tracing::warn!(target: "thegn::daemon", session = %session_id, ?end, "pane attach stream ended permanently");
+                                let reason = format!("{end:?}").replace('\r', " ").replace('\n', " ");
+                                if let Err(error) = out_tx
+                                    .send(ExecFrame::Stdout(format!("\r\n[pane stream failed: {reason}]\r\n").into_bytes()))
+                                    .await
+                                {
+                                    tracing::debug!(target: "thegn::daemon", %error, "pane stream failure diagnostic could not be delivered");
+                                }
+                                if let Err(error) = out_tx.send(ExecFrame::Exit(EXIT_STATUS_UNKNOWN)).await {
+                                    tracing::debug!(target: "thegn::daemon", %error, "pane stream failure exit could not be delivered");
+                                }
+                                return;
                             }
                             Ok(Ok(end)) => {
                                 tracing::warn!(target: "thegn::daemon", session = %session_id, ?end, "pane attach stream ended permanently");
@@ -609,12 +633,17 @@ fn adapt(session_id: String, stream: AttachStream) -> ExecSession {
 async fn forward_frame_while_servicing_control(
     out_tx: &tokio_mpsc::Sender<ExecFrame>,
     frame: ExecFrame,
+    budget: &mut ByteBudget,
     in_rx: &mut tokio_mpsc::Receiver<ExecControl>,
     control: &tokio_mpsc::Sender<AttachControl>,
 ) -> bool {
+    let charge = match &frame {
+        ExecFrame::Stdout(bytes) => bytes.len(),
+        ExecFrame::Exit(_) => 0,
+    };
     loop {
         tokio::select! {
-            permit = out_tx.reserve() => match permit {
+            permit = budget.reserve(out_tx, charge) => match permit {
                 Ok(permit) => {
                     permit.send(frame);
                     return true;
@@ -732,6 +761,119 @@ impl ExecSource for LazyDaemonSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::control_wire::MAX_WIRE_PAYLOAD;
+
+    fn attach_stream_with_end() -> (
+        tokio_mpsc::Sender<EventFrame>,
+        tokio::sync::oneshot::Sender<StreamEnd>,
+        AttachStream,
+    ) {
+        let (frame_tx, frames) = tokio_mpsc::channel(32);
+        let (control, _controls) = tokio_mpsc::channel(32);
+        let (end_tx, end) = tokio::sync::oneshot::channel();
+        (
+            frame_tx,
+            end_tx,
+            AttachStream {
+                frames,
+                control,
+                end,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn permanent_stream_outcomes_emit_diagnostic_and_unknown_exit() {
+        let cases = [
+            (
+                StreamEnd::IdentityMismatch {
+                    expected: "session-1".into(),
+                    got: "session-2".into(),
+                },
+                "IdentityMismatch",
+            ),
+            (
+                StreamEnd::Protocol("duplicate Hello".into()),
+                "duplicate Hello",
+            ),
+        ];
+
+        for (end, reason) in cases {
+            let (frame_tx, end_tx, stream) = attach_stream_with_end();
+            let mut session = adapt("session-1".into(), stream);
+            end_tx.send(end).unwrap();
+            drop(frame_tx);
+
+            let diagnostic = tokio::time::timeout(Duration::from_secs(1), session.frames.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let ExecFrame::Stdout(bytes) = diagnostic else {
+                panic!("expected a stream failure diagnostic");
+            };
+            let diagnostic = String::from_utf8(bytes).unwrap();
+            assert!(diagnostic.starts_with("\r\n[pane stream failed: "));
+            assert!(diagnostic.ends_with("]\r\n"));
+            assert!(diagnostic.contains(reason), "{diagnostic:?}");
+            assert_eq!(session.frames.recv().await, Some(ExecFrame::Exit(254)));
+            assert_eq!(session.frames.recv().await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_and_clean_stream_ends_emit_no_exit() {
+        for end in [
+            StreamEnd::TransportLost("socket reset".into()),
+            StreamEnd::CleanClose,
+        ] {
+            let (frame_tx, end_tx, stream) = attach_stream_with_end();
+            let mut session = adapt("session-1".into(), stream);
+            end_tx.send(end).unwrap();
+            drop(frame_tx);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), session.frames.recv())
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn adapter_byte_budget_bounds_queued_stdout_and_drains_in_order() {
+        let frame_size = MAX_WIRE_PAYLOAD / 2;
+        let count = ADAPTER_BYTE_BUDGET / frame_size + 3;
+        let (frame_tx, frames) = tokio_mpsc::channel(count);
+        let (control, _controls) = tokio_mpsc::channel(1);
+        let stream = AttachStream {
+            frames,
+            control,
+            end: tokio::sync::oneshot::channel().1,
+        };
+        let mut session = adapt("session-1".into(), stream);
+        for seq in 0..count {
+            frame_tx
+                .send(EventFrame::PaneDelta {
+                    session: "session-1".into(),
+                    seq: seq as u64,
+                    bytes: vec![b'x'; frame_size],
+                })
+                .await
+                .unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(session.frames.len() * frame_size <= ADAPTER_BYTE_BUDGET);
+
+        for _ in 0..count {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), session.frames.recv())
+                    .await
+                    .unwrap(),
+                Some(ExecFrame::Stdout(vec![b'x'; frame_size]))
+            );
+        }
+    }
 
     #[test]
     fn scope_reply_classification_is_fail_closed_and_accepts_legacy_daemons() {

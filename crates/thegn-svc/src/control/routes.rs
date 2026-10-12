@@ -365,20 +365,43 @@ pub fn implemented_caps() -> Vec<&'static str> {
 mod tests {
     use super::*;
     use thegn_core::capability::{SURFACE_GAPS, Surface, coverage_problems, lookup, scope_of};
+    use thegn_core::control::{Scope, ScopeSet};
+    use thegn_core::control_error::ControlErrorCode;
+    use thegn_core::control_wire::{FeedFilter, OBSERVER_KINDS};
+
+    fn control_api_doc() -> String {
+        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/superpowers/specs/control-api.md");
+        std::fs::read_to_string(&doc_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", doc_path.display()))
+    }
+
+    fn doc_section<'a>(doc: &'a str, heading: &str) -> &'a str {
+        doc.split(heading)
+            .nth(1)
+            .unwrap_or_else(|| panic!("control API docs have a {heading} section"))
+            .split("\n## ")
+            .next()
+            .expect("section has a boundary")
+    }
+
+    fn backticked(text: &str) -> Vec<&str> {
+        let mut values = Vec::new();
+        let mut rest = text;
+        while let Some((_, after_open)) = rest.split_once('`') {
+            let Some((value, after_close)) = after_open.split_once('`') else {
+                break;
+            };
+            values.push(value);
+            rest = after_close;
+        }
+        values
+    }
 
     #[test]
     fn control_api_doc_routes_match_registry() {
-        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/superpowers/specs/control-api.md");
-        let doc = std::fs::read_to_string(&doc_path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", doc_path.display()));
-        let routes_section = doc
-            .split("## Routes")
-            .nth(1)
-            .expect("control API docs have a Routes section")
-            .split("\n## ")
-            .next()
-            .expect("Routes section has a boundary");
+        let doc = control_api_doc();
+        let routes_section = doc_section(&doc, "## Routes");
 
         let mut documented = std::collections::HashSet::new();
         let mut all_rows = std::collections::HashSet::new();
@@ -495,6 +518,129 @@ mod tests {
             documented, expected,
             "control-api.md Routes table does not match API_CALLS and open routes"
         );
+    }
+
+    #[test]
+    fn control_api_doc_error_codes_match_taxonomy() {
+        let doc = control_api_doc();
+        let errors = doc_section(&doc, "## Error responses")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let vocabulary = errors
+            .split_once("closed vocabulary")
+            .expect("error response docs describe the closed vocabulary")
+            .1
+            .split_once(". Clients")
+            .expect("error vocabulary ends before client guidance")
+            .0;
+        let documented = backticked(vocabulary);
+        let expected: Vec<_> = ControlErrorCode::ALL
+            .iter()
+            .map(|code| code.as_str())
+            .collect();
+        assert_eq!(
+            documented, expected,
+            "documented error code vocabulary drifted"
+        );
+    }
+
+    #[test]
+    fn control_api_doc_scope_table_matches_lattice() {
+        let doc = control_api_doc();
+        let scopes = doc_section(&doc, "## Scopes");
+        let mut documented = std::collections::HashSet::new();
+        for line in scopes
+            .lines()
+            .filter(|line| line.trim_start().starts_with('|'))
+        {
+            let cells: Vec<_> = line.split('|').map(str::trim).collect();
+            if cells.len() < 4 || !cells[1].starts_with('`') {
+                continue;
+            }
+            let name = cells[1].trim_matches('`');
+            assert!(documented.insert(name), "duplicate scope row {name}");
+            if name == Scope::Read.as_str() {
+                continue;
+            }
+            let allows_read = ScopeSet::parse(name).allows(Scope::Read);
+            let grants_cell = cells[2];
+            let says_implies_read = grants_cell.contains("implies read");
+            let says_implies_everything = grants_cell.contains("implies everything");
+            assert_eq!(
+                says_implies_read || says_implies_everything,
+                allows_read,
+                "scope {name} implication wording does not match the scope lattice"
+            );
+        }
+        let expected: std::collections::HashSet<_> = [
+            Scope::Read,
+            Scope::Write,
+            Scope::Git,
+            Scope::MergeAdd,
+            Scope::Exec,
+            Scope::Admin,
+        ]
+        .iter()
+        .map(Scope::as_str)
+        .collect();
+        assert_eq!(documented, expected, "documented scope rows drifted");
+    }
+
+    #[test]
+    fn control_api_doc_event_kinds_match_parser() {
+        let doc = control_api_doc();
+        let event_wire = doc_section(&doc, "## The event wire")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let accepted = event_wire
+            .split_once("accepts only the bounded `kinds` vocabulary")
+            .expect("event docs describe accepted subscription kinds")
+            .1
+            .split_once(" and an optional session id")
+            .expect("event kind list ends before session filter guidance")
+            .0;
+        let documented = backticked(accepted);
+        assert_eq!(documented.as_slice(), OBSERVER_KINDS);
+        assert!(
+            FeedFilter::parse(Some("snapshot"), None, false).is_err(),
+            "pane snapshot kinds must be rejected by the generic subscription parser"
+        );
+    }
+
+    #[test]
+    fn control_api_doc_prose_routes_are_registered() {
+        let doc = control_api_doc();
+        let routes_section = doc_section(&doc, "## Routes");
+        let reserved: std::collections::HashSet<_> = routes_section
+            .lines()
+            .filter(|line| line.contains("**reserved**"))
+            .filter_map(|line| {
+                let cells: Vec<_> = line.split('|').map(str::trim).collect();
+                cells.get(1).map(|route| route.trim_matches('`'))
+            })
+            .filter_map(|route| route.split_once(' ').map(|(_, path)| path))
+            .collect();
+        let prose = doc.replace(routes_section, "");
+        for mention in backticked(&prose) {
+            let path = if let Some((method, path)) = mention.split_once(' ') {
+                if method.is_empty() || !method.bytes().all(|byte| byte.is_ascii_uppercase()) {
+                    continue;
+                }
+                path.split_whitespace()
+                    .next()
+                    .expect("route method mention has a path")
+            } else if mention.starts_with("/v1/") {
+                mention
+            } else {
+                continue;
+            };
+            assert!(
+                ROUTES.iter().any(|route| route.path == path) || reserved.contains(path),
+                "prose route mention {mention} is neither registered nor reserved"
+            );
+        }
     }
 
     #[test]

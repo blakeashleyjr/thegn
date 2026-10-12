@@ -950,6 +950,16 @@ fn pr_queue_enqueue_update_list_and_remove() {
 
     db.enqueue_pr("/repo", 7, Some("/wt/a"), "feat-a", "main", "github")
         .unwrap();
+    db.enqueue_bound_pr(
+        "/repo",
+        7,
+        Some("/wt/a"),
+        "feat-a",
+        "main",
+        "github",
+        "https://github.com/me/repo/pull/7",
+    )
+    .unwrap();
     // Same number in a DIFFERENT repo is a distinct row — the key is repo+number,
     // so two repos' PR #7 must not collide.
     db.enqueue_pr("/other", 7, None, "feat-x", "main", "github")
@@ -970,6 +980,10 @@ fn pr_queue_enqueue_update_list_and_remove() {
     assert_eq!(a.status, "watching");
     assert_eq!(a.number, 7);
     assert_eq!(a.worktree.as_deref(), Some("/wt/a"));
+    assert_eq!(
+        a.pr_url.as_deref(),
+        Some("https://github.com/me/repo/pull/7")
+    );
     assert_eq!(a.base_branch, "main");
     assert!(a.blocker.is_none() && a.last_head_oid.is_none());
     assert_eq!(a.agent_attempts, 0);
@@ -1011,6 +1025,26 @@ fn pr_queue_enqueue_update_list_and_remove() {
     assert_eq!(a.agent_attempts, 0);
     assert!(a.blocker.is_none() && a.detail.is_none());
     assert_eq!(a.worktree.as_deref(), Some("/wt/a"), "worktree survives");
+    assert_eq!(
+        a.pr_url.as_deref(),
+        Some("https://github.com/me/repo/pull/7")
+    );
+    db.enqueue_bound_pr(
+        "/repo",
+        7,
+        Some("/wt/b"),
+        "feat-b",
+        "main",
+        "github",
+        "https://github.com/other/repo/pull/7",
+    )
+    .unwrap();
+    let a = by(&k);
+    assert_eq!(a.worktree.as_deref(), Some("/wt/b"));
+    assert_eq!(
+        a.pr_url.as_deref(),
+        Some("https://github.com/other/repo/pull/7")
+    );
 
     db.remove_pr_entry(&k).unwrap();
     assert_eq!(db.list_pr_queue().unwrap().len(), 1);

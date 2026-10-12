@@ -38,6 +38,7 @@ pub(crate) struct PrItem {
     pub agent_attempts: u32,
     pub last_head_oid: Option<String>,
     pub forge: String,
+    pub pr_url: Option<String>,
 }
 
 impl From<&PrQueueRow> for PrItem {
@@ -50,6 +51,7 @@ impl From<&PrQueueRow> for PrItem {
             agent_attempts: r.agent_attempts,
             last_head_oid: r.last_head_oid.clone(),
             forge: r.forge.clone(),
+            pr_url: r.pr_url.clone(),
         }
     }
 }
@@ -260,6 +262,27 @@ pub(crate) fn drive_queue(
         };
 
         record_success(&item.key);
+        if let Err(detail) = pr_queue::attest_pr_identity(
+            item.pr_url.as_deref(),
+            item.number,
+            &fetched.pr.url,
+            fetched.pr.number,
+        ) {
+            if let Err(error) = db.update_pr_status(
+                &item.key,
+                PrqStatus::NeedsHuman.as_str(),
+                None,
+                Some(&detail),
+                None,
+            ) {
+                tracing::debug!(target: "thegn::prq", %error, "could not persist PR identity hold");
+            }
+            tracing::warn!(target: "thegn::prq", "PR #{}: {detail}", item.number);
+            out.warnings.push(format!("PR #{}: {detail}", item.number));
+            out.needs_human.push(item.number);
+            step(PrqStatus::NeedsHuman.as_str(), &detail, &mut progress);
+            continue;
+        }
         let head = fetched.pr.head_ref_oid.clone();
         let blocker = pr_queue::classify(&fetched.pr, cfg);
         let review_refresh =
@@ -1038,8 +1061,16 @@ mod tests {
         git_repo_on_branch(&checkout, "other");
         let checkout = checkout.canonicalize().unwrap();
         let checkout_s = checkout.to_string_lossy().into_owned();
-        db.enqueue_pr("/repo", 7, Some(&checkout_s), "feat", "main", "github")
-            .unwrap();
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            Some(&checkout_s),
+            "feat",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/7",
+        )
+        .unwrap();
         let sentinel = dir.path().join("agent-must-not-run");
         let mut config = cfg();
         config.watch = vec![PrWatchKind::Ci];
@@ -1069,6 +1100,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn identity_mismatch_and_unbound_rows_hold_before_any_effect_or_attempt_change() {
+        for (label, bound_url, fetched_url) in [
+            (
+                "project-swap",
+                Some("https://github.com/me/repo/pull/7"),
+                "https://github.com/other/repo/pull/7",
+            ),
+            ("unbound", None, "https://github.com/me/repo/pull/7"),
+        ] {
+            let (dir, db) = temp_db(&format!("prq-identity-{label}"));
+            if let Some(url) = bound_url {
+                db.enqueue_bound_pr("/repo", 7, Some("/w/feat"), "feat", "main", "github", url)
+                    .unwrap();
+            } else {
+                db.enqueue_pr("/repo", 7, Some("/w/feat"), "feat", "main", "github")
+                    .unwrap();
+            }
+            db.set_pr_agent_attempts("/repo#7", 1).unwrap();
+            let row = db.list_pr_queue().unwrap().remove(0);
+            let forge = FakeForge::new(Some(failing_ci_pr("abc")));
+            forge.pr.lock().unwrap().as_mut().unwrap().url = fetched_url.into();
+            let mut config = cfg();
+            config.watch = vec![PrWatchKind::Ci];
+            config.own_prs_only = false;
+            let sentinel = dir.path().join("agent-must-not-run");
+            config.agent_command = format!("touch {}", sentinel.display());
+            let out = drive_queue(
+                &config,
+                &Config::default(),
+                &forge,
+                Path::new("/repo"),
+                &db,
+                vec![PrItem::from(&row)],
+                |_| {},
+            );
+            let held = db.list_pr_queue().unwrap().remove(0);
+            assert_eq!(out.needs_human, vec![7], "{label}");
+            assert_eq!(held.status, "needs_human", "{label}");
+            assert_eq!(held.agent_attempts, 1, "{label}");
+            assert_eq!(held.ci_rerun_head, None, "{label}");
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|warning| warning.contains("identity"))
+            );
+            assert!(
+                forge
+                    .calls()
+                    .iter()
+                    .all(|call| { !call.starts_with("merge") && !call.starts_with("rerun") }),
+                "{label}: {:?}",
+                forge.calls()
+            );
+            assert!(!sentinel.exists());
+        }
+    }
+
     fn item() -> PrItem {
         PrItem {
             key: "/repo#7".into(),
@@ -1078,6 +1167,7 @@ mod tests {
             agent_attempts: 0,
             last_head_oid: Some("abc".into()),
             forge: "github".into(),
+            pr_url: Some("https://github.com/me/repo/pull/7".into()),
         }
     }
 
@@ -1555,8 +1645,16 @@ mod tests {
             let fixture = Fixture::new();
             let path = fixture.dir.path().to_str().unwrap();
             let db = Db::open_at(&fixture.dir.path().join("queue.db")).unwrap();
-            db.enqueue_pr(path, 7, Some(path), "fixture", "main", "github")
-                .unwrap();
+            db.enqueue_bound_pr(
+                path,
+                7,
+                Some(path),
+                "fixture",
+                "main",
+                "github",
+                "https://github.com/organization/project/pull/7",
+            )
+            .unwrap();
             let sentinel = fixture.dir.path().join("agent-must-not-run");
             let mut cfg = cfg();
             cfg.watch = vec![PrWatchKind::Ci];
@@ -1593,10 +1691,13 @@ mod tests {
                 items,
                 |_| {},
             );
+            let expected_warning = if mismatched_number {
+                "identity"
+            } else {
+                "own-PR automation held"
+            };
             assert!(
-                out.warnings
-                    .iter()
-                    .any(|s| s.contains("own-PR automation held")),
+                out.warnings.iter().any(|s| s.contains(expected_warning)),
                 "{out:?}"
             );
             assert_eq!(
@@ -1717,8 +1818,16 @@ mod tests {
         let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(1);
         {
             let db = Db::open_at(&path).unwrap();
-            db.enqueue_pr("/repo", 7, Some(&checkout_s), "feat", "main", "github")
-                .unwrap();
+            db.enqueue_bound_pr(
+                "/repo",
+                7,
+                Some(&checkout_s),
+                "feat",
+                "main",
+                "github",
+                "https://github.com/me/repo/pull/7",
+            )
+            .unwrap();
             let out = drive_queue(
                 &cfg,
                 &Config::default(),
@@ -1809,8 +1918,16 @@ mod tests {
         cfg.pause_on_foreign_push = false;
         cfg.agent_command = "true {prompt}".into();
         cfg.own_prs_only = false;
-        db.enqueue_pr("/repo", 7, Some("/w/feat"), "feat", "main", "github")
-            .unwrap();
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            Some("/w/feat"),
+            "feat",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/7",
+        )
+        .unwrap();
         let row = db.list_pr_queue().unwrap().remove(0);
         let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_error();
         let out = drive_queue(
@@ -1849,8 +1966,16 @@ mod tests {
         cfg.pause_on_foreign_push = false;
         cfg.agent_command = "true {prompt}".into();
         cfg.own_prs_only = false;
-        db.enqueue_pr("/repo", 7, Some("/w/feat"), "feat", "main", "github")
-            .unwrap();
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            Some("/w/feat"),
+            "feat",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/7",
+        )
+        .unwrap();
         let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(1);
         let row = db.list_pr_queue().unwrap().remove(0);
         drive_queue(
@@ -1892,8 +2017,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pr-rerun-race.db");
         let db = Db::open_at(&path).unwrap();
-        db.enqueue_pr("/repo", 7, Some("/w/feat"), "feat", "main", "github")
-            .unwrap();
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            Some("/w/feat"),
+            "feat",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/7",
+        )
+        .unwrap();
         let row = db.list_pr_queue().unwrap().remove(0);
         drop(db);
 
@@ -2099,8 +2232,16 @@ mod tests {
         config.watch = vec![PrWatchKind::Ci];
         config.own_prs_only = false;
         config.agent_command = format!("touch {}", sentinel.display());
-        db.enqueue_pr("/repo", 7, Some("/w/feat"), "feat", "main", "github")
-            .unwrap();
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            Some("/w/feat"),
+            "feat",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/7",
+        )
+        .unwrap();
         let row = db.list_pr_queue().unwrap().remove(0);
         let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(1);
         let unsupported = crate::agent_run::force_headless_unsupported();
@@ -2133,8 +2274,16 @@ mod tests {
         config.own_prs_only = false;
         config.prompts.ci_failure = "{nope}".into();
         config.agent_command = "true {prompt}".into();
-        db.enqueue_pr("/repo", 7, Some("/w/feat"), "feat", "main", "github")
-            .unwrap();
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            Some("/w/feat"),
+            "feat",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/7",
+        )
+        .unwrap();
         let row = db.list_pr_queue().unwrap().remove(0);
         let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(0);
         let out = drive_queue(

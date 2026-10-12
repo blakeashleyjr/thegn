@@ -556,6 +556,22 @@ impl NotificationStore for Db {
 }
 
 impl Db {
+    /// List the dispatch roster for display and summary readers that never
+    /// read handoff text. Note and report bodies are not selected or decoded.
+    pub fn list_dispatch_roster(&self) -> Result<Vec<crate::issue::AgentDispatch>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ROSTER_DISPATCH_COLS} FROM agent_dispatches \
+             ORDER BY dispatched_at_ms DESC, id DESC"
+        ))?;
+        let rows = stmt
+            .query_map([], map_roster_dispatch)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+}
+
+impl Db {
     /// Once-keyed notification for one create/revision event. The revision is
     /// included in the bounded message, so the same revision is idempotent and
     /// a later comment re-arms the audit row.
@@ -598,6 +614,10 @@ const DISPATCH_COLS: &str = "id, issue_id, worktree_path, agent_name, dispatched
      stage, parent_id, session_id, artifact_path, note, chunk_path, report, exit_code, \
      exited_at_ms";
 
+/// The text-free dispatch columns used by display and summary readers.
+const ROSTER_DISPATCH_COLS: &str = "id, issue_id, worktree_path, agent_name, dispatched_at_ms, status, \
+     stage, parent_id, session_id, artifact_path, chunk_path, exit_code, exited_at_ms";
+
 /// Map one [`DISPATCH_COLS`] row. The stored status string is coerced through
 /// [`AgentDispatchStatus::parse`](crate::issue::AgentDispatchStatus::parse), so
 /// a legacy or corrupt value reads as `Unknown` instead of failing the row; the
@@ -607,6 +627,24 @@ const DISPATCH_COLS: &str = "id, issue_id, worktree_path, agent_name, dispatched
 /// decades. This is the ONE seam every roster read passes through — never
 /// re-apply the guard at a display site.
 fn map_dispatch(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::issue::AgentDispatch> {
+    let mut dispatch = map_dispatch_base(r)?;
+    dispatch.note = r.get(10)?;
+    dispatch.chunk_path = r.get(11)?;
+    dispatch.report = r.get(12)?;
+    dispatch.exit_code = r.get(13)?;
+    dispatch.exited_at_ms = r.get(14)?;
+    Ok(dispatch)
+}
+
+fn map_roster_dispatch(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::issue::AgentDispatch> {
+    let mut dispatch = map_dispatch_base(r)?;
+    dispatch.chunk_path = r.get(10)?;
+    dispatch.exit_code = r.get(11)?;
+    dispatch.exited_at_ms = r.get(12)?;
+    Ok(dispatch)
+}
+
+fn map_dispatch_base(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::issue::AgentDispatch> {
     Ok(crate::issue::AgentDispatch {
         id: r.get(0)?,
         issue_id: r.get(1)?,
@@ -618,10 +656,87 @@ fn map_dispatch(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::issue::AgentDi
         parent_id: r.get(7)?,
         session_id: r.get(8)?,
         artifact_path: r.get(9)?,
-        note: r.get(10)?,
-        chunk_path: r.get(11)?,
-        report: r.get(12)?,
-        exit_code: r.get(13)?,
-        exited_at_ms: r.get(14)?,
+        note: None,
+        chunk_path: None,
+        report: None,
+        exit_code: None,
+        exited_at_ms: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::NotificationStore;
+
+    #[test]
+    fn dispatch_roster_matches_typed_fields_without_loading_text_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("roster.db")).unwrap();
+        let older = db
+            .put_agent_dispatch(crate::issue::NewDispatch {
+                issue_id: "THE-259",
+                worktree_path: "/wt/older",
+                agent_name: "codex",
+                stage: Some("review"),
+                parent_id: None,
+                session_id: Some("session-older"),
+                artifact_path: Some("handoff.md"),
+                chunk_path: Some("chunk.md"),
+            })
+            .unwrap();
+        let newer = db
+            .put_agent_dispatch(crate::issue::NewDispatch {
+                issue_id: "THE-260",
+                worktree_path: "/wt/newer",
+                agent_name: "codex",
+                stage: Some("code"),
+                parent_id: Some(older),
+                session_id: Some("session-newer"),
+                artifact_path: None,
+                chunk_path: None,
+            })
+            .unwrap();
+        db.set_dispatch_report(newer, &"r".repeat(crate::pipeline_report::REPORT_MAX_CHARS))
+            .unwrap();
+        db.stamp_dispatch_note(newer, "progress note").unwrap();
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET status='  legacy-padded  ', exit_code=7, exited_at_ms=123 WHERE id=?1",
+                [newer],
+            )
+            .unwrap();
+
+        let full = db.list_dispatches().unwrap();
+        let roster = db.list_dispatch_roster().unwrap();
+        assert_eq!(full[0].note.as_deref(), Some("progress note"));
+        assert!(full[0].report.is_some());
+        assert_eq!(
+            roster.iter().map(|row| row.id).collect::<Vec<_>>(),
+            full.iter().map(|row| row.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            roster,
+            full.iter()
+                .cloned()
+                .map(|mut row| {
+                    row.note = None;
+                    row.report = None;
+                    row
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(roster[0].status, crate::issue::AgentDispatchStatus::Unknown);
+        assert_eq!(roster[0].stage.as_deref(), Some("code"));
+        assert_eq!(roster[0].parent_id, Some(older));
+        assert_eq!(roster[0].session_id.as_deref(), Some("session-newer"));
+        assert_eq!(roster[0].exit_code, Some(7));
+        assert_eq!(roster[0].exited_at_ms, Some(123));
+        assert!(
+            roster
+                .iter()
+                .all(|row| row.note.is_none() && row.report.is_none())
+        );
+        assert_eq!(roster[1].chunk_path.as_deref(), Some("chunk.md"));
+    }
 }

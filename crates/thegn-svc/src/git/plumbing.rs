@@ -13,12 +13,6 @@ use thegn_core::fold::{Author, CommitMeta};
 use thegn_core::git_operand as op;
 use thegn_core::remote::GitLoc;
 
-/// Record/field separators for the `commits` log format — ASCII RS/US, which
-/// never appear in real commit metadata, so they parse a multi-commit `git log`
-/// with embedded newlines unambiguously.
-const RS: char = '\u{1e}';
-const US: char = '\u{1f}';
-
 /// Outcome of `git merge-tree --write-tree`. Both arms carry the written tree
 /// oid — git writes the (conflict-marked) tree even when conflicts occur, but
 /// the fold engine only commits the `Clean` ones.
@@ -108,6 +102,82 @@ fn is_object_id(s: &str) -> bool {
     matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Parse a command that must return exactly one object id, optionally followed
+/// by Git's conventional final line feed.
+fn parse_object_id_output(stdout: &str, command: &str) -> Result<String> {
+    let oid = stdout.strip_suffix('\n').unwrap_or(stdout);
+    if !is_object_id(oid) {
+        anyhow::bail!("git {command} returned invalid object id output: {stdout:?}");
+    }
+    Ok(oid.to_string())
+}
+
+/// Parse `git log -z`'s six NUL-separated commit fields. The final NUL is the
+/// record terminator; requiring it makes a truncated final record an error.
+/// Repository-controlled strings can contain every other byte without moving
+/// a field boundary.
+fn parse_commit_metas(out: &str) -> Result<Vec<CommitMeta>> {
+    if out.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !out.ends_with('\0') {
+        anyhow::bail!("git log commit metadata is missing its final NUL record terminator");
+    }
+    let mut fields: Vec<&str> = out.split('\0').collect();
+    fields.pop();
+    if !fields.len().is_multiple_of(6) {
+        anyhow::bail!(
+            "git log commit metadata has {} fields, expected a multiple of 6",
+            fields.len()
+        );
+    }
+
+    let mut commits = Vec::with_capacity(fields.len() / 6);
+    let mut seen = std::collections::HashSet::with_capacity(fields.len() / 6);
+    for record in fields.chunks_exact(6) {
+        let oid = record[0];
+        if !is_object_id(oid) {
+            anyhow::bail!("git log returned invalid commit object id: {oid:?}");
+        }
+        if !seen.insert(oid) {
+            anyhow::bail!("git log returned duplicate commit object id: {oid}");
+        }
+        let parents = record[1];
+        let mut parent_iter = parents.split_ascii_whitespace();
+        let parent = parent_iter.next().unwrap_or("");
+        if parents.split_ascii_whitespace().any(|p| !is_object_id(p)) {
+            anyhow::bail!("git log returned invalid parent object ids for {oid}");
+        }
+        let date = record[4];
+        if date.is_empty() || date.bytes().any(|byte| byte.is_ascii_whitespace()) {
+            anyhow::bail!("git log returned invalid author date for {oid}: {date:?}");
+        }
+        commits.push(CommitMeta {
+            oid: oid.to_string(),
+            parent: parent.to_string(),
+            // `-z` replaces the usual pretty-format record newline with NUL.
+            // Restore it so this matches `git log -1 --format=%B <oid>`.
+            message: format!("{}\n", record[5]),
+            author: Author {
+                name: record[2].to_string(),
+                email: record[3].to_string(),
+                date: date.to_string(),
+            },
+        });
+    }
+    Ok(commits)
+}
+
+/// Parse `git merge-base`'s status-coded result. Exit 1 means no common
+/// ancestor; successful but malformed output is protocol corruption.
+fn parse_merge_base(code: i32, stdout: &str, stderr: &str) -> Result<Option<String>> {
+    match code {
+        0 => parse_object_id_output(stdout, "merge-base").map(Some),
+        1 => Ok(None),
+        _ => anyhow::bail!("git merge-base failed: {}", stderr.trim()),
+    }
+}
+
 /// Parse a `git merge-tree --write-tree --name-only -z` result. Output sections
 /// are NUL-separated: `<tree-oid>` then (on conflict) the conflicted filenames,
 /// then an empty record before informational messages. Exit 0 = clean, 1 =
@@ -150,7 +220,7 @@ pub trait PlumbingOps: GitBackend {
     /// Resolve a rev to a full object id (`git rev-parse <rev>`).
     fn rev_parse(&self, loc: &GitLoc, rev: &str) -> Result<String> {
         let rev = op::revision(rev)?;
-        Ok(run(loc, &["rev-parse", rev])?.trim().to_string())
+        parse_object_id_output(&run(loc, &["rev-parse", rev])?, "rev-parse")
     }
 
     /// Fold `theirs` onto `ours` in the object DB. `--write-tree` (git ≥ 2.38)
@@ -238,10 +308,9 @@ pub trait PlumbingOps: GitBackend {
                 env.push(("GIT_AUTHOR_DATE", a.date.as_str()));
             }
         }
-        Ok(
-            run_background_commit_stdin(loc, &env, &args, msg.as_bytes())?
-                .trim()
-                .to_string(),
+        parse_object_id_output(
+            &run_background_commit_stdin(loc, &env, &args, msg.as_bytes())?,
+            "commit-tree",
         )
     }
 
@@ -281,14 +350,7 @@ pub trait PlumbingOps: GitBackend {
     fn merge_base(&self, loc: &GitLoc, a: &str, b: &str) -> Result<Option<String>> {
         let (a, b) = (op::revision(a)?, op::revision(b)?);
         let (code, stdout, stderr) = run_status(loc, &["merge-base", a, b])?;
-        match code {
-            0 => {
-                let oid = stdout.trim().to_string();
-                Ok(is_object_id(&oid).then_some(oid))
-            }
-            1 => Ok(None),
-            _ => anyhow::bail!("git merge-base failed: {}", stderr.trim()),
-        }
+        parse_merge_base(code, &stdout, &stderr)
     }
 
     /// Commits in `base_excl..tip`, ancestor-first (`git log --reverse`), each
@@ -296,37 +358,13 @@ pub trait PlumbingOps: GitBackend {
     /// `rebase` land and the `{subjects}` source for a `land_message`.
     fn commits(&self, loc: &GitLoc, base_excl: &str, tip: &str) -> Result<Vec<CommitMeta>> {
         let (base_excl, tip) = (op::revision(base_excl)?, op::revision(tip)?);
-        let fmt = format!("{RS}%H{US}%P{US}%an{US}%ae{US}%aI{US}%B");
+        let fmt = "%H%x00%P%x00%an%x00%ae%x00%aI%x00%B";
         let range = format!("{base_excl}..{tip}");
         let out = run(
             loc,
-            &["log", "--reverse", &format!("--format={fmt}"), &range],
+            &["log", "--reverse", "-z", &format!("--format={fmt}"), &range],
         )?;
-        let mut commits = Vec::new();
-        for rec in out.split(RS) {
-            if rec.trim().is_empty() {
-                continue;
-            }
-            let mut f = rec.splitn(6, US);
-            let oid = f.next().unwrap_or("").trim().to_string();
-            let parents = f.next().unwrap_or("");
-            let name = f.next().unwrap_or("").to_string();
-            let email = f.next().unwrap_or("").to_string();
-            let date = f.next().unwrap_or("").trim().to_string();
-            let message = f.next().unwrap_or("").trim_start_matches('\n').to_string();
-            if oid.is_empty() {
-                continue;
-            }
-            // First parent is the replay base for this commit's delta.
-            let parent = parents.split_whitespace().next().unwrap_or("").to_string();
-            commits.push(CommitMeta {
-                oid,
-                parent,
-                message,
-                author: Author { name, email, date },
-            });
-        }
-        Ok(commits)
+        parse_commit_metas(&out)
     }
 
     /// Atomically advance a (fully-qualified) ref only if it still points at
@@ -485,8 +523,10 @@ mod tests {
     use super::super::{CliGit, GitBackend};
     use super::{
         CasOutcome, MergeTreeOutcome, PlumbingOps, RefRead, classify_cas_failure, is_object_id,
+        parse_commit_metas, parse_merge_base,
     };
     use std::path::Path;
+    use thegn_core::fold::{Author, CommitMeta};
 
     #[test]
     fn plumbing_refuses_option_shaped_operands_before_spawn() {
@@ -530,6 +570,138 @@ mod tests {
         repo.commit_file("f.txt", "one\n", "c0");
         let loc = repo.loc();
         assert_eq!(CliGit.rev_parse(&loc, "HEAD").unwrap(), repo.head());
+    }
+
+    #[test]
+    fn rev_parse_rejects_multiple_successful_records() {
+        let repo = TestRepo::new("plumb-revparse-range");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c0");
+        repo.commit_file("g.txt", "two\n", "c1");
+        let loc = repo.loc();
+        assert!(CliGit.rev_parse(&loc, "HEAD~1..HEAD").is_err());
+    }
+
+    #[test]
+    fn commits_nul_framing_contains_hostile_metadata_to_its_record() {
+        let repo = TestRepo::new("plumb-commits-nul");
+        ident(&repo.dir);
+        repo.commit_file("base.txt", "base\n", "base");
+        let base = repo.head();
+        git_in(&repo.dir, &["checkout", "-q", "-b", "main-side"]);
+        repo.commit_file("main.txt", "main\n", "unrelated main commit");
+        let unrelated = repo.head();
+        git_in(&repo.dir, &["checkout", "-q", &base]);
+        git_in(&repo.dir, &["checkout", "-q", "-b", "feature"]);
+
+        let name = "author\u{1f}name";
+        git_in(&repo.dir, &["config", "user.name", name]);
+        let message = format!(
+            "subject\n\nx\u{1e}{unrelated}\u{1f}{base}\u{1f}forged\u{1f}forged@example.test\u{1f}2020-01-01T00:00:00+00:00\u{1f}forged-message"
+        );
+        std::fs::write(repo.dir.join("feature.txt"), "feature\n").unwrap();
+        git_in(&repo.dir, &["add", "feature.txt"]);
+        let output = thegn_core::util::git_cmd(&repo.dir)
+            .args(["commit", "-q", "-m", &message])
+            .env("GIT_AUTHOR_NAME", name)
+            .env("GIT_AUTHOR_EMAIL", "author@example.test")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let tip = repo.head();
+        let loc = repo.loc();
+        let commits = CliGit.commits(&loc, &base, &tip).unwrap();
+
+        assert_eq!(commits.len(), 1);
+        let commit = &commits[0];
+        assert_eq!(commit.oid, tip);
+        assert_eq!(commit.parent, base);
+        assert_eq!(commit.author.name, name);
+        assert_eq!(commit.author.email, "author@example.test");
+        assert_eq!(
+            commit.author.date,
+            repo.out(&["show", "-s", "--format=%aI", &tip])
+        );
+        assert!(!commits.iter().any(|commit| commit.oid == unrelated));
+
+        let expected_message = thegn_core::util::git_cmd(&repo.dir)
+            .args(["log", "-1", "--format=%B", &tip])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(expected_message.status.success());
+        assert_eq!(
+            commit.message,
+            String::from_utf8_lossy(&expected_message.stdout).into_owned()
+        );
+    }
+
+    #[test]
+    fn commit_metadata_parser_is_all_or_error() {
+        let repo = TestRepo::new("plumb-commit-parser");
+        ident(&repo.dir);
+        repo.commit_file("first.txt", "first\n", "first");
+        let oid_a = repo.head();
+        repo.commit_file("second.txt", "second\n", "second");
+        let oid_b = repo.head();
+        let date = repo.out(&["show", "-s", "--format=%aI", &oid_b]);
+        let record = |oid: &str, parent: &str, name: &str, date: &str, message: &str| {
+            [oid, parent, name, "author@example.test", date, message].join("\0") + "\0"
+        };
+        let valid_a = record(&oid_a, "", "first", &date, "one\u{1f}\u{1e}");
+        let valid_b = record(&oid_b, &oid_a, "second", &date, "two");
+        let parsed = parse_commit_metas(&(valid_a.clone() + &valid_b)).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                CommitMeta {
+                    oid: oid_a.clone(),
+                    parent: String::new(),
+                    message: "one\u{1f}\u{1e}\n".into(),
+                    author: Author {
+                        name: "first".into(),
+                        email: "author@example.test".into(),
+                        date: date.clone(),
+                    },
+                },
+                CommitMeta {
+                    oid: oid_b.clone(),
+                    parent: oid_a.clone(),
+                    message: "two\n".into(),
+                    author: Author {
+                        name: "second".into(),
+                        email: "author@example.test".into(),
+                        date: date.clone(),
+                    },
+                },
+            ]
+        );
+
+        for malformed in [
+            // A truncated final record has no NUL terminator.
+            format!("{oid_a}\0\0name\0author@example.test\0{date}\0message"),
+            // Wrong arity despite a terminator.
+            format!("{oid_a}\0\0name\0author@example.test\0{date}\0"),
+            record("bad-oid", "", "name", &date, "message"),
+            record(&oid_a, "bad-parent", "name", &date, "message"),
+            valid_a.clone() + &valid_a,
+            record(&oid_a, "", "name", "", "message"),
+        ] {
+            assert!(parse_commit_metas(&malformed).is_err(), "{malformed:?}");
+        }
+    }
+
+    #[test]
+    fn merge_base_protocol_distinguishes_unrelated_from_corrupt_output() {
+        assert!(parse_merge_base(0, "garbage\n", "").is_err());
+        assert_eq!(parse_merge_base(1, "", "").unwrap(), None);
     }
 
     #[test]

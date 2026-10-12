@@ -74,7 +74,7 @@ pub struct FinisherInput<'a> {
 /// Prior terminal output is deliberately not accepted as input.
 pub fn finisher_prompt(i: &FinisherInput) -> String {
     let (rendered_task, completion_contract) = split_completion_contract(i.stage_prompt);
-    let task = escape_task_markers(&bounded_sanitize(
+    let task = neutralize_prompt_markers(&bounded_sanitize(
         rendered_task,
         TASK_MAX_BYTES,
         TASK_MAX_LINES,
@@ -84,7 +84,7 @@ pub fn finisher_prompt(i: &FinisherInput) -> String {
         RECOVERY_FIELD_MAX_BYTES,
         RECOVERY_FIELD_MAX_LINES,
     );
-    let target_artifact = escape_task_markers(&bounded_sanitize(
+    let target_artifact = neutralize_prompt_markers(&bounded_sanitize(
         i.target_artifact,
         RECOVERY_FIELD_MAX_BYTES,
         1,
@@ -221,8 +221,13 @@ fn bounded_sanitize(s: &str, max_bytes: usize, max_lines: usize) -> String {
     out
 }
 
-/// Prevent task and target text from imitating recovery or contract markers.
-fn escape_task_markers(s: &str) -> String {
+/// Neutralize text that could imitate generated recovery or completion
+/// markers before it is interpolated into an authority-bearing prompt.
+///
+/// This preserves the prior byte-level behavior used by finisher prompts and
+/// is shared with fresh stage rendering so the two paths treat hostile task
+/// fields consistently.
+pub fn neutralize_prompt_markers(s: &str) -> String {
     const RECOVERY_OPEN: &str = "<UNTRUSTED-RECOVERY-JSON";
     const RECOVERY_CLOSE: &str = "</UNTRUSTED-RECOVERY-JSON";
     let markers = [
