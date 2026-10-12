@@ -629,6 +629,7 @@ mod tests {
     fn session_dispatch_enrichment_rejects_a_session_row_in_another_worktree() {
         let dir = tempfile::tempdir().unwrap();
         let db = thegn_core::db::Db::open_at(&dir.path().join("automation.db")).unwrap();
+        put_dispatch(&db, "/wt", "session-requested", "older-stage");
         put_dispatch(&db, "/wt/other", "session-requested", "wrong-stage");
 
         let mut event = event_for_dispatch("/wt", Some("session-requested"));

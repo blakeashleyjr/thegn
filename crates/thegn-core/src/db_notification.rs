@@ -697,9 +697,9 @@ mod tests {
                 chunk_path: None,
             })
             .unwrap();
-        db.set_dispatch_report(newer, &"r".repeat(64 * 1024))
+        db.set_dispatch_report(newer, &"r".repeat(crate::pipeline_report::REPORT_MAX_CHARS))
             .unwrap();
-        db.append_dispatch_note(newer, "progress note").unwrap();
+        db.stamp_dispatch_note(newer, "progress note").unwrap();
         db.conn()
             .execute(
                 "UPDATE agent_dispatches SET status='  legacy-padded  ', exit_code=7, exited_at_ms=123 WHERE id=?1",
@@ -709,6 +709,8 @@ mod tests {
 
         let full = db.list_dispatches().unwrap();
         let roster = db.list_dispatch_roster().unwrap();
+        assert_eq!(full[0].note.as_deref(), Some("progress note"));
+        assert!(full[0].report.is_some());
         assert_eq!(
             roster.iter().map(|row| row.id).collect::<Vec<_>>(),
             full.iter().map(|row| row.id).collect::<Vec<_>>()
