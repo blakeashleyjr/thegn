@@ -21,7 +21,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use thegn_core::control_wire::{
-    EventDecoder, EventFrame, FeedFilter, Hello, MAX_WIRE_FRAME, MAX_WIRE_PAYLOAD, PROTO_VERSION,
+    EventDecoder, EventFrame, FeedFilter, Hello, MAX_WIRE_FRAME, PROTO_VERSION,
 };
 use thegn_core::store::{ControlStore, DaemonRow};
 
@@ -2025,6 +2025,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::control_wire::MAX_WIRE_PAYLOAD;
     use thegn_core::db::Db;
 
     #[tokio::test]
