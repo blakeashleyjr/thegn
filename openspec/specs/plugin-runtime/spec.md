@@ -38,6 +38,13 @@ Resident plugins SHALL run as one long-lived process each, spoken to over NDJSON
 
 Incoming plugin messages SHALL be applied to the core `PluginRuntime`: `register` accepts only negotiated contributions; `update`/`invalidate` maintain the surface view cache; `notify` lands in the notification store (the NotificationSource surface); `state.get`/`state.set`/`host.value`/`subscribe`/`emit` behave per the plugin-api spec; junk lines are kept for diagnostics, never crash the host.
 
+Runtime registration SHALL match a contribution's negotiated ID, extension
+point, declaration, and granted surface capability. Unmatched or changed
+registrations SHALL fail without changing host contribution or surface state.
+An identical repeated registration SHALL succeed idempotently without another
+audit entry or state change. The currently unimplemented `io` verb SHALL return
+the typed `unsupported` RPC error after its capability decision is audited.
+
 #### Scenario: A statusbar segment renders
 
 - **WHEN** an accepted `StatusBarSegment` contribution's plugin sends `update` with a view for its surface

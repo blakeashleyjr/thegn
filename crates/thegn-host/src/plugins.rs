@@ -217,6 +217,21 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Validate the complete plugin set before setup is allowed to start any
+/// plugin process. Any enabled-spec problem rejects the whole set; run
+/// `thegn plugin check` for the diagnostics.
+fn admitted_plugins(
+    cfg: &thegn_core::config::Config,
+    config_dir: &std::path::Path,
+) -> Result<Vec<LoadedPlugin>, Vec<thegn_svc::plugin::loader::SpecProblem>> {
+    let (loaded, broken) = thegn_svc::plugin::discover(cfg, config_dir);
+    let problems = thegn_svc::plugin::loader::check_loaded(&loaded, broken);
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    Ok(loaded)
+}
+
 /// Spawn one resident session whose events are tagged with the plugin id,
 /// queued on the loop channel and waker-pulsed.
 fn spawn_session(
@@ -272,6 +287,29 @@ fn setup_and_schedule(
     tx: tokio_mpsc::UnboundedSender<PluginMsg>,
     waker: TerminalWaker,
 ) {
+    setup_and_schedule_with_waker(
+        supervisor,
+        specs,
+        config_dir,
+        sessions,
+        disabled,
+        stop,
+        tx,
+        Some(waker),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn setup_and_schedule_with_waker(
+    supervisor: ResidentSupervisor,
+    specs: Vec<PluginSpec>,
+    config_dir: PathBuf,
+    sessions: Sessions,
+    disabled: Disabled,
+    stop: Arc<AtomicBool>,
+    tx: tokio_mpsc::UnboundedSender<PluginMsg>,
+    waker: Option<TerminalWaker>,
+) {
     // `discover` reads `cfg.plugins` + the plugins directory; hand it the
     // owned specs on a default config rather than cloning the whole config
     // across the thread boundary.
@@ -279,7 +317,21 @@ fn setup_and_schedule(
         plugins: specs,
         ..Default::default()
     };
-    let discovered = thegn_svc::plugin::discover(&cfg, &config_dir);
+    let discovered = match admitted_plugins(&cfg, &config_dir) {
+        Ok(discovered) => discovered,
+        Err(problems) => {
+            for problem in problems {
+                tracing::warn!(target: "thegn::plugin", error = %problem, "plugin set rejected before startup");
+            }
+            // Publish an empty set for this failed admission. Crucially, this
+            // return precedes the resident and one-shot process spawn paths.
+            let _ = tx.send(PluginMsg::Loaded(Vec::new()));
+            if let Some(waker) = &waker {
+                let _ = waker.wake(); // best-effort: an input nudge must never fail this path
+            }
+            return;
+        }
+    };
     let mut loaded: Vec<LoadedState> = Vec::new();
     let mut sched: Vec<SchedEntry> = Vec::new();
     let now = Instant::now();
@@ -297,7 +349,12 @@ fn setup_and_schedule(
             }
         };
         let writer = match plugin.spec.mode {
-            PluginMode::Resident => match spawn_session(&supervisor, &plugin, &tx, &waker) {
+            PluginMode::Resident => match spawn_session(
+                &supervisor,
+                &plugin,
+                &tx,
+                waker.as_ref().expect("runtime setup has a terminal waker"),
+            ) {
                 Ok(session) => {
                     let w = session.writer();
                     lock(&sessions).insert(id.clone(), session);
@@ -362,7 +419,9 @@ fn setup_and_schedule(
 
     // best-effort: the loop may already be tearing down.
     let _ = tx.send(PluginMsg::Loaded(loaded));
-    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+    if let Some(waker) = &waker {
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+    }
 
     for r in initial_runs {
         if stop.load(Ordering::SeqCst) {
@@ -374,7 +433,9 @@ fn setup_and_schedule(
             plugin: r.plugin,
             run,
         });
-        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        if let Some(waker) = &waker {
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        }
     }
 
     if sched.is_empty() {
@@ -426,7 +487,9 @@ fn setup_and_schedule(
                         plugin: entry.plugin.clone(),
                         run,
                     });
-                    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                    if let Some(waker) = &waker {
+                        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                    }
                 }
             }
         }
@@ -437,6 +500,11 @@ fn setup_and_schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::plugin_api::{PluginId, PluginSpec};
+
+    fn example_spec() -> PluginSpec {
+        toml::from_str(include_str!("../../../examples/plugins/hello/plugin.toml")).unwrap()
+    }
 
     #[test]
     fn restart_backoff_is_1_5_25_then_disabled() {
@@ -445,5 +513,90 @@ mod tests {
         assert_eq!(restart_delay(2), Some(Duration::from_secs(25)));
         assert_eq!(restart_delay(3), None);
         assert_eq!(restart_delay(17), None);
+    }
+
+    #[test]
+    fn duplicate_ids_reject_the_entire_set_before_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut first = example_spec();
+        first.manifest.id = PluginId::new("duplicate");
+        first.command = vec!["true".into()];
+        let mut second = first.clone();
+        second.command = vec!["false".into()];
+        let cfg = thegn_core::config::Config {
+            plugins: vec![first, second],
+            ..Default::default()
+        };
+
+        let problems = admitted_plugins(&cfg, tmp.path()).unwrap_err();
+
+        assert!(problems.iter().any(|problem| {
+            problem.plugin == "duplicate" && problem.problem == "duplicate plugin id"
+        }));
+    }
+
+    #[test]
+    fn invalid_enabled_spec_rejects_the_entire_set_before_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut valid = example_spec();
+        valid.command = vec!["true".into()];
+        let mut invalid = example_spec();
+        invalid.manifest.id = PluginId::new("invalid-command");
+        invalid.command.clear();
+        let cfg = thegn_core::config::Config {
+            plugins: vec![valid, invalid],
+            ..Default::default()
+        };
+
+        let problems = admitted_plugins(&cfg, tmp.path()).unwrap_err();
+
+        assert!(problems.iter().any(|problem| {
+            problem.plugin == "invalid-command" && problem.problem == "empty command"
+        }));
+    }
+
+    #[test]
+    fn startup_publishes_empty_set_and_does_not_run_duplicate_one_shots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("ran");
+        let command = vec![
+            "sh".into(),
+            "-c".into(),
+            "touch \"$1\"".into(),
+            "plugin".into(),
+            marker.display().to_string(),
+        ];
+        let mut first = example_spec();
+        first.manifest.id = PluginId::new("duplicate");
+        first.manifest.contributions.clear();
+        first.command = command;
+        let second = first.clone();
+        let cfg_specs = vec![first, second];
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+
+        setup_and_schedule_with_waker(
+            supervisor,
+            cfg_specs,
+            tmp.path().to_path_buf(),
+            sessions.clone(),
+            disabled,
+            stop,
+            tx,
+            None,
+        );
+
+        assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(loaded) if loaded.is_empty()));
+        assert!(lock(&sessions).is_empty());
+        assert!(!marker.exists());
+        assert!(rx.try_recv().is_err());
     }
 }

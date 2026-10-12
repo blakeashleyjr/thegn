@@ -112,11 +112,11 @@ struct Observer {
 
 type BoxFut = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-/// The receive loop stays constant-time (THE-266): each exit is stamped and
-/// handed to a bounded per-session task, then the loop returns to `recv`
-/// immediately. A 60 s backoff on one row can no longer delay another row's
-/// stamp or classification, and a lagged receiver reconciles from durable
-/// state instead of only logging.
+/// The receive loop stays constant-time (THE-266): each exit is handed to a
+/// bounded per-session task, then the loop returns to `recv` immediately. A
+/// 60 s backoff on one row can no longer delay another row's stamp or
+/// classification, and a lagged receiver reconciles from durable state instead
+/// of only logging.
 pub(crate) fn spawn(
     svc: Arc<DaemonService>,
     mut rx: tokio::sync::broadcast::Receiver<Arc<EventFrame>>,
@@ -151,25 +151,9 @@ pub(crate) fn spawn(
     });
 }
 
-/// Constant-time handling of one exit: spawn the durable stamp and, for a
-/// nonzero code, enqueue bounded retry work. Never awaits.
+/// Constant-time handling of one exit: enqueue bounded per-session work.
+/// Association, durable stamping, and classification share that work item.
 fn observe_exit(obs: &Arc<Observer>, session: String, code: Option<i32>) {
-    // The CLI learns the server-generated session id only after
-    // `sessions.open` returns, so a very short-lived worker can emit this
-    // event just before open_stage stamps the row. Retry the association off
-    // this task; raw sessions simply age out of the bounded lookup.
-    let stamp_svc = obs.svc.clone();
-    let stamp_session = session.clone();
-    tokio::spawn(async move {
-        if let Err(e) = stamp_dispatch_exit(stamp_svc, stamp_session.clone(), code).await {
-            tracing::warn!(
-                target: "thegn::daemon",
-                session = %stamp_session,
-                "dispatch exit stamp: {e:#}"
-            );
-        }
-    });
-
     let Some(code) = code.filter(|c| *c != 0) else {
         // A clean exit is never retried: drop its assigned native id.
         obs.svc
@@ -177,6 +161,13 @@ fn observe_exit(obs: &Arc<Observer>, session: String, code: Option<i32>) {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&session);
+        let svc = obs.svc.clone();
+        let stamp_session = session.clone();
+        tokio::spawn(async move {
+            if let Err(e) = stamp_dispatch_exit(&svc, stamp_session.clone(), code).await {
+                tracing::warn!(target: "thegn::daemon", session = %stamp_session, "dispatch exit stamp: {e:#}");
+            }
+        });
         return;
     };
     {
@@ -192,6 +183,19 @@ fn observe_exit(obs: &Arc<Observer>, session: String, code: Option<i32>) {
                 cap = MAX_PENDING_EXITS,
                 "transport retry queue full; exit deferred to durable reconcile"
             );
+            // Queue capacity must not decide whether the durable exit stamp
+            // is written. Reconciliation can recover classification later.
+            let svc = obs.svc.clone();
+            let stamp_session = session.clone();
+            tokio::spawn(async move {
+                if let Err(e) = stamp_dispatch_exit(&svc, stamp_session.clone(), Some(code)).await {
+                    tracing::warn!(
+                        target: "thegn::daemon",
+                        session = %stamp_session,
+                        "dispatch exit stamp: {e:#}"
+                    );
+                }
+            });
             return;
         }
         pending.insert(session.clone());
@@ -263,66 +267,96 @@ async fn reconcile_pass(obs: &Arc<Observer>) {
     }
 }
 
-/// Persist a daemon session exit on its dispatch row. The association normally
-/// exists on the first read; the bounded retry closes the server-id publication
-/// race for workers that start and exit before the CLI can stamp the returned
-/// id. The database stamp is one-shot per run, so an adopted pane observing the
-/// same exit is harmless.
+/// Associate and persist a daemon session exit on its dispatch row. The
+/// returned run reference is the fence used by classification, so the stamp
+/// and retry decision cannot resolve different rows or generations. The
+/// bounded async lookup closes the server-id publication race without blocking
+/// the event receiver or unrelated exits.
 pub(crate) async fn stamp_dispatch_exit(
-    svc: Arc<DaemonService>,
+    svc: &DaemonService,
     session: String,
     code: Option<i32>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<thegn_core::issue::DispatchRunRef>> {
     const LOOKUP_ATTEMPTS: usize = 20;
     const LOOKUP_RETRY: Duration = Duration::from_millis(25);
+    const LOOKUP_DEADLINE: Duration = Duration::from_millis(500);
+    let deadline = tokio::time::Instant::now() + LOOKUP_DEADLINE;
 
     for attempt in 0..LOOKUP_ATTEMPTS {
         let sid = session.clone();
-        // Session identity only (THE-238): the worktree argument is unused on
-        // the session path, and a miss is Stale — usually the publication race
-        // this loop exists for, so it retries rather than falling back.
-        let attribution = svc
-            .with_db(move |db| db.dispatch_for_exit("", Some(&sid)))
-            .await?;
+        // Session identity only (THE-238): a miss is Stale, usually the
+        // publication race this bounded loop exists to close.
+        let attribution = match tokio::time::timeout_at(
+            deadline,
+            svc.with_db(move |db| db.dispatch_for_exit("", Some(&sid))),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => break,
+        };
         if let thegn_core::issue::ExitAttribution::Exact(run) = attribution {
-            let outcome = svc
-                .with_db(move |db| db.stamp_dispatch_exit(&run, code.map(i64::from)))
-                .await?;
+            let outcome = match tokio::time::timeout_at(
+                deadline,
+                svc.with_db({
+                    let run = run.clone();
+                    move |db| db.stamp_dispatch_exit(&run, code.map(i64::from))
+                }),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => break,
+            };
             if matches!(
                 outcome,
-                thegn_core::issue::ExitStamp::Stale | thegn_core::issue::ExitStamp::Missing
+                thegn_core::issue::ExitStamp::Stamped
+                    | thegn_core::issue::ExitStamp::AlreadyStamped
             ) {
-                tracing::warn!(
-                    target: "thegn::daemon",
-                    session = %session,
-                    ?outcome,
-                    "session exit did not stamp its run"
-                );
+                return Ok(Some(run));
             }
-            return Ok(());
+            tracing::warn!(
+                target: "thegn::daemon",
+                session = %session,
+                ?outcome,
+                "session exit did not stamp its run"
+            );
+            return Ok(None);
         }
         if attempt + 1 < LOOKUP_ATTEMPTS {
-            tokio::time::sleep(LOOKUP_RETRY).await;
+            tokio::time::sleep_until((tokio::time::Instant::now() + LOOKUP_RETRY).min(deadline))
+                .await;
         }
     }
-    Ok(())
+    tracing::warn!(
+        target: "thegn::daemon",
+        session = %session,
+        attempts = LOOKUP_ATTEMPTS,
+        "session exit was not associated before lookup deadline"
+    );
+    Ok(None)
 }
 
 /// Handle one nonzero headless exit. Split from [`spawn`] so a stub test can
 /// drive a synthetic exit through the same path with no PTY and no harness.
-/// `_code` is already known nonzero (the caller's gate); the classifier's
-/// `failed` argument is true by that same construction — the value itself is
-/// deliberately unused here (the underscore, not a discarded binding: the
-/// ignored-result ratchet pins `let _ = …` shapes).
 pub(crate) async fn handle_exit(
     svc: &DaemonService,
     session: &str,
-    _code: i32,
+    code: i32,
     attempts: &Attempts,
     permits: Option<&tokio::sync::Semaphore>,
 ) -> anyhow::Result<()> {
-    // Consume the launch-assigned native id up front, so no early return below
-    // can leave an entry behind.
+    // Associate and stamp first. Classification below uses this exact row/run
+    // identity, never a second session lookup with a different timing window.
+    let Some(run) = stamp_dispatch_exit(svc, session.to_string(), Some(code)).await? else {
+        svc.native_ids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(session);
+        return Ok(());
+    };
+    // Consume the launch-assigned native id up front, so no later return leaves
+    // an entry behind.
     let assigned = svc
         .native_ids
         .lock()
@@ -341,49 +375,32 @@ pub(crate) async fn handle_exit(
         return Ok(());
     }
 
-    // 2. The roster row this session was running, newest stamp wins. Skip
-    //    anything without one, and anything already closed.
-    let sid = session.to_string();
-    let Some(row) = svc.with_db(move |db| db.dispatch_by_session(&sid)).await? else {
-        return Ok(());
-    };
-    if row.status.is_terminal() {
-        // The pane path or the Lead already wrote the verdict.
-        return Ok(());
-    }
-
-    // 2b. The exact run this exit belongs to, and its harness-native session
-    //     id. The id assigned at launch lives in daemon memory; it is made
-    //     durable here by a CAS on (row, session, run_gen), so only the run
-    //     that really owned this session can carry it. Whatever the row holds
-    //     for its CURRENT generation is what a retry may resume.
-    let (run, native) = svc
-        .with_db({
-            let id = row.id;
-            let session = session.to_string();
-            move |db| {
-                let Some(run) = db.dispatch_run_ref(id)? else {
-                    return Ok((None, None));
-                };
-                if run.session_id != session {
-                    // The row already belongs to another run: nothing of this
-                    // session's identity may be recorded or resumed.
-                    return Ok((Some(run), None));
-                }
-                if let Some(native) = &assigned {
-                    // A refused CAS (already has an id) is fine: the read below
-                    // reports what is durable for exactly this run.
-                    db.set_dispatch_native_session(&run, native)?;
-                }
-                let native = db.dispatch_native_session(&run)?;
-                Ok((Some(run), native))
+    // 2. Read the row by the identity that was stamped. Recheck the current
+    //    run reference in the same DB closure so a concurrent redrive cannot
+    //    make this old exit act on its replacement.
+    let run_id = run.id;
+    let exact_run = run.clone();
+    let assigned_native = assigned.clone();
+    let (row, native) = svc
+        .with_db(move |db| {
+            let Some(current) = db.dispatch_run_ref(run_id)? else {
+                return Ok((None, None));
+            };
+            if current != exact_run {
+                return Ok((None, None));
             }
+            let row = db.get_dispatch(run_id)?;
+            if row.as_ref().is_some_and(|r| r.status.is_terminal()) {
+                return Ok((None, None));
+            }
+            if let Some(native) = &assigned_native {
+                db.set_dispatch_native_session(&current, native)?;
+            }
+            let native = db.dispatch_native_session(&current)?;
+            Ok((row, native))
         })
         .await?;
-    // The row was republished to a newer session (or vanished) since the
-    // lookup: this exit belongs to a replaced run, and the live worker that
-    // replaced it must not be parked or relaunched over.
-    let Some(run) = run.filter(|r| r.session_id == session) else {
+    let Some(row) = row else {
         return Ok(());
     };
 
@@ -851,5 +868,200 @@ mod tests {
         let mut keep = Some("id".to_string());
         assert!(retry_class(None, "segfault", &mut keep).is_none());
         assert_eq!(keep.as_deref(), Some("id"));
+    }
+
+    /// THE-257: the same bounded association that stamps the event must wait
+    /// through initial roster publication before classifying the transport
+    /// failure. Before the fix, the stamp task eventually succeeded while
+    /// `handle_exit` returned on its first session lookup miss.
+    #[tokio::test]
+    async fn exit_before_roster_publication_is_stamped_and_parked() {
+        use crate::daemon::service::DaemonService;
+        use crate::daemon::session::{IdleTransition, SessionMeta};
+        use crate::daemon::tombstone::{MAX_TOMBSTONES, TOMBSTONE_TTL_MS, Tombstone};
+        use thegn_core::control_wire::EventFrame;
+        use thegn_core::db::Db;
+        use thegn_core::graveyard::Graveyard;
+        use thegn_core::issue::{AgentDispatchStatus as St, NewDispatch};
+        use thegn_core::store::NotificationStore;
+        use tokio::sync::{broadcast, mpsc};
+
+        let (events, _rx) = broadcast::channel(16);
+        let (idle_tx, _idle_rx) = mpsc::unbounded_channel::<IdleTransition>();
+        let mut config = thegn_core::config::Config::default();
+        config.pipeline.transport_retry.backoff_ms = 0;
+        config.pipeline.transport_retry.max_attempts = 0;
+        let svc = Arc::new(DaemonService {
+            daemon_id: "test".into(),
+            sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            actor_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            accepting: AtomicBool::new(true),
+            tombs: Arc::new(tokio::sync::Mutex::new(Graveyard::new(
+                MAX_TOMBSTONES,
+                TOMBSTONE_TTL_MS,
+            ))),
+            native_ids: Mutex::new(HashMap::new()),
+            spawning_relaunches: Arc::new(Mutex::new(HashSet::new())),
+            events,
+            db: Arc::new(Mutex::new(Db::open_memory().expect("db"))),
+            grace_ms: 0,
+            idle_tx,
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            config: Arc::new(config),
+            profile_root: std::env::temp_dir(),
+            endpoint: "/tmp/test.sock".into(),
+        });
+        let row_id = {
+            let db = svc.db.lock().unwrap();
+            let id = db
+                .put_agent_dispatch(NewDispatch {
+                    stage: Some("code"),
+                    ..NewDispatch::new("linear:THE-257", "/wt/257", "aider")
+                })
+                .unwrap();
+            db.update_dispatch_status(id, St::Running).unwrap();
+            id
+        };
+        let session = "s-published-late";
+        let tomb = Tombstone {
+            meta: SessionMeta {
+                id: session.into(),
+                worktree: None,
+                program: "aider".into(),
+                cwd: None,
+                created_at_ms: 0,
+                pid: None,
+                forked_from: None,
+            },
+            exit_code: Some(1),
+            exited_at_ms: 1,
+            final_screen: EventFrame::PaneSnapshot {
+                session: session.into(),
+                seq: 0,
+                cols: 80,
+                rows: 24,
+                bytes: b"Connection error. SDK retry budget exhausted".to_vec(),
+            },
+            history_tail: Vec::new(),
+            last_state: thegn_core::attention::PaneAgentState::Idle,
+            attached: 0,
+            rows: 24,
+            cols: 80,
+            recording: None,
+        };
+        let buried_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_millis() as i64;
+        svc.tombs
+            .lock()
+            .await
+            .insert(session.into(), tomb, buried_at_ms);
+
+        let attempts = Mutex::new(HashMap::new());
+        let task_svc = svc.clone();
+        let task =
+            tokio::spawn(async move { handle_exit(&task_svc, session, 1, &attempts, None).await });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            svc.db
+                .lock()
+                .unwrap()
+                .bind_dispatch_session(row_id, session)
+                .unwrap()
+        );
+        task.await.unwrap().unwrap();
+
+        let row = svc
+            .db
+            .lock()
+            .unwrap()
+            .get_dispatch(row_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.exit_code, Some(1), "exit is durably stamped");
+        assert!(row.exited_at_ms.is_some());
+        assert_eq!(row.status, St::WaitingHuman, "transport failure classified");
+        assert!(
+            row.note
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("transport")
+        );
+    }
+
+    /// THE-257: an exit with no published row gives up at the bounded lookup
+    /// deadline, logs from `stamp_dispatch_exit`, and consumes its native id.
+    #[tokio::test]
+    async fn exit_without_a_published_row_gives_up_cleanly() {
+        use crate::daemon::service::DaemonService;
+        use crate::daemon::session::IdleTransition;
+        use crate::daemon::tombstone::{MAX_TOMBSTONES, TOMBSTONE_TTL_MS};
+        use thegn_core::db::Db;
+        use thegn_core::graveyard::Graveyard;
+        use thegn_core::issue::{AgentDispatchStatus as St, NewDispatch};
+        use tokio::sync::{broadcast, mpsc};
+
+        let (events, _rx) = broadcast::channel(16);
+        let (idle_tx, _idle_rx) = mpsc::unbounded_channel::<IdleTransition>();
+        let svc = DaemonService {
+            daemon_id: "test".into(),
+            sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            actor_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            accepting: AtomicBool::new(true),
+            tombs: Arc::new(tokio::sync::Mutex::new(Graveyard::new(
+                MAX_TOMBSTONES,
+                TOMBSTONE_TTL_MS,
+            ))),
+            native_ids: Mutex::new(HashMap::from([(
+                "s-never-published".into(),
+                "native-id".into(),
+            )])),
+            spawning_relaunches: Arc::new(Mutex::new(HashSet::new())),
+            events,
+            db: Arc::new(Mutex::new(Db::open_memory().expect("db"))),
+            grace_ms: 0,
+            idle_tx,
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            config: Arc::new(thegn_core::config::Config::default()),
+            profile_root: std::env::temp_dir(),
+            endpoint: "/tmp/test.sock".into(),
+        };
+        let row_id = {
+            let db = svc.db.lock().unwrap();
+            let id = db
+                .put_agent_dispatch(NewDispatch::new("linear:THE-257", "/wt/257", "aider"))
+                .unwrap();
+            db.update_dispatch_status(id, St::Running).unwrap();
+            assert!(db.bind_dispatch_session(id, "s-still-published").unwrap());
+            id
+        };
+        let attempts = Mutex::new(HashMap::new());
+        let started = tokio::time::Instant::now();
+        handle_exit(&svc, "s-never-published", 1, &attempts, None)
+            .await
+            .unwrap();
+
+        assert!(
+            started.elapsed() <= Duration::from_millis(750),
+            "unassociated exit exceeded its 500 ms lookup deadline"
+        );
+        let row = svc
+            .db
+            .lock()
+            .unwrap()
+            .get_dispatch(row_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, St::Running, "unrelated row remains unchanged");
+        assert_eq!(row.session_id.as_deref(), Some("s-still-published"));
+        assert_eq!(row.exit_code, None);
+        assert!(
+            !svc.native_ids
+                .lock()
+                .unwrap()
+                .contains_key("s-never-published"),
+            "native id is consumed when association gives up"
+        );
     }
 }

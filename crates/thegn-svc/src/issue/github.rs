@@ -360,7 +360,11 @@ impl IssueBackend for GitHubIssuesBackend {
     }
 
     fn caps(&self) -> super::IssueCaps {
-        super::IssueCaps::default()
+        super::IssueCaps {
+            patch_status: true,
+            patch_title: true,
+            ..Default::default()
+        }
     }
 
     fn list_issues<'a>(

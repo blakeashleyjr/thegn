@@ -106,3 +106,16 @@ the declared `exec` scope in the same central authorization lattice.
 - **WHEN** a plugin granted `write` but not `exec` calls an exec-scoped host
   capability
 - **THEN** the host denies and audits the call with the stable permission error
+
+### Requirement: Unimplemented plugin I/O fails explicitly
+
+The `io` host verb SHALL check and audit its requested capability, then return
+an `unsupported` RPC error until the host has a bounded implementation that
+performs the requested operation. A grant MUST NOT produce a success-shaped
+response for work that did not occur.
+
+#### Scenario: A granted I/O request has no implementation
+
+- **WHEN** a plugin requests a granted network or command operation
+- **THEN** it receives an `unsupported` RPC error and the capability decision
+  remains in the audit log

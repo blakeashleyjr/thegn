@@ -52,6 +52,59 @@ pub(crate) struct VanishedTabs {
 
 static RECONCILIATION_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+struct ReconciliationCompletionGuard;
+
+impl Drop for ReconciliationCompletionGuard {
+    fn drop(&mut self) {
+        RECONCILIATION_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+fn sample_vanished_tabs(
+    paths: &[String],
+    load_registry: impl FnOnce() -> anyhow::Result<(
+        Vec<thegn_core::models::WorktreeRow>,
+        Vec<thegn_core::models::WorkspaceRow>,
+    )>,
+) -> anyhow::Result<Vec<String>> {
+    let (rows, workspaces) = load_registry()?;
+    let mut gone = Vec::new();
+    let mut unregistered_count = 0;
+    let mut first_unregistered_path = None;
+    for path in paths {
+        let is_workspace_root = workspaces
+            .iter()
+            .any(|workspace| workspace.repo_path == *path);
+        let is_local_worktree = match rows.iter().find(|row| row.worktree == *path) {
+            Some(row) if row.location.is_empty() || row.location == "local" => true,
+            Some(_) => false,
+            None if is_workspace_root => true,
+            None => {
+                unregistered_count += 1;
+                if first_unregistered_path.is_none() {
+                    first_unregistered_path = Some(path.as_str());
+                }
+                continue;
+            }
+        };
+        if !is_local_worktree {
+            tracing::debug!(path, "skipping vanished-tab probe for remote worktree");
+            continue;
+        }
+        if !Path::new(path).is_dir() {
+            gone.push(path.clone());
+        }
+    }
+    if let Some(first_path) = first_unregistered_path {
+        tracing::info!(
+            count = unregistered_count,
+            first_path,
+            "skipped vanished-tab probes for unregistered paths"
+        );
+    }
+    Ok(gone)
+}
+
 /// Apply the lifecycle policy for one worktree branch in response to `event`.
 /// A no-op unless `[merge_queue] organize_folders` is on. Never fails.
 pub(crate) fn apply(
@@ -617,28 +670,31 @@ pub(crate) fn spawn_reconcile_removed_tabs(
     let spawned = std::thread::Builder::new()
         .name("thegn-vanished-tab-reconcile".into())
         .spawn(move || {
+            // Install before any worker operation so every exit releases ownership.
+            let _completion = ReconciliationCompletionGuard;
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            let db = Db::open().ok();
-            let remote: std::collections::HashSet<String> = db
-                .as_ref()
-                .and_then(|db| db.worktrees().ok())
-                .map(|rows| {
-                    rows.into_iter()
-                        .filter(|w| !w.location.is_empty())
-                        .map(|w| w.worktree)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let gone: Vec<String> = paths
-                .into_iter()
-                .filter(|path| !remote.contains(path) && !Path::new(path).is_dir())
-                .collect();
-            if let Some(db) = db {
+            let mut sampled_db = None;
+            let sample = sample_vanished_tabs(&paths, || {
+                let db = Db::open()?;
+                let rows = db.worktrees()?;
+                let workspaces = db.workspaces()?;
+                sampled_db = Some(db);
+                Ok((rows, workspaces))
+            });
+            let gone = match sample {
+                Ok(gone) => gone,
+                Err(error) => {
+                    tracing::warn!(%error, "vanished-tab reconciliation sample unavailable; leaving tabs untouched");
+                    return;
+                }
+            };
+            if let Some(db) = sampled_db {
                 for path in &gone {
-                    let _ = db.del_worktree(path); // best-effort: git is the source of truth
+                    if let Err(error) = db.del_worktree(path) {
+                        tracing::warn!(%error, path, "could not clear vanished worktree cache row");
+                    }
                 }
             }
-            RECONCILIATION_IN_FLIGHT.store(false, Ordering::Release);
             if !gone.is_empty() {
                 crate::worktree_lifecycle::send_refresh(
                     crate::hydrate::RefreshKind::VanishedTabs(Box::new(VanishedTabs {
@@ -714,6 +770,110 @@ mod tests {
     use std::path::{Path, PathBuf};
     use thegn_core::config::OnLanded;
     use thegn_core::util;
+
+    #[test]
+    fn failed_registry_sample_emits_no_removals_and_releases_worker_ownership() {
+        RECONCILIATION_IN_FLIGHT.store(true, Ordering::Release);
+        let _completion = ReconciliationCompletionGuard;
+        let paths = vec!["/definitely/missing/worktree".to_owned()];
+        let sample =
+            sample_vanished_tabs(&paths, || anyhow::bail!("injected database open failure"));
+        assert!(sample.is_err());
+        assert!(
+            sample
+                .unwrap_err()
+                .to_string()
+                .contains("injected database open failure")
+        );
+        drop(_completion);
+        assert!(!RECONCILIATION_IN_FLIGHT.load(Ordering::Acquire));
+
+        RECONCILIATION_IN_FLIGHT.store(true, Ordering::Release);
+        let panic = std::panic::catch_unwind(|| {
+            let _completion = ReconciliationCompletionGuard;
+            panic!("injected worker panic");
+        });
+        assert!(panic.is_err());
+        assert!(!RECONCILIATION_IN_FLIGHT.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn opaque_unregistered_path_is_skipped_during_vanished_tab_sample() {
+        let sample = sample_vanished_tabs(&["provider:workspace/branch".into()], || {
+            Ok((Vec::new(), Vec::new()))
+        });
+        assert_eq!(sample.unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn registered_remote_path_is_never_probed_as_a_local_directory() {
+        let db = Db::open_memory().unwrap();
+        db.put_workspace("/repo", "repo", "git").unwrap();
+        db.put_worktree("feature", "/repo", "/remote/feature", "feature", None, None)
+            .unwrap();
+        db.set_worktree_location("/remote/feature", r#"{"host":"build"}"#)
+            .unwrap();
+        let paths = vec!["/remote/feature".to_owned()];
+        let gone =
+            sample_vanished_tabs(&paths, || Ok((db.worktrees()?, db.workspaces()?))).unwrap();
+        assert!(gone.is_empty());
+    }
+
+    #[test]
+    fn home_root_and_gone_registered_local_worktree_are_sampled() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("repo");
+        std::fs::create_dir(&home).unwrap();
+        let gone_worktree = dir.path().join("gone-worktree");
+        let db = Db::open_memory().unwrap();
+        db.put_workspace(home.to_str().unwrap(), "repo", "git")
+            .unwrap();
+        db.put_worktree(
+            "gone",
+            home.to_str().unwrap(),
+            gone_worktree.to_str().unwrap(),
+            "gone",
+            None,
+            None,
+        )
+        .unwrap();
+        let paths = vec![
+            home.to_string_lossy().into_owned(),
+            gone_worktree.to_string_lossy().into_owned(),
+        ];
+
+        let gone =
+            sample_vanished_tabs(&paths, || Ok((db.worktrees()?, db.workspaces()?))).unwrap();
+        assert_eq!(gone, [gone_worktree.to_string_lossy().into_owned()]);
+    }
+
+    #[test]
+    fn unregistered_path_does_not_block_gone_registered_local_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("repo");
+        std::fs::create_dir(&home).unwrap();
+        let gone_worktree = dir.path().join("gone-worktree");
+        let db = Db::open_memory().unwrap();
+        db.put_workspace(home.to_str().unwrap(), "repo", "git")
+            .unwrap();
+        db.put_worktree(
+            "gone",
+            home.to_str().unwrap(),
+            gone_worktree.to_str().unwrap(),
+            "gone",
+            None,
+            None,
+        )
+        .unwrap();
+        let paths = vec![
+            "opaque:workspace/branch".into(),
+            gone_worktree.to_string_lossy().into_owned(),
+        ];
+
+        let gone =
+            sample_vanished_tabs(&paths, || Ok((db.worktrees()?, db.workspaces()?))).unwrap();
+        assert_eq!(gone, [gone_worktree.to_string_lossy().into_owned()]);
+    }
 
     // test code: fixture plumbing, never on the event loop.
     #[expect(clippy::disallowed_methods)]

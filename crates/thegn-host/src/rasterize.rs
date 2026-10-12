@@ -9,7 +9,7 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
 
 /// A decoded raster ready for [`crate::graphics::kitty_image`].
 pub struct Raster {
@@ -51,6 +51,8 @@ const PREVIEW_LIMITS: DecodeLimits = DecodeLimits {
 };
 /// Bound preview file reads to 256 MiB while covering large camera JPEGs.
 const MAX_PREVIEW_FILE_BYTES: u64 = 256 * 1024 * 1024;
+/// Bound generated Mermaid PNGs independently of the decoder's pixel budget.
+const MAX_MERMAID_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Whether declared source dimensions are within the decode budget. Pure.
 fn check_dimensions(w: u32, h: u32, limits: DecodeLimits) -> Result<(), String> {
@@ -102,33 +104,65 @@ fn decode_and_fit(bytes: &[u8], limits: DecodeLimits) -> Result<Raster, String> 
 }
 
 /// Read at most `cap` bytes from a REGULAR file. The kind is verified on the
-/// opened handle (not just the path), the open cannot block on a FIFO, and the
-/// read is `take`n so a file that grows after the size check is still bounded.
-fn read_regular_capped(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
+/// opened handle (not just the path), the resolved final target is opened
+/// without following a symlink, the open cannot block on a FIFO, and `take`
+/// bounds a file that grows mid-read.
+pub(crate) fn read_regular_capped(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
     use std::io::Read;
-    // Cheap pre-check so special files are refused before opening them at all.
-    match std::fs::metadata(path) {
-        Ok(m) if m.is_file() => {}
-        Ok(_) => return Err("not a regular file".to_string()),
-        Err(e) => return Err(format!("read failed: {e}")),
-    }
-    let file =
-        crate::platform::open_read_nonblocking(path).map_err(|e| format!("read failed: {e}"))?;
+    let file = open_regular_nonblocking(path)?;
     let meta = file.metadata().map_err(|e| format!("read failed: {e}"))?;
-    if !meta.is_file() {
-        return Err("not a regular file".to_string());
-    }
     if meta.len() > cap {
-        return Err("file exceeds the size cap".to_string());
+        return Err(format!(
+            "file exceeds the {cap} byte preview cap ({} bytes)",
+            meta.len()
+        ));
     }
     let mut buf = Vec::new();
     file.take(cap.saturating_add(1))
         .read_to_end(&mut buf)
         .map_err(|e| format!("read failed: {e}"))?;
     if buf.len() as u64 > cap {
-        return Err("file exceeds the size cap".to_string());
+        return Err(format!(
+            "file exceeds the {cap} byte preview cap (more than {cap} bytes)"
+        ));
     }
     Ok(buf)
+}
+
+/// Resolve a caller path (allowing a final symlink), then open the resolved
+/// path without following a final symlink. Validate the opened handle too.
+/// Nonblocking open prevents a path swapped to a FIFO from parking the caller.
+fn open_regular_nonblocking(path: &Path) -> Result<std::fs::File, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("read failed: {e}"))?;
+    match std::fs::metadata(&canonical) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Err("not a regular file".to_string()),
+        Err(e) => return Err(format!("read failed: {e}")),
+    }
+    let file = crate::platform::open_read_nonblocking_nofollow(&canonical)
+        .map_err(|e| format!("read failed: {e}"))?;
+    if !file
+        .metadata()
+        .map_err(|e| format!("read failed: {e}"))?
+        .is_file()
+    {
+        return Err("not a regular file".to_string());
+    }
+    Ok(file)
+}
+
+/// Read a small prefix from the opened regular file. Used only for
+/// extension-less content sniffing.
+pub(crate) fn read_regular_prefix(path: &Path, cap: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let file = open_regular_nonblocking(path)?;
+    let mut prefix = Vec::with_capacity(cap);
+    file.take(cap as u64)
+        .read_to_end(&mut prefix)
+        .map_err(|e| format!("read failed: {e}"))?;
+    Ok(prefix)
 }
 
 /// Rasterize an image file (PNG/JPEG) to RGBA. Blocking.
@@ -187,7 +221,10 @@ pub fn pdf_text(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
 /// renderer's whole process tree (mmdc spawns a browser) is killed and reaped.
 /// Blocking.
 pub fn mermaid(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
-    let tmp = unique_temp("mmd", "png");
+    // Keep the renderer's output in a private, unpredictable directory so an
+    // untrusted user of the shared temp directory cannot pre-place a symlink.
+    let tmp_dir = tempfile::tempdir().map_err(|e| format!("mmd temp directory failed: {e}"))?;
+    let tmp = tmp_dir.path().join("render.png");
     let mut cmd = Command::new("mmdc");
     cmd.arg("-i")
         .arg(path)
@@ -195,14 +232,16 @@ pub fn mermaid(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
         .arg(&tmp)
         .arg("-b")
         .arg("transparent");
-    let result = match crate::preview_jobs::run_renderer_quiet(&mut cmd, cancel) {
-        Ok(()) => std::fs::read(&tmp)
-            .map_err(|e| format!("mmdc output read failed: {e}"))
-            .and_then(|bytes| decode_and_fit(&bytes, PREVIEW_LIMITS)),
+    match crate::preview_jobs::run_renderer_quiet(&mut cmd, cancel) {
+        Ok(()) => read_mermaid_output(&tmp, MAX_MERMAID_OUTPUT_BYTES),
         Err(e) => Err(format!("mmdc: {}", capture_err(&e))),
-    };
-    let _ = std::fs::remove_file(&tmp); // best-effort: temp cleanup
-    result
+    }
+}
+
+fn read_mermaid_output(path: &Path, cap: u64) -> Result<Raster, String> {
+    read_regular_capped(path, cap)
+        .map_err(|e| format!("mmdc output read failed: {e}"))
+        .and_then(|bytes| decode_and_fit(&bytes, PREVIEW_LIMITS))
 }
 
 fn capture_err(e: &crate::preview_jobs::CaptureError) -> String {
@@ -214,14 +253,6 @@ fn capture_err(e: &crate::preview_jobs::CaptureError) -> String {
         C::Failed => "failed".to_string(),
         C::Capped(_) => "output exceeded the size cap".to_string(),
     }
-}
-
-/// A process-unique temp path `<tmpdir>/thegn-<pid>-<n>.<ext>`. Avoids a
-/// tempfile dependency; the counter makes concurrent rasterizations distinct.
-fn unique_temp(tag: &str, ext: &str) -> std::path::PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("thegn-{tag}-{}-{n}.{ext}", std::process::id()))
 }
 
 #[cfg(test)]
@@ -311,6 +342,13 @@ mod tests {
         assert_eq!(read_regular_capped(&f, 100).unwrap().len(), 100);
         assert!(read_regular_capped(&f, 99).is_err());
         assert!(read_regular_capped(&dir, 100).is_err(), "directory refused");
+        if crate::platform::test_symlink_supported() {
+            let target = dir.join("target");
+            let link = dir.join("link");
+            std::fs::write(&target, b"secret").unwrap();
+            crate::platform::test_symlink(&target, &link).unwrap();
+            assert_eq!(read_regular_capped(&link, 100).unwrap(), b"secret");
+        }
         if crate::platform::test_fifo_supported() {
             let fifo = dir.join("p");
             crate::platform::test_fifo(&fifo).unwrap();
@@ -321,12 +359,16 @@ mod tests {
     }
 
     #[test]
-    fn garbage_bytes_error_not_panic() {
-        assert!(decode_and_fit(b"not an image", PREVIEW_LIMITS).is_err());
+    fn mermaid_output_is_refused_at_its_byte_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("render.png");
+        std::fs::write(&output, [0u8; 33]).unwrap();
+        let error = read_mermaid_output(&output, 32).err().expect("must refuse");
+        assert!(error.contains("mmdc output read failed: file exceeds the 32 byte preview cap"));
     }
 
     #[test]
-    fn unique_temp_paths_differ() {
-        assert_ne!(unique_temp("x", "png"), unique_temp("x", "png"));
+    fn garbage_bytes_error_not_panic() {
+        assert!(decode_and_fit(b"not an image", PREVIEW_LIMITS).is_err());
     }
 }

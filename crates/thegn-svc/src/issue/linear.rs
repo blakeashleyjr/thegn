@@ -119,6 +119,15 @@ struct IssueNodes {
 #[derive(Deserialize)]
 struct IssueConnection {
     nodes: Vec<LinearIssue>,
+    #[serde(default, rename = "pageInfo")]
+    page_info: Option<LinearPageInfo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinearPageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -429,6 +438,7 @@ const ISSUE_FIELDS: &str = r#"
 
 /// Linear's pagination arguments accept `1..=250`; `first: 0` is rejected.
 const MAX_PAGE_SIZE: usize = 250;
+const MAX_LIST_PAGES: usize = 20;
 
 /// `limit == 0` means "no cap" to our callers (`cmd/issue.rs` only truncates
 /// when `limit > 0`), so it maps to the page maximum, not to 1.
@@ -444,7 +454,12 @@ fn page_size(limit: usize) -> usize {
 // emitted strings are reachable from unit tests — every THE-72 defect was a
 // query string no test could see.
 
-fn build_list_query(filter: &IssueFilter, team_id: Option<&str>) -> String {
+fn build_list_page_query(
+    filter: &IssueFilter,
+    team_id: Option<&str>,
+    after: Option<&str>,
+    first: usize,
+) -> String {
     let mut conditions = Vec::new();
 
     if filter.assignee_me {
@@ -482,15 +497,24 @@ fn build_list_query(filter: &IssueFilter, team_id: Option<&str>) -> String {
     if !conditions.is_empty() {
         args.push(format!("filter: {{ {} }}", conditions.join(", ")));
     }
-    args.push(format!("first: {}", page_size(filter.limit)));
+    args.push(format!("first: {}", first.clamp(1, MAX_PAGE_SIZE)));
+    if let Some(cursor) = after {
+        args.push(format!(r#"after: "{}""#, escape_graphql_str(cursor)));
+    }
     args.push("orderBy: updatedAt".to_string());
     let args = args.join(", ");
 
     format!(
         r#"query {{ issues({args}) {{
                 nodes {{ {ISSUE_FIELDS} }}
+                pageInfo {{ hasNextPage endCursor }}
             }} }}"#
     )
+}
+
+#[cfg(test)]
+fn build_list_query(filter: &IssueFilter, team_id: Option<&str>) -> String {
+    build_list_page_query(filter, team_id, None, page_size(filter.limit))
 }
 
 fn build_search_query(query: &str, limit: usize) -> String {
@@ -539,7 +563,12 @@ impl IssueBackend for LinearBackend {
     }
 
     fn caps(&self) -> super::IssueCaps {
-        super::IssueCaps::default()
+        super::IssueCaps {
+            patch_status: true,
+            patch_title: true,
+            patch_priority: true,
+            ..Default::default()
+        }
     }
 
     fn list_issues<'a>(
@@ -555,13 +584,72 @@ impl IssueBackend for LinearBackend {
             if let Some(team_id) = self.team_id.as_deref() {
                 ensure_dynamic_input(team_id)?;
             }
-            let query = build_list_query(filter, self.team_id.as_deref());
-            let data: IssueNodes = Self::gql(&mut op, &query, Vars {}).await?;
-            data.issues
-                .nodes
-                .into_iter()
-                .map(linear_issue_to_domain)
-                .collect()
+            let mut all = Vec::new();
+            let mut after: Option<String> = None;
+            let mut seen_cursors = std::collections::HashSet::new();
+            for page in 0..MAX_LIST_PAGES {
+                let first = if filter.limit == 0 {
+                    MAX_PAGE_SIZE
+                } else {
+                    filter.limit.saturating_sub(all.len()).min(MAX_PAGE_SIZE)
+                };
+                if first == 0 {
+                    return Ok(all);
+                }
+                let query =
+                    build_list_page_query(filter, self.team_id.as_deref(), after.as_deref(), first);
+                let data: IssueNodes = match Self::gql(&mut op, &query, Vars {}).await {
+                    Ok(data) => data,
+                    Err(IssueError::Timeout(_)) if !all.is_empty() => {
+                        return Err(IssueError::PartialList {
+                            issues: all,
+                            reason: "Linear listing deadline reached",
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
+                let page_info = data.issues.page_info;
+                all.extend(
+                    data.issues
+                        .nodes
+                        .into_iter()
+                        .map(linear_issue_to_domain)
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                if filter.limit > 0 && all.len() >= filter.limit {
+                    all.truncate(filter.limit);
+                    return Ok(all);
+                }
+                let Some(info) = page_info else {
+                    return Err(IssueError::PartialList {
+                        issues: all,
+                        reason: "Linear omitted pagination metadata",
+                    });
+                };
+                if !info.has_next_page {
+                    return Ok(all);
+                }
+                let Some(cursor) = info.end_cursor else {
+                    return Err(IssueError::PartialList {
+                        issues: all,
+                        reason: "Linear marked another page but returned no end cursor",
+                    });
+                };
+                if !seen_cursors.insert(cursor.clone()) {
+                    return Err(IssueError::PartialList {
+                        issues: all,
+                        reason: "Linear repeated a page cursor",
+                    });
+                }
+                after = Some(cursor);
+                if page + 1 == MAX_LIST_PAGES {
+                    return Err(IssueError::PartialList {
+                        issues: all,
+                        reason: "Linear listing page cap reached",
+                    });
+                }
+            }
+            Ok(all)
         })
     }
 
@@ -756,6 +844,183 @@ mod tests {
 
     fn state(ty: &str) -> Option<LinearState> {
         serde_json::from_value(json!({ "type": ty })).unwrap()
+    }
+
+    fn list_item(n: usize) -> serde_json::Value {
+        json!({
+            "id": format!("linear-id-{n}"),
+            "identifier": format!("ABC-{n}"),
+            "title": format!("Issue {n}"),
+            "description": null,
+            "state": {"type": "unstarted"},
+            "priority": 2,
+            "assignee": null,
+            "labels": {"nodes": []},
+            "branchName": null,
+            "dueDate": null,
+            "url": format!("https://linear.app/acme/issue/ABC-{n}"),
+            "updatedAt": "2026-09-01T00:00:00Z"
+        })
+    }
+
+    #[tokio::test]
+    async fn list_follows_cursors_without_fetching_past_exact_limit() {
+        use std::sync::Mutex;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let route_queries = Arc::clone(&queries);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let route_calls = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |request: Request| {
+                let route_queries = Arc::clone(&route_queries);
+                let route_calls = Arc::clone(&route_calls);
+                async move {
+                    let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    route_queries
+                        .lock()
+                        .unwrap()
+                        .push(request["query"].as_str().unwrap().to_string());
+                    let call = route_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let (nodes, end_cursor) = if call == 0 {
+                        (vec![list_item(1), list_item(2)], "cursor-1")
+                    } else {
+                        (vec![list_item(3)], "cursor-2")
+                    };
+                    let payload = json!({"data": {"issues": {
+                        "nodes": nodes,
+                        "pageInfo": {"hasNextPage": true, "endCursor": end_cursor}
+                    }}});
+                    let mut response =
+                        (StatusCode::OK, Body::from(payload.to_string())).into_response();
+                    response.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend = LinearBackend::new_for_test(
+            "linear-secret".into(),
+            None,
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+            &format!("http://{address}"),
+        );
+        let issues = backend
+            .list_issues(&IssueFilter {
+                limit: 3,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(issues.len(), 3);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        {
+            let queries = queries.lock().unwrap();
+            assert!(queries[0].contains("first: 3"), "{}", queries[0]);
+            assert!(queries[0].contains("pageInfo { hasNextPage endCursor }"));
+            assert!(queries[1].contains("after: \"cursor-1\""), "{}", queries[1]);
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn list_page_cap_returns_typed_partial_result() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let route_calls = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |_: Request| {
+                let route_calls = Arc::clone(&route_calls);
+                async move {
+                    let call = route_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let payload = json!({"data": {"issues": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": true, "endCursor": format!("cursor-{call}")}
+                    }}});
+                    let mut response =
+                        (StatusCode::OK, Body::from(payload.to_string())).into_response();
+                    response.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend = LinearBackend::new_for_test(
+            "linear-secret".into(),
+            None,
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+            &format!("http://{address}"),
+        );
+        let result = backend.list_issues(&IssueFilter::default()).await;
+        assert!(matches!(
+            result,
+            Err(IssueError::PartialList { issues, reason })
+                if issues.is_empty() && reason.contains("page cap")
+        ));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_LIST_PAGES
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn listing_deadline_after_first_page_returns_partial_rows() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let route_calls = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |_: Request| {
+                let route_calls = Arc::clone(&route_calls);
+                async move {
+                    route_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let payload = json!({"data": {"issues": {
+                        "nodes": [list_item(1)],
+                        "pageInfo": {"hasNextPage": true, "endCursor": "cursor-1"}
+                    }}});
+                    let mut response =
+                        (StatusCode::OK, Body::from(payload.to_string())).into_response();
+                    response.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let budget = Arc::new(TrackerHttpBudget::with_permits(1));
+        budget.expire_after_responses_for_test(1);
+        let backend = LinearBackend::new_for_test(
+            "linear-secret".into(),
+            None,
+            budget,
+            &format!("http://{address}"),
+        );
+        let result = backend.list_issues(&IssueFilter::default()).await;
+        assert!(matches!(
+            result,
+            Err(IssueError::PartialList { issues, reason })
+                if issues.len() == 1 && reason == "Linear listing deadline reached"
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     #[test]

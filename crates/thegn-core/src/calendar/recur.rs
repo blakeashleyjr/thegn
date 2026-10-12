@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 
 use chrono::{DateTime, Datelike, Days, Months, NaiveDate, NaiveDateTime, Timelike, Utc, Weekday};
 
-use super::{EventTime, ExpansionBudget, ExpansionError, ExpansionLimit, TzRef};
+use super::{EventTime, ExpansionBudget, ExpansionError, ExpansionLimit};
 
 /// How often a rule repeats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -683,10 +683,12 @@ fn past_until(
     }
 }
 
-/// The zone a series' wall times live in: its own `TZID`, else `home`.
+/// The zone a series' recurrence candidates live in: its own `TZID`, UTC for
+/// an absolute DTSTART, else `home` for floating dates and unknown TZIDs.
 pub(crate) fn series_zone(start: &EventTime, home: chrono_tz::Tz) -> chrono_tz::Tz {
     match start {
         EventTime::Zoned { zone, .. } => zone.resolve().unwrap_or(home),
+        EventTime::Instant { .. } => chrono_tz::UTC,
         _ => home,
     }
 }
@@ -1329,33 +1331,28 @@ fn weeks_in_iso_year(y: i32) -> u32 {
         .unwrap_or(52)
 }
 
-/// The local wall time a recurrence is seeded from: DTSTART's own wall time
-/// (a floating date at midnight; an instant as seen from `home`).
-pub(crate) fn seed_of(start: &EventTime, home: chrono_tz::Tz) -> Option<NaiveDateTime> {
+/// The recurrence frame a DTSTART is seeded from: its wall time for Zoned,
+/// midnight for a floating date, and UTC wall time for an absolute instant.
+pub(crate) fn seed_of(start: &EventTime) -> Option<NaiveDateTime> {
     match start {
         EventTime::Zoned { local, .. } => Some(*local),
         EventTime::Date { date } => date.and_hms_opt(0, 0, 0),
-        EventTime::Instant { at } => Some(at.with_timezone(&home).naive_local()),
+        EventTime::Instant { at } => Some(at.naive_utc()),
     }
 }
 
-/// One expanded wall time as an event time of DTSTART's shape: a floating date
-/// stays a date; anything else becomes a wall time in the event's own zone
-/// (or `home`, for an instant-seeded rule).
-pub(crate) fn instance_time(
-    local: NaiveDateTime,
-    start: &EventTime,
-    home: chrono_tz::Tz,
-) -> EventTime {
+/// One expanded time as an event time of DTSTART's shape: floating dates stay
+/// dates, Zoned values stay wall times in their zone, and Instant values are
+/// UTC timeline points.
+pub(crate) fn instance_time(local: NaiveDateTime, start: &EventTime) -> EventTime {
     match start {
         EventTime::Date { .. } => EventTime::Date { date: local.date() },
         EventTime::Zoned { zone, .. } => EventTime::Zoned {
             local,
             zone: zone.clone(),
         },
-        EventTime::Instant { .. } => EventTime::Zoned {
-            local,
-            zone: TzRef::new(home.name()),
+        EventTime::Instant { .. } => EventTime::Instant {
+            at: local.and_utc(),
         },
     }
 }
@@ -1364,9 +1361,8 @@ pub(crate) fn instance_time(
 /// test-only; production materializes instances one at a time in
 /// [`super::CalEvent::occurrences_bounded`].
 ///
-/// Wall times come from [`expand_local_bounded`]; each is then resolved
-/// through the event's own zone, so a DST boundary shifts the *instant* while
-/// the local time stays put.
+/// Candidate times come from [`expand_local_bounded`]; Zoned values resolve
+/// through their own zone, while Instant values remain on the UTC timeline.
 #[cfg(test)]
 pub fn occurrences(
     rec: &Recurrence,
@@ -1377,7 +1373,7 @@ pub fn occurrences(
     gap: super::GapPolicy,
 ) -> Vec<EventTime> {
     let mut budget = ExpansionBudget::default();
-    let Some(seed) = seed_of(start, home) else {
+    let Some(seed) = seed_of(start) else {
         return Vec::new();
     };
     expand_local_with_gap(
@@ -1391,7 +1387,7 @@ pub fn occurrences(
     )
     .unwrap_or_default()
     .into_iter()
-    .map(|local| instance_time(local, start, home))
+    .map(|local| instance_time(local, start))
     // Under `GapPolicy::Skip` an occurrence that falls in a spring-forward
     // gap genuinely does not happen, so it is dropped rather than nudged.
     .filter(|t| t.is_all_day() || t.instant_in(home, gap).is_some())

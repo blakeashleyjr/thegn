@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
 use thegn_core::outln;
 use thegn_svc::plugin::LoadedPlugin;
-use thegn_svc::plugin::{check_specs, discover, negotiate};
+use thegn_svc::plugin::{discover, negotiate};
 
 const LIVE_HEALTH_UNAVAILABLE: &str = "no attached compositor";
 
@@ -263,7 +263,7 @@ pub fn run(cfg: &Config, action: Action, config_path: &Path) -> Result<()> {
     let dir = config_dir(config_path);
     match action {
         Action::List { json } => {
-            let loaded = discover(cfg, &dir);
+            let (loaded, _) = discover(cfg, &dir);
             if json {
                 let rows: Vec<PluginListRow> = loaded.iter().map(list_row).collect();
                 super::emit_json(&rows)?;
@@ -296,13 +296,13 @@ pub fn run(cfg: &Config, action: Action, config_path: &Path) -> Result<()> {
             Ok(())
         }
         Action::Check => {
-            let loaded = discover(cfg, &dir);
+            let (loaded, broken) = discover(cfg, &dir);
             for plugin in &loaded {
                 for line in inspection_lines(plugin) {
                     outln!("{line}");
                 }
             }
-            let problems = check_specs(cfg, &dir);
+            let problems = thegn_svc::plugin::loader::check_loaded(&loaded, broken);
             if problems.is_empty() {
                 outln!("plugins: ok ({} discovered)", loaded.len());
                 return Ok(());
