@@ -342,6 +342,23 @@ fn path_is_rendered(path: &str, rendered: &BTreeSet<String>) -> bool {
         .any(|candidate| candidate == path || candidate.starts_with(&format!("{path}.")))
 }
 
+fn is_dispositioned(path: &str, section: &str, omissions: &BTreeSet<&str>) -> bool {
+    omissions.iter().any(|omitted| {
+        let omitted_in_section = *omitted == section || omitted.starts_with(&format!("{section}."));
+        omitted_in_section && (path == *omitted || path.starts_with(&format!("{omitted}.")))
+    })
+}
+
+#[test]
+fn section_disposition_ignores_ancestor_omissions() {
+    let omissions = BTreeSet::from(["sandbox"]);
+    assert!(!is_dispositioned(
+        "sandbox.remote.new_key",
+        "sandbox.remote",
+        &omissions,
+    ));
+}
+
 #[test]
 fn every_schema_key_is_rendered_or_dispositioned() {
     let rendered = rendered_paths(&module_src());
@@ -372,9 +389,7 @@ fn every_schema_key_is_rendered_or_dispositioned() {
             };
             if (schema_section == section || schema_section.starts_with(&format!("{section}.")))
                 && !path_is_rendered(&path, &rendered)
-                && !omissions
-                    .iter()
-                    .any(|omitted| path == *omitted || path.starts_with(&format!("{omitted}.")))
+                && !is_dispositioned(&path, section, &omissions)
             {
                 missing.push(path);
             }
