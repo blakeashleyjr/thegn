@@ -8,10 +8,12 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use termwiz::terminal::TerminalWaker;
 
 const MAX_LOG_INGEST_CALLS: usize = 32;
+const MAX_LOG_INGEST_WALL: Duration = Duration::from_secs(120);
 const MAX_INGEST_MEMO_ENTRIES: usize = 512;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -112,11 +114,18 @@ impl IngestMemo {
 #[derive(Debug)]
 struct CallBudget {
     remaining: usize,
+    deadline: Option<Instant>,
 }
 
 impl CallBudget {
     fn take(&mut self) -> bool {
-        if self.remaining == 0 {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            tracing::debug!(target: "thegn::ci", "CI log ingestion wall-clock budget exhausted");
+            false
+        } else if self.remaining == 0 {
             false
         } else {
             self.remaining -= 1;
@@ -400,6 +409,7 @@ fn refresh_ci_cache_for(
                 }
                 let mut ingest_budget = CallBudget {
                     remaining: MAX_LOG_INGEST_CALLS,
+                    deadline: Some(Instant::now() + MAX_LOG_INGEST_WALL),
                 };
                 ingest_failed_logs_with(IngestArgs {
                     host_path,
@@ -844,12 +854,24 @@ mod tests {
         budget_size: usize,
         now: i64,
     ) {
+        ingest_test_with_deadline(temp, client, runs, budget_size, now, None);
+    }
+
+    fn ingest_test_with_deadline(
+        temp: &tempfile::TempDir,
+        client: &FakeCi,
+        runs: &[thegn_core::ci::CiRun],
+        budget_size: usize,
+        now: i64,
+        deadline: Option<Instant>,
+    ) {
         let db = thegn_core::db::Db::open_at(&temp.path().join("ci.db")).expect("temp DB");
         let loc = thegn_core::remote::GitLoc::for_worktree(temp.path());
         let cfg = thegn_core::config::CiConfig::default();
         let full = thegn_core::config::Config::default();
         let mut budget = CallBudget {
             remaining: budget_size,
+            deadline,
         };
         ingest_failed_logs_with(IngestArgs {
             host_path: temp.path(),
@@ -986,11 +1008,40 @@ mod tests {
 
     #[test]
     fn log_ingestion_call_budget_stops_at_its_cap() {
-        let mut budget = CallBudget { remaining: 2 };
+        let mut budget = CallBudget {
+            remaining: 2,
+            deadline: None,
+        };
         assert!(budget.take());
         assert!(budget.take());
         assert!(!budget.take());
         assert!(!budget.take());
+    }
+
+    #[test]
+    fn log_ingestion_budget_rejects_expired_deadline() {
+        let mut budget = CallBudget {
+            remaining: 2,
+            deadline: Some(Instant::now() - Duration::from_secs(1)),
+        };
+        assert!(!budget.take());
+        assert_eq!(budget.remaining, 2);
+    }
+
+    #[test]
+    fn expired_log_ingestion_budget_makes_no_provider_log_calls() {
+        let temp = private_tempdir();
+        let provider = FakeCi::new(&[]).with_detail("run", "sha");
+        let runs = [ci_run("run", "sha")];
+        ingest_test_with_deadline(
+            &temp,
+            &provider,
+            &runs,
+            MAX_LOG_INGEST_CALLS,
+            50_000,
+            Some(Instant::now() - Duration::from_secs(1)),
+        );
+        assert!(provider.log_calls.lock().expect("calls").is_empty());
     }
 
     #[test]
