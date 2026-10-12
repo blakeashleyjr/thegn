@@ -1295,7 +1295,7 @@ mod tests {
                 seek: true,
                 ..MediaCaps::default()
             },
-            commands: vec![("command".into(), "seekcur".into())],
+            commands: vec!["seekcur".into()],
         };
 
         let snapshot = m.snapshot().await.unwrap().unwrap();
