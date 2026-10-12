@@ -527,8 +527,7 @@ fn clamp_notice(key: &str, clamped: &[thegn_core::channel::Feature]) -> Option<S
 }
 
 fn edit(cfg: &Config, path: &Path) -> Result<()> {
-    if !path.exists() {
-        seed_example(path)?;
+    if !path.exists() && seed_example(path)? {
         msg::info(&format!("seeded {} from the example", path.display()));
     }
     // The editor seam: `[editor] command` → `[[tools]] editor` → $VISUAL/$EDITOR
@@ -554,7 +553,7 @@ fn edit(cfg: &Config, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn seed_example(path: &Path) -> Result<()> {
+fn seed_example(path: &Path) -> Result<bool> {
     thegn_core::config_write::seed_if_absent(path, EXAMPLE.as_bytes())
 }
 
@@ -661,7 +660,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().join("new");
         let path = parent.join("config.toml");
-        seed_example(&path).unwrap();
+        assert!(seed_example(&path).unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), EXAMPLE.as_bytes());
         assert!(matches!(
             thegn_core::fsperm::mode_bits(&path).unwrap(),
@@ -680,7 +679,7 @@ mod tests {
         std::fs::create_dir(&parent).unwrap();
         let before = thegn_core::fsperm::mode_bits(&parent).unwrap();
 
-        seed_example(&parent.join("config.toml")).unwrap();
+        assert!(seed_example(&parent.join("config.toml")).unwrap());
 
         assert_eq!(thegn_core::fsperm::mode_bits(&parent).unwrap(), before);
     }
