@@ -125,7 +125,7 @@ fn parse_commit_metas(out: &str) -> Result<Vec<CommitMeta>> {
     }
     let mut fields: Vec<&str> = out.split('\0').collect();
     fields.pop();
-    if fields.len() % 6 != 0 {
+    if !fields.len().is_multiple_of(6) {
         anyhow::bail!(
             "git log commit metadata has {} fields, expected a multiple of 6",
             fields.len()
