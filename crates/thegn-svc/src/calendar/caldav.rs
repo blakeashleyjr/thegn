@@ -40,7 +40,7 @@ pub(super) fn map_transport_error(error: CalendarHttpError) -> CalendarError {
 pub struct CalDavBackend {
     username: String,
     token: String,
-    zone: String,
+    zone: thegn_core::calendar::Tz,
     calendar_ids: Vec<String>,
     timeout: Duration,
     admission: AccountAdmission,
@@ -65,7 +65,7 @@ impl CalDavBackend {
         CalDavBackend {
             username: a.username.clone(),
             token: thegn_core::config::expand_env_ref(&a.token).unwrap_or_default(),
-            zone: String::new(),
+            zone: admission.zone(),
             calendar_ids: a
                 .calendar_ids
                 .iter()
@@ -81,11 +81,6 @@ impl CalDavBackend {
             http,
             init_error,
         }
-    }
-
-    pub fn with_zone(mut self, zone: &str) -> Self {
-        self.zone = zone.to_string();
-        self
     }
 
     #[cfg(test)]
@@ -493,7 +488,7 @@ impl CalendarBackend for CalDavBackend {
         to: NaiveDate,
         sync_token: &'a str,
     ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
-        let Some(window) = CalendarWindow::new(from, to, thegn_core::calendar::Tz::UTC) else {
+        let Some(window) = CalendarWindow::new(from, to, self.zone) else {
             return Box::pin(async { Err(CalendarError::Api("invalid calendar window".into())) });
         };
         self.list_events_for_window(window, sync_token)
@@ -638,11 +633,7 @@ impl CalDavBackend {
 
 impl CalDavBackend {
     fn zone(&self) -> &str {
-        if self.zone.is_empty() {
-            "UTC"
-        } else {
-            &self.zone
-        }
+        self.zone.name()
     }
 
     /// A 409/507 token recovery is exactly one additional REPORT, sharing the
@@ -793,7 +784,8 @@ mod tests {
 
     fn page(ids: &[&str]) -> EventPage {
         let ids: Vec<String> = ids.iter().map(|s| (*s).to_string()).collect();
-        let meter = AccountAdmission::isolated(Default::default()).meter();
+        let meter =
+            AccountAdmission::isolated(Default::default(), thegn_core::calendar::Tz::UTC).meter();
         page_from_multistatus(&multistatus(), "UTC", &ids, meter).unwrap()
     }
 
@@ -859,7 +851,8 @@ mod tests {
     #[test]
     fn page_token_carries_the_filter_scope() {
         let ids = vec!["work".to_string()];
-        let meter = AccountAdmission::isolated(Default::default()).meter();
+        let meter =
+            AccountAdmission::isolated(Default::default(), thegn_core::calendar::Tz::UTC).meter();
         let p = page_from_multistatus(&multistatus(), "UTC", &ids, meter).unwrap();
         assert_eq!(unscope_token(&ids, p.sync_token()), "t1");
         assert_eq!(unscope_token(&["personal".to_string()], p.sync_token()), "");

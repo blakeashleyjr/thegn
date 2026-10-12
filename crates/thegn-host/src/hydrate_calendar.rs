@@ -890,8 +890,7 @@ fn refuse_horizon(problem: &str, notify: &mut dyn FnMut(String)) {
 }
 
 fn home_zone(cfg: &CalendarConfig) -> chrono_tz::Tz {
-    cfg.home_zone()
-        .unwrap_or_else(thegn_core::calendar::tz::system_zone)
+    cfg.effective_home_zone()
 }
 
 fn deliver(

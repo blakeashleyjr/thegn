@@ -136,34 +136,48 @@ pub enum EditScope {
     AllInstances,
 }
 
-/// The admission budget and shared pool one account's fetches are metered
-/// against. Required by every backend constructor.
+/// The immutable per-account context every backend is built from: the
+/// admission budget and shared pool one account's fetches are metered against,
+/// and the resolved home zone floating date-times are anchored to (THE-464).
+/// Required by every backend constructor, so a production path cannot forget
+/// the zone the way an optional builder setter could be forgotten.
 #[derive(Debug, Clone)]
 pub struct AccountAdmission {
     budget: AdmissionBudget,
     pool: Arc<AdmissionPool>,
+    zone: thegn_core::calendar::Tz,
 }
 
 impl AccountAdmission {
-    pub fn new(budget: AdmissionBudget, pool: Arc<AdmissionPool>) -> Self {
-        AccountAdmission { budget, pool }
+    pub fn new(
+        budget: AdmissionBudget,
+        pool: Arc<AdmissionPool>,
+        zone: thegn_core::calendar::Tz,
+    ) -> Self {
+        AccountAdmission { budget, pool, zone }
     }
 
     /// `budget` against the process-wide pool every router shares.
-    pub fn global(budget: AdmissionBudget) -> Self {
-        Self::new(budget, AdmissionPool::global())
+    pub fn global(budget: AdmissionBudget, zone: thegn_core::calendar::Tz) -> Self {
+        Self::new(budget, AdmissionPool::global(), zone)
     }
 
     /// `budget` against a private pool at the global ceilings — for tests and
     /// callers that must not contend with live syncs.
-    pub fn isolated(budget: AdmissionBudget) -> Self {
+    pub fn isolated(budget: AdmissionBudget, zone: thegn_core::calendar::Tz) -> Self {
         Self::new(
             budget,
             AdmissionPool::new(
                 thegn_core::calendar::admission::GLOBAL_MAX_RECORDS,
                 thegn_core::calendar::admission::GLOBAL_MAX_BYTES,
             ),
+            zone,
         )
+    }
+
+    /// The home zone floating date-times are anchored to.
+    pub fn zone(&self) -> thegn_core::calendar::Tz {
+        self.zone
     }
 
     pub fn budget(&self) -> AdmissionBudget {
@@ -525,7 +539,8 @@ impl CalendarRouter {
 
     /// Every active account, metered against `pool`.
     pub fn from_config_with_pool(cfg: &CalendarConfig, pool: Arc<AdmissionPool>) -> Self {
-        let admission = AccountAdmission::new(cfg.admission_budget(), pool);
+        let admission =
+            AccountAdmission::new(cfg.admission_budget(), pool, cfg.effective_home_zone());
         let accounts = cfg
             .active_accounts()
             .into_iter()

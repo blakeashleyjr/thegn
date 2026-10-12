@@ -60,6 +60,7 @@ fn page(events: Vec<CalEvent>, deleted: Vec<String>, sync_token: &str) -> EventP
         sync_token,
         &thegn_svc::calendar::AccountAdmission::isolated(
             thegn_core::calendar::AdmissionBudget::default(),
+            thegn_core::calendar::Tz::UTC,
         ),
     )
     .unwrap()

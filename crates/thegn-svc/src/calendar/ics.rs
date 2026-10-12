@@ -31,7 +31,7 @@ const _: () = assert!(MAX_DIRECTORY_ENTRIES > MAX_FILES);
 
 pub struct IcsBackend {
     path: String,
-    zone: String,
+    zone: thegn_core::calendar::Tz,
     admission: AccountAdmission,
 }
 
@@ -44,15 +44,9 @@ impl IcsBackend {
     pub(crate) fn new(a: &CalendarAccount, admission: AccountAdmission) -> Self {
         IcsBackend {
             path: thegn_core::util::expand_tilde(&a.path),
-            zone: String::new(),
+            zone: admission.zone(),
             admission,
         }
-    }
-
-    /// Set the zone floating times are anchored to (the resolved home zone).
-    pub fn with_zone(mut self, zone: &str) -> Self {
-        self.zone = zone.to_string();
-        self
     }
 
     fn read_one(
@@ -137,11 +131,7 @@ impl IcsBackend {
         let metadata = std::fs::symlink_metadata(p)
             .map_err(|e| CalendarError::Io(format!("{}: {e}", self.path)))?;
         let deadline = Instant::now() + SOURCE_DEADLINE;
-        let zone = if self.zone.is_empty() {
-            "UTC"
-        } else {
-            &self.zone
-        };
+        let zone = self.zone.name();
         let mut meter = self.admission.meter();
         let mut out = Vec::new();
 

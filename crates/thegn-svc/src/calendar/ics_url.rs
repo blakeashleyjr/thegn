@@ -37,7 +37,7 @@ pub(super) fn map_transport_error(error: CalendarHttpError) -> CalendarError {
 pub struct IcsUrlBackend {
     username: String,
     token: String,
-    zone: String,
+    zone: thegn_core::calendar::Tz,
     timeout: Duration,
     admission: AccountAdmission,
     http: Option<CalendarHttpClient>,
@@ -61,17 +61,12 @@ impl IcsUrlBackend {
         IcsUrlBackend {
             username: a.username.clone(),
             token: thegn_core::config::expand_env_ref(&a.token).unwrap_or_default(),
-            zone: String::new(),
+            zone: admission.zone(),
             timeout: Duration::from_secs(a.timeout_secs.clamp(5, 120)),
             admission,
             http,
             init_error,
         }
-    }
-
-    pub fn with_zone(mut self, zone: &str) -> Self {
-        self.zone = zone.to_string();
-        self
     }
 }
 
@@ -174,11 +169,7 @@ impl CalendarBackend for IcsUrlBackend {
             meter.release_transient(MAX_BODY_BYTES - body.capacity().min(MAX_BODY_BYTES));
             let body = String::from_utf8(body)
                 .map_err(|_| CalendarError::Parse("calendar response is not UTF-8".into()))?;
-            let zone = if self.zone.is_empty() {
-                "UTC"
-            } else {
-                &self.zone
-            };
+            let zone = self.zone.name();
             // Admission happens while parsing: the first event or byte over
             // the budget refuses the whole fetch, the ETag is not advanced,
             // and the cached calendar stays as it was. A subscribed feed is a
