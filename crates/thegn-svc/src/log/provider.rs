@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use thegn_core::log::parser::ParsedLog;
 
 /// How long to sleep between polls when the file is at EOF. The log view is a
 /// low-frequency surface; a 1s cadence is plenty responsive while keeping the
@@ -10,11 +9,7 @@ const IDLE_POLL: Duration = Duration::from_secs(1);
 
 pub trait LogProvider: Send + Sync {
     /// Start fetching and streaming logs into the provided sender
-    fn start_stream(
-        &self,
-        tx: tokio::sync::mpsc::UnboundedSender<Vec<ParsedLog>>,
-        waker: Arc<dyn Fn() + Send + Sync>,
-    );
+    fn start_stream(&self, tx: super::ingress::LogIngress, waker: Arc<dyn Fn() + Send + Sync>);
 }
 
 pub struct FileLogProvider {
@@ -22,11 +17,7 @@ pub struct FileLogProvider {
 }
 
 impl LogProvider for FileLogProvider {
-    fn start_stream(
-        &self,
-        tx: tokio::sync::mpsc::UnboundedSender<Vec<ParsedLog>>,
-        waker: Arc<dyn Fn() + Send + Sync>,
-    ) {
+    fn start_stream(&self, tx: super::ingress::LogIngress, waker: Arc<dyn Fn() + Send + Sync>) {
         let path = self.path.clone();
         // Blocking std file I/O + a polling sleep loop belongs on a blocking
         // worker, not a plain async task on a runtime worker thread.
@@ -39,25 +30,34 @@ impl LogProvider for FileLogProvider {
 /// live tail, not a backfill) and exits promptly when the consumer is gone.
 fn tail_file(
     path: &std::path::Path,
-    tx: tokio::sync::mpsc::UnboundedSender<Vec<ParsedLog>>,
+    tx: super::ingress::LogIngress,
     waker: Arc<dyn Fn() + Send + Sync>,
 ) {
     let mut follower = super::tail::FileFollower::new(path.to_path_buf());
-    while !tx.is_closed() {
-        let mut batch = Vec::new();
-        for line in follower.poll() {
-            batch.push(thegn_core::log::parser::parse_log(&line));
-            if batch.len() == 100 {
-                if tx.send(std::mem::take(&mut batch)).is_err() {
-                    return;
+    while !tx.is_orphaned() {
+        let mut batch = Vec::with_capacity(super::ingress::MAX_BATCH_RECORDS);
+        let mut batch_bytes = 0usize;
+        for mut line in follower.poll() {
+            super::ingress::clamp_record(&mut line);
+            let parsed = thegn_core::log::parser::parse_log(&line);
+            let parsed_bytes = super::ingress::parsed_cost(&parsed);
+            if !batch.is_empty()
+                && (batch.len() >= super::ingress::MAX_BATCH_RECORDS
+                    || batch_bytes.saturating_add(parsed_bytes) > super::ingress::MAX_BATCH_BYTES)
+            {
+                if tx.push(std::mem::take(&mut batch)) {
+                    waker();
                 }
-                waker();
+                batch = Vec::with_capacity(super::ingress::MAX_BATCH_RECORDS);
+                batch_bytes = 0;
             }
+            batch_bytes = batch_bytes.saturating_add(parsed_bytes);
+            batch.push(parsed);
         }
-        if !batch.is_empty() {
-            if tx.send(batch).is_err() {
-                return;
-            }
+        // The follower bounds source reads to 64 KiB plus its 1 MiB partial
+        // record cap. Parsed copies stay in smaller batches, so a poll with
+        // many short lines cannot become one huge transient parsed batch.
+        if !batch.is_empty() && tx.push(batch) {
             waker();
         }
         if !follower.has_more() {
@@ -84,7 +84,8 @@ mod tests {
         // Pre-existing history that must NOT be replayed.
         std::fs::write(&path, "old line 1\nold line 2\n").unwrap();
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = super::super::ingress::LogIngress::new();
+        let rx = tx.clone();
         let p = path.clone();
         let handle = std::thread::spawn(move || tail_file(&p, tx, noop_waker()));
 
@@ -101,13 +102,11 @@ mod tests {
         // The first (and only) batch we receive must be the appended line, never
         // the pre-existing history.
         let batch = loop {
-            match rx.try_recv() {
-                Ok(b) => break b,
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Err(_) => panic!("channel closed unexpectedly"),
+            let batch = rx.take(100);
+            if !batch.is_empty() {
+                break batch;
             }
+            std::thread::sleep(Duration::from_millis(100));
         };
         assert_eq!(batch.len(), 1, "expected only the appended line: {batch:?}");
         assert!(
