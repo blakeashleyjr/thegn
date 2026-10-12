@@ -197,12 +197,31 @@ fn serve_health(listener: UnixListener) {
                     }
                 }
                 assert!(complete, "health fixture request headers were incomplete");
-                stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
-                    )
+                let request_line = std::str::from_utf8(&request)
+                    .unwrap()
+                    .lines()
+                    .next()
                     .unwrap();
-                return;
+                let path = request_line.split_whitespace().nth(1).unwrap();
+                match path {
+                    "/health" => stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                        )
+                        .unwrap(),
+                    "/daemon/scope" => {
+                        // Older daemons did not expose the Unix-only scope route.
+                        // The client accepts that response while preserving its
+                        // strict rejection of malformed scope replies.
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .unwrap();
+                        return;
+                    }
+                    unexpected => panic!("unexpected health fixture request: {unexpected}"),
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {

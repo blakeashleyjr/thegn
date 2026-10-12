@@ -103,12 +103,35 @@ fn client_socket_label(client: &ControlClient) -> String {
     }
 }
 
-fn scope_mismatch_error(socket: &std::path::Path, actual: &str) -> anyhow::Error {
+fn scope_mismatch_error(socket: &str, actual: &str) -> anyhow::Error {
     anyhow!(
-        "pane daemon socket {} belongs to a different state directory (reported scope {})",
-        socket.display(),
-        actual
+        "pane daemon socket {socket} belongs to a different state directory (reported scope {actual})"
     )
+}
+
+fn no_daemon_error() -> anyhow::Error {
+    anyhow!(
+        "no thegn pane daemon is running — start one with `thegn serve`, \
+         or enable `[daemon]` in config so the compositor keeps one warm"
+    )
+}
+
+/// Verify that a CLI client reached a daemon for one of this process's state
+/// scopes. Unknown scope endpoints are accepted for pre-upgrade daemons.
+pub(crate) async fn verify_local_daemon(
+    client: ControlClient,
+    scopes: &[String],
+) -> Result<ControlClient> {
+    if client.health().await.is_err() {
+        return Err(no_daemon_error());
+    }
+    match check_daemon_scope(&client, scopes).await {
+        ScopeCheck::Match | ScopeCheck::Unknown => Ok(client),
+        ScopeCheck::Mismatch(actual) => {
+            Err(scope_mismatch_error(&client_socket_label(&client), &actual))
+        }
+        ScopeCheck::NotOurs => Err(no_daemon_error()),
+    }
 }
 
 /// Find a live daemon for this state dir WITHOUT spawning one: registry
@@ -222,7 +245,7 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
     if client.health().await.is_ok()
         && let ScopeCheck::Mismatch(actual) = check_daemon_scope(&client, &scopes).await
     {
-        return Err(scope_mismatch_error(&sock, &actual));
+        return Err(scope_mismatch_error(&sock.display().to_string(), &actual));
     }
 
     // 3. Spawn detached (own process group, null stdio — the compositor must
@@ -247,7 +270,7 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
                     return Ok(client);
                 }
                 ScopeCheck::Mismatch(actual) => {
-                    return Err(scope_mismatch_error(&sock, &actual));
+                    return Err(scope_mismatch_error(&sock.display().to_string(), &actual));
                 }
                 ScopeCheck::NotOurs => {}
             }

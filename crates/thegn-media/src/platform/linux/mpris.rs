@@ -14,7 +14,7 @@ use zbus::zvariant::{Array, OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream};
 
 use crate::model::{LoopMode, MediaKind, MediaState, PlaybackState, Playlist, QueueItem};
-use crate::{MediaBackend, MediaCaps, MediaError, MediaWatch};
+use crate::{MediaBackend, MediaCaps, MediaError, MediaSnapshot, MediaWatch};
 
 const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
 const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
@@ -105,6 +105,39 @@ impl MprisZbus {
             .map_err(|e| MediaError::Backend(e.to_string()))
     }
 
+    /// Resolve and read the selected player once for either snapshot API.
+    async fn active_snapshot_data(
+        &self,
+    ) -> Result<Option<(String, HashMap<String, OwnedValue>)>, MediaError> {
+        let Some(bus) = self.active_player().await? else {
+            tracing::debug!(target: "thegn::media", "MPRIS: no active player on the bus");
+            return Ok(None);
+        };
+        let props = self.player_props(&bus).await?;
+        Ok(Some((bus, props)))
+    }
+
+    async fn root_props(&self, bus: &str) -> Result<HashMap<String, OwnedValue>, MediaError> {
+        let proxy = self.props_proxy(bus).await?;
+        let iface =
+            InterfaceName::try_from(ROOT_IFACE).map_err(|e| MediaError::Backend(e.to_string()))?;
+        proxy
+            .get_all(iface)
+            .await
+            .map_err(|e| MediaError::Backend(e.to_string()))
+    }
+
+    async fn has_playlists(&self, bus: &str) -> Result<bool, MediaError> {
+        let proxy = self.props_proxy(bus).await?;
+        let iface = InterfaceName::try_from(PLAYLISTS_IFACE)
+            .map_err(|e| MediaError::Backend(e.to_string()))?;
+        proxy
+            .get(iface, "PlaylistCount")
+            .await
+            .map(|_| true)
+            .map_err(|e| MediaError::Backend(e.to_string()))
+    }
+
     /// Resolve which player to control. Reads each present player's state once,
     /// then delegates the choice to the pure [`choose_player`] (priority →
     /// sticky-if-active → first-playing → sticky-if-present → first-present) and
@@ -186,11 +219,9 @@ impl MprisZbus {
 impl MediaBackend for MprisZbus {
     fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
         Box::pin(async move {
-            let Some(bus) = self.active_player().await? else {
-                tracing::debug!(target: "thegn::media", "MPRIS: no active player on the bus");
+            let Some((bus, props)) = self.active_snapshot_data().await? else {
                 return Ok(None);
             };
-            let props = self.player_props(&bus).await?;
             let state = parse_state(tail(&bus), &props);
             tracing::debug!(
                 target: "thegn::media",
@@ -198,6 +229,37 @@ impl MediaBackend for MprisZbus {
                 "MPRIS snapshot",
             );
             Ok(Some(state))
+        })
+    }
+
+    fn snapshot_with_caps(&self) -> BoxFuture<'_, Result<Option<MediaSnapshot>, MediaError>> {
+        Box::pin(async move {
+            let Some((bus, player)) = self.active_snapshot_data().await? else {
+                return Ok(None);
+            };
+            let (root, playlists) = futures::join!(self.root_props(&bus), self.has_playlists(&bus));
+            let root = match root {
+                Ok(props) => Some(props),
+                Err(error) => {
+                    tracing::debug!(target: "thegn::media", bus = %bus, %error, "MPRIS root capabilities unavailable");
+                    None
+                }
+            };
+            let playlists = match playlists {
+                Ok(available) => available,
+                Err(error) => {
+                    tracing::debug!(target: "thegn::media", bus = %bus, %error, "MPRIS playlist capability unavailable");
+                    false
+                }
+            };
+            let state = parse_state(tail(&bus), &player);
+            let caps = caps_from_props(&player, root.as_ref(), playlists);
+            tracing::debug!(
+                target: "thegn::media",
+                bus = %bus, state = ?state.state, title = %state.title, artist = %state.artist,
+                "MPRIS snapshot with capabilities",
+            );
+            Ok(Some(MediaSnapshot { state, caps }))
         })
     }
 
@@ -483,6 +545,8 @@ impl MediaBackend for MprisZbus {
     }
 
     fn caps(&self) -> MediaCaps {
+        // This is the pre-snapshot upper bound; snapshot_with_caps reports the
+        // selected player's concrete capabilities.
         MediaCaps {
             shuffle: true,
             loop_mode: true,
@@ -772,6 +836,31 @@ fn parse_state(player: &str, props: &HashMap<String, OwnedValue>) -> MediaState 
     }
 }
 
+fn caps_from_props(
+    player: &HashMap<String, OwnedValue>,
+    root: Option<&HashMap<String, OwnedValue>>,
+    playlists: bool,
+) -> MediaCaps {
+    let control = bool_of(player, "CanControl") == Some(true);
+    let volume = control && f64_of(player, "Volume").is_some_and(f64::is_finite);
+    MediaCaps {
+        shuffle: control && bool_of(player, "Shuffle").is_some(),
+        loop_mode: control
+            && str_of(player, "LoopStatus")
+                .and_then(|s| LoopMode::parse_mpris(&s))
+                .is_some(),
+        volume,
+        playlists,
+        signals: true,
+        seek: control && bool_of(player, "CanSeek") == Some(true),
+        art: true,
+        queue: root.and_then(|props| bool_of(props, "HasTrackList")) == Some(true),
+        abs_volume: volume,
+        chapters: false,
+        fullscreen: root.and_then(|props| bool_of(props, "CanSetFullscreen")) == Some(true),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -806,6 +895,52 @@ mod tests {
         assert!(!s.can_go_next);
         assert!(!s.can_go_previous);
         assert!(!s.can_seek);
+    }
+
+    fn props(pairs: &[(&str, Value<'_>)]) -> HashMap<String, OwnedValue> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.try_to_owned().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn capabilities_require_control_and_report_only_present_features() {
+        let player = props(&[("Shuffle", Value::Bool(true)), ("Volume", Value::F64(0.5))]);
+        let caps = caps_from_props(&player, None, false);
+        assert!(!caps.shuffle);
+        assert!(!caps.loop_mode);
+        assert!(!caps.volume);
+        assert!(!caps.abs_volume);
+        assert!(!caps.seek);
+
+        let player = props(&[
+            ("CanControl", Value::Bool(true)),
+            ("Shuffle", Value::Bool(true)),
+            ("Volume", Value::F64(0.5)),
+        ]);
+        let caps = caps_from_props(&player, None, false);
+        assert!(caps.shuffle);
+        assert!(!caps.loop_mode);
+        assert!(caps.volume);
+        assert!(caps.abs_volume);
+    }
+
+    #[test]
+    fn root_capabilities_fail_closed_without_true_properties() {
+        let player = HashMap::new();
+        let root = props(&[
+            ("HasTrackList", Value::Bool(false)),
+            ("CanSetFullscreen", Value::Bool(true)),
+        ]);
+        let caps = caps_from_props(&player, Some(&root), true);
+        assert!(!caps.queue);
+        assert!(caps.fullscreen);
+        assert!(caps.playlists);
+
+        let caps = caps_from_props(&player, None, false);
+        assert!(!caps.queue);
+        assert!(!caps.fullscreen);
     }
 
     #[test]

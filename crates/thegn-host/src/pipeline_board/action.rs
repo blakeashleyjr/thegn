@@ -27,12 +27,11 @@ pub fn spawn_dispatch_sample(
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-        use thegn_core::store::NotificationStore;
         // A failed open/read is a typed failure, never an empty roster: the
         // loop keeps the last known-good rows and marks them stale.
         let rows = thegn_core::db::Db::open()
             .map_err(|e| format!("open: {e}"))
-            .and_then(|db| db.list_dispatches().map_err(|e| format!("read: {e}")));
+            .and_then(|db| read_roster(&db));
         let at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
@@ -57,6 +56,10 @@ pub fn spawn_dispatch_sample(
             tracing::debug!(target: "thegn::pipeline", "board sample waker pulse failed: {e}");
         }
     });
+}
+
+fn read_roster(db: &thegn_core::db::Db) -> Result<Vec<thegn_core::issue::AgentDispatch>, String> {
+    db.list_dispatch_roster().map_err(|e| format!("read: {e}"))
 }
 
 /// Resolve a board-row jump into a sidebar row target.
@@ -113,6 +116,7 @@ mod tests {
     use super::*;
     use crate::chrome::FrameModel;
     use crate::sidebar::{DbWorktree, RowKind, RowTarget, SidebarRow};
+    use thegn_core::store::NotificationStore;
 
     fn jump(path: &str) -> PipelineJump {
         PipelineJump {
@@ -203,5 +207,38 @@ mod tests {
         assert_eq!(pipeline_target(&jump("/wt/a"), &model), None);
         assert_eq!(pipeline_target(&jump("/wt/b"), &model), None);
         assert_eq!(pipeline_target(&jump("/wt/zz"), &model), None);
+    }
+
+    #[test]
+    fn board_roster_read_omits_note_and_report_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = thegn_core::db::Db::open_at(&dir.path().join("board.db")).unwrap();
+        let id = db
+            .put_agent_dispatch(thegn_core::issue::NewDispatch {
+                issue_id: "THE-259",
+                worktree_path: "/wt/board",
+                agent_name: "codex",
+                stage: Some("code"),
+                parent_id: None,
+                session_id: Some("board-session"),
+                artifact_path: Some("handoff.md"),
+                chunk_path: None,
+            })
+            .unwrap();
+        db.update_dispatch_status(id, thegn_core::issue::AgentDispatchStatus::Running)
+            .unwrap();
+        db.set_dispatch_report(id, "report body").unwrap();
+        db.stamp_dispatch_note(id, "note body").unwrap();
+
+        let full = db.list_dispatches().unwrap();
+        let roster = read_roster(&db).unwrap();
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].id, full[0].id);
+        assert_eq!(roster[0].status, full[0].status);
+        assert_eq!(roster[0].id, id);
+        assert!(roster[0].note.is_none());
+        assert!(roster[0].report.is_none());
+        assert_eq!(full[0].note.as_deref(), Some("note body"));
+        assert_eq!(full[0].report.as_deref(), Some("report body"));
     }
 }

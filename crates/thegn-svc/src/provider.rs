@@ -1588,6 +1588,10 @@ pub enum ExecFrame {
     Exit(i32),
 }
 
+/// Exit status used when a provider reports an absent or invalid exit code.
+/// Matches the host daemon adapter's unknown-exit sentinel.
+pub const EXEC_EXIT_STATUS_UNKNOWN: i32 = 254;
+
 /// One client→server control message for a native exec session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecControl {
@@ -1722,7 +1726,12 @@ fn decode_stream_frame(b: &[u8]) -> StreamMsg {
     match id {
         1 => StreamMsg::Stdout(rest.to_vec()),
         2 => StreamMsg::Stderr(rest.to_vec()),
-        3 => StreamMsg::Exit(String::from_utf8_lossy(rest).trim().parse().unwrap_or(0)),
+        3 => StreamMsg::Exit(
+            String::from_utf8_lossy(rest)
+                .trim()
+                .parse()
+                .unwrap_or(EXEC_EXIT_STATUS_UNKNOWN),
+        ),
         _ => StreamMsg::Ignore,
     }
 }
@@ -1745,8 +1754,12 @@ fn parse_sprite_ctrl(text: &str) -> SpriteCtrl {
         return SpriteCtrl::Ignore;
     };
     if v.get("type").and_then(|t| t.as_str()) == Some("exit") {
-        let code = v.get("exit_code").and_then(|c| c.as_i64()).unwrap_or(0);
-        return SpriteCtrl::Exit(code as i32);
+        let code = v
+            .get("exit_code")
+            .and_then(|c| c.as_i64())
+            .and_then(|code| i32::try_from(code).ok())
+            .unwrap_or(EXEC_EXIT_STATUS_UNKNOWN);
+        return SpriteCtrl::Exit(code);
     }
     if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
         return SpriteCtrl::Session(sid.to_string());
@@ -1798,17 +1811,22 @@ impl SpritesProvider {
         };
         let mut sess = self.open_exec(id, &spec).await?;
         let mut out: Vec<u8> = Vec::new();
-        let mut code = -1;
+        let mut exit_code = None;
         while let Some(frame) = sess.frames.recv().await {
             match frame {
                 ExecFrame::Stdout(b) => out.extend_from_slice(&b),
                 ExecFrame::Exit(c) => {
-                    code = c;
+                    exit_code = Some(c);
                     break;
                 }
             }
         }
-        let _ = sess.control.send(ExecControl::Close).await; // best-effort: remote may already be gone
+        if let Err(error) = sess.control.send(ExecControl::Close).await {
+            tracing::debug!(target: "thegn::provider", %error, "best-effort exec close failed");
+        }
+        let Some(code) = exit_code else {
+            return Err(anyhow!("exec stream ended without an exit status"));
+        };
         Ok((code, String::from_utf8_lossy(&out).into_owned()))
     }
 
@@ -2034,12 +2052,10 @@ async fn drive_exec<S>(
                     let _ = write.send(Message::Pong(p)).await; // best-effort: peer may be gone
                 }
                 Some(Ok(Message::Close(_))) | None => {
-                    let _ = frames_tx.send(ExecFrame::Exit(0)).await; // best-effort: caller may have dropped the stream
                     break;
                 }
                 Some(Ok(_)) => {}
                 Some(Err(_)) => {
-                    let _ = frames_tx.send(ExecFrame::Exit(-1)).await; // best-effort: caller may have dropped the stream
                     break;
                 }
             },
@@ -2432,16 +2448,19 @@ impl Provider {
                 };
                 let mut session = home.open_exec(id, spec).await?;
                 let mut out = Vec::new();
-                let mut code = -1;
+                let mut exit_code = None;
                 while let Some(frame) = session.frames.recv().await {
                     match frame {
                         ExecFrame::Stdout(b) => out.extend(b),
                         ExecFrame::Exit(c) => {
-                            code = c;
+                            exit_code = Some(c);
                             break;
                         }
                     }
                 }
+                let Some(code) = exit_code else {
+                    return Err(anyhow!("exec stream ended without an exit status"));
+                };
                 Ok((code, String::from_utf8_lossy(&out).into_owned()))
             }
         }
@@ -2726,6 +2745,10 @@ mod tests {
             decode_stream_frame(&[3, b'1', b'3', b'7']),
             StreamMsg::Exit(137)
         );
+        assert_eq!(
+            decode_stream_frame(&[3, b'x']),
+            StreamMsg::Exit(EXEC_EXIT_STATUS_UNKNOWN)
+        );
         assert_eq!(decode_stream_frame(&[]), StreamMsg::Ignore);
         assert_eq!(decode_stream_frame(&[9, 1, 2]), StreamMsg::Ignore);
     }
@@ -2741,6 +2764,14 @@ mod tests {
             SpriteCtrl::Exit(137)
         );
         assert_eq!(
+            parse_sprite_ctrl(r#"{"type":"exit"}"#),
+            SpriteCtrl::Exit(EXEC_EXIT_STATUS_UNKNOWN)
+        );
+        assert_eq!(
+            parse_sprite_ctrl(r#"{"type":"exit","exit_code":2147483648}"#),
+            SpriteCtrl::Exit(EXEC_EXIT_STATUS_UNKNOWN)
+        );
+        assert_eq!(
             parse_sprite_ctrl(r#"{"session_id":"abc","tty":true,"cols":80}"#),
             SpriteCtrl::Session("abc".into())
         );
@@ -2750,6 +2781,116 @@ mod tests {
             SpriteCtrl::Ignore
         );
         assert_eq!(parse_sprite_ctrl("not json"), SpriteCtrl::Ignore);
+    }
+
+    #[tokio::test]
+    async fn drive_exec_tty_close_drops_frames_without_fabricating_exit() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(client, true, frames_tx, control_rx, sid_tx));
+
+        server
+            .send(Message::Binary(vec![b'o', b'k'].into()))
+            .await
+            .unwrap();
+        server.send(Message::Close(None)).await.unwrap();
+
+        assert_eq!(
+            frames_rx.recv().await,
+            Some(ExecFrame::Stdout(b"ok".to_vec()))
+        );
+        assert_eq!(frames_rx.recv().await, None);
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_exec_abrupt_socket_drop_closes_frames_without_exit() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(client, true, frames_tx, control_rx, sid_tx));
+
+        drop(server);
+
+        assert_eq!(frames_rx.recv().await, None);
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_exec_preserves_real_exit_frame() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(client, true, frames_tx, control_rx, sid_tx));
+
+        server
+            .send(Message::Text(r#"{"type":"exit","exit_code":3}"#.into()))
+            .await
+            .unwrap();
+
+        assert_eq!(frames_rx.recv().await, Some(ExecFrame::Exit(3)));
+        assert_eq!(frames_rx.recv().await, None);
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_exec_maps_unparseable_non_tty_exit_to_unknown_sentinel() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(client_io, Role::Client, None)
+                .await;
+        let mut server =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None)
+                .await;
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(4);
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let (sid_tx, _sid_rx) = tokio::sync::watch::channel(None);
+        let driver = tokio::spawn(drive_exec(client, false, frames_tx, control_rx, sid_tx));
+
+        server
+            .send(Message::Binary(vec![3, b'x'].into()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            frames_rx.recv().await,
+            Some(ExecFrame::Exit(EXEC_EXIT_STATUS_UNKNOWN))
+        );
+        assert_eq!(frames_rx.recv().await, None);
+        driver.await.unwrap();
     }
 
     #[test]
