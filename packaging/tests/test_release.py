@@ -11,6 +11,7 @@ import tomllib
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -67,6 +68,26 @@ class ReleaseRendererTests(unittest.TestCase):
         ):
             _, checksums[target] = self.make_asset(target)
         return checksums
+
+    def write_tar_asset(
+        self, entries: list[tuple[str, bytes, int]]
+    ) -> tuple[Path, str]:
+        target = "aarch64-apple-darwin"
+        archive_name, checksum_name = release._asset_names(self.manifest, self.tag, target)
+        archive_path = self.assets / archive_name
+        with tarfile.open(archive_path, "w:gz") as output:
+            for name, content, mode in entries:
+                info = tarfile.TarInfo(name)
+                info.size = len(content)
+                info.mode = mode
+                if name.endswith("/"):
+                    info.type = tarfile.DIRTYPE
+                output.addfile(info, io.BytesIO(content))
+        checksum = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+        (self.assets / checksum_name).write_text(
+            f"{checksum}  {archive_name}\n", encoding="utf-8"
+        )
+        return archive_path, checksum
 
     def render(self, output: Path | None = None) -> Path:
         output = output or self.temp / "rendered"
@@ -198,6 +219,44 @@ class ReleaseRendererTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(release.ReleaseError, "duplicate path 'thegn'"):
+            release.validate_assets(self.manifest, self.tag, self.assets, ["homebrew"])
+
+    def test_rejects_extra_archive_file_and_directory(self) -> None:
+        entries = [
+            (name, f"fixture:{name}\n".encode(), 0o755 if name == "thegn" else 0o644)
+            for name in self.manifest["archive"]["root_files"]
+        ]
+        self.write_tar_asset([*entries, ("evil.sh", b"echo bad\n", 0o755)])
+        with self.assertRaisesRegex(release.ReleaseError, "unexpected member.*evil.sh"):
+            release.validate_assets(self.manifest, self.tag, self.assets, ["homebrew"])
+
+        self.write_tar_asset([*entries, ("extra/", b"", 0o755)])
+        with self.assertRaisesRegex(release.ReleaseError, "unexpected member.*extra"):
+            release.validate_assets(self.manifest, self.tag, self.assets, ["homebrew"])
+
+    def test_rejects_archive_member_count_over_limit(self) -> None:
+        entries = [
+            (name, f"fixture:{name}\n".encode(), 0o755 if name == "thegn" else 0o644)
+            for name in self.manifest["archive"]["root_files"]
+        ]
+        entries.extend((f"extra-{index}", b"x", 0o644) for index in range(61))
+        self.write_tar_asset(entries)
+        with self.assertRaisesRegex(release.ReleaseError, "exceeds 64 members"):
+            release.validate_assets(self.manifest, self.tag, self.assets, ["homebrew"])
+
+    def test_rejects_oversized_archive_member_header(self) -> None:
+        self.make_asset("aarch64-apple-darwin")
+        with mock.patch.object(release, "MAX_MEMBER_BYTES", 8):
+            with self.assertRaisesRegex(release.ReleaseError, "member exceeds 8 bytes"):
+                release.validate_assets(self.manifest, self.tag, self.assets, ["homebrew"])
+
+    def test_rejects_non_executable_unix_binary(self) -> None:
+        entries = [
+            (name, f"fixture:{name}\n".encode(), 0o644)
+            for name in self.manifest["archive"]["root_files"]
+        ]
+        self.write_tar_asset(entries)
+        with self.assertRaisesRegex(release.ReleaseError, "binary thegn is not executable"):
             release.validate_assets(self.manifest, self.tag, self.assets, ["homebrew"])
 
     def test_inactive_windows_managers_fail_clearly(self) -> None:
