@@ -66,6 +66,40 @@ fn malformed_line_is_reported_inside_component() {
 }
 
 #[test]
+fn blank_line_inside_event_is_ignored_without_diagnostic() {
+    let input = one_event("DTSTART;VALUE=DATE:20261012\n\nSUMMARY:feed");
+    let (events, report) = parse_report(&input);
+    assert!(report.diagnostics().is_empty());
+    assert_eq!(events.len(), 1);
+    assert_legacy_matches(&input, &events);
+}
+
+#[test]
+fn trigger_in_nested_extension_is_not_a_reminder() {
+    let input = one_event(
+        "DTSTART;VALUE=DATE:20261012\nBEGIN:VALARM\nBEGIN:X-CHILD\nTRIGGER:-PT5M\nEND:X-CHILD\nEND:VALARM",
+    );
+    let (events, report) = parse_report(&input);
+    assert!(report.diagnostics().is_empty());
+    assert_eq!(events.len(), 1);
+    assert!(events[0].reminders.is_empty());
+    assert_legacy_matches(&input, &events);
+}
+
+#[test]
+fn oversized_trigger_in_nested_extension_is_skipped() {
+    let trigger = format!("TRIGGER:{}", "-".repeat(MAX_LINE_BYTES));
+    let input = one_event(&format!(
+        "DTSTART;VALUE=DATE:20261012\nBEGIN:VALARM\nBEGIN:X-CHILD\n{trigger}\nEND:X-CHILD\nEND:VALARM"
+    ));
+    let (events, report) = parse_report(&input);
+    assert!(report.diagnostics().is_empty());
+    assert_eq!(events.len(), 1);
+    assert!(events[0].reminders.is_empty());
+    assert_legacy_matches(&input, &events);
+}
+
+#[test]
 fn mismatched_end_is_document_failure() {
     let input = "BEGIN:VCALENDAR\nEND:VTODO\nEND:VCALENDAR";
     let (events, report) = parse_report(input);
@@ -81,6 +115,30 @@ fn event_end_with_open_child_reports_unclosed_child() {
     assert!(report.diagnostics().contains(&IcsDiagnostic::UnclosedChild));
     assert!(report.is_document_failure());
     assert_legacy_matches(input, &events);
+}
+
+#[test]
+fn unclosed_alarm_does_not_accumulate_across_events() {
+    let events_input = (1..=20)
+        .map(|day| {
+            format!(
+                "BEGIN:VEVENT\nUID:{day}\nDTSTART;VALUE=DATE:202610{day:02}\nBEGIN:VALARM\nEND:VEVENT"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let input = format!("BEGIN:VCALENDAR\n{events_input}\nEND:VCALENDAR");
+    let (events, report) = parse_report(&input);
+    assert_eq!(events.len(), 20);
+    assert_eq!(
+        report
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| **diagnostic == IcsDiagnostic::UnclosedChild)
+            .count(),
+        20
+    );
+    assert_legacy_matches(&input, &events);
 }
 
 #[test]
@@ -165,5 +223,29 @@ fn diagnostics_are_capped_and_overflow_is_counted() {
     let (_, report) = parse_report(&input);
     assert_eq!(report.diagnostics().len(), MAX_ICS_DIAGNOSTICS);
     assert_eq!(report.overflow(), 8);
+    assert!(!report.is_document_failure());
+}
+
+#[test]
+fn per_event_diagnostic_overflow_is_not_document_failure() {
+    let summaries = std::iter::repeat_n("SUMMARY:duplicate", MAX_ICS_DIAGNOSTICS + 2)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let input = one_event(&format!("DTSTART;VALUE=DATE:20261012\n{summaries}"));
+    let (_, report) = parse_report(&input);
+    assert_eq!(report.diagnostics().len(), MAX_ICS_DIAGNOSTICS);
+    assert_eq!(report.overflow(), 1);
+    assert!(!report.is_document_failure());
+}
+
+#[test]
+fn structural_diagnostic_overflow_remains_document_failure() {
+    let mismatched_ends = std::iter::repeat_n("END:VTODO", MAX_ICS_DIAGNOSTICS + 1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let input = format!("BEGIN:VCALENDAR\n{mismatched_ends}\nEND:VCALENDAR");
+    let (_, report) = parse_report(&input);
+    assert_eq!(report.diagnostics().len(), MAX_ICS_DIAGNOSTICS);
+    assert_eq!(report.overflow(), 1);
     assert!(report.is_document_failure());
 }
