@@ -139,7 +139,9 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
             .map(|error| format!("landed-row bookkeeping unavailable: {error}"))
     };
     match outcome {
-        AttemptOutcome::Landed { commit, resyncs } => {
+        AttemptOutcome::Landed {
+            commit, resyncs, ..
+        } => {
             // Persist first. If this post-CAS write is degraded, do not run the
             // row-dependent lifecycle filing against an untrusted observation.
             let degraded = record_landed(&commit).or_else(|| file_landed(&branch));

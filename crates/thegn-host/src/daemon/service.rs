@@ -1497,7 +1497,7 @@ impl ControlApi for DaemonService {
                 let db = thegn_core::db::Db::open()?;
                 let root = crate::merge_ops::repo_root_of(std::path::Path::new(&wt))
                     .ok_or_else(|| anyhow::anyhow!("{wt}: not inside a git repository"))?;
-                Ok::<_, anyhow::Error>(crate::merge_ops::rows_for_repo(&db, &root))
+                crate::merge_ops::rows_for_repo(&db, &root)
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("merge task join: {e}")))?

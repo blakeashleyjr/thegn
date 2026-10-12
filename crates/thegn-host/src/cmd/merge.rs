@@ -343,7 +343,7 @@ fn repo_root() -> Result<PathBuf> {
 /// `merge_driver::rows_for_repo`, shared with the host's in-app drain).
 fn rows_for_repo(root: &Path) -> Result<Vec<thegn_core::db::MergeQueueRow>> {
     let db = Db::open()?;
-    Ok(merge_driver::rows_for_repo(&db, root))
+    merge_driver::rows_for_repo(&db, root)
 }
 
 fn list(json: bool) -> Result<()> {
@@ -351,7 +351,16 @@ fn list(json: bool) -> Result<()> {
     // state DB holding several repos' queues doesn't leak other repos' rows into
     // this repo's listing — `merge` is per-repo, and `list` must match `drain`.
     let root = repo_root()?;
-    let rows = rows_for_repo(&root)?;
+    let rows = match rows_for_repo(&root) {
+        Ok(rows) => rows,
+        Err(error) if json => {
+            super::emit_json(&serde_json::json!({
+                "error": { "kind": "queue_unavailable", "message": error.to_string() }
+            }))?;
+            return Err(error.context("merge queue unreadable"));
+        }
+        Err(error) => return Err(error.context("merge queue unreadable")),
+    };
     if json {
         return super::emit_json(&rows);
     }
@@ -608,8 +617,27 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     // remote-target guard; `route_to_host` keeps the fold on the target host.
     let push_mode = mq.remote_mode == thegn_core::config::MergeRemoteMode::Push;
     if !push_mode {
-        let db = Db::open().context("remote-target guard database unavailable")?;
-        if let Some(msg) = crate::merge_ops::remote_target_guard(&db, &root)? {
+        let db = match Db::open().context("remote-target guard database unavailable") {
+            Ok(db) => db,
+            Err(error) if json => {
+                super::emit_json(&serde_json::json!({
+                    "error": { "kind": "queue_unavailable", "message": error.to_string() }
+                }))?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let guard = match crate::merge_ops::remote_target_guard(&db, &root) {
+            Ok(guard) => guard,
+            Err(error) if json => {
+                super::emit_json(&serde_json::json!({
+                    "error": { "kind": "queue_unavailable", "message": error.to_string() }
+                }))?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(msg) = guard {
             // Guard refusal: bail so the exit code is non-zero for scripting/CI.
             anyhow::bail!("{msg}");
         }
@@ -623,7 +651,17 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
         add_quiet(cfg, Vec::new(), true, json)?;
     }
     let target = integrate::resolve_target(mq, &root);
-    let items: Vec<QueueItem> = rows_for_repo(&root)?
+    let rows = match rows_for_repo(&root) {
+        Ok(rows) => rows,
+        Err(error) if json => {
+            super::emit_json(&serde_json::json!({
+                "error": { "kind": "queue_unavailable", "message": error.to_string() }
+            }))?;
+            return Err(error.context("merge queue unreadable"));
+        }
+        Err(error) => return Err(error.context("merge queue unreadable")),
+    };
+    let items: Vec<QueueItem> = rows
         .into_iter()
         // Only settled-good rows are excluded. `gate_failed`/`gate_error`/
         // `deferred`/`needs_human` are all retried by a plain drain — an
@@ -663,7 +701,18 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     // enqueue time (e.g. under `--set merge_queue.target_branch=…`), which is
     // why `merge list` used to keep showing the stale value. Re-stamp it.
     for it in &items {
-        let _ = db.set_merge_target(&it.worktree, &target); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        if let Err(error) = db.set_merge_target(&it.worktree, &target) {
+            if json {
+                super::emit_json(&serde_json::json!({
+                    "error": {
+                        "kind": "queue_persistence_failed",
+                        "worktree": it.worktree,
+                        "message": error.to_string()
+                    }
+                }))?;
+            }
+            return Err(error.into());
+        }
     }
     let out = merge_driver::drive_queue(mq, cfg, &root, &db, items, |step: &DriveStep| {
         if json {
@@ -680,6 +729,11 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             // Not a verdict about the branch — worded so it can't be misread.
             "gate_error" => outln!(
                 "  ! {} was NOT gated — {}",
+                step.branch,
+                first_line(step.detail)
+            ),
+            "agent_blocked" => outln!(
+                "  ! {} agent dispatch blocked by environment/isolation policy — {}",
                 step.branch,
                 first_line(step.detail)
             ),
@@ -727,11 +781,24 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
         for w in &out.warnings {
             outln!("Warning: {w}");
         }
+        for error in &out.persistence_errors {
+            outln!("Queue state unavailable: {error}");
+        }
+        for failure in &out.bookkeeping_failed {
+            outln!(
+                "Ref advanced, bookkeeping failed: {} {} {} → {}. Verify the target ref and rerun `thegn merge drain` to reconcile.",
+                failure.branch,
+                failure.target,
+                failure.old_oid,
+                failure.new_oid
+            );
+        }
         outln!(
-            "Done: {} landed, {} ready, {} deferred, {} ungated, {} need a human.",
+            "Done: {} landed, {} ready, {} deferred, {} agent-blocked, {} ungated, {} need a human.",
             out.landed.len(),
             out.ready.len(),
             out.deferred.len(),
+            out.agent_blocked.len(),
             out.gate_error.len(),
             out.needs_human.len()
         );
@@ -747,6 +814,9 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     if let Some(e) = push_err {
         return Err(e);
     }
+    if !out.persistence_errors.is_empty() || !out.bookkeeping_failed.is_empty() {
+        anyhow::bail!("merge drain partially completed; see the structured outcome above");
+    }
     Ok(())
 }
 
@@ -758,6 +828,7 @@ fn drain_json(target: &str, out: &merge_driver::DriveOutcome) -> serde_json::Val
         "landed": out.landed,
         "ready": out.ready,
         "deferred": out.deferred,
+        "agent_blocked": out.agent_blocked,
         // The gate could not RUN for these — reported apart from `deferred` so a
         // script never reads "the branch is bad" out of "the gate is missing".
         "gate_error": out.gate_error,
@@ -765,6 +836,15 @@ fn drain_json(target: &str, out: &merge_driver::DriveOutcome) -> serde_json::Val
         // Non-fatal setup problems (e.g. `agent` naming no configured entry), so
         // a scripted drain can tell "nothing to fix" from "couldn't fix".
         "warnings": out.warnings,
+        "persistence_errors": out.persistence_errors,
+        "bookkeeping_failed": out.bookkeeping_failed.iter().map(|failure| serde_json::json!({
+            "branch": failure.branch,
+            "target": failure.target,
+            "old_oid": failure.old_oid,
+            "new_oid": failure.new_oid,
+            "error": failure.error,
+            "recovery": format!("verify {} at {}; rerun `thegn merge drain` to reconcile the queue row", failure.target, failure.new_oid),
+        })).collect::<Vec<_>>(),
         // Live checkouts of the target the fold could not fast-forward. A script
         // that lands into a checked-out branch needs to know its working tree is
         // now stale — silence here is what made this dangerous.
@@ -783,8 +863,11 @@ fn drain_json(target: &str, out: &merge_driver::DriveOutcome) -> serde_json::Val
             "landed": out.landed.len(),
             "ready": out.ready.len(),
             "deferred": out.deferred.len(),
+            "agent_blocked": out.agent_blocked.len(),
             "gate_error": out.gate_error.len(),
             "needs_human": out.needs_human.len(),
+            "persistence_errors": out.persistence_errors.len(),
+            "bookkeeping_failed": out.bookkeeping_failed.len(),
         },
     })
 }
@@ -824,8 +907,22 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
     // non-zero afterward so scripting/CI sees the failure rather than a clean 0.
     let mut failure: Option<String> = None;
     match outcome {
-        AttemptOutcome::Landed { commit, resyncs } => {
-            let _ = db.update_merge_status(&wt_s, "landed", Some(&commit), None, None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        AttemptOutcome::Landed {
+            commit,
+            old_oid,
+            resyncs,
+        } => {
+            if let Err(error) = db.update_merge_status(
+                &wt_s,
+                thegn_core::attention::MqStatus::Landed.as_str(),
+                Some(&commit),
+                None,
+                None,
+            ) {
+                anyhow::bail!(
+                    "ref advanced, bookkeeping failed: target {target}, old OID {old_oid}, new OID {commit}; verify the target ref and rerun `thegn merge drain` to reconcile. DB error: {error}"
+                );
+            }
             crate::merge_lifecycle::apply_landed(
                 &cfg.repo_merge_queue(&root),
                 &db,
@@ -838,13 +935,13 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
             integrate::report_resyncs(&target, &resyncs);
         }
         AttemptOutcome::UpToDate { commit } => {
-            let _ = db.update_merge_status(
+            db.update_merge_status(
                 &wt_s,
-                "landed",
+                thegn_core::attention::MqStatus::Landed.as_str(),
                 Some(&commit),
                 Some("already merged"),
                 None,
-            ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            )?;
             lifecycle(LifecycleEvent::Landed);
             outln!("{branch} already merged.");
         }
@@ -871,14 +968,26 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
             } else {
                 format!("{reason}\n{}", log.trim())
             };
-            let _ = db.update_merge_status(&wt_s, "gate_error", None, None, Some(&detail)); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            db.update_merge_status(
+                &wt_s,
+                thegn_core::attention::MqStatus::GateError.as_str(),
+                None,
+                None,
+                Some(&detail),
+            )?;
             lifecycle(LifecycleEvent::Failed);
             outln!("✗ {branch} was NOT gated — {reason}.");
             outln!("  The branch was not judged; fix the gate environment and re-run.");
             failure = Some(format!("land failed: {branch} gate could not run"));
         }
         AttemptOutcome::Unreachable { detail } => {
-            let _ = db.update_merge_status(&wt_s, "deferred", None, Some(&detail), None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            db.update_merge_status(
+                &wt_s,
+                thegn_core::attention::MqStatus::Deferred.as_str(),
+                None,
+                Some(&detail),
+                None,
+            )?;
             lifecycle(LifecycleEvent::Failed);
             outln!("✗ {branch}: {detail}");
             failure = Some(format!("land failed: {branch} unreachable"));

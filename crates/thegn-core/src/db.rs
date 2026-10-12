@@ -1879,10 +1879,12 @@ impl Db {
             -- status (the full vocabulary; MqStatus::parse is the one decoder):
             --   queued | folding | verifying | agent_running
             --   landed | ready
-            --   deferred | gate_failed | gate_error | needs_human
+            --   deferred | gate_failed | gate_error | agent_blocked | needs_human
             -- gate_failed = the gate RAN and went red (a verdict about the code);
             -- gate_error  = the gate could not RUN (an environment fact). They are
-            -- separate because only the former may wake the fixing agent.
+            --               separate because only the former may wake the fixing agent.
+            -- agent_blocked = agent isolation/environment policy prevented dispatch;
+            --                 this is not a code verdict and consumes no attempt.
             CREATE TABLE IF NOT EXISTS merge_queue (
               worktree       TEXT PRIMARY KEY,
               branch         TEXT NOT NULL,

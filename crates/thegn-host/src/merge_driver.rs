@@ -16,6 +16,7 @@
 
 use std::path::Path;
 
+use thegn_core::attention::MqStatus;
 use thegn_core::config::{Config, ConflictHandoff, MergeQueueConfig};
 use thegn_core::db::Db;
 use thegn_core::store::{MergeStatusFields, WorkspaceStore, WorktreeAuxStore};
@@ -63,6 +64,8 @@ pub(crate) struct DriveOutcome {
     pub landed: Vec<String>,
     pub ready: Vec<String>,
     pub deferred: Vec<String>,
+    /// Agent dispatch held by environment/isolation policy, not a code verdict.
+    pub agent_blocked: Vec<String>,
     pub needs_human: Vec<String>,
     /// Branches whose gate could not RUN — an environment failure, reported
     /// separately from `deferred` so a caller never reads "the branch is bad"
@@ -76,6 +79,19 @@ pub(crate) struct DriveOutcome {
     /// swallowed: silently degrading to "notify" looks identical to a queue that
     /// simply had nothing to fix.
     pub warnings: Vec<String>,
+    /// Authoritative queue writes that failed while the drain was running.
+    pub persistence_errors: Vec<String>,
+    /// Git advanced, but the landed status could not be persisted.
+    pub bookkeeping_failed: Vec<RefAdvancedBookkeepingFailed>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RefAdvancedBookkeepingFailed {
+    pub branch: String,
+    pub target: String,
+    pub old_oid: String,
+    pub new_oid: String,
+    pub error: String,
 }
 
 /// Why a branch didn't land — the material a fixing agent needs.
@@ -106,11 +122,13 @@ fn conflict_fields(
     }
 }
 
-fn replace_status(db: &Db, worktree: &str, status: &str, fields: &MergeStatusFields) {
-    // Best-effort cache update, not a claim/CAS or proof that persistence worked.
-    if let Err(error) = db.replace_merge_status(worktree, status, fields) {
-        tracing::warn!(target: "thegn::merge", "queue status cache write failed: {error}");
-    }
+fn replace_status(
+    db: &Db,
+    worktree: &str,
+    status: MqStatus,
+    fields: &MergeStatusFields,
+) -> anyhow::Result<()> {
+    db.replace_merge_status(worktree, status.as_str(), fields)
 }
 
 /// Queue rows belonging to `root`'s repo (the queue is global; a drain is
@@ -122,29 +140,36 @@ fn replace_status(db: &Db, worktree: &str, status: &str, fields: &MergeStatusFie
 /// can't be `git worktree list`ed on this box) is still attributed to its repo
 /// instead of being silently dropped. Only an *unregistered* worktree (an
 /// ad-hoc CLI enqueue with no DB row) falls back to the local `main_checkout`.
-pub(crate) fn rows_for_repo(db: &Db, root: &Path) -> Vec<thegn_core::db::MergeQueueRow> {
+pub(crate) fn rows_for_repo(
+    db: &Db,
+    root: &Path,
+) -> anyhow::Result<Vec<thegn_core::db::MergeQueueRow>> {
     let root_s = root.to_string_lossy();
-    db.list_merge_queue()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|r| row_belongs_to_repo(db, &r.worktree, &root_s, root))
+    let rows = db.list_merge_queue()?;
+    rows.into_iter()
+        .filter_map(
+            |r| match row_belongs_to_repo(db, &r.worktree, &root_s, root) {
+                Ok(true) => Some(Ok(r)),
+                Ok(false) => None,
+                Err(e) => Some(Err(e)),
+            },
+        )
         .collect()
 }
 
 /// One membership test (see [`rows_for_repo`]): DB repo_path when known, else a
 /// local `git worktree list` fallback for an unregistered worktree.
-fn row_belongs_to_repo(db: &Db, worktree: &str, root_s: &str, root: &Path) -> bool {
-    if let Ok(Some(rp)) = db.repo_root_for(worktree)
+fn row_belongs_to_repo(db: &Db, worktree: &str, root_s: &str, root: &Path) -> anyhow::Result<bool> {
+    if let Some(rp) = db.repo_root_for(worktree)?
         && !rp.is_empty()
     {
-        return rp == root_s;
+        return Ok(rp == root_s);
     }
-    integrate::main_checkout(Path::new(worktree)).as_deref() == Some(root)
+    Ok(integrate::main_checkout(Path::new(worktree)).as_deref() == Some(root))
 }
 
 /// Drain `items` one at a time, landing clean branches and dispatching the agent
-/// on the rest. `progress` is invoked after each status write. Best-effort DB
-/// writes (the DB is a cache; the git refs are the source of truth).
+/// on the rest. `progress` is invoked only after each durable status write.
 pub(crate) fn drive_queue(
     cfg: &MergeQueueConfig,
     full: &Config,
@@ -225,28 +250,41 @@ fn drive_queue_with(
     let use_agent = wants_agent && agent_cmd.is_some();
     let target = integrate::resolve_target(cfg, repo_root);
 
-    for item in items {
-        let set = |db: &Db, status: &str, oid: Option<&str>, detail: Option<&str>| {
+    'items: for item in items {
+        let write_error = std::cell::RefCell::new(None::<String>);
+        let set = |db: &Db, status: MqStatus, oid: Option<&str>, detail: Option<&str>| {
             let fields = MergeStatusFields {
                 result_oid: oid.map(str::to_owned),
                 conflict_paths: None,
                 error_detail: detail.map(str::to_owned),
             };
-            replace_status(db, &item.worktree, status, &fields);
+            if let Err(error) = replace_status(db, &item.worktree, status, &fields) {
+                *write_error.borrow_mut() = Some(format!("{}: {error}", item.worktree));
+            }
             fields
         };
+        macro_rules! stop_on_write_error {
+            () => {
+                if let Some(error) = write_error.borrow_mut().take() {
+                    tracing::error!(target: "thegn::merge", "queue state write failed: {error}");
+                    out.persistence_errors.push(error);
+                    break 'items;
+                }
+            };
+        }
         // Sidebar-folder lifecycle: move the worktree on a settled transition
         // (landed ⇒ Merged/cleanup, failure ⇒ the failed folder). No-op unless
         // `[merge_queue] organize_folders` is on.
         let lifecycle = |db: &Db, event: thegn_core::merge_lifecycle::LifecycleEvent| {
             crate::merge_lifecycle::apply(cfg, db, repo_root, &item.worktree, &item.branch, event);
         };
-        let fields = set(db, "folding", None, None);
+        let fields = set(db, MqStatus::Folding, None, None);
+        stop_on_write_error!();
         progress(&DriveStep {
             fields: &fields,
             worktree: &item.worktree,
             branch: &item.branch,
-            status: "folding",
+            status: MqStatus::Folding.as_str(),
             detail: "",
         });
 
@@ -265,13 +303,14 @@ fn drive_queue_with(
                 Ok(a) => a,
                 Err(e) => {
                     let detail = format!("{e}");
-                    let fields = set(db, "needs_human", None, Some(&detail));
+                    let fields = set(db, MqStatus::NeedsHuman, None, Some(&detail));
+                    stop_on_write_error!();
                     lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Failed);
                     progress(&DriveStep {
                         fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
-                        status: "needs_human",
+                        status: MqStatus::NeedsHuman.as_str(),
                         detail: &detail,
                     });
                     out.needs_human.push(item.branch.clone());
@@ -280,11 +319,26 @@ fn drive_queue_with(
             };
 
             let failure = match attempt {
-                AttemptOutcome::Landed { commit, resyncs } => {
+                AttemptOutcome::Landed {
+                    commit,
+                    old_oid,
+                    resyncs,
+                } => {
                     // Carried out to the caller so the CLI can warn about any
                     // live checkout of the target left stale by the ref move.
                     out.resyncs.extend(resyncs);
-                    let fields = set(db, "landed", Some(&commit), None);
+                    let fields = set(db, MqStatus::Landed, Some(&commit), None);
+                    if let Some(error) = write_error.borrow_mut().take() {
+                        out.bookkeeping_failed.push(RefAdvancedBookkeepingFailed {
+                            branch: item.branch.clone(),
+                            target: target.clone(),
+                            old_oid,
+                            new_oid: commit,
+                            error,
+                        });
+                        out.landed.push(item.branch.clone());
+                        break;
+                    }
                     crate::merge_lifecycle::apply_landed(
                         cfg,
                         db,
@@ -297,32 +351,39 @@ fn drive_queue_with(
                         fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
-                        status: "landed",
+                        status: MqStatus::Landed.as_str(),
                         detail: &commit[..commit.len().min(12)],
                     });
                     out.landed.push(item.branch.clone());
                     break;
                 }
                 AttemptOutcome::UpToDate { commit } => {
-                    let fields = set(db, "landed", Some(&commit), Some("already merged"));
+                    let fields = set(db, MqStatus::Landed, Some(&commit), Some("already merged"));
+                    stop_on_write_error!();
                     lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Landed);
                     progress(&DriveStep {
                         fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
-                        status: "landed",
+                        status: MqStatus::Landed.as_str(),
                         detail: "already merged",
                     });
                     out.landed.push(item.branch.clone());
                     break;
                 }
                 AttemptOutcome::Ready { tip } => {
-                    let fields = set(db, "ready", Some(&tip), Some("gated green — awaiting land"));
+                    let fields = set(
+                        db,
+                        MqStatus::Ready,
+                        Some(&tip),
+                        Some("gated green — awaiting land"),
+                    );
+                    stop_on_write_error!();
                     progress(&DriveStep {
                         fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
-                        status: "ready",
+                        status: MqStatus::Ready.as_str(),
                         detail: "gated green — awaiting land",
                     });
                     out.ready.push(item.branch.clone());
@@ -332,13 +393,14 @@ fn drive_queue_with(
                     // Branch host unreachable / tip couldn't be fetched in. Hold
                     // (deferred) with the reason — a transient blip is retried on
                     // the next drain; never silently drop the row.
-                    let fields = set(db, "deferred", None, Some(&detail));
+                    let fields = set(db, MqStatus::Deferred, None, Some(&detail));
+                    stop_on_write_error!();
                     lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Failed);
                     progress(&DriveStep {
                         fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
-                        status: "deferred",
+                        status: MqStatus::Deferred.as_str(),
                         detail: &detail,
                     });
                     out.deferred.push(item.branch.clone());
@@ -353,13 +415,14 @@ fn drive_queue_with(
                     // stop; the row is retried on the next drain, by which time
                     // the environment may be fixed.
                     let detail = detail_with_log(&reason, &log);
-                    let fields = set(db, "gate_error", None, Some(&detail));
+                    let fields = set(db, MqStatus::GateError, None, Some(&detail));
+                    stop_on_write_error!();
                     lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Failed);
                     progress(&DriveStep {
                         fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
-                        status: "gate_error",
+                        status: MqStatus::GateError.as_str(),
                         detail: &detail,
                     });
                     out.gate_error.push(item.branch.clone());
@@ -385,16 +448,17 @@ fn drive_queue_with(
                 let sandbox = match dispatch {
                     crate::agent_run::AgentDispatch::InfraHold(reason) => {
                         thegn_core::msg::warn(&reason);
-                        let fields = set(db, "agent_blocked", None, Some(&reason));
+                        let fields = set(db, MqStatus::AgentBlocked, None, Some(&reason));
+                        stop_on_write_error!();
                         progress(&DriveStep {
                             fields: &fields,
                             worktree: &item.worktree,
                             branch: &item.branch,
-                            status: "agent_blocked",
+                            status: MqStatus::AgentBlocked.as_str(),
                             detail: &reason,
                         });
                         // Held for a later drain; NOT a branch/gate failure.
-                        out.deferred.push(item.branch.clone());
+                        out.agent_blocked.push(item.branch.clone());
                         break;
                     }
                     crate::agent_run::AgentDispatch::RunDegraded(spec, warning) => {
@@ -404,14 +468,21 @@ fn drive_queue_with(
                     crate::agent_run::AgentDispatch::Run(spec) => spec,
                 };
                 agent_runs += 1;
-                let _ = db.set_merge_agent_attempts(&item.worktree, agent_runs); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                if let Err(error) = db.set_merge_agent_attempts(&item.worktree, agent_runs) {
+                    out.persistence_errors.push(format!(
+                        "{}: could not reserve agent attempt: {error}",
+                        item.worktree
+                    ));
+                    break;
+                }
                 let note = format!("agent fixing ({agent_runs}/{})", cfg.agent_max_attempts);
-                let fields = set(db, "agent_running", None, Some(&note));
+                let fields = set(db, MqStatus::AgentRunning, None, Some(&note));
+                stop_on_write_error!();
                 progress(&DriveStep {
                     fields: &fields,
                     worktree: &item.worktree,
                     branch: &item.branch,
-                    status: "agent_running",
+                    status: MqStatus::AgentRunning.as_str(),
                     detail: &note,
                 });
                 // Run to completion; the re-attempt (top of loop) is the real
@@ -440,17 +511,21 @@ fn drive_queue_with(
                 } => {
                     let detail = conflict_detail(&paths, &submodule_conflicts);
                     let status = if agent_runs > 0 {
-                        "needs_human"
+                        MqStatus::NeedsHuman
                     } else {
-                        "deferred"
+                        MqStatus::Deferred
                     };
                     let fields = conflict_fields(&paths, &submodule_conflicts);
-                    replace_status(db, &item.worktree, status, &fields);
+                    if let Err(error) = replace_status(db, &item.worktree, status, &fields) {
+                        out.persistence_errors
+                            .push(format!("{}: {error}", item.worktree));
+                        break;
+                    }
                     progress(&DriveStep {
                         fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
-                        status,
+                        status: status.as_str(),
                         detail: &detail,
                     });
                     if agent_runs > 0 {
@@ -461,20 +536,21 @@ fn drive_queue_with(
                 }
                 Failure::Gate(log) => {
                     let status = if agent_runs > 0 {
-                        "needs_human"
+                        MqStatus::NeedsHuman
                     } else {
-                        "gate_failed"
+                        MqStatus::GateFailed
                     };
                     // Persist the actual gate output, not a fixed two-word
                     // string: "breaks build" told the user nothing about WHY,
                     // and the log was otherwise discarded entirely.
                     let detail = detail_with_log("breaks build", &log);
                     let fields = set(db, status, None, Some(&detail));
+                    stop_on_write_error!();
                     progress(&DriveStep {
                         fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
-                        status,
+                        status: status.as_str(),
                         detail: &tail_line(&log),
                     });
                     if agent_runs > 0 {

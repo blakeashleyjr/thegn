@@ -58,6 +58,9 @@ pub enum AttentionReason {
     ChangesRequested,
     GateFailed,
     GateError,
+    /// Agent dispatch is held by the environment or isolation policy; this is
+    /// not a verdict about the branch and does not consume an agent attempt.
+    AgentBlocked,
     Deferred,
     // Waiting
     AgentWaiting,
@@ -90,6 +93,7 @@ impl AttentionReason {
             Self::ChangesRequested => "changes requested",
             Self::GateFailed => "merge gate failed",
             Self::GateError => "merge gate could not run",
+            Self::AgentBlocked => "agent blocked by environment or isolation policy",
             Self::Deferred => "merge deferred",
             Self::AgentWaiting => "agent finished",
             Self::AgentDone => "agent done",
@@ -364,11 +368,44 @@ pub enum MqStatus {
     /// the branch: this one says nothing about the code, so no agent is
     /// dispatched and no bisect is attempted.
     GateError,
+    /// Agent dispatch is held by environment or isolation policy; this is not
+    /// a verdict about the branch and consumes no agent attempt.
+    AgentBlocked,
     AgentRunning,
     NeedsHuman,
 }
 
 impl MqStatus {
+    pub const ALL: [Self; 11] = [
+        Self::Queued,
+        Self::Folding,
+        Self::Verifying,
+        Self::Landed,
+        Self::Ready,
+        Self::Deferred,
+        Self::GateFailed,
+        Self::GateError,
+        Self::AgentRunning,
+        Self::NeedsHuman,
+        Self::AgentBlocked,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Folding => "folding",
+            Self::Verifying => "verifying",
+            Self::Landed => "landed",
+            Self::Ready => "ready",
+            Self::Deferred => "deferred",
+            Self::GateFailed => "gate_failed",
+            Self::GateError => "gate_error",
+            Self::AgentRunning => "agent_running",
+            Self::NeedsHuman => "needs_human",
+            Self::AgentBlocked => "agent_blocked",
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "queued" => Self::Queued,
@@ -379,6 +416,7 @@ impl MqStatus {
             "deferred" => Self::Deferred,
             "gate_failed" => Self::GateFailed,
             "gate_error" => Self::GateError,
+            "agent_blocked" => Self::AgentBlocked,
             "agent_running" => Self::AgentRunning,
             "needs_human" => Self::NeedsHuman,
             _ => return None,
@@ -399,7 +437,7 @@ impl MqStatus {
             Self::Deferred | Self::GateFailed => (gl.flag, Hue::Red),
             // Amber, not red: nothing is wrong with the *branch*, so this must
             // not read as a code verdict alongside GateFailed.
-            Self::GateError => (gl.attention, Hue::Amber),
+            Self::GateError | Self::AgentBlocked => (gl.attention, Hue::Amber),
             Self::NeedsHuman => (gl.attention, Hue::Red), // agent tried and gave up
             Self::Folding | Self::Verifying => (gl.dot_filled, Hue::Amber),
             Self::AgentRunning => (gl.half_dot, Hue::Amber), // agent fixing the branch
@@ -522,9 +560,9 @@ pub fn score(inputs: &AttentionInputs) -> AttentionScore {
         match mq.status {
             MqStatus::NeedsHuman => consider(T::Blocked, 1, R::QueueNeedsHuman, at, 0),
             MqStatus::GateFailed => consider(T::Failure, 7, R::GateFailed, at, 0),
-            // Blocked, not Failure: nothing is wrong with the branch, and no
-            // agent or retry can clear it — only the user fixing the gate can.
+            // A gate that could not run is an environment fact, not a branch verdict.
             MqStatus::GateError => consider(T::Blocked, 2, R::GateError, at, 0),
+            MqStatus::AgentBlocked => consider(T::Blocked, 2, R::AgentBlocked, at, 0),
             MqStatus::Deferred => consider(T::Failure, 8, R::Deferred, at, 0),
             MqStatus::Ready => consider(T::Ready, 1, R::QueueReady, at, 0),
             MqStatus::Queued | MqStatus::Folding | MqStatus::Verifying | MqStatus::AgentRunning => {
@@ -1128,11 +1166,29 @@ mod tests {
             ("ready", MqStatus::Ready),
             ("deferred", MqStatus::Deferred),
             ("gate_failed", MqStatus::GateFailed),
+            ("gate_error", MqStatus::GateError),
+            ("agent_blocked", MqStatus::AgentBlocked),
             ("agent_running", MqStatus::AgentRunning),
             ("needs_human", MqStatus::NeedsHuman),
         ] {
             assert_eq!(MqStatus::parse(s), Some(v));
+            assert_eq!(v.as_str(), s);
         }
+        for status in MqStatus::ALL {
+            assert_eq!(MqStatus::parse(status.as_str()), Some(status));
+            assert!(
+                !status
+                    .glyph(crate::termcaps::glyphs(crate::termcaps::UnicodeLevel::Full))
+                    .0
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            MqStatus::AgentBlocked
+                .glyph(crate::termcaps::glyphs(crate::termcaps::UnicodeLevel::Full))
+                .1,
+            crate::theme::Hue::Amber
+        );
         assert_eq!(MqStatus::parse("bogus"), None);
         // needs_human blocks.
         let s = score(&AttentionInputs {
@@ -1143,6 +1199,17 @@ mod tests {
             ..Default::default()
         });
         assert_eq!((s.tier, s.reason), (T::Blocked, R::QueueNeedsHuman));
+        let blocked = score(&AttentionInputs {
+            merge_queue: Some(MqFacts {
+                status: MqStatus::AgentBlocked,
+                updated_at: 4,
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            (blocked.tier, blocked.reason),
+            (T::Blocked, R::AgentBlocked)
+        );
     }
 
     fn sc(tier: AttentionTier, since: Option<i64>) -> AttentionScore {
