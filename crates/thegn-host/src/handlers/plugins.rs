@@ -612,7 +612,7 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> Plu
     let params = msg.params;
     // The verb's effect, plus the value (if any) an id-bearing request gets
     // back. Invalid params short-circuit to an Invalid error response.
-    let mut damage = PluginDamage::None;
+    let damage = PluginDamage::None;
     let outcome: Result<serde_json::Value, RpcError> = match verb {
         HostVerb::Register => parse_register_contribution(params).and_then(|c| {
             if let Err(error) = entry.runtime.register(pid.clone(), c.clone()) {
