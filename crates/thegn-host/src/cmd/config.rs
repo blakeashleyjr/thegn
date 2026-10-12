@@ -683,19 +683,16 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn config_edit_seed_preserves_existing_parent_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().join("existing");
         std::fs::create_dir(&parent).unwrap();
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let before = thegn_core::fsperm::mode_bits(&parent).unwrap();
 
         seed_example(&parent.join("config.toml")).unwrap();
 
-        assert_eq!(thegn_core::fsperm::mode_bits(&parent).unwrap(), Some(0o755));
+        assert_eq!(thegn_core::fsperm::mode_bits(&parent).unwrap(), before);
     }
 
     #[test]
