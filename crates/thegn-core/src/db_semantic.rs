@@ -8,6 +8,7 @@
 
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::db::Db;
@@ -199,12 +200,12 @@ impl SemanticStore for Db {
 
 impl Db {
     /// Sweep one bounded slice of semantic entities whose source files are gone.
-    /// Registered roots are retained even when they are not present locally:
-    /// remote worktrees legitimately have no local filesystem path. When the
-    /// worker reaches the terminal slice (`scanned == 0`), this also triggers
-    /// the bounded orphan-worktree cache sweep (up to
-    /// [`crate::db_workspace::ORPHAN_CACHE_SWEEP_MAX_KEYS`] keys); see `db.rs`'s
-    /// worker loop.
+    /// A missing file under the longest matching registered root is pruned only
+    /// when that root is locally live (`.git` exists); remote or unavailable
+    /// roots stay protected. When the worker reaches the terminal slice
+    /// (`scanned == 0`), this also triggers the bounded orphan-worktree cache
+    /// sweep (up to [`crate::db_workspace::ORPHAN_CACHE_SWEEP_MAX_KEYS`] keys);
+    /// see `db.rs`'s worker loop.
     pub(crate) fn prune_missing_semantic_files(
         &self,
         after_rowid: i64,
@@ -238,11 +239,24 @@ impl Db {
             .iter()
             .map(|(_, _, file)| file.as_str())
             .collect();
+        let mut root_liveness: HashMap<&str, bool> = HashMap::new();
         let stale_files: Vec<&str> = candidate_files
             .into_iter()
             .filter(|file| {
                 let path = Path::new(file);
-                !roots.iter().any(|root| path.starts_with(Path::new(root))) && !path.exists()
+                if path.exists() {
+                    return false;
+                }
+                let matching_root = roots
+                    .iter()
+                    .filter(|root| path.starts_with(Path::new(root.as_str())))
+                    .max_by_key(|root| root.len());
+                matching_root.map_or(true, |root| {
+                    *root_liveness.entry(root.as_str()).or_insert_with(|| {
+                        let root_path = Path::new(root);
+                        root_path.is_dir() && root_path.join(".git").exists()
+                    })
+                })
             })
             .collect();
         if !stale_files.is_empty() {
@@ -503,6 +517,112 @@ mod tests {
         assert_eq!(
             orphan_cache_count, 0,
             "terminal sweep must prune orphan caches"
+        );
+    }
+
+    #[test]
+    fn missing_file_sweep_prunes_deleted_files_under_live_root() {
+        use crate::store::WorkspaceStore;
+        use std::fs;
+
+        let db = Db::open_memory().unwrap();
+        let live_root = tempfile::tempdir().unwrap();
+        fs::create_dir(live_root.path().join(".git")).unwrap();
+        fs::create_dir(live_root.path().join("src")).unwrap();
+        let kept_file = live_root.path().join("src/kept.rs");
+        fs::write(&kept_file, "pub fn kept() {}\n").unwrap();
+        let live_root_path = live_root.path().to_str().unwrap();
+        let kept_path = kept_file.to_str().unwrap();
+        let gone_path = live_root.path().join("src/gone.rs");
+        let gone_path = gone_path.to_str().unwrap();
+
+        db.put_worktree("live", live_root_path, live_root_path, "main", None, None)
+            .unwrap();
+
+        let remote_root = tempfile::tempdir().unwrap();
+        let remote_root_path = remote_root.path().to_str().unwrap();
+        db.put_worktree(
+            "remote",
+            remote_root_path,
+            remote_root_path,
+            "remote-branch",
+            Some(r#"{"path":"remote","host":"builder"}"#),
+            None,
+        )
+        .unwrap();
+        let remote_missing = remote_root.path().join("src/missing.rs");
+        let remote_missing = remote_missing.to_str().unwrap();
+
+        let nested_root = live_root.path().join("nested");
+        let nested_root_path = nested_root.to_str().unwrap();
+        db.put_worktree(
+            "nested",
+            live_root_path,
+            nested_root_path,
+            "nested",
+            None,
+            None,
+        )
+        .unwrap();
+        let nested_missing = nested_root.join("src/missing.rs");
+        let nested_missing = nested_missing.to_str().unwrap();
+
+        db.upsert_entity(&row("kept", kept_path, "kept", EntityKind::Function, "h1"))
+            .unwrap();
+        db.upsert_entity(&row("gone", gone_path, "gone", EntityKind::Function, "h2"))
+            .unwrap();
+        db.upsert_entity(&row(
+            "remote-missing",
+            remote_missing,
+            "remote_missing",
+            EntityKind::Function,
+            "h3",
+        ))
+        .unwrap();
+        db.upsert_entity(&row(
+            "nested-missing",
+            nested_missing,
+            "nested_missing",
+            EntityKind::Function,
+            "h4",
+        ))
+        .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sem_edge(src_id,dst_id,kind) VALUES('kept','gone','call')",
+                [],
+            )
+            .unwrap();
+
+        let mut after_rowid = 0;
+        loop {
+            let (scanned, next_rowid) = db.prune_missing_semantic_files(after_rowid, 512).unwrap();
+            if scanned == 0 {
+                break;
+            }
+            after_rowid = next_rowid;
+        }
+
+        assert!(db.file_source_hash(gone_path).unwrap().is_none());
+        assert_eq!(
+            db.file_source_hash(kept_path).unwrap().as_deref(),
+            Some("h1")
+        );
+        assert_eq!(
+            db.file_source_hash(remote_missing).unwrap().as_deref(),
+            Some("h3")
+        );
+        assert_eq!(
+            db.file_source_hash(nested_missing).unwrap().as_deref(),
+            Some("h4")
+        );
+        let edge_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM sem_edge", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            edge_count, 0,
+            "pruning a missing entity also prunes its edges"
         );
     }
 
