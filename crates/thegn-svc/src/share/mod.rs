@@ -310,6 +310,15 @@ impl UrlRule {
                 if !matches!(scheme.as_str(), "http" | "https") {
                     return None;
                 }
+                let authority = token.split('/').next()?;
+                let port = if authority.starts_with('[') {
+                    authority.split_once(']')?.1.strip_prefix(':')?
+                } else {
+                    authority.rsplit_once(':')?.1
+                };
+                if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
                 PublicEndpoint::parse_url(&format!("{scheme}://{token}"))
             }
             UrlRule::AfterMarkerRaw { marker } => {
