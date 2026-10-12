@@ -208,15 +208,10 @@ pub(crate) fn provision_worktree_on_host(
                 }
                 StepKind::Dotfiles(names) => stage_and_push(runner, &container, &home, |staging| {
                     for name in names {
-                        let src = host_home.join(name);
-                        if let Ok(data) = std::fs::read(&src) {
-                            let dst = staging.join(name);
-                            if let Some(parent) = dst.parent() {
-                                let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
-                            }
-                            let _ = std::fs::write(dst, data); // best-effort: staging: a missing file fails the install step below with a visible error
-                        }
+                        let rel = safe_relative_path(name)?;
+                        stage_file(staging, &host_home.join(&rel), &staging.join(rel), false)?;
                     }
+                    Ok(())
                 }),
                 StepKind::AgentConfigs(ids) => {
                     stage_and_push(runner, &container, &home, |staging| {
@@ -227,27 +222,35 @@ pub(crate) fn provision_worktree_on_host(
                                 if !src.is_dir() {
                                     continue;
                                 }
-                                for (abs, inner, _exec) in
+                                for (abs, inner, exec) in
                                     crate::agent_configs::collect_agent_config_files(&src)
                                 {
-                                    let dst = staging.join(&rel).join(&inner);
-                                    if let Some(parent) = dst.parent() {
-                                        let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
-                                    }
-                                    let _ = std::fs::copy(&abs, &dst); // best-effort: staging: a missing file fails the install step below with a visible error
+                                    let base = safe_relative_path(&rel)?;
+                                    let inner = safe_relative_path(&inner)?;
+                                    // Agent config collection intentionally follows links (for
+                                    // NixOS hooks); resolve that policy explicitly, then use a
+                                    // no-follow open on the resolved regular file.
+                                    let resolved = std::fs::canonicalize(&abs)
+                                        .map_err(|e| format!("resolve {}: {e}", abs.display()))?;
+                                    stage_file(
+                                        staging,
+                                        &resolved,
+                                        &staging.join(base).join(inner),
+                                        exec,
+                                    )?;
                                 }
                             }
                             for rel in files {
-                                let src = host_home.join(&rel);
-                                if let Ok(data) = std::fs::read(&src) {
-                                    let dst = staging.join(&rel);
-                                    if let Some(parent) = dst.parent() {
-                                        let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
-                                    }
-                                    let _ = std::fs::write(dst, data); // best-effort: staging: a missing file fails the install step below with a visible error
-                                }
+                                let rel = safe_relative_path(&rel)?;
+                                stage_file(
+                                    staging,
+                                    &host_home.join(&rel),
+                                    &staging.join(rel),
+                                    false,
+                                )?;
                             }
                         }
+                        Ok(())
                     })
                 }
                 StepKind::AtuinSync => stage_and_push(runner, &container, &home, |staging| {
@@ -256,15 +259,10 @@ pub(crate) fn provision_worktree_on_host(
                         ".local/share/atuin/key",
                         ".local/share/atuin/session",
                     ] {
-                        let src = host_home.join(rel);
-                        if let Ok(data) = std::fs::read(&src) {
-                            let dst = staging.join(rel);
-                            if let Some(parent) = dst.parent() {
-                                let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
-                            }
-                            let _ = std::fs::write(dst, data); // best-effort: staging: a missing file fails the install step below with a visible error
-                        }
+                        let rel = safe_relative_path(rel)?;
+                        stage_file(staging, &host_home.join(&rel), &staging.join(rel), false)?;
                     }
+                    Ok(())
                 }),
                 // Provider-only machinery: no meaning on a plain OCI host.
                 StepKind::Checkpoint
@@ -327,32 +325,167 @@ fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }
 
-/// Stage files into a temp dir via `fill`, then tar-push them into the
-/// container `$HOME`. Empty staging ⇒ no-op success.
+/// Stage files into a private, exclusive temp dir via `fill`, then tar-push
+/// them into the container `$HOME`. An empty transaction is an error.
 fn stage_and_push(
     runner: &OciRunner,
     container: &str,
     home: &str,
-    fill: impl FnOnce(&std::path::Path),
+    fill: impl FnOnce(&std::path::Path) -> Result<(), String>,
 ) -> Result<(), String> {
-    let staging = std::env::temp_dir().join(format!(
-        "tg-hostwt-{}-{}",
-        std::process::id(),
-        thegn_core::util::short_hash(container, 6)
-    ));
-    let _ = std::fs::remove_dir_all(&staging); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
-    fill(&staging);
-    let empty = std::fs::read_dir(&staging)
-        .map(|mut d| d.next().is_none())
-        .unwrap_or(true);
-    let result = if empty {
-        Ok(())
-    } else {
-        runner.push_dir_to_container(container, &staging, home, secs(120))
-    };
-    let _ = std::fs::remove_dir_all(&staging); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-    result
+    with_private_staging(fill, |staging| {
+        runner.push_dir_to_container(container, staging, home, secs(120))
+    })
+}
+
+fn with_private_staging(
+    fill: impl FnOnce(&std::path::Path) -> Result<(), String>,
+    transfer: impl FnOnce(&std::path::Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let staging = tempfile::Builder::new()
+        .prefix("tg-hostwt-")
+        .tempdir()
+        .map_err(|e| format!("create private staging directory: {e}"))?;
+    let result = thegn_core::fsperm::restrict_dir_to_owner(staging.path())
+        .map_err(|e| format!("restrict staging directory: {e}"))
+        .and_then(|()| {
+            fill(staging.path())?;
+            let mut entries = std::fs::read_dir(staging.path())
+                .map_err(|e| format!("inspect staging directory: {e}"))?;
+            if entries
+                .next()
+                .transpose()
+                .map_err(|e| format!("inspect staging directory entry: {e}"))?
+                .is_none()
+            {
+                return Err("staging transaction produced no files".into());
+            }
+            transfer(staging.path())
+        });
+    let cleanup = staging
+        .close()
+        .map_err(|e| format!("remove staging directory: {e}"));
+    finish_staging_transaction(result, cleanup)
+}
+
+fn finish_staging_transaction(
+    result: Result<(), String>,
+    cleanup: Result<(), String>,
+) -> Result<(), String> {
+    match (result, cleanup) {
+        (Err(error), Err(cleanup)) => Err(format!("{error}; {cleanup}")),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// Accept only normalized relative paths: no roots, parent components, or
+/// platform-specific separator tricks. Callers may use nested known config
+/// paths, while user-configured dotfiles are additionally restricted to one
+/// component in `agent_home`.
+fn safe_relative_path(value: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+    if value.is_empty() || value.contains('\\') || value.chars().any(char::is_control) {
+        return Err(format!("unsafe provisioning path {value:?}"));
+    }
+    let path = std::path::Path::new(value);
+    let normalized = path
+        .components()
+        .map(|component| match component {
+            Component::Normal(part) => part.to_string_lossy().into_owned(),
+            _ => String::new(),
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    if path.is_absolute()
+        || normalized != value
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || path.components().count() == 0
+    {
+        return Err(format!("unsafe provisioning path {value:?}"));
+    }
+    Ok(path.to_path_buf())
+}
+
+/// Read an existing regular file and create its staged copy exclusively with
+/// owner-only permissions. Agent hooks marked executable retain that bit only
+/// for the in-container copy path that depends on it.
+fn stage_file(
+    staging_root: &std::path::Path,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    executable: bool,
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let mut source = thegn_core::fsperm::open_regular_file_nofollow(src)
+        .map_err(|e| format!("read {}: {e}", src.display()))?;
+    let mut bytes = Vec::new();
+    source
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read {}: {e}", src.display()))?;
+    create_staging_parents(staging_root, dst)?;
+    let mut output = thegn_core::fsperm::create_owner_only_exclusive(dst)
+        .map_err(|e| format!("create staged file {}: {e}", dst.display()))?;
+    output
+        .write_all(&bytes)
+        .and_then(|()| output.sync_all())
+        .map_err(|e| format!("write staged file {}: {e}", dst.display()))?;
+    if executable {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("set staged mode {}: {e}", dst.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Create each staged directory component without accepting a pre-existing
+/// symlink as a directory. The private temporary root is the only parent.
+fn create_staging_parents(
+    staging_root: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<(), String> {
+    use std::path::Component;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("staging path has no parent: {}", destination.display()))?;
+    let relative = parent
+        .strip_prefix(staging_root)
+        .map_err(|_| format!("staging path escaped its root: {}", destination.display()))?;
+    let mut current = staging_root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(format!("unsafe staging parent: {}", parent.display()));
+        };
+        current.push(name);
+        match std::fs::create_dir(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = std::fs::symlink_metadata(&current)
+                    .map_err(|e| format!("inspect staging directory {}: {e}", current.display()))?;
+                if !metadata.file_type().is_dir() {
+                    return Err(format!(
+                        "staging path component is not a directory: {}",
+                        current.display()
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "create staging directory {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+        thegn_core::fsperm::restrict_dir_to_owner(&current)
+            .map_err(|e| format!("restrict staging directory {}: {e}", current.display()))?;
+    }
+    Ok(())
 }
 
 /// Report the plan a worktree WOULD run (doctor / tests): tier + step ids.
@@ -400,6 +533,203 @@ mod tests {
         assert!(
             !steps.iter().any(|s| s == "clone"),
             "no clone for existing worktrees"
+        );
+    }
+
+    #[test]
+    fn staging_transaction_is_private_and_cleans_up_after_fill_failure() {
+        use std::cell::RefCell;
+
+        let seen = RefCell::new(None);
+        let result = with_private_staging(
+            |staging| {
+                *seen.borrow_mut() = Some(staging.to_path_buf());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        std::fs::metadata(staging).unwrap().permissions().mode() & 0o777,
+                        0o700
+                    );
+                }
+                Err("injected read failure".into())
+            },
+            |_| panic!("a failed fill must never transfer"),
+        );
+        assert!(result.unwrap_err().contains("injected read failure"));
+        assert!(!seen.borrow().as_ref().unwrap().exists());
+    }
+
+    #[test]
+    fn staging_transaction_rejects_empty_output() {
+        let transferred = std::cell::Cell::new(false);
+        let result = with_private_staging(
+            |_| Ok(()),
+            |_| {
+                transferred.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().contains("produced no files"));
+        assert!(!transferred.get());
+    }
+
+    #[test]
+    fn concurrent_staging_transactions_get_distinct_directories() {
+        use std::sync::{Arc, Barrier, Mutex};
+
+        let barrier = Arc::new(Barrier::new(2));
+        let paths = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for contents in [&b"first"[..], &b"second"[..]] {
+                let barrier = Arc::clone(&barrier);
+                let paths = &paths;
+                workers.push(scope.spawn(move || {
+                    with_private_staging(
+                        |staging| {
+                            std::fs::write(staging.join("identity"), contents)
+                                .map_err(|e| e.to_string())
+                        },
+                        |staging| {
+                            paths.lock().unwrap().push(staging.to_path_buf());
+                            barrier.wait();
+                            assert_eq!(std::fs::read(staging.join("identity")).unwrap(), contents);
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                }));
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        let paths = paths.into_inner().unwrap();
+        assert_eq!(paths.len(), 2);
+        assert_ne!(paths[0], paths[1]);
+        assert!(paths.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn staging_transaction_reports_cleanup_failure() {
+        let error = finish_staging_transaction(
+            Err("injected transfer failure".into()),
+            Err("remove staging directory: injected cleanup failure".into()),
+        )
+        .unwrap_err();
+        assert!(error.contains("injected transfer failure"));
+        assert!(error.contains("injected cleanup failure"));
+    }
+
+    #[test]
+    fn a_failed_staging_attempt_does_not_poison_the_retry() {
+        let failed = with_private_staging(|_| Err("injected copy failure".into()), |_| Ok(()));
+        assert!(failed.unwrap_err().contains("injected copy failure"));
+
+        let retry = with_private_staging(
+            |staging| stage_file_from_bytes_for_test(staging, "credential", b"retry data"),
+            |staging| {
+                assert_eq!(
+                    std::fs::read(staging.join("credential")).unwrap(),
+                    b"retry data"
+                );
+                Ok(())
+            },
+        );
+        assert!(retry.is_ok());
+    }
+
+    fn stage_file_from_bytes_for_test(
+        staging: &std::path::Path,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        use std::io::Write;
+        let mut file = thegn_core::fsperm::create_owner_only_exclusive(&staging.join(name))
+            .map_err(|e| e.to_string())?;
+        file.write_all(bytes).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn stage_file_is_exclusive_owner_only_and_rejects_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("staging").join("secret");
+        std::fs::write(&source, b"secret bytes").unwrap();
+        let staging = root.path().join("staging");
+        std::fs::create_dir(&staging).unwrap();
+        stage_file(&staging, &source, &destination, false).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"secret bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        assert!(stage_file(&staging, &source, &destination, false).is_err());
+        let executable = staging.join("hook");
+        stage_file(&staging, &source, &executable, true).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&executable).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let link = root.path().join("source-link");
+            std::os::unix::fs::symlink(&source, &link).unwrap();
+            assert!(
+                stage_file(
+                    &staging,
+                    &link,
+                    &root.path().join("staging/link-copy"),
+                    false
+                )
+                .is_err()
+            );
+            let external = root.path().join("external");
+            std::fs::create_dir(&external).unwrap();
+            std::os::unix::fs::symlink(&external, staging.join("linked-parent")).unwrap();
+            assert!(
+                stage_file(
+                    &staging,
+                    &source,
+                    &staging.join("linked-parent/escaped"),
+                    false
+                )
+                .is_err()
+            );
+            assert!(!external.join("escaped").exists());
+        }
+    }
+
+    #[test]
+    fn provisioning_paths_must_be_normalized_relative_paths() {
+        for bad in [
+            "",
+            "/tmp/file",
+            "../file",
+            "a/../file",
+            "a/./file",
+            "a\\file",
+            "bad\nname",
+        ] {
+            assert!(safe_relative_path(bad).is_err(), "accepted {bad:?}");
+        }
+        assert_eq!(
+            safe_relative_path(".config/app/file").unwrap(),
+            std::path::PathBuf::from(".config/app/file")
         );
     }
 }

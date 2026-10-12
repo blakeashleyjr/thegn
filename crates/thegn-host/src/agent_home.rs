@@ -58,7 +58,22 @@ pub(crate) fn resolve_personal_dotfiles(
     let mut dotfiles = Vec::new();
     let mut roots: Vec<String> = Vec::new();
     for name in candidates {
-        let contents = std::fs::read_to_string(home_dir.join(&name)).ok(); // best-effort: drain: bounded read of auxiliary output; failure loses the buffer, not the outcome
+        if !is_safe_dotfile_name(&name) {
+            thegn_core::msg::warn(&format!(
+                "[sandbox.home] skipping unsafe dotfile path {name:?}"
+            ));
+            continue;
+        }
+        let source = home_dir.join(&name);
+        // Dotfiles are deliberately not followed through symlinks. Only a
+        // regular file directly under HOME can be selected for staging.
+        match std::fs::symlink_metadata(&source) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {} // Keep it selected; the staging read will report the real failure.
+        }
+        let contents = std::fs::read_to_string(&source).ok(); // best-effort: scan failure leaves upload selected; staging reports read errors
         match home.strategy {
             ShellStrategy::Clean => {} // nothing personal under clean
             ShellStrategy::HostParity => {
@@ -97,4 +112,57 @@ pub(crate) fn resolve_personal_dotfiles(
         }
     }
     (dotfiles, roots)
+}
+
+/// Dotfile configuration names represent one item directly under HOME, never
+/// a path expression. Reject separators and control characters before any
+/// filesystem join so configuration cannot escape the selected home.
+fn is_safe_dotfile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.chars().any(char::is_control)
+        && Path::new(name).components().count() == 1
+        && Path::new(name)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_dotfiles_must_be_single_safe_components() {
+        use thegn_core::config::{HomeConfig, ShellStrategy};
+
+        let home_dir = tempfile::tempdir().unwrap();
+        std::fs::write(home_dir.path().join(".gitconfig"), "[user]\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            home_dir.path().join(".gitconfig"),
+            home_dir.path().join(".zshrc"),
+        )
+        .unwrap();
+        let config = HomeConfig {
+            strategy: ShellStrategy::HostParity,
+            dotfiles: vec![
+                ".gitconfig".into(),
+                "../outside".into(),
+                "/tmp/absolute".into(),
+                "nested/.zshrc".into(),
+                "..".into(),
+                "bad\nname".into(),
+                "nested\\file".into(),
+                ".zshrc".into(),
+            ],
+            ..HomeConfig::default()
+        };
+
+        let (files, roots) = resolve_personal_dotfiles(home_dir.path(), &config, "test");
+        assert_eq!(files, vec![".gitconfig"]);
+        assert!(roots.is_empty());
+    }
 }
