@@ -582,7 +582,10 @@ fn parse_hex(s: &str) -> Option<Rgb> {
     match h.len() {
         3 if h.is_ascii() => {
             let mut chars = h.chars();
-            let channel = |c: char| u8::from_str_radix(&format!("{c}{c}"), 16).ok();
+            let channel = |c: char| match u8::from_str_radix(&format!("{c}{c}"), 16) {
+                Ok(value) => Some(value),
+                Err(_) => None,
+            };
             Some((
                 channel(chars.next()?)?,
                 channel(chars.next()?)?,
@@ -719,7 +722,10 @@ mod tests {
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                // best-effort: temporary test-directory cleanup must not panic during unwinding.
+                std::mem::drop(error);
+            }
         }
     }
 
