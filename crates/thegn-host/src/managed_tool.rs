@@ -921,7 +921,7 @@ mod tests {
         assert!(extract_binary(traversal.path(), "a.tar.gz", "difft", dir.path()).is_err());
         let absolute = tar_gz(&[("/difft", b'0', b"binary")]);
         assert!(extract_binary(absolute.path(), "a.tar.gz", "difft", dir.path()).is_err());
-        for kind in [b'1', b'2', b'3', b'4', b'6'] {
+        for kind in *b"12346" {
             let special = tar_gz(&[("difft", kind, b"target")]);
             assert!(extract_binary(special.path(), "a.tar.gz", "difft", dir.path()).is_err());
         }
