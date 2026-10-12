@@ -21,6 +21,7 @@
 //! writes a `.cast` file for external playback.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use thegn_core::config::ReplayConfig;
@@ -35,6 +36,10 @@ const REPLAY_SCROLLBACK: usize = 10_000;
 /// including fixed allocation overhead. This enforces a logical replay budget;
 /// it is not a measured RSS guarantee and does not account for Vec capacity.
 const REPLAY_ENTRY_OVERHEAD_BYTES: u64 = 64;
+/// Deterministic worker-side cell ceiling. This covers a default-sized retained
+/// ring at ordinary pane geometries while still bounding resize floods.
+const SEARCH_SCAN_MAX_CELLS: usize = 2_000_000_000;
+static NEXT_RECORDING_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The two ways the recorder bounds a pane's ring, plus the keyframe cadence.
 #[derive(Debug, Clone, Copy)]
@@ -76,6 +81,8 @@ struct Keyframe {
 /// with periodic keyframe markers. Lives beside the `PtyPane` as
 /// `record: Option<Recording>`.
 pub struct Recording {
+    identity: u64,
+    revision: u64,
     epoch: Instant,
     events: VecDeque<Event>,
     keyframes: Vec<Keyframe>,
@@ -96,10 +103,122 @@ pub struct Recording {
     base_cols: u16,
 }
 
+/// Immutable, capped input owned by one replay-search job.
+pub(crate) struct SearchSnapshot {
+    events: Vec<Event>,
+    base_rows: u16,
+    base_cols: u16,
+    max_events: usize,
+    incomplete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchResult {
+    Match(u64),
+    NoMatch,
+    Incomplete,
+    Cancelled,
+}
+
+impl SearchSnapshot {
+    /// Search with deterministic event, cell, and cancellation bounds.
+    /// Sampling remains once per complete timestamp, preserving replay search's
+    /// visible-frame and strict directional-boundary semantics.
+    pub(crate) fn search(
+        &self,
+        needle: &str,
+        from_ms: u64,
+        reverse: bool,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> SearchResult {
+        let needle = needle.trim().to_lowercase();
+        if needle.is_empty() {
+            return SearchResult::NoMatch;
+        }
+        let mut rows = self.base_rows;
+        let mut cols = self.base_cols;
+        let mut cells = usize::from(rows).saturating_mul(usize::from(cols));
+        if cells > SEARCH_SCAN_MAX_CELLS {
+            return SearchResult::Incomplete;
+        }
+        let mut emu = AlacrittyEmulator::new(rows, cols, REPLAY_SCROLLBACK);
+        let mut events = self.events.iter().peekable();
+        let mut best_before = None;
+        let mut scanned = 0usize;
+        while let Some(first) = events.next() {
+            if cancelled.load(Ordering::Relaxed) {
+                return SearchResult::Cancelled;
+            }
+            if scanned >= self.max_events {
+                return SearchResult::Incomplete;
+            }
+            let at_ms = first.at_ms;
+            for ev in std::iter::once(first).chain(std::iter::from_fn(|| {
+                (events.peek().is_some_and(|ev| ev.at_ms == at_ms))
+                    .then(|| events.next())
+                    .flatten()
+            })) {
+                scanned += 1;
+                match &ev.kind {
+                    EventKind::Bytes(payload) => emu.advance(payload),
+                    EventKind::Resize { rows: r, cols: c } => {
+                        let resize_cells = usize::from(*r).saturating_mul(usize::from(*c));
+                        cells = cells.saturating_add(resize_cells);
+                        if cells > SEARCH_SCAN_MAX_CELLS {
+                            return SearchResult::Incomplete;
+                        }
+                        rows = *r;
+                        cols = *c;
+                        emu.resize(rows, cols);
+                    }
+                }
+            }
+            // A timestamp is one visible frame: sample only after all events at
+            // that millisecond have been applied.
+            let candidate = if reverse {
+                at_ms < from_ms
+            } else {
+                at_ms > from_ms
+            };
+            if candidate {
+                let frame_cells = usize::from(rows).saturating_mul(usize::from(cols));
+                cells = cells.saturating_add(frame_cells);
+                if cells > SEARCH_SCAN_MAX_CELLS {
+                    return SearchResult::Incomplete;
+                }
+            }
+            let found = candidate && grid_text(&emu).to_lowercase().contains(&needle);
+            if cancelled.load(Ordering::Relaxed) {
+                return SearchResult::Cancelled;
+            }
+            if found {
+                if reverse {
+                    if at_ms < from_ms {
+                        best_before = Some(at_ms);
+                    }
+                } else if at_ms > from_ms {
+                    return SearchResult::Match(at_ms);
+                }
+            }
+        }
+        if cancelled.load(Ordering::Relaxed) {
+            SearchResult::Cancelled
+        } else if self.incomplete {
+            SearchResult::Incomplete
+        } else if reverse {
+            best_before.map_or(SearchResult::NoMatch, SearchResult::Match)
+        } else {
+            SearchResult::NoMatch
+        }
+    }
+}
+
 impl Recording {
     /// A recording sized from `[replay]` config, starting at the given geometry.
     pub fn from_config(cfg: &ReplayConfig, rows: u16, cols: u16) -> Self {
         Self {
+            identity: NEXT_RECORDING_ID.fetch_add(1, Ordering::Relaxed),
+            revision: 0,
             epoch: Instant::now(),
             events: VecDeque::new(),
             keyframes: Vec::new(),
@@ -117,6 +236,37 @@ impl Recording {
             last_keyframe_ms: 0,
             base_rows: rows.max(1),
             base_cols: cols.max(1),
+        }
+    }
+
+    /// Stable identity and retained-ring revision for search result validation.
+    pub fn version(&self) -> (u64, u64) {
+        (self.identity, self.revision)
+    }
+
+    /// Clone the retained ring for off-loop search. THE-553's logical recording
+    /// budget bounds this deterministic copy: each event consumes at least its
+    /// fixed entry charge, and payload bytes also count toward that budget.
+    pub(crate) fn search_snapshot(&self) -> SearchSnapshot {
+        let max_events = usize::try_from(self.budget.max_bytes / REPLAY_ENTRY_OVERHEAD_BYTES)
+            .unwrap_or(usize::MAX);
+        let mut events: Vec<Event> = self.events.iter().take(max_events).cloned().collect();
+        let incomplete = self.events.len() > max_events;
+        if incomplete {
+            let truncated_at_ms = events.last().map(|event| event.at_ms);
+            while events
+                .last()
+                .is_some_and(|event| Some(event.at_ms) == truncated_at_ms)
+            {
+                events.pop();
+            }
+        }
+        SearchSnapshot {
+            events,
+            base_rows: self.base_rows,
+            base_cols: self.base_cols,
+            max_events,
+            incomplete,
         }
     }
 
@@ -206,6 +356,7 @@ impl Recording {
     /// Evict oldest events until both budgets are satisfied, then drop any
     /// keyframe whose event fell off the front (its byte range no longer exists).
     fn evict(&mut self, now_ms: u64) {
+        let mut evicted_any = false;
         loop {
             // A keyframe whose event is already popped is orphaned and about to
             // be dropped below, so its marker no longer counts against the
@@ -246,6 +397,7 @@ impl Recording {
                     }
                 }
                 self.evicted += 1;
+                evicted_any = true;
             }
         }
         // Drop keyframes orphaned by eviction (their event is gone).
@@ -257,6 +409,9 @@ impl Recording {
             self.bytes_used = self
                 .bytes_used
                 .saturating_sub((removed as u64).saturating_mul(REPLAY_ENTRY_OVERHEAD_BYTES));
+        }
+        if evicted_any {
+            self.revision = self.revision.wrapping_add(1);
         }
     }
 
@@ -370,6 +525,7 @@ impl Recording {
     /// tests the styling-agnostic [`grid_text`], so it finds strings that only
     /// ever appeared inside full-screen apps (never in scrollback). Bounded by the
     /// recording budget; `None` if no frame matches.
+    #[cfg(test)]
     pub fn search_next(&self, needle: &str, from_ms: u64, reverse: bool) -> Option<u64> {
         let needle = needle.trim();
         if needle.is_empty() {
@@ -641,6 +797,82 @@ mod tests {
         assert!(grid_text(&rec.reconstruct(0)).contains("final"));
         assert_eq!(rec.search_next("transient", 1, true), None);
         assert_eq!(rec.search_next("final", 1, true), Some(0));
+    }
+
+    #[test]
+    fn default_budget_snapshot_searches_past_two_megabytes_and_1100_frames() {
+        let mut rec = Recording::from_config(&ReplayConfig::default(), 24, 80);
+        let epoch = rec.epoch;
+        for i in 0..1_200u64 {
+            rec.push_bytes(&[b'x'; 1_800], epoch + Duration::from_millis(i + 1));
+        }
+        rec.push_bytes(b"\r\nneedle", epoch + Duration::from_millis(1_201));
+        rec.push_bytes(b"\r\n", epoch + Duration::from_millis(1_202));
+        let retained_payload: usize = rec
+            .events
+            .iter()
+            .map(|event| match &event.kind {
+                EventKind::Bytes(bytes) => bytes.len(),
+                EventKind::Resize { .. } => 0,
+            })
+            .sum();
+        assert!(retained_payload > 2 * 1024 * 1024);
+        assert!(rec.events.len() > 1_100);
+
+        let snapshot = rec.search_snapshot();
+        assert_eq!(snapshot.events.len(), rec.events.len());
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            snapshot.search("needle", rec.end_ms(), true, &cancelled),
+            SearchResult::Match(1_201),
+            "a complete default-budget ring must find a near-tail reverse match"
+        );
+    }
+
+    #[test]
+    fn snapshot_keeps_a_retained_flood_of_tiny_resize_events_complete() {
+        let mut rec = Recording::from_config(&replay_cfg(2 * 1024 * 1024), 24, 80);
+        let epoch = rec.epoch;
+        for _ in 0..20_001 {
+            rec.record_resize(24, 80, epoch);
+        }
+        let snapshot = rec.search_snapshot();
+        assert_eq!(snapshot.events.len(), rec.events.len());
+        assert_eq!(
+            snapshot.search(
+                "never-present",
+                0,
+                false,
+                &std::sync::atomic::AtomicBool::new(false),
+            ),
+            SearchResult::NoMatch,
+            "a complete retained event flood must not hit an arbitrary snapshot cap"
+        );
+    }
+
+    #[test]
+    fn search_rejects_large_grids_before_emulator_allocation() {
+        let rec = Recording::from_config(&cfg(), u16::MAX, u16::MAX);
+        let snapshot = rec.search_snapshot();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            snapshot.search("anything", 0, false, &cancelled),
+            SearchResult::Incomplete,
+            "a grid above the cell ceiling must be reported incomplete"
+        );
+    }
+
+    #[test]
+    fn search_observes_cancellation_before_scanning() {
+        let mut rec = Recording::from_config(&cfg(), 24, 80);
+        let epoch = rec.epoch;
+        rec.push_bytes(b"payload", epoch);
+        let snapshot = rec.search_snapshot();
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        assert_eq!(
+            snapshot.search("payload", 0, false, &cancelled),
+            SearchResult::Cancelled
+        );
     }
 
     #[test]

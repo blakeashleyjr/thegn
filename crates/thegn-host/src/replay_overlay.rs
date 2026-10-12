@@ -12,21 +12,39 @@
 //! [`ReplayOverlay::advance_clock`], which advances the cursor by *real* elapsed
 //! time. Paused or closed ⇒ no thread, no wakeups.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::Surface;
 use termwiz::terminal::TerminalWaker;
+use thegn_core::config::ReplayConfig;
 
 use crate::chrome::S;
 use crate::compositor::{Rect, compose_pane};
 use crate::emulator::AlacrittyEmulator;
-use crate::replay::{Recording, parse_duration};
+use crate::replay::{Recording, SearchResult, SearchSnapshot, parse_duration};
 use crate::seg::{self, Line, Tok, seg};
 
 /// Seek granularity for the `←`/`→` keys.
 const SEEK_STEP_MS: u64 = 5_000;
+/// Cap query normalization and substring work independently of recording size.
+const SEARCH_MAX_QUERY_BYTES: usize = 1024;
+type ReplayConfigVersion = (bool, u64, u64, u64, u64, u64, bool);
+
+fn replay_config_version(cfg: &ReplayConfig) -> ReplayConfigVersion {
+    (
+        cfg.enabled,
+        cfg.max_bytes_per_pane,
+        cfg.max_duration_secs,
+        cfg.keyframe_interval_ms,
+        cfg.keyframe_interval_bytes,
+        cfg.idle_threshold_ms,
+        cfg.persist,
+    )
+}
 /// Playback speeds cycled by `[` / `]`.
 const SPEEDS: &[f32] = &[0.25, 0.5, 1.0, 2.0, 4.0, 8.0];
 
@@ -74,6 +92,10 @@ pub struct ReplayOverlay {
     last_query: String,
     /// Transient status note (e.g. "skipped 4m idle", "no match").
     note: String,
+    search_worker: Option<SearchWorker>,
+    search_generation: u64,
+    search_recording_version: Option<(u64, u64)>,
+    search_config_version: Option<ReplayConfigVersion>,
 }
 
 impl ReplayOverlay {
@@ -97,7 +119,24 @@ impl ReplayOverlay {
             query: String::new(),
             last_query: String::new(),
             note: String::new(),
+            search_worker: None,
+            search_generation: 0,
+            search_recording_version: None,
+            search_config_version: None,
         }
+    }
+
+    /// Install the loop waker once the overlay enters the event loop. The worker
+    /// is lazy with respect to searches, but its thread is owned by this overlay.
+    pub fn set_search_waker(&mut self, waker: TerminalWaker) {
+        if self.search_worker.is_none() {
+            self.search_worker = SearchWorker::spawn(waker);
+        }
+    }
+
+    /// Remember the replay config generation present when the overlay opened.
+    pub fn set_search_config(&mut self, cfg: &ReplayConfig) {
+        self.search_config_version = Some(replay_config_version(cfg));
     }
 
     pub fn pane_id(&self) -> u32 {
@@ -215,6 +254,7 @@ impl ReplayOverlay {
     }
 
     fn run_search(&mut self, rec: &Recording, reverse: bool) {
+        self.cancel_search();
         let q = if self.query.trim().is_empty() {
             self.last_query.clone()
         } else {
@@ -240,13 +280,82 @@ impl ReplayOverlay {
             );
             return;
         }
-        match rec.search_next(&q, self.cursor_ms, reverse) {
-            Some(at) => {
-                self.seek(rec, at);
-                self.note = format!("match: {q}");
-            }
-            None => self.note = format!("no match: {q}"),
+        let Some(worker) = self.search_worker.as_mut() else {
+            self.note = "search unavailable".into();
+            return;
+        };
+        worker.submit(
+            self.search_generation,
+            rec.version(),
+            q,
+            self.cursor_ms,
+            reverse,
+            rec.search_snapshot(),
+        );
+        self.search_recording_version = Some(rec.version());
+        self.note = "searching…".into();
+    }
+
+    /// Drain a completed search on the loop. Results are applied only for the
+    /// current recording identity and query generation.
+    pub fn drain_search_result(&mut self, rec: &Recording) -> bool {
+        let Some(worker) = self.search_worker.as_mut() else {
+            return false;
+        };
+        let Ok(result) = worker.try_result() else {
+            return false;
+        };
+        let (generation, recording_id, query, result) = result;
+        if generation != self.search_generation
+            || recording_id.0 != rec.version().0
+            || query != self.last_query
+        {
+            return false;
         }
+        self.search_recording_version = None;
+        match result {
+            SearchResult::Match(at) => {
+                if at < rec.start_ms() {
+                    self.note = format!("match evicted: {query}");
+                } else {
+                    self.seek(rec, at);
+                    self.note = format!("match: {query}");
+                }
+            }
+            SearchResult::NoMatch => self.note = format!("no match: {query}"),
+            SearchResult::Incomplete => self.note = format!("search incomplete: {query}"),
+            SearchResult::Cancelled => return false,
+        }
+        true
+    }
+
+    /// Config reload may replace a pane's recording while replay stays open.
+    /// Appends and ring eviction keep the same identity and do not cancel work.
+    pub fn invalidate_changed_recording(&mut self, rec: &Recording) -> bool {
+        if self
+            .search_recording_version
+            .is_some_and(|version| version.0 != rec.version().0)
+        {
+            self.cancel_search();
+            self.note = "search cancelled: recording changed".into();
+            return true;
+        }
+        false
+    }
+
+    /// Cancel active work if live replay settings changed during a search.
+    pub fn invalidate_changed_config(&mut self, cfg: &ReplayConfig) -> bool {
+        let version = replay_config_version(cfg);
+        let changed = self
+            .search_config_version
+            .is_some_and(|previous| previous != version);
+        self.search_config_version = Some(version);
+        if changed && self.search_recording_version.is_some() {
+            self.cancel_search();
+            self.note = "search cancelled: replay config changed".into();
+            return true;
+        }
+        false
     }
 
     /// Feed a key. `rec` is the pane's recording (bounds + reconstruction).
@@ -254,6 +363,7 @@ impl ReplayOverlay {
         // ── Search input sub-mode captures typing ──────────────────────────────
         if self.searching {
             if crate::input::is_escape_key(key) {
+                self.cancel_search();
                 self.searching = false;
                 self.query.clear();
                 return ReplayOutcome::Pending;
@@ -264,12 +374,18 @@ impl ReplayOverlay {
                     self.run_search(rec, false);
                 }
                 KeyCode::Backspace => {
+                    self.cancel_search();
                     self.query.pop();
                 }
                 KeyCode::Char(c)
                     if (mods.is_empty() || mods == Modifiers::SHIFT) && !c.is_control() =>
                 {
-                    self.query.push(*c);
+                    self.cancel_search();
+                    if self.query.len().saturating_add(c.len_utf8()) <= SEARCH_MAX_QUERY_BYTES {
+                        self.query.push(*c);
+                    } else {
+                        self.note = format!("search query limit: {SEARCH_MAX_QUERY_BYTES} bytes");
+                    }
                 }
                 _ => {}
             }
@@ -282,10 +398,14 @@ impl ReplayOverlay {
             || (mods.contains(Modifiers::CTRL)
                 && matches!(key, KeyCode::Char('g') | KeyCode::Char('c')))
         {
+            self.cancel_search();
             return ReplayOutcome::Dismiss;
         }
 
         self.note.clear();
+        if !matches!(key, KeyCode::Char('n') | KeyCode::Char('N')) {
+            self.cancel_search();
+        }
         match key {
             KeyCode::Char(' ') => self.toggle_play(),
             KeyCode::LeftArrow => self.seek(rec, self.cursor_ms.saturating_sub(SEEK_STEP_MS)),
@@ -310,6 +430,7 @@ impl ReplayOverlay {
                 self.last_tick = None;
             }
             KeyCode::Char('/') => {
+                self.cancel_search();
                 self.searching = true;
                 self.query.clear();
             }
@@ -320,6 +441,14 @@ impl ReplayOverlay {
             _ => {}
         }
         ReplayOutcome::Pending
+    }
+
+    fn cancel_search(&mut self) {
+        self.search_generation = self.search_generation.wrapping_add(1);
+        if let Some(worker) = self.search_worker.as_mut() {
+            worker.cancel();
+        }
+        self.search_recording_version = None;
     }
 
     /// Draw the scratch grid over `rect`, with a scrub/status bar on the bottom
@@ -409,6 +538,139 @@ impl ReplayOverlay {
             ];
             seg::draw_line(surface, rect.x, by, rect.cols, &Line::segs(prompt), panel);
         }
+    }
+}
+
+struct SearchJob {
+    generation: u64,
+    recording_version: (u64, u64),
+    query: String,
+    from_ms: u64,
+    reverse: bool,
+    snapshot: SearchSnapshot,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct SearchWorkerState {
+    pending: Option<SearchJob>,
+    stopped: bool,
+}
+
+/// One parked, overlay-owned worker. It runs at most one scan and retains at
+/// most one replaceable pending snapshot. Including the loop's temporary
+/// capture, peak snapshot ownership is three bounded copies regardless of
+/// submission rate; no thread is created per query.
+struct SearchWorker {
+    state: Arc<(Mutex<SearchWorkerState>, Condvar)>,
+    results: Receiver<(u64, (u64, u64), String, SearchResult)>,
+    active_cancel: Option<Arc<AtomicBool>>,
+}
+
+impl SearchWorker {
+    fn spawn(waker: TerminalWaker) -> Option<Self> {
+        let state = Arc::new((Mutex::new(SearchWorkerState::default()), Condvar::new()));
+        let thread_state = state.clone();
+        let (result_tx, results) = mpsc::sync_channel(1);
+        match std::thread::Builder::new()
+            .name("replay-search".into())
+            .spawn(move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+                loop {
+                    let job = {
+                        let (lock, cv) = &*thread_state;
+                        let mut guard = lock
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        while guard.pending.is_none() && !guard.stopped {
+                            guard = cv
+                                .wait(guard)
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        }
+                        if guard.stopped {
+                            return;
+                        }
+                        guard.pending.take().expect("pending job checked")
+                    };
+                    let result =
+                        job.snapshot
+                            .search(&job.query, job.from_ms, job.reverse, &job.cancelled);
+                    if result != SearchResult::Cancelled
+                        && !job.cancelled.load(Ordering::Relaxed)
+                        && result_tx
+                            .send((job.generation, job.recording_version, job.query, result))
+                            .is_ok()
+                        && let Err(error) = waker.wake()
+                    {
+                        tracing::debug!(%error, "could not wake loop for replay search result");
+                    }
+                }
+            }) {
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!(%error, "could not spawn replay search worker");
+                return None;
+            }
+        }
+        Some(Self {
+            state,
+            results,
+            active_cancel: None,
+        })
+    }
+
+    fn submit(
+        &mut self,
+        generation: u64,
+        recording_version: (u64, u64),
+        query: String,
+        from_ms: u64,
+        reverse: bool,
+        snapshot: SearchSnapshot,
+    ) {
+        self.cancel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.active_cancel = Some(cancelled.clone());
+        let (lock, cv) = &*self.state;
+        let mut guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.pending = Some(SearchJob {
+            generation,
+            recording_version,
+            query,
+            from_ms,
+            reverse,
+            snapshot,
+            cancelled,
+        });
+        drop(guard);
+        cv.notify_one();
+    }
+
+    fn cancel(&mut self) {
+        if let Some(cancelled) = self.active_cancel.take() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+        let (lock, _) = &*self.state;
+        lock.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending = None;
+    }
+
+    fn try_result(&self) -> Result<(u64, (u64, u64), String, SearchResult), TryRecvError> {
+        self.results.try_recv()
+    }
+}
+
+impl Drop for SearchWorker {
+    fn drop(&mut self) {
+        self.cancel();
+        let (lock, cv) = &*self.state;
+        lock.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stopped = true;
+        cv.notify_one();
     }
 }
 
@@ -666,8 +928,14 @@ mod tests {
 
     #[test]
     fn search_submode_types_then_jumps() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
         let rec = recording_with(&[(b"alpha\r\n", 10), (b"beta\r\n", 20)]);
         let mut ov = ReplayOverlay::new(1, &rec, 1000);
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        ov.set_search_waker(waker);
         // Start at the tail; reverse-search for alpha via / then n? Use forward
         // from start: jump to start first.
         ov.handle_key(&KeyCode::Char('g'), Modifiers::NONE, &rec);
@@ -677,8 +945,137 @@ mod tests {
         }
         ov.handle_key(&KeyCode::Enter, Modifiers::NONE, &rec);
         assert!(!ov.searching);
+        assert_eq!(ov.note, "searching…", "search work returns before the scan");
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while ov.note == "searching…" && Instant::now() < deadline {
+            ov.drain_search_result(&rec);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(ov.note, "match: beta");
         // Landed on a frame that shows "beta".
         assert!(grid_text(&ov.scratch).contains("beta"));
+    }
+
+    #[test]
+    fn rapid_query_replacement_publishes_only_the_latest_result() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let rec = recording_with(&[(b"alpha\r\n", 10), (b"beta\r\n", 20)]);
+        let mut ov = ReplayOverlay::new(1, &rec, 1000);
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        ov.set_search_waker(waker);
+        ov.handle_key(&KeyCode::Char('g'), Modifiers::NONE, &rec);
+
+        ov.handle_key(&KeyCode::Char('/'), Modifiers::NONE, &rec);
+        for c in "alpha".chars() {
+            ov.handle_key(&KeyCode::Char(c), Modifiers::NONE, &rec);
+        }
+        ov.handle_key(&KeyCode::Enter, Modifiers::NONE, &rec);
+        let stale_cancel = ov
+            .search_worker
+            .as_ref()
+            .and_then(|worker| worker.active_cancel.clone())
+            .expect("submitted search owns a cancel flag");
+
+        ov.handle_key(&KeyCode::Char('/'), Modifiers::NONE, &rec);
+        assert!(stale_cancel.load(Ordering::Relaxed));
+        for c in "beta".chars() {
+            ov.handle_key(&KeyCode::Char(c), Modifiers::NONE, &rec);
+        }
+        ov.handle_key(&KeyCode::Enter, Modifiers::NONE, &rec);
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while ov.note == "searching…" && Instant::now() < deadline {
+            ov.drain_search_result(&rec);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(ov.note, "match: beta");
+        assert!(grid_text(&ov.scratch).contains("beta"));
+    }
+
+    #[test]
+    fn search_survives_append_with_eviction_and_reports_evicted_match() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let mut rec = Recording::from_config(
+            &ReplayConfig {
+                max_bytes_per_pane: 256,
+                keyframe_interval_bytes: u64::MAX,
+                keyframe_interval_ms: u64::MAX,
+                ..ReplayConfig::default()
+            },
+            24,
+            80,
+        );
+        let epoch = rec.epoch();
+        rec.push_bytes(b"old", epoch);
+        rec.push_bytes(b"\r\nnew", epoch + std::time::Duration::from_millis(10));
+        let mut ov = ReplayOverlay::new(1, &rec, 1000);
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        ov.set_search_waker(waker);
+        ov.last_query = "old".into();
+        ov.run_search(&rec, true);
+        let old_version = ov.search_recording_version;
+
+        rec.push_bytes(&[b'x'; 1024], epoch + std::time::Duration::from_millis(20));
+        assert_ne!(old_version, Some(rec.version()));
+        assert!(!ov.invalidate_changed_recording(&rec));
+        assert_eq!(ov.note, "searching…");
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while ov.note == "searching…" && Instant::now() < deadline {
+            ov.drain_search_result(&rec);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(ov.note, "match evicted: old");
+    }
+
+    #[test]
+    fn replay_config_change_invalidates_an_in_flight_search() {
+        let rec = recording_with(&[(b"old", 10)]);
+        let mut ov = ReplayOverlay::new(1, &rec, 1000);
+        let original = ReplayConfig::default();
+        ov.set_search_config(&original);
+        ov.search_recording_version = Some(rec.version());
+        let changed = ReplayConfig {
+            max_bytes_per_pane: original.max_bytes_per_pane + 1,
+            ..original
+        };
+
+        assert!(ov.invalidate_changed_config(&changed));
+        assert!(ov.search_recording_version.is_none());
+        assert_eq!(ov.note, "search cancelled: replay config changed");
+    }
+
+    #[test]
+    fn dropping_overlay_cancels_and_retires_its_worker() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let rec = recording_with(&[(b"alpha", 10)]);
+        let mut ov = ReplayOverlay::new(1, &rec, 1000);
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        ov.set_search_waker(waker);
+        ov.handle_key(&KeyCode::Char('/'), Modifiers::NONE, &rec);
+        ov.handle_key(&KeyCode::Char('a'), Modifiers::NONE, &rec);
+        ov.handle_key(&KeyCode::Enter, Modifiers::NONE, &rec);
+        let worker = ov.search_worker.as_ref().expect("worker installed");
+        let cancelled = worker
+            .active_cancel
+            .as_ref()
+            .expect("search submitted")
+            .clone();
+        let state = worker.state.clone();
+        drop(ov);
+
+        assert!(cancelled.load(Ordering::Relaxed));
+        let guard = state.0.lock().unwrap();
+        assert!(guard.stopped);
+        assert!(guard.pending.is_none());
     }
 
     #[test]
