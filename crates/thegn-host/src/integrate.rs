@@ -3000,6 +3000,7 @@ mod tests {
         repo.commit("data.txt", "mainline\n", "main edit");
         let ours = repo.out(&["rev-parse", "main"]);
         let theirs = repo.out(&["rev-parse", "feat"]);
+        #[expect(clippy::disallowed_methods)]
         let merge_tree = util::git_cmd(&repo.dir)
             .args(["merge-tree", "--write-tree", &ours, &theirs])
             .output()
@@ -3109,6 +3110,7 @@ mod tests {
 
         let ours = repo.out(&["rev-parse", "main"]);
         let theirs = repo.out(&["rev-parse", "feat"]);
+        #[expect(clippy::disallowed_methods)]
         let merge_tree = util::git_cmd(&repo.dir)
             .args(["merge-tree", "--write-tree", &ours, &theirs])
             .output()
