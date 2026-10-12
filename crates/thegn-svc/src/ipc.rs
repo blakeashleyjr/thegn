@@ -686,13 +686,24 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, IpcL
 /// Create and owner-restrict a Unix socket's parent directory. Unix endpoint
 /// parents are hardened for both local-admin and token-only listeners.
 pub fn prepare_control_directory(path: &Path, _require_hardening: bool) -> io::Result<()> {
-    std::fs::create_dir_all(path)?;
+    // Windows control endpoints are named pipes, so their security comes from
+    // the pipe DACL and there is no filesystem parent to harden.
+    if cfg!(windows) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(path).map_err(|error| {
+        io_error_with_path_context(
+            error,
+            "prepare control socket directory; move [daemon] socket into a private directory",
+            path,
+        )
+    })?;
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "control socket parent {} must not be a symlink",
+                "control socket parent {} must not be a symlink; move [daemon] socket into a private directory",
                 path.display()
             ),
         ));
@@ -700,7 +711,13 @@ pub fn prepare_control_directory(path: &Path, _require_hardening: bool) -> io::R
     let result = thegn_core::fsperm::restrict_dir_to_owner(path);
     #[cfg(unix)]
     let result = result.and_then(|()| verify_unix_owner_mode(path, 0o700, true));
-    result
+    result.map_err(|error| {
+        io_error_with_path_context(
+            error,
+            "harden control socket directory; move [daemon] socket into a private directory",
+            path,
+        )
+    })
 }
 
 /// Read-only hardening status used by `thegn doctor`.
@@ -1002,6 +1019,15 @@ mod tests {
         };
         assert_eq!(shared_error.kind(), io::ErrorKind::PermissionDenied);
 
+        let not_a_directory = dir.join("not-a-directory");
+        std::fs::write(&not_a_directory, b"file").unwrap();
+        let directory_error = prepare_control_directory(&not_a_directory, false).unwrap_err();
+        assert!(
+            directory_error
+                .to_string()
+                .contains("move [daemon] socket into a private directory")
+        );
+
         let lock_sock = dir.join("replace.sock");
         let lock_link = dir.join("replace.sock.lock");
         let lock_target = dir.join("lock-target");
@@ -1012,7 +1038,12 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("token-only bind must reject a replaceable lock path"),
         };
-        assert_eq!(lock_error.raw_os_error(), Some(libc::ELOOP));
+        let lock_context = lock_error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<IoPathContext>())
+            .expect("lock open error retains path context");
+        assert!(lock_error.to_string().contains("open control socket lock"));
+        assert_eq!(lock_context.source.raw_os_error(), Some(libc::ELOOP));
         assert!(
             !lock_sock.exists(),
             "failed lock acquisition must not create the endpoint"
