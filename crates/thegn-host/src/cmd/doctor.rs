@@ -179,13 +179,19 @@ fn sandbox_json(cfg: &Config) -> serde_json::Value {
 /// mention in a prompt or a longer option name cannot trigger the warning.
 fn has_full_access_token(command: &str) -> bool {
     command.split_whitespace().any(|token| {
+        let token = token.trim_matches(['\'', '"']);
+        let value = token
+            .rsplit_once('=')
+            .map(|(_, value)| value)
+            .unwrap_or(token)
+            .trim_matches(['\'', '"']);
         matches!(
-            token.trim_matches(['\'', '"']),
+            token,
             "--dangerously-skip-permissions"
                 | "--dangerously-bypass-approvals-and-sandbox"
                 | "--yolo"
                 | "danger-full-access"
-        )
+        ) || value == "danger-full-access"
     })
 }
 
@@ -4245,19 +4251,25 @@ mod tests {
         assert!(!has_full_access_token(
             "agent prompt-mentions-danger-full-access"
         ));
+        assert!(has_full_access_token("codex --sandbox=danger-full-access"));
+        assert!(has_full_access_token(
+            "codex -c sandbox_mode=\"danger-full-access\""
+        ));
     }
 
     #[test]
     fn pipeline_stage_warning_uses_effective_agent_command_and_containment() {
-        let mut cfg = Config::default();
-        cfg.agents = vec![
-            toml::from_str(
-                r#"name = "unsafe"
+        let mut cfg = Config {
+            agents: vec![
+                toml::from_str(
+                    r#"name = "unsafe"
 command = "claude --dangerously-skip-permissions"
 "#,
-            )
-            .unwrap(),
-        ];
+                )
+                .unwrap(),
+            ],
+            ..Config::default()
+        };
         cfg.pipeline.stages = vec![
             toml::from_str(
                 r#"name = "coder"
