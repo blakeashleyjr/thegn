@@ -431,6 +431,7 @@ done
             IssueCaps {
                 comments: true,
                 labels: false,
+                ..Default::default()
             },
         )
         .unwrap();

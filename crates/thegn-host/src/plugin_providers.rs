@@ -74,6 +74,7 @@ mod tests {
         let caps = IssueCaps {
             comments: true,
             labels: false,
+            ..Default::default()
         };
         set_issue_providers(vec![("demo".into(), "Demo".into(), bridge, caps)]);
         let backends = issue_backends();

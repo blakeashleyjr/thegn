@@ -202,6 +202,33 @@ fn get_issue_comments_selection_matches_recorded_schema() {
 }
 
 #[test]
+fn list_pagination_selection_matches_recorded_schema() {
+    let query = build_list_query(&IssueFilter::default(), None);
+    let mut errors = Vec::new();
+    check_selection(
+        "hasNextPage endCursor",
+        "PageInfo",
+        "IssueConnection.pageInfo",
+        &mut errors,
+    );
+    assert!(
+        errors.is_empty(),
+        "list connection selection drifted:\n{}",
+        errors.join("\n")
+    );
+    assert_eq!(schema()["types"]["IssueConnection"]["pageInfo"], "PageInfo");
+    assert!(query.contains("pageInfo { hasNextPage endCursor }"));
+}
+
+#[test]
+fn list_page_query_escapes_cursor_and_uses_requested_page_size() {
+    let query = build_list_page_query(&IssueFilter::default(), None, Some("cursor\"x"), 17);
+    assert!(query.contains("first: 17"), "{query}");
+    assert!(query.contains(r#"after: "cursor\"x""#), "{query}");
+    assert!(braces_balanced(&query), "{query}");
+}
+
+#[test]
 fn create_mutation_selects_the_same_fields_as_issue_fields() {
     let mutation = build_create_mutation();
     assert!(

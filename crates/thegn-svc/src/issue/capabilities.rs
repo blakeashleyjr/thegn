@@ -1,8 +1,8 @@
-//! Optional operations exposed by an issue provider.
+//! Write fields and optional operations exposed by an issue provider.
 //!
-//! The capability bits are deliberately limited to operations that exist on
-//! [`super::IssueBackend`].  A provider must declare a bit before the router
-//! may ask it to perform that operation; omitted plugin capabilities therefore
+//! A provider must declare a write-field bit before the router may ask it to
+//! apply that field. Optional operation bits likewise describe methods that
+//! exist on [`super::IssueBackend`]. Omitted plugin capabilities therefore
 //! degrade locally and never cause an unnecessary RPC round trip.
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,14 @@ use serde::{Deserialize, Serialize};
 )]
 #[serde(default, deny_unknown_fields)]
 pub struct IssueCaps {
+    /// The provider can change an issue's workflow status.
+    pub patch_status: bool,
+    /// The provider can change an issue's title.
+    pub patch_title: bool,
+    /// The provider can assign or unassign the current user.
+    pub patch_assignee_me: bool,
+    /// The provider can change an issue's priority.
+    pub patch_priority: bool,
     /// The provider can create comments on issues.
     pub comments: bool,
     /// The provider can attach and detach labels on issues.
@@ -61,5 +69,14 @@ mod tests {
     fn unknown_caps_are_rejected() {
         let err = IssueCaps::from_json(&serde_json::json!({ "comment": true })).unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn patch_caps_are_least_privilege_when_omitted() {
+        let caps = IssueCaps::from_json(&serde_json::json!({"patch_title": true})).unwrap();
+        assert!(caps.patch_title);
+        assert!(!caps.patch_status);
+        assert!(!caps.patch_assignee_me);
+        assert!(!caps.patch_priority);
     }
 }
