@@ -18,6 +18,8 @@ use thegn_core::voice::{VoiceCaps, VoiceError, VoiceProvider};
 
 pub const MAX_WAV_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_TRANSCRIPT_BYTES: usize = 1024 * 1024;
+const TERMINATE_GRACE: Duration = Duration::from_millis(60);
+const WORKER_SETTLE: Duration = Duration::from_millis(60);
 
 /// The external command provider selected by `[voice] kind = "command"`.
 #[derive(Debug, Clone)]
@@ -87,9 +89,7 @@ impl VoiceProvider for CommandVoiceProvider {
 }
 
 impl CommandVoiceProvider {
-    /// Run one transcription while allowing the host worker to terminate it.
-    /// The public provider seam remains synchronous; the host owns the worker
-    /// and cancellation flag around this blocking implementation.
+    /// Run one transcription with a cancellation flag and one total deadline.
     pub fn transcribe_push_to_talk_cancellable(
         &self,
         wav: &[u8],
@@ -131,21 +131,21 @@ impl CommandVoiceProvider {
         let mut stdin = match child.stdin.take() {
             Some(stdin) => stdin,
             None => {
-                terminate_child(&mut child);
+                terminate_child(child);
                 return Err(VoiceError::Failed("transcriber stdin unavailable".into()));
             }
         };
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                terminate_child(&mut child);
+                terminate_child(child);
                 return Err(VoiceError::Failed("transcriber stdout unavailable".into()));
             }
         };
         let stderr = match child.stderr.take() {
             Some(stderr) => stderr,
             None => {
-                terminate_child(&mut child);
+                terminate_child(child);
                 return Err(VoiceError::Failed("transcriber stderr unavailable".into()));
             }
         };
@@ -184,21 +184,24 @@ impl CommandVoiceProvider {
         let mut error = None;
         let status = loop {
             if cancelled.load(Ordering::Acquire) {
-                terminate_child(&mut child);
-                workers.discard(written, output, error);
-                return Err(VoiceError::Failed("transcriber cancelled".into()));
+                let terminated = terminate_child(child);
+                let settled = workers.discard(written, output, error);
+                return Err(shutdown_error("transcriber cancelled", terminated, settled));
             }
             if Instant::now() >= deadline {
-                terminate_child(&mut child);
-                workers.discard(written, output, error);
-                return Err(VoiceError::Failed("transcriber timed out".into()));
+                let terminated = terminate_child(child);
+                let settled = workers.discard(written, output, error);
+                return Err(shutdown_error("transcriber timed out", terminated, settled));
             }
             if written.is_none() {
                 written = try_recv(&workers.write_rx);
                 if let Some(Err(reason)) = written.as_ref() {
                     let reason = reason.clone();
-                    terminate_child(&mut child);
-                    workers.discard(written, output, error);
+                    let terminated = terminate_child(child);
+                    let settled = workers.discard(written, output, error);
+                    if !terminated || !settled {
+                        return Err(VoiceError::UnresolvedProcess(reason));
+                    }
                     return Err(VoiceError::Failed(reason));
                 }
             }
@@ -206,8 +209,11 @@ impl CommandVoiceProvider {
                 output = try_recv(&workers.out_rx);
                 if let Some(Err(reason)) = output.as_ref() {
                     let reason = reason.clone();
-                    terminate_child(&mut child);
-                    workers.discard(written, output, error);
+                    let terminated = terminate_child(child);
+                    let settled = workers.discard(written, output, error);
+                    if !terminated || !settled {
+                        return Err(VoiceError::UnresolvedProcess(reason));
+                    }
                     return Err(VoiceError::Failed(reason));
                 }
             }
@@ -215,8 +221,13 @@ impl CommandVoiceProvider {
                 error = try_recv(&workers.err_rx);
                 if let Some(Err(reason)) = error.as_ref() {
                     let reason = reason.clone();
-                    terminate_child(&mut child);
-                    workers.discard(written, output, error);
+                    let terminated = terminate_child(child);
+                    let settled = workers.discard(written, output, error);
+                    if !terminated || !settled {
+                        return Err(VoiceError::UnresolvedProcess(
+                            "transcriber output exceeded or failed".into(),
+                        ));
+                    }
                     return Err(VoiceError::Failed(reason));
                 }
             }
@@ -224,8 +235,13 @@ impl CommandVoiceProvider {
                 Ok(Some(status)) => break status,
                 Ok(None) => thread::sleep(Duration::from_millis(5)),
                 Err(e) => {
-                    terminate_child(&mut child);
-                    workers.discard(written, output, error);
+                    let terminated = terminate_child(child);
+                    let settled = workers.discard(written, output, error);
+                    if !terminated || !settled {
+                        return Err(VoiceError::UnresolvedProcess(format!(
+                            "wait for transcriber: {e}"
+                        )));
+                    }
                     return Err(VoiceError::Failed(format!("wait for transcriber: {e}")));
                 }
             }
@@ -234,7 +250,16 @@ impl CommandVoiceProvider {
         // pipes. Close that whole process group before joining helpers so an
         // otherwise successful child cannot leave a reader or writer behind.
         if written.is_none() || output.is_none() || error.is_none() {
-            terminate_child(&mut child);
+            if !terminate_child(child) {
+                if !workers.discard(written, output, error) {
+                    tracing::warn!(
+                        "voice transcriber pipe workers did not settle after child exit"
+                    );
+                }
+                return Err(VoiceError::UnresolvedProcess(
+                    "transcriber process tree remained live after termination".into(),
+                ));
+            }
         }
         let (out, err) = workers.join(written, output, error)?;
         if !status.success() {
@@ -265,8 +290,8 @@ impl TranscriberWorkers {
         written: Option<Result<(), String>>,
         output: Option<Result<Vec<u8>, String>>,
         error: Option<Result<Vec<u8>, String>>,
-    ) {
-        let _ = self.join(written, output, error);
+    ) -> bool {
+        self.join(written, output, error).is_ok()
     }
 
     fn join(
@@ -283,6 +308,18 @@ impl TranscriberWorkers {
             out_rx,
             err_rx,
         } = self;
+        let deadline = Instant::now() + WORKER_SETTLE;
+        while Instant::now() < deadline
+            && !(write.is_finished() && out.is_finished() && err.is_finished())
+        {
+            thread::sleep(Duration::from_millis(2));
+        }
+        if !(write.is_finished() && out.is_finished() && err.is_finished()) {
+            drop((write, out, err));
+            return Err(VoiceError::UnresolvedProcess(
+                "transcriber pipe worker did not stop before its deadline".into(),
+            ));
+        }
         let write_joined = write.join().is_ok();
         let out_joined = out.join().is_ok();
         let err_joined = err.join().is_ok();
@@ -321,12 +358,52 @@ fn try_recv<T>(rx: &Receiver<Result<T, String>>) -> Option<Result<T, String>> {
     rx.try_recv().ok()
 }
 
-fn terminate_child(child: &mut Child) {
+fn terminate_child(mut child: Child) -> bool {
     // The command is isolated in the plugin process seam's process group/job,
     // so descendants cannot retain our pipes after cancellation or timeout.
     crate::plugin::proc::kill_group(child.id());
-    let _ = child.kill(); // best-effort: the child may have exited already
-    let _ = child.wait(); // best-effort: reap after termination
+    if let Err(kill_error) = child.kill() {
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => tracing::warn!(%kill_error, "voice transcriber child kill failed"),
+            Err(wait_error) => {
+                tracing::warn!(%kill_error, %wait_error, "voice transcriber child kill and wait failed")
+            }
+        }
+    }
+    let deadline = Instant::now() + TERMINATE_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(2)),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    match thread::Builder::new()
+        .name("voice-transcriber-reaper".into())
+        .spawn(move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            if let Err(error) = child.wait() {
+                tracing::warn!(%error, "voice transcriber reaper failed");
+            }
+        }) {
+        Ok(_) => false,
+        Err(error) => {
+            // Reaper creation failure is returned as UnresolvedProcess; Child
+            // drops here as the documented degraded last resort rather than
+            // extending this API beyond its cleanup deadline.
+            tracing::error!(%error, "voice transcriber child could not be handed to reaper");
+            false
+        }
+    }
+}
+
+fn shutdown_error(context: &str, terminated: bool, settled: bool) -> VoiceError {
+    if terminated && settled {
+        VoiceError::Failed(context.into())
+    } else {
+        VoiceError::UnresolvedProcess(format!("{context}; termination or worker join unresolved"))
+    }
 }
 
 fn read_capped(reader: &mut impl Read, cap: usize) -> Result<Vec<u8>, String> {
@@ -416,5 +493,43 @@ mod tests {
             .unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(2));
         assert!(err.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn failed_termination_or_worker_settle_is_reported_as_unresolved() {
+        assert!(matches!(
+            shutdown_error("transcriber timed out", false, true),
+            VoiceError::UnresolvedProcess(_)
+        ));
+        assert!(matches!(
+            shutdown_error("transcriber cancelled", true, false),
+            VoiceError::UnresolvedProcess(_)
+        ));
+        assert!(matches!(
+            shutdown_error("transcriber cancelled", true, true),
+            VoiceError::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn stalled_pipe_worker_does_not_make_provider_cleanup_unbounded() {
+        let (write_tx, write_rx) = mpsc::channel();
+        let (out_tx, out_rx) = mpsc::channel();
+        let (err_tx, err_rx) = mpsc::channel();
+        let write = thread::spawn(|| thread::sleep(Duration::from_millis(300)));
+        let out = thread::spawn(|| {});
+        let err = thread::spawn(|| {});
+        drop((write_tx, out_tx, err_tx));
+        let workers = TranscriberWorkers {
+            write,
+            out,
+            err,
+            write_rx,
+            out_rx,
+            err_rx,
+        };
+        let start = Instant::now();
+        assert!(!workers.discard(None, None, None));
+        assert!(start.elapsed() < Duration::from_millis(200));
     }
 }

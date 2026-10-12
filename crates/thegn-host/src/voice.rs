@@ -30,12 +30,22 @@ pub(crate) enum VoiceMessage {
         generation: u64,
         reason: String,
     },
+    CaptureUnresolved {
+        pane_id: u32,
+        generation: u64,
+        reason: String,
+    },
     TranscriptSucceeded {
         pane_id: u32,
         request_id: u64,
         transcript: String,
     },
     TranscriptFailed {
+        pane_id: u32,
+        request_id: u64,
+        reason: String,
+    },
+    TranscriptUnresolved {
         pane_id: u32,
         request_id: u64,
         reason: String,
@@ -60,8 +70,11 @@ pub(crate) struct VoiceController {
     tx: Sender<VoiceMessage>,
     rx: Receiver<VoiceMessage>,
     capture_stop: Option<Sender<CaptureCommand>>,
+    capture_worker: Option<thread::JoinHandle<()>>,
     capture_generation: u64,
     transcription_cancel: Option<(u64, Arc<AtomicBool>)>,
+    transcription_worker: Option<thread::JoinHandle<()>>,
+    shutdown_unresolved: bool,
 }
 
 impl VoiceController {
@@ -74,8 +87,11 @@ impl VoiceController {
             tx,
             rx,
             capture_stop: None,
+            capture_worker: None,
             capture_generation: 0,
             transcription_cancel: None,
+            transcription_worker: None,
+            shutdown_unresolved: false,
         }
     }
 
@@ -88,7 +104,19 @@ impl VoiceController {
     }
 
     pub(crate) fn is_recording(&self) -> bool {
-        self.state.is_recording()
+        self.state.is_recording() || self.shutdown_pending()
+    }
+
+    pub(crate) fn shutdown_pending(&self) -> bool {
+        self.shutdown_unresolved
+            || self
+                .capture_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+            || self
+                .transcription_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
     }
 
     pub(crate) fn messages(&self) -> &Receiver<VoiceMessage> {
@@ -96,18 +124,45 @@ impl VoiceController {
     }
 
     pub(crate) fn start_capture(&mut self, pane_id: u32, waker: &TerminalWaker) {
+        if self
+            .capture_worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+            || self
+                .transcription_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        {
+            if self
+                .tx
+                .send(VoiceMessage::CaptureFailed {
+                    pane_id,
+                    generation: self.capture_generation,
+                    reason: "previous voice capture has not shut down".into(),
+                })
+                .is_err()
+            {
+                tracing::debug!("voice loop closed before shutdown-pending notification");
+            }
+            if let Err(error) = waker.wake() {
+                tracing::trace!(%error, "voice shutdown-pending wake failed");
+            }
+            return;
+        }
+        self.join_finished_workers();
         self.capture_generation = self.capture_generation.saturating_add(1);
         let generation = self.capture_generation;
         let (stop_tx, stop_rx) = mpsc::channel();
         self.capture_stop = Some(stop_tx);
-        if !spawn_capture(
+        self.capture_worker = spawn_capture(
             self.cfg.clone(),
             pane_id,
             generation,
             stop_rx,
             self.tx.clone(),
             waker.clone(),
-        ) {
+        );
+        if self.capture_worker.is_none() {
             self.capture_stop = None;
             let _ = self.tx.send(VoiceMessage::CaptureFailed {
                 pane_id,
@@ -117,13 +172,6 @@ impl VoiceController {
             let _ = waker.wake();
             return;
         }
-        spawn_max_timer(
-            pane_id,
-            generation,
-            self.cfg.max_duration(),
-            self.tx.clone(),
-            waker.clone(),
-        );
     }
 
     pub(crate) fn stop_capture(&mut self) {
@@ -140,7 +188,8 @@ impl VoiceController {
         }
     }
 
-    pub(crate) fn transcription_finished(&mut self, request_id: u64) {
+    pub(crate) fn transcription_finished(&mut self, request_id: u64, unresolved: bool) {
+        self.shutdown_unresolved |= unresolved;
         if self
             .transcription_cancel
             .as_ref()
@@ -148,10 +197,13 @@ impl VoiceController {
         {
             self.transcription_cancel = None;
         }
+        self.join_finished_workers();
     }
 
-    pub(crate) fn capture_finished(&mut self) {
+    pub(crate) fn capture_finished(&mut self, unresolved: bool) {
+        self.shutdown_unresolved |= unresolved;
         self.capture_stop = None;
+        self.join_finished_workers();
     }
 
     pub(crate) fn capture_generation(&self) -> u64 {
@@ -170,7 +222,7 @@ impl VoiceController {
         let wk = waker.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         self.transcription_cancel = Some((request_id, cancel.clone()));
-        if thread::Builder::new()
+        match thread::Builder::new()
             .name("voice-transcribe".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
@@ -182,6 +234,13 @@ impl VoiceController {
                         request_id,
                         transcript,
                     },
+                    Err(thegn_core::voice::VoiceError::UnresolvedProcess(reason)) => {
+                        VoiceMessage::TranscriptUnresolved {
+                            pane_id,
+                            request_id,
+                            reason,
+                        }
+                    }
                     Err(e) => VoiceMessage::TranscriptFailed {
                         pane_id,
                         request_id,
@@ -190,16 +249,50 @@ impl VoiceController {
                 };
                 let _ = tx.send(msg); // best-effort: loop may have exited
                 let _ = wk.wake(); // best-effort: waker pulse
-            })
-            .is_err()
+            }) {
+            Ok(worker) => self.transcription_worker = Some(worker),
+            Err(_) => {
+                self.transcription_cancel = None;
+                if self
+                    .tx
+                    .send(VoiceMessage::TranscriptFailed {
+                        pane_id,
+                        request_id,
+                        reason: "voice transcription worker could not start".into(),
+                    })
+                    .is_err()
+                {
+                    tracing::debug!(
+                        "voice loop closed before transcription-start failure notification"
+                    );
+                }
+                if let Err(error) = waker.wake() {
+                    tracing::trace!(%error, "voice transcription-start failure wake failed");
+                }
+            }
+        }
+    }
+
+    fn join_finished_workers(&mut self) {
+        if self
+            .capture_worker
+            .as_ref()
+            .is_some_and(thread::JoinHandle::is_finished)
+            && let Some(worker) = self.capture_worker.take()
         {
-            self.transcription_cancel = None;
-            let _ = self.tx.send(VoiceMessage::TranscriptFailed {
-                pane_id,
-                request_id,
-                reason: "voice transcription worker could not start".into(),
-            });
-            let _ = waker.wake();
+            if worker.join().is_err() {
+                tracing::warn!("voice capture worker panicked");
+            }
+        }
+        if self
+            .transcription_worker
+            .as_ref()
+            .is_some_and(thread::JoinHandle::is_finished)
+            && let Some(worker) = self.transcription_worker.take()
+        {
+            if worker.join().is_err() {
+                tracing::warn!("voice transcription worker panicked");
+            }
         }
     }
 }
@@ -208,27 +301,21 @@ impl Drop for VoiceController {
     fn drop(&mut self) {
         self.stop_capture();
         self.cancel_transcription();
+        let deadline = std::time::Instant::now() + Duration::from_millis(10);
+        while std::time::Instant::now() < deadline
+            && (self
+                .capture_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+                || self
+                    .transcription_worker
+                    .as_ref()
+                    .is_some_and(|worker| !worker.is_finished()))
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        self.join_finished_workers();
     }
-}
-
-fn spawn_max_timer(
-    pane_id: u32,
-    generation: u64,
-    duration: Duration,
-    tx: Sender<VoiceMessage>,
-    waker: TerminalWaker,
-) {
-    let _ = thread::Builder::new()
-        .name("voice-max-duration".into())
-        .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            thread::sleep(duration);
-            let _ = tx.send(VoiceMessage::MaxDuration {
-                pane_id,
-                generation,
-            });
-            let _ = waker.wake(); // best-effort: waker pulse
-        });
 }
 
 fn spawn_capture(
@@ -238,7 +325,7 @@ fn spawn_capture(
     stop_rx: Receiver<CaptureCommand>,
     tx: Sender<VoiceMessage>,
     waker: TerminalWaker,
-) -> bool {
+) -> Option<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("voice-capture".into())
         .spawn(move || {
@@ -288,42 +375,83 @@ fn spawn_capture(
                 let _ = error_tx.send(read_capped(stderr, MAX_CAPTURE_BYTES));
             });
             let mut requested_stop = false;
+            let mut stop_deadline = None;
             let deadline = std::time::Instant::now() + max_duration;
             let mut output = None;
             let mut error = None;
             let status = loop {
                 match stop_rx.try_recv() {
                     Ok(CaptureCommand::Stop) => {
-                        requested_stop = true;
-                        kill_capture_child(&mut child, &group);
+                        if !requested_stop {
+                            requested_stop = true;
+                            stop_deadline =
+                                Some(std::time::Instant::now() + Duration::from_millis(200));
+                            kill_capture_child(&mut child, &group);
+                        }
                     }
                     Err(TryRecvError::Disconnected) => {
-                        requested_stop = true;
-                        kill_capture_child(&mut child, &group);
+                        if !requested_stop {
+                            requested_stop = true;
+                            stop_deadline =
+                                Some(std::time::Instant::now() + Duration::from_millis(200));
+                            kill_capture_child(&mut child, &group);
+                        }
                     }
                     Err(TryRecvError::Empty) => {}
                 }
                 if !requested_stop && std::time::Instant::now() >= deadline {
                     requested_stop = true;
+                    stop_deadline = Some(std::time::Instant::now() + Duration::from_millis(200));
+                    send_capture(
+                        &tx,
+                        &waker,
+                        VoiceMessage::MaxDuration {
+                            pane_id,
+                            generation,
+                        },
+                    );
                     kill_capture_child(&mut child, &group);
+                }
+                if stop_deadline.is_some_and(|until| std::time::Instant::now() >= until) {
+                    let process_stopped = terminate_capture_child(child, group);
+                    let readers_stopped = join_capture_workers(output_thread, error_thread);
+                    send_capture(
+                        &tx,
+                        &waker,
+                        capture_failure(
+                            pane_id,
+                            generation,
+                            if process_stopped && readers_stopped {
+                                "capture shutdown did not produce a complete result"
+                            } else {
+                                "capture process shutdown could not be proven"
+                            },
+                            !process_stopped || !readers_stopped,
+                        ),
+                    );
+                    return;
                 }
                 if output.is_none() {
                     output = output_rx.try_recv().ok();
                     if matches!(&output, Some(Err(_))) {
-                        terminate_capture_child(&mut child, &group);
-                        let _ = output_thread.join();
-                        let _ = error_thread.join();
+                        let process_stopped = terminate_capture_child(child, group);
+                        let readers_stopped = join_capture_workers(output_thread, error_thread);
                         let reason = output
                             .and_then(Result::err)
                             .unwrap_or_else(|| "capture output reader failed".into());
                         send_capture(
                             &tx,
                             &waker,
-                            VoiceMessage::CaptureFailed {
+                            capture_failure(
                                 pane_id,
                                 generation,
-                                reason,
-                            },
+                                if process_stopped && readers_stopped {
+                                    reason
+                                } else {
+                                    "capture shutdown unresolved after output failure".into()
+                                },
+                                !process_stopped || !readers_stopped,
+                            ),
                         );
                         return;
                     }
@@ -331,20 +459,24 @@ fn spawn_capture(
                 if error.is_none() {
                     error = error_rx.try_recv().ok();
                     if matches!(&error, Some(Err(_))) {
-                        terminate_capture_child(&mut child, &group);
-                        let _ = output_thread.join();
-                        let _ = error_thread.join();
+                        let process_stopped = terminate_capture_child(child, group);
+                        let readers_stopped = join_capture_workers(output_thread, error_thread);
                         let reason = error
                             .and_then(Result::err)
                             .unwrap_or_else(|| "capture error reader failed".into());
                         send_capture(
                             &tx,
                             &waker,
-                            VoiceMessage::CaptureFailed {
+                            capture_failure(
                                 pane_id,
                                 generation,
-                                reason,
-                            },
+                                if process_stopped && readers_stopped {
+                                    reason
+                                } else {
+                                    "capture shutdown unresolved after error-pipe failure".into()
+                                },
+                                !process_stopped || !readers_stopped,
+                            ),
                         );
                         return;
                     }
@@ -353,17 +485,21 @@ fn spawn_capture(
                     Ok(Some(status)) => break status,
                     Ok(None) => thread::sleep(Duration::from_millis(5)),
                     Err(e) => {
-                        terminate_capture_child(&mut child, &group);
-                        let _ = output_thread.join();
-                        let _ = error_thread.join();
+                        let process_stopped = terminate_capture_child(child, group);
+                        let readers_stopped = join_capture_workers(output_thread, error_thread);
                         send_capture(
                             &tx,
                             &waker,
-                            VoiceMessage::CaptureFailed {
+                            capture_failure(
                                 pane_id,
                                 generation,
-                                reason: format!("wait for capture: {e}"),
-                            },
+                                if process_stopped && readers_stopped {
+                                    format!("wait for capture: {e}")
+                                } else {
+                                    format!("capture shutdown unresolved after wait failure: {e}")
+                                },
+                                !process_stopped || !readers_stopped,
+                            ),
                         );
                         return;
                     }
@@ -373,19 +509,35 @@ fn spawn_capture(
             // pipes. Kill the grouped process tree before joining helpers so
             // no reader survives the utterance.
             if output.is_none() || error.is_none() {
-                terminate_capture_child(&mut child, &group);
+                if !terminate_capture_child(child, group) {
+                    let readers_stopped = join_capture_workers(output_thread, error_thread);
+                    send_capture(
+                        &tx,
+                        &waker,
+                        capture_failure(
+                            pane_id,
+                            generation,
+                            if readers_stopped {
+                                "capture process shutdown could not be proven"
+                            } else {
+                                "capture process and pipe-worker shutdown could not be proven"
+                            },
+                            true,
+                        ),
+                    );
+                    return;
+                }
             }
-            let output_joined = output_thread.join().is_ok();
-            let error_joined = error_thread.join().is_ok();
-            if !output_joined || !error_joined {
+            if !join_capture_workers(output_thread, error_thread) {
                 send_capture(
                     &tx,
                     &waker,
-                    VoiceMessage::CaptureFailed {
+                    capture_failure(
                         pane_id,
                         generation,
-                        reason: "capture pipe reader panicked".into(),
-                    },
+                        "capture pipe reader did not settle",
+                        true,
+                    ),
                 );
                 return;
             }
@@ -447,26 +599,109 @@ fn spawn_capture(
                 );
             }
         })
-        .is_ok()
+        .map_or_else(|_| None, Some)
 }
 
 #[expect(
     clippy::disallowed_methods,
     reason = "the off-loop capture worker must reap its child after termination"
 )]
-fn terminate_capture_child(child: &mut std::process::Child, group: &crate::platform::GroupHandle) {
-    kill_capture_child(child, group);
-    let _ = child.wait(); // best-effort: reap after termination
+fn terminate_capture_child(
+    mut child: std::process::Child,
+    group: crate::platform::GroupHandle,
+) -> bool {
+    group.kill();
+    if let Err(kill_error) = child.kill() {
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => tracing::warn!(%kill_error, "voice capture child kill failed"),
+            Err(wait_error) => {
+                tracing::warn!(%kill_error, %wait_error, "voice capture child kill and wait failed")
+            }
+        }
+    }
+    let until = std::time::Instant::now() + Duration::from_millis(60);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) if group.is_empty() => return true,
+            Ok(Some(_)) if std::time::Instant::now() < until => {
+                group.kill();
+                thread::sleep(Duration::from_millis(2));
+            }
+            Ok(None) if std::time::Instant::now() < until => {
+                thread::sleep(Duration::from_millis(2))
+            }
+            Ok(Some(_)) | Ok(None) | Err(_) => break,
+        }
+    }
+    match thread::Builder::new()
+        .name("voice-capture-reaper".into())
+        .spawn(move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            if let Err(error) = child.wait() {
+                tracing::warn!(%error, "voice capture reaper failed");
+            }
+        }) {
+        Ok(_) => false,
+        Err(error) => {
+            // The thread could not accept reaper ownership; returning false
+            // becomes CaptureUnresolved, and dropping Child here is the
+            // explicitly degraded last resort rather than an unbounded wait.
+            tracing::error!(%error, "voice capture child could not be handed to reaper");
+            false
+        }
+    }
+}
+
+fn join_capture_workers(output: thread::JoinHandle<()>, error: thread::JoinHandle<()>) -> bool {
+    let until = std::time::Instant::now() + Duration::from_millis(60);
+    while std::time::Instant::now() < until && !(output.is_finished() && error.is_finished()) {
+        thread::sleep(Duration::from_millis(2));
+    }
+    if !output.is_finished() || !error.is_finished() {
+        drop((output, error));
+        return false;
+    }
+    output.join().is_ok() && error.join().is_ok()
 }
 
 fn kill_capture_child(child: &mut std::process::Child, group: &crate::platform::GroupHandle) {
     group.kill();
-    let _ = child.kill(); // best-effort: the child may have exited already
+    if let Err(kill_error) = child.kill() {
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => tracing::warn!(%kill_error, "voice capture child kill failed"),
+            Err(wait_error) => {
+                tracing::warn!(%kill_error, %wait_error, "voice capture child kill and wait failed")
+            }
+        }
+    }
 }
 
 fn send_capture(tx: &Sender<VoiceMessage>, waker: &TerminalWaker, msg: VoiceMessage) {
     let _ = tx.send(msg); // best-effort: loop may have exited
     let _ = waker.wake(); // best-effort: waker pulse
+}
+
+fn capture_failure(
+    pane_id: u32,
+    generation: u64,
+    reason: impl Into<String>,
+    unresolved: bool,
+) -> VoiceMessage {
+    if unresolved {
+        VoiceMessage::CaptureUnresolved {
+            pane_id,
+            generation,
+            reason: reason.into(),
+        }
+    } else {
+        VoiceMessage::CaptureFailed {
+            pane_id,
+            generation,
+            reason: reason.into(),
+        }
+    }
 }
 
 fn read_capped(reader: impl Read, cap: usize) -> Result<Vec<u8>, String> {
@@ -519,5 +754,23 @@ mod tests {
         let recording = mode_chip(crate::keymap::Mode::Normal, false, true);
         assert!(recording.ends_with(" N"));
         assert!(!recording.is_empty());
+    }
+
+    #[test]
+    fn stalled_capture_reader_does_not_make_join_unbounded() {
+        let output = thread::spawn(|| thread::sleep(Duration::from_millis(300)));
+        let error = thread::spawn(|| {});
+        let start = std::time::Instant::now();
+        assert!(!join_capture_workers(output, error));
+        assert!(start.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn unresolved_shutdown_keeps_voice_visibly_busy() {
+        let mut controller = VoiceController::new(VoiceConfig::default());
+        assert!(!controller.shutdown_pending());
+        controller.shutdown_unresolved = true;
+        assert!(controller.shutdown_pending());
+        assert!(controller.is_recording());
     }
 }
