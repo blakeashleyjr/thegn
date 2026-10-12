@@ -458,7 +458,14 @@ async fn mpd_client(opts: &mut ResolveOpts) -> Option<MediaClient> {
     if opts.mpd_socket.is_empty() {
         return None;
     }
-    let endpoint = mpd::MpdEndpoint::resolve(&opts.mpd_socket, opts.mpd_password.take());
+    let endpoint = match mpd::MpdEndpoint::resolve(&opts.mpd_socket, opts.mpd_password.take()) {
+        Ok(ep) => ep,
+        Err(e) => {
+            // Configuration error: surface it, never dial a guessed endpoint.
+            tracing::warn!(target: "thegn::media", error = %e, "invalid [media.mpd] socket; MPD disabled");
+            return None;
+        }
+    };
     match mpd::Mpd::connect(endpoint).await {
         Ok(m) => {
             tracing::debug!(target: "thegn::media", "media backend: native MPD");
