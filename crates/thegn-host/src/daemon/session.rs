@@ -592,8 +592,8 @@ impl SessionActor {
             self.publish_state();
         }
 
-        // Tee to the recorder (the raw chunk, exactly as it arrived). A single
-        // null check when off; finalize inline if this chunk crossed the cap.
+        // Tee to the recorder (the raw chunk, exactly as it arrived). Admission
+        // is a nonblocking bounded enqueue; finalize once its worker is done.
         if let Some(rec) = self.recorder.as_mut() {
             rec.feed(bytes);
             if rec.done() {
@@ -1114,8 +1114,8 @@ impl SessionActor {
     /// clearing the live "recording" flag. Called on stop, size-cap, and exit.
     fn finalize_recording(&mut self) {
         if let Some(rec) = self.recorder.take() {
-            self.record_capped = rec.capped();
             let fin = rec.finish();
+            self.record_capped = fin.capped;
             // A recording that could not be flushed is truncated; say so on the
             // status reply (and in the log) instead of reporting it as saved.
             if let Some(reason) = &fin.truncated {
