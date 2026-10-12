@@ -26,6 +26,7 @@ pub enum VoiceError {
     NotInstalled(String),
     InvalidInput(String),
     Failed(String),
+    UnresolvedProcess(String),
     Unsupported(&'static str),
 }
 
@@ -36,6 +37,9 @@ impl std::fmt::Display for VoiceError {
             Self::NotInstalled(program) => write!(f, "voice command is not installed: {program}"),
             Self::InvalidInput(reason) => write!(f, "invalid voice input: {reason}"),
             Self::Failed(reason) => write!(f, "voice transcription failed: {reason}"),
+            Self::UnresolvedProcess(reason) => {
+                write!(f, "voice process shutdown could not be proven: {reason}")
+            }
             Self::Unsupported(op) => write!(f, "{op} is not supported by this voice provider"),
         }
     }
@@ -49,7 +53,9 @@ impl SeamError for VoiceError {
             Self::NotConfigured => ErrorClass::NotConfigured,
             Self::NotInstalled(_) => ErrorClass::NotInstalled,
             Self::Unsupported(_) => ErrorClass::Unsupported,
-            Self::InvalidInput(_) | Self::Failed(_) => ErrorClass::Other,
+            Self::InvalidInput(_) | Self::Failed(_) | Self::UnresolvedProcess(_) => {
+                ErrorClass::Other
+            }
         }
     }
 

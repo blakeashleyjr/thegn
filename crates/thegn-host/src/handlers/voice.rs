@@ -20,6 +20,9 @@ pub(crate) fn toggle(
     now_ms: u64,
     waker: &TerminalWaker,
 ) -> String {
+    if matches!(voice.state, VoiceState::Idle) && voice.shutdown_pending() {
+        return "Voice shutdown pending".into();
+    }
     if !voice.config().enabled {
         return "Voice is off ([voice] enabled = false)".into();
     }
@@ -96,22 +99,13 @@ pub(crate) fn drain(
             continue;
         }
         if let VoiceMessage::CaptureComplete { generation, .. }
-        | VoiceMessage::CaptureFailed { generation, .. } = &message
+        | VoiceMessage::CaptureFailed { generation, .. }
+        | VoiceMessage::CaptureUnresolved { generation, .. } = &message
             && *generation != voice.capture_generation()
         {
             continue;
         }
-        if matches!(
-            &message,
-            VoiceMessage::CaptureComplete { .. } | VoiceMessage::CaptureFailed { .. }
-        ) {
-            voice.capture_finished();
-        }
-        if let VoiceMessage::TranscriptSucceeded { request_id, .. }
-        | VoiceMessage::TranscriptFailed { request_id, .. } = &message
-        {
-            voice.transcription_finished(*request_id);
-        }
+        voice.record_lifecycle_message(&message);
         let event = match message {
             VoiceMessage::CaptureComplete { pane_id, wav, .. } => {
                 VoiceEvent::CaptureComplete { pane_id, wav }
@@ -119,6 +113,10 @@ pub(crate) fn drain(
             VoiceMessage::CaptureFailed {
                 pane_id, reason, ..
             } => VoiceEvent::CaptureFailed { pane_id, reason },
+            VoiceMessage::CaptureUnresolved {
+                pane_id, reason, ..
+            } => VoiceEvent::CaptureFailed { pane_id, reason },
+            VoiceMessage::CaptureReaped { .. } => continue,
             VoiceMessage::TranscriptSucceeded {
                 pane_id,
                 request_id,
@@ -137,6 +135,16 @@ pub(crate) fn drain(
                 request_id,
                 reason,
             },
+            VoiceMessage::TranscriptUnresolved {
+                pane_id,
+                request_id,
+                reason,
+            } => VoiceEvent::TranscriptFailed {
+                pane_id,
+                request_id,
+                reason,
+            },
+            VoiceMessage::TranscriptReaped { .. } => continue,
             VoiceMessage::MaxDuration { pane_id, .. } => VoiceEvent::MaxDuration { pane_id },
         };
         apply_event(voice, event, waker, Some(model), Some(panes), focused_pane);
