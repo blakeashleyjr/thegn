@@ -10,6 +10,10 @@ use gtui_core::frame::Frame;
 
 use crate::loki_parser::parse_loki_response;
 
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
 pub struct LokiSource {
     base_url: String,
     token: String,
@@ -22,7 +26,11 @@ impl LokiSource {
         Self {
             base_url: base_url.into(),
             token: token.into(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(TOTAL_TIMEOUT)
+                .build()
+                .expect("valid Loki HTTP client settings"),
         }
     }
 }
@@ -57,15 +65,43 @@ impl DataSource for LokiSource {
                     .send()
                     .await
                     .map_err(|e| QueryError::Network(e.to_string()))?;
-                let body = resp
-                    .text()
-                    .await
-                    .map_err(|e| QueryError::Network(e.to_string()))?;
+                if !resp.status().is_success() {
+                    return Err(QueryError::Network(format!(
+                        "Loki HTTP status {}",
+                        resp.status()
+                    )));
+                }
+                let body = read_limited(resp).await?;
                 frames.extend(parse_loki_response(&body)?);
             }
             Ok(frames)
         })
     }
+}
+
+async fn read_limited(mut response: reqwest::Response) -> Result<String, QueryError> {
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(QueryError::Other(
+            "Loki response exceeds 4 MiB limit".into(),
+        ));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| QueryError::Network(e.to_string()))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err(QueryError::Other(
+                "Loki response exceeds 4 MiB limit".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|e| QueryError::Syntax(e.to_string()))
 }
 
 #[cfg(test)]
