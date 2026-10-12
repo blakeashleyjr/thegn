@@ -423,6 +423,41 @@ impl MqStatus {
         })
     }
 
+    /// Whether this row is held and can be explicitly retried after its cause
+    /// has been addressed.
+    pub const fn is_held(self) -> bool {
+        match self {
+            Self::Deferred
+            | Self::GateFailed
+            | Self::GateError
+            | Self::AgentBlocked
+            | Self::NeedsHuman => true,
+            Self::Queued
+            | Self::Folding
+            | Self::Verifying
+            | Self::Landed
+            | Self::Ready
+            | Self::AgentRunning => false,
+        }
+    }
+
+    /// Whether the hold describes an environment or policy issue rather than
+    /// a verdict about the branch.
+    pub const fn is_infrastructure(self) -> bool {
+        match self {
+            Self::GateError | Self::AgentBlocked => true,
+            Self::Queued
+            | Self::Folding
+            | Self::Verifying
+            | Self::Landed
+            | Self::Ready
+            | Self::Deferred
+            | Self::GateFailed
+            | Self::AgentRunning
+            | Self::NeedsHuman => false,
+        }
+    }
+
     /// The one hued-glyph vocabulary for merge-queue status, shared by every
     /// surface that renders it (the sidebar detail chip, the panel's queue
     /// section) — a single source so the surfaces can never diverge. Glyphs
@@ -1193,6 +1228,27 @@ mod tests {
             crate::theme::Hue::Amber
         );
         assert_eq!(MqStatus::parse("bogus"), None);
+        for status in MqStatus::ALL {
+            assert_eq!(
+                status.is_held(),
+                matches!(
+                    status,
+                    MqStatus::Deferred
+                        | MqStatus::GateFailed
+                        | MqStatus::GateError
+                        | MqStatus::AgentBlocked
+                        | MqStatus::NeedsHuman
+                ),
+                "held table for {}",
+                status.as_str()
+            );
+            assert_eq!(
+                status.is_infrastructure(),
+                matches!(status, MqStatus::GateError | MqStatus::AgentBlocked),
+                "infrastructure table for {}",
+                status.as_str()
+            );
+        }
         // needs_human blocks.
         let s = score(&AttentionInputs {
             merge_queue: Some(MqFacts {

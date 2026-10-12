@@ -7,6 +7,7 @@
 //! section-key arm to `handlers::merge_queue::section_key`, so the hint row
 //! below can never drift from the dispatch.
 
+use thegn_core::attention::MqStatus;
 use thegn_core::remote::GitLoc;
 use thegn_core::theme::Hue;
 
@@ -85,34 +86,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         // panel could never show WHICH test failed, and an environment failure
         // read as a verdict about the code. Always prefer the recorded detail;
         // only the headline's first line is shown (the log tail is in the row).
-        if matches!(
-            r.status.as_str(),
-            "deferred" | "gate_failed" | "gate_error" | "agent_blocked" | "needs_human"
-        ) {
-            let reason = if let Some(d) = r.error_detail.as_deref().filter(|s| !s.is_empty()) {
-                let reason = d.lines().next().unwrap_or(d);
-                if r.status == "agent_blocked" {
-                    format!("environment/policy blocked — {reason}")
-                } else {
-                    reason.to_string()
-                }
-            } else {
-                match r.conflict_paths.as_deref() {
-                    Some(p) if !p.is_empty() => p.replace('\n', ", "),
-                    _ if r.status == "gate_failed" => "breaks build".to_string(),
-                    _ if r.status == "gate_error" => "gate could not run".to_string(),
-                    _ if r.status == "agent_blocked" => {
-                        "agent blocked by environment or isolation policy".to_string()
-                    }
-                    _ => "conflict".to_string(),
-                }
-            };
-            // Amber for an environment failure: nothing is wrong with the branch.
-            let tone = if matches!(r.status.as_str(), "gate_error" | "agent_blocked") {
-                Hue::Amber
-            } else {
-                Hue::Red
-            };
+        if let Some((reason, tone)) = held_reason(r) {
             left.push(seg(g(), "  "));
             left.push(seg(hue(tone), reason));
         }
@@ -130,6 +104,38 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
     out.push(mq_hint_row());
     out
+}
+
+fn held_reason(r: &thegn_core::db::MergeQueueRow) -> Option<(String, Hue)> {
+    let status = MqStatus::parse(&r.status)?;
+    if !status.is_held() {
+        return None;
+    }
+    let reason = if let Some(d) = r.error_detail.as_deref().filter(|s| !s.is_empty()) {
+        let reason = d.lines().next().unwrap_or(d);
+        if status == MqStatus::AgentBlocked {
+            format!("environment/policy blocked — {reason}")
+        } else {
+            reason.to_string()
+        }
+    } else {
+        match r.conflict_paths.as_deref() {
+            Some(p) if !p.is_empty() => p.replace('\n', ", "),
+            _ if status == MqStatus::GateFailed => "breaks build".to_string(),
+            _ if status == MqStatus::GateError => "gate could not run".to_string(),
+            _ if status == MqStatus::AgentBlocked => {
+                "agent blocked by environment or isolation policy".to_string()
+            }
+            _ => "conflict".to_string(),
+        }
+    };
+    // Amber for an environment failure: nothing is wrong with the branch.
+    let tone = if status.is_infrastructure() {
+        Hue::Amber
+    } else {
+        Hue::Red
+    };
+    Some((reason, tone))
 }
 
 /// Full: queue list + a detail column for the cursor row — the one place the
@@ -326,5 +332,18 @@ mod expiry_tests {
         // Past the window ⇒ waiting on the next sweep.
         let old = expiry_label(&row("landed", now - ttl as i64 - 1)).unwrap();
         assert!(old.ends_with("due"), "{old}");
+    }
+
+    #[test]
+    fn held_reason_uses_the_complete_typed_status_table() {
+        for status in MqStatus::ALL {
+            assert_eq!(
+                held_reason(&row(status.as_str(), 1)).is_some(),
+                status.is_held(),
+                "reason column for {}",
+                status.as_str()
+            );
+        }
+        assert_eq!(held_reason(&row("unknown-status", 1)), None);
     }
 }
