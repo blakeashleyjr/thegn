@@ -1,8 +1,8 @@
 //! Sole process/pipe owner; cancellation never travels through the data queue.
 use super::admission::Shared;
-use super::{CLOSE_BUDGET, CloseReason, SessionEvent, SessionOutcome, TreeGuarantee};
+use super::{CLOSE_BUDGET, CloseReason, SessionEvent, SessionOutcome, TreeGuarantee, junk_text};
 use crate::plugin::platform::{Input, Output, Process};
-use crate::plugin::proc::MAX_LINE_BYTES;
+use crate::plugin::proc::{FrameReject, MAX_LINE_BYTES};
 use futures_util::FutureExt;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -11,21 +11,36 @@ use tokio::time::{Duration, Instant};
 
 struct Lines {
     partial: Vec<u8>,
+    discarding: bool,
+}
+#[derive(Debug, Clone, Copy)]
+enum LineReject {
+    InvalidUtf8,
+    Oversized,
 }
 impl Lines {
     fn new() -> Self {
         Self {
             partial: Vec::new(),
+            discarding: false,
         }
     }
     fn feed(&mut self, bytes: &[u8], callback: &impl Fn(SessionEvent)) -> Result<(), CloseReason> {
         for &byte in bytes {
+            if self.discarding {
+                if byte == b'\n' {
+                    self.discarding = false;
+                }
+                continue;
+            }
             if byte == b'\n' {
                 self.finish(callback)?;
                 continue;
             }
             if self.partial.len() >= MAX_LINE_BYTES - 1 {
-                return Err(CloseReason::Protocol);
+                self.emit_junk(LineReject::Oversized, callback)?;
+                self.discarding = true;
+                continue;
             }
             if self.partial.len() == self.partial.capacity() {
                 let capacity = self
@@ -40,14 +55,43 @@ impl Lines {
         Ok(())
     }
     fn finish(&mut self, callback: &impl Fn(SessionEvent)) -> Result<(), CloseReason> {
-        let text = std::str::from_utf8(&self.partial)
-            .map_err(|_| CloseReason::Protocol)?
-            .trim();
+        let text = match std::str::from_utf8(&self.partial) {
+            Ok(text) => text.trim().to_owned(),
+            Err(_) => {
+                self.emit_junk(LineReject::InvalidUtf8, callback)?;
+                return Ok(());
+            }
+        };
+        self.partial.clear();
         if !text.is_empty() {
-            catch_unwind(AssertUnwindSafe(|| callback(super::parse_line(text))))
+            catch_unwind(AssertUnwindSafe(|| callback(super::parse_line(&text))))
                 .map_err(|_| CloseReason::CallbackPanic)?;
         }
-        self.partial.clear();
+        Ok(())
+    }
+    fn emit_junk(
+        &mut self,
+        reason: LineReject,
+        callback: &impl Fn(SessionEvent),
+    ) -> Result<(), CloseReason> {
+        let text = junk_text(&self.partial);
+        self.partial = Vec::with_capacity(128);
+        match reason {
+            LineReject::InvalidUtf8 => tracing::debug!(
+                target: "thegn::plugin",
+                reason = ?FrameReject::InvalidUtf8,
+                "discarding rejected resident plugin frame"
+            ),
+            LineReject::Oversized => tracing::debug!(
+                target: "thegn::plugin",
+                reason = ?reason,
+                "discarding oversized resident plugin frame"
+            ),
+        }
+        if !text.is_empty() || matches!(reason, LineReject::Oversized) {
+            catch_unwind(AssertUnwindSafe(|| callback(SessionEvent::Junk(text))))
+                .map_err(|_| CloseReason::CallbackPanic)?;
+        }
         Ok(())
     }
 }
