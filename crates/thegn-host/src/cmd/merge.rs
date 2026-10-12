@@ -1126,7 +1126,6 @@ mod routing_tests {
 #[cfg(test)]
 mod queue_error_tests {
     use super::queue_error_kind;
-    use anyhow::Context;
     use std::time::Duration;
 
     #[test]
