@@ -1144,13 +1144,23 @@ fn capture_verdict(
             (GateVerdict::Passed, false)
         }
         Capture::Completed { status, log } => (
-            match gate::classify_exit(status.code(), false) {
-                gate::GateClass::Passed => GateVerdict::Passed,
-                gate::GateClass::Failed => GateVerdict::Failed { log },
-                gate::GateClass::Error => GateVerdict::Error {
-                    reason: gate::error_reason(status.code(), false).into(),
-                    log,
-                },
+            // `Completed` is emitted only after the owned runner's grouped
+            // spawn acknowledges the configured shell entry point. From that
+            // boundary onward, the full numeric exit domain belongs to the
+            // command, including shell-reserved values such as 126/127.
+            {
+                let end = status
+                    .code()
+                    .map(gate::RunEnd::Exited)
+                    .unwrap_or(gate::RunEnd::Signaled);
+                match gate::classify_run(true, end) {
+                    gate::GateClass::Passed => GateVerdict::Passed,
+                    gate::GateClass::Failed => GateVerdict::Failed { log },
+                    gate::GateClass::Error => GateVerdict::Error {
+                        reason: gate::run_error_reason(true, end).into(),
+                        log,
+                    },
+                }
             },
             false,
         ),

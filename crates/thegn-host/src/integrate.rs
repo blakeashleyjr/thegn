@@ -374,17 +374,46 @@ fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Opt
             "--no-ff",
             theirs,
         ]);
-        // Conflicts are expected (the driver / rerere may resolve them) → ignore
-        // the exit status and inspect the index next.
-        util::git_cmd(&tmp).args(&args).output().ok()?;
-        // Stage whatever the driver / rerere resolved.
+        // Git uses exit 1 for a merge with conflicts. That is the sole
+        // nonzero result that can proceed to index inspection; other failures
+        // (including an already-active merge) are infrastructure errors.
+        let (status, stdout, stderr) = match run_driver_merge(&tmp, &args) {
+            Ok(output) => output,
+            Err(error) => {
+                warn_driver_merge_failure("could not start merge", &error.to_string());
+                return None;
+            }
+        };
+        let exit_code = status.code();
+        if !status.success() && exit_code != Some(1) {
+            let diagnostics = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+            warn_driver_merge_failure(
+                &format!("merge failed with status {exit_code:?}"),
+                &diagnostics,
+            );
+            return None;
+        }
+        // Reject a pre-existing or foreign merge state before trusting the index.
         scratch.verify().ok()?;
-        let _ = util::git_cmd(&tmp).args(["add", "-A"]).output(); // best-effort: stage: the unmerged-path check below catches a failed stage
+        let merge_head = util::git_out_allow_empty(&tmp, &["rev-parse", "--verify", "MERGE_HEAD"]);
+        if merge_head.as_deref() != Some(theirs) {
+            warn_driver_merge_failure(
+                "merge did not establish the expected MERGE_HEAD",
+                &format!("expected {theirs}; observed {merge_head:?}"),
+            );
+            return None;
+        }
         // Any remaining unmerged path means we couldn't resolve it here → defer.
         scratch.verify().ok()?;
-        let unmerged =
-            util::git_out(&tmp, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
-        if !unmerged.trim().is_empty() {
+        let Some(unmerged) = util::git_out_allow_empty(&tmp, &["ls-files", "-u"]) else {
+            warn_driver_merge_failure(
+                "could not inspect unmerged index entries",
+                "git ls-files -u failed",
+            );
+            return None;
+        };
+        if !unmerged.is_empty() {
+            warn_driver_merge_failure("driver/rerere left unmerged index entries", &unmerged);
             return None;
         }
         scratch.verify().ok()?;
@@ -399,6 +428,65 @@ fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Opt
         );
     }
     tree
+}
+
+/// Run the one real merge while retaining only a bounded tail from each pipe.
+/// Reader workers drain the complete pipes so a verbose driver cannot block Git.
+#[expect(clippy::disallowed_methods)]
+fn run_driver_merge(
+    dir: &Path,
+    args: &[&str],
+) -> std::io::Result<(std::process::ExitStatus, String, String)> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    fn reader<R: Read + Send + 'static>(
+        mut pipe: R,
+    ) -> std::thread::JoinHandle<std::io::Result<String>> {
+        std::thread::spawn(move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+            let mut retained = Vec::with_capacity(4096);
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let count = pipe.read(&mut chunk)?;
+                if count == 0 {
+                    break;
+                }
+                retained.extend_from_slice(&chunk[..count]);
+                if retained.len() > 4096 {
+                    let excess = retained.len() - 4096;
+                    retained.drain(..excess);
+                }
+            }
+            Ok(String::from_utf8_lossy(&retained).into_owned())
+        })
+    }
+
+    let mut child = util::git_cmd(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = reader(child.stdout.take().expect("piped merge stdout"));
+    let stderr = reader(child.stderr.take().expect("piped merge stderr"));
+    let status = child.wait()?;
+    let stdout = stdout
+        .join()
+        .map_err(|_| std::io::Error::other("merge stdout reader panicked"))??;
+    let stderr = stderr
+        .join()
+        .map_err(|_| std::io::Error::other("merge stderr reader panicked"))??;
+    Ok((status, stdout, stderr))
+}
+
+fn warn_driver_merge_failure(reason: &str, diagnostics: &str) {
+    tracing::warn!(
+        target: "thegn::integrate",
+        reason,
+        diagnostics = %tail(diagnostics, 4000),
+        "custom merge-driver/rerere merge was deferred"
+    );
 }
 
 /// Resolve a regenerable-only merge by replaying it in a throwaway worktree:
@@ -2404,8 +2492,16 @@ mod tests {
         if !repo.history_supported_or_refused() {
             return;
         }
-        // A custom driver that always resolves to "ours" (exits 0 leaving %A).
-        git(&repo.dir, &["config", "merge.takeours.driver", "true"]);
+        // Count invocations and write an untracked file in the temporary merge
+        // worktree. Neither side effect may be repeated or swept into the tree.
+        let counter = repo.dir.join("driver-count");
+        let stray = repo.dir.join("stray.txt");
+        let driver = format!(
+            "printf x >> {}; printf stray > {}; true %O %A %B %L %P",
+            thegn_core::util::sh_quote(&counter.to_string_lossy()),
+            thegn_core::util::sh_quote(&stray.to_string_lossy())
+        );
+        git(&repo.dir, &["config", "merge.takeours.driver", &driver]);
         repo.commit(".gitattributes", "data.txt merge=takeours\n", "attrs");
         repo.commit("data.txt", "base\n", "seed");
         // Two textually-conflicting edits to the driver-governed file.
@@ -2423,6 +2519,44 @@ mod tests {
         assert!(report.deferred.is_empty(), "{report:?}");
         // The `true` driver kept "ours" (main's content).
         assert_eq!(repo.out(&["show", "main:data.txt"]), "main");
+        assert_eq!(std::fs::read_to_string(counter).unwrap(), "x");
+        assert!(
+            !repo
+                .out(&["ls-tree", "-r", "--name-only", "main"])
+                .lines()
+                .any(|path| path == "stray.txt")
+        );
+    }
+
+    #[test]
+    fn failing_custom_driver_defers_and_removes_its_scratch_worktree() {
+        let repo = Repo::new("driver-failure");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        git(
+            &repo.dir,
+            &["config", "merge.fail.driver", "false %O %A %B %L %P"],
+        );
+        repo.commit(".gitattributes", "data.txt merge=fail\n", "attrs");
+        repo.commit("data.txt", "base\n", "seed");
+        git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
+        repo.commit("data.txt", "feat\n", "feature edit");
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit("data.txt", "main\n", "main edit");
+
+        let report = run_fold(&cfg(""), &repo.dir, repo.branch_set()).unwrap();
+        assert_eq!(
+            report.landed.len(),
+            0,
+            "a failed driver must not resolve: {report:?}"
+        );
+        assert_eq!(report.deferred.len(), 1, "failed driver branch must defer");
+        let worktrees = repo.out(&["worktree", "list", "--porcelain"]);
+        assert!(
+            !worktrees.contains("tg-drivermerge-"),
+            "driver scratch worktree leaked: {worktrees}"
+        );
     }
 
     #[test]

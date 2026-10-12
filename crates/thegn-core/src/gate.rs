@@ -29,6 +29,55 @@ pub enum GateClass {
     Error,
 }
 
+/// Terminal event reported by an owned gate runner after setup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunEnd {
+    /// The started entry point exited with its own numeric status.
+    Exited(i32),
+    /// The entry point was terminated by a signal.
+    Signaled,
+    /// Runner deadline expired.
+    RunnerTimeout,
+    /// Runner terminated the process for a resource or policy limit.
+    RunnerKilled,
+    /// Runner transport was lost before a terminal event arrived.
+    TransportLost,
+    /// No trustworthy terminal event was available.
+    Unknown,
+}
+
+/// Classify authenticated runner evidence. A number is a code verdict only
+/// after the runner confirms that the requested entry point started.
+pub fn classify_run(started: bool, end: RunEnd) -> GateClass {
+    if !started {
+        return GateClass::Error;
+    }
+    match end {
+        RunEnd::Exited(0) => GateClass::Passed,
+        RunEnd::Exited(_) => GateClass::Failed,
+        RunEnd::Signaled
+        | RunEnd::RunnerTimeout
+        | RunEnd::RunnerKilled
+        | RunEnd::TransportLost
+        | RunEnd::Unknown => GateClass::Error,
+    }
+}
+
+/// Short reason for runner evidence classified as an infrastructure error.
+pub fn run_error_reason(started: bool, end: RunEnd) -> &'static str {
+    if !started {
+        return "gate entry point did not start";
+    }
+    match end {
+        RunEnd::Signaled => "gate entry point was killed by a signal",
+        RunEnd::RunnerTimeout => "gate runner timed out",
+        RunEnd::RunnerKilled => "gate runner killed the entry point",
+        RunEnd::TransportLost => "gate runner transport was lost",
+        RunEnd::Unknown => "gate runner reported no trustworthy terminal event",
+        RunEnd::Exited(_) => "gate command exited normally",
+    }
+}
+
 /// Shell exit code for "command not found".
 pub const EXIT_NOT_FOUND: i32 = 127;
 /// Shell exit code for "found, but not executable".
@@ -111,5 +160,25 @@ mod tests {
         assert!(error_reason(Some(126), false).contains("not executable"));
         // Total for the non-error codes rather than panicking.
         assert!(!error_reason(Some(1), false).is_empty());
+    }
+
+    #[test]
+    fn owned_runner_evidence_separates_code_exits_from_runner_failures() {
+        for code in [125, 126, 127, 137, 255] {
+            assert_eq!(classify_run(true, RunEnd::Exited(code)), GateClass::Failed);
+        }
+        assert_eq!(classify_run(true, RunEnd::Exited(0)), GateClass::Passed);
+        assert_eq!(classify_run(false, RunEnd::Exited(0)), GateClass::Error);
+        for end in [
+            RunEnd::Signaled,
+            RunEnd::RunnerTimeout,
+            RunEnd::RunnerKilled,
+            RunEnd::TransportLost,
+            RunEnd::Unknown,
+        ] {
+            assert_eq!(classify_run(true, end), GateClass::Error);
+            assert!(!run_error_reason(true, end).is_empty());
+        }
+        assert!(run_error_reason(false, RunEnd::Unknown).contains("did not start"));
     }
 }
