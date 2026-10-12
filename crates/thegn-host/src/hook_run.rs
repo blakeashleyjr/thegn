@@ -289,6 +289,90 @@ fn join_pipe(pipe: Option<PipeReader>, deadline: Instant) -> String {
 static LOG_INDICES: OnceLock<Mutex<std::collections::HashMap<(String, String), u64>>> =
     OnceLock::new();
 
+const HOOK_LOG_KEEP_NEWEST: usize = 20;
+const HOOK_LOG_MAX_AGE_SECS: u64 = 14 * 86_400;
+const HOOK_LOG_PRUNE_INTERVAL_SECS: i64 = 60 * 60;
+static LAST_LOG_PRUNE: OnceLock<Mutex<std::collections::HashMap<PathBuf, i64>>> = OnceLock::new();
+
+pub(crate) fn log_root() -> PathBuf {
+    thegn_core::util::xdg_state_home()
+        .join("thegn")
+        .join("hooks")
+}
+
+/// Prune direct hook-log children on the background disk lane. The hourly
+/// throttle ensures idle rounds do not repeatedly enumerate the state tree.
+pub(crate) fn prune_logs(root: &Path, now_secs: i64) {
+    let mut last_run = LAST_LOG_PRUNE
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if last_run
+        .get(root)
+        .is_some_and(|last| now_secs.saturating_sub(*last) < HOOK_LOG_PRUNE_INTERVAL_SECS)
+    {
+        return;
+    }
+    last_run.insert(root.to_path_buf(), now_secs);
+    drop(last_run);
+
+    let Ok(root_meta) = std::fs::symlink_metadata(root) else {
+        return;
+    };
+    if !root_meta.is_dir() || root_meta.file_type().is_symlink() {
+        return;
+    }
+    let Ok(slugs) = std::fs::read_dir(root) else {
+        return;
+    };
+    for slug in slugs.flatten() {
+        let path = slug.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        let mut logs = Vec::new();
+        for entry in entries.flatten() {
+            let file_path = entry.path();
+            let Ok(file_meta) = std::fs::symlink_metadata(&file_path) else {
+                continue;
+            };
+            if !file_meta.is_file()
+                || file_meta.file_type().is_symlink()
+                || file_path.extension().is_none_or(|ext| ext != "log")
+            {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let mtime_secs = match file_meta.modified() {
+                Ok(time) => match time.duration_since(std::time::UNIX_EPOCH) {
+                    Ok(age) => age.as_secs(),
+                    Err(_) => 0,
+                },
+                Err(_) => 0,
+            };
+            logs.push(thegn_core::disk_reclaim::HookLog { name, mtime_secs });
+        }
+        let remove = thegn_core::disk_reclaim::plan_hook_log_prune(
+            &logs,
+            HOOK_LOG_KEEP_NEWEST,
+            HOOK_LOG_MAX_AGE_SECS,
+            now_secs.max(0) as u64,
+        );
+        for name in remove {
+            // best-effort: hook logs are diagnostics; inability to prune one must not stop the disk scan.
+            let _ = std::fs::remove_file(path.join(name));
+        }
+    }
+}
+
 fn log_path(log_root: &Path, worktree: &str, event: thegn_core::hooks::HookEvent) -> PathBuf {
     let worktree_slug = thegn_core::util::slugify(worktree);
     let slug = if worktree_slug.is_empty() {
@@ -429,15 +513,7 @@ pub fn run_all(
     cwd: &Path,
     mode: thegn_core::hooks::HookExecutionMode,
 ) -> Vec<HookRunResult> {
-    run_all_with_log_root(
-        specs,
-        context,
-        cwd,
-        mode,
-        &thegn_core::util::xdg_state_home()
-            .join("thegn")
-            .join("hooks"),
-    )
+    run_all_with_log_root(specs, context, cwd, mode, &log_root())
 }
 
 fn run_all_with_log_root(
@@ -519,6 +595,33 @@ mod tests {
         assert!(result.log_path.starts_with(dir.path()));
         let contents = std::fs::read_to_string(&result.log_path).unwrap();
         assert!(contents.contains("stdout:\nlogged"));
+    }
+
+    #[test]
+    fn prune_logs_limits_direct_regular_log_files_without_following_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let slug = dir.path().join("worktree-hash");
+        std::fs::create_dir_all(slug.join("nested")).unwrap();
+        for index in 0..21 {
+            std::fs::write(slug.join(format!("post_create-{index}.log")), b"log").unwrap();
+        }
+        std::fs::write(slug.join("keep.txt"), b"not a log").unwrap();
+        std::fs::write(slug.join("nested/old.log"), b"nested").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 1;
+        prune_logs(dir.path(), now);
+
+        let remaining_logs = std::fs::read_dir(&slug)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "log"))
+            .count();
+        assert_eq!(remaining_logs, 20);
+        assert!(slug.join("keep.txt").exists());
+        assert!(slug.join("nested/old.log").exists());
     }
 
     #[test]

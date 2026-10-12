@@ -1010,9 +1010,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                     *ctx.corner_name = Some(name);
                     // Corner panes parse on the loop (kitty relay feeds
                     // text pieces at exact cursor positions).
-                    if let Some(p) = ctx.panes.table.get(&fresh) {
-                        p.set_loop_fed(true);
-                    }
+                    ctx.panes.enter_corner_role(fresh);
                 }
             }
         }

@@ -12,9 +12,11 @@ use crate::helper::{self, Limits};
 use crate::model::{LoopMode, MediaKind, MediaState, PlaybackState, Playlist};
 use crate::{MediaBackend, MediaCaps, MediaError};
 
-/// Field separator for the `metadata --format` template — a unit-separator byte,
-/// which never appears in track text.
+/// Field separator for the `metadata --format` template. Since metadata may
+/// contain this byte, the parser validates the complete field count and rejects
+/// records whose framing is ambiguous.
 const SEP: char = '\u{1f}';
+const FIELDS: usize = 13;
 const FORMAT: &str = "{{playerName}}\u{1f}{{status}}\u{1f}{{title}}\u{1f}{{artist}}\u{1f}{{album}}\u{1f}{{mpris:length}}\u{1f}{{position}}\u{1f}{{shuffle}}\u{1f}{{loopStatus}}\u{1f}{{volume}}\u{1f}{{mpris:artUrl}}\u{1f}{{xesam:url}}\u{1f}{{mpris:trackid}}";
 
 pub struct MprisCli {
@@ -94,7 +96,7 @@ impl MediaBackend for MprisCli {
                 Err(MediaError::NoPlayer) => return Ok(None),
                 Err(e) => return Err(e),
             };
-            Ok(Some(parse_line(&line)))
+            Ok(Some(parse_line(&line)?))
         })
     }
 
@@ -188,10 +190,16 @@ impl MediaBackend for MprisCli {
 }
 
 /// Parse the `\x1f`-delimited `metadata --format` line into a [`MediaState`].
-/// Missing/blank fields fall back to defaults — players vary in what they expose.
-fn parse_line(line: &str) -> MediaState {
+/// Every template field must be present; ambiguous framing is rejected atomically.
+fn parse_line(line: &str) -> Result<MediaState, MediaError> {
     let f: Vec<&str> = line.split(SEP).collect();
-    let get = |i: usize| f.get(i).map(|s| s.trim()).unwrap_or("");
+    if f.len() != FIELDS {
+        return Err(MediaError::Backend(format!(
+            "malformed playerctl metadata record ({} fields)",
+            f.len()
+        )));
+    }
+    let get = |i: usize| f[i].trim();
 
     let length = get(5)
         .parse::<i64>()
@@ -209,7 +217,7 @@ fn parse_line(line: &str) -> MediaState {
     let art = get(10);
     let url = get(11);
     let trackid = get(12);
-    MediaState {
+    Ok(MediaState {
         title: get(2).to_string(),
         artist: get(3).to_string(),
         album: get(4).to_string(),
@@ -229,7 +237,7 @@ fn parse_line(line: &str) -> MediaState {
         can_seek: true, // playerctl can always position-seek
         track_id: (!trackid.is_empty()).then(|| trackid.to_string()),
         player,
-    }
+    })
 }
 
 fn parse_bool(s: &str) -> Option<bool> {
@@ -254,8 +262,8 @@ mod tests {
 
     #[test]
     fn parses_full_line() {
-        let line = "spotify\u{1f}Playing\u{1f}Get Lucky\u{1f}Daft Punk\u{1f}Random Access Memories\u{1f}248000000\u{1f}1000000\u{1f}true\u{1f}Playlist\u{1f}0.80";
-        let s = parse_line(line);
+        let line = "spotify\u{1f}Playing\u{1f}Get Lucky\u{1f}Daft Punk\u{1f}Random Access Memories\u{1f}248000000\u{1f}1000000\u{1f}true\u{1f}Playlist\u{1f}0.80\u{1f}art\u{1f}url\u{1f}track-id";
+        let s = parse_line(line).unwrap();
         assert_eq!(s.player, "spotify");
         assert_eq!(s.state, PlaybackState::Playing);
         assert_eq!(s.title, "Get Lucky");
@@ -271,8 +279,8 @@ mod tests {
     #[test]
     fn tolerates_blank_fields() {
         // A player that exposes only status + title.
-        let line = "mpv\u{1f}Paused\u{1f}Some Song\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}";
-        let s = parse_line(line);
+        let line = "mpv\u{1f}Paused\u{1f}Some Song\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}";
+        let s = parse_line(line).unwrap();
         assert_eq!(s.player, "mpv");
         assert_eq!(s.state, PlaybackState::Paused);
         assert_eq!(s.title, "Some Song");
@@ -281,6 +289,21 @@ mod tests {
         assert_eq!(s.shuffle, None);
         assert_eq!(s.loop_mode, None);
         assert_eq!(s.volume, None);
+    }
+
+    #[test]
+    fn rejects_wrong_field_counts_and_delimiter_collisions() {
+        let valid = "spotify\u{1f}Playing\u{1f}Title\u{1f}Artist\u{1f}Album\u{1f}1000000\u{1f}0\u{1f}true\u{1f}None\u{1f}0.8\u{1f}art\u{1f}url\u{1f}track-id";
+        assert!(parse_line(valid).is_ok());
+
+        let fields: Vec<&str> = valid.split(SEP).collect();
+        let twelve_fields = fields[..12].join(&SEP.to_string());
+        assert!(parse_line(&twelve_fields).is_err());
+        let fourteen_fields = format!("{valid}{SEP}extra");
+        assert!(parse_line(&fourteen_fields).is_err());
+
+        let colliding_title = valid.replacen("Title", "Title\u{1f}Injected", 1);
+        assert!(parse_line(&colliding_title).is_err());
     }
 
     #[test]

@@ -156,6 +156,9 @@ pub struct PtyPane {
     /// Time-travel recording ring (`[replay]`). `None` when replay is disabled —
     /// then `feed` does a single null check and allocates nothing.
     record: Option<crate::replay::Recording>,
+    /// Corner panes receive parser-filtered fragments, so their byte stream is
+    /// not safe to retain as an independently replayable recording.
+    corner_role: bool,
     /// Who parses this pane's output into the grid. `false` (default for PTY
     /// panes): the READER THREAD feeds via the emulator's
     /// [`crate::emulator::FeedSink`] — the
@@ -391,6 +394,7 @@ impl PtyPane {
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
             record: None,
+            corner_role: false,
             loop_fed,
             last_output_at: None,
             last_input_at: None,
@@ -476,6 +480,7 @@ impl PtyPane {
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
             record: None,
+            corner_role: false,
             // Stream frames arrive via the relay task's Output events with no
             // reader-side feeder — the loop parses them.
             loop_fed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -668,10 +673,21 @@ impl PtyPane {
             .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Mark this pane as a filtered corner stream and discard its unusable
+    /// per-pane byte recording. This role is explicit; `loop_fed` has other
+    /// owners and is not a reliable identity signal.
+    pub fn enter_corner_role(&mut self) {
+        self.corner_role = true;
+        self.record = None;
+        self.set_loop_fed(true);
+    }
+
     /// Attach a fresh recording ring so this pane's output is captured for
     /// time-travel replay. Called after spawn when `[replay] enabled`.
     pub fn enable_recording(&mut self, rec: crate::replay::Recording) {
-        self.record = Some(rec);
+        if !self.corner_role {
+            self.record = Some(rec);
+        }
     }
 
     /// This pane's recording ring, if replay is enabled — for the replay overlay
@@ -889,6 +905,7 @@ impl PtyPane {
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
             record: None,
+            corner_role: false,
             loop_fed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             last_output_at: None,
             last_input_at: None,
@@ -1775,6 +1792,39 @@ mod tests {
         // User input stamps the input side.
         pane.write_input(b"y").unwrap();
         assert!(pane.output_stamps().1.is_some());
+    }
+
+    #[test]
+    fn corner_role_clears_recording_and_refuses_reenable_after_filtered_fragments() {
+        let (ctrl_tx, _ctrl_rx) = tokio_mpsc::channel(8);
+        let mut pane = PtyPane::test_stream(ctrl_tx, 24, 80);
+        let cfg = thegn_core::config::ReplayConfig::default();
+        pane.enable_recording(crate::replay::Recording::from_config(&cfg, 24, 80));
+        pane.feed(b"before corner");
+        assert!(pane.recording().is_some());
+
+        pane.enter_corner_role();
+        assert!(pane.recording().is_none());
+        // Fragments left by the kitty relay must never be retained as a
+        // standalone stream after removed control boundaries.
+        pane.feed(b"\x1b[5");
+        pane.feed(b"C\r\n\x1b]0;unfinished");
+        pane.enable_recording(crate::replay::Recording::from_config(&cfg, 24, 80));
+        pane.feed(b"title\x07");
+        assert!(pane.recording().is_none());
+    }
+
+    #[test]
+    fn ordinary_pane_recording_exports_the_bytes_it_receives() {
+        let (ctrl_tx, _ctrl_rx) = tokio_mpsc::channel(8);
+        let mut pane = PtyPane::test_stream(ctrl_tx, 24, 80);
+        let cfg = thegn_core::config::ReplayConfig::default();
+        pane.enable_recording(crate::replay::Recording::from_config(&cfg, 24, 80));
+        pane.feed(b"center bytes\r\n");
+        let mut cast = Vec::new();
+        pane.recording().unwrap().export_cast(&mut cast).unwrap();
+        let cast = String::from_utf8(cast).unwrap();
+        assert!(cast.contains("center bytes\\r\\n"));
     }
 
     #[test]

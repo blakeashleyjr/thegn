@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde::de::Deserializer;
 
 use crate::config::{Config, NamedCommand, config_enum, config_warn};
+use crate::identity::{BytePart, digest_parts, hex_bytes};
 
 config_enum! {
     /// Where a configured drawer tool is reused: per worktree or globally for
@@ -333,7 +334,41 @@ pub fn validate_drawer_cwd(scope: DrawerScope, cwd: &str) -> Result<(), String> 
 /// or otherwise inspect it.
 pub fn drawer_scope_key(scope: DrawerScope, worktree: &Path) -> String {
     match scope {
-        DrawerScope::Worktree => crate::util::slugify(&worktree.to_string_lossy()),
+        DrawerScope::Worktree => {
+            const PREFIX_LIMIT: usize = 40;
+            const DIGEST_CHUNK_BYTES: usize = 8 * 1024;
+
+            let raw_path = worktree.as_os_str().as_encoded_bytes();
+            let digest = match digest_parts(b"thegn/drawer-scope", &[BytePart::new(raw_path)]) {
+                Ok(digest) => digest,
+                Err(_) => {
+                    // Keep oversized paths exact and collision-resistant too.
+                    // Chain bounded chunks because `digest_parts` intentionally
+                    // rejects an identity encoding larger than its input limit.
+                    let mut state = digest_parts(b"thegn/drawer-scope/chunked", &[])
+                        .expect("the fixed drawer digest domain fits");
+                    for chunk in raw_path.chunks(DIGEST_CHUNK_BYTES) {
+                        state = digest_parts(
+                            b"thegn/drawer-scope/chunk",
+                            &[BytePart::new(&state), BytePart::new(chunk)],
+                        )
+                        .expect("bounded drawer digest chunks fit");
+                    }
+                    digest_parts(
+                        b"thegn/drawer-scope/chunked-final",
+                        &[BytePart::new(&state)],
+                    )
+                    .expect("the fixed drawer digest domain fits")
+                }
+            };
+            let prefix = worktree
+                .file_name()
+                .map(|name| crate::util::slugify(&name.to_string_lossy()))
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "worktree".to_string());
+            let prefix = prefix.chars().take(PREFIX_LIMIT).collect::<String>();
+            format!("{prefix}--{}", hex_bytes(&digest))
+        }
         DrawerScope::Global => GLOBAL_SCOPE_KEY.to_string(),
     }
 }
@@ -418,15 +453,45 @@ mod tests {
     }
 
     #[test]
-    fn scope_keys_are_slugged_or_global_without_io() {
+    fn worktree_scope_keys_use_exact_path_digest_with_bounded_display_prefix() {
+        let paths = [
+            "/r/b-c",
+            "/r/b_c",
+            "/r/B-c",
+            "/r/b/c",
+            "/r1/repo",
+            "/r2/repo",
+            "/r/caf\u{e9}",
+            "/r/cafe",
+        ];
+        let keys = paths
+            .iter()
+            .map(|path| drawer_scope_key(DrawerScope::Worktree, Path::new(path)))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(keys.len(), paths.len());
+        let key = drawer_scope_key(DrawerScope::Worktree, Path::new("/r/repo"));
         assert_eq!(
-            drawer_scope_key(DrawerScope::Worktree, Path::new("/Work Trees/One")),
-            "work-trees-one"
+            key,
+            drawer_scope_key(DrawerScope::Worktree, Path::new("/r/repo"))
         );
+        assert!(key.len() <= 40 + 2 + 64);
+        assert_ne!(key, GLOBAL_SCOPE_KEY);
+        assert!(drawer_scope_key(DrawerScope::Worktree, Path::new("/")).starts_with("worktree--"));
         assert_eq!(
             drawer_scope_key(DrawerScope::Global, Path::new("/ignored")),
             GLOBAL_SCOPE_KEY
         );
+    }
+
+    #[test]
+    fn oversized_worktree_scope_keys_use_chunked_exact_path_digest() {
+        let a = PathBuf::from(format!("/{}a", "x".repeat(20_000)));
+        let b = PathBuf::from(format!("/{}b", "x".repeat(20_000)));
+        let a_key = drawer_scope_key(DrawerScope::Worktree, &a);
+        let b_key = drawer_scope_key(DrawerScope::Worktree, &b);
+        assert_ne!(a_key, b_key);
+        assert!(a_key.contains("--"));
+        assert!(a_key.len() <= 40 + 2 + 64);
     }
 
     #[test]

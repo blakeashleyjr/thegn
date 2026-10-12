@@ -63,6 +63,21 @@ impl std::fmt::Display for ResumeDispatchConflict {
 
 impl std::error::Error for ResumeDispatchConflict {}
 
+/// A child admission named a parent that was absent from the roster snapshot
+/// read under the admission write lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParentDispatchConflict {
+    pub parent_id: i64,
+}
+
+impl std::fmt::Display for ParentDispatchConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "parent dispatch {} does not exist", self.parent_id)
+    }
+}
+
+impl std::error::Error for ParentDispatchConflict {}
+
 impl Db {
     /// Bind a daemon session id to a dispatch row that was recorded without one
     /// (a UI tracker dispatch launching into a daemon pane, THE-733). Only an
@@ -468,6 +483,11 @@ impl Db {
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<std::result::Result<i64, DispatchAdmissionDecision>> {
             let rows = self.list_dispatches()?;
+            if let Some(parent_id) = new.parent_id
+                && !rows.iter().any(|row| row.id == parent_id)
+            {
+                return Err(anyhow::Error::new(ParentDispatchConflict { parent_id }));
+            }
             if new.chunk_path.is_some() && allow_scope.is_none() {
                 let Some(prepared) = prepared else {
                     return Ok(Err(DispatchAdmissionDecision::ScopeRefused(
@@ -896,10 +916,15 @@ impl Db {
         Ok(out)
     }
 
-    /// Append a progress note to a row's queue — INSERT into
-    /// `agent_dispatch_notes`. Returns the new note's id. Errors when the row
-    /// does not exist.
+    /// Append a progress note and return its id, preserving the original API.
     pub fn append_dispatch_note(&self, id: i64, text: &str) -> Result<i64> {
+        Ok(self.append_dispatch_note_record(id, text)?.id)
+    }
+
+    /// Append a progress note to a row's queue — INSERT into
+    /// `agent_dispatch_notes`. Returns the inserted note without rescanning
+    /// the row's history. Errors when the row does not exist.
+    pub fn append_dispatch_note_record(&self, id: i64, text: &str) -> Result<DispatchNote> {
         let text = crate::pipeline_report::note_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
         if self.get_dispatch(id)?.is_none() {
             anyhow::bail!("roster row {id} does not exist");
@@ -909,7 +934,61 @@ impl Db {
             "INSERT INTO agent_dispatch_notes (dispatch_id, created_at_ms, text) VALUES (?1, ?2, ?3)",
             rusqlite::params![id, now, text],
         )?;
-        Ok(self.conn().last_insert_rowid())
+        Ok(DispatchNote {
+            id: self.conn().last_insert_rowid(),
+            dispatch_id: id,
+            created_at_ms: now,
+            text,
+        })
+    }
+
+    /// Count matching notes in SQL without materializing their text.
+    pub fn dispatch_note_count(&self, id: i64, since_ms: Option<i64>) -> Result<usize> {
+        let count: i64 = if let Some(since) = since_ms {
+            self.conn().query_row(
+                "SELECT COUNT(*) FROM agent_dispatch_notes WHERE dispatch_id=?1 AND created_at_ms > ?2",
+                rusqlite::params![id, since],
+                |row| row.get(0),
+            )?
+        } else {
+            self.conn().query_row(
+                "SELECT COUNT(*) FROM agent_dispatch_notes WHERE dispatch_id=?1",
+                [id],
+                |row| row.get(0),
+            )?
+        };
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
+    /// Fetch at most `limit` newest notes, returned oldest-first for callers.
+    pub fn newest_dispatch_notes(
+        &self,
+        id: i64,
+        since_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<DispatchNote>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let cap = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut notes = if let Some(since) = since_ms {
+            let mut stmt = self.conn().prepare(
+                "SELECT id, dispatch_id, created_at_ms, text FROM agent_dispatch_notes \
+                 WHERE dispatch_id=?1 AND created_at_ms > ?2 \
+                 ORDER BY created_at_ms DESC, id DESC LIMIT ?3",
+            )?;
+            stmt.query_map(rusqlite::params![id, since, cap], map_note)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let mut stmt = self.conn().prepare(
+                "SELECT id, dispatch_id, created_at_ms, text FROM agent_dispatch_notes \
+                 WHERE dispatch_id=?1 ORDER BY created_at_ms DESC, id DESC LIMIT ?2",
+            )?;
+            stmt.query_map(rusqlite::params![id, cap], map_note)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        notes.reverse();
+        Ok(notes)
     }
 
     /// Read the progress queue for one dispatch row, newest last.
@@ -1072,6 +1151,77 @@ mod tests {
         let (db, _dir) = temp_db();
         let err = db.append_dispatch_note(99, "x").unwrap_err();
         assert!(err.to_string().contains("99"), "{err}");
+    }
+
+    #[test]
+    fn admitted_claim_rejects_missing_parent_and_accepts_existing_parent() {
+        let (db, _dir) = temp_db();
+        let mut missing = crate::issue::NewDispatch::new("linear:CHILD", "/wt/x", "coder");
+        missing.stage = Some("code");
+        missing.parent_id = Some(700);
+        let err = db
+            .claim_dispatch_admitted(missing, 10, None, None, None)
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ParentDispatchConflict>(),
+            Some(&ParentDispatchConflict { parent_id: 700 })
+        );
+        assert!(
+            err.to_string()
+                .contains("parent dispatch 700 does not exist")
+        );
+        assert!(
+            db.list_dispatches().unwrap().is_empty(),
+            "refusal must not insert the child"
+        );
+
+        let parent = put_row(&db, "linear:PARENT", "/wt/x");
+        let mut child = crate::issue::NewDispatch::new("linear:CHILD", "/wt/x", "coder");
+        child.stage = Some("code");
+        child.parent_id = Some(parent);
+        assert!(
+            db.claim_dispatch_admitted(child, 10, None, None, None)
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn newest_note_page_is_bounded_ordered_and_counted_in_sql() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:NOTES", "/wt/x");
+        for text in ["a", "b", "c", "d"] {
+            db.append_dispatch_note(id, text).unwrap();
+        }
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatch_notes SET created_at_ms=10 WHERE dispatch_id=?1",
+                [id],
+            )
+            .unwrap();
+        let page = db.newest_dispatch_notes(id, None, 2).unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|note| note.text.as_str())
+                .collect::<Vec<_>>(),
+            ["c", "d"]
+        );
+        assert!(
+            page[0].id < page[1].id,
+            "ties use id as a stable tiebreaker"
+        );
+        let since_page = db.newest_dispatch_notes(id, Some(9), 2).unwrap();
+        assert_eq!(since_page, page);
+        assert_eq!(
+            db.newest_dispatch_notes(id, None, usize::MAX)
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(db.dispatch_note_count(id, None).unwrap(), 4);
+        assert_eq!(db.dispatch_note_count(id, Some(9)).unwrap(), 4);
+        assert_eq!(db.dispatch_note_count(id, Some(10)).unwrap(), 0);
+        assert_eq!(db.newest_dispatch_notes(id, None, 0).unwrap().len(), 0);
     }
 
     #[test]

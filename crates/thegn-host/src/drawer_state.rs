@@ -161,7 +161,8 @@ fn clear_desired_if(key: &str, occupant_id: &str) {
 // ── keep-alive pane pool ─────────────────────────────────────────────────────
 
 /// The key for a pooled drawer pane. A global occupant uses the fixed global
-/// scope key, while worktree occupants use the existing slugged absolute path.
+/// scope key, while worktree occupants use an exact-byte digest of the
+/// already-resolved absolute path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct DrawerPoolKey {
     pub scope_key: String,
@@ -836,7 +837,8 @@ impl DrawerRuntime {
                 return;
             }
         };
-        let active = Self::target(cfg, dir).is_some_and(|(_, active_key, _)| active_key == key);
+        let active = (request.scope != DrawerScope::Worktree || request.worktree.as_path() == dir)
+            && Self::target(cfg, dir).is_some_and(|(_, active_key, _)| active_key == key);
         if active && self.visible.is_none() {
             if let Some(pane_id) = open_resolved(panes, launch, cfg, &request.worktree, rect) {
                 self.visible = Some(VisibleDrawer {
@@ -903,6 +905,20 @@ mod tests {
         assert_eq!(c.occupant_for_key(&b_key), None, "flags are per-worktree");
         c.set_key(&a_key, None);
         assert_eq!(c.occupant_for_key(&a_key), None);
+    }
+
+    #[test]
+    fn flag_cache_does_not_share_state_for_slug_colliding_worktrees() {
+        let mut cache = FlagCache::default();
+        let first = Path::new("/r/b-c");
+        let second = Path::new("/r/b_c");
+        let first_key = drawer_scope_key(DrawerScope::Worktree, first);
+        let second_key = drawer_scope_key(DrawerScope::Worktree, second);
+
+        cache.set_key(&first_key, Some(FILES_OCCUPANT_ID.into()));
+
+        assert_eq!(cache.occupant_for_key(&first_key), Some("files".into()));
+        assert_eq!(cache.occupant_for_key(&second_key), None);
     }
 
     #[test]

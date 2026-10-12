@@ -14,8 +14,8 @@ use std::collections::BTreeMap;
 use thegn_core::plugin_api::{
     API_VERSION, Alert, AuditDecision, Capability, Contribution, Event, EventKind, ExtensionPoint,
     HOST_VERB_SUPPORT, HostVerb, IoRequest, NegotiatedManifest, PluginApiError, PluginId,
-    PluginRuntime, PluginSpec, RpcError, RpcErrorCode, RpcMessage, RpcResponse, SupportState,
-    SurfaceId, View,
+    PluginMode, PluginRuntime, PluginSpec, RpcError, RpcErrorCode, RpcMessage, RpcResponse,
+    SupportState, SurfaceId, View,
 };
 use thegn_svc::issue::IssueCaps;
 use thegn_svc::plugin::{LoadedPlugin, SessionEvent, SessionWriter};
@@ -324,9 +324,11 @@ pub(crate) fn palette_items(state: &PluginsState) -> Vec<crate::palette::Palette
 }
 
 /// Invoke a plugin palette action by its `plugin:<plugin>:<contribution>`
-/// key. Residents get an `on_event` notification (`kind: Action`,
-/// `payload.id` = the contribution); one-shot plugins run once, now, via
-/// [`crate::plugins::PluginsHost::run_one_shot`]. Returns a status line.
+/// key. Dispatch follows the configured plugin mode: a live resident gets an
+/// `on_event` notification (`kind: Action`, `payload.id` = the contribution),
+/// while a one-shot plugin runs once via
+/// [`crate::plugins::PluginsHost::run_one_shot`]. A resident without a live
+/// writer reports that it is unavailable and is never run as one-shot.
 pub(crate) fn invoke_palette_action(
     state: &PluginsState,
     host: Option<&crate::plugins::PluginsHost>,
@@ -348,17 +350,20 @@ pub(crate) fn invoke_palette_action(
         thegn_core::plugin_api::EventKind::Action,
         serde_json::json!({ "id": contribution }),
     );
-    match &entry.writer {
-        Some(writer) => {
-            if let Err(e) = writer.notify(
-                thegn_core::plugin_api::PluginCallback::OnEvent,
-                serde_json::to_value(&event).unwrap_or_default(),
-            ) {
-                return Some(format!("Plugin {plugin}: {e}"));
+    match entry.plugin.spec.mode {
+        PluginMode::Resident => match &entry.writer {
+            Some(writer) => {
+                if let Err(e) = writer.notify(
+                    thegn_core::plugin_api::PluginCallback::OnEvent,
+                    serde_json::to_value(&event).unwrap_or_default(),
+                ) {
+                    return Some(format!("Plugin {plugin}: {e}"));
+                }
+                Some(format!("Plugin {plugin}: {contribution}"))
             }
-            Some(format!("Plugin {plugin}: {contribution}"))
-        }
-        None => {
+            None => Some(format!("Plugin {plugin} is not running (restarting)")),
+        },
+        PluginMode::OneShot => {
             host?.run_one_shot(entry.plugin.clone());
             Some(format!("Plugin {plugin}: running {contribution}"))
         }
@@ -977,7 +982,7 @@ mod tests {
     use super::*;
     use thegn_core::control::Scope;
     use thegn_core::plugin_api::{
-        ApiVersion, CadenceHint, ContributionId, PluginManifest, PluginMode, Span, StyleRole,
+        ApiVersion, CadenceHint, ContributionId, PluginManifest, Span, StyleRole,
     };
 
     fn contribution(id: &str, ep: ExtensionPoint, surface: &str, label: &str) -> Contribution {
@@ -1436,10 +1441,29 @@ mod tests {
         assert_eq!(items[0].key, "plugin:acts:acts.hello");
         assert!(items[0].label.contains("Say hello"), "{items:?}");
 
-        // No writer (one-shot) and no host handle: nothing to run, but the
-        // key still resolves to its owner (a None host is the only miss).
+        // A resident with no session reports health; writer absence must not
+        // route it through one-shot execution.
+        assert!(
+            invoke_palette_action(&state, None, "plugin:acts:acts.hello")
+                .is_some_and(|status| status.contains("not running"))
+        );
+
+        // The same missing-writer state for a configured one-shot keeps the
+        // prior behavior when no host handle is available.
+        let mut one_shot = spec(
+            "one-shot",
+            vec![contribution(
+                "one-shot.hello",
+                ExtensionPoint::PaletteAction,
+                "one-shot/palette",
+                "Say hello",
+            )],
+            Vec::new(),
+        );
+        one_shot.mode = PluginMode::OneShot;
+        let one_shot_state = state_with(vec![one_shot]);
         assert_eq!(
-            invoke_palette_action(&state, None, "plugin:acts:acts.hello"),
+            invoke_palette_action(&one_shot_state, None, "plugin:one-shot:one-shot.hello"),
             None
         );
         // Unknown contribution / unknown plugin answer with a status.

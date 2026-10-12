@@ -86,6 +86,7 @@ mod tests {
             path: "lib.rs".into(),
             added: 1,
             deleted: 1,
+            binary: false,
         }];
         let summary = compute_entity_summary(&loc, &entries).expect("entity summary");
         assert_eq!(summary.per_file.len(), 1, "{summary:?}");

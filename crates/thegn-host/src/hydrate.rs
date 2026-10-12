@@ -3017,7 +3017,11 @@ pub(crate) fn build_panel(
     panel.files = diff_entries
         .iter()
         .map(|f| crate::panel::DiffFile {
-            status: f.path.chars().next().unwrap_or('M'),
+            status: if f.binary {
+                'B'
+            } else {
+                f.path.chars().next().unwrap_or('M')
+            },
             path: f.path.clone(),
             added: f.added,
             deleted: f.deleted,

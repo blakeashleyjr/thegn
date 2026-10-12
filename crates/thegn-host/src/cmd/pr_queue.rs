@@ -285,8 +285,9 @@ fn drain(cfg: &Config, json: bool) -> Result<()> {
         outln!("Warning: {w}");
     }
     outln!(
-        "Done: {} merged/armed, {} ready, {} still blocked, {} need a human, {} left the queue.",
+        "Done: {} merged, {} auto-merge armed, {} ready, {} still blocked, {} need a human, {} left the queue.",
         out.merged.len(),
+        out.auto_merge_armed.len(),
         out.ready.len(),
         out.blocked.len(),
         out.needs_human.len(),
@@ -300,6 +301,7 @@ fn drain(cfg: &Config, json: bool) -> Result<()> {
 fn drain_json(out: &pr_driver::PrOutcome) -> serde_json::Value {
     serde_json::json!({
         "merged": out.merged,
+        "auto_merge_armed": out.auto_merge_armed,
         "ready": out.ready,
         "blocked": out.blocked,
         "needs_human": out.needs_human,
@@ -308,4 +310,21 @@ fn drain_json(out: &pr_driver::PrOutcome) -> serde_json::Value {
         // scripted drain can tell "nothing to do" from "couldn't look".
         "warnings": out.warnings,
     })
+}
+
+#[cfg(test)]
+mod drain_json_tests {
+    use super::drain_json;
+    use crate::pr_driver::PrOutcome;
+
+    #[test]
+    fn auto_merge_armed_is_additive_and_not_reported_as_merged() {
+        let out = PrOutcome {
+            auto_merge_armed: vec![42],
+            ..PrOutcome::default()
+        };
+        let json = drain_json(&out);
+        assert_eq!(json["merged"], serde_json::json!([]));
+        assert_eq!(json["auto_merge_armed"], serde_json::json!([42]));
+    }
 }

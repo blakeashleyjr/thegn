@@ -158,12 +158,7 @@ fn a_non_local_placement_asserts_nothing() {
 }
 
 #[test]
-fn a_compose_service_asserts_nothing() {
-    // The last of the four "cannot prove it" escape hatches, and the subtlest:
-    // the pane enters via `compose exec <service>`, a DIFFERENT container than
-    // the one the preflight probe targets. Asserting the worktree here would
-    // fail a compose sandbox whose bind is perfectly fine — a pre-existing
-    // mismatch this module deliberately does not widen.
+fn a_compose_service_keeps_mount_sentinels() {
     let mut s = spec(Backend::Docker);
     s.compose = Some(
         crate::sandbox_compose::ComposeSpec {
@@ -173,7 +168,10 @@ fn a_compose_service_asserts_nothing() {
         }
         .encode(),
     );
-    assert!(mount_sentinels(&s, &has(&["/wt/feat/.git"])).is_empty());
+    assert_eq!(
+        mount_sentinels(&s, &has(&["/wt/feat/.git"])),
+        vec!["/wt/feat/.git".to_string()]
+    );
 
     // A compose spec with no service DOES enter the probed container, so it is
     // checked like any other — the gate is the service, not compose itself.

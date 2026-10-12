@@ -143,10 +143,10 @@ impl Default for DaemonConfig {
 
 impl DaemonConfig {
     /// Resolve the control-socket path: the explicit `socket` override, else
-    /// `$XDG_RUNTIME_DIR/thegn/daemon.sock`, else
-    /// `<state_dir>/run/daemon.sock` (the state-dir fallback keeps
-    /// `just start` / smoke isolation working — an isolated `XDG_STATE_HOME`
-    /// gets an isolated daemon). Pure: env is injected.
+    /// `$XDG_RUNTIME_DIR/thegn/daemon.sock`, else the legacy
+    /// `<state_dir>/run/daemon.sock`. The host daemon relocates this fallback
+    /// into a vetted private runtime directory when one is available. Pure: env
+    /// is injected.
     pub fn socket_path(&self, runtime_dir: Option<&str>, state_dir: &std::path::Path) -> PathBuf {
         if !self.socket.is_empty() {
             return PathBuf::from(&self.socket);
@@ -156,6 +156,12 @@ impl DaemonConfig {
             None => state_dir.join("run").join("daemon.sock"),
         }
     }
+}
+
+/// Pre-relocation endpoint used only to discover a daemon from an older
+/// release. New startup code must not bind this path.
+pub fn legacy_socket_path(state_dir: &std::path::Path) -> PathBuf {
+    state_dir.join("run").join("daemon.sock")
 }
 
 /// Longest usable unix-socket path for the platform, in bytes.
