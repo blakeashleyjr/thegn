@@ -119,6 +119,96 @@ fn rejected_resident_frame_does_not_stop_later_messages() {
 }
 
 #[test]
+fn invalid_utf8_resident_line_is_junk_and_later_message_is_delivered() {
+    let (tx, rx) = mpsc::channel();
+    let fixture = FixtureSupervisor::new();
+    let _session = fixture
+        .spawn(
+            &sh(r#"printf '\377\376 junk\n'; sleep 0.05; printf '%s\n' '{"method":"update","params":{"surface":"s"}}'"#),
+            &BTreeMap::new(),
+            None,
+            move |ev| {
+                drop(tx.send(ev)); // best-effort: test receiver may be gone
+            },
+        )
+        .unwrap();
+
+    let events = collect(&rx);
+    assert!(
+        matches!(events.first(), Some(SessionEvent::Junk(_))),
+        "{events:?}"
+    );
+    assert!(
+        matches!(events.get(1), Some(SessionEvent::Message(message)) if message.method == "update"),
+        "{events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(SessionEvent::Exit { code: Some(0) })),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn oversized_resident_line_is_discarded_through_newline() {
+    let (tx, rx) = mpsc::channel();
+    let fixture = FixtureSupervisor::new();
+    let script = format!(
+        "head -c {} /dev/zero | tr '\\0' x; printf '\\n%s\\n' '{}'",
+        crate::plugin::proc::MAX_LINE_BYTES + 64,
+        r#"{"method":"update","params":{"surface":"s"}}"#
+    );
+    let _session = fixture
+        .spawn(&sh(&script), &BTreeMap::new(), None, move |ev| {
+            drop(tx.send(ev)); // best-effort: test receiver may be gone
+        })
+        .unwrap();
+
+    let events = collect(&rx);
+    assert!(
+        matches!(events.first(), Some(SessionEvent::Junk(text)) if text.chars().count() <= 200),
+        "{events:?}"
+    );
+    assert!(
+        matches!(events.get(1), Some(SessionEvent::Message(message)) if message.method == "update"),
+        "{events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(SessionEvent::Exit { code: Some(0) })),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn invalid_utf8_cleanup_drain_preserves_final_valid_frame() {
+    let (tx, rx) = mpsc::channel();
+    let fixture = FixtureSupervisor::new();
+    let _session = fixture
+        .spawn(
+            &sh(r#"printf '\377\376 junk\n%s\n' '{"method":"update","params":{"surface":"s"}}'"#),
+            &BTreeMap::new(),
+            None,
+            move |ev| {
+                drop(tx.send(ev)); // best-effort: test receiver may be gone
+            },
+        )
+        .unwrap();
+
+    let events = collect(&rx);
+    assert!(
+        matches!(events.first(), Some(SessionEvent::Junk(_))),
+        "{events:?}"
+    );
+    assert!(
+        matches!(events.get(1), Some(SessionEvent::Message(message)) if message.method == "update"),
+        "{events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(SessionEvent::Exit { code: Some(0) })),
+        "{events:?}"
+    );
+}
+
+#[test]
 fn round_trips_a_callback_and_classifies_lines() {
     let (tx, rx) = mpsc::channel();
     // The child echoes an update verb for every line it reads, plus one
