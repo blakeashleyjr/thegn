@@ -1730,6 +1730,9 @@ mod tests {
         cmds: Vec<WizardCmd>,
         db_path: &Path,
     ) -> Vec<CreateEvent> {
+        let state_home = repo.join("state");
+        let state_home = state_home.to_string_lossy().into_owned();
+        let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", &state_home)]);
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         for c in cmds {
             cmd_tx.send(c).unwrap();
@@ -2187,6 +2190,10 @@ mod tests {
         let p = expect_done(&events);
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "done");
         assert!(Path::new(&p.path).is_dir());
+        assert!(
+            repo.join("state/thegn/hooks").is_dir(),
+            "post-create hook log should use the worker's isolated state home"
+        );
         let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
