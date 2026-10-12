@@ -16,7 +16,7 @@
 //! | sibling PR branch cache refresh | replaceable cache refresh; generation fence only | cache | skip; next refresh retries |
 //! | `hydrate::spawn_my_work_refresh` | replaceable cache refresh; no latch | cache + waker | skip; periodic trigger retries |
 //! | `remote_poll::poll` | replaceable remote refresh; no latch | model refresh + waker | skip; poll tick retries |
-//! | `ci_refresh::spawn_ci_cache_refresh` | replaceable cache refresh; generation fence only | cache + waker | skip; ticker/switch retries |
+//! | `ci_refresh::spawn_ci_cache_refresh` | single-flight cache refresh; newest request queued, stale generation cancelled | cache + waker | clear latch; ticker/switch retries |
 //! | `measure::disk::spawn_scan` | replaceable cache scan; worker-owned round flag | cache + waker | skip; planner/ticker retries |
 //! | `measure::loc::spawn_scan` | replaceable cache scan; worker-owned round flag | cache + waker | skip; planner/ticker retries |
 //! | `hydrate_calendar::spawn_month_fetch` | user-visible cache read; popup awaits payload | month result channel | send typed unavailable payload |
