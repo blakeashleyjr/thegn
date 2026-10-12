@@ -208,7 +208,6 @@ impl VoiceController {
                 reason: "voice capture worker could not start".into(),
             });
             let _ = waker.wake();
-            return;
         }
     }
 
@@ -346,20 +345,18 @@ impl VoiceController {
             .as_ref()
             .is_some_and(thread::JoinHandle::is_finished)
             && let Some(worker) = self.capture_worker.take()
+            && worker.join().is_err()
         {
-            if worker.join().is_err() {
-                tracing::warn!("voice capture worker panicked");
-            }
+            tracing::warn!("voice capture worker panicked");
         }
         if self
             .transcription_worker
             .as_ref()
             .is_some_and(thread::JoinHandle::is_finished)
             && let Some(worker) = self.transcription_worker.take()
+            && worker.join().is_err()
         {
-            if worker.join().is_err() {
-                tracing::warn!("voice transcription worker panicked");
-            }
+            tracing::warn!("voice transcription worker panicked");
         }
     }
 }
@@ -584,25 +581,25 @@ fn spawn_capture(
             // A child can exit while a descendant still owns one of the
             // pipes. Kill the grouped process tree before joining helpers so
             // no reader survives the utterance.
-            if output.is_none() || error.is_none() {
-                if !terminate_capture_child(child, group, &on_reaped) {
-                    let readers_stopped = join_capture_workers(output_thread, error_thread);
-                    send_capture(
-                        &tx,
-                        &waker,
-                        capture_failure(
-                            pane_id,
-                            generation,
-                            if readers_stopped {
-                                "capture process shutdown could not be proven"
-                            } else {
-                                "capture process and pipe-worker shutdown could not be proven"
-                            },
-                            true,
-                        ),
-                    );
-                    return;
-                }
+            if (output.is_none() || error.is_none())
+                && !terminate_capture_child(child, group, &on_reaped)
+            {
+                let readers_stopped = join_capture_workers(output_thread, error_thread);
+                send_capture(
+                    &tx,
+                    &waker,
+                    capture_failure(
+                        pane_id,
+                        generation,
+                        if readers_stopped {
+                            "capture process shutdown could not be proven"
+                        } else {
+                            "capture process and pipe-worker shutdown could not be proven"
+                        },
+                        true,
+                    ),
+                );
+                return;
             }
             if !join_capture_workers(output_thread, error_thread) {
                 send_capture(
