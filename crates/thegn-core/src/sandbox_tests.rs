@@ -409,10 +409,12 @@ fn compose_enter_refuses_unsupported_apple_backend() {
         }
         .encode(),
     );
-    assert!(matches!(
-        enter_argv(&s, "true"),
-        Err(EnterError::Refused(_))
-    ));
+    match enter_argv(&s, "true") {
+        Err(EnterError::Refused(message)) => {
+            assert!(message.contains("unsupported for backend 'apple'"));
+        }
+        other => panic!("expected unsupported Compose refusal, got {other:?}"),
+    }
 }
 
 #[test]
@@ -2356,26 +2358,31 @@ fn secret_env_file_rejects_a_symlinked_intermediate_component() {
 
 #[cfg(unix)]
 #[test]
-fn secret_env_file_rejects_a_group_writable_intermediate_component() {
+fn secret_env_file_tightens_owned_group_writable_state_directory() {
     let parent = tempfile::tempdir().unwrap();
     let intermediate = parent.path().join("thegn");
     std::fs::create_dir(&intermediate).unwrap();
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&intermediate, std::fs::Permissions::from_mode(0o777)).unwrap();
+    std::fs::set_permissions(&intermediate, std::fs::Permissions::from_mode(0o775)).unwrap();
     let key = String::from("GH_TOKEN");
     let value = String::from("canary-secret");
 
-    assert!(
-        write_secret_env_file_in(
-            parent.path(),
-            std::path::Path::new("thegn/sandbox-env"),
-            "launch",
-            &[(&key, &value)],
-            false,
-        )
-        .is_none()
+    let path = write_secret_env_file_in(
+        parent.path(),
+        std::path::Path::new("thegn/sandbox-env"),
+        "launch",
+        &[(&key, &value)],
+        false,
+    )
+    .expect("owned group-writable state directory is tightened");
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        "GH_TOKEN=canary-secret\n"
     );
-    assert!(!intermediate.join("sandbox-env").exists());
+    assert_eq!(
+        std::fs::metadata(intermediate).unwrap().mode() & 0o777,
+        0o755
+    );
 }
 
 #[test]
