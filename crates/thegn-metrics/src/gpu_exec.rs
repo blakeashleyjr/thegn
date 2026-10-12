@@ -270,12 +270,17 @@ pub(crate) mod test_support {
     pub(crate) fn gone(pid: i32) -> bool {
         match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Err(_) => true,
-            Ok(s) => s
-                .rsplit(')')
-                .next()
-                .map(|t| t.trim_start().starts_with('Z'))
-                .unwrap_or(true),
+            Ok(stat) => stat_state_is_gone(&stat),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn stat_state_is_gone(stat: &str) -> bool {
+        stat.rsplit(')')
+            .next()
+            .and_then(|tail| tail.trim_start().chars().next())
+            .map(|state| matches!(state, 'Z' | 'X' | 'x'))
+            .unwrap_or(true)
     }
 }
 
@@ -338,6 +343,29 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn proc_stat_parser_recognizes_zombie_and_dead_states() {
+        assert!(test_support::stat_state_is_gone("123 (a) b) Z 1 ..."));
+        assert!(test_support::stat_state_is_gone("123 (a) b) X 1 ..."));
+        assert!(test_support::stat_state_is_gone("123 (a) b) x 1 ..."));
+        assert!(!test_support::stat_state_is_gone("123 (a) b) S 1 ..."));
+        assert!(test_support::stat_state_is_gone(""));
+    }
+
+    // SIGKILL-to-exit can exceed a few seconds on a CPU-capped host under swap.
+    #[cfg(target_os = "linux")]
+    const REAP_GRACE: Duration = Duration::from_secs(15);
+
+    #[cfg(target_os = "linux")]
+    fn assert_pid_gone(pid: i32, context: &str) {
+        if !gone(pid) {
+            let last_stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+            panic!("{context}: process {pid} remained; last /proc/{pid}/stat: {last_stat}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn timeout_kills_grandchildren() {
         let d = tempfile::tempdir().unwrap();
         let pidfile = d.path().join("gc.pid");
@@ -352,11 +380,11 @@ mod tests {
             .trim()
             .parse()
             .unwrap();
-        let end = Instant::now() + Duration::from_secs(3);
+        let end = Instant::now() + REAP_GRACE;
         while !gone(pid) && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(gone(pid), "grandchild {pid} survived the timeout");
+        assert_pid_gone(pid, "grandchild survived the timeout");
     }
 
     #[cfg(target_os = "linux")]
@@ -379,10 +407,10 @@ mod tests {
             .trim()
             .parse()
             .unwrap();
-        let end = Instant::now() + Duration::from_secs(3);
+        let end = Instant::now() + REAP_GRACE;
         while !gone(pid) && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(gone(pid), "descendant {pid} survived a clean exit");
+        assert_pid_gone(pid, "descendant survived a clean exit");
     }
 }
