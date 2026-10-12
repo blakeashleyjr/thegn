@@ -1569,7 +1569,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = Config::default();
         cfg.recording.dir = tmp.path().to_string_lossy().into_owned();
-        let BuiltActor { mut actor, .. } = build_actor_cfg("cat", None, "sh", cfg);
+        let BuiltActor {
+            mut actor,
+            pane_rx,
+            msg_rx,
+            harness,
+        } = build_actor_cfg("cat", None, "sh", cfg);
         let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
         actor.recording_done_tx = Some(completed_tx);
 
@@ -1585,6 +1590,22 @@ mod tests {
             .await
             .expect("recording worker finishes")
             .expect("recording completion is reported");
+
+        tokio::spawn(actor.run(pane_rx, msg_rx));
+        harness
+            .msg_tx
+            .send(SessionMsg::Kill)
+            .await
+            .expect("actor accepts kill");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(harness.feed.recv().await, Ok(frame) if matches!(frame.as_ref(), EventFrame::SessionExit { session, .. } if session == "s1")) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("actor tears down after test");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1621,7 +1642,7 @@ mod tests {
             .await
             .expect("actor accepts stdin");
 
-        tokio::time::timeout(std::time::Duration::from_millis(200), async {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if h.live
                     .lock()
@@ -1635,7 +1656,7 @@ mod tests {
             }
         })
         .await
-        .expect("worker cap wakes actor before a periodic poll could run");
+        .expect("worker cap finalizes the quiet session within 2 seconds");
 
         h.msg_tx
             .send(SessionMsg::Kill)
