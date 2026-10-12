@@ -18,6 +18,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+const MAX_PARSE_COLLECTION_ENTRIES: usize = 1024;
+/// Maximum bytes produced by variable expansion before the remaining input is
+/// copied verbatim and the report is marked limited.
+pub const MAX_SUBSTITUTION_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// A parsed, normalized `devcontainer.json`. Only the fields thegn can act
 /// on are retained; `customizations.vscode.*` and other editor-only keys are
@@ -183,6 +189,13 @@ pub enum ParseError {
     NotAnObject,
     /// The selected file could not be read.
     Read { path: PathBuf, error: String },
+    /// A JSON array or object exceeded its bounded entry count.
+    Budget {
+        /// Collection kind that exceeded its limit.
+        field: &'static str,
+        /// Maximum number of entries permitted.
+        limit: usize,
+    },
 }
 
 impl std::fmt::Display for ParseError {
@@ -192,6 +205,9 @@ impl std::fmt::Display for ParseError {
             ParseError::NotAnObject => write!(f, "devcontainer.json is not a JSON object"),
             ParseError::Read { path, error } => {
                 write!(f, "{}: cannot read: {error}", path.display())
+            }
+            ParseError::Budget { field, limit } => {
+                write!(f, "devcontainer {field} exceeds {limit} entries")
             }
         }
     }
@@ -246,6 +262,7 @@ pub fn parse(text: &str) -> Result<DevContainer, ParseError> {
     let stripped = strip_jsonc(text);
     let value: Value =
         serde_json::from_str(&stripped).map_err(|e| ParseError::Json(e.to_string()))?;
+    validate_collection_budgets(&value)?;
     let obj = value.as_object().ok_or(ParseError::NotAnObject)?;
 
     Ok(DevContainer {
@@ -304,16 +321,68 @@ pub fn parse(text: &str) -> Result<DevContainer, ParseError> {
     })
 }
 
-/// Stable identifier for a repo/config pair, suitable for `${devcontainerId}`
-/// and deterministic volume names. The separator prevents path concatenation
-/// collisions and no file contents are included, so edits keep the same id.
+fn validate_collection_budgets(value: &Value) -> Result<(), ParseError> {
+    match value {
+        Value::Array(values) => {
+            if values.len() > MAX_PARSE_COLLECTION_ENTRIES {
+                return Err(ParseError::Budget {
+                    field: "array",
+                    limit: MAX_PARSE_COLLECTION_ENTRIES,
+                });
+            }
+            for value in values {
+                validate_collection_budgets(value)?;
+            }
+        }
+        Value::Object(values) => {
+            if values.len() > MAX_PARSE_COLLECTION_ENTRIES {
+                return Err(ParseError::Budget {
+                    field: "object",
+                    limit: MAX_PARSE_COLLECTION_ENTRIES,
+                });
+            }
+            for value in values.values() {
+                validate_collection_budgets(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Versioned, collision-resistant identifier for a repo/config pair, suitable
+/// for `${devcontainerId}` and deterministic volume names. Exact encoded path
+/// bytes are used so non-UTF-8 names remain distinct; file contents are not
+/// included, so edits keep the same id.
 pub fn devcontainer_id(repo_root: &Path, config_relative_path: &Path) -> String {
-    let key = format!(
-        "{}\0{}",
-        repo_root.to_string_lossy(),
-        config_relative_path.to_string_lossy()
-    );
-    crate::util::short_hash(&key, 12)
+    let repo_bytes = repo_root.as_os_str().as_encoded_bytes();
+    let config_bytes = config_relative_path.as_os_str().as_encoded_bytes();
+    let digest = crate::identity::digest_parts(
+        "thegn.devcontainer-id.v2",
+        &[
+            crate::identity::BytePart::new(repo_bytes),
+            crate::identity::BytePart::new(config_bytes),
+        ],
+    )
+    .unwrap_or_else(|_| {
+        // The shared identity encoder is deliberately capped. Hash the same
+        // exact components directly under a distinct overflow domain rather
+        // than truncating, lossy-converting, or reverting to FNV.
+        let mut hasher = Sha256::new();
+        hasher.update(b"thegn.devcontainer-id.v2.overflow\0");
+        hasher.update((repo_bytes.len() as u64).to_be_bytes());
+        hasher.update(repo_bytes);
+        hasher.update((config_bytes.len() as u64).to_be_bytes());
+        hasher.update(config_bytes);
+        hasher.finalize().into()
+    });
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut rendered = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        rendered.push(HEX[(byte >> 4) as usize] as char);
+        rendered.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    rendered
 }
 
 /// Classify every source key using the shared inventory table.
@@ -333,6 +402,9 @@ pub fn substitute(input: &str, ctx: &SubstCtx) -> String {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SubstitutionReport {
     pub blocked_local_env: std::collections::BTreeSet<String>,
+    /// Expansion stopped at the output budget; the unprocessed input was
+    /// copied verbatim after the bounded expanded prefix.
+    pub output_limit_exceeded: bool,
 }
 
 /// Expand variables while enforcing a caller-supplied local environment
@@ -370,7 +442,7 @@ fn substitute_with_id_report(
     devcontainer_id: Option<&str>,
     local_env_allowed: &dyn Fn(&str) -> bool,
 ) -> (String, SubstitutionReport) {
-    let mut out = String::with_capacity(input.len());
+    let mut out = String::with_capacity(input.len().min(MAX_SUBSTITUTION_OUTPUT_BYTES));
     let mut report = SubstitutionReport::default();
     let bytes = input.as_bytes();
     let mut i = 0;
@@ -381,13 +453,25 @@ fn substitute_with_id_report(
             && let Some(end) = input[i + 2..].find('}')
         {
             let name = &input[i + 2..i + 2 + end];
-            out.push_str(&ctx.resolve(name, devcontainer_id, local_env_allowed, &mut report));
-            i = i + 2 + end + 1;
+            let next = i + 2 + end + 1;
+            let replacement = ctx.resolve(name, devcontainer_id, local_env_allowed, &mut report);
+            if out.len().saturating_add(replacement.len()) > MAX_SUBSTITUTION_OUTPUT_BYTES {
+                report.output_limit_exceeded = true;
+                out.push_str(&input[i..]);
+                return (out, report);
+            }
+            out.push_str(&replacement);
+            i = next;
             continue;
         }
         // Not a well-formed `${...}` — copy the char through on a UTF-8
         // boundary (never re-encode a multibyte code point as Latin-1).
         let ch = input[i..].chars().next().expect("valid utf-8 boundary");
+        if out.len().saturating_add(ch.len_utf8()) > MAX_SUBSTITUTION_OUTPUT_BYTES {
+            report.output_limit_exceeded = true;
+            out.push_str(&input[i..]);
+            return (out, report);
+        }
         out.push(ch);
         i += ch.len_utf8();
     }
@@ -1026,6 +1110,87 @@ mod tests {
                 Path::new(".devcontainer/b/devcontainer.json")
             )
         );
+    }
+
+    #[test]
+    fn devcontainer_id_is_versioned_hex_and_overflow_inputs_are_stable() {
+        let id = devcontainer_id(
+            Path::new("/repo"),
+            Path::new(".devcontainer/devcontainer.json"),
+        );
+        assert!(id.len() >= 32);
+        assert!(
+            id.chars()
+                .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+        );
+
+        // Exercise the encoder's over-limit branch without requiring the path
+        // to exist on disk.
+        let long_root = PathBuf::from(format!("/{}", "r".repeat(20_000)));
+        let overflow_id = devcontainer_id(&long_root, Path::new("devcontainer.json"));
+        assert_eq!(overflow_id.len(), 64);
+        assert_eq!(
+            overflow_id,
+            devcontainer_id(&long_root, Path::new("devcontainer.json"))
+        );
+    }
+
+    #[test]
+    fn substitution_stops_expansion_at_output_budget() {
+        let ctx = SubstCtx {
+            local_workspace_folder: "x".repeat(4096),
+            container_workspace_folder: String::new(),
+            local_env: &|_| None,
+            container_env: &|_| None,
+        };
+        let token = "${localWorkspaceFolder}";
+        let at_limit_input = token.repeat(MAX_SUBSTITUTION_OUTPUT_BYTES / 4096);
+        let (at_limit, at_limit_report) = substitute_with_report(&at_limit_input, &ctx, &|_| true);
+        assert_eq!(at_limit.len(), MAX_SUBSTITUTION_OUTPUT_BYTES);
+        assert!(!at_limit_report.output_limit_exceeded);
+
+        let input = token.repeat(50_000);
+        let (output, report) = substitute_with_report(&input, &ctx, &|_| true);
+        assert!(report.output_limit_exceeded);
+        assert!(output.len() <= MAX_SUBSTITUTION_OUTPUT_BYTES + input.len());
+    }
+
+    #[test]
+    fn parse_bounds_array_and_object_collections() {
+        let mounts_at_limit = serde_json::json!({
+            "mounts": vec![Value::Null; MAX_PARSE_COLLECTION_ENTRIES]
+        });
+        assert!(parse(&mounts_at_limit.to_string()).is_ok());
+        let mounts_over_limit = serde_json::json!({
+            "mounts": vec![Value::Null; MAX_PARSE_COLLECTION_ENTRIES + 1]
+        });
+        assert!(matches!(
+            parse(&mounts_over_limit.to_string()),
+            Err(ParseError::Budget {
+                field: "array",
+                limit: MAX_PARSE_COLLECTION_ENTRIES
+            })
+        ));
+
+        let mut env_at_limit = serde_json::Map::new();
+        for index in 0..MAX_PARSE_COLLECTION_ENTRIES {
+            env_at_limit.insert(format!("K{index}"), Value::String("v".into()));
+        }
+        let at_limit = serde_json::json!({ "remoteEnv": env_at_limit });
+        assert!(parse(&at_limit.to_string()).is_ok());
+
+        let mut env_over_limit = serde_json::Map::new();
+        for index in 0..=MAX_PARSE_COLLECTION_ENTRIES {
+            env_over_limit.insert(format!("K{index}"), Value::String("v".into()));
+        }
+        let over_limit = serde_json::json!({ "remoteEnv": env_over_limit });
+        assert!(matches!(
+            parse(&over_limit.to_string()),
+            Err(ParseError::Budget {
+                field: "object",
+                limit: MAX_PARSE_COLLECTION_ENTRIES
+            })
+        ));
     }
 
     #[test]
