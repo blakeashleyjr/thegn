@@ -1506,12 +1506,20 @@ mod tests {
     fn files_main_region_renders_typed_diff_count() {
         let mut m = model();
         m.panel.changes[0].count = thegn_svc::git::DiffCount::Binary;
-        let frame = build_git_full(&m, &ui(GitView::Files), 120, 40, true);
-        let all = all_text(&frame);
-        assert!(all.contains("bin"), "typed binary label: {all}");
+        let ui = ui(GitView::Files);
+        let main_rows = staging_region(&m.panel, &ui, true, 120, 40);
+        let main_file_row = main_rows
+            .iter()
+            .map(|row| text_of(&row.line))
+            .find(|text| text.contains("src/a.rs"))
+            .expect("selected file summary row rendered in the main region");
         assert!(
-            !all.contains("+5"),
-            "binary row has no numeric count: {all}"
+            main_file_row.contains("bin"),
+            "typed binary label: {main_file_row}"
+        );
+        assert!(
+            !main_file_row.contains("+5") && !main_file_row.contains("−1"),
+            "binary row has no numeric count: {main_file_row}"
         );
     }
 
