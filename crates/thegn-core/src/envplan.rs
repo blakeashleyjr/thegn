@@ -496,9 +496,10 @@ pub struct PlanOpts {
     pub snapshot_restore: Option<String>,
     /// Sandbox-side URL of the host's embedded nix binary cache (the loopback the
     /// reverse tunnel binds, e.g. `http://127.0.0.1:8484`), or `None`. When set,
-    /// it's baked into the sandbox nix.conf as an `extra-substituters` entry with
-    /// `require-sigs = false`, so `nix develop`/`direnv` substitute prebuilt store
-    /// paths from the host instead of building. See `[env.<name>.provider] host_cache`.
+    /// it's baked into the sandbox nix.conf as an `extra-substituters` entry.
+    /// The embedded host cache is unsigned, so Nix ignores its paths while
+    /// signature verification is enforced; it can accelerate substitutions once
+    /// the cache has an authenticated signer. See `[env.<name>.provider] host_cache`.
     pub host_cache_url: Option<String>,
     /// `[toolchain]` — how the [`Tier::SynthNix`] tier resolves language
     /// manifests into a synthesized Nix devShell (mode + per-language package
@@ -966,18 +967,16 @@ fn nix_install_script(
             ));
         }
     }
-    // The host's embedded nix cache (served over the reverse tunnel). It's UNSIGNED
-    // — paths are served straight from the host store with no signing key — so the
-    // sandbox must accept unsigned substitutes: `require-sigs = false`. Safe here
-    // (the cache is reachable only over the per-sandbox loopback tunnel, the store
-    // is single-user, and NarHash still content-checks each download). `nix`
+    // The embedded host cache is currently UNSIGNED. Keep Nix's signature boundary
+    // enforced: unsigned narinfo cannot authenticate its own NarHash, and an
+    // unsigned cache must remain inert until it has an authenticated signer. `nix`
     // accumulates `extra-substituters` lines, so this coexists with `cache` above.
     if let Some(url) = host_cache_url.map(str::trim).filter(|u| !u.is_empty()) {
         conf.push_str(&format!(
             "extra-substituters = {}\\n",
             printf_fmt_escape(url)
         ));
-        conf.push_str("require-sigs = false\\n");
+        conf.push_str("require-sigs = true\\n");
         // Graceful degradation for a cache reachable ONLY over the per-sprite reverse
         // tunnel. Two failure modes made `host_cache` unusable: (1) the in-sprite
         // build can start BEFORE the tunnel is up, so nix would hang on the OS connect
@@ -2717,8 +2716,8 @@ mod tests {
         let s = nix_install_script(NixInstaller::Official, None, Some(&cache), None);
         assert!(s.contains("extra-substituters = https://cache.example.org"));
         assert!(s.contains("extra-trusted-public-keys = cache.example.org-1:abc"));
-        // host_cache_url adds the loopback substituter + require-sigs=false (unsigned
-        // host store served over the reverse tunnel), and coexists with a real cache.
+        // host_cache_url adds the loopback substituter while keeping signature
+        // verification enabled, and coexists with a real cache.
         let hc = nix_install_script(
             NixInstaller::Official,
             None,
@@ -2726,7 +2725,8 @@ mod tests {
             Some("http://127.0.0.1:8484"),
         );
         assert!(hc.contains("extra-substituters = http://127.0.0.1:8484"));
-        assert!(hc.contains("require-sigs = false"));
+        assert!(!hc.contains("require-sigs = false"));
+        assert!(hc.contains("require-sigs = true"));
         assert!(hc.contains("extra-substituters = https://cache.example.org"));
         // Host cache ⇒ graceful-degradation trio so a not-yet-up tunnel or a desynced
         // NAR degrades (fast fall-through / from-source rebuild) instead of hanging or
@@ -2769,6 +2769,40 @@ mod tests {
         };
         let p2 = plan(&req, &opts2);
         assert!(!p2.steps.iter().any(|s| s.id == "cache_push"));
+    }
+
+    #[test]
+    fn host_cache_plan_never_disables_nix_signature_checks() {
+        let req = EnvRequirements {
+            nix_flake_devshell: true,
+            ..Default::default()
+        };
+        let opts = PlanOpts {
+            host_cache_url: Some("http://127.0.0.1:8484".into()),
+            binary_cache: Some(BinaryCache {
+                url: "https://cache.example.org".into(),
+                key: String::new(),
+                push: false,
+            }),
+            ..Default::default()
+        };
+        let p = plan(&req, &opts);
+
+        let scripts: Vec<&str> = p
+            .steps
+            .iter()
+            .filter_map(|step| match &step.kind {
+                StepKind::Exec(script) => Some(script.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !scripts.is_empty(),
+            "the Nix plan includes executable steps"
+        );
+        assert!(scripts.iter().all(|script| {
+            !script.contains("require-sigs = false") && !script.contains("--no-check-sigs")
+        }));
     }
 
     #[test]
