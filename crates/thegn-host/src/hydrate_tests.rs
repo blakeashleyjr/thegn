@@ -102,7 +102,7 @@ fn glyph_partition_keeps_suspended_cache_skips_uncached_and_scans_active() {
 fn glyph_location_lookup_failure_falls_back_to_local_scan_policy() {
     let path = "/repo/local";
     let on_lookup_error = may_live_scan_for_location(path, Err("database unavailable"), false);
-    let on_local_miss = may_live_scan_for_location(path, Ok(None), false);
+    let on_local_miss = may_live_scan_for_location(path, Ok::<Option<String>, String>(None), false);
     assert!(
         on_lookup_error,
         "a DB error must retain local live scanning"
