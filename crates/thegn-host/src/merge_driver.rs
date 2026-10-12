@@ -205,6 +205,9 @@ pub(crate) fn drive_queue(
                 integrate::attempt_land(cfg, repo_root, branch, location)
             },
             floor: |worktree: &str| {
+                if let Some(reason) = crate::agent_run::headless_unsupported() {
+                    return crate::agent_run::AgentDispatch::InfraHold(reason);
+                }
                 let Some(branch) = worktree_branches.get(worktree) else {
                     return crate::agent_run::AgentDispatch::InfraHold(
                         "worktree identity drift: queue item identity is unavailable".into(),
@@ -751,7 +754,7 @@ fn compose(
     thegn_core::agent_task::TaskVars,
     String,
 )> {
-    use thegn_core::agent_task::{TaskKind, TaskVars, format_paths, render_task_prompt};
+    use thegn_core::agent_task::{TaskKind, TaskVars, format_paths, render_kind_prompt};
 
     let (kind, vars) = match failure {
         Failure::Conflict {
@@ -774,7 +777,7 @@ fn compose(
         .set("target", target)
         .set("worktree", worktree);
 
-    match render_task_prompt(cfg.prompts.resolve(kind), &vars) {
+    match render_kind_prompt(kind, cfg.prompts.resolve(kind), &vars) {
         Ok(prompt) => Some((kind, vars, prompt)),
         Err(e) => {
             // `config validate` catches this ahead of time; if a bad template
@@ -1186,6 +1189,30 @@ mod tests {
                 "identity drift must not launch the fixer"
             );
             assert_eq!(db.list_merge_queue().unwrap()[0].agent_attempts, 0);
+        }
+
+        #[test]
+        fn unsupported_platform_holds_before_merge_agent_attempt_or_spawn() {
+            let (_fixture, root, feat_wt) = conflicting_repo("unsupported-agent");
+            let sentinel = root.join("unsupported-agent-was-run");
+            let db = Db::open_memory().unwrap();
+            let queued = item(&db, &feat_wt);
+            let unsupported = crate::agent_run::force_headless_unsupported();
+            let outcome = drive_queue(
+                &cfg(&format!("touch {} && {FIXER}", sentinel.display()), 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+            drop(unsupported);
+
+            assert_eq!(outcome.agent_blocked, ["feat"]);
+            assert!(!sentinel.exists());
+            let row = db.list_merge_queue().unwrap().remove(0);
+            assert_eq!(row.agent_attempts, 0);
+            assert!(row.error_detail.unwrap().contains("THE-235"));
         }
 
         #[test]

@@ -302,17 +302,7 @@
       "issue": "THE-143",
       "project": "Cross-Platform Support & Verification",
       "changes": [
-        "package-shell-completions",
         "rework-shell-completions"
-      ]
-    },
-    {
-      "issue": "THE-144",
-      "project": "Proposal Retirement & Cleanup",
-      "changes": [
-        "add-fleet-view",
-        "add-localization",
-        "package-shell-completions"
       ]
     },
     {

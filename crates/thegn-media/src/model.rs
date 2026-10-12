@@ -7,6 +7,14 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// Maximum normalized display-label characters retained for media metadata.
+/// Host-panel collection row limits are defined alongside this display cap.
+pub const MAX_LABEL_CHARS: usize = 256;
+/// Maximum queue rows retained by the host media panel.
+pub const MAX_QUEUE_ITEMS: usize = 500;
+/// Maximum source rows retained by the host media panel.
+pub const MAX_SOURCES: usize = 64;
+
 /// Transport state, normalized across backends (maps MPRIS `PlaybackStatus`,
 /// Windows SMTC `PlaybackStatus`, and mpv's `pause`/`idle` onto one axis).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -183,21 +191,44 @@ fn percent_decode(value: &str) -> Option<String> {
 
 /// Normalize provider-controlled text before it is displayed in terminal UI.
 /// C0/C1 controls become spaces; bidi and zero-width formatting controls drop.
+/// Output is capped at `MAX_LABEL_CHARS` normalized characters, with `...` when visible text is
+/// omitted.
 pub fn display_text(value: &str) -> String {
-    value
-        .chars()
-        .filter_map(|ch| match ch {
-            '\u{061c}'
-            | '\u{200e}'
-            | '\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{200b}'..='\u{200d}'
-            | '\u{feff}' => None,
-            ch if ch.is_control() => Some(' '),
-            ch => Some(ch),
-        })
-        .collect()
+    display_text_parts(&[value])
+}
+
+fn normalize_display_char(ch: char) -> Option<char> {
+    match ch {
+        '\u{061c}'
+        | '\u{200e}'
+        | '\u{200f}'
+        | '\u{202a}'..='\u{202e}'
+        | '\u{2066}'..='\u{2069}'
+        | '\u{200b}'..='\u{200d}'
+        | '\u{feff}' => None,
+        ch if ch.is_control() => Some(' '),
+        ch => Some(ch),
+    }
+}
+
+fn display_text_parts(parts: &[&str]) -> String {
+    let mut chars = parts.iter().flat_map(|part| part.chars());
+    let mut output = String::with_capacity(MAX_LABEL_CHARS + 3);
+    let mut count = 0;
+    for ch in chars.by_ref() {
+        let normalized = normalize_display_char(ch);
+        if let Some(normalized) = normalized {
+            output.push(normalized);
+            count += 1;
+            if count == MAX_LABEL_CHARS {
+                break;
+            }
+        }
+    }
+    if count == MAX_LABEL_CHARS && chars.any(|ch| normalize_display_char(ch).is_some()) {
+        output.push_str("...");
+    }
+    output
 }
 
 /// Repeat mode, normalized across backends (MPRIS `LoopStatus`: None/Track/
@@ -291,13 +322,12 @@ impl MediaState {
     /// `"Artist — Title"`, falling back gracefully when fields are missing.
     /// Used by both the statusbar badge and the panel header.
     pub fn now_playing(&self) -> String {
-        let raw = match (self.artist.trim(), self.title.trim()) {
-            ("", "") => self.player.clone(),
-            ("", t) => t.to_string(),
-            (a, "") => a.to_string(),
-            (a, t) => format!("{a} \u{2014} {t}"), // em dash
-        };
-        display_text(&raw)
+        match (self.artist.trim(), self.title.trim()) {
+            ("", "") => display_text(&self.player),
+            ("", title) => display_text(title),
+            (artist, "") => display_text(artist),
+            (artist, title) => display_text_parts(&[artist, " \u{2014} ", title]),
+        }
     }
 
     /// The full badge text — transport glyph + now-playing — e.g. `▶ Daft Punk
@@ -347,12 +377,12 @@ pub struct QueueItem {
 impl QueueItem {
     /// `"Artist — Title"`, falling back to the title/id when fields are missing.
     pub fn label(&self) -> String {
-        let raw = match (self.artist.trim(), self.title.trim()) {
-            ("", "") => self.id.clone(),
-            ("", t) => t.to_string(),
-            (a, t) => format!("{a} \u{2014} {t}"),
-        };
-        display_text(&raw)
+        match (self.artist.trim(), self.title.trim()) {
+            ("", "") => display_text(&self.id),
+            ("", title) => display_text(title),
+            (artist, "") => display_text(artist),
+            (artist, title) => display_text_parts(&[artist, " \u{2014} ", title]),
+        }
     }
 }
 
@@ -424,6 +454,29 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(state.now_playing(), "a  b");
+    }
+
+    #[test]
+    fn display_text_bounds_long_labels() {
+        let normalized = display_text(&"x".repeat(1024 * 1024));
+        assert!(normalized.chars().count() <= MAX_LABEL_CHARS + 3);
+        assert!(normalized.ends_with("..."));
+    }
+
+    #[test]
+    fn display_text_does_not_mark_dropped_tail_as_truncated() {
+        let value = format!("{}\u{200b}", "x".repeat(MAX_LABEL_CHARS));
+        assert_eq!(display_text(&value), "x".repeat(MAX_LABEL_CHARS));
+    }
+
+    #[test]
+    fn queue_item_with_only_artist_has_no_dangling_separator() {
+        let item = QueueItem {
+            artist: "Artist".into(),
+            ..Default::default()
+        };
+        assert_eq!(item.label(), "Artist");
+        assert!(!item.label().contains('\u{2014}'));
     }
 
     #[test]

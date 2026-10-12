@@ -2,10 +2,10 @@
 //! commits, rich branches, stashes, tags, bisect state, git version.
 //!
 //! Pure parsing; the svc layer runs the commands and hands the stdout here.
-//! Commit records use NUL-delimited fields, which cannot collide with Git
-//! identity or message data. Ref records use unit separators because Git ref
-//! names cannot contain control bytes. Parsers reject malformed rows as a
-//! whole rather than silently returning partial repository state.
+//! Commit and stash records use NUL-delimited fields, which cannot collide
+//! with Git identity or message data. Ref records use unit separators because
+//! Git ref names cannot contain control bytes. Parsers reject malformed rows
+//! as a whole rather than silently returning partial repository state.
 
 /// One commit from `git log` (see [`parse_commits`] for the format).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,17 +209,30 @@ pub struct StashEntry {
     pub message: String,
 }
 
-/// Parse `git stash list --format=%gd%x1f%H%x1f%ct%x1f%gs` output. `%gd` is
-/// the selector "stash@{N}"; any row whose selector or other field is
-/// malformed makes the complete parse fail.
+/// Parse the four NUL-delimited fields emitted by
+/// `git stash list -z --format=%gd%x00%H%x00%ct%x00%gs`. `%gd` is the
+/// selector "stash@{N}"; exactly one final empty chunk is accepted as the
+/// record terminator. Any malformed row makes the complete parse fail.
 pub fn parse_stashes(out: &str) -> anyhow::Result<Vec<StashEntry>> {
+    if out.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut fields: Vec<&str> = out.split('\0').collect();
+    if fields.last() == Some(&"") {
+        fields.pop();
+    }
+    anyhow::ensure!(!fields.is_empty(), "empty stash record terminator");
+    anyhow::ensure!(
+        fields.len().is_multiple_of(4),
+        "malformed stash record field count"
+    );
     let mut indexes = std::collections::HashSet::new();
-    out.split_terminator('\n')
+    fields
+        .chunks_exact(4)
         .enumerate()
-        .map(|(line_no, line)| {
+        .map(|(line_no, row)| {
             let malformed = || anyhow::anyhow!("malformed stash row {}", line_no + 1);
-            let mut it = line.split('\u{1f}');
-            let selector = it.next().ok_or_else(malformed)?;
+            let selector = row[0];
             let index = selector
                 .strip_prefix("stash@{")
                 .and_then(|v| v.strip_suffix('}'))
@@ -231,23 +244,14 @@ pub fn parse_stashes(out: &str) -> anyhow::Result<Vec<StashEntry>> {
                 "duplicate stash selector on row {}",
                 line_no + 1
             );
-            let sha = it.next().ok_or_else(malformed)?.to_string();
+            let sha = row[1].to_string();
             anyhow::ensure!(
                 valid_oid(&sha),
                 "malformed stash object id on row {}",
                 line_no + 1
             );
-            let date = it
-                .next()
-                .ok_or_else(malformed)?
-                .parse()
-                .map_err(|_| malformed())?;
-            let message = it.next().ok_or_else(malformed)?.to_string();
-            anyhow::ensure!(
-                it.next().is_none(),
-                "extra stash fields on row {}",
-                line_no + 1
-            );
+            let date = row[2].parse().map_err(|_| malformed())?;
+            let message = row[3].to_string();
             Ok(StashEntry {
                 index,
                 sha,
@@ -426,6 +430,10 @@ mod tests {
     /// Join fields into one NUL-delimited commit record.
     fn rec(fields: &[&str]) -> String {
         fields.join("\0")
+    }
+
+    fn stash_row(selector: &str, sha: &str, date: &str, message: &str) -> String {
+        format!("{selector}\0{sha}\0{date}\0{message}")
     }
 
     // --- parse_commits ---
@@ -618,17 +626,21 @@ mod tests {
     #[test]
     fn stashes_indices_and_messy_messages() {
         let out = [
-            format!(
-                "stash@{{0}}{US}{}{US}10{US}WIP on main: abc123 fix: thing {{x}}",
-                "a".repeat(40)
+            stash_row(
+                "stash@{0}",
+                &"a".repeat(40),
+                "10",
+                "WIP on main: abc123 fix: thing {x}",
             ),
-            format!(
-                "stash@{{1}}{US}{}{US}20{US}On feat: msg: with: colons",
-                "b".repeat(40)
+            stash_row(
+                "stash@{1}",
+                &"b".repeat(40),
+                "20",
+                "On feat: msg: with: colons",
             ),
-            format!("stash@{{2}}{US}{}{US}30{US}plain", "c".repeat(40)),
+            stash_row("stash@{2}", &"c".repeat(40), "30", "plain"),
         ]
-        .join("\n");
+        .join("\0");
         let v = parse_stashes(&out).unwrap();
         assert_eq!(v.len(), 3);
         assert_eq!(v[0].index, 0);
@@ -640,28 +652,40 @@ mod tests {
     }
 
     #[test]
+    fn stash_message_unit_separator_round_trips() {
+        let message = "On main: a\u{1f}b";
+        let out = format!(
+            "{}\0",
+            stash_row("stash@{0}", &"a".repeat(40), "10", message)
+        );
+        let parsed = parse_stashes(&out).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].message, message);
+    }
+
+    #[test]
     fn stashes_empty_and_malformed() {
         assert_eq!(parse_stashes("").unwrap(), Vec::<StashEntry>::new());
-        let out = format!(
-            "not-a-selector{US}{}{US}1{US}m\nstash@{{x}}{US}{}{US}1{US}m",
-            "a".repeat(40),
-            "b".repeat(40)
-        );
+        let out = [
+            stash_row("not-a-selector", &"a".repeat(40), "1", "m"),
+            stash_row("stash@{x}", &"b".repeat(40), "1", "m"),
+        ]
+        .join("\0");
         assert!(parse_stashes(&out).is_err());
-        assert!(parse_stashes(&format!("stash@{{0}}{US}{}{US}bad{US}m", "a".repeat(40))).is_err());
+        assert!(parse_stashes(&format!("stash@{{0}}\0{}\0bad\0m", "a".repeat(40))).is_err());
         assert!(
             parse_stashes(&format!(
-                "stash@{{0}}{US}{}{US}1{US}a\nstash@{{0}}{US}{}{US}2{US}b",
-                "a".repeat(40),
-                "b".repeat(40)
+                "{}\0{}",
+                stash_row("stash@{0}", &"a".repeat(40), "1", "a"),
+                stash_row("stash@{0}", &"b".repeat(40), "2", "b")
             ))
             .is_err()
         );
         assert!(
             parse_stashes(&format!(
-                "stash@{{0}}{US}{}{US}1{US}a\nstash@{{1}}{US}{}{US}2{US}b",
-                "bad",
-                "b".repeat(40)
+                "{}\0{}",
+                stash_row("stash@{0}", "bad", "1", "a"),
+                stash_row("stash@{1}", &"b".repeat(40), "2", "b")
             ))
             .is_err()
         );
@@ -693,8 +717,7 @@ mod tests {
             ),
             (
                 "stash extra field",
-                parse_stashes(&format!("stash@{{0}}{US}{sha}{US}1{US}message{US}extra"))
-                    .map(|_| ()),
+                parse_stashes(&format!("stash@{{0}}\0{sha}\01\0message\0extra")).map(|_| ()),
             ),
         ];
         for (case, result) in cases {

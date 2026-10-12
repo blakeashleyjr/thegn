@@ -399,7 +399,7 @@ impl StreamEnd {
 
 #[derive(Clone, Debug)]
 enum StreamMode {
-    Events,
+    Events { filter: FeedFilter },
     Attach { session: String },
 }
 
@@ -423,10 +423,24 @@ impl StreamGuard {
         }
         match (mode, frame) {
             (
-                StreamMode::Events,
+                StreamMode::Events { .. },
                 EventFrame::PaneSnapshot { .. } | EventFrame::PaneDelta { .. },
             ) => Err(StreamEnd::Protocol("pane frame on events stream".into())),
-            (StreamMode::Events, _) => Ok(()),
+            (StreamMode::Events { .. }, EventFrame::Lagged { .. }) => Ok(()),
+            (StreamMode::Events { filter }, frame) if filter.matches(frame) => Ok(()),
+            (StreamMode::Events { filter }, frame) => {
+                if let (Some(expected), Some(got)) = (&filter.session, frame.session_id())
+                    && got != expected
+                {
+                    return Err(StreamEnd::IdentityMismatch {
+                        expected: expected.clone(),
+                        got: got.to_owned(),
+                    });
+                }
+                Err(StreamEnd::Protocol(
+                    "frame outside requested feed filter".into(),
+                ))
+            }
             (StreamMode::Attach { .. }, EventFrame::PaneSnapshot { session, seq, .. }) => {
                 self.check_identity(session)?;
                 self.last_seq = Some(*seq);
@@ -1211,7 +1225,9 @@ impl ControlClient {
         let connect = self.limits.connect_timeout;
         let (frame_tx, frame_rx) = tokio_mpsc::channel::<EventFrame>(256);
         let (ctrl_tx, ctrl_rx) = tokio_mpsc::channel::<AttachControl>(1);
-        let mode = StreamMode::Events;
+        let mode = StreamMode::Events {
+            filter: filter.clone(),
+        };
         let liveness = match &self.addr {
             ControlAddr::Unix(_) => None,
             _ => Some(REMOTE_LIVENESS),
@@ -1632,7 +1648,13 @@ where
                 }
                 Some(Err(e)) => {
                     tracing::debug!(target: "thegn::control", "attach websocket error: {e}");
-                    return StreamEnd::TransportLost(e.to_string());
+                    let message = e.to_string();
+                    return match e {
+                        tokio_tungstenite::tungstenite::Error::Capacity(_) => {
+                            StreamEnd::Protocol(message)
+                        }
+                        _ => StreamEnd::TransportLost(message),
+                    };
                 }
             },
             c = ctrl.recv() => {
@@ -2135,11 +2157,261 @@ mod tests {
             })
         ));
 
-        let mut events = StreamGuard::new(StreamMode::Events);
+        let mut events = StreamGuard::new(StreamMode::Events {
+            filter: FeedFilter::default(),
+        });
         assert!(matches!(
             events.admit(&snapshot),
             Err(StreamEnd::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn events_stream_enforces_the_requested_feed_filter() {
+        use thegn_core::control_wire::LeaseEventKind;
+
+        let session_filter = FeedFilter::parse(None, Some("s1"), true).unwrap();
+        let mut events = StreamGuard::new(StreamMode::Events {
+            filter: session_filter,
+        });
+        let other_lease = EventFrame::Lease {
+            session: "s2".into(),
+            kind: LeaseEventKind::Opened,
+            expires_at: None,
+        };
+        assert!(matches!(
+            events.admit(&other_lease),
+            Err(StreamEnd::IdentityMismatch { expected, got })
+                if expected == "s1" && got == "s2"
+        ));
+
+        let mut events = StreamGuard::new(StreamMode::Events {
+            filter: FeedFilter::parse(None, Some("s1"), true).unwrap(),
+        });
+        assert!(matches!(
+            events.admit(&EventFrame::Activity {
+                json: r#"{"session":"s2"}"#.into(),
+            }),
+            Err(StreamEnd::Protocol(message)) if message == "frame outside requested feed filter"
+        ));
+        assert!(events.admit(&EventFrame::Sessions).is_ok());
+        assert!(events.admit(&EventFrame::Lagged { missed: 3 }).is_ok());
+
+        let mut events = StreamGuard::new(StreamMode::Events {
+            filter: FeedFilter::parse(Some("exit"), None, false).unwrap(),
+        });
+        assert!(matches!(
+            events.admit(&EventFrame::Lease {
+                session: "s1".into(),
+                kind: LeaseEventKind::Opened,
+                expires_at: None,
+            }),
+            Err(StreamEnd::Protocol(message)) if message == "frame outside requested feed filter"
+        ));
+    }
+
+    #[tokio::test]
+    async fn events_socket_rejects_a_frame_for_another_session() {
+        use thegn_core::control_wire::LeaseEventKind;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for frame in [
+                EventFrame::Hello(Hello {
+                    proto: PROTO_VERSION,
+                    server: "daemon".into(),
+                    scopes: vec![],
+                }),
+                EventFrame::Lease {
+                    session: "s2".into(),
+                    kind: LeaseEventKind::Opened,
+                    expires_at: None,
+                },
+            ] {
+                ws.send(Message::Binary(frame.encode().into()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let (frames, mut rx) = tokio_mpsc::channel(4);
+        let (_ctrl_tx, ctrl_rx) = tokio_mpsc::channel(1);
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+        start_attach(
+            ws,
+            frames,
+            ctrl_rx,
+            StreamMode::Events {
+                filter: FeedFilter::parse(None, Some("s1"), false).unwrap(),
+            },
+            None,
+            end_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(rx.recv().await, Some(EventFrame::Hello(_))));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), end_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            StreamEnd::IdentityMismatch { expected, got }
+                if expected == "s1" && got == "s2"
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "the unrelated lease must not be delivered"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_accepts_maximum_size_frames_and_classifies_oversize_as_protocol() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let mut largest = EventFrame::PaneSnapshot {
+            session: "s1".into(),
+            seq: 0,
+            cols: 80,
+            rows: 24,
+            bytes: Vec::new(),
+        };
+        let mut encoded_len = largest.encode().len();
+        loop {
+            if let EventFrame::PaneSnapshot { bytes, .. } = &mut largest {
+                bytes.push(b'x');
+            }
+            let next_encoded_len = largest.encode().len();
+            if next_encoded_len == encoded_len {
+                if let EventFrame::PaneSnapshot { bytes, .. } = &mut largest {
+                    bytes.pop();
+                }
+                break;
+            }
+            encoded_len = next_encoded_len;
+        }
+        let expected_bytes = match &largest {
+            EventFrame::PaneSnapshot { bytes, .. } => bytes.len(),
+            _ => unreachable!(),
+        };
+        let largest_encoded_len = largest.encode().len();
+        assert!(largest_encoded_len < MAX_WIRE_FRAME);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for frame in [
+                EventFrame::Hello(Hello {
+                    proto: PROTO_VERSION,
+                    server: "daemon".into(),
+                    scopes: vec![],
+                }),
+                largest,
+            ] {
+                ws.send(Message::Binary(frame.encode().into()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let (ws, _) = tokio_tungstenite::connect_async_with_config(
+            format!("ws://{addr}"),
+            Some(control_ws_config()),
+            false,
+        )
+        .await
+        .unwrap();
+        let (frames, mut rx) = tokio_mpsc::channel(4);
+        let (_ctrl_tx, ctrl_rx) = tokio_mpsc::channel(1);
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+        start_attach(
+            ws,
+            frames,
+            ctrl_rx,
+            StreamMode::Attach {
+                session: "s1".into(),
+            },
+            None,
+            end_tx,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(rx.recv().await, Some(EventFrame::Hello(_))));
+        assert!(matches!(
+            rx.recv().await,
+            Some(EventFrame::PaneSnapshot { bytes, .. })
+                if bytes.len() == expected_bytes && bytes.iter().all(|byte| *byte == b'x')
+        ));
+        drop(rx);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), end_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            StreamEnd::TransportLost(_) | StreamEnd::ConsumerGone | StreamEnd::CleanClose
+        ));
+        server.await.unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            ws.send(Message::Binary(
+                EventFrame::Hello(Hello {
+                    proto: PROTO_VERSION,
+                    server: "daemon".into(),
+                    scopes: vec![],
+                })
+                .encode()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            if let Err(error) = ws
+                .send(Message::Binary(vec![0u8; MAX_WIRE_FRAME + 1].into()))
+                .await
+            {
+                tracing::debug!(%error, "client closed on oversize frame, as expected");
+            }
+        });
+        let (ws, _) = tokio_tungstenite::connect_async_with_config(
+            format!("ws://{addr}"),
+            Some(control_ws_config()),
+            false,
+        )
+        .await
+        .unwrap();
+        let (frames, _rx) = tokio_mpsc::channel(1);
+        let (_ctrl_tx, ctrl_rx) = tokio_mpsc::channel(1);
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+        start_attach(
+            ws,
+            frames,
+            ctrl_rx,
+            StreamMode::Events {
+                filter: FeedFilter::default(),
+            },
+            None,
+            end_tx,
+        )
+        .await
+        .unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(1), end_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&end, StreamEnd::Protocol(_)));
+        assert!(!end.reconnects());
+        server.await.unwrap();
     }
 
     #[test]
@@ -2192,7 +2464,9 @@ mod tests {
             ws,
             frames,
             ctrl_rx,
-            StreamMode::Events,
+            StreamMode::Events {
+                filter: FeedFilter::default(),
+            },
             Some(Liveness {
                 ping_every: Duration::from_millis(50),
                 read_idle: Duration::from_millis(150),

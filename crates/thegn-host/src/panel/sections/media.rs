@@ -136,6 +136,12 @@ pub(super) fn content(ctx: &SectionCtx<'_>) -> Vec<PanelRow> {
                 .with_hit(PanelHit::Row(Section::Media, i)),
             );
         }
+        if media.sources_truncated {
+            rows.push(PanelRow::plain(Line::segs(vec![seg(
+                d(),
+                "+more sources not shown",
+            )])));
+        }
     }
     rows.extend(detail_rows(ctx, state, policy));
     if policy.show_queue {
@@ -161,6 +167,12 @@ pub(super) fn content(ctx: &SectionCtx<'_>) -> Vec<PanelRow> {
                     ]))
                     .with_hit(PanelHit::Row(Section::Media, offset + i)),
                 );
+            }
+            if media.queue_truncated > 0 {
+                rows.push(PanelRow::plain(Line::segs(vec![seg(
+                    d(),
+                    format!("+{} more not shown", media.queue_truncated),
+                )])));
             }
         }
     }
@@ -304,6 +316,82 @@ mod tests {
             full.iter()
                 .any(|r| r.hit == Some(PanelHit::Row(Section::Media, 1)))
         );
+    }
+
+    #[test]
+    fn capped_collection_rows_show_truncation_without_hit_targets() {
+        let mut model = crate::chrome::FrameModel::default();
+        model.panel.media = Some(state());
+        let mut ui = crate::panel::PanelUi {
+            width: crate::layout::PanelWidth::Full,
+            ..Default::default()
+        };
+        ui.media.sync_snapshot(
+            model.panel.media.as_ref(),
+            Some(MediaCaps {
+                queue: true,
+                ..MediaCaps::default()
+            }),
+            0,
+        );
+        let source_request = ui
+            .media
+            .take_sources_request(model.panel.media.as_ref())
+            .unwrap();
+        ui.media.set_sources(
+            source_request,
+            model.panel.media.as_ref(),
+            (0..thegn_core::media::MAX_SOURCES + 1)
+                .map(|index| format!("source-{index}"))
+                .collect(),
+        );
+        let queue_request = ui
+            .media
+            .take_queue_request(model.panel.media.as_ref())
+            .unwrap();
+        ui.media.set_queue(
+            queue_request,
+            model.panel.media.as_ref(),
+            Ok((0..thegn_core::media::MAX_QUEUE_ITEMS + 2)
+                .map(|index| QueueItem {
+                    id: index.to_string(),
+                    ..Default::default()
+                })
+                .collect()),
+        );
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 40,
+            rows: 30,
+        };
+        let rows = content(&ctx);
+        let rendered_text = rows
+            .iter()
+            .filter_map(|row| match &row.line {
+                Line::Segs(segs) => Some(
+                    segs.iter()
+                        .map(|part| part.text.as_str())
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered_text
+                .iter()
+                .any(|text| text.as_str() == "+more sources not shown")
+        );
+        assert!(
+            rendered_text
+                .iter()
+                .any(|text| text.as_str() == "+2 more not shown")
+        );
+        assert!(rows.iter().filter_map(|row| row.hit).all(|hit| {
+            !matches!(hit, PanelHit::Row(Section::Media, index)
+                if index >= ui.media.sources.len() + thegn_core::media::MAX_QUEUE_ITEMS)
+        }));
     }
 
     #[test]

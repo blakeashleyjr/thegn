@@ -31,6 +31,84 @@ fn read_rebase_marker(loc: &GitLoc, rel: &str) -> Result<Option<Vec<u8>>> {
         .with_context(|| format!("read sequencer marker {rel}"))
 }
 
+/// Resolve and read the local live todo without following a final-component
+/// symlink. A missing path is distinct from an unreadable or non-regular one.
+fn read_local_pending_todo(loc: &GitLoc) -> Result<Option<(std::path::PathBuf, Vec<u8>)>> {
+    let GitLoc::Local(worktree) = loc else {
+        bail!("local todo read requested for a non-local worktree");
+    };
+    let resolved = loc
+        .git_out(&["rev-parse", "--git-path", "rebase-merge/git-rebase-todo"])
+        .ok_or_else(|| anyhow!("cannot resolve live rebase todo path"))?;
+    let path = if resolved.starts_with('/') {
+        std::path::PathBuf::from(resolved)
+    } else {
+        worktree.join(resolved)
+    };
+    let bytes = read_local_pending_todo_for_path(&path)?;
+    Ok(bytes.map(|bytes| (path, bytes)))
+}
+
+/// Atomically publish a local todo only while its exact previously-read bytes
+/// are still present. Git does not lock this file, so the final byte check
+/// narrows the race to the rename but cannot provide a Git-honoured CAS.
+fn replace_local_pending_todo(path: &std::path::Path, expected: &[u8], bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("live rebase todo has no parent directory"))?;
+    let sequence = TODO_SCRATCH_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".git-rebase-todo.thegn-{}-{sequence}",
+        std::process::id()
+    ));
+    thegn_core::fsperm::write_owner_only_new(&temporary, bytes)
+        .context("stage owner-only live rebase todo")?;
+    let publish = (|| {
+        let Some(current) = read_local_pending_todo_for_path(path)? else {
+            bail!("rebase todo changed on disk — reload the editor before rewriting");
+        };
+        if current != expected {
+            bail!("rebase todo changed on disk — reload the editor before rewriting");
+        }
+        thegn_core::fsperm::rename_replace(&temporary, path)
+            .context("atomically replace live rebase todo")?;
+        Ok(())
+    })();
+    if let Err(error) = publish {
+        if let Err(cleanup_error) = std::fs::remove_file(&temporary)
+            && cleanup_error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(target: "thegn::git", %cleanup_error, "could not remove staged live rebase todo");
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Re-read an already-resolved local todo path without following links.
+fn read_local_pending_todo_for_path(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
+    let mut file = match thegn_core::fsperm::open_regular_file_nofollow(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => {
+                    return Err(error).context("open live rebase todo without following links");
+                }
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                Err(metadata_error) => {
+                    return Err(metadata_error).context("inspect live rebase todo");
+                }
+            }
+        }
+        Err(error) => return Err(error).context("open live rebase todo without following links"),
+    };
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).context("read live rebase todo")?;
+    Ok(Some(bytes))
+}
+
 /// Run a read-only git probe without taking the mutation lock or advancing the
 /// write epoch. A non-zero exit is an error for these observations.
 fn run_read(loc: &GitLoc, args: &[&str]) -> Result<String> {
@@ -506,9 +584,17 @@ pub trait RebaseOps: GitBackend {
     }
 
     /// Rewrite the PENDING entries of a paused rebase (reorder/drop/retag
-    /// mid-flight). Only safe because the host serializes mutations — git
-    /// must not be running against this worktree.
+    /// mid-flight). Local writes use an exact-byte check followed by atomic
+    /// replacement. Git does not lock this file, so this cannot be a true CAS;
+    /// git must not be running against this worktree.
     fn rewrite_pending_todo(&self, loc: &GitLoc, todo: &[TodoEntry]) -> Result<()> {
+        if let GitLoc::Local(_) = loc {
+            let Some((path, disk)) = read_local_pending_todo(loc)? else {
+                bail!("no interactive rebase in progress");
+            };
+            return replace_local_pending_todo(&path, &disk, serialize_todo(todo).as_bytes())
+                .context("rewrite live rebase todo");
+        }
         if read_rebase_marker(loc, "rebase-merge/git-rebase-todo")?.is_none() {
             bail!("no interactive rebase in progress");
         }
@@ -521,22 +607,34 @@ pub trait RebaseOps: GitBackend {
 
     /// [`rewrite_pending_todo`](Self::rewrite_pending_todo) with a
     /// lost-update guard: `baseline` is the pending list AS THE EDITOR READ
-    /// IT, and the write is refused when the on-disk todo no longer parses
-    /// to the same entries (the user edited it from another terminal, or
-    /// the sequencer moved). Comparison is over parsed entries, so git's
-    /// regenerable `#` comment noise can never cause a false conflict.
+    /// IT, and the write is refused when the on-disk todo bytes differ from
+    /// the bytes read before parsing. The final check narrows the race to the
+    /// rename; Git does not provide a lock or CAS for this file.
     fn rewrite_pending_todo_checked(
         &self,
         loc: &GitLoc,
         todo: &[TodoEntry],
         baseline: &[TodoEntry],
     ) -> Result<()> {
-        let Some(disk) = read_rebase_marker(loc, "rebase-merge/git-rebase-todo")? else {
-            bail!("no interactive rebase in progress");
+        let (local_path, disk) = if let GitLoc::Local(_) = loc {
+            let Some((path, bytes)) = read_local_pending_todo(loc)? else {
+                bail!("no interactive rebase in progress");
+            };
+            (Some(path), bytes)
+        } else {
+            let Some(bytes) = read_rebase_marker(loc, "rebase-merge/git-rebase-todo")? else {
+                bail!("no interactive rebase in progress");
+            };
+            (None, bytes)
         };
-        let disk = parse_todo(&String::from_utf8_lossy(&disk));
-        if disk != baseline {
+        let text = String::from_utf8(disk.clone())
+            .map_err(|_| anyhow!("rebase todo is not valid UTF-8; refusing a lossy rewrite"))?;
+        if parse_todo(&text) != baseline {
             bail!("rebase todo changed on disk — reload the editor before rewriting");
+        }
+        if let Some(path) = local_path {
+            return replace_local_pending_todo(&path, &disk, serialize_todo(todo).as_bytes())
+                .context("rewrite live rebase todo");
         }
         loc.write_git_path(
             "rebase-merge/git-rebase-todo",
@@ -1099,5 +1197,74 @@ mod tests {
         // --empty=keep: the empty commit replays instead of pausing the run.
         assert_eq!(r.subjects(), ["c4", "empty", "c1"]);
         assert_eq!(touched(&r, &r.sha_of("empty")), "");
+    }
+
+    #[test]
+    fn local_todo_rewrites_refuse_a_symlink_without_touching_its_target() {
+        let r = linear("edit-symlink-todo");
+        let c2 = r.sha_of("c2");
+        assert_eq!(
+            CliGit
+                .rebase_retag(&r.loc(), &c2, &[&c2], TodoAction::Edit, &opts())
+                .unwrap(),
+            RebaseOutcome::Paused
+        );
+        let baseline = CliGit.rebase_status(&r.loc()).unwrap().unwrap().remaining;
+        let todo_path = r.dir.join(".git/rebase-merge/git-rebase-todo");
+        let outside = r.dir.join("outside-todo");
+        std::fs::rename(&todo_path, &outside).unwrap();
+        match thegn_core::fsperm::create_symlink(&outside, &todo_path, false) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("create todo symlink: {error}"),
+        }
+        let original = std::fs::read(&outside).unwrap();
+        let edited: Vec<TodoEntry> = baseline
+            .iter()
+            .filter(|entry| entry.subject != "c3")
+            .cloned()
+            .collect();
+
+        assert!(CliGit.rewrite_pending_todo(&r.loc(), &edited).is_err());
+        assert!(
+            CliGit
+                .rewrite_pending_todo_checked(&r.loc(), &edited, &baseline)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), original);
+    }
+
+    #[test]
+    fn checked_local_todo_rewrite_refuses_non_utf8_without_changing_bytes() {
+        let r = linear("edit-non-utf8-todo");
+        let c2 = r.sha_of("c2");
+        assert_eq!(
+            CliGit
+                .rebase_retag(&r.loc(), &c2, &[&c2], TodoAction::Edit, &opts())
+                .unwrap(),
+            RebaseOutcome::Paused
+        );
+        let todo_path = r.dir.join(".git/rebase-merge/git-rebase-todo");
+        let mut bytes = std::fs::read(&todo_path).unwrap();
+        let subject = bytes
+            .windows(b" c3\n".len())
+            .position(|window| window == b" c3\n")
+            .expect("pending c3 todo subject");
+        bytes[subject + 2] = 0xff;
+        std::fs::write(&todo_path, &bytes).unwrap();
+        let baseline = parse_todo(&String::from_utf8_lossy(&bytes));
+
+        let error = CliGit
+            .rewrite_pending_todo_checked(&r.loc(), &baseline, &baseline)
+            .expect_err("invalid UTF-8 must not be rewritten lossily");
+        assert!(error.to_string().contains("not valid UTF-8"), "{error}");
+        assert_eq!(std::fs::read(&todo_path).unwrap(), bytes);
     }
 }

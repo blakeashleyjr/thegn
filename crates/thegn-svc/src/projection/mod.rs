@@ -105,8 +105,58 @@ fn mount_sshfs(spec: &ProjectionSpec) -> Result<Mounted> {
 }
 
 fn unmount_sshfs(spec: &ProjectionSpec) -> Result<()> {
-    let argv = SshPlacement::sshfs_unmount_argv(&spec.mountpoint);
-    run(&argv)
+    let legacy_path = spec.legacy_mountpoint();
+    let legacy_present = legacy_path.as_ref().is_some_and(|path| {
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+    });
+    let plan = sshfs_unmount_plan(spec, legacy_present);
+    let primary_result = run(&plan[0]);
+
+    let mut legacy_succeeded = false;
+    if let Some(legacy_path) = legacy_path.filter(|_| legacy_present)
+        && let Some(legacy_argv) = plan.get(1)
+    {
+        match run(legacy_argv) {
+            Ok(()) => {
+                legacy_succeeded = true;
+                if let Err(error) = std::fs::remove_dir(&legacy_path) {
+                    tracing::debug!(%error, path = %legacy_path, "could not remove empty legacy sshfs mountpoint");
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, path = %legacy_path, "could not unmount legacy sshfs mountpoint");
+            }
+        }
+    }
+
+    finish_sshfs_unmount(spec, primary_result, legacy_succeeded)
+}
+
+fn finish_sshfs_unmount(
+    spec: &ProjectionSpec,
+    primary_result: Result<()>,
+    legacy_succeeded: bool,
+) -> Result<()> {
+    match primary_result {
+        Ok(()) => Ok(()),
+        Err(error) if legacy_succeeded => {
+            tracing::warn!(
+                %error,
+                mountpoint = %spec.mountpoint,
+                "primary sshfs unmount failed but legacy unmount succeeded"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn sshfs_unmount_plan(spec: &ProjectionSpec, legacy_present: bool) -> Vec<Vec<String>> {
+    let mut plan = vec![SshPlacement::sshfs_unmount_argv(&spec.mountpoint)];
+    if legacy_present && let Some(legacy_mountpoint) = spec.legacy_mountpoint() {
+        plan.push(SshPlacement::sshfs_unmount_argv(&legacy_mountpoint));
+    }
+    plan
 }
 
 /// `rsync -e` transport flag carrying the placement's ssh knobs (port/identity).
@@ -182,7 +232,60 @@ fn run(argv: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
     use thegn_core::placement::{SshPlacement, TransportKind};
+    use tracing::field::{Field, Visit};
+    use tracing::span;
+    use tracing::{Event, Level, Metadata, Subscriber};
+
+    #[derive(Clone, Default)]
+    struct CapturedWarnings(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+    impl CapturedWarnings {
+        fn records(&self) -> Vec<BTreeMap<String, String>> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    struct FieldVisitor(BTreeMap<String, String>);
+
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl Subscriber for CapturedWarnings {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            if event.metadata().level() == &Level::WARN {
+                let mut fields = FieldVisitor(BTreeMap::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+        }
+
+        fn enter(&self, _: &span::Id) {}
+
+        fn exit(&self, _: &span::Id) {}
+    }
 
     fn spec(mode: DataMode, placement: Placement) -> ProjectionSpec {
         ProjectionSpec {
@@ -250,5 +353,49 @@ mod tests {
         let s = spec(DataMode::Sshfs, Placement::Local);
         let b = for_data_mode(&s);
         assert!(b.mount(&s).is_err());
+    }
+
+    #[test]
+    fn sshfs_unmount_plan_keeps_primary_and_adds_legacy_only_when_present() {
+        let s = spec(DataMode::Sshfs, ssh());
+        let primary = SshPlacement::sshfs_unmount_argv(&s.mountpoint);
+        let without_legacy = sshfs_unmount_plan(&s, false);
+        assert_eq!(without_legacy, vec![primary.clone()]);
+
+        let with_legacy = sshfs_unmount_plan(&s, true);
+        assert_eq!(with_legacy[0], primary);
+        assert_eq!(with_legacy.len(), 2);
+        assert_eq!(
+            with_legacy[1],
+            SshPlacement::sshfs_unmount_argv(&s.legacy_mountpoint().unwrap())
+        );
+    }
+
+    #[test]
+    fn sshfs_unmount_plan_omits_unavailable_legacy_path() {
+        let s = spec(DataMode::Sshfs, Placement::Local);
+        assert_eq!(
+            sshfs_unmount_plan(&s, true),
+            vec![SshPlacement::sshfs_unmount_argv(&s.mountpoint)]
+        );
+    }
+
+    #[test]
+    fn legacy_unmount_success_warns_when_primary_unmount_fails() {
+        let s = spec(DataMode::Sshfs, ssh());
+        let captured = CapturedWarnings::default();
+        let result = tracing::subscriber::with_default(captured.clone(), || {
+            finish_sshfs_unmount(&s, Err(anyhow::anyhow!("primary mount is busy")), true)
+        });
+
+        assert!(result.is_ok());
+        let records = captured.records();
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0]
+                .get("error")
+                .is_some_and(|value| value.contains("busy"))
+        );
+        assert_eq!(records[0].get("mountpoint"), Some(&s.mountpoint));
     }
 }

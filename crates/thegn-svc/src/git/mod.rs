@@ -415,7 +415,7 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
     fn commit_times(&self, loc: &GitLoc, weeks: usize) -> Result<Vec<i64>> {
         let since = format!("{weeks}.weeks");
         let out = run(loc, &["log", "--since", &since, "--format=%ct"])?;
-        Ok(out.lines().filter_map(|l| l.trim().parse().ok()).collect())
+        parse_commit_times(&out)
     }
 
     /// The unified-diff hunks of one file against `base`, capped at
@@ -448,12 +448,10 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
     /// Stash entry count (0 when the stash is empty or absent). Routes through the
     /// persistent bridge when connected (no per-op spawn).
     fn stash_count(&self, loc: &GitLoc) -> Result<usize> {
-        let (exit, out) = match run_status(loc, &["stash", "list", "--format=%h"]) {
-            Ok(v) => v,
-            Err(_) => return Ok(0),
-        };
+        let (exit, out) = run_status(loc, &["stash", "list", "--format=%h"])
+            .context("reading git stash count")?;
         if exit != 0 {
-            return Ok(0);
+            anyhow::bail!("git stash list exited with status {exit}");
         }
         Ok(out.lines().filter(|l| !l.trim().is_empty()).count())
     }
@@ -519,7 +517,7 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
     fn stash_list(&self, loc: &GitLoc) -> Result<Vec<StashEntry>> {
         let (exit, out) = run_status(
             loc,
-            &["stash", "list", "--format=%gd\u{1f}%H\u{1f}%ct\u{1f}%gs"],
+            &["stash", "list", "-z", "--format=%gd%x00%H%x00%ct%x00%gs"],
         )
         .context("reading git stash list")?;
         if exit != 0 {
@@ -1339,6 +1337,7 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
             return None;
         }
     }
+    let observed_generation = GLYPH_BASE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
     let origin_result = run_status(
         loc,
         &[
@@ -1380,21 +1379,18 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
         return None;
     }
     let mut cache = base_cache().lock().unwrap_or_else(|e| e.into_inner());
-    if cache.len() >= GLYPH_BASE_CACHE_CAPACITY
-        && !cache.contains_key(&key)
-        && let Some(evict) = cache
-            .iter()
-            .filter(|(_, (_, at, _))| at.elapsed() >= GLYPH_BASE_TTL)
-            .min_by_key(|(_, (_, at, _))| *at)
-            .or_else(|| cache.iter().min_by_key(|(_, (_, at, _))| *at))
-            .map(|(key, _)| key.clone())
-    {
-        cache.remove(&evict);
-    }
-    cache.insert(
+    let current_generation = GLYPH_BASE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    let stored = store_glyph_base(
+        &mut cache,
         key.clone(),
         (base.clone(), std::time::Instant::now(), print),
+        observed_generation,
+        current_generation,
     );
+    drop(cache);
+    if !stored {
+        return base;
+    }
     failed_base_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1463,14 +1459,44 @@ pub fn invalidate_glyph_base(loc: &GitLoc) {
 }
 
 fn invalidate_glyph_base_identity(key: RepoExecutionIdentity) {
-    base_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&key);
+    let mut bases = base_cache().lock().unwrap_or_else(|e| e.into_inner());
+    GLYPH_BASE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    bases.remove(&key);
+    drop(bases);
     failed_base_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&key);
+}
+
+static GLYPH_BASE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn store_glyph_base(
+    cache: &mut std::collections::HashMap<
+        RepoExecutionIdentity,
+        (Option<String>, std::time::Instant, BaseKey),
+    >,
+    key: RepoExecutionIdentity,
+    entry: (Option<String>, std::time::Instant, BaseKey),
+    observed_generation: u64,
+    current_generation: u64,
+) -> bool {
+    if observed_generation != current_generation {
+        return false;
+    }
+    if cache.len() >= GLYPH_BASE_CACHE_CAPACITY
+        && !cache.contains_key(&key)
+        && let Some(evict) = cache
+            .iter()
+            .filter(|(_, (_, at, _))| at.elapsed() >= GLYPH_BASE_TTL)
+            .min_by_key(|(_, (_, at, _))| *at)
+            .or_else(|| cache.iter().min_by_key(|(_, (_, at, _))| *at))
+            .map(|(key, _)| key.clone())
+    {
+        cache.remove(&evict);
+    }
+    cache.insert(key, entry);
+    true
 }
 
 fn record_base_probe_failure(key: RepoExecutionIdentity) {
@@ -1845,6 +1871,17 @@ fn run_root(root: &Path, args: &[&str]) -> Result<()> {
     } else {
         anyhow::bail!("git {} failed in {}", args.join(" "), root.display())
     }
+}
+
+fn parse_commit_times(out: &str) -> Result<Vec<i64>> {
+    out.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.trim()
+                .parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("malformed commit timestamp"))
+        })
+        .collect()
 }
 
 impl GitBackend for CliGit {
@@ -2792,6 +2829,44 @@ mod tests {
     }
 
     #[test]
+    fn glyph_base_store_is_fenced_by_invalidation_generation() {
+        let key = RepoExecutionIdentity("generation-fence".into());
+        let entry = (Some("main".into()), std::time::Instant::now(), None);
+        let mut cache = std::collections::HashMap::new();
+        assert!(store_glyph_base(
+            &mut cache,
+            key.clone(),
+            entry.clone(),
+            7,
+            7
+        ));
+        assert_eq!(cache.get(&key), Some(&entry));
+
+        let untouched_key = RepoExecutionIdentity("untouched-generation-fence".into());
+        let untouched_entry = (None, std::time::Instant::now(), None);
+        cache.insert(untouched_key.clone(), untouched_entry.clone());
+        assert!(!store_glyph_base(&mut cache, key, entry, 7, 8));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get(&untouched_key), Some(&untouched_entry));
+    }
+
+    #[test]
+    fn invalidate_glyph_base_advances_generation() {
+        let before = GLYPH_BASE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+        invalidate_glyph_base(&GitLoc::Local(
+            std::env::temp_dir().join("generation-fence"),
+        ));
+        let after = GLYPH_BASE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+        assert!(after > before);
+    }
+
+    #[test]
+    fn commit_times_rejects_malformed_rows_without_shortening_feed() {
+        assert!(parse_commit_times("1\nx\n2").is_err());
+        assert_eq!(parse_commit_times("1\n\n2\n").unwrap(), vec![1, 2]);
+    }
+
+    #[test]
     fn execution_identity_separates_placements_without_retaining_authority_secrets() {
         let a = GitLoc::provider(
             vec!["sprite".into(), "exec".into(), "-s".into(), "alpha".into()],
@@ -3061,6 +3136,26 @@ mod tests {
         assert_eq!(entries.len(), 1, "one stash entry expected: {entries:?}");
         let outside = GitLoc::Local(repo.dir.join("not-a-repository"));
         assert!(CliGit.stash_list(&outside).is_err());
+    }
+
+    #[test]
+    fn stash_list_preserves_unit_separator_in_message() {
+        let repo = testutil::TestRepo::new("stash-unit-separator");
+        repo.commit_file("f.txt", "one\n", "c0");
+        std::fs::write(repo.dir.join("f.txt"), "two\n").unwrap();
+        testutil::git_in(&repo.dir, &["stash", "push", "-q", "-m", "a\u{1f}b"]);
+
+        let entries = CliGit.stash_list(&repo.loc()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].message.ends_with("a\u{1f}b"));
+    }
+
+    #[test]
+    fn stash_count_reports_non_repository_failure() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join(".git"), "").unwrap();
+        let loc = GitLoc::Local(fixture.path().to_path_buf());
+        assert!(CliGit.stash_count(&loc).is_err());
     }
 
     /// Run `git` in `dir`, panicking on failure (test setup helper).

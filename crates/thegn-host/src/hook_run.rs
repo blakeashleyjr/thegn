@@ -71,14 +71,20 @@ fn run_with_log_root(
     cwd: &Path,
     log_root: &Path,
 ) -> HookRunResult {
-    let log_path = log_path(log_root, &context.worktree, context.event);
+    let allocation = log_path(log_root, &context.worktree, context.event);
+    let (log_path, allocation_error) = match allocation {
+        Ok(path) => (path, None),
+        Err(error) => (PathBuf::new(), Some(error.to_string())),
+    };
     let (mut child, group) = match spawn(spec, context, cwd) {
         Ok(child) => child,
         Err(error) => {
             let stderr = format!("failed to start hook: {error}");
-            let log_error = append_log(&log_path, context, HookRunState::Failed, "", &stderr)
-                .err()
-                .map(|error| error.to_string());
+            let log_error = allocation_error.or_else(|| {
+                append_log(&log_path, context, HookRunState::Failed, "", &stderr)
+                    .err()
+                    .map(|error| error.to_string())
+            });
             return HookRunResult {
                 command: spec.command.clone(),
                 state: HookRunState::Failed,
@@ -139,9 +145,11 @@ fn run_with_log_root(
     } else {
         HookRunState::Failed
     };
-    let log_error = append_log(&log_path, context, state, &stdout, &stderr)
-        .err()
-        .map(|error| error.to_string());
+    let log_error = allocation_error.or_else(|| {
+        append_log(&log_path, context, state, &stdout, &stderr)
+            .err()
+            .map(|error| error.to_string())
+    });
     HookRunResult {
         command: spec.command.clone(),
         state,
@@ -286,13 +294,13 @@ fn join_pipe(pipe: Option<PipeReader>, deadline: Instant) -> String {
         .text(!finished)
 }
 
-static LOG_INDICES: OnceLock<Mutex<std::collections::HashMap<(String, String), u64>>> =
-    OnceLock::new();
-
 const HOOK_LOG_KEEP_NEWEST: usize = 20;
 const HOOK_LOG_MAX_AGE_SECS: u64 = 14 * 86_400;
 const HOOK_LOG_PRUNE_INTERVAL_SECS: i64 = 60 * 60;
+const HOOK_LOG_ALLOCATION_ATTEMPTS: usize = 1000;
 static LAST_LOG_PRUNE: OnceLock<Mutex<std::collections::HashMap<PathBuf, i64>>> = OnceLock::new();
+static LAST_LOG_INDEX: OnceLock<Mutex<std::collections::HashMap<(PathBuf, String), u64>>> =
+    OnceLock::new();
 
 pub(crate) fn log_root() -> PathBuf {
     let state_home = thegn_core::util::xdg_state_home();
@@ -378,45 +386,88 @@ pub(crate) fn prune_logs(root: &Path, now_secs: i64) {
     }
 }
 
-fn log_path(log_root: &Path, worktree: &str, event: thegn_core::hooks::HookEvent) -> PathBuf {
-    let worktree_slug = thegn_core::util::slugify(worktree);
-    let slug = if worktree_slug.is_empty() {
-        "worktree".to_string()
-    } else {
-        format!(
-            "{}-{}",
-            worktree_slug,
-            thegn_core::util::short_hash(worktree, 6)
-        )
-    };
+fn log_path(
+    log_root: &Path,
+    worktree: &str,
+    event: thegn_core::hooks::HookEvent,
+) -> std::io::Result<PathBuf> {
+    let label: String = thegn_core::util::slugify(worktree)
+        .chars()
+        .take(48)
+        .collect();
+    let label = if label.is_empty() { "worktree" } else { &label };
+    let digest = thegn_core::identity::digest_parts(
+        b"thegn/hook-log-worktree",
+        &[thegn_core::identity::BytePart::new(worktree.as_bytes())],
+    )
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()))?;
+    let suffix: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let slug = format!("{label}-{suffix}");
+    let dir = log_root.join(slug);
+    std::fs::create_dir_all(&dir)?;
+    crate::platform::restrict_dir_owner_only_checked(&dir)?;
+
     let event_name = event.as_str().to_string();
-    let mut indices = LOG_INDICES
+    let key = (dir.clone(), event_name.clone());
+    let mut indices = LAST_LOG_INDEX
         .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
         .lock()
-        .expect("hook log index mutex poisoned");
-    let next = indices
-        .get(&(slug.clone(), event_name.clone()))
-        .copied()
-        .unwrap_or_else(|| {
-            let dir = log_root.join(&slug);
-            std::fs::read_dir(dir)
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .filter_map(|name| {
-                    name.strip_prefix(&format!("{event_name}-"))
-                        .and_then(|n| n.strip_suffix(".log"))
-                        .and_then(|n| n.parse::<u64>().ok())
-                })
-                .max()
-                .unwrap_or(0)
-        });
-    let next = next + 1;
-    indices.insert((slug.clone(), event_name.clone()), next);
-    drop(indices);
-    log_root.join(slug).join(format!("{event_name}-{next}.log"))
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut index = match indices.get(&key).copied() {
+        Some(last) => last.checked_add(1),
+        None => {
+            let mut max_index = 0u64;
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                if let Some(found) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix(&format!("{event_name}-")))
+                    .and_then(|name| name.strip_suffix(".log"))
+                    .and_then(|name| name.parse::<u64>().ok())
+                {
+                    max_index = max_index.max(found);
+                }
+            }
+            max_index.checked_add(1)
+        }
+    }
+    .ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "hook log index space exhausted",
+        )
+    })?;
+
+    for _ in 0..HOOK_LOG_ALLOCATION_ATTEMPTS {
+        let path = dir.join(format!("{event_name}-{index}.log"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                // Keep this reservation even if append_log later fails: reusing a path
+                // already returned in a HookRunResult could identify a different run.
+                drop(file);
+                indices.insert(key, index);
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                index = index.checked_add(1).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "hook log index space exhausted",
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("could not allocate hook log after {HOOK_LOG_ALLOCATION_ATTEMPTS} attempts"),
+    ))
 }
 
 const FAILURE_TAIL_BYTES: usize = 4096;
@@ -610,6 +661,44 @@ mod tests {
         assert!(result.log_path.starts_with(dir.path()));
         let contents = std::fs::read_to_string(&result.log_path).unwrap();
         assert!(contents.contains("stdout:\nlogged"));
+    }
+
+    #[test]
+    fn hook_log_allocation_retries_files_created_by_another_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = format!("/isolated-hook-log-race-{}", std::process::id());
+        let first = log_path(dir.path(), &worktree, HookEvent::PostCreate).unwrap();
+        assert!(first.ends_with("post_create-1.log"));
+        let second_process_path = first.with_file_name("post_create-2.log");
+        std::fs::write(&second_process_path, b"other process owns this run").unwrap();
+
+        let next = log_path(dir.path(), &worktree, HookEvent::PostCreate).unwrap();
+        assert_ne!(next, second_process_path);
+        assert!(next.ends_with("post_create-3.log"));
+    }
+
+    #[test]
+    fn hook_log_allocation_does_not_reuse_pruned_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = format!("/isolated-hook-log-prune-{}", std::process::id());
+        let first = log_path(dir.path(), &worktree, HookEvent::PostCreate).unwrap();
+        std::fs::remove_file(&first).unwrap();
+
+        let next = log_path(dir.path(), &worktree, HookEvent::PostCreate).unwrap();
+        assert_ne!(next, first);
+        assert!(next.ends_with("post_create-2.log"));
+    }
+
+    #[test]
+    fn hook_log_directory_component_is_bounded_for_deep_worktree_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = "w".repeat(4 * 1024);
+        let path = log_path(dir.path(), &worktree, HookEvent::PostCreate).unwrap();
+        let component = path.parent().unwrap().file_name().unwrap();
+        assert!(component.to_string_lossy().len() <= 255);
+
+        let overlong_worktree = "w".repeat(thegn_core::identity::MAX_IDENTITY_COMPONENT_BYTES + 1);
+        assert!(log_path(dir.path(), &overlong_worktree, HookEvent::PostCreate).is_err());
     }
 
     #[test]

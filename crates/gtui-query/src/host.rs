@@ -19,12 +19,30 @@ use gtui_core::datasource::{DataSource, Query, QueryError};
 use gtui_core::frame::{Field, FieldType, Frame};
 use thegn_metrics::{StatsSampler, StatsSnapshot};
 
-/// How many samples to retain (≈ this many seconds at the 1 Hz sample rate).
-const RING_CAP: usize = 600;
-/// Retain at most ten minutes of host samples, matching the ring's 1 Hz cap.
-const RETENTION_SECS: f64 = 600.0;
+/// Bound host retention by time and memory: at 1 Hz, a full day is about 2.7 MiB
+/// of samples (about 4 MiB of deque capacity). The 24-hour window matches
+/// `embed.rs::adjust_window`'s maximum supported query range.
+const RING_CAP: usize = 86_400;
+const RETENTION_SECS: f64 = 86_400.0;
 
-type Ring = Arc<Mutex<VecDeque<(f64, StatsSnapshot)>>>;
+#[derive(Clone, Copy)]
+struct HostSample {
+    cpu_pct: Option<u8>,
+    mem_used: Option<f32>,
+    load1: Option<f32>,
+}
+
+impl From<&StatsSnapshot> for HostSample {
+    fn from(snapshot: &StatsSnapshot) -> Self {
+        Self {
+            cpu_pct: snapshot.cpu_pct,
+            mem_used: snapshot.mem_gib.map(|(used, _total)| used),
+            load1: snapshot.load_avg.map(|(one, _, _)| one),
+        }
+    }
+}
+
+type Ring = Arc<Mutex<VecDeque<(f64, HostSample)>>>;
 
 pub struct HostSource {
     ring: Ring,
@@ -78,7 +96,7 @@ impl HostSource {
         on_thread_start: impl FnOnce() + Send + 'static,
         spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>>,
     ) -> Result<Self, HostSourceSpawnError> {
-        let ring: Ring = Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAP)));
+        let ring: Ring = Arc::new(Mutex::new(VecDeque::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let ring_bg = ring.clone();
         let stop_bg = stop.clone();
@@ -147,10 +165,10 @@ impl HostSource {
     /// Build a `(time, value)` frame for `expr` from the ring, keeping only
     /// samples where the metric is present.
     fn frame_for(&self, expr: &str, range: &gtui_core::datasource::TimeRange) -> Frame {
-        let extract: fn(&StatsSnapshot) -> Option<f64> = match expr {
+        let extract: fn(&HostSample) -> Option<f64> = match expr {
             "host_cpu_pct" => |s| s.cpu_pct.map(|v| v as f64),
-            "host_mem_used" => |s| s.mem_gib.map(|(used, _total)| used as f64),
-            "host_load1" => |s| s.load_avg.map(|(one, _, _)| one as f64),
+            "host_mem_used" => |s| s.mem_used.map(|v| v as f64),
+            "host_load1" => |s| s.load1.map(|v| v as f64),
             _ => |_| None,
         };
         let mut times = Vec::new();
@@ -160,13 +178,12 @@ impl HostSource {
         let to = range.to.timestamp() as f64
             + f64::from(range.to.timestamp_subsec_nanos()) / 1_000_000_000.0;
         if let Ok(r) = self.ring.lock() {
-            for (ts, snap) in r.iter() {
-                // Both endpoints are inclusive; host samples and query ranges
-                // share the UNIX wall-clock/UTC time domain.
-                if *ts >= from
-                    && *ts <= to
-                    && let Some(v) = extract(snap)
-                {
+            // Samples are sorted; both UTC endpoints are inclusive.
+            let start = r.partition_point(|(ts, _)| *ts < from);
+            let end = r.partition_point(|(ts, _)| *ts <= to);
+            for index in start.min(end)..end {
+                let (ts, sample) = &r[index];
+                if let Some(v) = extract(sample) {
                     times.push(*ts);
                     values.push(v);
                 }
@@ -242,11 +259,19 @@ fn now_secs() -> f64 {
 /// Admit a sample against the current wall clock, keeping a sorted, bounded
 /// window. Samples newer than `ts` are discarded after a backward clock step;
 /// equal timestamps retain arrival order.
-fn admit(ring: &mut VecDeque<(f64, StatsSnapshot)>, ts: f64, snap: StatsSnapshot) {
+fn admit(ring: &mut VecDeque<(f64, HostSample)>, ts: f64, snap: StatsSnapshot) {
     let cutoff = ts - RETENTION_SECS;
-    ring.retain(|(sample_ts, _)| *sample_ts >= cutoff && *sample_ts <= ts);
+    while ring
+        .front()
+        .is_some_and(|(sample_ts, _)| *sample_ts < cutoff)
+    {
+        ring.pop_front();
+    }
+    while ring.back().is_some_and(|(sample_ts, _)| *sample_ts > ts) {
+        ring.pop_back();
+    }
     let index = ring.partition_point(|(sample_ts, _)| *sample_ts <= ts);
-    ring.insert(index, (ts, snap));
+    ring.insert(index, (ts, HostSample::from(&snap)));
     while ring.len() > RING_CAP {
         ring.pop_front();
     }
@@ -347,7 +372,7 @@ mod tests {
     #[test]
     fn retention_evicts_strictly_older_samples_and_keeps_boundary() {
         let mut ring = VecDeque::new();
-        for ts in [100.0, 701.0] {
+        for ts in [100.0, 86_501.0] {
             admit(
                 &mut ring,
                 ts,
@@ -359,15 +384,43 @@ mod tests {
         }
         assert_eq!(
             ring.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
-            vec![701.0]
+            vec![86_501.0]
         );
 
         let mut ring = VecDeque::new();
         admit(&mut ring, 700.0, StatsSnapshot::default());
-        admit(&mut ring, 1300.0, StatsSnapshot::default());
+        admit(&mut ring, 87_100.0, StatsSnapshot::default());
         assert_eq!(
             ring.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
-            vec![700.0, 1300.0]
+            vec![700.0, 87_100.0]
+        );
+    }
+
+    #[test]
+    fn retention_covers_the_default_fifteen_minute_window() {
+        let mut ring = VecDeque::new();
+        admit(&mut ring, 0.0, StatsSnapshot::default());
+        admit(&mut ring, 900.0, StatsSnapshot::default());
+        assert_eq!(
+            ring.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+            vec![0.0, 900.0]
+        );
+    }
+
+    #[test]
+    fn retention_covers_the_maximum_zoom_window() {
+        let mut ring = VecDeque::new();
+        admit(&mut ring, 0.0, StatsSnapshot::default());
+        admit(&mut ring, 86_400.0, StatsSnapshot::default());
+        assert_eq!(
+            ring.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+            vec![0.0, 86_400.0]
+        );
+
+        admit(&mut ring, 86_401.0, StatsSnapshot::default());
+        assert_eq!(
+            ring.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+            vec![86_400.0, 86_401.0]
         );
     }
 

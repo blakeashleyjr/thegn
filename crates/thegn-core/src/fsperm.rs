@@ -198,6 +198,27 @@ pub fn owned_by_current_user(meta: &std::fs::Metadata) -> bool {
     }
 }
 
+/// Refuse a regular file that has another hardlink name. Security-sensitive
+/// destinations that will be atomically replaced use this as a tamper signal:
+/// replacement would not update the contents visible through the other name.
+/// This policy is Unix only; other platforms accept regular files.
+pub fn ensure_single_link_regular_file(meta: &std::fs::Metadata) -> std::io::Result<()> {
+    if !meta.is_file() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() > 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "regular file has multiple hardlinks",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Carry an existing config's permissions to its replacement while limiting
 /// the result to owner-only access. This keeps deliberate read-only configs
 /// read-only and drops group/other access on Unix.
@@ -451,6 +472,20 @@ Set-Acl -LiteralPath $path -AclObject $acl"#
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn single_link_regular_file_policy_accepts_one_link_and_rejects_hardlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original");
+        let linked = dir.path().join("linked");
+        std::fs::write(&original, b"secret").unwrap();
+        ensure_single_link_regular_file(&std::fs::metadata(&original).unwrap()).unwrap();
+        ensure_single_link_regular_file(&std::fs::metadata(dir.path()).unwrap()).unwrap();
+        std::fs::hard_link(&original, &linked).unwrap();
+        let error = ensure_single_link_regular_file(&std::fs::metadata(&original).unwrap())
+            .expect_err("multiple hardlinks must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn carried_permissions_keep_read_only_and_drop_group_access() {

@@ -18,7 +18,9 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use thegn_core::revtunnel::{
     Frame, FrameDecoder, MAX_RESYNC_SKIP, SYNC_MAGIC, SyncOutcome, encode, encode_data_chunked,
@@ -44,9 +46,21 @@ const CHANNEL_DEPTH: usize = 32;
 /// Safe per-tunnel ceiling for concurrent logical connections.
 const MAX_TUNNEL_CONNS: usize = 256;
 
+/// Process-wide host ceiling, shared by every reverse-tunnel run in this process.
+const MAX_GLOBAL_TUNNEL_CONNS: usize = 1024;
+
+/// Bound host endpoint connection establishment so an unresponsive dial cannot
+/// pin a route, a connection permit, or the shared tunnel read loop indefinitely.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+static GLOBAL_HOST_PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_GLOBAL_TUNNEL_CONNS)));
+static REJECTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 type ConnectionTasks = Arc<Mutex<JoinSet<()>>>;
 
 fn report_rejection(rejections: &AtomicUsize, endpoint: &'static str, reason: &'static str) {
+    REJECTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
     let count = rejections.fetch_add(1, Ordering::Relaxed) + 1;
     if count == 1 {
         tracing::warn!(
@@ -57,6 +71,11 @@ fn report_rejection(rejections: &AtomicUsize, endpoint: &'static str, reason: &'
             "reverse-tunnel connection rejected"
         );
     }
+}
+
+/// Number of reverse-tunnel admission and dial-timeout rejections since process start.
+pub fn rejection_total() -> u64 {
+    REJECTIONS_TOTAL.load(Ordering::Relaxed)
 }
 
 async fn reap_finished(tasks: &ConnectionTasks) {
@@ -361,6 +380,27 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     D: Dialer,
 {
+    run_host_with_admission(
+        stream,
+        dialer,
+        max_connections,
+        GLOBAL_HOST_PERMITS.clone(),
+        DIAL_TIMEOUT,
+    )
+    .await
+}
+
+async fn run_host_with_admission<S, D>(
+    stream: S,
+    dialer: D,
+    max_connections: usize,
+    global_permits: Arc<Semaphore>,
+    dial_timeout: Duration,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    D: Dialer,
+{
     let (rd, wr) = tokio::io::split(stream);
     let (sink, sink_task) = spawn_sink(wr);
     let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
@@ -379,14 +419,26 @@ where
             let sink = sink.clone();
             let conns = conns2.clone();
             let permits = permits2.clone();
+            let global_permits = global_permits.clone();
             let rejections = rejections2.clone();
             let tasks = tasks2.clone();
             async move {
                 reap_finished(&tasks).await;
+                let global_permit = match global_permits.try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        report_rejection(&rejections, "host", "global_connection_limit");
+                        if let Err(error) = sink.send(encode(&Frame::Close(id))).await {
+                            tracing::debug!(target: "thegn::revtunnel", %error, "close reply dropped");
+                        }
+                        return;
+                    }
+                };
                 let permit = match permits.try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
                         report_rejection(&rejections, "host", "connection_limit");
+                        drop(global_permit);
                         if let Err(error) = sink.send(encode(&Frame::Close(id))).await {
                             tracing::debug!(target: "thegn::revtunnel", %error, "close reply dropped");
                         }
@@ -399,6 +451,7 @@ where
                     report_rejection(&rejections, "host", "duplicate_id");
                     drop(routes);
                     drop(permit);
+                    drop(global_permit);
                     if let Err(error) = sink.send(encode(&Frame::Close(id))).await {
                         tracing::debug!(target: "thegn::revtunnel", %error, "close reply dropped");
                     }
@@ -415,11 +468,18 @@ where
                 ));
                 drop(routes);
                 tasks.lock().await.spawn(async move {
-                    let dial_result = dialer.dial().await;
-                    let dial_failed = dial_result.is_err();
-                    if let Ok(local) = dial_result {
-                        pump_conn(id, local, in_rx, sink.clone()).await;
-                    }
+                    let dial_result = tokio::time::timeout(dial_timeout, dialer.dial()).await;
+                    let dial_failed = match dial_result {
+                        Ok(Ok(local)) => {
+                            pump_conn(id, local, in_rx, sink.clone()).await;
+                            false
+                        }
+                        Ok(Err(_)) => true,
+                        Err(_) => {
+                            report_rejection(&rejections, "host", "dial_timeout");
+                            true
+                        }
+                    };
                     let mut routes = conns.lock().await;
                     if routes
                         .get(&id)
@@ -429,6 +489,7 @@ where
                     }
                     drop(routes);
                     drop(permit);
+                    drop(global_permit);
                     if dial_failed && let Err(error) = sink.send(encode(&Frame::Close(id))).await {
                         tracing::debug!(target: "thegn::revtunnel", %error, "close reply dropped");
                     }
@@ -566,6 +627,18 @@ mod tests {
                 io::ErrorKind::ConnectionRefused,
                 "test dial failure",
             ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct PendingDialer {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Dialer for PendingDialer {
+        async fn dial(&self) -> io::Result<Box<dyn IoStream>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            std::future::pending().await
         }
     }
 
@@ -778,6 +851,157 @@ mod tests {
             }
         }
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_dial_timeout_closes_route_and_releases_permit() {
+        let (host, mut peer) = tokio::io::duplex(16 * 1024);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(run_host_with_admission(
+            host,
+            PendingDialer {
+                calls: calls.clone(),
+            },
+            1,
+            Arc::new(Semaphore::new(1)),
+            std::time::Duration::from_millis(50),
+        ));
+        send_opens(&mut peer, &[1]).await;
+        let mut data = Vec::new();
+        for _ in 0..(CHANNEL_DEPTH + 4) {
+            data.extend(encode(&Frame::Data(1, vec![0; 8])));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), peer.write_all(&data))
+            .await
+            .expect("timed out filling the stalled route's inbound queue")
+            .unwrap();
+
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(next_frame(&mut peer, &mut decoder).await, Frame::Close(1));
+        send_open(&mut peer, 2).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while calls.load(Ordering::Relaxed) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed-out dial did not release the permit and read loop");
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("host did not stop after peer disconnect")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn global_cap_spans_tunnels() {
+        let shared_permits = Arc::new(Semaphore::new(1));
+        let permit_observer = shared_permits.clone();
+        let (host_a, mut peer_a) = tokio::io::duplex(4096);
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let (far_a_tx, mut far_a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task_a = tokio::spawn(run_host_with_admission(
+            host_a,
+            HoldingDialer {
+                calls: calls_a.clone(),
+                far_ends: far_a_tx,
+            },
+            1,
+            shared_permits.clone(),
+            std::time::Duration::from_secs(2),
+        ));
+
+        let (host_b, mut peer_b) = tokio::io::duplex(4096);
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let (far_b_tx, mut far_b_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task_b = tokio::spawn(run_host_with_admission(
+            host_b,
+            HoldingDialer {
+                calls: calls_b.clone(),
+                far_ends: far_b_tx,
+            },
+            1,
+            shared_permits,
+            std::time::Duration::from_secs(2),
+        ));
+
+        send_opens(&mut peer_a, &[1]).await;
+        let far_a = tokio::time::timeout(std::time::Duration::from_secs(2), far_a_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        send_opens(&mut peer_b, &[9]).await;
+        let mut decoder_b = FrameDecoder::new();
+        assert_eq!(
+            next_frame(&mut peer_b, &mut decoder_b).await,
+            Frame::Close(9)
+        );
+        assert_eq!(calls_b.load(Ordering::Relaxed), 0);
+
+        drop(far_a);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer_a.write_all(&encode(&Frame::Close(1))),
+        )
+        .await
+        .expect("timed out closing tunnel A connection")
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while permit_observer.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tunnel A did not release the process-wide permit");
+        send_open(&mut peer_b, 10).await;
+        let _far_b = tokio::time::timeout(std::time::Duration::from_secs(2), far_b_rx.recv())
+            .await
+            .expect("released global permit did not admit tunnel B")
+            .expect("tunnel B dialer receiver closed");
+        assert_eq!(calls_a.load(Ordering::Relaxed), 1);
+        assert_eq!(calls_b.load(Ordering::Relaxed), 1);
+
+        drop(peer_a);
+        drop(peer_b);
+        for task in [task_a, task_b] {
+            tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .expect("host tunnel did not stop after peer disconnect")
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rejection_total_counts_connection_limit_rejections() {
+        let before = rejection_total();
+        let (host, mut peer) = tokio::io::duplex(4096);
+        let (far_tx, mut far_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_host_with_admission(
+            host,
+            HoldingDialer {
+                calls: Arc::new(AtomicUsize::new(0)),
+                far_ends: far_tx,
+            },
+            1,
+            Arc::new(Semaphore::new(1)),
+            std::time::Duration::from_secs(2),
+        ));
+        send_opens(&mut peer, &[1, 2]).await;
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(next_frame(&mut peer, &mut decoder).await, Frame::Close(2));
+        let _far = tokio::time::timeout(std::time::Duration::from_secs(2), far_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rejection_total() > before);
         drop(peer);
         tokio::time::timeout(std::time::Duration::from_secs(2), task)
             .await

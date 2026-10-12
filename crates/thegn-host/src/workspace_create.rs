@@ -21,6 +21,8 @@ use crate::run::{
 
 const MAX_PROGRESS_SEGMENT: usize = 512;
 const CLONE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const CLONE_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+const CLONE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const CLONE_TERMINATE_GRACE: Duration = Duration::from_millis(300);
 const CLONE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 static CLONE_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -78,10 +80,61 @@ enum CloneStep {
     Kill,
 }
 
+#[derive(Clone, Copy)]
+struct CloneLimits {
+    total: Duration,
+    connect: Duration,
+    idle: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloneStopReason {
+    Cancelled,
+    ConnectTimeout,
+    IdleTimeout,
+    TotalTimeout,
+}
+
+impl CloneStopReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Cancelled => "git clone cancelled",
+            Self::ConnectTimeout => "git clone timed out (no response from remote)",
+            Self::IdleTimeout => "git clone timed out (stalled)",
+            Self::TotalTimeout => "git clone timed out",
+        }
+    }
+}
+
+fn clone_stop_reason(
+    now: Instant,
+    started: Instant,
+    limits: CloneLimits,
+    last_output: Option<Instant>,
+    cancelled: bool,
+) -> Option<CloneStopReason> {
+    if cancelled {
+        Some(CloneStopReason::Cancelled)
+    } else if now.saturating_duration_since(started) >= limits.total {
+        Some(CloneStopReason::TotalTimeout)
+    } else if let Some(last_output) = last_output {
+        if now.saturating_duration_since(last_output) >= limits.idle {
+            Some(CloneStopReason::IdleTimeout)
+        } else {
+            None
+        }
+    } else if now.saturating_duration_since(started) >= limits.connect {
+        Some(CloneStopReason::ConnectTimeout)
+    } else {
+        None
+    }
+}
+
 fn clone_step(
     now: Instant,
     started: Instant,
-    deadline: Instant,
+    limits: CloneLimits,
+    last_output: Option<Instant>,
     cancelled: bool,
     term_sent_at: Option<Instant>,
 ) -> CloneStep {
@@ -91,10 +144,7 @@ fn clone_step(
         } else {
             CloneStep::Continue
         }
-    } else if cancelled
-        || now >= deadline
-        || now.saturating_duration_since(started) >= CLONE_TOTAL_TIMEOUT
-    {
+    } else if clone_stop_reason(now, started, limits, last_output, cancelled).is_some() {
         CloneStep::Terminate
     } else {
         CloneStep::Continue
@@ -347,135 +397,193 @@ pub(crate) fn workspace_clone_dest(
 fn clone_workspace_repo_with_deadline(
     url: &str,
     dest: &std::path::Path,
-    deadline: Instant,
+    limits: CloneLimits,
     mut cancelled: impl FnMut() -> bool,
     on_progress: impl FnMut(String) + Send + 'static,
 ) -> Result<()> {
-    anyhow::ensure!(
-        !cancelled() && Instant::now() < deadline,
-        "workspace clone cancelled or timed out before admission"
-    );
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    // Via the scrubbed git_cmd so a stray GIT_DIR can't redirect the
-    // clone; dest is absolute, so the `-C` only sets the working dir.
-    let cwd = dest.parent().unwrap_or(std::path::Path::new("."));
-    // `--progress` forces git to emit its transfer counters even though stderr
-    // is a pipe, not a TTY; we stream them to the picker's cloning panel.
-    let mut command = thegn_core::util::git_cmd(cwd);
-    command
-        .arg("clone")
-        .arg("--progress")
-        .arg(url)
-        .arg(dest)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    let (mut child, group) = crate::platform::spawn_grouped(&mut command)
-        .with_context(|| format!("git clone into {}", dest.display()))?;
-    let started = Instant::now();
-    let mut reader = if let Some(stderr) = child.stderr.take() {
-        match std::thread::Builder::new()
-            .name("workspace-clone-progress".into())
-            .spawn(move || {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                stream_progress_lines(std::io::BufReader::new(stderr), on_progress);
-            }) {
-            Ok(handle) => Some(handle),
-            Err(error) => {
-                group.kill();
-                #[expect(clippy::disallowed_methods)]
-                if let Err(wait_error) = child.wait() {
-                    return Err(wait_error).context("reap clone after reader spawn failure");
-                }
-                return Err(error).context("spawn workspace clone progress reader");
-            }
+    let mut dest_existed = None;
+    let result = (|| {
+        anyhow::ensure!(!cancelled(), "git clone cancelled");
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
         }
-    } else {
-        None
-    };
-    let mut term_sent_at = None;
-    let mut status = None;
-    loop {
-        let polled = match child.try_wait() {
-            Ok(polled) => polled,
-            Err(error) => {
-                group.kill();
-                #[expect(clippy::disallowed_methods)]
-                if let Err(wait_error) = child.wait() {
-                    return Err(wait_error).context("reap clone after poll failure");
+        // Via the scrubbed git_cmd so a stray GIT_DIR can't redirect the
+        // clone; dest is absolute, so the `-C` only sets the working dir.
+        let cwd = dest.parent().unwrap_or(std::path::Path::new("."));
+        // `--progress` forces git to emit its transfer counters even though stderr
+        // is a pipe, not a TTY; we stream them to the picker's cloning panel.
+        let mut command = thegn_core::util::git_cmd(cwd);
+        command
+            .arg("clone")
+            .arg("--progress")
+            .arg(url)
+            .arg(dest)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        dest_existed = Some(std::fs::symlink_metadata(dest).is_ok());
+        let (mut child, group) = crate::platform::spawn_grouped(&mut command)
+            .with_context(|| format!("git clone into {}", dest.display()))?;
+        let started = Instant::now();
+        let last_output_ms = std::sync::Arc::new(AtomicU64::new(0));
+        let mut reader = if let Some(stderr) = child.stderr.take() {
+            let reader_last_output_ms = last_output_ms.clone();
+            match std::thread::Builder::new()
+                .name("workspace-clone-progress".into())
+                .spawn(move || {
+                    crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+                    stream_progress_lines_with_activity(
+                        std::io::BufReader::new(stderr),
+                        on_progress,
+                        || {
+                            let millis = u64::try_from(started.elapsed().as_millis())
+                                .unwrap_or(u64::MAX)
+                                .saturating_add(1);
+                            reader_last_output_ms.store(millis, Ordering::Relaxed);
+                        },
+                    );
+                }) {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    group.kill();
+                    #[expect(clippy::disallowed_methods)]
+                    if let Err(wait_error) = child.wait() {
+                        return Err(wait_error).context("reap clone after reader spawn failure");
+                    }
+                    return Err(error).context("spawn workspace clone progress reader");
                 }
-                if let Some(reader) = reader.take() {
-                    reader
-                        .join()
-                        .map_err(|_| anyhow::anyhow!("workspace clone progress reader panicked"))?;
-                }
-                return Err(error).context("poll git clone");
             }
+        } else {
+            None
         };
-        if let Some(exit) = polled {
-            status = Some(exit);
-            // A helper may keep stderr open after git exits. Reap the whole
-            // owned group so the progress reader reaches EOF as well.
-            if !group.is_empty() {
-                group.terminate();
-            }
-            break;
-        }
-        match clone_step(Instant::now(), started, deadline, cancelled(), term_sent_at) {
-            CloneStep::Continue => std::thread::sleep(CLONE_POLL_INTERVAL),
-            CloneStep::Terminate => {
-                group.terminate();
-                term_sent_at = Some(Instant::now());
-            }
-            CloneStep::Kill => {
-                group.kill();
+        let mut term_sent_at = None;
+        let mut stop_reason = None;
+        let mut status = None;
+        loop {
+            let polled = match child.try_wait() {
+                Ok(polled) => polled,
+                Err(error) => {
+                    group.kill();
+                    #[expect(clippy::disallowed_methods)]
+                    if let Err(wait_error) = child.wait() {
+                        return Err(wait_error).context("reap clone after poll failure");
+                    }
+                    if let Some(reader) = reader.take() {
+                        reader.join().map_err(|_| {
+                            anyhow::anyhow!("workspace clone progress reader panicked")
+                        })?;
+                    }
+                    return Err(error).context("poll git clone");
+                }
+            };
+            if let Some(exit) = polled {
+                status = Some(exit);
+                // A helper may keep stderr open after git exits. Reap the whole
+                // owned group so the progress reader reaches EOF as well.
+                if !group.is_empty() {
+                    group.terminate();
+                }
                 break;
             }
+            let elapsed_ms = last_output_ms.load(Ordering::Relaxed);
+            let last_output = (elapsed_ms != 0)
+                .then(|| started + Duration::from_millis(elapsed_ms.saturating_sub(1)));
+            let now = Instant::now();
+            let is_cancelled = cancelled();
+            let expired_reason = clone_stop_reason(now, started, limits, last_output, is_cancelled);
+            match clone_step(
+                now,
+                started,
+                limits,
+                last_output,
+                is_cancelled,
+                term_sent_at,
+            ) {
+                CloneStep::Continue => std::thread::sleep(CLONE_POLL_INTERVAL),
+                CloneStep::Terminate => {
+                    stop_reason = expired_reason;
+                    group.terminate();
+                    term_sent_at = Some(Instant::now());
+                }
+                CloneStep::Kill => {
+                    group.kill();
+                    break;
+                }
+            }
         }
+        if status.is_none() {
+            // The child may have exited while the group was being killed.
+            #[expect(clippy::disallowed_methods)]
+            let exit = child.wait().context("wait for terminated git clone")?;
+            status = Some(exit);
+        }
+        // Ensure no pipe-holding descendant survives a completed git process.
+        let reap_deadline = Instant::now() + CLONE_TERMINATE_GRACE;
+        while !group.is_empty() && Instant::now() < reap_deadline {
+            std::thread::sleep(CLONE_POLL_INTERVAL);
+        }
+        if !group.is_empty() {
+            group.kill();
+        }
+        let group_reap_deadline = Instant::now() + Duration::from_secs(2);
+        while !group.is_empty() && Instant::now() < group_reap_deadline {
+            std::thread::sleep(CLONE_POLL_INTERVAL);
+        }
+        anyhow::ensure!(group.is_empty(), "git clone process group did not exit");
+        if let Some(reader) = reader.take() {
+            reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("workspace clone progress reader panicked"))?;
+        }
+        let status = status.expect("clone loop always records or waits for child status");
+        if let Some(reason) = stop_reason
+            && (reason == CloneStopReason::Cancelled || !status.success())
+        {
+            anyhow::bail!("{}", reason.message());
+        }
+        if !status.success() {
+            anyhow::bail!("git clone failed");
+        }
+        Ok(())
+    })();
+    if result.is_err()
+        && let Some(dest_existed) = dest_existed
+    {
+        remove_partial_clone_dest(dest, dest_existed);
     }
-    if status.is_none() {
-        // The child may have exited while the group was being killed.
-        #[expect(clippy::disallowed_methods)]
-        let exit = child.wait().context("wait for terminated git clone")?;
-        status = Some(exit);
+    result
+}
+
+fn remove_partial_clone_dest(dest: &std::path::Path, dest_existed: bool) {
+    if dest_existed {
+        return;
     }
-    // Ensure no pipe-holding descendant survives a completed git process.
-    let reap_deadline = Instant::now() + CLONE_TERMINATE_GRACE;
-    while !group.is_empty() && Instant::now() < reap_deadline {
-        std::thread::sleep(CLONE_POLL_INTERVAL);
+    match std::fs::symlink_metadata(dest) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            if let Err(error) = std::fs::remove_dir_all(dest) {
+                tracing::debug!(%error, path = %dest.display(), "remove partial workspace clone destination");
+            }
+        }
+        Ok(_) | Err(_) => {}
     }
-    if !group.is_empty() {
-        group.kill();
-    }
-    let group_reap_deadline = Instant::now() + Duration::from_secs(2);
-    while !group.is_empty() && Instant::now() < group_reap_deadline {
-        std::thread::sleep(CLONE_POLL_INTERVAL);
-    }
-    anyhow::ensure!(group.is_empty(), "git clone process group did not exit");
-    if let Some(reader) = reader.take() {
-        reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("workspace clone progress reader panicked"))?;
-    }
-    let status = status.expect("clone loop always records or waits for child status");
-    if !status.success() {
-        anyhow::bail!("git clone failed");
-    }
-    if Instant::now() >= deadline || cancelled() {
-        anyhow::bail!("git clone cancelled or timed out");
-    }
-    Ok(())
 }
 
 /// Read `git`'s progress stream, calling `on_line` with each finished segment.
 /// git rewrites its progress counter in place with a carriage return, so we
 /// break on `\r` *and* `\n` (trimming, dropping empties) rather than by line.
-pub(crate) fn stream_progress_lines<R: std::io::BufRead>(
+#[cfg(test)]
+pub(crate) fn stream_progress_lines<R: std::io::BufRead>(reader: R, on_line: impl FnMut(String)) {
+    stream_progress_lines_with_activity(reader, on_line, || {});
+}
+
+fn stream_progress_lines_with_activity<R: std::io::BufRead>(
     reader: R,
     mut on_line: impl FnMut(String),
+    mut on_activity: impl FnMut(),
 ) {
     let mut buf: Vec<u8> = Vec::new();
+    let mut first_segment = true;
+    const CLONE_BANNER: &[u8] = b"Cloning into ";
     let flush = |buf: &mut Vec<u8>, on_line: &mut dyn FnMut(String)| {
         let decoded = String::from_utf8_lossy(buf);
         let clean: String = decoded.chars().filter(|ch| !ch.is_control()).collect();
@@ -488,9 +596,17 @@ pub(crate) fn stream_progress_lines<R: std::io::BufRead>(
     for byte in reader.bytes() {
         let Ok(b) = byte else { break };
         if b == b'\r' || b == b'\n' {
+            if first_segment && !buf.is_empty() && !buf.starts_with(CLONE_BANNER) {
+                on_activity();
+            }
             flush(&mut buf, &mut on_line);
+            first_segment = false;
         } else if buf.len() < MAX_PROGRESS_SEGMENT {
             buf.push(b);
+            if !first_segment || (!CLONE_BANNER.starts_with(&buf) && !buf.starts_with(CLONE_BANNER))
+            {
+                on_activity();
+            }
         }
     }
     flush(&mut buf, &mut on_line);
@@ -715,7 +831,11 @@ fn run_clone_job(job: CloneJob) {
     let result = clone_workspace_repo_with_deadline(
         &url,
         &dest,
-        Instant::now() + CLONE_TOTAL_TIMEOUT,
+        CloneLimits {
+            total: CLONE_TOTAL_TIMEOUT,
+            connect: CLONE_CONNECT_TIMEOUT,
+            idle: CLONE_IDLE_TIMEOUT,
+        },
         || !clone_event_is_current(generation, CLONE_GENERATION.load(Ordering::SeqCst)),
         move |line| {
             let pending = reader_throttle
@@ -1121,6 +1241,17 @@ Receiving objects: 100% (10/10)\rdone.\n";
     }
 
     #[test]
+    fn clone_banner_does_not_count_as_remote_activity() {
+        let activity_bytes = std::cell::Cell::new(0);
+        stream_progress_lines_with_activity(
+            std::io::Cursor::new(b"Cloning into 'x'...\nremote\n".as_slice()),
+            |_| {},
+            || activity_bytes.set(activity_bytes.get() + 1),
+        );
+        assert_eq!(activity_bytes.get(), "remote".len());
+    }
+
+    #[test]
     fn progress_lines_flush_trailing_without_terminator() {
         let mut lines = Vec::new();
         stream_progress_lines(std::io::Cursor::new(b"no newline".as_slice()), |l| {
@@ -1185,9 +1316,13 @@ Receiving objects: 100% (10/10)\rdone.\n";
     #[test]
     fn clone_step_terminates_then_escalates_after_grace() {
         let started = Instant::now();
-        let deadline = started + Duration::from_secs(5);
+        let limits = CloneLimits {
+            total: Duration::from_secs(5),
+            connect: Duration::from_secs(5),
+            idle: Duration::from_secs(5),
+        };
         assert_eq!(
-            clone_step(started, started, deadline, true, None),
+            clone_step(started, started, limits, None, true, None),
             CloneStep::Terminate
         );
         let sent = started + Duration::from_secs(1);
@@ -1195,16 +1330,125 @@ Receiving objects: 100% (10/10)\rdone.\n";
             clone_step(
                 sent + CLONE_TERMINATE_GRACE,
                 started,
-                deadline,
+                limits,
+                None,
                 false,
                 Some(sent)
             ),
             CloneStep::Kill
         );
         assert_eq!(
-            clone_step(started, started, started, false, None),
+            clone_step(
+                started + Duration::from_secs(5),
+                started,
+                limits,
+                None,
+                false,
+                None
+            ),
             CloneStep::Terminate
         );
+    }
+
+    #[test]
+    fn clone_step_enforces_connect_and_idle_deadlines() {
+        let started = Instant::now();
+        let limits = CloneLimits {
+            total: Duration::from_secs(60),
+            connect: Duration::from_millis(300),
+            idle: Duration::from_millis(500),
+        };
+        assert_eq!(
+            clone_step(
+                started + Duration::from_millis(300),
+                started,
+                limits,
+                None,
+                false,
+                None
+            ),
+            CloneStep::Terminate
+        );
+        assert_eq!(
+            clone_stop_reason(
+                started + Duration::from_millis(300),
+                started,
+                limits,
+                None,
+                false
+            ),
+            Some(CloneStopReason::ConnectTimeout)
+        );
+        assert_eq!(
+            clone_step(
+                started + Duration::from_millis(600),
+                started,
+                limits,
+                Some(started + Duration::from_millis(99)),
+                false,
+                None
+            ),
+            CloneStep::Terminate
+        );
+        assert_eq!(
+            clone_stop_reason(
+                started + Duration::from_millis(600),
+                started,
+                limits,
+                Some(started + Duration::from_millis(99)),
+                false
+            ),
+            Some(CloneStopReason::IdleTimeout)
+        );
+        assert_eq!(
+            clone_step(
+                started + Duration::from_millis(299),
+                started,
+                limits,
+                Some(started + Duration::from_millis(200)),
+                false,
+                None
+            ),
+            CloneStep::Continue
+        );
+    }
+
+    #[test]
+    fn cancelled_clone_reports_cancelled_before_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = clone_workspace_repo_with_deadline(
+            "https://example.invalid/repo.git",
+            &temp.path().join("clone"),
+            CloneLimits {
+                total: Duration::from_secs(60),
+                connect: Duration::from_secs(1),
+                idle: Duration::from_secs(1),
+            },
+            || true,
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "git clone cancelled");
+    }
+
+    #[test]
+    fn partial_clone_destination_cleanup_only_removes_new_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let created = temp.path().join("created");
+        std::fs::create_dir(&created).unwrap();
+        std::fs::write(created.join("partial"), b"partial clone").unwrap();
+        remove_partial_clone_dest(&created, false);
+        assert!(!created.exists());
+
+        let preexisting = temp.path().join("preexisting");
+        std::fs::create_dir(&preexisting).unwrap();
+        remove_partial_clone_dest(&preexisting, true);
+        assert!(preexisting.is_dir());
+
+        let regular_file = temp.path().join("file");
+        std::fs::write(&regular_file, b"keep").unwrap();
+        remove_partial_clone_dest(&regular_file, false);
+        assert!(regular_file.is_file());
     }
 
     #[test]
@@ -1236,7 +1480,11 @@ Receiving objects: 100% (10/10)\rdone.\n";
             let result = clone_workspace_repo_with_deadline(
                 &url,
                 &dest,
-                Instant::now() + Duration::from_millis(300),
+                CloneLimits {
+                    total: Duration::from_secs(60),
+                    connect: Duration::from_millis(300),
+                    idle: Duration::from_secs(60),
+                },
                 || false,
                 |_| {},
             );
@@ -1246,10 +1494,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
         let elapsed = started.elapsed();
         worker.join().unwrap();
         let error = result.expect_err("a nonresponsive HTTP peer must time out");
-        assert!(
-            error.contains("git clone failed") || error.contains("cancelled or timed out"),
-            "expected timeout or clone failure, got: {error}"
-        );
+        assert_eq!(error, "git clone timed out (no response from remote)");
         assert!(
             !error.contains("did not exit"),
             "the clone process group must be reaped, got: {error}"
@@ -1258,6 +1503,66 @@ Receiving objects: 100% (10/10)\rdone.\n";
             elapsed < Duration::from_secs(3),
             "clone process group took {elapsed:?} to reap"
         );
+        assert!(!temp.path().join("clone").exists());
+        assert!(
+            accept_thread.join().unwrap().is_some(),
+            "git contacted local peer"
+        );
+    }
+
+    #[test]
+    fn hung_clone_total_deadline_reaps_local_http_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let accept_thread = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => return Some(stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return None;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept clone connection: {error}"),
+                }
+            }
+        });
+        let dest = temp.path().join("clone");
+        let url = format!("http://{address}/x.git");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let worker = std::thread::spawn(move || {
+            let result = clone_workspace_repo_with_deadline(
+                &url,
+                &dest,
+                CloneLimits {
+                    total: Duration::from_millis(300),
+                    connect: Duration::from_secs(60),
+                    idle: Duration::from_secs(60),
+                },
+                || false,
+                |_| {},
+            );
+            tx.send(result.map_err(|error| error.to_string())).unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let elapsed = started.elapsed();
+        worker.join().unwrap();
+        let error = result.expect_err("a nonresponsive HTTP peer must time out");
+        assert_eq!(error, "git clone timed out");
+        assert!(
+            !error.contains("did not exit"),
+            "the clone process group must be reaped, got: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "clone process group took {elapsed:?} to reap"
+        );
+        assert!(!temp.path().join("clone").exists());
         assert!(
             accept_thread.join().unwrap().is_some(),
             "git contacted local peer"

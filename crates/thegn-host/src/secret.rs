@@ -20,6 +20,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use thegn_core::secret_audit::{SecretAudit, SecretOutcome};
 use thegn_core::secret_store::{SecretBackendCaps, SecretBackendKind, SecretError, SecretStore};
 use thegn_core::secretref::{BareAs, SecretRef};
@@ -231,32 +232,22 @@ pub fn forget(name: &str) {
     if let Ok(mut m) = presence_memo().lock() {
         m.clear();
     }
-    let _ = keyring_del(name); // best-effort: bounded cleanup; absence is success
-    if let Ok(path) = secrets_file(name) {
-        match account_matches_or_missing(&path, name) {
-            Ok(()) => {
-                if let Err(error) = std::fs::remove_file(&path)
-                    && error.kind() != std::io::ErrorKind::NotFound
-                {
-                    tracing::warn!(%error, "failed to remove file-backed secret");
-                }
-                if let Err(error) = remove_sidecar(&path) {
-                    tracing::warn!(%error, "failed to remove secret account sidecar");
-                }
-                if let Some(parent) = path.parent()
-                    && let Err(error) = thegn_core::fsperm::sync_parent_dir(parent)
-                {
-                    tracing::warn!(%error, "failed to sync secret directory after removal");
-                }
-            }
-            Err(error) => tracing::warn!(%error, "refused file-backed secret removal"),
-        }
+    if let Err(error) = keyring_del(name) {
+        tracing::debug!(target: "thegn::secret", %error, "best-effort keyring secret cleanup failed");
     }
     // Do not derive and delete the pre-hash fallback filename. That historical
     // sanitizer was not injective (`a/b` and `a_b` both became `a_b.token`), so
     // automatic legacy cleanup could delete a different account's credential.
     // Existing `file:` refs remain directly resolvable and can be removed by
     // their explicit path during a user-directed migration.
+    match secrets_dir() {
+        Ok(dir) => {
+            if let Err(error) = file_del_at(&dir, name) {
+                tracing::warn!(%error, "refused file-backed secret removal");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "secrets dir unavailable for removal"),
+    }
 }
 
 /// Whether an OS keyring is actually usable here (so the UI can tell the user
@@ -413,7 +404,7 @@ fn secrets_file(name: &str) -> Result<PathBuf> {
         .map(|p| p.join("secrets"))
         .context("config path has no parent")?;
     secrets_dir_at(&dir)?;
-    token_path_in(&dir, name)
+    resolve_token_path_in(&dir, name)
 }
 
 fn secrets_dir() -> Result<PathBuf> {
@@ -437,6 +428,24 @@ fn token_path_in(dir: &std::path::Path, name: &str) -> Result<PathBuf> {
     }
     // Keep a readable prefix; the sidecar below verifies the exact account for
     // this hashed filename, including aliases such as `a/b` and `a_b`.
+    let safe = safe_account_prefix(name);
+    let mut hasher = Sha256::new();
+    hasher.update(b"thegn-secret-account-v2\0");
+    hasher.update(name.as_bytes());
+    let identity = format!("{:x}", hasher.finalize());
+    Ok(dir.join(format!("{safe}-{identity}.token")))
+}
+
+fn legacy_token_path_in(dir: &std::path::Path, name: &str) -> Result<PathBuf> {
+    if name.is_empty() || name.len() > MAX_ACCOUNT_BYTES {
+        anyhow::bail!("secret account must contain 1..={MAX_ACCOUNT_BYTES} UTF-8 bytes");
+    }
+    let safe = safe_account_prefix(name);
+    let identity = thegn_core::util::short_hash(name, 16);
+    Ok(dir.join(format!("{safe}-{identity}.token")))
+}
+
+fn safe_account_prefix(name: &str) -> String {
     let safe: String = name
         .chars()
         .map(|c| {
@@ -448,9 +457,32 @@ fn token_path_in(dir: &std::path::Path, name: &str) -> Result<PathBuf> {
         })
         .take(48)
         .collect();
-    let safe = if safe.is_empty() { "secret" } else { &safe };
-    let identity = thegn_core::util::short_hash(name, 16);
-    Ok(dir.join(format!("{safe}-{identity}.token")))
+    if safe.is_empty() {
+        "secret".into()
+    } else {
+        safe
+    }
+}
+
+fn resolve_token_path_in(dir: &std::path::Path, account: &str) -> Result<PathBuf> {
+    let v2 = token_path_in(dir, account)?;
+    if path_entry_exists(&v2)? || path_entry_exists(&account_path(&v2))? {
+        return Ok(v2);
+    }
+    let legacy = legacy_token_path_in(dir, account)?;
+    if path_entry_exists(&legacy)? {
+        account_matches_or_missing(&legacy, account)?;
+        return Ok(legacy);
+    }
+    Ok(v2)
+}
+
+fn path_entry_exists(path: &std::path::Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("inspect secret path {}", path.display())),
+    }
 }
 
 fn account_path(token: &std::path::Path) -> PathBuf {
@@ -588,9 +620,8 @@ impl SecretStore for FileStore {
         }
     }
     fn get(&self, account: &str) -> Result<String, SecretError> {
-        // A bare account name resolves to the config-adjacent secrets file.
-        let path = secrets_file(account).map_err(|e| SecretError::unavailable(e.to_string()))?;
-        file_get_at(&path, account)
+        let dir = secrets_dir().map_err(|e| SecretError::unavailable(e.to_string()))?;
+        file_get_in(&dir, account)
     }
     fn set(&self, account: &str, value: &str) -> Result<(), SecretError> {
         let dir = secrets_dir().map_err(|e| SecretError::unavailable(e.to_string()))?;
@@ -639,22 +670,37 @@ fn file_get_at(path: &std::path::Path, account: &str) -> Result<String, SecretEr
     }
 }
 
+fn file_get_in(dir: &std::path::Path, account: &str) -> Result<String, SecretError> {
+    let path =
+        resolve_token_path_in(dir, account).map_err(|e| SecretError::denied(e.to_string()))?;
+    file_get_at(&path, account)
+}
+
 fn file_set_at(dir: &std::path::Path, account: &str, value: &str) -> Result<(), SecretError> {
-    let path = token_path_in(dir, account).map_err(|e| SecretError::denied(e.to_string()))?;
+    let path =
+        resolve_token_path_in(dir, account).map_err(|e| SecretError::denied(e.to_string()))?;
     write_account_sidecar(&path, account).map_err(|e| SecretError::denied(e.to_string()))?;
     write_private(&path, value).map_err(|e| SecretError::denied(e.to_string()))?;
     thegn_core::fsperm::sync_parent_dir(dir).map_err(|e| SecretError::denied(e.to_string()))
 }
 
 fn file_del_at(dir: &std::path::Path, account: &str) -> Result<(), SecretError> {
-    let path = token_path_in(dir, account).map_err(|e| SecretError::denied(e.to_string()))?;
-    account_matches_or_missing(&path, account).map_err(|e| SecretError::denied(e.to_string()))?;
-    match std::fs::remove_file(&path) {
-        Ok(()) => remove_sidecar(&path).map_err(|e| SecretError::denied(e.to_string()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            remove_sidecar(&path).map_err(|e| SecretError::denied(e.to_string()))?;
+    let paths = [
+        token_path_in(dir, account).map_err(|e| SecretError::denied(e.to_string()))?,
+        legacy_token_path_in(dir, account).map_err(|e| SecretError::denied(e.to_string()))?,
+    ];
+    for path in &paths {
+        account_matches_or_missing(path, account)
+            .map_err(|e| SecretError::denied(e.to_string()))?;
+    }
+    for path in &paths {
+        match std::fs::remove_file(path) {
+            Ok(()) => remove_sidecar(path).map_err(|e| SecretError::denied(e.to_string()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                remove_sidecar(path).map_err(|e| SecretError::denied(e.to_string()))?;
+            }
+            Err(error) => return Err(SecretError::denied(format!("remove secret: {error}"))),
         }
-        Err(error) => return Err(SecretError::denied(format!("remove secret: {error}"))),
     }
     thegn_core::fsperm::sync_parent_dir(dir).map_err(|e| SecretError::denied(e.to_string()))
 }
@@ -680,12 +726,18 @@ fn file_list_at(dir: &std::path::Path) -> Result<Vec<String>, SecretError> {
         }
         let account = read_account_sidecar(&entry.path())
             .map_err(|e| SecretError::denied(format!("invalid secret account sidecar: {e}")))?;
-        let token = token_path_in(dir, &account).map_err(|e| SecretError::denied(e.to_string()))?;
-        if token.with_extension("account") != entry.path() {
+        let v2 = token_path_in(dir, &account).map_err(|e| SecretError::denied(e.to_string()))?;
+        let legacy =
+            legacy_token_path_in(dir, &account).map_err(|e| SecretError::denied(e.to_string()))?;
+        let token = if v2.with_extension("account") == entry.path() {
+            v2
+        } else if legacy.with_extension("account") == entry.path() {
+            legacy
+        } else {
             return Err(SecretError::denied(
                 "secret account sidecar identity mismatch",
             ));
-        }
+        };
         match thegn_core::fsperm::open_regular_file_nofollow(&token) {
             Ok(file)
                 if thegn_core::fsperm::owned_by_current_user(
@@ -694,7 +746,9 @@ fn file_list_at(dir: &std::path::Path) -> Result<Vec<String>, SecretError> {
                         .map_err(|e| SecretError::denied(e.to_string()))?,
                 ) =>
             {
-                names.push(account)
+                if !names.contains(&account) {
+                    names.push(account)
+                }
             }
             Ok(_) => return Err(SecretError::denied("secret file is owned by another user")),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1068,6 +1122,28 @@ mod tests {
         assert_ne!(slash, underscore);
     }
 
+    #[test]
+    fn token_digest_is_domain_separated_sha256_and_legacy_name_is_retained() {
+        let temp = private_temp();
+        let v2 = token_path_in(temp.path(), "acct").unwrap();
+        let legacy = legacy_token_path_in(temp.path(), "acct").unwrap();
+        let digest = v2
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .rsplit('-')
+            .next()
+            .unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(
+            digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_ne!(v2, legacy);
+    }
+
     fn private_temp() -> tempfile::TempDir {
         let temp = tempfile::tempdir().unwrap();
         thegn_core::fsperm::ensure_private_dir(temp.path()).unwrap();
@@ -1116,6 +1192,67 @@ mod tests {
             b"legacy/account"
         );
         assert_eq!(file_get_at(&token, "legacy/account").unwrap(), "new-value");
+    }
+
+    #[test]
+    fn legacy_token_stays_sticky_for_get_set_list_and_delete() {
+        let temp = private_temp();
+        let legacy = legacy_token_path_in(temp.path(), "acct").unwrap();
+        write_private(&legacy, "old").unwrap();
+        write_account_sidecar(&legacy, "acct").unwrap();
+
+        assert_eq!(file_get_in(temp.path(), "acct").unwrap(), "old");
+        assert_eq!(file_list_at(temp.path()).unwrap(), vec!["acct"]);
+        file_set_at(temp.path(), "acct", "new").unwrap();
+        assert_eq!(file_get_at(&legacy, "acct").unwrap(), "new");
+        assert!(!token_path_in(temp.path(), "acct").unwrap().exists());
+
+        let v2 = token_path_in(temp.path(), "acct").unwrap();
+        write_private(&v2, "duplicate-generation").unwrap();
+        write_account_sidecar(&v2, "acct").unwrap();
+        assert_eq!(file_list_at(temp.path()).unwrap(), vec!["acct"]);
+
+        file_del_at(temp.path(), "acct").unwrap();
+        assert!(!legacy.exists());
+        assert!(!account_path(&legacy).exists());
+        assert!(!v2.exists());
+        assert!(!account_path(&v2).exists());
+    }
+
+    #[test]
+    fn legacy_token_without_sidecar_remains_readable() {
+        let temp = private_temp();
+        let legacy = legacy_token_path_in(temp.path(), "acct").unwrap();
+        write_private(&legacy, "old").unwrap();
+        assert_eq!(file_get_in(temp.path(), "acct").unwrap(), "old");
+    }
+
+    #[test]
+    fn mismatched_legacy_sidecar_refuses_get_and_delete_without_removing_bytes() {
+        let temp = private_temp();
+        let legacy = legacy_token_path_in(temp.path(), "acct").unwrap();
+        write_private(&legacy, "keep-me").unwrap();
+        std::fs::write(account_path(&legacy), "other").unwrap();
+
+        assert!(file_get_in(temp.path(), "acct").is_err());
+        assert!(file_del_at(temp.path(), "acct").is_err());
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "keep-me");
+        assert_eq!(
+            std::fs::read_to_string(account_path(&legacy)).unwrap(),
+            "other"
+        );
+    }
+
+    #[test]
+    fn new_account_is_written_only_at_v2_path() {
+        let temp = private_temp();
+        let v2 = token_path_in(temp.path(), "new-acct").unwrap();
+        let legacy = legacy_token_path_in(temp.path(), "new-acct").unwrap();
+        file_set_at(temp.path(), "new-acct", "value").unwrap();
+        assert!(v2.exists());
+        assert!(account_path(&v2).exists());
+        assert!(!legacy.exists());
+        assert!(!account_path(&legacy).exists());
     }
 
     #[test]

@@ -983,6 +983,99 @@ fn running_share_accepts_post_startup_identical_announcements() {
     running.stop();
 }
 
+#[cfg(unix)]
+#[test]
+fn endpoint_conflict_hook_fires_once_for_post_startup_changes() {
+    let state = tempfile::tempdir().expect("private temporary state");
+    let script = "echo 'public: first.example:4123'; sleep 0.3; echo 'public: first.example:4123'; echo 'public: first.example:4123'; echo 'public: second.example:4123'; sleep 0.3; echo 'public: third.example:4123'; sleep 1";
+    let plan = SharePlan {
+        program: "sh".into(),
+        args: vec!["-c".into(), script.into()],
+        env: Vec::new(),
+        files: Vec::new(),
+        url_rule: UrlRule::AfterMarker {
+            marker: "public: ".into(),
+            scheme: "https".into(),
+        },
+    };
+    let running = start(&plan, state.path(), Duration::from_secs(2)).expect("start share");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_calls = calls.clone();
+    running.on_endpoint_conflict(Box::new(move || {
+        hook_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while calls.load(std::sync::atomic::Ordering::SeqCst) == 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    running.stop();
+}
+
+#[cfg(unix)]
+#[test]
+fn endpoint_conflict_hook_fires_when_installed_after_conflict() {
+    let state = tempfile::tempdir().expect("private temporary state");
+    let script =
+        "echo 'public: first.example:4123'; sleep 0.3; echo 'public: second.example:4123'; sleep 1";
+    let plan = SharePlan {
+        program: "sh".into(),
+        args: vec!["-c".into(), script.into()],
+        env: Vec::new(),
+        files: Vec::new(),
+        url_rule: UrlRule::AfterMarker {
+            marker: "public: ".into(),
+            scheme: "https".into(),
+        },
+    };
+    let running = start(&plan, state.path(), Duration::from_secs(2)).expect("start share");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !running.endpoint_conflict() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        running.endpoint_conflict(),
+        "fixture must publish the conflict first"
+    );
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_calls = calls.clone();
+    running.on_endpoint_conflict(Box::new(move || {
+        hook_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    running.stop();
+}
+
+#[cfg(unix)]
+#[test]
+fn endpoint_conflict_hook_does_not_fire_for_identical_repeats() {
+    let state = tempfile::tempdir().expect("private temporary state");
+    let script = "echo 'public: first.example:4123'; sleep 0.3; echo 'public: first.example:4123'; echo 'public: first.example:4123'; sleep 0.6";
+    let plan = SharePlan {
+        program: "sh".into(),
+        args: vec!["-c".into(), script.into()],
+        env: Vec::new(),
+        files: Vec::new(),
+        url_rule: UrlRule::AfterMarker {
+            marker: "public: ".into(),
+            scheme: "https".into(),
+        },
+    };
+    let running = start(&plan, state.path(), Duration::from_secs(2)).expect("start share");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_calls = calls.clone();
+    running.on_endpoint_conflict(Box::new(move || {
+        hook_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    running.stop();
+}
+
 #[test]
 fn bounded_reader_retries_interrupted_and_emits_eof_url() {
     struct InterruptOnce {
@@ -1323,6 +1416,28 @@ fn materialize_failure_aborts_before_spawn_and_leaves_no_temp() {
         1,
         "only the planted dir remains: {leftovers:?}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn materialize_refuses_hardlinked_state_file_before_replacement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sd = tmp.path().join("state");
+    std::fs::create_dir(&sd).unwrap();
+    let credential = sd.join("frpc.toml");
+    std::fs::write(&credential, "ORIGINAL").unwrap();
+    let second_name = tmp.path().join("outside-link");
+    std::fs::hard_link(&credential, &second_name).unwrap();
+    let marker = tmp.path().join("spawned");
+    let plan = file_plan(
+        vec![("frpc.toml", "REPLACEMENT")],
+        "sh",
+        vec!["-c".into(), format!("touch {}", marker.display())],
+    );
+
+    assert!(start(&plan, &sd, Duration::from_secs(2)).is_err());
+    assert_eq!(std::fs::read_to_string(&second_name).unwrap(), "ORIGINAL");
+    assert!(!marker.exists(), "provider must not be spawned");
 }
 
 #[cfg(unix)]

@@ -294,6 +294,7 @@ mod tests {
             path: path.into(),
             added: 0,
             deleted: 0,
+            count: thegn_svc::git::DiffCount::Exact(0),
             submodule: None,
             incoming: false,
         }

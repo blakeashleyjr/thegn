@@ -3,6 +3,31 @@ use crate::hydrate_tuning::DEFAULT_MODEL_REFRESH_MS;
 use crate::session::{GroupKind, Session, WorktreeGroup};
 
 #[test]
+fn stash_error_still_caches_watched_status_and_diff_snapshot() {
+    let cwd = tempfile::tempdir().unwrap();
+    let key = (crate::diff_watch::WatchPrint::for_test(41, 9), 3);
+    let stash_count = cache_panel_git_snapshot(
+        cwd.path(),
+        Some(key),
+        false,
+        true,
+        crate::panel_git_cache::GitReads::default(),
+        Err(anyhow::anyhow!("broken refs/stash")),
+    );
+
+    assert_eq!(
+        stash_count, 0,
+        "unknown stash count keeps the panel fallback"
+    );
+    let cached = crate::panel_git_cache::get(cwd.path(), key);
+    assert_eq!(
+        cached.map(|reads| reads.stash_count),
+        Some(None),
+        "status and diff snapshot is cached while stash count stays unknown"
+    );
+}
+
+#[test]
 fn dropped_panel_prefetch_completion_sends_failed_generation_and_rearms_latch() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let path = std::path::PathBuf::from("/repo/wt");

@@ -34,6 +34,22 @@ pub struct ProjectionSpec {
     pub mountpoint: String,
 }
 
+impl ProjectionSpec {
+    /// The pre-digest mountpoint for ssh placements, if it is safe to target.
+    ///
+    /// The legacy slug collapses distinct `(host, path)` pairs, which is why
+    /// current mountpoints include a digest. Teardown may therefore target a
+    /// colliding pre-upgrade mount belonging to another env. A non-lazy
+    /// `fusermount3 -u` refuses a busy mount, so this is safe; do not make it
+    /// lazy (`-uz`).
+    pub fn legacy_mountpoint(&self) -> Option<String> {
+        let Placement::Ssh(ssh) = &self.placement else {
+            return None;
+        };
+        legacy_mountpoint(&ssh.host, &self.remote_dir)
+    }
+}
+
 /// A stable local mountpoint for the exact UTF-8 bytes of a host and remote
 /// path, under `<thegn_dir>/mounts/<readable-prefix>--<digest>`. The digest is
 /// versioned, domain-separated, and length-delimited so separators and
@@ -46,6 +62,26 @@ pub fn mountpoint(host: &str, remote_path: &str) -> String {
         .join(component)
         .to_string_lossy()
         .into_owned()
+}
+
+/// The mountpoint formula used before projection mountpoints gained a digest.
+/// Returns `None` when the old slug would target the mounts directory itself or
+/// when it happens to equal the current mountpoint.
+pub fn legacy_mountpoint(host: &str, remote_path: &str) -> Option<String> {
+    let component = crate::util::slugify(&format!("{host}-{remote_path}"));
+    if component.is_empty() {
+        return None;
+    }
+    let candidate = crate::util::thegn_dir().join("mounts").join(component);
+    distinct_mountpoint(candidate, &mountpoint(host, remote_path))
+}
+
+fn distinct_mountpoint(candidate: std::path::PathBuf, current: &str) -> Option<String> {
+    if candidate == std::path::Path::new(current) {
+        None
+    } else {
+        Some(candidate.to_string_lossy().into_owned())
+    }
 }
 
 const PROJECTION_PREFIX_MAX_BYTES: usize = 40;
@@ -176,6 +212,41 @@ mod tests {
         // Deterministic: recomputing from the same inputs matches.
         assert_eq!(spec.mountpoint, mountpoint("dev-box", "/srv/work"));
         assert!(spec.mountpoint.contains("mounts"));
+    }
+
+    #[test]
+    fn legacy_mountpoint_reproduces_old_slug_formula() {
+        let expected = crate::util::thegn_dir()
+            .join("mounts")
+            .join("dev-box-srv-work")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            legacy_mountpoint("dev-box", "/srv/work"),
+            Some(expected.clone())
+        );
+        assert_ne!(expected, mountpoint("dev-box", "/srv/work"));
+    }
+
+    #[test]
+    fn legacy_mountpoint_rejects_empty_slug_and_current_path() {
+        assert_eq!(legacy_mountpoint("///", "\\\\"), None);
+        let current = std::path::PathBuf::from("/tmp/mounts/current");
+        assert_eq!(
+            distinct_mountpoint(current.clone(), current.to_str().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn sshfs_spec_exposes_legacy_mountpoint() {
+        let env = ssh_env(DataMode::Sshfs, "/srv/work");
+        let spec = for_environment(&env).expect("sshfs spec");
+        assert!(spec.legacy_mountpoint().is_some());
+
+        let mut local_spec = spec;
+        local_spec.placement = Placement::Local;
+        assert_eq!(local_spec.legacy_mountpoint(), None);
     }
 
     #[test]
