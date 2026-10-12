@@ -55,13 +55,20 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn("ref", checkouts[0].get("with", {}))
 
     def test_package_setup_action_comes_from_admitted_workflow_revision(self) -> None:
-        workflow = read_workflow("release.yml")
-        actions = [
-            step.get("uses")
-            for step in workflow["jobs"]["package"]["steps"]
-            if step.get("uses", "").endswith(".github/actions/ci-setup")
-        ]
-        self.assertEqual(["./trusted-workflow/.github/actions/ci-setup"], actions)
+        steps = read_workflow("release.yml")["jobs"]["package"]["steps"]
+        action_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("uses") == "./.github/actions/ci-setup"
+        )
+        self.assertGreater(action_index, 0)
+        preparation = steps[action_index - 1]
+        self.assertEqual("Prepare trusted workflow action", preparation.get("name"))
+        script = preparation.get("run", "")
+        self.assertIn(
+            'git archive "$TRUSTED_WORKFLOW_SHA" .github/actions/ci-setup', script
+        )
+        self.assertIn("rm -rf .github/actions/ci-setup", script)
 
     def test_sandbox_publication_is_serialized(self) -> None:
         workflow = read_workflow("sandbox-image.yml")
