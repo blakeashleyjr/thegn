@@ -1519,7 +1519,12 @@ pub(super) async fn calendar_events(
         return r;
     }
     match state.api.calendar_events(&q.from, &q.to).await {
-        Ok(events) => axum::Json(json!({ "events": events })).into_response(),
+        Ok(reply) => axum::Json(json!({
+            "events": reply.events,
+            "skipped_rows": reply.skipped_rows,
+            "incomplete": reply.incomplete,
+        }))
+        .into_response(),
         Err(e) => e.into_response(),
     }
 }
