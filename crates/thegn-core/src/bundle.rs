@@ -670,14 +670,14 @@ pub fn materialize_dotfiles(
 ) -> usize {
     use crate::config::DotfileMode;
     let source = std::path::PathBuf::from(util::expand_tilde(&spec.source));
-    if !matches!(std::fs::symlink_metadata(&source), Ok(metadata) if metadata.is_dir()) {
+    if !source.is_dir() {
         crate::msg::warn(&format!(
             "bundle: dotfiles source {} is not a directory; skipping",
             source.display()
         ));
         return 0;
     }
-    if let Err(e) = ensure_directory_chain_nofollow(dest_home) {
+    if let Err(e) = ensure_managed_home_directories(dest_home) {
         crate::msg::warn(&format!(
             "bundle: cannot create managed HOME {}: {e}",
             dest_home.display()
@@ -723,6 +723,30 @@ pub fn materialize_dotfiles(
             continue;
         };
         let to = dest_home.join(base);
+        if spec.mode == DotfileMode::Template {
+            match std::fs::symlink_metadata(&from) {
+                Ok(metadata)
+                    if metadata.file_type().is_symlink()
+                        || (!metadata.is_file() && !metadata.is_dir()) =>
+                {
+                    all_succeeded = false;
+                    crate::msg::warn(&format!(
+                        "bundle: refusing unsupported template entry {}",
+                        from.display()
+                    ));
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    all_succeeded = false;
+                    crate::msg::warn(&format!(
+                        "bundle: cannot inspect template entry {}: {error}",
+                        from.display()
+                    ));
+                    continue;
+                }
+            }
+        }
         if let Err(error) = std::fs::remove_file(&to).or_else(|_| std::fs::remove_dir_all(&to))
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -758,25 +782,34 @@ pub fn materialize_dotfiles(
 const MAX_DOTFILE_DEPTH: usize = 32;
 const MAX_DOTFILE_ENTRIES: usize = 10_000;
 
-fn ensure_directory_chain_nofollow(path: &std::path::Path) -> std::io::Result<()> {
-    let mut current = std::path::PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        match std::fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "directory path contains a non-directory or symlink",
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&current)?
-            }
-            Err(error) => return Err(error),
-        }
+fn ensure_managed_home_directories(path: &std::path::Path) -> std::io::Result<()> {
+    let slug = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "managed HOME has no bundle dir",
+        )
+    })?;
+    let bundles = slug.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "managed HOME has no bundles dir",
+        )
+    })?;
+    std::fs::create_dir_all(bundles)?;
+    ensure_directory_nofollow(slug)?;
+    ensure_directory_nofollow(path)
+}
+
+fn ensure_directory_nofollow(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "directory path is a non-directory or symlink",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(path),
+        Err(error) => Err(error),
     }
-    Ok(())
 }
 
 fn dotfiles_signature(source: &std::path::Path, mode: crate::config::DotfileMode) -> String {
@@ -1356,6 +1389,95 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn materialize_allows_symlinked_ancestor_above_bundles() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        let link = root.path().join("link");
+        let source = root.path().join("source");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join(".bashrc"), "test").unwrap();
+        symlink(&real, &link).unwrap();
+        let home = link.join("bundles").join("work").join("home");
+        let spec = DotfilesSpec {
+            source: source.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+
+        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        assert_eq!(
+            std::fs::read(real.join("bundles/work/home/.bashrc")).unwrap(),
+            "test"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_accepts_symlinked_configured_source_root() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let source_link = root.path().join("dotfiles");
+        let home = root.path().join("bundles/work/home");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join(".bashrc"), "test").unwrap();
+        symlink(&source, &source_link).unwrap();
+        let spec = DotfilesSpec {
+            source: source_link.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+
+        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        assert_eq!(std::fs::read(home.join(".bashrc")).unwrap(), "test");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_refuses_signature_symlink_without_touching_target() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("bundles/work/home");
+        let target = root.path().join("signature-target");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(source.join(".bashrc"), "test").unwrap();
+        std::fs::write(&target, "keep").unwrap();
+        symlink(&target, &home.join(".thegn-dotfiles.json")).unwrap();
+        let spec = DotfilesSpec {
+            source: source.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+
+        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        assert!(!home.join(".bashrc").exists());
+    }
+
+    #[test]
+    fn materialize_refuses_regular_file_bundle_component() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let bundles = root.path().join("bundles");
+        let slug = bundles.join("work");
+        let home = slug.join("home");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&bundles).unwrap();
+        std::fs::write(source.join(".bashrc"), "test").unwrap();
+        std::fs::write(&slug, "keep").unwrap();
+        let spec = DotfilesSpec {
+            source: source.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+
+        assert_eq!(materialize_dotfiles(&spec, &home), 0);
+        assert_eq!(std::fs::read_to_string(&slug).unwrap(), "keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn template_copy_skips_symlinks_and_does_not_cache_partial_success() {
         use crate::config::{DotfileMode, DotfilesSpec};
         let root = tempfile::tempdir().unwrap();
@@ -1377,6 +1499,33 @@ mod tests {
         assert!(!home.join("link/secret.txt").exists());
         assert!(!home.join(".thegn-dotfiles.json").exists());
         assert!(materialize_dotfiles(&spec, &home) >= 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_template_entry_preserves_existing_target() {
+        use crate::config::{DotfileMode, DotfilesSpec};
+        use std::os::unix::net::UnixListener;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("home");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(source.join(".bashrc"), "new").unwrap();
+        std::fs::write(home.join("unsupported"), "keep").unwrap();
+        let listener = UnixListener::bind(source.join("unsupported")).unwrap();
+        let spec = DotfilesSpec {
+            source: source.to_string_lossy().into_owned(),
+            mode: DotfileMode::Template,
+        };
+
+        assert_eq!(materialize_dotfiles(&spec, &home), 1);
+        assert_eq!(
+            std::fs::read_to_string(home.join("unsupported")).unwrap(),
+            "keep"
+        );
+        assert!(!home.join(".thegn-dotfiles.json").exists());
+        drop(listener);
     }
 
     #[cfg(unix)]
