@@ -56,6 +56,23 @@ deliberate invocation and is not generation-fenced or race-safe; it is not a
 checkout-hook security boundary. That shared-config repair is tracked by
 THE-371.
 
+## Docker compatibility shim
+
+Entering the dev shell may create the persistent symlink
+`~/.docker/docker.sock` when `DOCKER_HOST` is unset, the Podman socket is
+available, and that path does not already exist. The shim never replaces an
+existing socket, file, directory, or symlink, and it does not remove other
+links. Set `DOCKER_HOST` explicitly to opt out of this compatibility path.
+
+To recover, remove the link only after confirming it points to the Podman
+socket:
+
+```sh
+if [ "$(readlink "$HOME/.docker/docker.sock")" = "$XDG_RUNTIME_DIR/podman/podman.sock" ]; then
+  rm -- "$HOME/.docker/docker.sock"
+fi
+```
+
 ## Faithful path — `act`
 
 [`act`](https://github.com/nektos/act) runs the actual GitHub Actions workflow
@@ -69,14 +86,9 @@ cold-builds from scratch.
 1. `act` ships in the dev shell — enter it (`nix develop` / `direnv allow`).
 2. Start a container engine: Docker, or podman with the socket exported —
    `export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/podman/podman.sock"`.
-3. Create the secrets file `act` expects:
-   ```sh
-   cp .secrets.example .secrets
-   # NIX_GITHUB_TOKEN may be left blank
-   ```
-   `.secrets` is gitignored. Every flake input is public, so the token is
-   optional — it only raises GitHub's anonymous API rate limit, which repeated
-   in-container nix fetches can trip.
+3. No secrets file is needed for the default anonymous run. All current flake
+   inputs are public. If you deliberately need a token for a trusted workflow
+   debug, create `.secrets` yourself and opt in on that invocation.
 
 ### Run
 
@@ -85,19 +97,29 @@ just act-list           # list the jobs act sees
 just act-job name=lint  # run one job (start here — lint is the quickest)
 just act                # run the whole workflow (push event)
 just act -- --verbose   # pass extra flags through to act
-just act-clean          # remove act's reused containers if one wedges
+just act -- --secret-file .secrets  # explicitly expose credentials for this run
+just act -- --reuse     # explicitly retain the act job container
+just act-clean          # remove act containers if one wedges
 ```
 
-Defaults live in `.actrc`: the `catthehacker/ubuntu:act-latest` runner image,
-`linux/amd64` (identical on Apple silicon), `--secret-file .secrets`, and
-`--reuse` (keeps the job container so the in-container nix install + `/nix`
-store survive between runs — without it every run reinstalls nix).
+Defaults live in `.actrc`: the `catthehacker/ubuntu:act-latest` runner image
+and `linux/amd64` (identical on Apple silicon). The default run does not load a
+secret file and does not reuse its job container. `--secret-file .secrets` is
+an explicit credential opt-in: it gives the checked-out branch's workflow and
+composite-action code access to the token, so use it only when you trust that
+code. The token is unnecessary for anonymous access to current public flake
+inputs. `--reuse` explicitly retains the container and its mutable `/nix`
+state; avoid carrying it across revisions or trust domains. Both modes execute
+workflow and local composite-action files from the checked-out revision, and
+`.actrc` still selects the mutable `act-latest` image tag. These defaults do not
+admit a reviewed workflow revision or authenticate the runner image; use only
+branches you trust. Image digest admission is tracked separately by THE-413.
 
 ### Caveats
 
-- **Slow.** The first run of a job installs nix and cold-builds the whole
-  workspace + nix closure. `--reuse` amortizes this across later runs; a cold
-  `nix-build` job can still take the better part of an hour.
+- **Slow.** Each disposable run installs nix and cold-builds the whole
+  workspace + nix closure; a cold `nix-build` job can still take the better
+  part of an hour.
 - **Disk.** The images + `/nix` store are large; keep several GB free.
 - **nix-in-container.** The DeterminateSystems installer runs without systemd
   inside the act container; if a job fails during nix install rather than during
@@ -117,7 +139,8 @@ repository needs one, add it under `[[tools]]` and invoke it as a reproduction
 helper; keep forge-backed CI inspection on the normal provider path.
 
 - `act` reproduces GitHub Actions locally; the commands above use the checked-in
-  workflow and `.secrets` setup.
+  workflow anonymously by default. Credentials and reuse require explicit
+  flags for an individual invocation.
 - `gama` can be added as a configured command for a repository's local workflow
   reproduction.
 - `wrkflw` can be added as a configured command for a repository-specific local

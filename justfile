@@ -486,12 +486,11 @@ check-msrv:
 # `just smoke`) — the CI jobs literally run `nix develop --command just <stage>`,
 # so those give the same result without a container. See docs/local-ci.md.
 #
-# Needs: a running Docker (or podman) daemon + a `.secrets` file with
-# NIX_GITHUB_TOKEN (copy .secrets.example). Config lives in .actrc.
+# Needs: a running Docker (or podman) daemon. Credentials are an explicit
+# per-invocation act flag; config defaults live in .actrc.
 
 _act-check:
     @command -v act >/dev/null 2>&1 || { echo "act not found — run inside 'nix develop' (or 'direnv allow'); it's in the dev-shell packages"; exit 1; }
-    @test -f .secrets || { echo "no .secrets file — copy .secrets.example to .secrets and set NIX_GITHUB_TOKEN (see docs/local-ci.md)"; exit 1; }
 
 # List the jobs act would run for the push event.
 act-list:
@@ -506,8 +505,7 @@ act *ARGS: _act-check
 act-job name: _act-check
     act push -j {{name}}
 
-# Remove act's reused job containers (.actrc keeps them warm between runs);
-# use this to reset a wedged/half-installed container.
+# Remove containers left by `--reuse` runs or a wedged/half-installed run.
 act-clean:
     -docker ps -aq --filter 'name=act-' | xargs -r docker rm -f
     @echo "act containers removed"
@@ -785,7 +783,7 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test: contract-ratchets test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins
+test: contract-ratchets test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend
     cargo nextest run --workspace
 
 # Doctest pass. Split out of `test` (and therefore off pre-push) because it is
@@ -979,20 +977,12 @@ term-check: build
     if [ "$fail" = 0 ]; then echo "term-check: all green"; else echo "term-check: MISMATCH"; exit 1; fi
 
 # Point THIS repo (all its worktrees) at a sandbox backend / managed-sandbox
-# provider, without touching any other repo — the engine behind the `backend=`
-# param on `start-term`/`start-term-release`. Writes a per-repo `.thegn.toml`
-# overlay at the MAIN worktree (resolved via `git --git-common-dir`, mirroring
-# `thegn_core::repo::main_worktree`), which every thegn worktree reads.
-#   - `sprites` (a managed-sandbox PROVIDER) → overlay `env = "sprites"`, and the
-#     global `[env.sprites]` block is auto-scaffolded into
-#     $XDG_CONFIG_HOME/thegn/config.toml if missing. Needs SPRITES_TOKEN set
-#     (fail-fast); the `sprite` CLI is only advisory now — the default exec=auto
-#     attaches the pane over the native WSS exec API with no vendor CLI.
-#   - a real sandbox backend (podman|docker|bwrap|systemd|none) → overlay
-#     `[sandbox] backend = "<x>"`.
-# Empty `backend` is a no-op. Refuses to clobber a hand-authored overlay that
-# already carries a `[keybinds]`/`[sandbox]` table. To revert: delete the overlay
-# (`rm "$(git rev-parse --show-toplevel)/.thegn.toml"` from the main checkout).
+# provider. Writes a per-repo `.thegn.toml` overlay at the main worktree.
+# Existing overlays are replaced only when absent or byte-for-byte equal to a
+# backend value generated here; unrelated hand-written content must be edited
+# by hand. Sprites may also append its default provider block to global config.
+# Empty `backend` is a no-op. To revert the overlay, remove it from the main
+# checkout (`rm "$(git rev-parse --show-toplevel)/.thegn.toml"`).
 _apply-backend backend="":
     backend="{{backend}}"; \
     if [ -n "$backend" ]; then \
@@ -1000,27 +990,45 @@ _apply-backend backend="":
       case "$root" in */.git) root="${root%/.git}";; esac; \
       overlay="$root/.thegn.toml"; \
       cfg="${XDG_CONFIG_HOME:-$HOME/.config}/thegn/config.toml"; \
-      if [ -f "$overlay" ] && grep -qE '^\[(keybinds|sandbox)' "$overlay"; then \
-        echo "$overlay already has a [keybinds]/[sandbox] table — edit it by hand to set the backend" >&2; exit 1; \
-      fi; \
       case "$backend" in \
         sprites) \
           [ -n "${SPRITES_TOKEN:-}" ] || { echo "SPRITES_TOKEN not set — export it before using backend=sprites" >&2; exit 1; }; \
-          command -v sprite >/dev/null 2>&1 || echo "note: sprite CLI not on PATH — fine for native exec (the default exec=auto attaches over the WSS API with just SPRITES_TOKEN); the CLI is only the fallback transport" >&2; \
-          if ! grep -q '^\[env\.sprites\]' "$cfg" 2>/dev/null; then \
-            mkdir -p "$(dirname "$cfg")"; \
-            printf '\n[env.sprites]\nplacement = "provider"\ndata = "in_env"\n[env.sprites.provider]\nprovider = "sprites"\n# Per-worktree sprite name. Tokens: {repo}=repo name, {worktree}=dir basename,\n# {hash}=stable path digest (collision-defuser), {slug}=full-path. Default is\n# conflict-free across repos; "" is equivalent. A no-token literal = one shared sprite.\nid = "{repo}-{worktree}-{hash}"\napi_key_env = "SPRITES_TOKEN"\nexec = "auto"\nauto_provision = true\nauto_checkpoint = true\n# CLI bridge — only used if you set exec = "cli"; lifecycle is API (auto_provision/auto_checkpoint).\nexec_command = ["sprite", "exec", "-s", "{id}", "--"]\ninteractive_command = ["sprite", "exec", "-s", "{id}", "--tty", "--"]\n' >> "$cfg"; \
-            echo "scaffolded [env.sprites] into $cfg"; \
-          fi; \
-          printf 'env = "sprites"\n' > "$overlay"; \
-          echo "set $overlay -> env = \"sprites\" (applies to all worktrees under $root)"; \
+          overlay_body='env = "sprites"'; \
           ;; \
         podman|docker|apple|bwrap|systemd|none) \
-          printf '[sandbox]\nbackend = "%s"\n' "$backend" > "$overlay"; \
-          echo "set $overlay -> [sandbox] backend = \"$backend\" (applies to all worktrees under $root)"; \
+          overlay_body="$(printf '[sandbox]\nbackend = "%s"' "$backend")"; \
           ;; \
         *) echo "unknown backend '$backend' — expected: sprites | podman | docker | apple | bwrap | systemd | none" >&2; exit 1;; \
       esac; \
+      if [ -L "$overlay" ] || { [ -e "$overlay" ] && [ ! -f "$overlay" ]; }; then \
+        echo "$overlay is a symlink or non-regular file — refusing to modify it" >&2; exit 1; \
+      fi; \
+      if [ -e "$cfg" ] && { [ -L "$cfg" ] || [ ! -f "$cfg" ] || [ ! -r "$cfg" ]; }; then \
+        echo "$cfg is a symlink, unreadable, or non-regular file — refusing to modify it" >&2; exit 1; \
+      fi; \
+      overlay_matches=false; \
+      if [ -e "$overlay" ]; then \
+        for known in 'env = "sprites"' "$(printf '[sandbox]\nbackend = "%s"' podman)" "$(printf '[sandbox]\nbackend = "%s"' docker)" "$(printf '[sandbox]\nbackend = "%s"' apple)" "$(printf '[sandbox]\nbackend = "%s"' bwrap)" "$(printf '[sandbox]\nbackend = "%s"' systemd)" "$(printf '[sandbox]\nbackend = "%s"' none)"; do \
+          if printf '%s\n' "$known" | cmp -s - "$overlay"; then overlay_matches=true; break; fi; \
+        done; \
+        if [ "$overlay_matches" != true ]; then \
+          echo "$overlay contains user-managed content — edit it by hand to set the backend" >&2; exit 1; \
+        fi; \
+      fi; \
+      overlay_current=false; \
+      if [ -e "$overlay" ] && printf '%s\n' "$overlay_body" | cmp -s - "$overlay"; then overlay_current=true; fi; \
+      if [ "$backend" = sprites ] && ! grep -q '^\[env\.sprites\]' "$cfg" 2>/dev/null; then \
+        command -v sprite >/dev/null 2>&1 || echo "note: sprite CLI not on PATH — fine for native exec (the default exec=auto attaches over the WSS API with just SPRITES_TOKEN); the CLI is only the fallback transport" >&2; \
+        mkdir -p "$(dirname "$cfg")"; \
+        printf '\n[env.sprites]\nplacement = "provider"\ndata = "in_env"\n[env.sprites.provider]\nprovider = "sprites"\n# Per-worktree sprite name. Tokens: {repo}=repo name, {worktree}=dir basename,\n# {hash}=stable path digest (collision-defuser), {slug}=full-path. Default is\n# conflict-free across repos; "" is equivalent. A no-token literal = one shared sprite.\nid = "{repo}-{worktree}-{hash}"\napi_key_env = "SPRITES_TOKEN"\nexec = "auto"\nauto_provision = true\nauto_checkpoint = true\n# CLI bridge — only used if you set exec = "cli"; lifecycle is API (auto_provision/auto_checkpoint).\nexec_command = ["sprite", "exec", "-s", "{id}", "--"]\ninteractive_command = ["sprite", "exec", "-s", "{id}", "--tty", "--"]\n' >> "$cfg"; \
+        echo "scaffolded [env.sprites] into $cfg"; \
+      fi; \
+      if [ "$overlay_current" != true ]; then \
+        staged="$(mktemp "$root/.thegn.toml.XXXXXX")"; \
+        printf '%s\n' "$overlay_body" > "$staged"; \
+        mv -f -- "$staged" "$overlay"; \
+        echo "set $overlay -> $overlay_body (applies to all worktrees under $root)"; \
+      fi; \
     fi
 
 # Dogfood the local merge queue (the fold-actor): same isolated state root as
@@ -1167,6 +1175,10 @@ test-heredoc-guard:
 # freshness without rebuilding the application.
 test-build-metadata:
     python3 -B test/build_metadata_test.py
+
+# Backend overlay preservation regression; uses throwaway Git + HOME fixtures.
+test-apply-backend:
+    python3 -B test/apply_backend_test.py
 
 # Supply-chain policy: every external GitHub Action is pinned to an immutable
 # commit SHA, recursively through local composite actions. Pure YAML scan; no
