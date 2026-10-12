@@ -438,6 +438,20 @@ fn run_output_timed_returns_fast_command_output() {
     assert_eq!(out, "hello");
 }
 
+/// Truncation on stderr must not reject complete stdout from `exec_in`.
+#[cfg(unix)]
+#[test]
+fn run_output_timed_allows_stderr_over_capture_limit() {
+    let argv = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        "head -c 100000 /dev/zero >&2; printf complete".to_string(),
+    ];
+    let (ok, out) = run_output_timed(&argv, Duration::from_secs(5)).unwrap();
+    assert!(ok);
+    assert_eq!(out, "complete");
+}
+
 #[cfg(unix)]
 #[test]
 fn bounded_runner_closes_pipe_held_by_descendant() {

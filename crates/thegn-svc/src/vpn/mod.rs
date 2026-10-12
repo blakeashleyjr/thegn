@@ -939,7 +939,10 @@ pub fn exec_in(rt: &OciRuntime, container: &str, cmd: &[String]) -> Result<(bool
 /// Returns `(success, stdout)`; a timeout is an `Err`.
 fn run_output_timed(argv: &[String], timeout: Duration) -> Result<(bool, String)> {
     let output = run_bounded(argv, timeout, EXEC_STDOUT_CAPTURE_CAP, STDERR_CAPTURE_CAP)?;
-    if output.truncated {
+    if output.truncated && !output.stdout_truncated {
+        tracing::debug!(target: "thegn::vpn", "subprocess stderr exceeded capture limit");
+    }
+    if output.stdout_truncated {
         bail!("vpn: subprocess output exceeded capture limit");
     }
     Ok((output.success, output.stdout))
@@ -951,6 +954,8 @@ struct BoundedOutput {
     success: bool,
     stdout: String,
     stderr: String,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
     truncated: bool,
 }
 
@@ -1010,8 +1015,10 @@ fn run_bounded(
             },
         };
         if exited {
-            // The unreaped leader pins the process group while inherited pipe
-            // holders are terminated, then wait() deterministically reaps it.
+            // This success path also runs for `run -d`: podman/docker hand the
+            // container to their daemon, and their long-lived helpers leave
+            // this process group. The unreaped leader pins the group while we
+            // terminate remaining inherited-pipe holders, then wait() reaps it.
             crate::plugin::proc::kill_group(pid);
             break child.wait().context("vpn: reap subprocess")?;
         }
@@ -1030,13 +1037,16 @@ fn run_bounded(
     let drain_deadline = deadline + READER_REAP_BUDGET;
     let stdout = read_bounded_result(&stdout, drain_deadline)?;
     let stderr = read_bounded_result(&stderr, drain_deadline)?;
-    let truncated = stdout.1 || stderr.1;
-    Ok(BoundedOutput {
+    let mut output = BoundedOutput {
         success: status.success(),
         stdout: String::from_utf8_lossy(&stdout.0).into_owned(),
         stderr: String::from_utf8_lossy(&stderr.0).into_owned(),
-        truncated,
-    })
+        stdout_truncated: stdout.1,
+        stderr_truncated: stderr.1,
+        truncated: false,
+    };
+    output.truncated = output.stdout_truncated || output.stderr_truncated;
+    Ok(output)
 }
 
 fn spawn_bounded_reader<R: Read + Send + 'static>(
