@@ -1511,14 +1511,14 @@ const STREAM_BYTE_BUDGET: usize = 4 * MAX_WIRE_FRAME;
 /// Sender-side accounting for frames still waiting in the downstream queue.
 /// The sender reconciles against channel occupancy before each reservation so
 /// frames already consumed by the receiver release their byte charges.
-struct ByteBudget {
+pub struct ByteBudget {
     limit: usize,
     sizes: VecDeque<usize>,
     queued: usize,
 }
 
 impl ByteBudget {
-    fn new(limit: usize) -> Self {
+    pub fn new(limit: usize) -> Self {
         Self {
             limit,
             sizes: VecDeque::new(),
@@ -1526,7 +1526,7 @@ impl ByteBudget {
         }
     }
 
-    fn reconcile(&mut self, frames: &tokio_mpsc::Sender<EventFrame>) {
+    pub fn reconcile<T>(&mut self, frames: &tokio_mpsc::Sender<T>) {
         let in_queue = frames.max_capacity() - frames.capacity();
         while self.sizes.len() > in_queue {
             if let Some(size) = self.sizes.pop_front() {
@@ -1535,11 +1535,11 @@ impl ByteBudget {
         }
     }
 
-    async fn reserve<'a>(
+    pub async fn reserve<'a, T>(
         &mut self,
-        frames: &'a tokio_mpsc::Sender<EventFrame>,
+        frames: &'a tokio_mpsc::Sender<T>,
         charge: usize,
-    ) -> Result<tokio_mpsc::Permit<'a, EventFrame>, tokio_mpsc::error::SendError<()>> {
+    ) -> Result<tokio_mpsc::Permit<'a, T>, tokio_mpsc::error::SendError<()>> {
         self.reconcile(frames);
         if self.queued + charge > self.limit && !self.sizes.is_empty() {
             let mut released = 0;
