@@ -33,6 +33,10 @@ TARGET_RE = re.compile(r"[a-z0-9_]+(?:-[a-z0-9_]+){2,}")
 PLACEHOLDER_RE = re.compile(r"@@([A-Z][A-Z0-9_]*)@@")
 FORBIDDEN_OUTPUT = ("REPLACE_WITH_", "thegn-dev", ".SRCINFO")
 WINDOWS_ERROR = "Windows release lane is not enabled"
+MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+MAX_MEMBERS = 64
+MAX_MEMBER_BYTES = 256 * 1024 * 1024
+MAX_EXPANDED_BYTES = 512 * 1024 * 1024
 MANAGER_PLACEHOLDERS = {
     "homebrew": {
         "VERSION",
@@ -274,6 +278,13 @@ def _read_checksum(path: Path, archive_name: str) -> str:
 
 
 def _sha256(path: Path) -> str:
+    try:
+        if path.stat().st_size > MAX_ARCHIVE_BYTES:
+            raise ReleaseError(
+                f"release archive {path} exceeds {MAX_ARCHIVE_BYTES} bytes"
+            )
+    except OSError as error:
+        raise ReleaseError(f"cannot inspect release archive {path}: {error}") from error
     digest = hashlib.sha256()
     try:
         with path.open("rb") as handle:
@@ -302,37 +313,97 @@ def _safe_archive_names(names: Iterable[str], path: Path) -> set[str]:
 def _validate_archive_layout(
     path: Path, platform: str, required_files: Sequence[str]
 ) -> None:
+    required = set(required_files)
+    expanded = 0
+    count = 0
     try:
         if platform == "unix":
             with tarfile.open(path, "r:gz") as archive:
-                members = archive.getmembers()
-                names = _safe_archive_names((member.name for member in members), path)
-                unsafe = [
-                    member.name
-                    for member in members
-                    if not (member.isfile() or member.isdir())
-                ]
-                regular = {
-                    member.name.rstrip("/") for member in members if member.isfile()
-                }
+                names: set[str] = set()
+                regular: set[str] = set()
+                unsafe: list[str] = []
+                thegn_executable = True
+                for member in archive:
+                    count += 1
+                    if count > MAX_MEMBERS:
+                        raise ReleaseError(
+                            f"archive {path} exceeds {MAX_MEMBERS} members"
+                        )
+                    if len(member.name) > 255:
+                        raise ReleaseError(f"archive {path} has an overlong path")
+                    clean_names = _safe_archive_names((member.name,), path)
+                    duplicates = names & clean_names
+                    if duplicates:
+                        raise ReleaseError(
+                            f"archive {path} contains duplicate path {min(duplicates)!r}"
+                        )
+                    names.update(clean_names)
+                    if member.size > MAX_MEMBER_BYTES:
+                        raise ReleaseError(
+                            f"archive {path} member exceeds {MAX_MEMBER_BYTES} bytes"
+                        )
+                    if member.isdir() and member.name.rstrip("/") in ("", "."):
+                        continue
+                    if member.isdir():
+                        continue
+                    if not member.isfile():
+                        unsafe.append(member.name)
+                        continue
+                    expanded += member.size
+                    if expanded > MAX_EXPANDED_BYTES:
+                        raise ReleaseError(
+                            f"archive {path} exceeds {MAX_EXPANDED_BYTES} expanded bytes"
+                        )
+                    regular.add(member.name.rstrip("/"))
+                    if member.name.rstrip("/") == "thegn" and not member.mode & 0o111:
+                        thegn_executable = False
         else:
             with zipfile.ZipFile(path) as archive:
-                members = archive.infolist()
-                names = _safe_archive_names((member.filename for member in members), path)
+                names = set()
                 unsafe = []
                 regular = set()
-                for member in members:
+                for member in archive.infolist():
+                    count += 1
+                    if count > MAX_MEMBERS:
+                        raise ReleaseError(
+                            f"archive {path} exceeds {MAX_MEMBERS} members"
+                        )
+                    if len(member.filename) > 255:
+                        raise ReleaseError(f"archive {path} has an overlong path")
+                    clean_names = _safe_archive_names((member.filename,), path)
+                    duplicates = names & clean_names
+                    if duplicates:
+                        raise ReleaseError(
+                            f"archive {path} contains duplicate path {min(duplicates)!r}"
+                        )
+                    names.update(clean_names)
+                    if member.file_size > MAX_MEMBER_BYTES:
+                        raise ReleaseError(
+                            f"archive {path} member exceeds {MAX_MEMBER_BYTES} bytes"
+                        )
+                    if member.is_dir() and member.filename.rstrip("/") in ("", "."):
+                        continue
                     mode = member.external_attr >> 16
                     file_type = stat.S_IFMT(mode)
                     if file_type not in (0, stat.S_IFREG, stat.S_IFDIR):
                         unsafe.append(member.filename)
                     elif not member.is_dir():
+                        expanded += member.file_size
+                        if expanded > MAX_EXPANDED_BYTES:
+                            raise ReleaseError(
+                                f"archive {path} exceeds {MAX_EXPANDED_BYTES} expanded bytes"
+                            )
                         regular.add(member.filename.rstrip("/"))
     except (OSError, tarfile.TarError, zipfile.BadZipFile) as error:
         raise ReleaseError(f"cannot inspect release archive {path}: {error}") from error
     if unsafe:
         raise ReleaseError(
             f"archive {path} contains non-regular member(s): {', '.join(unsafe)}"
+        )
+    extra = names - required
+    if extra:
+        raise ReleaseError(
+            f"archive {path} contains unexpected member(s): {', '.join(sorted(extra))}"
         )
     missing = [name for name in required_files if name not in names]
     if missing:
@@ -342,6 +413,8 @@ def _validate_archive_layout(
         raise ReleaseError(
             f"archive {path} has non-regular required file(s): {', '.join(non_regular)}"
         )
+    if platform == "unix" and not thegn_executable:
+        raise ReleaseError(f"archive {path} binary thegn is not executable")
 
 
 def validate_assets(
