@@ -205,6 +205,229 @@ fn issue_branch_tail_prefers_hint_then_slugifies() {
     assert!(!t.starts_with('-') && !t.ends_with('-'), "{t:?}");
 }
 
+#[test]
+fn test_cache_load_fence_rejects_old_switches_and_preserves_pending_sync() {
+    let mut fence = super::run_test_cache::TestCacheLoad::default();
+    let mut ui = crate::panel::PanelUi::default();
+
+    let a_first = fence.begin_switch("/wt/a");
+    let b = fence.begin_switch("/wt/b");
+    assert!(!fence.accept("/wt/a", a_first, "/wt/b", &mut ui, None));
+    assert!(fence.accept("/wt/b", b, "/wt/b", &mut ui, None));
+
+    let a_old = fence.begin_switch("/wt/a");
+    let b_again = fence.begin_switch("/wt/b");
+    let a_last = fence.begin_switch("/wt/a");
+    assert!(!fence.accept("/wt/a", a_old, "/wt/a", &mut ui, None));
+    assert!(!fence.accept("/wt/b", b_again, "/wt/a", &mut ui, None));
+    assert!(fence.accept("/wt/a", a_last, "/wt/a", &mut ui, None));
+
+    let late = fence.begin_switch("/wt/a");
+    assert!(!fence.begin_sync("/wt/a"));
+    assert!(fence.accept("/wt/a", late, "/wt/a", &mut ui, None));
+    assert!(!fence.begin_sync("/wt/a"));
+}
+
+#[test]
+fn test_run_waits_for_pending_cache_then_overwrites_cached_status() {
+    use crate::testkit::model::{TestNode, TestNodeKind, TestRunRec, TestState};
+
+    let mut fence = super::run_test_cache::TestCacheLoad::default();
+    let mut ui = crate::panel::PanelUi::default();
+    let seq = fence.begin_switch("/wt/a");
+    let cached = crate::panel::TestCache {
+        nodes: vec![TestNode {
+            id: "unit::case".into(),
+            label: "case".into(),
+            depth: 0,
+            kind: TestNodeKind::Test,
+            state: TestState::Pass,
+            location: None,
+            message: None,
+            placeholder: false,
+        }],
+        history: vec![TestRunRec {
+            passed: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let run_result = TestNode {
+        id: "unit::case".into(),
+        label: "case".into(),
+        depth: 0,
+        kind: TestNodeKind::Test,
+        state: TestState::Fail,
+        location: None,
+        message: None,
+        placeholder: false,
+    };
+    let mut deferred = Vec::new();
+
+    if fence.is_pending("/wt/a") {
+        deferred.push(run_result);
+    } else {
+        ui.tests.merge_results(&[run_result]);
+    }
+    assert!(ui.tests.nodes.is_empty());
+    assert_eq!(deferred.len(), 1);
+
+    assert!(fence.accept("/wt/a", seq, "/wt/a", &mut ui, Some(cached)));
+    for result in deferred {
+        ui.tests.merge_results(&[result]);
+    }
+    assert_eq!(ui.tests.history.len(), 1);
+    let case = ui
+        .tests
+        .nodes
+        .iter()
+        .find(|node| node.id == "unit::case")
+        .expect("run result should replace the cached case");
+    assert_eq!(case.state, TestState::Fail);
+}
+
+#[test]
+fn test_cache_load_roundtrips_and_rejects_corrupt_json() {
+    use thegn_core::store::CacheStore as _;
+
+    let root = tempfile::Builder::new()
+        .prefix("thegn-test-cache-")
+        .tempdir()
+        .unwrap();
+    let db = thegn_core::db::Db::open_at(&root.path().join("thegn.db")).unwrap();
+
+    let panel = crate::panel::TestPanelState::default();
+    let expected = panel.to_cache();
+    let json = serde_json::to_string(&expected).unwrap();
+    db.put_test_cache("/wt/a", &json).unwrap();
+    assert_eq!(
+        super::run_test_cache::load_test_cache(&db, "/wt/a"),
+        Some(expected)
+    );
+
+    db.put_test_cache("/wt/b", "not json").unwrap();
+    assert_eq!(super::run_test_cache::load_test_cache(&db, "/wt/b"), None);
+}
+
+#[test]
+fn loop_startup_prefs_use_one_optional_db_connection() {
+    use thegn_core::store::WorktreeAuxStore as _;
+
+    let root = tempfile::Builder::new()
+        .prefix("thegn-startup-prefs-")
+        .tempdir()
+        .unwrap();
+    let db = thegn_core::db::Db::open_at(&root.path().join("thegn.db")).unwrap();
+    db.put_register('a', "saved register").unwrap();
+    let cfg = thegn_core::config::Config::default();
+
+    let (registers, prefs) = load_loop_startup_prefs(Some(&db), &cfg);
+    assert_eq!(registers.get('a'), Some("saved register"));
+    assert_eq!(
+        prefs,
+        crate::monitor::MonitorPrefs::from_config(&cfg.monitor)
+    );
+
+    let (registers, prefs) = load_loop_startup_prefs(None, &cfg);
+    assert_eq!(registers.get('a'), None);
+    assert_eq!(registers.persistent().count(), 0);
+    assert_eq!(
+        prefs,
+        crate::monitor::MonitorPrefs::from_config(&cfg.monitor)
+    );
+}
+
+#[test]
+fn rebase_status_error_keeps_todo_locked_and_unchanged() {
+    let todos = vec![thegn_core::rebase_todo::TodoEntry {
+        action: thegn_core::rebase_todo::TodoAction::Pick,
+        sha: "abc123".into(),
+        subject: "keep this plan".into(),
+    }];
+    let original = todos.clone();
+    let mut flow = crate::panel::gitui::GitFlow::Rebase(crate::panel::gitui::RebaseUi {
+        running: true,
+        todos_synced: false,
+        todos,
+        ..Default::default()
+    });
+
+    let message = apply_rebase_doc(&mut flow, Err("sequencer unreadable".into()));
+    let crate::panel::gitui::GitFlow::Rebase(rebase) = flow else {
+        panic!("rebase flow changed");
+    };
+    assert_eq!(message.as_deref(), Some("sequencer unreadable"));
+    assert!(!rebase.todos_synced);
+    assert_eq!(rebase.todos, original);
+}
+
+#[test]
+fn rebase_status_success_syncs_live_todo_state() {
+    let remaining = vec![thegn_core::rebase_todo::TodoEntry {
+        action: thegn_core::rebase_todo::TodoAction::Edit,
+        sha: "def456".into(),
+        subject: "live sequencer todo".into(),
+    }];
+    let status = thegn_svc::git::RebaseStatus {
+        onto: "base".into(),
+        head_name: "topic".into(),
+        stopped_sha: Some("def456".into()),
+        done: Vec::new(),
+        remaining: remaining.clone(),
+        paused: thegn_svc::git::PauseReason::Edit,
+    };
+    let mut flow = crate::panel::gitui::GitFlow::Rebase(crate::panel::gitui::RebaseUi {
+        running: true,
+        ..Default::default()
+    });
+
+    assert_eq!(apply_rebase_doc(&mut flow, Ok(Some(status))), None);
+    let crate::panel::gitui::GitFlow::Rebase(rebase) = flow else {
+        panic!("rebase flow changed");
+    };
+    assert!(rebase.todos_synced);
+    assert_eq!(rebase.todos, remaining);
+    assert_eq!(rebase.baseline, remaining);
+    assert_eq!(rebase.stopped_sha.as_deref(), Some("def456"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn env_remove_worker_returns_before_blocking_remover_and_toasts_afterward() {
+    let (refresh_tx, mut refresh_rx) = tokio_mpsc::unbounded_channel();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    spawn_env_remove_with(
+        "staging".into(),
+        refresh_tx,
+        || {},
+        move |name| {
+            entered_tx.send(name.to_owned()).unwrap();
+            release_rx.recv().unwrap();
+            format!("removed env '{name}'")
+        },
+    );
+
+    assert_eq!(
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap(),
+        "staging"
+    );
+    assert!(refresh_rx.try_recv().is_err());
+    release_tx.send(()).unwrap();
+    let toast = tokio::time::timeout(std::time::Duration::from_secs(2), refresh_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        toast,
+        RefreshKind::Toast {
+            message,
+            priority: thegn_core::notification::Priority::Info
+        } if message == "removed env 'staging'"
+    ));
+}
+
 // ---- test-run scope narrowing (item 518) -------------------------------
 fn t_node(
     id: &str,
