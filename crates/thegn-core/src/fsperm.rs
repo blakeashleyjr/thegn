@@ -201,6 +201,7 @@ pub fn owned_by_current_user(meta: &std::fs::Metadata) -> bool {
 /// Refuse a regular file that has another hardlink name. Security-sensitive
 /// destinations that will be atomically replaced use this as a tamper signal:
 /// replacement would not update the contents visible through the other name.
+/// This policy is Unix only; other platforms accept regular files.
 pub fn ensure_single_link_regular_file(meta: &std::fs::Metadata) -> std::io::Result<()> {
     if !meta.is_file() {
         return Ok(());
