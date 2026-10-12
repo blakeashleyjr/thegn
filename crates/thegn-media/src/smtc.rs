@@ -28,7 +28,8 @@ use crate::MediaWatch;
 
 use crate::model::{LoopMode, MediaKind, MediaState};
 use crate::smtc_decode::{
-    duration_from_ticks, loop_from_repeat, loop_to_repeat, playback_state_from_status,
+    accepted, duration_from_ticks, loop_from_repeat, loop_to_repeat, playback_state_from_status,
+    seek_target,
 };
 use crate::{MediaBackend, MediaCaps, MediaError};
 
@@ -49,7 +50,7 @@ impl Smtc {
     /// new current session on `CurrentSessionChanged`, so it never freezes when
     /// the active app changes.
     pub async fn watch(&self) -> Result<SmtcWatch, MediaError> {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
         let sub = run_blocking(move || subscribe(tx)).await?;
         Ok(SmtcWatch { _sub: sub, rx })
     }
@@ -77,10 +78,11 @@ impl MediaBackend for Smtc {
     fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
             run_blocking(|| {
-                current_session()?
+                let was_accepted = current_session()?
                     .TryTogglePlayPauseAsync()
                     .and_then(|op| op.get())
                     .map_err(win_err)?;
+                accepted("play/pause", was_accepted)?;
                 Ok(())
             })
             .await
@@ -89,10 +91,11 @@ impl MediaBackend for Smtc {
     fn next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
             run_blocking(|| {
-                current_session()?
+                let was_accepted = current_session()?
                     .TrySkipNextAsync()
                     .and_then(|op| op.get())
                     .map_err(win_err)?;
+                accepted("next", was_accepted)?;
                 Ok(())
             })
             .await
@@ -101,10 +104,11 @@ impl MediaBackend for Smtc {
     fn previous(&self) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
             run_blocking(|| {
-                current_session()?
+                let was_accepted = current_session()?
                     .TrySkipPreviousAsync()
                     .and_then(|op| op.get())
                     .map_err(win_err)?;
+                accepted("previous", was_accepted)?;
                 Ok(())
             })
             .await
@@ -113,10 +117,11 @@ impl MediaBackend for Smtc {
     fn set_shuffle(&self, on: bool) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
             run_blocking(move || {
-                current_session()?
+                let was_accepted = current_session()?
                     .TryChangeShuffleActiveAsync(on)
                     .and_then(|op| op.get())
                     .map_err(win_err)?;
+                accepted("shuffle", was_accepted)?;
                 Ok(())
             })
             .await
@@ -125,10 +130,11 @@ impl MediaBackend for Smtc {
     fn set_loop(&self, mode: LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
             run_blocking(move || {
-                current_session()?
+                let was_accepted = current_session()?
                     .TryChangeAutoRepeatModeAsync(MediaPlaybackAutoRepeatMode(loop_to_repeat(mode)))
                     .and_then(|op| op.get())
                     .map_err(win_err)?;
+                accepted("repeat", was_accepted)?;
                 Ok(())
             })
             .await
@@ -136,7 +142,9 @@ impl MediaBackend for Smtc {
     }
     fn volume_step(&self, _delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
-            Ok(()) // SMTC exposes no volume control; caps().volume == false
+            Err(MediaError::Unsupported(
+                "SMTC does not expose volume control".into(),
+            ))
         })
     }
 
@@ -146,7 +154,11 @@ impl MediaBackend for Smtc {
         })
     }
     fn activate_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {
+            Err(MediaError::Unsupported(
+                "SMTC does not expose playlist activation".into(),
+            ))
+        })
     }
 
     fn seek(
@@ -161,17 +173,16 @@ impl MediaBackend for Smtc {
                     .GetTimelineProperties()
                     .and_then(|t| t.Position())
                     .map(|ts| ts.Duration)
-                    .unwrap_or(0);
+                    .map_err(win_err)?;
                 let delta = ticks_from_duration(offset);
-                let target = if forward {
-                    cur + delta
-                } else {
-                    (cur - delta).max(0)
-                };
-                session
+                let target = seek_target(cur, delta, forward).ok_or_else(|| {
+                    MediaError::Backend("relative seek position is invalid or overflows".into())
+                })?;
+                let was_accepted = session
                     .TryChangePlaybackPositionAsync(target)
                     .and_then(|op| op.get())
                     .map_err(win_err)?;
+                accepted("seek", was_accepted)?;
                 Ok(())
             })
             .await
@@ -184,10 +195,11 @@ impl MediaBackend for Smtc {
     ) -> BoxFuture<'a, Result<(), MediaError>> {
         Box::pin(async move {
             run_blocking(move || {
-                current_session()?
+                let was_accepted = current_session()?
                     .TryChangePlaybackPositionAsync(ticks_from_duration(pos))
                     .and_then(|op| op.get())
                     .map_err(win_err)?;
+                accepted("set position", was_accepted)?;
                 Ok(())
             })
             .await
@@ -268,11 +280,7 @@ impl Drop for Subscription {
 
 /// (Re)bind `PlaybackInfoChanged` + `MediaPropertiesChanged` on the manager's
 /// current session, replacing any prior bindings. Each fires `tx`.
-fn rebind(
-    manager: &Manager,
-    bind: &Arc<Mutex<SessionBind>>,
-    tx: &tokio::sync::mpsc::UnboundedSender<()>,
-) {
+fn rebind(manager: &Manager, bind: &Arc<Mutex<SessionBind>>, tx: &tokio::sync::mpsc::Sender<()>) {
     let mut b = bind.lock().unwrap();
     b.clear();
     let Ok(session) = manager.GetCurrentSession() else {
@@ -281,14 +289,14 @@ fn rebind(
     let tx_info = tx.clone();
     b.info_token = session
         .PlaybackInfoChanged(&TypedEventHandler::new(move |_, _| {
-            let _ = tx_info.send(()); // best-effort: listener may be gone
+            let _ = tx_info.try_send(()); // best-effort: Full means a wake is already pending; Closed means listener is gone
             Ok(())
         }))
         .ok(); // best-effort: registration failure just means no auto-updates
     let tx_props = tx.clone();
     b.props_token = session
         .MediaPropertiesChanged(&TypedEventHandler::new(move |_, _| {
-            let _ = tx_props.send(()); // best-effort: listener may be gone
+            let _ = tx_props.try_send(()); // best-effort: Full means a wake is already pending; Closed means listener is gone
             Ok(())
         }))
         .ok(); // best-effort: registration failure just means no auto-updates
@@ -297,7 +305,7 @@ fn rebind(
 
 /// Build the full subscription: bind the current session now, then subscribe to
 /// `CurrentSessionChanged` to rebind + tick on app swaps.
-fn subscribe(tx: tokio::sync::mpsc::UnboundedSender<()>) -> Result<Subscription, MediaError> {
+fn subscribe(tx: tokio::sync::mpsc::Sender<()>) -> Result<Subscription, MediaError> {
     let manager = manager().map_err(win_err)?;
     let bind = Arc::new(Mutex::new(SessionBind::default()));
     rebind(&manager, &bind, &tx);
@@ -307,6 +315,7 @@ fn subscribe(tx: tokio::sync::mpsc::UnboundedSender<()>) -> Result<Subscription,
     let session_changed_token = manager
         .CurrentSessionChanged(&TypedEventHandler::new(move |_, _| {
             rebind(&mgr_for_handler, &bind_for_handler, &tx);
+            let _ = tx.try_send(()); // best-effort: Full means a wake is already pending; Closed means listener is gone
             Ok(())
         }))
         .map_err(win_err)?;
@@ -322,7 +331,7 @@ fn subscribe(tx: tokio::sync::mpsc::UnboundedSender<()>) -> Result<Subscription,
 /// playback info, media properties, or current session change.
 pub struct SmtcWatch {
     _sub: Subscription,
-    rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    rx: tokio::sync::mpsc::Receiver<()>,
 }
 
 impl MediaWatch for SmtcWatch {
