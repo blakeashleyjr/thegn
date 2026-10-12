@@ -29,9 +29,12 @@ const MAX_PROVIDER_ID: usize = 50;
 ///
 /// An **empty** id uses the conflict-free default `"{repo}-{worktree}-{hash}"`.
 /// A configured id with no token is returned as-is (a static, shared sandbox —
-/// back-compat). The result is dash-collapsed and clamped to a DNS-safe length,
-/// always preserving a path-hash suffix so the clamp can't reintroduce a
-/// collision. The id flows into `ProviderPlacement.id` + `{id}` command templates,
+/// back-compat) when it is a valid DNS name. Previously accepted literals with
+/// `_` or other non-DNS characters now resolve to a different provider id.
+/// The result is dash-collapsed and constrained to a DNS-safe length. Long
+/// valid expansions preserve the path-hash suffix; invalid expansions are
+/// slugged with a short hash of the expanded value. The id flows
+/// into `ProviderPlacement.id` + `{id}` command templates,
 /// so it MUST be derived identically everywhere — all callers resolve it through
 /// this one function (the host reads `ProviderPlacement.id` rather than
 /// re-deriving). `repo` is the repo dir name (`None` ⇒ `{repo}` expands empty).
@@ -64,14 +67,61 @@ pub fn effective_provider_id(configured: &str, worktree: &Path, repo: Option<&st
         .collect::<Vec<_>>()
         .join("-");
 
-    if name.len() <= MAX_PROVIDER_ID {
+    if valid_provider_id(&name) {
         return name;
     }
-    // Too long: truncate but ALWAYS keep a trailing path-hash so the clamp can't
-    // collapse two distinct worktrees onto one id.
-    let keep = MAX_PROVIDER_ID.saturating_sub(hash.len() + 1);
-    let head: String = name.chars().take(keep).collect();
-    format!("{}-{hash}", head.trim_end_matches('-'))
+    // Invalid configured text must never become a provider name or filesystem
+    // component. Keep a deterministic suffix so distinct original values map
+    // to distinct canonical names within the existing short-hash contract.
+    let suffix = if valid_provider_syntax(&name) {
+        hash.clone()
+    } else {
+        util::short_hash(&expanded, 6)
+    };
+    let slug = util::slugify(&expanded);
+    let keep = MAX_PROVIDER_ID.saturating_sub(suffix.len() + 1);
+    let head: String = slug.chars().take(keep).collect();
+    let head = head.trim_end_matches('-');
+    if head.is_empty() {
+        format!("id-{suffix}")
+    } else {
+        format!("{head}-{suffix}")
+    }
+}
+
+fn valid_provider_id(name: &str) -> bool {
+    name.len() <= MAX_PROVIDER_ID && valid_provider_name(name)
+}
+
+fn valid_provider_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('.').all(|label| {
+            let bytes = label.as_bytes();
+            !bytes.is_empty()
+                && bytes.len() <= 63
+                && bytes[0].is_ascii_alphanumeric()
+                && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        })
+}
+
+/// Check DNS label syntax without applying the provider's length limits. This
+/// distinguishes a long but otherwise valid expansion (which must retain its
+/// worktree-path hash when clamped) from unsafe configured text (which gets a
+/// hash of the expanded value).
+fn valid_provider_syntax(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('.').all(|label| {
+            let bytes = label.as_bytes();
+            !bytes.is_empty()
+                && bytes[0].is_ascii_alphanumeric()
+                && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        })
 }
 
 /// Build the runtime [`Placement`] for a named env from its `[env.<name>]`
@@ -296,5 +346,23 @@ mod tests {
             long.ends_with(&util::short_hash(&deep.to_string_lossy(), 6)),
             "clamp preserves the path-hash suffix: {long}"
         );
+    }
+
+    #[test]
+    fn unsafe_provider_ids_are_canonicalized_within_byte_limit() {
+        let wt = Path::new("/work/repo/main");
+        let inputs = [
+            "/etc/passwd".to_string(),
+            "../x".to_string(),
+            "a\0b".to_string(),
+            "{worktree}/../x".to_string(),
+            "my_sprite".to_string(),
+            "é".repeat(40),
+        ];
+        for input in inputs {
+            let id = effective_provider_id(&input, wt, Some("repo"));
+            assert!(id.len() <= MAX_PROVIDER_ID, "{id:?}");
+            assert!(valid_provider_id(&id), "{id:?}");
+        }
     }
 }
