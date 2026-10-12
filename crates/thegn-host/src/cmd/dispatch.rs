@@ -947,9 +947,8 @@ fn list(active: bool, json: bool) -> Result<()> {
         rows.retain(|d| d.status.is_active());
     }
     if json {
-        // One value per row: stored fields plus a display-time read. The
-        // `chunk_files_from_file_at_display_time` key is explicitly not the
-        // admitted ownership snapshot; no scope is persisted in this schema.
+        // One value per row: stored fields, the admitted ownership snapshot,
+        // and a display-time read used only to report source-file drift.
         let mut vals: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
         let now_ms = thegn_core::util::now_ms();
         for d in &rows {
@@ -965,16 +964,26 @@ fn list(active: bool, json: bool) -> Result<()> {
             v["verdict_disagrees"] = serde_json::json!(
                 pipeline_report::verdict_disagrees_with_status(d.status, verdict)
             );
-            if let Some(scope) = d
+            let admitted = db.dispatch_chunk_scope(d.id)?;
+            v["chunk_files_admitted"] = admitted
+                .as_ref()
+                .map_or(serde_json::Value::Null, |files| serde_json::json!(files));
+            let live_files = d
                 .chunk_path
                 .as_deref()
                 .map(str::trim)
                 .filter(|c| !c.is_empty())
                 .and_then(|chunk_path| read_chunk_file(&d.worktree_path, chunk_path).ok())
                 .and_then(|body| pipeline_chunk::parse_frontmatter(&body).ok())
-            {
-                v["chunk_files_from_file_at_display_time"] = serde_json::json!(scope.files);
+                .map(|scope| scope.files);
+            if let Some(files) = &live_files {
+                v["chunk_files_from_file_at_display_time"] = serde_json::json!(files);
             }
+            v["chunk_scope_drift"] = serde_json::json!(
+                admitted
+                    .as_ref()
+                    .is_some_and(|files| live_files.as_ref() != Some(files))
+            );
             vals.push(v);
         }
         return super::emit_json(&vals);
@@ -2805,6 +2814,74 @@ mod tests {
             result.is_ok(),
             "admission must use the already parsed scope facts: {result:?}"
         );
+        assert_eq!(db.list_dispatches().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn active_sibling_narrowing_or_deletion_cannot_change_admitted_scope() {
+        let (_dir, wt) = chunk_wt(&[
+            ("chunk-1.md", "---\nfiles: [src/**]\n---\n"),
+            ("chunk-2.md", "---\nfiles: [src/shared.rs]\n---\n"),
+        ]);
+        let db = db("claim-chunk-snapshot").1;
+        let first = claim_admitted_with_refresh(
+            &db,
+            NewDispatch {
+                issue_id: "linear:THE-214",
+                worktree_path: &wt,
+                agent_name: "coder",
+                stage: Some("code"),
+                parent_id: None,
+                session_id: None,
+                artifact_path: Some("first.md"),
+                chunk_path: Some("chunk-1.md"),
+            },
+            3,
+            None,
+            &wt,
+            "linear:THE-214",
+            Some("chunk-1.md"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            db.dispatch_chunk_scope(first).unwrap(),
+            Some(vec!["src/**".into()])
+        );
+
+        let claim_second = || {
+            claim_admitted_with_refresh(
+                &db,
+                NewDispatch {
+                    issue_id: "linear:THE-214",
+                    worktree_path: &wt,
+                    agent_name: "coder",
+                    stage: Some("code"),
+                    parent_id: None,
+                    session_id: None,
+                    artifact_path: Some("second.md"),
+                    chunk_path: Some("chunk-2.md"),
+                },
+                3,
+                None,
+                &wt,
+                "linear:THE-214",
+                Some("chunk-2.md"),
+                None,
+            )
+            .unwrap()
+        };
+        let first_refusal = claim_second().unwrap_err();
+        let narrowed_reason = format!("{first_refusal:?}");
+        assert!(narrowed_reason.contains("chunk scope gate refused"));
+        assert!(narrowed_reason.contains("admitted scope snapshot"));
+        std::fs::remove_file(std::path::Path::new(&wt).join("chunk-1.md")).unwrap();
+        let deleted_refusal = claim_second().unwrap_err();
+        let deleted_reason = format!("{deleted_refusal:?}");
+        assert!(deleted_reason.contains("chunk scope gate refused"));
+        assert!(deleted_reason.contains("admitted scope snapshot"));
+        assert!(!deleted_reason.contains("not readable"));
         assert_eq!(db.list_dispatches().unwrap().len(), 1);
     }
 
