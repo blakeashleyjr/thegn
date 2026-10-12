@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{Datelike, Days, Months, NaiveDate, NaiveDateTime, Timelike, Weekday};
+use chrono::{DateTime, Datelike, Days, Months, NaiveDate, NaiveDateTime, Timelike, Utc, Weekday};
 
 use super::{EventTime, ExpansionBudget, ExpansionError, ExpansionLimit, TzRef};
 
@@ -219,6 +219,9 @@ fn parse_by_day(s: &str) -> Option<ByDay> {
         return None;
     }
     let split = t.len() - 2;
+    if !t.is_char_boundary(split) {
+        return None;
+    }
     let (num, day) = t.split_at(split);
     let weekday = weekday(day)?;
     let nth = if num.is_empty() {
@@ -241,6 +244,7 @@ const MAX_BY_LIST: usize = 400;
 fn checked_list<T: TryFrom<i64>>(
     part: &str,
     v: &str,
+    lo: i64,
     hi: i64,
     signed: bool,
 ) -> Result<Vec<T>, RecurError> {
@@ -260,9 +264,9 @@ fn checked_list<T: TryFrom<i64>>(
                 .parse::<i64>()
                 .map_err(|_| RecurError::BadValue(t.to_string()))?;
             let ok = if signed {
-                n != 0 && n.abs() <= hi
+                n != 0 && n.unsigned_abs() <= hi as u64
             } else {
-                (0..=hi).contains(&n)
+                (lo..=hi).contains(&n)
             };
             if !ok {
                 return Err(RecurError::OutOfRange(format!("{part}={t}")));
@@ -340,15 +344,15 @@ impl RRule {
                     );
                     r.until_form = until_form_of(v);
                 }
-                "BYSECOND" => r.by_second = checked_list("BYSECOND", v, 60, false)?,
-                "BYMINUTE" => r.by_minute = checked_list("BYMINUTE", v, 59, false)?,
-                "BYHOUR" => r.by_hour = checked_list("BYHOUR", v, 23, false)?,
+                "BYSECOND" => r.by_second = checked_list("BYSECOND", v, 0, 60, false)?,
+                "BYMINUTE" => r.by_minute = checked_list("BYMINUTE", v, 0, 59, false)?,
+                "BYHOUR" => r.by_hour = checked_list("BYHOUR", v, 0, 23, false)?,
                 "BYDAY" => r.by_day = checked_by_day(v)?,
-                "BYMONTHDAY" => r.by_month_day = checked_list("BYMONTHDAY", v, 31, true)?,
-                "BYYEARDAY" => r.by_year_day = checked_list("BYYEARDAY", v, 366, true)?,
-                "BYWEEKNO" => r.by_week_no = checked_list("BYWEEKNO", v, 53, true)?,
-                "BYMONTH" => r.by_month = checked_list("BYMONTH", v, 12, false)?,
-                "BYSETPOS" => r.by_set_pos = checked_list("BYSETPOS", v, 366, true)?,
+                "BYMONTHDAY" => r.by_month_day = checked_list("BYMONTHDAY", v, 1, 31, true)?,
+                "BYYEARDAY" => r.by_year_day = checked_list("BYYEARDAY", v, 1, 366, true)?,
+                "BYWEEKNO" => r.by_week_no = checked_list("BYWEEKNO", v, 1, 53, true)?,
+                "BYMONTH" => r.by_month = checked_list("BYMONTH", v, 1, 12, false)?,
+                "BYSETPOS" => r.by_set_pos = checked_list("BYSETPOS", v, 1, 366, true)?,
                 "WKST" => {
                     r.wkst = weekday(v).ok_or_else(|| RecurError::BadValue(v.to_string()))?;
                 }
@@ -468,12 +472,14 @@ fn until_form_of(v: &str) -> UntilForm {
     }
 }
 
-/// The `UNTIL` bound as a local wall time in the series zone, inclusive.
+/// The `UNTIL` bound projected to a local wall time, inclusive. For UTC
+/// rules this projection is used for coarse date-window admission; expansion
+/// compares each candidate's resolved instant with the original UTC value.
 ///
 /// A `DATE` bound covers its whole day (so a 09:00 occurrence on the UNTIL
 /// date is kept); a `UTC` bound is converted into `zone` so it compares as the
 /// instant it names; a floating bound is already local.
-fn until_bound(r: &RRule, zone: Option<chrono_tz::Tz>) -> Option<NaiveDateTime> {
+pub(crate) fn until_bound(r: &RRule, zone: Option<chrono_tz::Tz>) -> Option<NaiveDateTime> {
     let u = r.until?;
     Some(match r.until_form {
         UntilForm::Date => u.date().and_hms_opt(23, 59, 59).unwrap_or(u),
@@ -545,10 +551,11 @@ pub fn expand_local_bounded(
     expand_local_in(rec, start, None, from, to, budget)
 }
 
-/// [`expand_local_bounded`] with the series' zone, so absolute values keep
-/// their meaning: a UTC `UNTIL`, `RDATE` or `EXDATE` is converted into `zone`
-/// (not read as a wall time), and a zoned one in a different zone is converted
-/// through its instant. `None` reads instants as UTC wall times.
+/// [`expand_local_bounded`] with the series' zone, using `ShiftForward` to
+/// resolve nominal candidates at DST transitions. Absolute values keep their
+/// meaning: UTC values are converted into `zone`, and zoned values in a
+/// different zone are converted through their instant. `None` reads instants
+/// as UTC wall times.
 pub fn expand_local_in(
     rec: &Recurrence,
     start: NaiveDateTime,
@@ -556,6 +563,27 @@ pub fn expand_local_in(
     from: NaiveDate,
     to: NaiveDate,
     budget: &mut ExpansionBudget,
+) -> Result<Vec<NaiveDateTime>, ExpansionError> {
+    expand_local_with_gap(
+        rec,
+        start,
+        zone,
+        from,
+        to,
+        budget,
+        super::GapPolicy::ShiftForward,
+    )
+}
+
+/// Zone-aware expansion with the occurrence resolver's gap policy.
+pub(crate) fn expand_local_with_gap(
+    rec: &Recurrence,
+    start: NaiveDateTime,
+    zone: Option<chrono_tz::Tz>,
+    from: NaiveDate,
+    to: NaiveDate,
+    budget: &mut ExpansionBudget,
+    gap: super::GapPolicy,
 ) -> Result<Vec<NaiveDateTime>, ExpansionError> {
     if from > to {
         return Err(ExpansionError::InvalidWindow);
@@ -569,9 +597,7 @@ pub fn expand_local_in(
     budget.recurrence_work(listed)?;
     let mut out: BTreeSet<NaiveDateTime> = BTreeSet::new();
     for rule in &rec.rules {
-        let mut eff = rule.clone();
-        eff.until = until_bound(rule, zone);
-        out.extend(expand_rule(&eff, start, from, to, budget)?);
+        out.extend(expand_rule(rule, start, from, to, budget, zone, gap)?);
     }
     // RDATEs are additional occurrences, independent of any rule.
     for r in &rec.rdates {
@@ -590,17 +616,28 @@ pub fn expand_local_in(
     // A DATE exclusion removes every occurrence on that day; a date-time one
     // matches the exact recurrence-id.
     let mut ex: BTreeSet<NaiveDateTime> = BTreeSet::new();
+    let mut ex_instants: BTreeSet<DateTime<Utc>> = BTreeSet::new();
     let mut ex_days: BTreeSet<NaiveDate> = BTreeSet::new();
     for t in &rec.exdates {
         if let EventTime::Date { date } = t {
             ex_days.insert(*date);
+        } else if let EventTime::Instant { at } = t {
+            ex_instants.insert(*at);
         } else if let Some(dt) = local_of(t, zone) {
             ex.insert(dt);
         }
     }
     Ok(out
         .into_iter()
-        .filter(|d| !ex.contains(d) && !ex_days.contains(&d.date()))
+        .filter(|d| {
+            !ex.contains(d)
+                && !ex_days.contains(&d.date())
+                && !ex_instants.contains(
+                    &zone
+                        .and_then(|z| super::tz::resolve_local(*d, z, gap))
+                        .unwrap_or_else(|| d.and_utc()),
+                )
+        })
         .collect())
 }
 
@@ -622,6 +659,30 @@ fn local_of(t: &EventTime, zone: Option<chrono_tz::Tz>) -> Option<NaiveDateTime>
             Some(z) => at.with_timezone(&z).naive_local(),
             None => at.naive_utc(),
         }),
+    }
+}
+
+/// Compare a nominal occurrence against UNTIL. UTC bounds compare resolved
+/// instants, using the same DST policy as occurrence materialization.
+fn past_until(
+    r: &RRule,
+    candidate: NaiveDateTime,
+    zone: Option<chrono_tz::Tz>,
+    gap: super::GapPolicy,
+) -> bool {
+    let Some(until) = r.until else {
+        return false;
+    };
+    match r.until_form {
+        UntilForm::Date | UntilForm::Floating => {
+            until_bound(r, zone).is_some_and(|bound| candidate > bound)
+        }
+        UntilForm::Utc => {
+            let instant = zone
+                .and_then(|z| super::tz::resolve_local(candidate, z, gap))
+                .unwrap_or_else(|| candidate.and_utc());
+            instant > until.and_utc()
+        }
     }
 }
 
@@ -696,13 +757,15 @@ fn expand_rule(
     from: NaiveDate,
     to: NaiveDate,
     budget: &mut ExpansionBudget,
+    zone: Option<chrono_tz::Tz>,
+    gap: super::GapPolicy,
 ) -> Result<Vec<NaiveDateTime>, ExpansionError> {
     let cost = RuleCost::of(r).ok_or_else(work_exhausted)?;
     // Sub-daily rules step by a time unit, not by a calendar period, so their
     // INTERVAL means hours/minutes/seconds. Folding them into the day-stepping
     // loop below would read `HOURLY;INTERVAL=24` as "every 24 days".
     if matches!(r.freq, Freq::Secondly | Freq::Minutely | Freq::Hourly) {
-        return expand_subdaily(r, start, from, to, budget, &cost);
+        return expand_subdaily(r, start, from, to, budget, &cost, zone, gap);
     }
     let mut out = Vec::new();
     let mut emitted: u32 = 0;
@@ -717,9 +780,7 @@ fn expand_rule(
             if dt < start {
                 continue;
             }
-            if let Some(u) = r.until
-                && dt > u
-            {
+            if past_until(r, dt, zone, gap) {
                 return Ok(out);
             }
             if let Some(c) = r.count {
@@ -813,6 +874,8 @@ fn expand_subdaily(
     to: NaiveDate,
     budget: &mut ExpansionBudget,
     cost: &RuleCost,
+    zone: Option<chrono_tz::Tz>,
+    gap: super::GapPolicy,
 ) -> Result<Vec<NaiveDateTime>, ExpansionError> {
     let unit: i64 = match r.freq {
         Freq::Secondly => 1,
@@ -847,9 +910,7 @@ fn expand_subdaily(
         }
         steps += 1;
         budget.recurrence_work(cost.filter)?;
-        if let Some(u) = r.until
-            && cur > u
-        {
+        if past_until(r, cur, zone, gap) {
             break;
         }
         if cur.date() > to {
@@ -1303,13 +1364,14 @@ pub fn occurrences(
     let Some(seed) = seed_of(start, home) else {
         return Vec::new();
     };
-    expand_local_in(
+    expand_local_with_gap(
         rec,
         seed,
         Some(series_zone(start, home)),
         from,
         to,
         &mut budget,
+        gap,
     )
     .unwrap_or_default()
     .into_iter()
