@@ -44,6 +44,9 @@
   # Defaults to the same allowlisted source the flake passes in, so a bare
   # `callPackage ./nix/package.nix {}` cannot drift from `nix build`.
   src ? import ./source.nix {inherit lib;} ../.,
+  # Read the workspace identity by default; the flake passes the same value to
+  # every native, dependency-only, and cross derivation.
+  version ? (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package.version,
 }: let
   runtimeDeps = [git fzf gum lazygit yazi delta gh gdu coreutils] ++ yaziDeps;
   isDev = channel == "dev";
@@ -59,7 +62,7 @@
 in
   craneLib.buildPackage {
     pname = binName;
-    version = "0.1.0";
+    inherit version;
 
     inherit src cargoArtifacts;
 
@@ -92,6 +95,9 @@ in
 
       # The native host is the user-facing program, with a short alias.
       ln -s ${binName} $out/bin/${aliasName}
+
+      install -Dm644 ${src}/LICENSE-MIT $out/share/licenses/${binName}/LICENSE-MIT
+      install -Dm644 ${src}/LICENSE-APACHE $out/share/licenses/${binName}/LICENSE-APACHE
 
       # Expose the pinned yazi under a thegn-private name for the file drawer.
       ln -s ${yazi}/bin/yazi $out/bin/thegn-yazi
@@ -155,7 +161,7 @@ in
         "Terminal-native git-worktree IDE"
         + lib.optionalString isDev " (dev channel: experimental features enabled)";
       mainProgram = binName;
-      license = lib.licenses.mit;
+      license = with lib.licenses; [mit asl20];
       platforms = lib.platforms.linux ++ lib.platforms.darwin;
     };
   }
