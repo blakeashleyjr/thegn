@@ -200,6 +200,34 @@ impl Recurrence {
     }
 }
 
+/// Reject recurrence values that cannot be represented in the DTSTART frame
+/// without silently changing their meaning during local-time expansion.
+pub(crate) fn check_values(rec: &Recurrence, start: &EventTime) -> Result<(), ExpansionError> {
+    for date in &rec.rdates {
+        match (start, date) {
+            (EventTime::Date { .. }, EventTime::Zoned { .. } | EventTime::Instant { .. })
+            | (EventTime::Zoned { .. } | EventTime::Instant { .. }, EventTime::Date { .. }) => {
+                return Err(ExpansionError::InvalidSpan);
+            }
+            _ => {}
+        }
+    }
+
+    let start_zone = match start {
+        EventTime::Zoned { zone, .. } => Some(zone),
+        EventTime::Date { .. } | EventTime::Instant { .. } => None,
+    };
+    for value in rec.rdates.iter().chain(&rec.exdates) {
+        if let EventTime::Zoned { zone, .. } = value
+            && zone.resolve().is_none()
+            && start_zone != Some(zone)
+        {
+            return Err(ExpansionError::InvalidSpan);
+        }
+    }
+    Ok(())
+}
+
 fn weekday(s: &str) -> Option<Weekday> {
     Some(match s.trim().to_ascii_uppercase().as_str() {
         "MO" => Weekday::Mon,
