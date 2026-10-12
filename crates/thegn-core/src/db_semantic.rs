@@ -200,7 +200,9 @@ impl SemanticStore for Db {
 impl Db {
     /// Sweep one bounded slice of semantic entities whose source files are gone.
     /// Registered roots are retained even when they are not present locally:
-    /// remote worktrees legitimately have no local filesystem path.
+    /// remote worktrees legitimately have no local filesystem path. When the
+    /// worker reaches the terminal slice (`scanned == 0`), this also triggers
+    /// the bounded orphan-worktree cache sweep; see `db.rs`'s worker loop.
     pub(crate) fn prune_missing_semantic_files(
         &self,
         after_rowid: i64,
@@ -256,6 +258,9 @@ impl Db {
                 tx.execute("DELETE FROM sem_entity WHERE id=?1", params![id])?;
             }
             tx.commit()?;
+        }
+        if scanned == 0 {
+            self.prune_orphan_worktree_caches(1024)?;
         }
         Ok((scanned, next_rowid))
     }
@@ -453,10 +458,22 @@ mod tests {
             "h3",
         ))
         .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO pr_cache(worktree,branch,json,fetched_at) VALUES('/gone/wt','main','[]',1)",
+                [],
+            )
+            .unwrap();
 
-        let (scanned, _) = db.prune_missing_semantic_files(0, 512).unwrap();
+        let mut after_rowid = 0;
+        loop {
+            let (scanned, next_rowid) = db.prune_missing_semantic_files(after_rowid, 512).unwrap();
+            if scanned == 0 {
+                break;
+            }
+            after_rowid = next_rowid;
+        }
 
-        assert_eq!(scanned, 3);
         assert!(db.file_source_hash("/gone/src/lib.rs").unwrap().is_none());
         assert_eq!(
             db.file_source_hash("/live/src/lib.rs").unwrap().as_deref(),
@@ -467,6 +484,18 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("h3")
+        );
+        let orphan_cache_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM pr_cache WHERE worktree='/gone/wt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphan_cache_count, 0,
+            "terminal sweep must prune orphan caches"
         );
     }
 

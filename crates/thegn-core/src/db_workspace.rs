@@ -104,6 +104,56 @@ pub(crate) fn delete_worktree_cache_rows(db: &Db, wt: &str) -> Result<()> {
     Ok(())
 }
 
+impl Db {
+    /// Prune cached rows for a bounded number of worktree keys that are neither
+    /// registered nor present on disk. This is called from the terminal slice
+    /// of `prune_missing_semantic_files`, which the `db.rs` worker loop reaches
+    /// after its semantic scan is complete.
+    pub(crate) fn prune_orphan_worktree_caches(&self, max_keys: usize) -> Result<usize> {
+        let conn = self.conn();
+        let mut cache_queries = vec![
+            "SELECT worktree FROM worktree_disk",
+            "SELECT worktree FROM loc_cache",
+            "SELECT worktree_path FROM attention_acks",
+            "SELECT worktree_path FROM session_attention",
+            "SELECT worktree FROM pr_cache",
+            "SELECT worktree FROM pr_review_cache",
+            "SELECT worktree FROM ci_runs_cache",
+            "SELECT worktree FROM ci_log_cache",
+            "SELECT worktree FROM ci_autofix_dedupe",
+            "SELECT worktree FROM commit_cache",
+            "SELECT worktree FROM worktree_titles",
+            "SELECT worktree FROM test_cache",
+        ];
+        if table_exists(conn, "glyph_cache")? {
+            cache_queries.push("SELECT worktree FROM glyph_cache");
+        }
+        let query = format!(
+            "SELECT DISTINCT worktree FROM ({}) WHERE worktree IS NOT NULL AND worktree != '' ORDER BY worktree",
+            cache_queries.join(" UNION ALL ")
+        );
+        let keys = {
+            let mut stmt = conn.prepare(&query)?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let registered = {
+            let mut stmt = conn.prepare("SELECT worktree FROM worktrees WHERE worktree != ''")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()?
+        };
+        let orphan_keys: Vec<String> = keys
+            .into_iter()
+            .filter(|key| !registered.contains(key) && !std::path::Path::new(key).exists())
+            .take(max_keys)
+            .collect();
+        for key in &orphan_keys {
+            delete_worktree_cache_rows(self, key)?;
+        }
+        Ok(orphan_keys.len())
+    }
+}
+
 fn table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -1850,6 +1900,112 @@ mod tests {
         }
         assert_eq!(db.all_glyph_cache().len(), 1);
         assert_eq!(db.all_glyph_cache()[0].0, "/wt/a2");
+    }
+
+    #[test]
+    fn orphan_cache_sweep_prunes_only_missing_unregistered_worktrees() {
+        use crate::store::WorkspaceStore;
+
+        let db = Db::open_memory().unwrap();
+        let existing = tempfile::tempdir().unwrap();
+        let existing_path = existing.path().to_string_lossy().into_owned();
+        let remote = r#"{"path":"/remote/wt","host":"builder"}"#;
+        db.put_worktree("tab", "/repo", "/live", "main", None, None)
+            .unwrap();
+        db.put_worktree("tab", "/repo", "/remote/wt", "remote", Some(remote), None)
+            .unwrap();
+        db.put_worktree("tab", "/repo", "/gone/wt2", "sibling", None, None)
+            .unwrap();
+
+        let keys = [
+            "/gone/wt",
+            "/live",
+            "/remote/wt",
+            existing_path.as_str(),
+            "/gone/wt2",
+        ];
+        for key in keys {
+            db.conn()
+                .execute(
+                    "INSERT INTO pr_cache(worktree,branch,json,fetched_at) VALUES(?1,'main','[]',1)",
+                    params![key],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO commit_cache(worktree,json,fetched_at) VALUES(?1,'[]',1)",
+                    params![key],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO ci_runs_cache(worktree,branch,json,fetched_at) VALUES(?1,'main','[]',1)",
+                    params![key],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO worktree_titles(worktree,last_title,updated_at) VALUES(?1,'title',1)",
+                    params![key],
+                )
+                .unwrap();
+            db.put_glyph_cache(key, "{}").unwrap();
+        }
+
+        assert_eq!(db.prune_orphan_worktree_caches(1024).unwrap(), 1);
+        for table in [
+            "pr_cache",
+            "commit_cache",
+            "ci_runs_cache",
+            "worktree_titles",
+        ] {
+            let stale_count: i64 = db
+                .conn()
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE worktree='/gone/wt'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stale_count, 0, "{table} retained an orphan cache row");
+            let retained_count: i64 = db
+                .conn()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(retained_count, 4, "{table} lost a live or existing key");
+        }
+        let glyphs: std::collections::HashSet<String> = db
+            .all_glyph_cache()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert!(!glyphs.contains("/gone/wt"));
+        for key in ["/live", "/remote/wt", existing_path.as_str(), "/gone/wt2"] {
+            assert!(glyphs.contains(key), "registered/existing {key} was pruned");
+        }
+    }
+
+    #[test]
+    fn orphan_cache_sweep_respects_max_keys() {
+        let db = Db::open_memory().unwrap();
+        for key in ["/gone/wt-a", "/gone/wt-b", "/gone/wt-c"] {
+            db.conn()
+                .execute(
+                    "INSERT INTO pr_cache(worktree,branch,json,fetched_at) VALUES(?1,'main','[]',1)",
+                    params![key],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(db.prune_orphan_worktree_caches(2).unwrap(), 2);
+        assert_eq!(db.prune_orphan_worktree_caches(2).unwrap(), 1);
+        let remaining: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM pr_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[test]
