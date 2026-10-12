@@ -126,10 +126,9 @@ pub(crate) fn preflight_exec_with(
             if spec
                 .compose_spec()
                 .is_some_and(|compose| compose.has_service())
+                && let Some(reason) = compose_exec_failure(msg)
             {
-                if let Some(reason) = compose_exec_failure(msg) {
-                    return Err(reason);
-                }
+                return Err(reason);
             }
             Err(if msg.is_empty() {
                 format!("exec probe failed for container '{}'", spec.name)
@@ -332,15 +331,27 @@ mod tests {
         let mut spec = base_spec(Backend::Docker);
         spec.name = "thegn-x".into();
         spec.compose = Some(compose.encode());
-        let mut observed = Vec::new();
+        let observed = std::cell::RefCell::new(Vec::new());
         let result = preflight_exec_with(&spec, &|argv| {
-            observed = argv.to_vec();
+            *observed.borrow_mut() = argv.to_vec();
             Some((true, String::new()))
         });
         assert_eq!(result, Ok(()));
+        let observed = observed.borrow();
         let exec = observed.iter().position(|arg| arg == "exec").unwrap();
-        assert!(observed[exec + 1..].iter().any(|arg| arg == "app"));
-        assert!(!observed.iter().any(|arg| arg == "thegn-x"));
+        assert_eq!(observed[exec - 2].as_str(), "-p");
+        assert_eq!(observed[exec - 1].as_str(), "thegn-x");
+        let after_exec = &observed[exec + 1..];
+        assert!(!after_exec.iter().any(|arg| arg == "thegn-x"));
+        let service_index = if after_exec.first().is_some_and(|arg| arg == "--workdir") {
+            2
+        } else {
+            0
+        };
+        assert_eq!(
+            after_exec.get(service_index).map(String::as_str),
+            Some("app")
+        );
     }
 
     #[test]
