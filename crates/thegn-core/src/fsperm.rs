@@ -9,6 +9,31 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Create a file or directory symlink using the platform's native API.
+/// Callers that use this for optional capabilities can treat `Unsupported` or
+/// `PermissionDenied` as an unavailable platform feature.
+pub fn create_symlink(_target: &Path, _link: &Path, _is_dir: bool) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(_target, _link)
+    }
+    #[cfg(windows)]
+    {
+        if _is_dir {
+            std::os::windows::fs::symlink_dir(_target, _link)
+        } else {
+            std::os::windows::fs::symlink_file(_target, _link)
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlinks are unavailable on this platform",
+        ))
+    }
+}
+
 /// Open an existing regular file without following its final path component.
 ///
 /// The returned descriptor is checked after opening, so callers can safely

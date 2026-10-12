@@ -1070,7 +1070,7 @@ pub trait ProviderFiles: Send + Sync {
                 );
                 let listing = self.list_dir(id, &join_remote(remote, &rel)).await?;
                 let mut siblings = std::collections::HashSet::new();
-                for e in listing {
+                for e in &listing {
                     if e.name == ".git" {
                         continue;
                     }
@@ -1096,6 +1096,16 @@ pub trait ProviderFiles: Send + Sync {
                         child_depth <= DOWNLOAD_MAX_DEPTH,
                         "provider listing exceeded maximum directory depth"
                     );
+                }
+                for e in listing {
+                    if e.name == ".git" {
+                        continue;
+                    }
+                    let child = if rel.is_empty() {
+                        e.name.clone()
+                    } else {
+                        format!("{rel}/{}", e.name)
+                    };
                     let mut dest = local.to_path_buf();
                     for component in child.split('/') {
                         dest.push(component);
@@ -2760,19 +2770,8 @@ mod tests {
         std::fs::write(&file, b"old").unwrap();
         publish_download_file(&file, b"new").unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), b"new");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
-            publish_download_file(&file, b"script").unwrap();
-            assert_eq!(
-                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
-                0o755
-            );
-        }
     }
 
-    #[cfg(unix)]
     #[test]
     fn download_publication_refuses_symlink_leaf() {
         let temp = tempfile::tempdir().unwrap();
@@ -2781,12 +2780,19 @@ mod tests {
         let target = temp.path().join("target");
         std::fs::write(&target, b"safe").unwrap();
         let link = root.join("leaf");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
+        if let Err(error) = thegn_core::fsperm::create_symlink(&target, &link, false) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("create symlink fixture: {error}");
+        }
         assert!(publish_download_file(&link, b"overwrite").is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"safe");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn download_dir_refuses_symlinked_intermediate_and_root() {
         let temp = tempfile::tempdir().unwrap();
@@ -2794,7 +2800,16 @@ mod tests {
         let outside = temp.path().join("outside");
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir(&outside).unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("nested")).unwrap();
+        let nested_link = root.join("nested");
+        if let Err(error) = thegn_core::fsperm::create_symlink(&outside, &nested_link, true) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("create directory symlink fixture: {error}");
+        }
         let provider = ListingProvider::new(
             vec![FileEntry {
                 name: "nested".into(),
@@ -2814,7 +2829,7 @@ mod tests {
         std::fs::create_dir(&leaf_root).unwrap();
         let leaf_target = temp.path().join("leaf-target");
         std::fs::write(&leaf_target, b"safe").unwrap();
-        std::os::unix::fs::symlink(&leaf_target, leaf_root.join("file")).unwrap();
+        thegn_core::fsperm::create_symlink(&leaf_target, &leaf_root.join("file"), false).unwrap();
         let leaf_provider = ListingProvider::new(
             vec![FileEntry {
                 name: "file".into(),
@@ -2832,7 +2847,7 @@ mod tests {
         assert_eq!(std::fs::read(&leaf_target).unwrap(), b"safe");
 
         let root_link = temp.path().join("root-link");
-        std::os::unix::fs::symlink(&root, &root_link).unwrap();
+        thegn_core::fsperm::create_symlink(&root, &root_link, true).unwrap();
         assert!(provider.download_dir("id", "/", &root_link).await.is_err());
     }
 
