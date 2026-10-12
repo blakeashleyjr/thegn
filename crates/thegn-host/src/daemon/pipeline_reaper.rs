@@ -42,11 +42,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::service::DaemonService;
 use thegn_core::issue::AgentDispatchStatus;
 use thegn_core::pipeline_reap::ReapVerdict;
-use thegn_core::store::NotificationStore as _;
-
-use super::service::DaemonService;
 
 /// How often to reconcile. Long on purpose: the work is per-row git I/O, and
 /// nothing here is latency-sensitive — a stale row costs a supervisor's
