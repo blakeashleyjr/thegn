@@ -14,8 +14,8 @@ use sysinfo::{
 use crate::gpu_monitor::GpuMonitor;
 use crate::thermal::ThermalProbe;
 use crate::{
-    ChildGroup, DiskInfo, DiskKind, IfaceFact, NetMedium, StatsSnapshot, disk_space, read_battery,
-    read_battery_power, select_medium,
+    ChildGroup, DiskInfo, DiskKind, NetMedium, StatsSnapshot, disk_space, read_battery,
+    read_battery_power,
 };
 
 /// Refresh the slow tier (frequency / temperatures / disks) once every N
@@ -128,6 +128,7 @@ pub(crate) fn parse_default_route(contents: &str) -> Vec<String> {
 
 #[cfg(target_os = "linux")]
 fn read_net_medium() -> NetMedium {
+    use crate::{IfaceFact, select_medium};
     use std::collections::BTreeSet;
     use std::path::Path;
 
