@@ -1033,7 +1033,6 @@ impl CiProvider for GitlabCi {
             let page_length = page_rows.len();
             let (parsed, discarded) =
                 parse_gitlab_jobs_with_discarded(&jobs_json).map_err(CiError::Other)?;
-            let row_count = parsed.len() + discarded;
             for job in parsed {
                 if !ids.insert(job.id.clone()) {
                     return Err(CiError::Other(format!(
