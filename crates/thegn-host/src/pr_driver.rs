@@ -67,8 +67,10 @@ pub(crate) struct PrStep<'a> {
 /// Summary of one pass over the queue.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PrOutcome {
-    /// Merged, or handed to the forge's auto-merge.
+    /// Direct merges confirmed by the forge during this pass.
     pub merged: Vec<u64>,
+    /// Auto-merge was enabled; the forge may merge these after its own rules pass.
+    pub auto_merge_armed: Vec<u64>,
     /// Green and mergeable, held for a human (`merge_mode = "ready"`).
     pub ready: Vec<u64>,
     /// Still blocked; will be re-examined next pass.
@@ -390,7 +392,11 @@ pub(crate) fn drive_queue(
                             Some(&head),
                         );
                         step(status.as_str(), &detail, &mut progress);
-                        out.merged.push(item.number);
+                        if direct {
+                            out.merged.push(item.number);
+                        } else {
+                            out.auto_merge_armed.push(item.number);
+                        }
                     }
                     Err(e) => {
                         // A refused merge is usually the forge enforcing a rule
@@ -1453,7 +1459,8 @@ mod tests {
             vec![item()],
             |_| {},
         );
-        assert_eq!(out.merged, vec![7], "{out:?}");
+        assert!(out.merged.is_empty(), "{out:?}");
+        assert_eq!(out.auto_merge_armed, vec![7], "{out:?}");
         let calls = forge.calls();
         assert!(
             !calls.iter().any(|c| c == "whoami"),
