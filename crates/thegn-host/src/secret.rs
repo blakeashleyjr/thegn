@@ -19,6 +19,11 @@
 
 use std::path::PathBuf;
 
+const MAX_SECRET_BYTES: u64 = 64 * 1024;
+const MAX_ACCOUNT_BYTES: usize = 1024;
+const MAX_INDEX_BYTES: u64 = 64 * 1024;
+const MAX_INDEX_ENTRIES: usize = 4096;
+
 use anyhow::{Context, Result};
 use thegn_core::secret_audit::{SecretAudit, SecretOutcome};
 use thegn_core::secret_store::{SecretBackendCaps, SecretBackendKind, SecretError, SecretStore};
@@ -190,7 +195,9 @@ pub fn store(name: &str, token: &str) -> Result<String> {
         return Ok(format!("keyring:{name}"));
     }
     let path = secrets_file(name)?;
+    write_account_sidecar(&path, name)?;
     write_private(&path, token)?;
+    thegn_core::fsperm::sync_parent_dir(path.parent().context("secret path has no parent")?)?;
     Ok(format!("file:{}", path.display()))
 }
 
@@ -212,7 +219,9 @@ pub fn store_file(name: &str, token: &str) -> Result<String> {
         m.clear();
     }
     let path = secrets_file(name)?;
+    write_account_sidecar(&path, name)?;
     write_private(&path, token)?;
+    thegn_core::fsperm::sync_parent_dir(path.parent().context("secret path has no parent")?)?;
     Ok(format!("file:{}", path.display()))
 }
 
@@ -224,7 +233,24 @@ pub fn forget(name: &str) {
     }
     let _ = keyring_del(name); // best-effort: bounded cleanup; absence is success
     if let Ok(path) = secrets_file(name) {
-        let _ = std::fs::remove_file(path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        match account_matches_or_missing(&path, name) {
+            Ok(()) => {
+                if let Err(error) = std::fs::remove_file(&path) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(%error, "failed to remove file-backed secret");
+                    }
+                }
+                if let Err(error) = remove_sidecar(&path) {
+                    tracing::warn!(%error, "failed to remove secret account sidecar");
+                }
+                if let Some(parent) = path.parent()
+                    && let Err(error) = thegn_core::fsperm::sync_parent_dir(parent)
+                {
+                    tracing::warn!(%error, "failed to sync secret directory after removal");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "refused file-backed secret removal"),
+        }
     }
     // Do not derive and delete the pre-hash fallback filename. That historical
     // sanitizer was not injective (`a/b` and `a_b` both became `a_b.token`), so
@@ -386,11 +412,31 @@ fn secrets_file(name: &str) -> Result<PathBuf> {
         .parent()
         .map(|p| p.join("secrets"))
         .context("config path has no parent")?;
-    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
-    thegn_core::fsperm::restrict_dir_to_owner(&dir)
-        .with_context(|| format!("restrict {}", dir.display()))?;
-    // Sanitize for readability, then bind the filename to the exact name so
-    // aliases such as `a/b` and `a_b` cannot share or delete one another's token.
+    secrets_dir_at(&dir)?;
+    token_path_in(&dir, name)
+}
+
+fn secrets_dir() -> Result<PathBuf> {
+    let cfg = thegn_core::config::Config::path();
+    let dir = std::path::Path::new(&cfg)
+        .parent()
+        .map(|p| p.join("secrets"))
+        .context("config path has no parent")?;
+    secrets_dir_at(&dir)?;
+    Ok(dir)
+}
+
+fn secrets_dir_at(dir: &std::path::Path) -> Result<()> {
+    thegn_core::fsperm::ensure_private_dir(dir)
+        .with_context(|| format!("prepare private secrets directory {}", dir.display()))
+}
+
+fn token_path_in(dir: &std::path::Path, name: &str) -> Result<PathBuf> {
+    if name.is_empty() || name.len() > MAX_ACCOUNT_BYTES {
+        anyhow::bail!("secret account must contain 1..={MAX_ACCOUNT_BYTES} UTF-8 bytes");
+    }
+    // Keep a readable prefix; the sidecar below verifies the exact account for
+    // this hashed filename, including aliases such as `a/b` and `a_b`.
     let safe: String = name
         .chars()
         .map(|c| {
@@ -405,6 +451,62 @@ fn secrets_file(name: &str) -> Result<PathBuf> {
     let safe = if safe.is_empty() { "secret" } else { &safe };
     let identity = thegn_core::util::short_hash(name, 16);
     Ok(dir.join(format!("{safe}-{identity}.token")))
+}
+
+fn account_path(token: &std::path::Path) -> PathBuf {
+    token.with_extension("account")
+}
+
+fn write_account_sidecar(token_path: &std::path::Path, account: &str) -> Result<()> {
+    let sidecar = account_path(token_path);
+    match read_account_sidecar(&sidecar) {
+        Ok(existing) if existing != account => anyhow::bail!("secret account digest collision"),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match thegn_core::fsperm::open_regular_file_nofollow(token_path) {
+                Ok(_) => anyhow::bail!("refusing to assign an identity to a legacy secret file"),
+                Err(token_error) if token_error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(token_error) => {
+                    return Err(token_error).context("validate existing secret file");
+                }
+            }
+        }
+        Err(error) => return Err(error).context("read existing secret account sidecar"),
+    }
+    thegn_core::fsperm::write_owner_only_atomic(&sidecar, account.as_bytes())?;
+    thegn_core::fsperm::sync_parent_dir(sidecar.parent().context("sidecar has no parent")?)?;
+    Ok(())
+}
+
+fn read_account_sidecar(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let file = thegn_core::fsperm::open_regular_file_nofollow(path)?;
+    if !thegn_core::fsperm::owned_by_current_user(&file.metadata()?) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "foreign-owned secret account sidecar",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_ACCOUNT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > MAX_ACCOUNT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid secret account sidecar size",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+fn account_matches_or_missing(token_path: &std::path::Path, account: &str) -> Result<()> {
+    match read_account_sidecar(&account_path(token_path)) {
+        Ok(existing) if existing != account => anyhow::bail!("secret account digest collision"),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("validate secret account sidecar"),
+    }
 }
 
 fn write_private(path: &std::path::Path, token: &str) -> Result<()> {
@@ -486,57 +588,126 @@ impl SecretStore for FileStore {
     fn get(&self, account: &str) -> Result<String, SecretError> {
         // A bare account name resolves to the config-adjacent secrets file.
         let path = secrets_file(account).map_err(|e| SecretError::unavailable(e.to_string()))?;
-        match std::fs::read_to_string(&path) {
-            Ok(value) => {
-                let value = value.trim().to_string();
-                if value.is_empty() {
-                    Err(SecretError::not_found(account.to_string()))
-                } else {
-                    Ok(value)
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Err(SecretError::not_found(account.to_string()))
-            }
-            Err(error) => Err(SecretError::denied(format!(
-                "read {}: {error}",
-                path.display()
-            ))),
-        }
+        file_get_at(&path, account)
     }
     fn set(&self, account: &str, value: &str) -> Result<(), SecretError> {
-        let path = secrets_file(account).map_err(|e| SecretError::unavailable(e.to_string()))?;
-        write_private(&path, value).map_err(|e| SecretError::denied(e.to_string()))
+        let dir = secrets_dir().map_err(|e| SecretError::unavailable(e.to_string()))?;
+        file_set_at(&dir, account, value)
     }
     fn del(&self, account: &str) -> Result<(), SecretError> {
-        let path = secrets_file(account).map_err(|e| SecretError::unavailable(e.to_string()))?;
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(SecretError::denied(format!(
-                "remove {}: {error}",
-                path.display()
-            ))),
-        }
+        let dir = secrets_dir().map_err(|e| SecretError::unavailable(e.to_string()))?;
+        file_del_at(&dir, account)
     }
     fn list(&self) -> Result<Vec<String>, SecretError> {
-        let path =
-            secrets_file("__probe__").map_err(|e| SecretError::unavailable(e.to_string()))?;
-        let dir = match path.parent() {
-            Some(d) => d,
-            None => return Ok(Vec::new()),
-        };
-        let mut names = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for e in rd.flatten() {
-                if let Some(n) = e.file_name().to_string_lossy().strip_suffix(".token") {
-                    names.push(n.to_string());
-                }
+        let dir = secrets_dir().map_err(|e| SecretError::unavailable(e.to_string()))?;
+        file_list_at(&dir)
+    }
+}
+
+fn file_get_at(path: &std::path::Path, account: &str) -> Result<String, SecretError> {
+    use std::io::Read;
+    account_matches_or_missing(path, account).map_err(|e| SecretError::denied(e.to_string()))?;
+    let file = thegn_core::fsperm::open_regular_file_nofollow(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            SecretError::not_found(account.to_string())
+        } else {
+            SecretError::denied(format!("open secret: {error}"))
+        }
+    })?;
+    if !thegn_core::fsperm::owned_by_current_user(
+        &file
+            .metadata()
+            .map_err(|e| SecretError::denied(e.to_string()))?,
+    ) {
+        return Err(SecretError::denied("secret file is owned by another user"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_SECRET_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| SecretError::denied(e.to_string()))?;
+    if bytes.len() as u64 > MAX_SECRET_BYTES {
+        return Err(SecretError::denied("secret file exceeds size limit"));
+    }
+    let value = String::from_utf8(bytes).map_err(|e| SecretError::denied(e.to_string()))?;
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        Err(SecretError::not_found(account.to_string()))
+    } else {
+        Ok(value)
+    }
+}
+
+fn file_set_at(dir: &std::path::Path, account: &str, value: &str) -> Result<(), SecretError> {
+    let path = token_path_in(dir, account).map_err(|e| SecretError::denied(e.to_string()))?;
+    account_matches_or_missing(&path, account).map_err(|e| SecretError::denied(e.to_string()))?;
+    write_account_sidecar(&path, account).map_err(|e| SecretError::denied(e.to_string()))?;
+    write_private(&path, value).map_err(|e| SecretError::denied(e.to_string()))?;
+    thegn_core::fsperm::sync_parent_dir(dir).map_err(|e| SecretError::denied(e.to_string()))
+}
+
+fn file_del_at(dir: &std::path::Path, account: &str) -> Result<(), SecretError> {
+    let path = token_path_in(dir, account).map_err(|e| SecretError::denied(e.to_string()))?;
+    account_matches_or_missing(&path, account).map_err(|e| SecretError::denied(e.to_string()))?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => remove_sidecar(&path).map_err(|e| SecretError::denied(e.to_string()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            remove_sidecar(&path).map_err(|e| SecretError::denied(e.to_string()))?;
+        }
+        Err(error) => return Err(SecretError::denied(format!("remove secret: {error}"))),
+    }
+    thegn_core::fsperm::sync_parent_dir(dir).map_err(|e| SecretError::denied(e.to_string()))
+}
+
+fn remove_sidecar(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(account_path(path)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn file_list_at(dir: &std::path::Path) -> Result<Vec<String>, SecretError> {
+    // Legacy tokens without an exact-identity sidecar are deliberately omitted.
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| SecretError::unavailable(format!("read secret inventory: {e}")))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| SecretError::unavailable(format!("read secret inventory entry: {e}")))?;
+        if entry.path().extension().and_then(|v| v.to_str()) != Some("account") {
+            continue;
+        }
+        let account = read_account_sidecar(&entry.path())
+            .map_err(|e| SecretError::denied(format!("invalid secret account sidecar: {e}")))?;
+        let token = token_path_in(dir, &account).map_err(|e| SecretError::denied(e.to_string()))?;
+        if token.with_extension("account") != entry.path() {
+            return Err(SecretError::denied(
+                "secret account sidecar identity mismatch",
+            ));
+        }
+        match thegn_core::fsperm::open_regular_file_nofollow(&token) {
+            Ok(file)
+                if thegn_core::fsperm::owned_by_current_user(
+                    &file
+                        .metadata()
+                        .map_err(|e| SecretError::denied(e.to_string()))?,
+                ) =>
+            {
+                names.push(account)
+            }
+            Ok(_) => return Err(SecretError::denied("secret file is owned by another user")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SecretError::denied("account sidecar has no token"));
+            }
+            Err(error) => {
+                return Err(SecretError::denied(format!(
+                    "invalid secret token: {error}"
+                )));
             }
         }
-        names.sort();
-        Ok(names)
     }
+    names.sort();
+    Ok(names)
 }
 
 /// The environment-variable backend (read-only).
@@ -611,7 +782,7 @@ pub fn mcp_secret_set(account: &str, value: &str) -> Result<(), String> {
     KeyringStore
         .set(account, value)
         .map_err(|e| e.message().to_string())?;
-    index_add(account);
+    index_add(account)?;
     Ok(())
 }
 
@@ -620,12 +791,12 @@ pub fn mcp_secret_rm(account: &str) -> Result<(), String> {
     KeyringStore
         .del(account)
         .map_err(|error| error.message().to_string())?;
-    index_remove(account);
+    index_remove(account)?;
     Ok(())
 }
 
 /// `thegn mcp secret list` — the names thegn has stored (never values).
-pub fn mcp_secret_list() -> Vec<String> {
+pub fn mcp_secret_list() -> Result<Vec<String>, String> {
     index_read()
 }
 
@@ -635,48 +806,123 @@ pub fn mcp_keyring_probe() -> thegn_core::seam::ProbeReport {
 }
 
 /// The names-only index path (`secrets/mcp-index.json`).
-fn mcp_index_path() -> Option<PathBuf> {
-    let cfg = thegn_core::config::Config::path();
-    let dir = std::path::Path::new(&cfg).parent()?.join("secrets");
-    let _ = std::fs::create_dir_all(&dir); // best-effort: dir prep: a later write reports the real failure
-    let _ = thegn_core::fsperm::restrict_dir_to_owner(&dir); // best-effort: hardening: a failed chmod must never block the caller
-    Some(dir.join("mcp-index.json"))
+fn index_read() -> Result<Vec<String>, String> {
+    let dir = secrets_dir().map_err(|e| e.to_string())?;
+    index_read_in(&dir)
 }
 
-fn index_read() -> Vec<String> {
-    let Some(path) = mcp_index_path() else {
-        return Vec::new();
+fn index_read_in(dir: &std::path::Path) -> Result<Vec<String>, String> {
+    let path = dir.join("mcp-index.json");
+    let file = match thegn_core::fsperm::open_regular_file_nofollow(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("read MCP secret index: {error}")),
     };
-    let Ok(body) = std::fs::read_to_string(&path) else {
-        return Vec::new();
+    use std::io::Read;
+    if !thegn_core::fsperm::owned_by_current_user(&file.metadata().map_err(|e| e.to_string())?) {
+        return Err("MCP secret index is owned by another user".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_INDEX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_INDEX_BYTES {
+        return Err("MCP secret index exceeds size limit".into());
+    }
+    let names: Vec<String> =
+        serde_json::from_slice(&bytes).map_err(|e| format!("corrupt MCP secret index: {e}"))?;
+    if names.len() > MAX_INDEX_ENTRIES
+        || names
+            .iter()
+            .any(|name| name.is_empty() || name.len() > MAX_ACCOUNT_BYTES)
+    {
+        return Err("MCP secret index has invalid entry count or account name".into());
+    }
+    Ok(names)
+}
+
+fn index_write_in(dir: &std::path::Path, names: &[String]) -> Result<(), String> {
+    if names.len() > MAX_INDEX_ENTRIES
+        || names
+            .iter()
+            .any(|name| name.is_empty() || name.len() > MAX_ACCOUNT_BYTES)
+    {
+        return Err("MCP secret index has invalid entry count or account name".into());
+    }
+    let body = serde_json::to_vec_pretty(names).map_err(|e| e.to_string())?;
+    if body.len() as u64 > MAX_INDEX_BYTES {
+        return Err("MCP secret index exceeds size limit".into());
+    }
+    let path = dir.join("mcp-index.json");
+    thegn_core::fsperm::write_owner_only_atomic(&path, &body).map_err(|e| e.to_string())?;
+    thegn_core::fsperm::sync_parent_dir(dir).map_err(|e| e.to_string())
+}
+
+fn with_index_lock<T>(
+    dir: &std::path::Path,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let path = dir.join("mcp-index.lock");
+    let file = loop {
+        match thegn_core::fsperm::open_regular_file_nofollow(&path) {
+            Ok(file) => break file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match thegn_core::fsperm::create_owner_only_exclusive(&path) {
+                    Ok(file) => break file,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(format!("open MCP secret index lock: {error}")),
+                }
+            }
+            Err(error) => return Err(format!("open MCP secret index lock: {error}")),
+        }
     };
-    serde_json::from_str(&body).unwrap_or_default()
+    if !thegn_core::fsperm::owned_by_current_user(
+        &file
+            .metadata()
+            .map_err(|e| format!("inspect MCP secret index lock: {e}"))?,
+    ) {
+        return Err("MCP secret index lock is owned by another user".into());
+    }
+    file.lock()
+        .map_err(|e| format!("lock MCP secret index: {e}"))?;
+    action()
 }
 
-fn index_write(names: &[String]) {
-    let Some(path) = mcp_index_path() else { return };
-    if let Ok(body) = serde_json::to_string_pretty(names) {
-        // best-effort: the index is a convenience for `secret list`, not truth.
-        let _ = std::fs::write(&path, body);
+fn index_add_in(dir: &std::path::Path, account: &str) -> Result<(), String> {
+    if account.is_empty() || account.len() > MAX_ACCOUNT_BYTES {
+        return Err("invalid MCP secret account name".into());
     }
+    with_index_lock(dir, || {
+        let mut names = index_read_in(dir)?;
+        if !names.iter().any(|name| name == account) {
+            names.push(account.to_string());
+            names.sort();
+            index_write_in(dir, &names)?;
+        }
+        Ok(())
+    })
 }
 
-fn index_add(account: &str) {
-    let mut names = index_read();
-    if !names.iter().any(|n| n == account) {
-        names.push(account.to_string());
-        names.sort();
-        index_write(&names);
-    }
+fn index_remove_in(dir: &std::path::Path, account: &str) -> Result<(), String> {
+    with_index_lock(dir, || {
+        let mut names = index_read_in(dir)?;
+        let before = names.len();
+        names.retain(|name| name != account);
+        if names.len() != before {
+            index_write_in(dir, &names)?;
+        }
+        Ok(())
+    })
 }
 
-fn index_remove(account: &str) {
-    let mut names = index_read();
-    let before = names.len();
-    names.retain(|n| n != account);
-    if names.len() != before {
-        index_write(&names);
-    }
+fn index_add(account: &str) -> Result<(), String> {
+    let dir = secrets_dir().map_err(|e| e.to_string())?;
+    index_add_in(&dir, account)
+}
+
+fn index_remove(account: &str) -> Result<(), String> {
+    let dir = secrets_dir().map_err(|e| e.to_string())?;
+    index_remove_in(&dir, account)
 }
 
 #[cfg(test)]
@@ -785,13 +1031,14 @@ mod tests {
 
     #[test]
     fn resolve_file_ref_reads_token() {
-        let f = std::env::temp_dir().join(format!("tg-secret-test-{}.tok", std::process::id()));
+        let temp = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(temp.path()).unwrap();
+        let f = temp.path().join("secret.tok");
         std::fs::write(&f, "  filetoken\n").unwrap();
         assert_eq!(
             resolve(&format!("file:{}", f.display())).as_deref(),
             Some("filetoken")
         );
-        let _ = std::fs::remove_file(&f); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -815,8 +1062,105 @@ mod tests {
 
     #[test]
     fn fallback_names_do_not_alias_after_sanitization() {
-        let slash = secrets_file("a/b").unwrap();
-        let underscore = secrets_file("a_b").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(temp.path()).unwrap();
+        let slash = token_path_in(temp.path(), "a/b").unwrap();
+        let underscore = token_path_in(temp.path(), "a_b").unwrap();
         assert_ne!(slash, underscore);
+    }
+
+    fn private_temp() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(temp.path()).unwrap();
+        temp
+    }
+
+    #[test]
+    fn private_secrets_root_rejects_a_preplanted_symlink() {
+        let temp = private_temp();
+        let canary = temp.path().join("canary");
+        let secrets = temp.path().join("secrets");
+        std::fs::create_dir(&canary).unwrap();
+        thegn_core::fsperm::ensure_private_dir(&canary).unwrap();
+        std::fs::write(canary.join("sentinel"), "unchanged").unwrap();
+        thegn_core::fsperm::create_symlink(&canary, &secrets, true).unwrap();
+        assert!(secrets_dir_at(&secrets).is_err());
+        assert_eq!(
+            std::fs::read_to_string(canary.join("sentinel")).unwrap(),
+            "unchanged"
+        );
+    }
+
+    #[test]
+    fn conflicting_account_sidecar_refuses_set_get_and_delete() {
+        let temp = private_temp();
+        let token = token_path_in(temp.path(), "mine").unwrap();
+        write_private(&token, "keep-me").unwrap();
+        std::fs::write(account_path(&token), "other").unwrap();
+        assert!(file_set_at(temp.path(), "mine", "replacement").is_err());
+        assert!(file_get_at(&token, "mine").is_err());
+        assert!(file_del_at(temp.path(), "mine").is_err());
+        assert_eq!(std::fs::read_to_string(token).unwrap(), "keep-me");
+    }
+
+    #[test]
+    fn no_follow_get_rejects_symlink_and_oversized_secret() {
+        let temp = private_temp();
+        let canary = temp.path().join("canary");
+        std::fs::write(&canary, "do-not-read").unwrap();
+        let symlinked = token_path_in(temp.path(), "symlinked").unwrap();
+        thegn_core::fsperm::create_symlink(&canary, &symlinked, false).unwrap();
+        assert!(file_get_at(&symlinked, "symlinked").is_err());
+
+        let oversized = token_path_in(temp.path(), "oversized").unwrap();
+        std::fs::write(&oversized, vec![b'x'; (MAX_SECRET_BYTES + 1) as usize]).unwrap();
+        assert!(file_get_at(&oversized, "oversized").is_err());
+    }
+
+    #[test]
+    fn file_list_sidecars_round_trip_exact_accounts() {
+        let temp = private_temp();
+        for account in ["a/b", "a_b"] {
+            file_set_at(temp.path(), account, &format!("value-{account}")).unwrap();
+        }
+        assert_eq!(file_list_at(temp.path()).unwrap(), vec!["a/b", "a_b"]);
+        for account in ["a/b", "a_b"] {
+            let token = token_path_in(temp.path(), account).unwrap();
+            assert_eq!(
+                file_get_at(&token, account).unwrap(),
+                format!("value-{account}")
+            );
+            file_del_at(temp.path(), account).unwrap();
+        }
+        assert!(file_list_at(temp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mcp_index_corruption_is_preserved_and_reported() {
+        let temp = private_temp();
+        let index = temp.path().join("mcp-index.json");
+        std::fs::write(&index, b"not-json").unwrap();
+        assert!(index_add_in(temp.path(), "new-name").is_err());
+        assert_eq!(std::fs::read(index).unwrap(), b"not-json");
+    }
+
+    #[test]
+    fn concurrent_mcp_index_additions_keep_every_name() {
+        let temp = private_temp();
+        let dir = temp.path().to_path_buf();
+        let workers: Vec<_> = (0..8)
+            .map(|n| {
+                let dir = dir.clone();
+                std::thread::spawn(move || index_add_in(&dir, &format!("name-{n}")))
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        let names = index_read_in(temp.path()).unwrap();
+        assert_eq!(names.len(), 8);
+        for n in 0..8 {
+            assert!(names.contains(&format!("name-{n}")));
+        }
     }
 }
