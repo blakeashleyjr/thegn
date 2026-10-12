@@ -36,14 +36,9 @@ const REPLAY_SCROLLBACK: usize = 10_000;
 /// including fixed allocation overhead. This enforces a logical replay budget;
 /// it is not a measured RSS guarantee and does not account for Vec capacity.
 const REPLAY_ENTRY_OVERHEAD_BYTES: u64 = 64;
-/// Replay search's independent snapshot and scan ceilings. Snapshot capture is
-/// also on the UI loop, so its event, payload, and time limits are deliberately
-/// separate from the recording's configurable byte budget.
-pub(crate) const SEARCH_SNAPSHOT_MAX_EVENTS: usize = 20_000;
-const SEARCH_SNAPSHOT_MAX_BYTES: usize = 2 * 1024 * 1024;
-const SEARCH_SNAPSHOT_MAX_CAPTURE: Duration = Duration::from_millis(3);
-const SEARCH_SCAN_MAX_CELLS: usize = 2_000_000;
-const SEARCH_SCAN_MAX_TIME: Duration = Duration::from_millis(100);
+/// Deterministic worker-side cell ceiling. This covers a default-sized retained
+/// ring at ordinary pane geometries while still bounding resize floods.
+const SEARCH_SCAN_MAX_CELLS: usize = 2_000_000_000;
 static NEXT_RECORDING_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The two ways the recorder bounds a pane's ring, plus the keyframe cadence.
@@ -113,6 +108,7 @@ pub(crate) struct SearchSnapshot {
     events: Vec<Event>,
     base_rows: u16,
     base_cols: u16,
+    max_events: usize,
     incomplete: bool,
 }
 
@@ -125,7 +121,7 @@ pub(crate) enum SearchResult {
 }
 
 impl SearchSnapshot {
-    /// Search with independent event, cell, wall-time, and cancellation bounds.
+    /// Search with deterministic event, cell, and cancellation bounds.
     /// Sampling remains once per complete timestamp, preserving replay search's
     /// visible-frame and strict directional-boundary semantics.
     pub(crate) fn search(
@@ -139,7 +135,6 @@ impl SearchSnapshot {
         if needle.is_empty() {
             return SearchResult::NoMatch;
         }
-        let started = Instant::now();
         let mut rows = self.base_rows;
         let mut cols = self.base_cols;
         let mut cells = usize::from(rows).saturating_mul(usize::from(cols));
@@ -154,7 +149,7 @@ impl SearchSnapshot {
             if cancelled.load(Ordering::Relaxed) {
                 return SearchResult::Cancelled;
             }
-            if scanned >= SEARCH_SNAPSHOT_MAX_EVENTS || started.elapsed() >= SEARCH_SCAN_MAX_TIME {
+            if scanned >= self.max_events {
                 return SearchResult::Incomplete;
             }
             let at_ms = first.at_ms;
@@ -178,19 +173,21 @@ impl SearchSnapshot {
                     }
                 }
             }
-            // Snapshot truncation can split a same-millisecond group. Never
-            // sample its partial final frame as a match.
-            if self.incomplete && events.peek().is_none() {
-                return SearchResult::Incomplete;
-            }
             // A timestamp is one visible frame: sample only after all events at
             // that millisecond have been applied.
-            let frame_cells = usize::from(rows).saturating_mul(usize::from(cols));
-            cells = cells.saturating_add(frame_cells);
-            if cells > SEARCH_SCAN_MAX_CELLS || started.elapsed() >= SEARCH_SCAN_MAX_TIME {
-                return SearchResult::Incomplete;
+            let candidate = if reverse {
+                at_ms < from_ms
+            } else {
+                at_ms > from_ms
+            };
+            if candidate {
+                let frame_cells = usize::from(rows).saturating_mul(usize::from(cols));
+                cells = cells.saturating_add(frame_cells);
+                if cells > SEARCH_SCAN_MAX_CELLS {
+                    return SearchResult::Incomplete;
+                }
             }
-            let found = grid_text(&emu).to_lowercase().contains(&needle);
+            let found = candidate && grid_text(&emu).to_lowercase().contains(&needle);
             if cancelled.load(Ordering::Relaxed) {
                 return SearchResult::Cancelled;
             }
@@ -202,9 +199,6 @@ impl SearchSnapshot {
                 } else if at_ms > from_ms {
                     return SearchResult::Match(at_ms);
                 }
-            }
-            if started.elapsed() >= SEARCH_SCAN_MAX_TIME {
-                return SearchResult::Incomplete;
             }
         }
         if cancelled.load(Ordering::Relaxed) {
@@ -250,38 +244,28 @@ impl Recording {
         (self.identity, self.revision)
     }
 
-    /// Capture a bounded immutable prefix for off-loop search. A truncated
-    /// snapshot is marked incomplete so a miss can never be reported as final.
+    /// Clone the retained ring for off-loop search. THE-553's logical recording
+    /// budget bounds this deterministic copy: each event consumes at least its
+    /// fixed entry charge, and payload bytes also count toward that budget.
     pub(crate) fn search_snapshot(&self) -> SearchSnapshot {
-        let started = Instant::now();
-        let mut events = Vec::with_capacity(self.events.len().min(SEARCH_SNAPSHOT_MAX_EVENTS));
-        let mut bytes = 0usize;
-        let mut incomplete = false;
-        for event in &self.events {
-            if events.len() >= SEARCH_SNAPSHOT_MAX_EVENTS
-                || started.elapsed() >= SEARCH_SNAPSHOT_MAX_CAPTURE
+        let max_events = usize::try_from(self.budget.max_bytes / REPLAY_ENTRY_OVERHEAD_BYTES)
+            .unwrap_or(usize::MAX);
+        let mut events: Vec<Event> = self.events.iter().take(max_events).cloned().collect();
+        let incomplete = self.events.len() > max_events;
+        if incomplete {
+            let truncated_at_ms = events.last().map(|event| event.at_ms);
+            while events
+                .last()
+                .is_some_and(|event| Some(event.at_ms) == truncated_at_ms)
             {
-                incomplete = true;
-                break;
+                events.pop();
             }
-            let charge = match &event.kind {
-                EventKind::Bytes(payload) => payload.len(),
-                EventKind::Resize { .. } => 0,
-            };
-            if bytes.saturating_add(charge) > SEARCH_SNAPSHOT_MAX_BYTES {
-                incomplete = true;
-                break;
-            }
-            bytes += charge;
-            events.push(event.clone());
-        }
-        if events.len() < self.events.len() {
-            incomplete = true;
         }
         SearchSnapshot {
             events,
             base_rows: self.base_rows,
             base_cols: self.base_cols,
+            max_events,
             incomplete,
         }
     }
@@ -816,14 +800,15 @@ mod tests {
     }
 
     #[test]
-    fn tiny_event_snapshot_budget_reports_incomplete_instead_of_a_miss() {
-        let mut rec = Recording::from_config(&replay_cfg(8 * 1024 * 1024), 24, 80);
+    fn default_budget_snapshot_searches_past_two_megabytes_and_1100_frames() {
+        let mut rec = Recording::from_config(&ReplayConfig::default(), 24, 80);
         let epoch = rec.epoch;
-        for _ in 0..=SEARCH_SNAPSHOT_MAX_EVENTS {
-            rec.record_resize(24, 80, epoch);
+        for i in 0..1_200u64 {
+            rec.push_bytes(&[b'x'; 1_800], epoch + Duration::from_millis(i + 1));
         }
-        let snapshot = rec.search_snapshot();
-        let payload_bytes: usize = snapshot
+        rec.push_bytes(b"\r\nneedle", epoch + Duration::from_millis(1_201));
+        rec.push_bytes(b"\r\n", epoch + Duration::from_millis(1_202));
+        let retained_payload: usize = rec
             .events
             .iter()
             .map(|event| match &event.kind {
@@ -831,21 +816,37 @@ mod tests {
                 EventKind::Resize { .. } => 0,
             })
             .sum();
-        let estimated_snapshot_bytes =
-            snapshot.events.capacity() * std::mem::size_of::<Event>() + payload_bytes;
-        assert!(snapshot.events.len() <= SEARCH_SNAPSHOT_MAX_EVENTS);
-        assert!(payload_bytes <= SEARCH_SNAPSHOT_MAX_BYTES);
-        assert!(
-            estimated_snapshot_bytes
-                <= SEARCH_SNAPSHOT_MAX_EVENTS * std::mem::size_of::<Event>()
-                    + SEARCH_SNAPSHOT_MAX_BYTES,
-            "snapshot event storage plus cloned payload stays within its accounting ceiling"
-        );
+        assert!(retained_payload > 2 * 1024 * 1024);
+        assert!(rec.events.len() > 1_100);
+
+        let snapshot = rec.search_snapshot();
+        assert_eq!(snapshot.events.len(), rec.events.len());
         let cancelled = std::sync::atomic::AtomicBool::new(false);
         assert_eq!(
-            snapshot.search("never-present", 0, false, &cancelled),
-            SearchResult::Incomplete,
-            "the event cap must not turn a truncated scan into a false no-match"
+            snapshot.search("needle", rec.end_ms(), true, &cancelled),
+            SearchResult::Match(1_201),
+            "a complete default-budget ring must find a near-tail reverse match"
+        );
+    }
+
+    #[test]
+    fn snapshot_keeps_a_retained_flood_of_tiny_resize_events_complete() {
+        let mut rec = Recording::from_config(&replay_cfg(2 * 1024 * 1024), 24, 80);
+        let epoch = rec.epoch;
+        for _ in 0..20_001 {
+            rec.record_resize(24, 80, epoch);
+        }
+        let snapshot = rec.search_snapshot();
+        assert_eq!(snapshot.events.len(), rec.events.len());
+        assert_eq!(
+            snapshot.search(
+                "never-present",
+                0,
+                false,
+                &std::sync::atomic::AtomicBool::new(false),
+            ),
+            SearchResult::NoMatch,
+            "a complete retained event flood must not hit an arbitrary snapshot cap"
         );
     }
 
