@@ -105,23 +105,7 @@ pub(crate) fn drain(
         {
             continue;
         }
-        if matches!(
-            &message,
-            VoiceMessage::CaptureComplete { .. }
-                | VoiceMessage::CaptureFailed { .. }
-                | VoiceMessage::CaptureUnresolved { .. }
-        ) {
-            voice.capture_finished(matches!(&message, VoiceMessage::CaptureUnresolved { .. }));
-        }
-        if let VoiceMessage::TranscriptSucceeded { request_id, .. }
-        | VoiceMessage::TranscriptFailed { request_id, .. }
-        | VoiceMessage::TranscriptUnresolved { request_id, .. } = &message
-        {
-            voice.transcription_finished(
-                *request_id,
-                matches!(&message, VoiceMessage::TranscriptUnresolved { .. }),
-            );
-        }
+        voice.record_lifecycle_message(&message);
         let event = match message {
             VoiceMessage::CaptureComplete { pane_id, wav, .. } => {
                 VoiceEvent::CaptureComplete { pane_id, wav }
@@ -132,6 +116,7 @@ pub(crate) fn drain(
             VoiceMessage::CaptureUnresolved {
                 pane_id, reason, ..
             } => VoiceEvent::CaptureFailed { pane_id, reason },
+            VoiceMessage::CaptureReaped { .. } => continue,
             VoiceMessage::TranscriptSucceeded {
                 pane_id,
                 request_id,
@@ -159,6 +144,7 @@ pub(crate) fn drain(
                 request_id,
                 reason,
             },
+            VoiceMessage::TranscriptReaped { .. } => continue,
             VoiceMessage::MaxDuration { pane_id, .. } => VoiceEvent::MaxDuration { pane_id },
         };
         apply_event(voice, event, waker, Some(model), Some(panes), focused_pane);

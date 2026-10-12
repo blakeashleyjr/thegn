@@ -12666,8 +12666,11 @@ async fn event_loop<T: Terminal>(
             != crate::center::Grow::Tiled
             && eff_zoom != Some(crate::focus::Zone::Center);
         model.sync_panes = sync_panes;
-        model.mode_chip =
-            crate::voice::mode_chip(mode, current_config.ui.full_mode_chip, voice.is_recording());
+        model.mode_chip = crate::voice::mode_chip(
+            mode,
+            current_config.ui.full_mode_chip,
+            voice.is_recording() || voice.shutdown_pending(),
+        );
         model.keyhints = crate::keyhint::context_hints(&focus, &panel_ui, keymap.config());
         model.sidebar_hints = crate::sidebar_keytable::footer_hints(
             keymap.config(),
