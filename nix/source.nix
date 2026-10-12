@@ -15,6 +15,7 @@
 #   - `config/**`                     ← thegn-core file_manager/yazi.rs + help/config_ref.rs
 #   - `docs/help/**`, `docs/cli.md`   ← thegn-host help pages
 #   - `docs/api/**`                   ← thegn-core tests/plugin_api_wire.rs snapshot
+#   - `LICENSE-MIT`, `LICENSE-APACHE` ← installed package license texts
 #
 # If you add an `include_str!` that reaches outside `crates/`, add its path here
 # or the sandboxed build fails with a missing file. Prefer whole directories
@@ -23,6 +24,8 @@
   roots = [
     "Cargo.toml"
     "Cargo.lock"
+    "LICENSE-MIT"
+    "LICENSE-APACHE"
     ".cargo"
     "crates"
     "vendor/termwiz" # Cargo.toml patches termwiz to this path dependency.
