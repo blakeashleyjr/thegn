@@ -235,6 +235,7 @@ mod tests {
         let mut model = crate::chrome::FrameModel::default();
         model.panel.media = Some(state());
         let mut ui = crate::panel::PanelUi {
+            tab: crate::panel::PanelTab::System,
             width: crate::layout::PanelWidth::Full,
             ..Default::default()
         };
@@ -474,7 +475,7 @@ mod tests {
         let (model, mut ui) = collection_fixture(thegn_core::media::MAX_QUEUE_ITEMS);
         ui.open = Section::Media;
         let sources = ui.media.sources.len();
-        let radius = 30_usize.max(8) * 2 + 2;
+        let radius = 30_usize * 2 + 2;
 
         ui.cursor = 0;
         let ctx = SectionCtx {
