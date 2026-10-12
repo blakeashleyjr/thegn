@@ -2216,11 +2216,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
         backend: spec.backend.label(),
     });
     let ssh_secret_env = ssh_oci_secret_env(spec);
-    let (argv, stdin) = oci_create_argv_and_stdin(
-        spec,
-        oci_create_opts_with_ssh_secrets(spec, &ssh_secret_env)?,
-        &ssh_secret_env,
-    );
+    let (argv, stdin) = oci_create_argv_and_stdin(spec, oci_create_opts(spec)?, &ssh_secret_env);
     // Keep the create's stderr: it is the only place the runtime says WHY, and
     // for the commonest macOS failure (a bind the VM cannot resolve) it names the
     // exact path. `run_control_owned` would drop it.
@@ -2266,7 +2262,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
         remove_container(spec);
         let (retry, stdin) = oci_create_argv_and_stdin(
             spec,
-            oci_create_opts_with_keep_id_and_ssh_secrets(spec, false, &ssh_secret_env)?,
+            oci_create_opts_with_keep_id(spec, false)?,
             &ssh_secret_env,
         );
         match stdin {
