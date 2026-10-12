@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 
 use chrono::{DateTime, Datelike, Days, Months, NaiveDate, NaiveDateTime, Timelike, Utc, Weekday};
 
-use super::{EventTime, ExpansionBudget, ExpansionError, ExpansionLimit, TzRef};
+use super::{EventTime, ExpansionBudget, ExpansionError, ExpansionLimit};
 
 /// How often a rule repeats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

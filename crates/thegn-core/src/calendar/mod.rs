@@ -989,12 +989,16 @@ fn nominal_span(e: &CalEvent) -> Option<chrono::Duration> {
         (EventTime::Date { date: a }, EventTime::Date { date: b }) if b >= a => {
             Some(b.signed_duration_since(*a))
         }
-        (EventTime::Zoned { local: a, .. }, EventTime::Zoned { local: b, .. }) if b >= a => {
+        (EventTime::Zoned { local: a, zone: za }, EventTime::Zoned { local: b, zone: zb })
+            if za == zb && b >= a =>
+        {
             Some(b.signed_duration_since(*a))
         }
         (EventTime::Instant { at: a }, EventTime::Instant { at: b }) if b >= a => {
             Some(b.signed_duration_since(*a))
         }
+        // THE-474 admission validation has not landed, so mixed shapes remain
+        // row-local InvalidSpan errors and are counted in skipped_rows.
         _ => None,
     }
 }

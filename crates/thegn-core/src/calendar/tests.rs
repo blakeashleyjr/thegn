@@ -1172,6 +1172,22 @@ fn recurrence_rejects_mixed_time_shapes_as_an_invalid_span() {
 }
 
 #[test]
+fn recurrence_rejects_zoned_endpoints_in_different_zones() {
+    // 10:00 New York to 13:00 Los Angeles is six elapsed hours, but there is
+    // no single wall-time frame in which nominal_span can preserve that span.
+    let event = recurring(
+        zoned(2026, 6, 1, 10, 0, "America/New_York"),
+        zoned(2026, 6, 1, 13, 0, "America/Los_Angeles"),
+        "FREQ=DAILY;COUNT=1",
+    );
+    let mut budget = ExpansionBudget::default();
+    assert_eq!(
+        event.occurrences_bounded(d(2026, 6, 1), d(2026, 6, 1), Tz::UTC, &mut budget),
+        Err(ExpansionError::InvalidSpan)
+    );
+}
+
+#[test]
 fn an_all_day_recurrence_keeps_its_day_length() {
     let mut e = CalEvent::new(
         "hol",
