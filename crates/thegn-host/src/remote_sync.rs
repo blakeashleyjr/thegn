@@ -10,9 +10,11 @@
 //! there, then the working state (tracked diff + `.gitignore`-filtered untracked
 //! files) applied on top. Existing remote destinations are retained for explicit
 //! recovery. Completed destinations are refreshed from the current local state
-//! on each sync, and a path is returned only after every materialization step
-//! succeeds.
+//! once per process, and a path is returned only after every materialization
+//! step succeeds.
 
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use thegn_svc::host::OciRunner;
@@ -21,6 +23,61 @@ use thegn_svc::host::OciRunner;
 /// The base sandbox image creates `/workspace`, so the container path is fixed
 /// and decoupled from the (remote, `$HOME`-relative) host path.
 const REMOTE_WORKTREE_DEST: &str = "/workspace";
+
+/// Successful remote worktrees for this process. Per-key locks serialize the
+/// first materialization so concurrent pane preparation shares its result.
+#[derive(Default)]
+struct SyncCache {
+    synced: Mutex<HashMap<String, String>>,
+    in_flight: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+static SYNCED: LazyLock<SyncCache> = LazyLock::new(SyncCache::default);
+
+fn sync_once(
+    cache: &SyncCache,
+    key: &str,
+    sync: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    if let Some(path) = cache
+        .synced
+        .lock()
+        .map_err(|_| "remote worktree sync cache is poisoned".to_string())?
+        .get(key)
+        .cloned()
+    {
+        return Ok(path);
+    }
+
+    let key_lock = cache
+        .in_flight
+        .lock()
+        .map_err(|_| "remote worktree sync lock map is poisoned".to_string())?
+        .entry(key.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    let _guard = key_lock
+        .lock()
+        .map_err(|_| "remote worktree sync lock is poisoned".to_string())?;
+
+    if let Some(path) = cache
+        .synced
+        .lock()
+        .map_err(|_| "remote worktree sync cache is poisoned".to_string())?
+        .get(key)
+        .cloned()
+    {
+        return Ok(path);
+    }
+
+    let path = sync()?;
+    cache
+        .synced
+        .lock()
+        .map_err(|_| "remote worktree sync cache is poisoned".to_string())?
+        .insert(key.to_string(), path.clone());
+    Ok(path)
+}
 
 /// Guard a REMOTE placement that resolved to a bare `Backend::None`. A remote
 /// SSH placement has no container to hold the synced worktree, so degrading to
@@ -204,8 +261,12 @@ pub(crate) fn retarget_if_remote_oci(
             thegn_core::host::mount_remote_worktree(spec, &remote_path, REMOTE_WORKTREE_DEST)
         }
         Err(e) => {
-            warnings.push(format!("remote worktree sync failed: {e}"));
-            thegn_core::msg::warn(&format!("remote worktree sync failed for {worktree}: {e}"));
+            let warning = format!(
+                "remote worktree sync failed: {e}; manual recovery on the remote host: run `rm -rf \"$HOME/thegn-worktrees/{0}\" \"$HOME/thegn-worktrees/{0}.thegn-incomplete\" \"$HOME/thegn-worktrees/{0}.bundle\"`, then retry",
+                spec.name
+            );
+            warnings.push(warning.clone());
+            thegn_core::msg::warn(&format!("{warning} (worktree {worktree})"));
         }
     }
 }
@@ -256,9 +317,22 @@ pub(crate) fn degrade_oci_runtime(spec: &mut thegn_core::sandbox::SandboxSpec) -
 /// Sync `worktree` to `runner`'s remote host under `~/thegn-worktrees/<slug>`
 /// and return the resolved absolute remote path. `slug` should be the sandbox
 /// container name (deterministic + unique per worktree), so the materialized
-/// tree maps 1:1 to the container that binds it. Existing destinations and
-/// failed attempts are retained.
+/// tree maps 1:1 to the container that binds it. A successful sync is cached
+/// by worktree for this process; a later process refreshes the destination.
+/// Existing destinations and failed attempts are retained.
 pub(crate) fn sync_worktree(
+    runner: &OciRunner,
+    worktree: &str,
+    slug: &str,
+    recursive_submodules: bool,
+    warnings: &mut Vec<String>,
+) -> Result<String, String> {
+    sync_once(&SYNCED, worktree, || {
+        sync_worktree_uncached(runner, worktree, slug, recursive_submodules, warnings)
+    })
+}
+
+fn sync_worktree_uncached(
     runner: &OciRunner,
     worktree: &str,
     slug: &str,
@@ -385,8 +459,15 @@ pub(crate) fn sync_worktree(
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_command, refresh_command, restore_command, should_apply_tracked_diff};
+    use super::{
+        SyncCache, claim_command, refresh_command, restore_command, should_apply_tracked_diff,
+        sync_once,
+    };
     use std::process::Command;
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     fn temp_home(label: &str) -> std::path::PathBuf {
         let home = std::env::temp_dir().join(format!(
@@ -650,5 +731,55 @@ mod tests {
         std::fs::write(&tracked, "changed\n").unwrap();
         assert!(should_apply_tracked_diff(home.to_str().unwrap()).unwrap());
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn second_sync_for_worktree_uses_cached_path_without_refresh() {
+        let cache = SyncCache::default();
+        let calls = AtomicUsize::new(0);
+        let first = sync_once(&cache, "/repo/worktree", || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok("/remote/thegn-worktrees/sandbox".to_string())
+        })
+        .unwrap();
+        let second = sync_once(&cache, "/repo/worktree", || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok("unexpected refresh".to_string())
+        })
+        .unwrap();
+
+        assert_eq!(first, "/remote/thegn-worktrees/sandbox");
+        assert_eq!(second, first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_syncs_for_worktree_run_materialization_once() {
+        let cache = Arc::new(SyncCache::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let cache = Arc::clone(&cache);
+            let calls = Arc::clone(&calls);
+            let start = Arc::clone(&start);
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                sync_once(&cache, "/repo/worktree", || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok("/remote/thegn-worktrees/sandbox".to_string())
+                })
+                .unwrap()
+            }));
+        }
+        start.wait();
+        let paths = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths[0], "/remote/thegn-worktrees/sandbox");
+        assert_eq!(paths[1], paths[0]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
