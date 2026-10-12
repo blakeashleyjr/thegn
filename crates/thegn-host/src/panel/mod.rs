@@ -419,7 +419,7 @@ pub enum Stage {
 
 /// One row of the changes section: porcelain status joined with the
 /// diffstat, path split for the dim-dir + bright-name rendering.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeRow {
     /// Display status ("M", "A", "D", "!U", "?").
     pub status: String,
@@ -432,6 +432,9 @@ pub struct ChangeRow {
     pub path: String,
     pub added: u32,
     pub deleted: u32,
+    /// Typed total of the text-line counts for this file. Binary rows and
+    /// rows whose combined count exceeds the representable range are distinct.
+    pub count: thegn_svc::git::DiffCount,
     /// Typed gitlink data for an atomic submodule pointer. Its presence also
     /// means the ordinary numeric diffstat is unavailable/not applicable.
     pub submodule: Option<SubmoduleChange>,
@@ -440,6 +443,23 @@ pub struct ChangeRow {
     /// `incoming from <onto>` grouping so the merge dump reads apart from the
     /// user's own changes. Always false outside a merge.
     pub incoming: bool,
+}
+
+impl Default for ChangeRow {
+    fn default() -> Self {
+        Self {
+            status: String::new(),
+            stage: Stage::default(),
+            dir: String::new(),
+            name: String::new(),
+            path: String::new(),
+            added: 0,
+            deleted: 0,
+            count: thegn_svc::git::DiffCount::Exact(0),
+            submodule: None,
+            incoming: false,
+        }
+    }
 }
 
 /// The independently degradable submodule payload attached to a change row.
@@ -1280,14 +1300,18 @@ pub fn build_change_rows(
     diff: &[thegn_svc::git::DiffEntry],
     incoming: &std::collections::HashSet<String>,
 ) -> Vec<ChangeRow> {
-    let counts: std::collections::HashMap<&str, (u32, u32)> = diff
+    let counts: std::collections::HashMap<&str, (u32, u32, thegn_svc::git::DiffCount)> = diff
         .iter()
-        .map(|d| (d.path.as_str(), (d.added, d.deleted)))
-        .collect();
-    let binary_paths: std::collections::HashSet<&str> = diff
-        .iter()
-        .filter(|d| d.binary)
-        .map(|d| d.path.as_str())
+        .map(|d| {
+            let count = if d.binary {
+                thegn_svc::git::DiffCount::Binary
+            } else if let Some(total) = d.added.checked_add(d.deleted) {
+                thegn_svc::git::DiffCount::Exact(total)
+            } else {
+                thegn_svc::git::DiffCount::Capped
+            };
+            (d.path.as_str(), (d.added, d.deleted, count))
+        })
         .collect();
     let mut rows: Vec<ChangeRow> = status
         .iter()
@@ -1312,14 +1336,15 @@ pub fn build_change_rows(
                 })
                 .to_string(),
             };
-            let (dir, mut name) = match f.path.rsplit_once('/') {
+            let (dir, name) = match f.path.rsplit_once('/') {
                 Some((d, n)) => (format!("{d}/"), n.to_string()),
                 None => (String::new(), f.path.clone()),
             };
-            if binary_paths.contains(f.path.as_str()) {
-                name.push_str(" [binary]");
-            }
-            let (added, deleted) = counts.get(f.path.as_str()).copied().unwrap_or((0, 0));
+            let (added, deleted, count) = counts.get(f.path.as_str()).copied().unwrap_or((
+                0,
+                0,
+                thegn_svc::git::DiffCount::Exact(0),
+            ));
             ChangeRow {
                 status: status_str,
                 stage,
@@ -1329,6 +1354,7 @@ pub fn build_change_rows(
                 path: f.path.clone(),
                 added,
                 deleted,
+                count,
                 submodule: None,
             }
         })
@@ -1602,6 +1628,14 @@ mod tests {
     }
 
     #[test]
+    fn default_change_row_count_is_exact_zero() {
+        assert_eq!(
+            ChangeRow::default().count,
+            thegn_svc::git::DiffCount::Exact(0)
+        );
+    }
+
+    #[test]
     fn width_memory_recalls_per_section_and_cycles_back() {
         use crate::layout::PanelWidth;
         let mut ui = PanelUi {
@@ -1755,7 +1789,7 @@ mod tests {
     }
 
     #[test]
-    fn binary_change_rows_show_binary_marker() {
+    fn binary_change_rows_keep_typed_binary_count() {
         let status = [fstat('M', ' ', "assets/logo.png")];
         let diff = [thegn_svc::git::DiffEntry {
             path: "assets/logo.png".into(),
@@ -1764,7 +1798,23 @@ mod tests {
             binary: true,
         }];
         let rows = build_change_rows(&status, &diff, &std::collections::HashSet::new());
-        assert_eq!(rows[0].name, "logo.png [binary]");
+        assert_eq!(rows[0].name, "logo.png");
+        assert_eq!(rows[0].count, thegn_svc::git::DiffCount::Binary);
+    }
+
+    #[test]
+    fn change_row_count_caps_when_added_and_deleted_overflow() {
+        let status = [fstat('M', ' ', "src/large.rs")];
+        let diff = [thegn_svc::git::DiffEntry {
+            path: "src/large.rs".into(),
+            added: u32::MAX,
+            deleted: 1,
+            binary: false,
+        }];
+
+        let rows = build_change_rows(&status, &diff, &std::collections::HashSet::new());
+
+        assert_eq!(rows[0].count, thegn_svc::git::DiffCount::Capped);
     }
 
     #[test]
