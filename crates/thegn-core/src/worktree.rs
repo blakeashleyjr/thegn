@@ -1103,9 +1103,9 @@ mod tests {
             Err(error) => error.to_string(),
         };
 
+        let cfg = scratch_cfg(&repo);
         let error =
-            add_checked_with_state(&linked_root, "target", "main", &path, &Config::default())
-                .unwrap_err();
+            add_checked_with_state(&linked_root, "target", "main", &path, &cfg).unwrap_err();
         assert!(error.lock_unavailable);
         assert!(
             error
@@ -1139,7 +1139,8 @@ mod tests {
         let lock_path = util::git_common_dir(&repo).join("thegn-git.lock");
         std::fs::create_dir(&lock_path).unwrap();
 
-        let error = rename(&repo, &path, "old", "new", &Config::default()).unwrap_err();
+        let cfg = scratch_cfg(&repo);
+        let error = rename(&repo, &path, "old", "new", &cfg).unwrap_err();
         assert!(error.contains("mutation lock"), "{error}");
         assert!(
             error.contains(&lock_path.to_string_lossy().to_string()),
