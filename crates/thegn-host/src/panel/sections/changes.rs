@@ -10,8 +10,8 @@ use crate::seg::{Line, Seg, seg, sp};
 use crate::seg::seg_width;
 
 use super::{
-    ChangeRow, PanelHit, PanelRow, PanelUi, Section, SectionCtx, Stage, d, diffstat, f, g, g2,
-    hint_row, hue, split_bar, t,
+    ChangeRow, PanelHit, PanelRow, PanelUi, Section, SectionCtx, Stage, d, diff_count_label,
+    diffstat, f, g, g2, hint_row, hue, split_bar, t,
 };
 
 pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
@@ -330,6 +330,9 @@ fn change_row(c: &ChangeRow, i: usize, on: bool, deep: bool, cols: usize) -> Pan
     let r: Vec<Seg> = match c.stage {
         Stage::Conflict if !on => vec![seg(hue(Hue::Red), "resolve ").bold(), seg(g2(), "↵")],
         Stage::Untracked => vec![seg(g2(), "new")],
+        _ if let Some(label) = diff_count_label(c.count) => {
+            vec![seg(hue(Hue::Amber), label)]
+        }
         _ => {
             let mut v = diffstat(c.added, c.deleted);
             v.push(sp(1));
@@ -448,13 +451,37 @@ fn state_tok(c: &ChangeRow, submodule: &crate::panel::SubmoduleChange) -> crate:
 /// (while collapsed) an `e expand` affordance — expanding the section reveals the
 /// individual incoming rows beneath it.
 fn incoming_divider(data: &crate::panel::PanelData, deep: bool, _cols: usize) -> PanelRow {
-    let (n, added, deleted) = data
-        .changes
-        .iter()
-        .filter(|c| c.incoming)
-        .fold((0usize, 0u32, 0u32), |(n, a, d), c| {
-            (n + 1, a + c.added, d + c.deleted)
-        });
+    let (n, added, deleted, saw_text, saw_binary) =
+        data.changes.iter().filter(|c| c.incoming).fold(
+            (
+                0usize,
+                thegn_svc::git::DiffCount::Exact(0),
+                thegn_svc::git::DiffCount::Exact(0),
+                false,
+                false,
+            ),
+            |(n, added, deleted, saw_text, saw_binary), c| {
+                let add = |total, amount| match total {
+                    thegn_svc::git::DiffCount::Exact(value) => value
+                        .checked_add(amount)
+                        .map(thegn_svc::git::DiffCount::Exact)
+                        .unwrap_or(thegn_svc::git::DiffCount::Capped),
+                    state => state,
+                };
+                let (added, deleted, saw_text, saw_binary) =
+                    if c.count == thegn_svc::git::DiffCount::Binary {
+                        (added, deleted, saw_text, true)
+                    } else {
+                        (
+                            add(added, c.added),
+                            add(deleted, c.deleted),
+                            true,
+                            saw_binary,
+                        )
+                    };
+                (n + 1, added, deleted, saw_text, saw_binary)
+            },
+        );
     let onto = data
         .merge
         .as_ref()
@@ -465,7 +492,22 @@ fn incoming_divider(data: &crate::panel::PanelData, deep: bool, _cols: usize) ->
         seg(hue(Hue::Amber), "◇ "),
         seg(f(), format!("{n} incoming from {onto}")),
     ];
-    let mut r = diffstat(added, deleted);
+    let mut r = match (added, deleted) {
+        (thegn_svc::git::DiffCount::Capped, _) | (_, thegn_svc::git::DiffCount::Capped) => {
+            vec![seg(hue(Hue::Amber), "capped")]
+        }
+        (thegn_svc::git::DiffCount::Unavailable, _)
+        | (_, thegn_svc::git::DiffCount::Unavailable) => {
+            vec![seg(hue(Hue::Amber), "unavailable")]
+        }
+        (thegn_svc::git::DiffCount::Exact(added), thegn_svc::git::DiffCount::Exact(deleted)) => {
+            diffstat(added, deleted)
+        }
+        _ => vec![seg(hue(Hue::Amber), "bin")],
+    };
+    if !saw_text && saw_binary {
+        r = vec![seg(hue(Hue::Amber), "bin")];
+    }
     if !deep {
         r.push(sp(1));
         r.push(seg(g(), "e expand"));
@@ -735,6 +777,7 @@ mod tests {
             path: "crates/thegn-host/src/changes.rs".into(),
             added: 3,
             deleted: 1,
+            count: thegn_svc::git::DiffCount::Exact(4),
             submodule: None,
             incoming: false,
         };
@@ -774,6 +817,7 @@ mod tests {
                 path: "src/a.rs".into(),
                 added: 30,
                 deleted: 10,
+                count: thegn_svc::git::DiffCount::Exact(40),
                 submodule: None,
                 incoming: false,
             }],
@@ -857,6 +901,7 @@ mod tests {
             path: path.into(),
             added,
             deleted: 0,
+            count: thegn_svc::git::DiffCount::Exact(added),
             submodule: None,
             incoming,
         }
@@ -942,6 +987,74 @@ mod tests {
             !out.contains("e expand"),
             "no collapse hint when open: {out}"
         );
+    }
+
+    #[test]
+    fn incoming_total_overflow_renders_capped_without_panicking() {
+        let model = crate::chrome::FrameModel {
+            panel: crate::panel::PanelData {
+                changes: vec![
+                    chg("core/src/huge.rs", true, u32::MAX),
+                    chg("core/src/extra.rs", true, 1),
+                ],
+                merge: Some(crate::panel::MergeBanner {
+                    label: "MERGING".into(),
+                    onto: "main".into(),
+                    unresolved: 0,
+                    total: None,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ui = PanelUi {
+            open: Section::Changes,
+            width: crate::layout::PanelWidth::Normal,
+            ..Default::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 44,
+            rows: 28,
+        };
+
+        assert!(flat(&content(&ctx)).contains("capped"));
+    }
+
+    #[test]
+    fn non_exact_change_counts_render_typed_labels() {
+        let mut binary = chg("assets/logo.png", false, 0);
+        binary.count = thegn_svc::git::DiffCount::Binary;
+        let mut capped = chg("src/large.rs", false, u32::MAX);
+        capped.count = thegn_svc::git::DiffCount::Capped;
+        let model = crate::chrome::FrameModel {
+            panel: crate::panel::PanelData {
+                changes: vec![binary, capped],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ui = PanelUi {
+            open: Section::Changes,
+            width: crate::layout::PanelWidth::Half,
+            ..Default::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 70,
+            rows: 28,
+        };
+
+        let rendered = flat(&content(&ctx));
+        assert!(rendered.contains("bin"), "binary marker: {rendered}");
+        assert!(rendered.contains("capped"), "capped marker: {rendered}");
+        assert!(
+            rendered.contains("logo.png"),
+            "filename retained: {rendered}"
+        );
+        assert!(!rendered.contains("[binary]"), "no name suffix: {rendered}");
     }
 
     #[test]

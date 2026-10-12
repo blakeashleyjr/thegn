@@ -712,6 +712,7 @@ mod tests {
             path: path.into(),
             added: 10,
             deleted: 2,
+            count: thegn_svc::git::DiffCount::Exact(12),
             submodule: None,
             incoming: false,
         }
