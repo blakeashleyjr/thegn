@@ -1014,7 +1014,6 @@ impl Builder {
     fn finish(self, default_zone: &str, report: &mut IcsReport) -> Option<CalEvent> {
         let start = self.start?;
         if self.end.is_some() && self.duration_seen {
-            report.record(IcsDiagnostic::InvalidEvent);
             return None;
         }
         // RFC 5545: DTEND is optional. With a DURATION, add it; with neither, a
@@ -1047,7 +1046,6 @@ impl Builder {
                 EventTime::Zoned { local, zone } => {
                     let Some(local) = local.checked_add_signed(self.duration.unwrap_or_default())
                     else {
-                        report.record(IcsDiagnostic::InvalidEvent);
                         return None;
                     };
                     EventTime::Zoned {
@@ -1057,7 +1055,6 @@ impl Builder {
                 }
                 EventTime::Instant { at } => {
                     let Some(at) = at.checked_add_signed(self.duration.unwrap_or_default()) else {
-                        report.record(IcsDiagnostic::InvalidEvent);
                         return None;
                     };
                     EventTime::Instant { at }

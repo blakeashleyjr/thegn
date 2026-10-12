@@ -25,7 +25,7 @@ fn plugin_event_with_empty_uid_is_refused_before_admission() {
 
     assert!(matches!(
         sink.events_line(line),
-        Err(CalendarError::Parse(_))
+        Err(CalendarError::Parse(message)) if message.contains("invalid event (element 0: empty UID)")
     ));
     assert!(sink.admitted.events.is_empty());
 }
@@ -37,7 +37,7 @@ fn plugin_event_with_mixed_date_and_timed_end_is_refused() {
 
     assert!(matches!(
         sink.events_line(line),
-        Err(CalendarError::Parse(_))
+        Err(CalendarError::Parse(message)) if message.contains("invalid event (element 0: mixed all-day and timed endpoints)")
     ));
     assert!(sink.admitted.events.is_empty());
 }
