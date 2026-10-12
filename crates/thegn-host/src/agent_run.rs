@@ -88,7 +88,9 @@ pub(crate) struct AgentTaskRun<'a> {
 /// How a queue's opt-in agent floor resolves for one dispatch — the attribution
 /// split. A fail-closed miss (or an unbuildable sandbox under a demanded floor)
 /// is [`InfraHold`](AgentDispatch::InfraHold): the queue entry is held, never the
-/// branch/PR marked failed (the merge-guard doctrine).
+/// branch/PR marked failed (the merge-guard doctrine). A runnable spec is also
+/// provisioned and preflighted before this gate returns; VPN-requiring specs are
+/// held until queued dispatch can attach their tunnel.
 pub(crate) enum AgentDispatch {
     /// Run the task; `Some(spec)` runs it inside that sandbox, `None` on the host.
     Run(Option<thegn_core::sandbox::SandboxSpec>),
@@ -98,10 +100,47 @@ pub(crate) enum AgentDispatch {
     InfraHold(String),
 }
 
+/// Provision a resolved dispatch target before a queue can claim its work.
+/// VPN attachment is not yet supported for queued agents, so a requested VPN
+/// fails closed instead of entering a sandbox without its required network.
+fn provision_dispatch(
+    dispatch: AgentDispatch,
+    provision: &dyn Fn(&thegn_core::sandbox::SandboxSpec) -> Result<(), String>,
+) -> AgentDispatch {
+    let (spec, degraded_warning) = match dispatch {
+        AgentDispatch::Run(None) => return AgentDispatch::Run(None),
+        AgentDispatch::RunDegraded(None, warning) => {
+            return AgentDispatch::RunDegraded(None, warning);
+        }
+        AgentDispatch::InfraHold(reason) => return AgentDispatch::InfraHold(reason),
+        AgentDispatch::Run(Some(spec)) => (spec, None),
+        AgentDispatch::RunDegraded(Some(spec), warning) => (spec, Some(warning)),
+    };
+
+    if spec.vpn.is_some() {
+        return AgentDispatch::InfraHold(format!(
+            "sandbox `{}` requests a VPN, which queued agent dispatch cannot attach yet (THE-304); held",
+            spec.name
+        ));
+    }
+    if let Err(error) = provision(&spec) {
+        return AgentDispatch::InfraHold(format!(
+            "agent sandbox `{}` could not be provisioned: {error}",
+            spec.name
+        ));
+    }
+    match degraded_warning {
+        Some(warning) => AgentDispatch::RunDegraded(Some(spec), warning),
+        None => AgentDispatch::Run(Some(spec)),
+    }
+}
+
 /// Resolve a queue agent task's sandbox + floor into a dispatch decision. With
 /// the opt-in off this is always `Run(None)` (host + slice, unchanged). With it
 /// on, the worktree's sandbox is resolved and its honest class compared against
 /// the demanded floor via the pure [`thegn_core::sandbox_floor::agent_task_gate`].
+/// Before returning a runnable dispatch, this gate ensures the sandbox and
+/// proves it can execute a noninteractive preflight command.
 pub(crate) fn agent_floor_gate(
     full: &thegn_core::config::Config,
     worktree: &str,
@@ -138,11 +177,15 @@ pub(crate) fn agent_floor_gate(
     }
     let resolved = spec.as_ref().map(|s| s.capabilities().isolation);
     let best = resolved.unwrap_or(IsolationClass::HostProcess);
-    match agent_task_gate(true, floor, on_miss, resolved, best) {
+    let dispatch = match agent_task_gate(true, floor, on_miss, resolved, best) {
         AgentGate::Run => AgentDispatch::Run(spec),
         AgentGate::RunDegraded(w) => AgentDispatch::RunDegraded(spec, w),
         AgentGate::InfraHold(r) => AgentDispatch::InfraHold(r),
-    }
+    };
+    provision_dispatch(dispatch, &|spec| {
+        thegn_core::sandbox::ensure(spec).map_err(|error| format!("{error:#}"))?;
+        thegn_core::sandbox_preflight::preflight_exec(spec)
+    })
 }
 
 /// Run the agent to completion and report whether it exited zero.
@@ -939,6 +982,7 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     fn vars() -> TaskVars {
         TaskVars::new()
@@ -957,6 +1001,105 @@ mod tests {
             sandbox: None,
             credential_free: false,
         }
+    }
+
+    fn sandbox_spec() -> thegn_core::sandbox::SandboxSpec {
+        thegn_core::sandbox::SandboxSpec {
+            backend: thegn_core::sandbox::Backend::Bwrap,
+            placement: thegn_core::placement::Placement::Local,
+            image: None,
+            worktree: std::path::PathBuf::from("/repo"),
+            mounts: Vec::new(),
+            env: Vec::new(),
+            env_overrides: std::collections::HashMap::new(),
+            env_block: Vec::new(),
+            network: thegn_core::config::Network::Nat,
+            network_allow: Vec::new(),
+            network_block: Vec::new(),
+            read_only_root: false,
+            no_new_privileges: false,
+            pids_limit: None,
+            drop_capabilities: Vec::new(),
+            add_capabilities: Vec::new(),
+            file_access: thegn_core::config::FileAccess::Worktree,
+            ports: Vec::new(),
+            gpu: None,
+            limits: thegn_core::sandbox::SandboxLimits::default(),
+            volumes: Vec::new(),
+            compose: None,
+            build: None,
+            init_script: None,
+            devenv: false,
+            devenv_path: None,
+            name: "agent-preflight-test".into(),
+            vpn: None,
+            oci_host: None,
+            oci_runtime: None,
+            daemon_persistent: false,
+            seal_home: None,
+        }
+    }
+
+    #[test]
+    fn provisioning_leaves_host_dispatch_unchanged() {
+        let calls = Cell::new(0);
+        let dispatch = provision_dispatch(AgentDispatch::Run(None), &|_| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert!(matches!(dispatch, AgentDispatch::Run(None)));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn provisioning_failure_holds_the_named_sandbox() {
+        let spec = sandbox_spec();
+        let name = spec.name.clone();
+        let dispatch = provision_dispatch(AgentDispatch::Run(Some(spec)), &|_| {
+            Err("exec probe failed: boom".into())
+        });
+        match dispatch {
+            AgentDispatch::InfraHold(reason) => {
+                assert!(reason.contains(&name));
+                assert!(reason.contains("boom"));
+            }
+            _ => panic!("provisioning failure must hold dispatch"),
+        }
+    }
+
+    #[test]
+    fn successful_provisioning_preserves_degraded_warning() {
+        let spec = sandbox_spec();
+        let calls = Cell::new(0);
+        let dispatch =
+            provision_dispatch(AgentDispatch::RunDegraded(Some(spec), "w".into()), &|_| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            });
+        assert!(matches!(dispatch, AgentDispatch::RunDegraded(Some(_), warning) if warning == "w"));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn vpn_request_holds_without_provisioning() {
+        let mut spec = sandbox_spec();
+        let vpn_config = thegn_core::config::VpnConfig {
+            provider: thegn_core::config::VpnProviderKind::Tailscale,
+            ..Default::default()
+        };
+        spec.vpn = thegn_core::sandbox::build_vpn_spec(
+            &vpn_config,
+            &spec.name,
+            thegn_core::config::SandboxProfile::Hardened,
+        );
+        assert!(spec.vpn.is_some());
+        let calls = Cell::new(0);
+        let dispatch = provision_dispatch(AgentDispatch::Run(Some(spec)), &|_| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert!(matches!(dispatch, AgentDispatch::InfraHold(reason) if reason.contains("VPN")));
+        assert_eq!(calls.get(), 0);
     }
 
     #[test]
