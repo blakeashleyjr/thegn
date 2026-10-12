@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
+use std::time::Duration;
 use thegn_core::git_operand as op;
 use thegn_core::gitrefs::{BranchInfo, Commit, StashEntry};
 use thegn_core::reflog::ReflogEntry;
@@ -58,6 +59,10 @@ pub(crate) const SANITIZED_DIFF: &[&str] = &[
     "--no-renames",
     "-U3",
 ];
+
+// Fetch and push can hold this per-command lock while waiting on a remote.
+// Keep the wait long enough for ordinary transfers without blocking forever.
+const MUTATION_LOCK_WAIT: Duration = Duration::from_secs(120);
 
 /// A changed file in `git status` terms (porcelain XY + path).
 #[derive(Debug, Clone)]
@@ -1886,11 +1891,27 @@ fn run_root(root: &Path, args: &[&str]) -> Result<()> {
 }
 
 fn require_mutation_lock(worktree: &Path, args: &[&str]) -> Result<thegn_core::util::GitLock> {
-    thegn_core::util::lock_git_mutations(worktree).ok_or_else(|| {
+    require_mutation_lock_within(worktree, args, MUTATION_LOCK_WAIT)
+}
+
+fn require_mutation_lock_within(
+    worktree: &Path,
+    args: &[&str],
+    wait: Duration,
+) -> Result<thegn_core::util::GitLock> {
+    thegn_core::util::try_lock_git_mutations_within(worktree, wait).map_err(|error| {
+        tracing::warn!(
+            target: "thegn::git",
+            worktree = %worktree.display(),
+            git_args = %args.join(" "),
+            error = %error,
+            "could not acquire required git-mutation lock"
+        );
         anyhow::anyhow!(
-            "refusing git {}: repository mutation lock is unavailable for {} (see thegn log)",
+            "refusing git {}: repository mutation lock is unavailable for {}: {} (see thegn log)",
             args.join(" "),
-            worktree.display()
+            worktree.display(),
+            error
         )
     })
 }
@@ -2440,6 +2461,46 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn require_mutation_lock_within_refuses_a_held_lock_without_running_git() {
+        let dir = tempfile::tempdir().unwrap();
+        testutil::git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("tracked.txt"), "before\n").unwrap();
+        testutil::git_in(dir.path(), &["add", "--", "tracked.txt"]);
+        testutil::git_in(dir.path(), &["commit", "-q", "-m", "initial"]);
+        let held = thegn_core::util::try_lock_git_mutations(dir.path()).unwrap();
+        let worktree = dir.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = super::require_mutation_lock_within(
+                &worktree,
+                &["branch", "bounded-lock-test"],
+                Duration::from_millis(100),
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+            sender.send(result).unwrap();
+        });
+
+        let error = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bounded lock acquisition must return promptly")
+            .expect_err("the held lock must refuse the required mutation");
+        assert!(error.contains("mutation lock"));
+        assert!(error.contains("see thegn log"));
+        assert!(
+            super::run(
+                &GitLoc::for_worktree(dir.path()),
+                &["branch", "--list", "bounded-lock-test"]
+            )
+            .unwrap()
+            .is_empty(),
+            "the mutation command must not run after bounded acquisition fails"
+        );
+        drop(held);
+        worker.join().unwrap();
     }
 
     #[test]
