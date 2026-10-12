@@ -214,26 +214,51 @@ fn drive_claim(
     // This edge is best-effort and never releases the durable claim.  A
     // provider outage must leave the run visible for a human to inspect.
     let tracker_cfg = tracker_config_for_account(cfg, repo_root, account);
-    let router = thegn_svc::issue::IssueRouter::from_config_at(&tracker_cfg, Some(cwd));
-    if router.is_configured()
-        && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+    let router = autopilot_issue_router(
+        &tracker_cfg,
+        cwd,
+        account,
+        crate::plugin_providers::issue_backends(),
+    );
+    if !router.is_configured() {
+        mark_needs_human(
+            db,
+            run_id,
+            AutopilotState::Claimed,
+            Some(dispatch_id),
+            &format!("no tracker route for autopilot account {account}"),
+        );
+        return;
+    }
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
     {
-        let patch = IssuePatch {
-            status: Some(thegn_core::issue::IssueStatus::InProgress),
-            ..Default::default()
-        };
-        if let Err(e) = rt.block_on(router.update_issue(&issue.id, &patch)) {
+        Ok(rt) => rt,
+        Err(error) => {
             mark_needs_human(
                 db,
                 run_id,
                 AutopilotState::Claimed,
                 Some(dispatch_id),
-                &format!("issue status update failed: {e}"),
+                &format!("issue runtime build failed: {error}"),
             );
             return;
         }
+    };
+    let patch = IssuePatch {
+        status: Some(thegn_core::issue::IssueStatus::InProgress),
+        ..Default::default()
+    };
+    if let Err(e) = rt.block_on(router.update_issue(&issue.id, &patch)) {
+        mark_needs_human(
+            db,
+            run_id,
+            AutopilotState::Claimed,
+            Some(dispatch_id),
+            &format!("issue status update failed: {e}"),
+        );
+        return;
     }
 
     match db.transition_autopilot(
@@ -565,12 +590,37 @@ fn tracker_config_for_account(
     account: &str,
 ) -> thegn_core::config::IssuesConfig {
     let mut tracker_cfg = cfg.repo_issues(Some(repo_root));
-    if !tracker_cfg.issue_accounts.is_empty() {
-        tracker_cfg
-            .issue_accounts
-            .retain(|entry| entry.name == account);
+    let matched = tracker_cfg
+        .active_accounts()
+        .iter()
+        .any(|entry| entry.name == account);
+    tracker_cfg
+        .issue_accounts
+        .retain(|entry| entry.name == account);
+    if !matched {
+        tracker_cfg.issue_accounts.clear();
+        tracker_cfg.accounts_restricted = true;
     }
     tracker_cfg
+}
+
+/// Build the same account-scoped route used by tracker hydration, including
+/// plugin providers registered for this account.
+fn autopilot_issue_router(
+    tracker_cfg: &thegn_core::config::IssuesConfig,
+    dir: &Path,
+    account: &str,
+    plugins: Vec<(String, Box<dyn thegn_svc::issue::IssueBackend>)>,
+) -> thegn_svc::issue::IssueRouter {
+    let mut router = thegn_svc::issue::IssueRouter::from_config_at(tracker_cfg, Some(dir));
+    for (plugin_account, backend) in plugins {
+        if plugin_account == account
+            && let Err(error) = router.push_backend(plugin_account, backend)
+        {
+            tracing::warn!(%error, account, "rejecting invalid autopilot issue provider");
+        }
+    }
+    router
 }
 
 /// Resolve the issue worker's isolation boundary independently of the normal
@@ -732,26 +782,51 @@ pub(crate) fn on_pr_merged(cfg: &Config, repo_root: &Path, number: u64) {
     let policy = cfg.repo_autopilot(repo_root);
     if policy.done_on_merge {
         let tracker_cfg = tracker_config_for_account(cfg, repo_root, &run.key.account);
-        let router = thegn_svc::issue::IssueRouter::from_config_at(&tracker_cfg, Some(repo_root));
-        if router.is_configured()
-            && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
+        let router = autopilot_issue_router(
+            &tracker_cfg,
+            repo_root,
+            &run.key.account,
+            crate::plugin_providers::issue_backends(),
+        );
+        if !router.is_configured() {
+            mark_needs_human(
+                &db,
+                run.id,
+                run.state,
+                run.dispatch_id,
+                &format!("no tracker route for autopilot account {}", run.key.account),
+            );
+            return;
+        }
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
         {
-            let patch = IssuePatch {
-                status: Some(thegn_core::issue::IssueStatus::Done),
-                ..Default::default()
-            };
-            if let Err(e) = rt.block_on(router.update_issue(&run.key.issue_id, &patch)) {
+            Ok(rt) => rt,
+            Err(error) => {
                 mark_needs_human(
                     &db,
                     run.id,
                     run.state,
                     run.dispatch_id,
-                    &format!("done sync failed: {e}"),
+                    &format!("issue runtime build failed: {error}"),
                 );
                 return;
             }
+        };
+        let patch = IssuePatch {
+            status: Some(thegn_core::issue::IssueStatus::Done),
+            ..Default::default()
+        };
+        if let Err(e) = rt.block_on(router.update_issue(&run.key.issue_id, &patch)) {
+            mark_needs_human(
+                &db,
+                run.id,
+                run.state,
+                run.dispatch_id,
+                &format!("done sync failed: {e}"),
+            );
+            return;
         }
     }
     let next = match run.state {
@@ -785,8 +860,13 @@ pub(crate) fn on_pr_merged(cfg: &Config, repo_root: &Path, number: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{autopilot_backend_is_isolated, issue_prompt, worker_failure};
+    use super::{
+        autopilot_backend_is_isolated, autopilot_issue_router, issue_prompt,
+        tracker_config_for_account, worker_failure,
+    };
+    use thegn_core::issue::IssueFilter;
     use thegn_core::sandbox::Backend;
+    use thegn_svc::issue::{IssueBackend, IssueCaps, IssueError};
 
     #[test]
     fn worker_validation_reason_is_bounded_and_actionable() {
@@ -822,5 +902,137 @@ mod tests {
         assert!(prompt.contains("Rules:"));
         assert!(prompt.contains("task data omitted"));
         assert!(prompt.len() <= thegn_core::agent_task::MAX_RENDERED_PROMPT_BYTES);
+    }
+
+    #[test]
+    fn renamed_autopilot_account_does_not_resurrect_legacy_tracker_account() {
+        let cfg: thegn_core::config::Config = toml::from_str(
+            "[issues]\nprovider = \"linear\"\n\
+             [issues.linear]\napi_key = \"legacy-secret\"\n\
+             [[issues.issue_accounts]]\nname = \"work\"\nprovider = \"linear\"\n\
+             token = \"named-secret\"\n",
+        )
+        .expect("valid issue config");
+        let repo_root = tempfile::tempdir().expect("temporary repo root");
+
+        let tracker_cfg = tracker_config_for_account(&cfg, repo_root.path(), "renamed");
+
+        assert!(tracker_cfg.active_accounts().is_empty());
+    }
+
+    #[test]
+    fn plugin_account_does_not_resurrect_legacy_only_tracker_account() {
+        let cfg: thegn_core::config::Config = toml::from_str(
+            "[issues]\nprovider = \"linear\"\n\
+             [issues.linear]\napi_key = \"legacy-secret\"\n",
+        )
+        .expect("valid legacy issue config");
+        let repo_root = tempfile::tempdir().expect("temporary repo root");
+
+        let plugin_cfg = tracker_config_for_account(&cfg, repo_root.path(), "work");
+        assert!(plugin_cfg.active_accounts().is_empty());
+
+        let legacy_cfg = tracker_config_for_account(&cfg, repo_root.path(), "linear");
+        let legacy_accounts = legacy_cfg.active_accounts();
+        assert_eq!(legacy_accounts.len(), 1);
+        assert_eq!(legacy_accounts[0].name, "linear");
+    }
+
+    #[test]
+    fn autopilot_router_includes_only_the_plugin_account_that_supplied_issue() {
+        let cfg = thegn_core::config::IssuesConfig::default();
+        let repo_root = tempfile::tempdir().expect("temporary repo root");
+        let router = autopilot_issue_router(
+            &cfg,
+            repo_root.path(),
+            "demo",
+            vec![
+                (
+                    "other".into(),
+                    Box::new(PluginIssueBackend { account: "other" }) as Box<dyn IssueBackend>,
+                ),
+                (
+                    "demo".into(),
+                    Box::new(PluginIssueBackend { account: "demo" }) as Box<dyn IssueBackend>,
+                ),
+            ],
+        );
+        assert!(router.is_configured());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let detail = runtime
+            .block_on(router.get_issue("plugin:demo:1"))
+            .expect("demo provider route");
+
+        assert_eq!(detail.issue.title, "demo");
+    }
+
+    struct PluginIssueBackend {
+        account: &'static str,
+    }
+
+    impl IssueBackend for PluginIssueBackend {
+        fn provider_id(&self) -> &str {
+            "plugin:demo"
+        }
+
+        fn caps(&self) -> IssueCaps {
+            IssueCaps::default()
+        }
+
+        fn list_issues<'a>(
+            &'a self,
+            _filter: &'a IssueFilter,
+        ) -> futures::future::BoxFuture<'a, Result<Vec<thegn_core::issue::Issue>, IssueError>>
+        {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn get_issue<'a>(
+            &'a self,
+            id: &'a str,
+        ) -> futures::future::BoxFuture<'a, Result<thegn_core::issue::IssueDetail, IssueError>>
+        {
+            let account = self.account;
+            Box::pin(async move {
+                Ok(thegn_core::issue::IssueDetail {
+                    issue: thegn_core::issue::Issue {
+                        id: id.to_owned(),
+                        number: "1".into(),
+                        provider: "plugin:demo".into(),
+                        title: account.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn create_issue<'a>(
+            &'a self,
+            _draft: &'a thegn_core::issue::IssueDraft,
+        ) -> futures::future::BoxFuture<'a, Result<thegn_core::issue::Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::unsupported("create_issue")) })
+        }
+
+        fn update_issue<'a>(
+            &'a self,
+            _id: &'a str,
+            _patch: &'a thegn_core::issue::IssuePatch,
+        ) -> futures::future::BoxFuture<'a, Result<thegn_core::issue::Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::unsupported("update_issue")) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> futures::future::BoxFuture<'a, Result<Vec<thegn_core::issue::Issue>, IssueError>>
+        {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 }
