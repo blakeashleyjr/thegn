@@ -151,13 +151,18 @@ pub struct QueryEngine {
     paused: bool,
     hidden: bool,
     refresh: Duration,
-    frames_tx: mpsc::UnboundedSender<PanelUpdate>,
+    frames_tx: mpsc::Sender<PanelUpdate>,
     waker: Waker,
     gate: Arc<WakeGate>,
 }
 
 /// Bound dashboard fan-out independently of dashboard size.
 const MAX_CONCURRENT_PANELS: usize = 4;
+/// Bound completed panel results waiting for the UI to drain them.
+#[cfg(not(test))]
+const RESULT_CHANNEL_CAPACITY: usize = 16;
+#[cfg(test)]
+const RESULT_CHANNEL_CAPACITY: usize = 2;
 /// Bound target fan-out and the amount of per-panel state retained by a refresh.
 const MAX_TARGETS_PER_PANEL: usize = 32;
 /// A panel that does not finish cannot hold the next refresh forever.
@@ -192,7 +197,7 @@ impl QueryEngine {
         gate: Arc<WakeGate>,
     ) -> (
         mpsc::UnboundedSender<EngineCmd>,
-        mpsc::UnboundedReceiver<PanelUpdate>,
+        mpsc::Receiver<PanelUpdate>,
     ) {
         Self::spawn_with_window(
             rt,
@@ -221,10 +226,10 @@ impl QueryEngine {
         gate: Arc<WakeGate>,
     ) -> (
         mpsc::UnboundedSender<EngineCmd>,
-        mpsc::UnboundedReceiver<PanelUpdate>,
+        mpsc::Receiver<PanelUpdate>,
     ) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (frames_tx, frames_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
         let engine = QueryEngine {
             dashboard,
             sources,
@@ -433,31 +438,29 @@ impl QueryEngine {
             tokio::select! {
                 joined = pending.join_next_with_id() => {
                     let Some(joined) = joined else { break };
-                    match joined {
-                Ok((id, (panel_id, targets))) => {
-                    drop(job_ids.remove(&id));
-                    // Best-effort: the UI may be gone during shutdown.
-                    match self.frames_tx.send(PanelUpdate { panel_id, targets }) {
-                        Ok(()) | Err(_) => {}
-                    }
-                    self.gate.wake(&self.waker);
-                }
-                Err(join_error) => {
-                    if let Some((panel_id, target_ids)) = job_ids.remove(&join_error.id()) {
-                        let message = format!("panel query panicked: {join_error}");
-                        let targets = target_ids
-                            .into_iter()
-                            .map(|ref_id| TargetUpdate {
-                                ref_id,
-                                result: Err(message.clone()),
-                            })
-                            .collect();
-                        match self.frames_tx.send(PanelUpdate { panel_id, targets }) {
-                            Ok(()) | Err(_) => {}
+                    let update = match joined {
+                        Ok((id, (panel_id, targets))) => {
+                            drop(job_ids.remove(&id));
+                            Some(PanelUpdate { panel_id, targets })
+                        }
+                        Err(join_error) => job_ids.remove(&join_error.id()).map(|(panel_id, target_ids)| {
+                            let message = format!("panel query panicked: {join_error}");
+                            let targets = target_ids
+                                .into_iter()
+                                .map(|ref_id| TargetUpdate {
+                                    ref_id,
+                                    result: Err(message.clone()),
+                                })
+                                .collect();
+                            PanelUpdate { panel_id, targets }
+                        }),
+                    };
+                    if let Some(update) = update {
+                        if self.frames_tx.send(update).await.is_err() {
+                            pending.abort_all();
+                            return QueryOutcome::Disconnected;
                         }
                         self.gate.wake(&self.waker);
-                    }
-                }
                     }
                     if let Some(job) = jobs.next() {
                         spawn_job(&mut pending, &mut job_ids, job);
@@ -534,7 +537,7 @@ mod tests {
     /// A spawned engine plus the queries its source observed.
     type EngineHarness = (
         mpsc::UnboundedSender<EngineCmd>,
-        mpsc::UnboundedReceiver<PanelUpdate>,
+        mpsc::Receiver<PanelUpdate>,
         RecordedQueries,
     );
 
@@ -606,7 +609,7 @@ mod tests {
         refresh: Duration,
     ) -> (
         mpsc::UnboundedSender<EngineCmd>,
-        mpsc::UnboundedReceiver<PanelUpdate>,
+        mpsc::Receiver<PanelUpdate>,
         RecordedQueries,
         Arc<std::sync::atomic::AtomicUsize>,
         Arc<WakeGate>,
@@ -647,7 +650,7 @@ mod tests {
         })
     }
 
-    async fn receive_updates(frames_rx: &mut mpsc::UnboundedReceiver<PanelUpdate>, count: usize) {
+    async fn receive_updates(frames_rx: &mut mpsc::Receiver<PanelUpdate>, count: usize) {
         for _ in 0..count {
             tokio::time::timeout(std::time::Duration::from_secs(1), frames_rx.recv())
                 .await
@@ -703,6 +706,21 @@ mod tests {
         drop(cmd);
     }
 
+    #[tokio::test]
+    async fn undrained_result_queue_bounds_buffering_and_resumes_progress() {
+        let (cmd, mut updates, queries, _, _) = spawn_counting(6, Duration::from_secs(3600));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(updates.len() <= RESULT_CHANNEL_CAPACITY);
+        assert!(
+            queries.lock().unwrap().len() <= RESULT_CHANNEL_CAPACITY + MAX_CONCURRENT_PANELS + 1,
+            "completed result backpressure allowed too many panel queries to start"
+        );
+
+        receive_updates(&mut updates, 6).await;
+        drop(cmd);
+    }
+
     struct OneHungPanelSource;
 
     impl DataSource for OneHungPanelSource {
@@ -748,7 +766,7 @@ mod tests {
 
     fn spawn_drop_observed_engine() -> (
         mpsc::UnboundedSender<EngineCmd>,
-        mpsc::UnboundedReceiver<PanelUpdate>,
+        mpsc::Receiver<PanelUpdate>,
         Arc<tokio::sync::Notify>,
         Arc<std::sync::atomic::AtomicBool>,
     ) {
