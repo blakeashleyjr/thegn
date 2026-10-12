@@ -324,8 +324,9 @@ fn fill_agent_config_staging(
                 // Agent config collection intentionally follows links (for
                 // NixOS hooks); resolve that policy explicitly, then use a
                 // no-follow open on the resolved regular file.
-                let resolved = std::fs::canonicalize(&abs)
-                    .map_err(|e| format!("resolve {}: {e}", abs.display()))?;
+                let Some(resolved) = resolve_optional_agent_config_file(&abs)? else {
+                    continue;
+                };
                 stage_file(staging, &resolved, &staging.join(base).join(inner), exec)?;
             }
         }
@@ -335,15 +336,28 @@ fn fill_agent_config_staging(
                 continue;
             }
             let source = host_home.join(&rel);
-            let resolved = match std::fs::canonicalize(&source) {
-                Ok(resolved) => resolved,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(format!("resolve {}: {error}", source.display())),
+            let Some(resolved) = resolve_optional_agent_config_file(&source)? else {
+                continue;
             };
-            stage_file(staging, &resolved, &staging.join(rel), false)?;
+            let destination = staging.join(&rel);
+            if rel == std::path::Path::new(".claude.json") {
+                stage_sanitized_claude_json(staging, &resolved, &destination)?;
+            } else {
+                stage_file(staging, &resolved, &destination, false)?;
+            }
         }
     }
     Ok(())
+}
+
+fn resolve_optional_agent_config_file(
+    path: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, String> {
+    match std::fs::canonicalize(path) {
+        Ok(resolved) => Ok(Some(resolved)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("resolve {}: {error}", path.display())),
+    }
 }
 
 fn fill_atuin_staging(
@@ -386,9 +400,51 @@ fn is_agent_secret_path(path: &std::path::Path) -> bool {
     };
     let name = name.to_ascii_lowercase();
     name.contains("credential")
+        || name.contains("creds")
         || name.contains("token")
+        || name.contains("secret")
+        || name.contains("apikey")
+        || name.contains("api_key")
+        || name.starts_with(".env")
+        || name.ends_with(".pem")
+        || name.ends_with(".key")
         || name == "auth.json"
         || name.ends_with(".auth.json")
+}
+
+/// Claude's top-level config also carries API-key and OAuth credentials.
+/// Keep its non-secret settings while refusing to stage malformed or
+/// unexpected top-level JSON, which cannot be safely inspected.
+fn stage_sanitized_claude_json(
+    staging_root: &std::path::Path,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let mut source = thegn_core::fsperm::open_regular_file_nofollow(src)
+        .map_err(|e| format!("read {}: {e}", src.display()))?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut source, &mut bytes)
+        .map_err(|e| format!("read {}: {e}", src.display()))?;
+    let Ok(serde_json::Value::Object(mut object)) = serde_json::from_slice(&bytes) else {
+        return Ok(());
+    };
+    object.retain(|key, _| {
+        let normalized = key.to_ascii_lowercase();
+        !normalized.contains("apikey")
+            && !normalized.contains("api_key")
+            && !normalized.contains("token")
+    });
+    let sanitized = serde_json::to_vec(&serde_json::Value::Object(object))
+        .map_err(|e| format!("serialize {}: {e}", src.display()))?;
+    create_staging_parents(staging_root, dst)?;
+    let mut output = thegn_core::fsperm::create_owner_only_exclusive(dst)
+        .map_err(|e| format!("create staged file {}: {e}", dst.display()))?;
+    output
+        .write_all(&sanitized)
+        .and_then(|()| output.sync_all())
+        .map_err(|e| format!("write staged file {}: {e}", dst.display()))
 }
 
 fn with_private_staging(
@@ -757,25 +813,41 @@ mod tests {
     fn agent_config_staging_preserves_root_and_file_paths() {
         let home = tempfile::tempdir().unwrap();
         let staging = tempfile::tempdir().unwrap();
-        std::fs::write(home.path().join(".claude.json"), "claude config\n").unwrap();
+        std::fs::write(
+            home.path().join(".claude.json"),
+            r#"{"theme":"dark","primaryApiKey":"sk-secret","customApiKey":"also-secret","refreshToken":"token-secret","oauthAccount":{"email":"person@example.com"}}"#,
+        )
+        .unwrap();
         std::fs::create_dir(home.path().join(".claude")).unwrap();
         std::fs::write(home.path().join(".claude/settings.json"), "{}\n").unwrap();
         std::fs::write(home.path().join(".claude/.credentials.json"), "secret\n").unwrap();
         std::fs::write(home.path().join(".claude/oauth_token.json"), "secret\n").unwrap();
         std::fs::create_dir(home.path().join(".codex")).unwrap();
         std::fs::write(home.path().join(".codex/auth.json"), "secret\n").unwrap();
+        std::fs::create_dir(home.path().join(".gemini")).unwrap();
+        std::fs::write(home.path().join(".gemini/oauth_creds.json"), "secret\n").unwrap();
+        std::fs::write(home.path().join(".gemini/api_key.json"), "secret\n").unwrap();
+        std::fs::write(home.path().join(".gemini/apikey.json"), "secret\n").unwrap();
+        std::fs::write(home.path().join(".gemini/my-secret.json"), "secret\n").unwrap();
+        std::fs::write(home.path().join(".gemini/.env.local"), "secret\n").unwrap();
+        std::fs::write(home.path().join(".gemini/client.pem"), "secret\n").unwrap();
+        std::fs::write(home.path().join(".gemini/client.key"), "secret\n").unwrap();
 
         fill_agent_config_staging(
             staging.path(),
             home.path(),
-            &["claude".into(), "codex".into()],
+            &["claude".into(), "codex".into(), "gemini".into()],
         )
         .unwrap();
 
-        assert_eq!(
-            std::fs::read(staging.path().join(".claude.json")).unwrap(),
-            b"claude config\n"
-        );
+        let claude_config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(staging.path().join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(claude_config["theme"], "dark");
+        assert_eq!(claude_config["oauthAccount"]["email"], "person@example.com");
+        assert!(claude_config.get("primaryApiKey").is_none());
+        assert!(claude_config.get("customApiKey").is_none());
+        assert!(claude_config.get("refreshToken").is_none());
         assert_eq!(
             std::fs::read(staging.path().join(".claude/settings.json")).unwrap(),
             b"{}\n"
@@ -783,6 +855,38 @@ mod tests {
         assert!(!staging.path().join(".claude/.credentials.json").exists());
         assert!(!staging.path().join(".claude/oauth_token.json").exists());
         assert!(!staging.path().join(".codex/auth.json").exists());
+        for secret in [
+            ".gemini/oauth_creds.json",
+            ".gemini/api_key.json",
+            ".gemini/apikey.json",
+            ".gemini/my-secret.json",
+            ".gemini/.env.local",
+            ".gemini/client.pem",
+            ".gemini/client.key",
+        ] {
+            assert!(!staging.path().join(secret).exists(), "staged {secret}");
+        }
+    }
+
+    #[test]
+    fn malformed_claude_json_is_skipped_instead_of_staged_raw() {
+        let home = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".claude.json"), "primaryApiKey: secret\n").unwrap();
+
+        fill_agent_config_staging(staging.path(), home.path(), &["claude".into()]).unwrap();
+
+        assert!(!staging.path().join(".claude.json").exists());
+    }
+
+    #[test]
+    fn missing_agent_config_file_resolves_as_a_skip() {
+        let home = tempfile::tempdir().unwrap();
+
+        let resolved =
+            resolve_optional_agent_config_file(&home.path().join("rewritten.json")).unwrap();
+
+        assert!(resolved.is_none());
     }
 
     #[test]
