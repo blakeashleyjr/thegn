@@ -868,7 +868,9 @@ where
 }
 
 /// Interleave account-ranked rows fairly, retaining the first row for each
-/// stable issue id. A zero limit means unbounded, matching provider semantics.
+/// stable issue id. Dedup identity is `Issue.id`; cross-workspace Linear key
+/// collisions are conflated, as elsewhere. A zero limit means unbounded,
+/// matching provider semantics.
 fn merge_fair(per_account: Vec<Vec<Issue>>, limit: usize) -> Vec<Issue> {
     let mut positions = vec![0; per_account.len()];
     let mut seen = HashSet::new();
@@ -1264,7 +1266,6 @@ mod spec {
     struct FixedBackend {
         id: String,
         issues: Vec<Issue>,
-        pending: bool,
     }
 
     impl IssueBackend for FixedBackend {
@@ -1281,15 +1282,11 @@ mod spec {
             filter: &'a IssueFilter,
         ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
             Box::pin(async move {
-                if self.pending {
-                    std::future::pending().await
-                } else {
-                    let mut issues = self.issues.clone();
-                    if filter.limit > 0 {
-                        issues.truncate(filter.limit);
-                    }
-                    Ok(issues)
+                let mut issues = self.issues.clone();
+                if filter.limit > 0 {
+                    issues.truncate(filter.limit);
                 }
+                Ok(issues)
             })
         }
 
@@ -1318,15 +1315,11 @@ mod spec {
             limit: usize,
         ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
             Box::pin(async move {
-                if self.pending {
-                    std::future::pending().await
-                } else {
-                    let mut issues = self.issues.clone();
-                    if limit > 0 {
-                        issues.truncate(limit);
-                    }
-                    Ok(issues)
+                let mut issues = self.issues.clone();
+                if limit > 0 {
+                    issues.truncate(limit);
                 }
+                Ok(issues)
             })
         }
     }
@@ -1353,7 +1346,6 @@ mod spec {
                     Box::new(FixedBackend {
                         id: "linear".into(),
                         issues,
-                        pending: false,
                     }),
                 )
                 .unwrap();
