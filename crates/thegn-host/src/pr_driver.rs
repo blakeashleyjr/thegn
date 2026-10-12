@@ -1010,6 +1010,7 @@ mod tests {
         assert!(!checkout_matches(None, "feat"));
     }
 
+    #[expect(clippy::disallowed_methods)]
     fn git_repo_on_branch(dir: &Path, branch: &str) {
         thegn_core::fsperm::restrict_dir_to_owner(dir).unwrap();
         let git = |args: &[&str]| {
