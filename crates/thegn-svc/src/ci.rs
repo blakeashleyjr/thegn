@@ -278,6 +278,81 @@ fn run_cli(cmd: &mut std::process::Command) -> Result<String, CiError> {
     }
 }
 
+/// Read no more than `max` bytes, probing one additional byte only to detect
+/// that the producer exceeded the limit.
+fn read_capped<R: Read>(mut reader: R, max: usize) -> Result<Vec<u8>, CiError> {
+    let mut output = Vec::with_capacity(max.min(64 * 1024));
+    let mut chunk = [0u8; 8192];
+    loop {
+        let remaining = max.saturating_sub(output.len());
+        let requested = chunk.len().min(remaining.saturating_add(1));
+        let n = reader
+            .read(&mut chunk[..requested])
+            .map_err(|error| CiError::Other(error.to_string()))?;
+        if n == 0 {
+            return Ok(output);
+        }
+        if n > remaining {
+            return Err(CiError::Other(
+                "provider output byte budget exhausted".into(),
+            ));
+        }
+        output.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// Run a command while bounding stdout before it is buffered in memory.
+fn run_cli_capped(cmd: &mut Command, max: usize) -> Result<String, CiError> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| CiError::Other(error.to_string()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CiError::Other("provider stdout was not piped".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CiError::Other("provider stderr was not piped".into()))?;
+    let err_thread = std::thread::spawn(|| read_stderr(stderr));
+    let output = read_capped(stdout, max);
+    if output.is_err() {
+        // best-effort: the bounded read error is primary; still attempt to stop
+        // and reap the child so it cannot outlive the failed read.
+        if let Err(error) = child.kill() {
+            if error.kind() != std::io::ErrorKind::InvalidInput {
+                tracing::debug!(target: "thegn::ci", "failed to kill provider after output limit");
+            }
+        }
+        if let Err(error) = child.wait() {
+            tracing::debug!(target: "thegn::ci", "failed to reap provider after output limit");
+            return Err(CiError::Other(format!(
+                "provider process wait failed: {}",
+                error.kind()
+            )));
+        }
+        drop(
+            err_thread
+                .join()
+                .map_err(|_| CiError::Other("provider stderr reader panicked".into()))?,
+        );
+        return output.map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    }
+    let status = child
+        .wait()
+        .map_err(|error| CiError::Other(error.to_string()))?;
+    let stderr = err_thread
+        .join()
+        .map_err(|_| CiError::Other("provider stderr reader panicked".into()))?;
+    let output = output?;
+    if !status.success() {
+        return Err(classify_stderr(&stderr));
+    }
+    String::from_utf8(output).map_err(|_| CiError::Other("provider output was not UTF-8".into()))
+}
+
 /// Run a log-producing command while retaining only its newest complete lines.
 ///
 /// `Command::output` is unsuitable for CI logs: it buffers the complete child
@@ -909,13 +984,41 @@ pub fn parse_gh_workflows(json: &str) -> Result<Vec<CiWorkflow>, String> {
 
 // === GitLab CI (glab + GitLab API) ========================================
 
-/// GitLab CI via `glab api`. A configured token is resolved by the injected
-/// broker and supplied only through `GITLAB_TOKEN`; when absent, `glab` may use
-/// its own credential store. GitLab has no per-job "steps", so
+/// Credential selection for GitLab CLI execution.
+#[derive(Clone, Default, PartialEq, Eq)]
+enum GitlabCredential {
+    #[default]
+    CliManaged,
+    Configured(String),
+    Unavailable,
+}
+
+impl GitlabCredential {
+    fn from_resolution(raw: &str, resolution: crate::secret::SecretResolution) -> Self {
+        match resolution {
+            crate::secret::SecretResolution::Absent => Self::CliManaged,
+            crate::secret::SecretResolution::Resolved(token) => Self::Configured(token),
+            crate::secret::SecretResolution::Failed
+                if raw == thegn_core::config::GitLabCiConfig::default().token =>
+            {
+                // Compatibility: the shipped env:GITLAB_TOKEN default has
+                // historically allowed glab's own login when the env is absent.
+                Self::CliManaged
+            }
+            crate::secret::SecretResolution::Failed => Self::Unavailable,
+        }
+    }
+}
+
+/// GitLab CI via `glab api`. The shipped `env:GITLAB_TOKEN` default remains
+/// explicitly CLI-managed when unavailable for compatibility with `glab auth
+/// login`; an absent field is also CLI-managed. Any other configured reference
+/// that fails resolution is unavailable and fails closed. A resolved token is
+/// supplied only through `GITLAB_TOKEN`. GitLab has no per-job "steps", so
 /// [`CiJob::steps`] stays empty.
 #[derive(Default)]
 pub struct GitlabCi {
-    token: Option<String>,
+    credential: GitlabCredential,
     host: Option<String>,
 }
 
@@ -934,7 +1037,10 @@ impl thegn_core::seam::Probe for GitlabCi {
 impl GitlabCi {
     fn from_config(cfg: &CiConfig) -> Self {
         Self {
-            token: crate::secret::resolve(&cfg.gitlab.token, BareAs::Literal, "ci:gitlab"),
+            credential: GitlabCredential::from_resolution(
+                &cfg.gitlab.token,
+                crate::secret::resolve_outcome(&cfg.gitlab.token, BareAs::Literal, "ci:gitlab"),
+            ),
             host: (!cfg.gitlab.host.trim().is_empty()).then(|| cfg.gitlab.host.trim().to_string()),
         }
     }
@@ -942,13 +1048,21 @@ impl GitlabCi {
     /// Construct a `glab` command with credentials in the child environment,
     /// never in argv. Keeping this at one chokepoint prevents a new operation
     /// from accidentally falling back to an unaudited/config-ignored path.
-    fn command(&self, loc: &GitLoc, remote: &GitlabRemote, args: &[&str]) -> Command {
+    fn command(
+        &self,
+        loc: &GitLoc,
+        remote: &GitlabRemote,
+        args: &[&str],
+    ) -> Result<Command, CiError> {
+        if matches!(&self.credential, GitlabCredential::Unavailable) {
+            return Err(CiError::NotAuthenticated);
+        }
         let mut cmd = loc.cli_command("glab", args);
-        if let Some(token) = &self.token {
+        if let GitlabCredential::Configured(token) = &self.credential {
             cmd.env("GITLAB_TOKEN", token);
         }
         cmd.env("GITLAB_HOST", &remote.host);
-        cmd
+        Ok(cmd)
     }
 
     /// Resolve origin once for an operation. The resulting host and project
@@ -978,7 +1092,7 @@ impl CiProvider for GitlabCi {
         let remote = self.remote(loc)?;
         let project_segment = Self::project_seg(&remote);
         let endpoint = gitlab_pipelines_endpoint(&project_segment, branch, limit)?;
-        let json = run_cli(&mut self.command(loc, &remote, &["api", &endpoint]))?;
+        let json = run_cli(&mut self.command(loc, &remote, &["api", &endpoint])?)?;
         let (runs, discarded) =
             parse_gitlab_pipelines_with_discarded(&json).map_err(CiError::Other)?;
         if discarded > 0 {
@@ -997,7 +1111,7 @@ impl CiProvider for GitlabCi {
         // Pipeline header + its jobs (two calls; the jobs carry the states).
         let run_endpoint = gitlab_run_endpoint(&proj, run_id, "")?;
         let jobs_endpoint = gitlab_run_endpoint(&proj, run_id, "jobs")?;
-        let pipe_json = run_cli(&mut self.command(loc, &remote, &["api", &run_endpoint]))?;
+        let pipe_json = run_cli(&mut self.command(loc, &remote, &["api", &run_endpoint])?)?;
         let value: serde_json::Value = serde_json::from_str(&pipe_json).map_err(|error| {
             CiError::Other(format!("invalid provider pipeline response: {error}"))
         })?;
@@ -1019,13 +1133,12 @@ impl CiProvider for GitlabCi {
         let mut complete = false;
         for page in 1..=GITLAB_JOBS_MAX_PAGES {
             let endpoint = format!("{jobs_endpoint}?per_page={GITLAB_JOBS_PAGE_SIZE}&page={page}");
-            let jobs_json = run_cli(&mut self.command(loc, &remote, &["api", &endpoint]))?;
+            let remaining = GITLAB_JOBS_MAX_BYTES.saturating_sub(bytes);
+            let jobs_json = run_cli_capped(
+                &mut self.command(loc, &remote, &["api", &endpoint])?,
+                remaining,
+            )?;
             bytes = bytes.saturating_add(jobs_json.len());
-            if bytes > GITLAB_JOBS_MAX_BYTES {
-                return Err(CiError::Other(
-                    "GitLab jobs pagination byte budget exhausted".into(),
-                ));
-            }
             let page_rows =
                 serde_json::from_str::<Vec<serde_json::Value>>(&jobs_json).map_err(|error| {
                     CiError::Other(format!("invalid GitLab jobs response: {error}"))
@@ -1074,7 +1187,7 @@ impl CiProvider for GitlabCi {
         let remote = self.remote(loc)?;
         let proj = Self::project_seg(&remote);
         let endpoint = gitlab_job_trace_endpoint(&proj, job_id)?;
-        run_bounded_log(&mut self.command(loc, &remote, &["api", &endpoint]))
+        run_bounded_log(&mut self.command(loc, &remote, &["api", &endpoint])?)
     }
 
     fn workflows(&self, _loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError> {
@@ -1099,7 +1212,7 @@ impl CiProvider for GitlabCi {
             args.push(format!("{k}={v}"));
         }
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_cli(&mut self.command(loc, &remote, &argv)).map(|_| ())
+        run_cli(&mut self.command(loc, &remote, &argv)?).map(|_| ())
     }
 
     fn rerun(&self, loc: &GitLoc, run_id: &str, _scope: RerunScope) -> Result<(), CiError> {
@@ -1109,7 +1222,7 @@ impl CiProvider for GitlabCi {
         // GitLab: `retry` re-runs failed jobs; a fresh full run isn't a single
         // call, so both scopes map to retry (it's the closest primitive).
         let endpoint = gitlab_run_endpoint(&proj, run_id, "retry")?;
-        run_cli(&mut self.command(loc, &remote, &["api", "-X", "POST", &endpoint])).map(|_| ())
+        run_cli(&mut self.command(loc, &remote, &["api", "-X", "POST", &endpoint])?).map(|_| ())
     }
 
     fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError> {
@@ -1117,7 +1230,7 @@ impl CiProvider for GitlabCi {
         let remote = self.remote(loc)?;
         let proj = Self::project_seg(&remote);
         let endpoint = gitlab_run_endpoint(&proj, run_id, "cancel")?;
-        run_cli(&mut self.command(loc, &remote, &["api", "-X", "POST", &endpoint])).map(|_| ())
+        run_cli(&mut self.command(loc, &remote, &["api", "-X", "POST", &endpoint])?).map(|_| ())
     }
 
     fn caps(&self) -> CiCaps {
@@ -1489,11 +1602,11 @@ mod tests {
         let endpoint =
             gitlab_pipelines_endpoint(&GitlabCi::project_seg(&remote), None, 10).unwrap();
         let client = GitlabCi {
-            token: Some("fixture-token".into()),
+            credential: GitlabCredential::Configured("fixture-token".into()),
             host: None,
         };
         let loc = GitLoc::for_worktree(std::path::Path::new("."));
-        let command = client.command(&loc, &remote, &["api", &endpoint]);
+        let command = client.command(&loc, &remote, &["api", &endpoint]).unwrap();
         assert_eq!(endpoint, "projects/group%2Frepo/pipelines?per_page=10");
         assert_eq!(
             command
@@ -2025,7 +2138,9 @@ esac
             host: "gitlab.example.test".into(),
             project: "g/r".into(),
         };
-        let command = client.command(&loc, &remote, &["api", "projects/g%2Fr/pipelines"]);
+        let command = client
+            .command(&loc, &remote, &["api", "projects/g%2Fr/pipelines"])
+            .unwrap();
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -2048,6 +2163,97 @@ esac
             env.get("GITLAB_HOST").and_then(Option::as_deref),
             Some("gitlab.example.test")
         );
+    }
+
+    #[test]
+    fn explicit_gitlab_secret_resolution_failures_stop_before_command_creation() {
+        assert!(std::env::var_os("THE541_SURELY_UNSET_VAR").is_none());
+        let missing_file = std::env::temp_dir().join(format!(
+            "the541-ci-token-that-does-not-exist-{}",
+            std::process::id()
+        ));
+        assert!(!missing_file.exists());
+        let missing_file_ref = format!("file:{}", missing_file.display());
+        let loc = GitLoc::for_worktree(std::path::Path::new("."));
+        let remote = GitlabRemote {
+            host: "gitlab.example.test".into(),
+            project: "g/r".into(),
+        };
+        for reference in [
+            "keyring:the541-fixture".to_string(),
+            missing_file_ref,
+            "env:THE541_SURELY_UNSET_VAR".to_string(),
+        ] {
+            let mut cfg = CiConfig::default();
+            cfg.gitlab.token = reference;
+            let client = GitlabCi::from_config(&cfg);
+            assert!(matches!(
+                client.command(&loc, &remote, &["api", "projects/g%2Fr/pipelines"]),
+                Err(CiError::NotAuthenticated)
+            ));
+        }
+    }
+
+    #[test]
+    fn gitlab_absent_and_legacy_default_credentials_are_cli_managed() {
+        assert_eq!(
+            GitlabCredential::from_resolution("", crate::secret::SecretResolution::Absent),
+            GitlabCredential::CliManaged
+        );
+        assert_eq!(
+            GitlabCredential::from_resolution(
+                &thegn_core::config::GitLabCiConfig::default().token,
+                crate::secret::SecretResolution::Failed
+            ),
+            GitlabCredential::CliManaged
+        );
+        assert_eq!(
+            GitlabCredential::from_resolution(
+                "env:THE541_SURELY_UNSET_VAR",
+                crate::secret::SecretResolution::Failed
+            ),
+            GitlabCredential::Unavailable
+        );
+        let mut cfg = CiConfig::default();
+        cfg.gitlab.token.clear();
+        let client = GitlabCi::from_config(&cfg);
+        let loc = GitLoc::for_worktree(std::path::Path::new("."));
+        let remote = GitlabRemote {
+            host: "gitlab.example.test".into(),
+            project: "g/r".into(),
+        };
+        let command = client.command(&loc, &remote, &["api"]).unwrap();
+        assert!(
+            !command
+                .get_envs()
+                .any(|(key, _)| key == std::ffi::OsStr::new("GITLAB_TOKEN"))
+        );
+    }
+
+    #[test]
+    fn capped_reader_rejects_first_byte_over_limit_and_accepts_exact_limit() {
+        assert!(read_capped(std::io::repeat(b'x').take(5), 4).is_err());
+        assert_eq!(
+            read_capped(std::io::repeat(b'x').take(4), 4).unwrap(),
+            b"xxxx"
+        );
+    }
+
+    #[test]
+    fn pem_begin_marker_split_across_single_byte_reads_is_redacted() {
+        struct OneByte<R>(R);
+        impl<R: Read> Read for OneByte<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let len = buf.len().min(1);
+                self.0.read(&mut buf[..len])
+            }
+        }
+
+        let input =
+            b"before\n-----BEGIN PRIVATE KEY-----\nsecret-body\n-----END PRIVATE KEY-----\nafter\n";
+        let (text, _) = collect_log(OneByte(&input[..])).unwrap();
+        assert!(!text.contains("secret-body"));
+        assert!(text.contains(thegn_core::ci_log::REDACTION_MARKER));
     }
 
     #[test]
