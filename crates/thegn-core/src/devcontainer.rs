@@ -234,6 +234,9 @@ pub fn detect_and_parse(worktree: &Path) -> Option<Result<DevContainer, ParseErr
                 "devcontainer selector {selector:?} matched no config"
             )))
         }
+        Some(crate::devcontainer_select::SelectionError::Discovery { error }) => Err(
+            ParseError::Json(format!("devcontainer discovery refused: {error}")),
+        ),
         None => Ok(selected.config.expect("successful selection has a config")),
     })
 }
