@@ -5,6 +5,7 @@
 use crate::issue::{AgentDispatch, DispatchNote};
 use std::collections::HashMap;
 use std::fmt;
+use unicode_width::UnicodeWidthChar;
 
 // --- text validation --------------------------------------------------------
 
@@ -38,6 +39,46 @@ pub fn display_cell(s: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Render untrusted text into a terminal cell with a fixed display width.
+/// Controls and format characters are replaced, leading zero-width characters
+/// are dropped, and truncation reserves one column for an ellipsis.
+pub fn display_fit(s: &str, cells: usize) -> String {
+    if cells == 0 {
+        return String::new();
+    }
+
+    let safe = display_cell(s);
+    let mut output = String::new();
+    let mut width = 0;
+    let mut truncated = false;
+
+    for c in safe.chars() {
+        let char_width = UnicodeWidthChar::width(c).unwrap_or(0);
+        if output.is_empty() && char_width == 0 {
+            continue;
+        }
+        if width + char_width > cells {
+            truncated = true;
+            break;
+        }
+        output.push(c);
+        width += char_width;
+    }
+
+    if truncated {
+        while width + 1 > cells {
+            let Some(last) = output.pop() else {
+                break;
+            };
+            width -= UnicodeWidthChar::width(last).unwrap_or(0);
+        }
+        output.push('…');
+        width += 1;
+    }
+    output.push_str(&" ".repeat(cells - width));
+    output
 }
 
 /// A report that cannot be stored.
@@ -413,6 +454,7 @@ pub fn digest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_width::UnicodeWidthStr;
 
     fn row(
         id: i64,
@@ -505,6 +547,44 @@ mod tests {
         assert!(!shown.contains('\x07'));
         assert!(!shown.contains('\u{202e}'));
         assert!(!shown.contains('\n'));
+    }
+
+    #[test]
+    fn display_fit_pads_short_text_and_leaves_exact_fit_unmarked() {
+        assert_eq!(display_fit("cat", 5), "cat  ");
+        assert_eq!(display_fit("four", 4), "four");
+    }
+
+    #[test]
+    fn display_fit_truncates_to_the_requested_display_width() {
+        let shown = display_fit("abcdefgh", 5);
+        assert_eq!(shown, "abcd…");
+        assert_eq!(UnicodeWidthStr::width(shown.as_str()), 5);
+    }
+
+    #[test]
+    fn display_fit_keeps_wide_characters_whole() {
+        let shown = display_fit("日本語", 4);
+        assert_eq!(UnicodeWidthStr::width(shown.as_str()), 4);
+        assert_eq!(shown, "日… ");
+    }
+
+    #[test]
+    fn display_fit_drops_a_leading_zero_width_character() {
+        assert_eq!(display_fit("\u{0301}x", 2), "x ");
+    }
+
+    #[test]
+    fn display_fit_replaces_terminal_controls_and_format_state() {
+        let shown = display_fit("a\x1b]0;t\x07\u{202e}", 20);
+        assert!(!shown.contains('\x1b'));
+        assert!(!shown.contains('\x07'));
+        assert!(!shown.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn display_fit_with_zero_cells_is_empty() {
+        assert_eq!(display_fit("hostile\x1b", 0), "");
     }
 
     #[test]
