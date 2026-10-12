@@ -71,6 +71,9 @@ async fn abort_tasks(tasks: &ConnectionTasks) {
 }
 
 async fn stop_sink(task: JoinHandle<()>) -> io::Result<()> {
+    // Once the read side has hit EOF, queued frames (including final Close
+    // frames) are intentionally discarded. Waiting for the sink to drain here
+    // could hang forever if the peer stopped reading at tunnel end.
     task.abort();
     match task.await {
         Ok(()) => Ok(()),
@@ -373,8 +376,8 @@ where
                     Ok(permit) => permit,
                     Err(_) => {
                         report_rejection(&rejections, "host", "connection_limit");
-                        if sink.send(encode(&Frame::Close(id))).await.is_err() {
-                            return;
+                        if let Err(error) = sink.send(encode(&Frame::Close(id))).await {
+                            tracing::debug!(target: "thegn::revtunnel", %error, "close reply dropped");
                         }
                         return;
                     }
@@ -385,11 +388,12 @@ where
                     report_rejection(&rejections, "host", "duplicate_id");
                     drop(routes);
                     drop(permit);
-                    if sink.send(encode(&Frame::Close(id))).await.is_err() {
-                        return;
+                    if let Err(error) = sink.send(encode(&Frame::Close(id))).await {
+                        tracing::debug!(target: "thegn::revtunnel", %error, "close reply dropped");
                     }
                     return;
                 }
+                let mine = in_tx.clone();
                 drop(routes.insert(id, in_tx));
                 drop(routes);
                 tasks.lock().await.spawn(async move {
@@ -400,7 +404,10 @@ where
                             let _ = sink.send(encode(&Frame::Close(id))).await; // best-effort: remote may be gone
                         }
                     }
-                    drop(conns.lock().await.remove(&id));
+                    let mut routes = conns.lock().await;
+                    if routes.get(&id).is_some_and(|tx| tx.same_channel(&mine)) {
+                        drop(routes.remove(&id));
+                    }
                 });
             }
         },
@@ -464,6 +471,7 @@ where
             };
             let id = acc_ids.fetch_add(1, Ordering::Relaxed);
             let (in_tx, in_rx) = channel::<Vec<u8>>(CHANNEL_DEPTH);
+            let mine = in_tx.clone();
             acc_conns.lock().await.insert(id, in_tx);
             if acc_sink.send(encode(&Frame::Open(id))).await.is_err() {
                 drop(acc_conns.lock().await.remove(&id));
@@ -474,7 +482,10 @@ where
             acc_tasks.lock().await.spawn(async move {
                 let _permit = permit;
                 pump_conn(id, Box::new(sock), in_rx, sink).await;
-                drop(conns.lock().await.remove(&id));
+                let mut routes = conns.lock().await;
+                if routes.get(&id).is_some_and(|tx| tx.same_channel(&mine)) {
+                    drop(routes.remove(&id));
+                }
             });
         }
     });
@@ -645,6 +656,68 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), task)
             .await
             .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_host_pump_does_not_remove_reopened_route() {
+        let (host, mut peer) = tokio::io::duplex(4096);
+        let (far_tx, mut far_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_host_with_limit(
+            host,
+            HoldingDialer {
+                calls: Arc::new(AtomicUsize::new(0)),
+                far_ends: far_tx,
+            },
+            2,
+        ));
+        send_opens(&mut peer, &[1]).await;
+        let first_far = tokio::time::timeout(std::time::Duration::from_secs(2), far_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer.write_all(&encode(&Frame::Close(1))),
+        )
+        .await
+        .expect("timed out closing the first route")
+        .unwrap();
+        send_open(&mut peer, 1).await;
+        let mut second_far = tokio::time::timeout(std::time::Duration::from_secs(2), far_rx.recv())
+            .await
+            .expect("reopened route was not dialed")
+            .expect("dialer receiver closed");
+
+        // The old pump is still alive until its local read end closes. Let its
+        // completion and route cleanup happen before exercising the new route.
+        drop(first_far);
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(next_frame(&mut peer, &mut decoder).await, Frame::Close(1));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer.write_all(&encode(&Frame::Data(1, b"still routed".to_vec()))),
+        )
+        .await
+        .expect("timed out sending data to reopened route")
+        .unwrap();
+        let mut received = [0u8; 12];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            second_far.read_exact(&mut received),
+        )
+        .await
+        .expect("old pump removed the reopened route")
+        .unwrap();
+        assert_eq!(&received, b"still routed");
+
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("host did not stop after peer disconnect")
             .unwrap()
             .unwrap();
     }
