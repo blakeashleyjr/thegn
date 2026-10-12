@@ -261,9 +261,7 @@ impl CommandVoiceProvider {
         // A command may have exited while a descendant still owns one of the
         // pipes. Close that whole process group before joining helpers so an
         // otherwise successful child cannot leave a reader or writer behind.
-        if (written.is_none() || output.is_none() || error.is_none())
-            && !terminate_child(child, &on_reaped)
-        {
+        if !terminate_child(child, &on_reaped) {
             if !workers.discard(written, output, error) {
                 tracing::warn!("voice transcriber pipe workers did not settle after child exit");
             }
@@ -462,6 +460,51 @@ mod tests {
             CommandVoiceProvider::new(cfg(&["sh", "-c", "cat >/dev/null; printf ' hello '"]));
         let wav = b"RIFF0000WAVE";
         assert_eq!(provider.transcribe_push_to_talk(wav).unwrap(), " hello ");
+    }
+
+    #[test]
+    fn successful_transcription_terminates_a_redirected_group_descendant() {
+        if !std::path::Path::new("/proc/self/stat").exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let command = [
+            "sh",
+            "-c",
+            "sleep 30 </dev/null >/dev/null 2>&1 & echo $! >\"$1\"; cat >/dev/null; printf hi",
+            "sh",
+        ];
+        let mut command = command.to_vec();
+        command.push(pid_file.to_str().unwrap());
+        let provider = CommandVoiceProvider::new(cfg(&command));
+        assert_eq!(
+            provider.transcribe_push_to_talk(b"RIFF0000WAVE").unwrap(),
+            "hi"
+        );
+        let pid = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        let started = Instant::now();
+        loop {
+            let state = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => stat
+                    .rsplit_once(')')
+                    .map(|(_, tail)| tail.trim_start().chars().next())
+                    .flatten(),
+                Err(_) => None,
+            };
+            if state.is_none() || state == Some('Z') {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "descendant {pid} remains live"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
