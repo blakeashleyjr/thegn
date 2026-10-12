@@ -370,57 +370,47 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
             } => {
                 apply_step(&mut ctx.model.panel, &worktree, &branch, &status, &fields);
                 match MqStatus::parse(&status) {
-                    Some(status) => match step_reaction(status) {
-                        StepReaction::Landed => {
-                            ctx.toasts.success(format!("Landed {branch}"), now);
-                            notify_queue(
-                                ctx,
-                                NotificationKind::QueueLanded,
-                                &worktree,
-                                format!("merge queue: {branch} landed"),
-                            );
-                            *ctx.want_model_refresh = true;
-                            // The drive's `apply` may have removed this worktree.
-                            ctx.reap_removed_tabs();
+                    Some(status) => {
+                        match step_reaction(status) {
+                            StepReaction::Landed => {
+                                ctx.toasts.success(format!("Landed {branch}"), now);
+                                *ctx.want_model_refresh = true;
+                                // The drive's `apply` may have removed this worktree.
+                                ctx.reap_removed_tabs();
+                            }
+                            StepReaction::Ready => {
+                                ctx.toasts
+                                    .success(format!("{branch} ready — gated green"), now);
+                                *ctx.want_model_refresh = true;
+                            }
+                            StepReaction::NeedsHuman => {
+                                ctx.toasts.info_ttl(
+                                    format!("{branch} needs a human — {detail}"),
+                                    now,
+                                    std::time::Duration::from_secs(6),
+                                );
+                                *ctx.want_model_refresh = true;
+                            }
+                            StepReaction::InfrastructureHeld => {
+                                let message = format!(
+                                    "{branch} held: environment/policy, not a code verdict: `{detail}`"
+                                );
+                                ctx.toasts.info_ttl(
+                                    message,
+                                    now,
+                                    std::time::Duration::from_secs(8),
+                                );
+                                *ctx.want_model_refresh = true;
+                            }
+                            StepReaction::Held => {
+                                *ctx.want_model_refresh = true;
+                            }
+                            StepReaction::Transient => {}
                         }
-                        StepReaction::Ready => {
-                            ctx.toasts
-                                .success(format!("{branch} ready — gated green"), now);
-                            notify_queue(
-                                ctx,
-                                NotificationKind::QueueReady,
-                                &worktree,
-                                format!("merge queue: {branch} ready to land"),
-                            );
-                            *ctx.want_model_refresh = true;
+                        if let Some((kind, message)) = step_notification(status, &branch, &detail) {
+                            notify_queue(ctx, kind, &worktree, message);
                         }
-                        StepReaction::NeedsHuman => {
-                            ctx.toasts.info_ttl(
-                                format!("{branch} needs a human — {detail}"),
-                                now,
-                                std::time::Duration::from_secs(6),
-                            );
-                            notify_queue(
-                                ctx,
-                                NotificationKind::QueueNeedsHuman,
-                                &worktree,
-                                format!("merge queue: {branch} needs a human — {detail}"),
-                            );
-                            *ctx.want_model_refresh = true;
-                        }
-                        StepReaction::InfrastructureHeld => {
-                            let message = format!(
-                                "{branch} held: environment/policy, not a code verdict: `{detail}`"
-                            );
-                            ctx.toasts
-                                .info_ttl(message, now, std::time::Duration::from_secs(8));
-                            *ctx.want_model_refresh = true;
-                        }
-                        StepReaction::Held => {
-                            *ctx.want_model_refresh = true;
-                        }
-                        StepReaction::Transient => {}
-                    },
+                    }
                     None => {
                         tracing::debug!(
                             target: "thegn::merge",
@@ -512,6 +502,45 @@ fn step_reaction(status: MqStatus) -> StepReaction {
         MqStatus::Queued | MqStatus::Folding | MqStatus::Verifying | MqStatus::AgentRunning => {
             StepReaction::Transient
         }
+    }
+}
+
+/// Build the inbox/desktop notification for statuses that warrant one.
+/// Infrastructure holds expose only their bounded headline, never gate logs.
+fn step_notification(
+    status: MqStatus,
+    branch: &str,
+    detail: &str,
+) -> Option<(NotificationKind, String)> {
+    match status {
+        MqStatus::Landed => Some((
+            NotificationKind::QueueLanded,
+            format!("merge queue: {branch} landed"),
+        )),
+        MqStatus::Ready => Some((
+            NotificationKind::QueueReady,
+            format!("merge queue: {branch} ready to land"),
+        )),
+        MqStatus::NeedsHuman => Some((
+            NotificationKind::QueueNeedsHuman,
+            format!("merge queue: {branch} needs a human — {detail}"),
+        )),
+        MqStatus::GateError | MqStatus::AgentBlocked => {
+            let headline = detail.lines().next().unwrap_or_default();
+            let headline = thegn_core::notification_render::truncate_chars(headline, 200, "…");
+            Some((
+                NotificationKind::QueueNeedsHuman,
+                format!(
+                    "merge queue: {branch} held (environment/policy, not a code verdict): {headline}"
+                ),
+            ))
+        }
+        MqStatus::Deferred
+        | MqStatus::GateFailed
+        | MqStatus::Queued
+        | MqStatus::Folding
+        | MqStatus::Verifying
+        | MqStatus::AgentRunning => None,
     }
 }
 
@@ -1499,6 +1528,76 @@ mod tests {
             };
             assert_eq!(step_reaction(status), expected, "{status:?}");
         }
+    }
+
+    #[test]
+    fn step_notification_is_exhaustive_over_persisted_statuses() {
+        for status in MqStatus::ALL {
+            let expected_kind = match status {
+                MqStatus::Landed => Some(NotificationKind::QueueLanded),
+                MqStatus::Ready => Some(NotificationKind::QueueReady),
+                MqStatus::NeedsHuman | MqStatus::GateError | MqStatus::AgentBlocked => {
+                    Some(NotificationKind::QueueNeedsHuman)
+                }
+                MqStatus::Deferred
+                | MqStatus::GateFailed
+                | MqStatus::Queued
+                | MqStatus::Folding
+                | MqStatus::Verifying
+                | MqStatus::AgentRunning => None,
+            };
+            let actual = step_notification(status, "feature", "reason");
+            assert_eq!(
+                actual.as_ref().map(|(kind, _)| *kind),
+                expected_kind,
+                "{status:?}"
+            );
+
+            if let Some((_, message)) = actual {
+                match status {
+                    MqStatus::Landed => assert_eq!(message, "merge queue: feature landed"),
+                    MqStatus::Ready => {
+                        assert_eq!(message, "merge queue: feature ready to land")
+                    }
+                    MqStatus::NeedsHuman => {
+                        assert_eq!(message, "merge queue: feature needs a human — reason")
+                    }
+                    MqStatus::GateError | MqStatus::AgentBlocked => assert_eq!(
+                        message,
+                        "merge queue: feature held (environment/policy, not a code verdict): reason"
+                    ),
+                    MqStatus::Deferred
+                    | MqStatus::GateFailed
+                    | MqStatus::Queued
+                    | MqStatus::Folding
+                    | MqStatus::Verifying
+                    | MqStatus::AgentRunning => {
+                        unreachable!("unexpected notification for {status:?}")
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn infrastructure_hold_notification_is_one_bounded_line() {
+        let detail = format!("gate unavailable\n{}", "é".repeat(5_000));
+        let (kind, message) = step_notification(MqStatus::GateError, "feature", &detail)
+            .expect("gate errors notify the inbox");
+
+        assert_eq!(kind, NotificationKind::QueueNeedsHuman);
+        assert!(!message.contains('\n'));
+        assert!(message.contains("gate unavailable"));
+        assert!(!message.contains("é"));
+        assert!(message.chars().count() <= 270);
+
+        let (kind, message) =
+            step_notification(MqStatus::AgentBlocked, "feature", &"é".repeat(5_000))
+                .expect("agent blocks notify the inbox");
+
+        assert_eq!(kind, NotificationKind::QueueNeedsHuman);
+        assert!(message.chars().count() <= 270);
+        assert!(message.ends_with('…'));
     }
 
     /// THE-515 fixture: a real git repo named `acme` plus an isolated state
