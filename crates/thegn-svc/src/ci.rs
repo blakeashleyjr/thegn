@@ -304,6 +304,7 @@ fn read_capped<R: Read>(mut reader: R, max: usize) -> Result<Vec<u8>, CiError> {
 /// Run a command while bounding stdout before it is buffered in memory.
 fn run_cli_capped(cmd: &mut Command, max: usize) -> Result<String, CiError> {
     let mut child = cmd
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -333,11 +334,9 @@ fn run_cli_capped(cmd: &mut Command, max: usize) -> Result<String, CiError> {
                 error.kind()
             )));
         }
-        drop(
-            err_thread
-                .join()
-                .map_err(|_| CiError::Other("provider stderr reader panicked".into()))?,
-        );
+        if err_thread.join().is_err() {
+            tracing::debug!(target: "thegn::ci", "provider stderr reader panicked after output limit");
+        }
         return output.map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
     }
     let status = child
@@ -362,6 +361,7 @@ fn run_cli_capped(cmd: &mut Command, max: usize) -> Result<String, CiError> {
 /// classification remain identical to [`run_cli`].
 fn run_bounded_log(cmd: &mut Command) -> Result<CiLog, CiError> {
     let mut child = cmd
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -993,6 +993,16 @@ enum GitlabCredential {
     Unavailable,
 }
 
+impl std::fmt::Debug for GitlabCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CliManaged => f.write_str("CliManaged"),
+            Self::Configured(_) => f.write_str("Configured(<redacted>)"),
+            Self::Unavailable => f.write_str("Unavailable"),
+        }
+    }
+}
+
 impl GitlabCredential {
     fn from_resolution(raw: &str, resolution: crate::secret::SecretResolution) -> Self {
         match resolution {
@@ -1055,7 +1065,9 @@ impl GitlabCi {
         args: &[&str],
     ) -> Result<Command, CiError> {
         if matches!(&self.credential, GitlabCredential::Unavailable) {
-            return Err(CiError::NotAuthenticated);
+            return Err(CiError::Other(
+                "configured [ci.gitlab] token reference could not be resolved".into(),
+            ));
         }
         let mut cmd = loc.cli_command("glab", args);
         if let GitlabCredential::Configured(token) = &self.credential {
@@ -2189,7 +2201,8 @@ esac
             let client = GitlabCi::from_config(&cfg);
             assert!(matches!(
                 client.command(&loc, &remote, &["api", "projects/g%2Fr/pipelines"]),
-                Err(CiError::NotAuthenticated)
+                Err(CiError::Other(message))
+                    if message == "configured [ci.gitlab] token reference could not be resolved"
             ));
         }
     }
@@ -2228,6 +2241,12 @@ esac
                 .get_envs()
                 .any(|(key, _)| key == std::ffi::OsStr::new("GITLAB_TOKEN"))
         );
+    }
+
+    #[test]
+    fn gitlab_credential_debug_redacts_configured_token() {
+        let credential = GitlabCredential::Configured("fixture-secret-token".into());
+        assert_eq!(format!("{credential:?}"), "Configured(<redacted>)");
     }
 
     #[test]
