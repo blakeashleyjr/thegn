@@ -395,12 +395,11 @@ mod tests {
             ProbeSocket::Silent => {
                 // Accept connections, answer nothing: `send_request` writes
                 // its request and waits forever — the exact shape the probe
-                // timeout exists to bound. Flat short path: sun_path is 108
-                // bytes and the temp dir eats most of them.
-                let path = std::env::temp_dir().join(format!("tg-wta-{}.sock", std::process::id()));
-                // best-effort: a stale socket file from a previous run would
-                // just fail the bind below; no state to preserve.
-                let _ = std::fs::remove_file(&path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+                // timeout exists to bound. Keep its parent owner-only so the
+                // client-side IPC policy reaches the listener even when the
+                // system temp directory is shared.
+                let socket_dir = tempfile::Builder::new().prefix("wta").tempdir().unwrap();
+                let path = socket_dir.path().join("daemon.sock");
                 let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
                 std::thread::spawn(move || {
                     for stream in l.incoming() {
