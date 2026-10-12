@@ -164,11 +164,17 @@ impl MediaBackend for Aggregate {
     /// child pushes (the host then falls back to its poll ticker).
     fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
         Box::pin(async move {
+            let watches = join_all(
+                self.children
+                    .iter()
+                    .map(|c| bounded_watch(c.watch(), SNAPSHOT_BUDGET)),
+            )
+            .await;
             let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
             let mut any = false;
             let mut tasks = Vec::new();
-            for c in &self.children {
-                if let Some(mut w) = c.watch().await {
+            for watch in watches {
+                if let Some(mut w) = watch {
                     any = true;
                     let tx = tx.clone();
                     // A notification means “refresh current state”; while one
@@ -194,6 +200,17 @@ impl MediaBackend for Aggregate {
             .map(|c| c.caps())
             .unwrap_or(NO_CAPS)
     }
+}
+
+fn bounded_watch<'a>(
+    watch: BoxFuture<'a, Option<Box<dyn MediaWatch + Send>>>,
+    budget: std::time::Duration,
+) -> BoxFuture<'a, Option<Box<dyn MediaWatch + Send>>> {
+    Box::pin(async move {
+        tokio::time::timeout(budget, watch)
+            .await
+            .unwrap_or_default()
+    })
 }
 
 impl Aggregate {
@@ -361,5 +378,29 @@ mod tests {
             task_abort.is_finished(),
             "dropping the aggregate must abort its child tasks"
         );
+    }
+
+    #[tokio::test]
+    async fn stalled_child_watch_does_not_hold_up_healthy_watchers() {
+        let healthy = Box::pin(async { Some(Box::new(TestWatch) as Box<dyn MediaWatch + Send>) });
+        let stalled = Box::pin(std::future::pending());
+        let watches = join_all([
+            bounded_watch(stalled, std::time::Duration::from_millis(10)),
+            bounded_watch(healthy, std::time::Duration::from_millis(10)),
+        ])
+        .await;
+
+        assert!(watches[0].is_none(), "a stalled watcher should time out");
+        assert!(watches[1].is_some(), "a healthy watcher should be retained");
+    }
+
+    struct TestWatch;
+
+    impl MediaWatch for TestWatch {
+        fn changed(
+            &mut self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
     }
 }
