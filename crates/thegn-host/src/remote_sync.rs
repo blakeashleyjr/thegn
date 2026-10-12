@@ -8,8 +8,9 @@
 //! only — inherently excludes `target/` etc.), streamed over the placement's ssh
 //! control transport (which carries the configured `ProxyCommand`), `git clone`d
 //! there, then the working state (tracked diff + `.gitignore`-filtered untracked
-//! files) applied on top. Everything is best-effort; on success it returns the
-//! absolute remote path the worktree was materialized at.
+//! files) applied on top. Existing remote destinations are retained for explicit
+//! recovery, and a path is returned only after every materialization step
+//! succeeds.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -25,8 +26,8 @@ const REMOTE_WORKTREE_DEST: &str = "/workspace";
 /// Worktrees already materialized on their remote this session → resolved remote
 /// path. `prepare_sandbox_env` runs more than once per open (host provisioning
 /// then the pane build); this makes the second call a cheap no-op that still
-/// yields the path to retarget the mount. (v1: re-sync only on a fresh session;
-/// push-back / incremental re-sync is a follow-up.)
+/// yields the path to retarget the mount. A cache miss never replaces a remote
+/// destination; existing state must be reconciled outside this materializer.
 static SYNCED: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -90,6 +91,14 @@ fn q(s: &str) -> String {
     thegn_core::util::sh_quote(s)
 }
 
+fn claim_command(slug: &str) -> String {
+    format!(
+        "set -e; d=\"$HOME/thegn-worktrees\"/{slug}; \
+         mkdir -p \"$(dirname \"$d\")\"; mkdir \"$d\"; printf %s \"$d\"",
+        slug = q(slug),
+    )
+}
+
 /// Run a local `git -C <worktree> <args>` and return trimmed stdout on success.
 /// Goes through `util::git_cmd` for the GIT_* env scrub (never a raw git spawn).
 fn local_git(worktree: &str, args: &[&str]) -> Option<String> {
@@ -108,8 +117,8 @@ fn local_git(worktree: &str, args: &[&str]) -> Option<String> {
 /// remote host and repoint the container bind at it (`/workspace`). The default
 /// path-preserving worktree + git-common + host-toolchain binds are all LOCAL
 /// paths that don't exist on the remote; this replaces them with a self-contained
-/// remote clone. Best-effort — a sync failure warns but still lets the container
-/// come up (empty tree) rather than silently dropping to a local host shell.
+/// remote clone. A sync failure warns and retains the remote destination rather
+/// than silently dropping to a local host shell.
 /// No-op for local placements / non-OCI backends.
 pub(crate) fn retarget_if_remote_oci(
     spec: &mut thegn_core::sandbox::SandboxSpec,
@@ -178,7 +187,8 @@ pub(crate) fn degrade_oci_runtime(spec: &mut thegn_core::sandbox::SandboxSpec) -
 /// Sync `worktree` to `runner`'s remote host under `~/thegn-worktrees/<slug>`
 /// and return the resolved absolute remote path. `slug` should be the sandbox
 /// container name (deterministic + unique per worktree), so the materialized
-/// tree maps 1:1 to the container that binds it.
+/// tree maps 1:1 to the container that binds it. Existing destinations and
+/// failed attempts are retained.
 pub(crate) fn sync_worktree(
     runner: &OciRunner,
     worktree: &str,
@@ -193,17 +203,16 @@ pub(crate) fn sync_worktree(
         return Ok(p.clone());
     }
 
-    // 1. Prepare the remote dir. `$HOME` expands remotely; a prior clone is wiped
-    //    (v1 re-clones each open). Echo the resolved absolute path for the mount.
-    let prep = format!(
-        "d=\"$HOME/thegn-worktrees/{slug}\"; rm -rf \"$d\" \"$d.bundle\"; \
-         mkdir -p \"$(dirname \"$d\")\"; printf %s \"$d\"",
-        slug = slug,
-    );
+    // 1. Claim the destination atomically. Never follow or remove an existing
+    //    checkout, symlink, or interrupted attempt; those require reconciliation.
+    let prep = claim_command(slug);
     let (ok, path, err) = runner.host_exec(&prep, secs(60))?;
     let dir = path.trim().to_string();
     if !ok || dir.is_empty() {
-        return Err(format!("remote mkdir failed: {}", err.trim()));
+        return Err(format!(
+            "remote destination is unavailable or already exists; retained for reconciliation: {}",
+            err.trim()
+        ));
     }
 
     // 2. Stream a bundle of HEAD's history, then clone it on the remote.
@@ -217,7 +226,7 @@ pub(crate) fn sync_worktree(
             "-".into(),
             "HEAD".into(),
         ],
-        &format!("cat > {}.bundle", q(&dir)),
+        &format!("set -C; cat > {}.bundle", q(&dir)),
         secs(600),
     )?;
     let (ok, _o, err) = runner.host_exec(
@@ -225,36 +234,41 @@ pub(crate) fn sync_worktree(
         secs(600),
     )?;
     if !ok {
-        let _ = runner.host_exec(&format!("rm -f {d}.bundle", d = q(&dir)), secs(30)); // best-effort: cleanup: a leftover bundle on the host is harmless
         return Err(format!("remote clone failed: {}", err.trim()));
     }
-    // Restore the branch name (clone lands on detached HEAD) + drop the bundle;
-    // both best-effort now that the checkout exists.
-    let branch = local_git(worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
+    // Restore the branch name (clone lands on detached HEAD).
+    let branch = local_git(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .ok_or_else(|| "could not determine local worktree branch".to_string())?;
     let restore = if branch.is_empty() || branch == "HEAD" {
         String::new()
     } else {
         format!(
-            "git -C {d} checkout -qB {b} 2>/dev/null; ",
+            "git -C {d} checkout -qB {b} 2>/dev/null && ",
             d = q(&dir),
             b = q(&branch)
         )
     };
     let init = if recursive_submodules {
         format!(
-            "git -C {d} submodule update --init --recursive; ",
+            "git -c submodule.recurse=false -C {d} submodule update --init; ",
             d = q(&dir)
         )
     } else {
         String::new()
     };
-    let _ = runner.host_exec(
-        &format!("{restore}{init}rm -f {d}.bundle", d = q(&dir)),
+    let (ok, _out, err) = runner.host_exec(
+        &format!("set -e; {restore}{init}rm -f {d}.bundle", d = q(&dir)),
         secs(600),
-    ); // best-effort: cleanup: a leftover bundle on the host is harmless
+    )?;
+    if !ok {
+        return Err(format!(
+            "remote branch or submodule setup failed: {}",
+            err.trim()
+        ));
+    }
 
-    // 3. Apply working state (best-effort): tracked diff, then untracked files.
-    let _ = runner.pipe_local_to_host(
+    // 3. Apply working state: tracked diff, then untracked files.
+    runner.pipe_local_to_host(
         &[
             "git".into(),
             "-C".into(),
@@ -263,26 +277,66 @@ pub(crate) fn sync_worktree(
             "HEAD".into(),
         ],
         &format!(
-            "cd {d} && git apply --whitespace=nowarn - 2>/dev/null || true",
+            "cd {d} && git apply --whitespace=nowarn - 2>/dev/null",
             d = q(&dir)
         ),
         secs(180),
-    );
-    let _ = runner.pipe_local_to_host( // best-effort: working-state sync is best-effort by design (comment above): the clone already carried the commit state
+    )?;
+    runner.pipe_local_to_host(
         &[
-            "sh".into(),
+            "bash".into(),
+            "-o".into(),
+            "pipefail".into(),
             "-c".into(),
             format!(
                 "git -C {wt} ls-files --others --exclude-standard -z | tar -C {wt} --null -T - -cf -",
                 wt = q(worktree),
             ),
         ],
-        &format!("tar -C {d} -xf - 2>/dev/null || true", d = q(&dir)),
+        &format!("tar -C {d} -xf -", d = q(&dir)),
         secs(180),
-    );
+    )?;
     SYNCED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(worktree.to_string(), dir.clone());
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::claim_command;
+    use std::process::Command;
+
+    #[test]
+    fn destination_claim_refuses_existing_checkout_without_removing_it() {
+        let home = std::env::temp_dir().join(format!(
+            "thegn-remote-sync-claim-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+
+        let command = claim_command("sandbox");
+        let first = Command::new("sh")
+            .args(["-c", command.as_str()])
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(first.status.success());
+        let marker = home.join("thegn-worktrees/sandbox/user-data");
+        std::fs::write(&marker, b"keep").unwrap();
+
+        let second = Command::new("sh")
+            .args(["-c", command.as_str()])
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(!second.status.success());
+        assert_eq!(std::fs::read(&marker).unwrap(), b"keep");
+        std::fs::remove_dir_all(home).unwrap();
+    }
 }
