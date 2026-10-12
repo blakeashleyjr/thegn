@@ -1952,7 +1952,13 @@ mod tests {
 
     #[test]
     fn scrubbed_git_command_pane_label_is_the_program() {
-        let program = command_on_path("git").unwrap_or_else(|| "/bin/sh".into());
+        let program = std::env::var("SHELL")
+            .ok()
+            .into_iter()
+            .chain(std::env::var("ComSpec"))
+            .chain(["/usr/bin/git".to_owned(), "/bin/sh".to_owned()])
+            .find(|candidate| std::path::Path::new(candidate).is_file())
+            .expect("an existing shell or git executable");
         let argv = [
             "env".to_string(),
             "-u".to_string(),
