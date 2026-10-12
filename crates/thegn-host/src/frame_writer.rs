@@ -7,10 +7,10 @@
 //! render + graphics + bell), submits them to a **bounded, 2-deep** queue, and
 //! moves on; the writer thread does the blocking I/O.
 //!
-//! Ordering: ONE FIFO carries both frames and out-of-band writes (OSC
-//! passthrough, kitty deletes, the muse marker), and every stdout byte inside
-//! the event loop goes through it — a single writer on a single fd, so frames
-//! and passthrough can never interleave mid-sequence.
+//! Ordering: ONE FIFO carries worker-managed frames and out-of-band writes
+//! (OSC passthrough, kitty deletes, the muse marker), so those writes cannot
+//! interleave mid-sequence. The termwiz debug renderer still writes directly
+//! from the render loop and needs a separate migration to this FIFO.
 //!
 //! Backpressure/correctness rules:
 //! - Frames are diffs against the loop's `front` surface: a frame, once
@@ -28,10 +28,12 @@
 //!   synchronous path; [`RETRY_MAX`](crate::frame_write::RETRY_MAX)
 //!   consecutive failures escalate to Fatal (tear down).
 //!
-//! `sync` mode (the termwiz debug renderer, or `THEGN_SYNC_WRITER=1`) still
-//! writes on the caller thread. `THEGN_SYNC_WRITER=1` is an unbounded
-//! synchronous diagnostic/field override, not a liveness-safe production
-//! fallback; use only when the output sink is known to be writable.
+//! `THEGN_SYNC_WRITER=1` keeps FIFO writes on the owned worker but makes each
+//! admission wait on the caller until completion or the bounded deadline. A
+//! timeout sets Fatal and abandons queued bytes. `want_sync` also enables this
+//! mode for the termwiz debug renderer, so its FIFO OOB and clipboard writes
+//! can block the render loop for up to three seconds; its frames still write
+//! outside this worker in `run.rs`.
 
 use std::collections::VecDeque;
 use std::io::Write as _;
@@ -77,12 +79,15 @@ struct Q {
     parser_reset_pending: bool,
     shutdown: bool,
     worker_done: bool,
+    submitted_seq: u64,
+    completed_seq: u64,
     metrics: WriterMetrics,
 }
 
 struct Inner {
     q: Mutex<Q>,
     cv: Condvar,
+    done_cv: Condvar,
     metrics_deferrals: AtomicU64,
     clipboard_retry: AtomicBool,
     oob_retry: AtomicBool,
@@ -91,7 +96,7 @@ struct Inner {
 
 pub(crate) struct FrameWriter {
     inner: Arc<Inner>,
-    /// `None` in sync mode (no thread; writes happen on the caller).
+    /// The owned writer worker, including in sync mode.
     handle: Option<std::thread::JoinHandle<()>>,
     sync: bool,
 }
@@ -108,12 +113,31 @@ const WRITER_SHUTDOWN_BOUND: std::time::Duration = if cfg!(test) {
 } else {
     std::time::Duration::from_millis(500)
 };
+/// Maximum caller wait for one synchronous-mode write. Production uses three
+/// seconds to allow a slow terminal to drain while keeping the UI recoverable.
+const SYNC_WRITE_BOUND: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(30)
+} else {
+    std::time::Duration::from_secs(3)
+};
 
 impl FrameWriter {
-    /// Spawn the writer thread (or a sync-mode handle when `sync` is set).
+    /// Spawn the owned writer thread.
     /// `waker` pulses the loop when the status changes so an error is acted
     /// on promptly even while idle.
     pub(crate) fn spawn(waker: TerminalWaker, sync: bool) -> Self {
+        Self::spawn_with(
+            sync,
+            move |reason| wake_loop(&waker, reason),
+            write_and_flush,
+        )
+    }
+
+    fn spawn_with(
+        sync: bool,
+        wake: impl Fn(&'static str) + Send + 'static,
+        sink: impl FnMut(&[u8]) -> std::io::Result<()> + Send + 'static,
+    ) -> Self {
         let inner = Arc::new(Inner {
             q: Mutex::new(Q {
                 msgs: VecDeque::new(),
@@ -126,22 +150,25 @@ impl FrameWriter {
                 consec_errs: 0,
                 parser_reset_pending: false,
                 shutdown: false,
-                worker_done: sync,
+                worker_done: false,
+                submitted_seq: 0,
+                completed_seq: 0,
                 metrics: WriterMetrics::default(),
             }),
             cv: Condvar::new(),
+            done_cv: Condvar::new(),
             metrics_deferrals: AtomicU64::new(0),
             clipboard_retry: AtomicBool::new(false),
             oob_retry: AtomicBool::new(false),
             oob_pressure_logged: AtomicBool::new(false),
         });
-        let handle = (!sync).then(|| {
-            let inner = Arc::clone(&inner);
+        let worker_inner = Arc::clone(&inner);
+        let handle = Some(
             std::thread::Builder::new()
                 .name("thegn-writer".into())
-                .spawn(move || writer_main(&inner, &waker))
-                .expect("spawn writer thread")
-        });
+                .spawn(move || writer_main(&worker_inner, wake, sink))
+                .expect("spawn writer thread"),
+        );
         FrameWriter {
             inner,
             handle,
@@ -150,8 +177,10 @@ impl FrameWriter {
     }
 
     /// Resolve sync mode: the termwiz debug renderer writes through the
-    /// BufferedTerminal (not us), and `THEGN_SYNC_WRITER=1` is the async
-    /// writer's kill-switch/A-B lever.
+    /// BufferedTerminal (not us), and `THEGN_SYNC_WRITER=1` makes worker-backed
+    /// writes ordered and caller-blocking up to `SYNC_WRITE_BOUND`; timeout is
+    /// Fatal and drops queued messages. Termwiz frames themselves remain on
+    /// the render loop until the run-loop lane moves them.
     pub(crate) fn want_sync(use_termwiz_renderer: bool) -> bool {
         use_termwiz_renderer || std::env::var_os("THEGN_SYNC_WRITER").is_some_and(|v| v == "1")
     }
@@ -160,29 +189,32 @@ impl FrameWriter {
     /// loop checks this BEFORE running the wire renderer (whose SGR state
     /// must only advance for frames that are actually delivered).
     pub(crate) fn frame_slot_free(&self) -> bool {
-        if self.sync {
-            return true;
-        }
         let q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
-        q.frames_queued < FRAME_QUEUE_DEPTH
+        !q.shutdown
+            && !matches!(q.status, WriterStatus::Fatal(_))
+            && q.frames_queued < FRAME_QUEUE_DEPTH
     }
 
     /// Submit a composed frame. Returns false when the queue is full (the
     /// caller deferred composing, so this only races a concurrent drain —
-    /// never drops). Sync mode writes inline.
+    /// never drops). Sync mode waits for worker completion up to its deadline.
     pub(crate) fn submit_frame(&self, bytes: Vec<u8>, stamp: Option<FrameStamp>) -> bool {
-        if self.sync {
-            self.write_inline(&bytes, stamp);
-            return true;
-        }
         let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
-        if q.frames_queued >= FRAME_QUEUE_DEPTH {
+        if q.shutdown
+            || matches!(q.status, WriterStatus::Fatal(_))
+            || q.frames_queued >= FRAME_QUEUE_DEPTH
+        {
             return false;
         }
+        q.submitted_seq = q.submitted_seq.saturating_add(1);
+        let target = q.submitted_seq;
         q.frames_queued += 1;
         q.msgs.push_back(Msg::Frame(bytes, stamp));
         drop(q);
         self.inner.cv.notify_one();
+        if self.sync {
+            self.wait_for_sync_write(target);
+        }
         true
     }
 
@@ -213,10 +245,6 @@ impl FrameWriter {
         if bytes.is_empty() {
             return Ok(());
         }
-        if self.sync {
-            self.write_inline(&bytes, None);
-            return Ok(());
-        }
         let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
         if q.shutdown
             || matches!(q.status, WriterStatus::Fatal(_))
@@ -229,11 +257,16 @@ impl FrameWriter {
         self.inner
             .oob_pressure_logged
             .store(false, Ordering::SeqCst);
+        q.submitted_seq = q.submitted_seq.saturating_add(1);
+        let target = q.submitted_seq;
         q.oob_in_flight += 1;
         q.oob_bytes += bytes.len();
         q.msgs.push_back(Msg::Oob(bytes));
         drop(q);
         self.inner.cv.notify_one();
+        if self.sync {
+            self.wait_for_sync_write(target);
+        }
         Ok(())
     }
 
@@ -247,10 +280,6 @@ impl FrameWriter {
     ) -> Result<(), Vec<u8>> {
         if bytes.len() > crate::queries::clipboard::MAX_WIRE {
             return Err(bytes);
-        }
-        if self.sync {
-            self.write_inline(&bytes, None);
-            return Ok(());
         }
         self.inner.clipboard_retry.store(true, Ordering::SeqCst);
         let mut q = match self.inner.q.try_lock() {
@@ -272,9 +301,14 @@ impl FrameWriter {
         }
         q.clipboard_queued += 1;
         q.clipboard_bytes += bytes.len();
+        q.submitted_seq = q.submitted_seq.saturating_add(1);
+        let target = q.submitted_seq;
         q.msgs.push_back(Msg::Clipboard(bytes));
         drop(q);
         self.inner.cv.notify_one();
+        if self.sync {
+            self.wait_for_sync_write(target);
+        }
         Ok(())
     }
 
@@ -290,36 +324,25 @@ impl FrameWriter {
         }
     }
 
-    /// Sync-mode write on the caller thread, with the same classification.
-    fn write_inline(&self, bytes: &[u8], stamp: Option<FrameStamp>) {
-        let started = stamp.map(|_| Instant::now());
-        let reset_pending = self
-            .inner
-            .q
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .parser_reset_pending;
-        let result = if reset_pending {
-            match write_and_flush(PARSER_RESET) {
-                Ok(()) => {
-                    self.inner
-                        .q
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .parser_reset_pending = false;
-                    write_and_flush(bytes)
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            write_and_flush(bytes)
-        };
-        let finished = started.map(|_| Instant::now());
+    fn wait_for_sync_write(&self, target: u64) {
+        let deadline = Instant::now() + SYNC_WRITE_BOUND;
         let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
-        if let (Some(stamp), Some(started), Some(finished)) = (stamp, started, finished) {
-            q.metrics.record(stamp, started, finished, result.is_ok());
+        while q.completed_seq < target && !matches!(q.status, WriterStatus::Fatal(_)) {
+            let now = Instant::now();
+            if now >= deadline {
+                q.status = WriterStatus::Fatal("synchronous terminal write deadline".into());
+                abandon_queued_messages(&mut q);
+                drop(q);
+                self.inner.done_cv.notify_all();
+                return;
+            }
+            let (next, _) = self
+                .inner
+                .done_cv
+                .wait_timeout(q, deadline.saturating_duration_since(now))
+                .unwrap_or_else(|e| e.into_inner());
+            q = next;
         }
-        apply_write_result(&mut q, result);
     }
 
     /// Never wait behind a producer for diagnostics. The fixed-size ledger is
@@ -400,7 +423,9 @@ impl Drop for FrameWriter {
 }
 
 fn abandon_queued_messages(q: &mut Q) {
-    q.status = WriterStatus::Fatal("terminal writer shutdown deadline".into());
+    if !matches!(q.status, WriterStatus::Fatal(_)) {
+        q.status = WriterStatus::Fatal("terminal writer shutdown deadline".into());
+    }
     let queued_oob_count = q
         .msgs
         .iter()
@@ -432,7 +457,11 @@ fn pop_message(q: &mut Q) -> Option<Msg> {
     Some(message)
 }
 
-fn writer_main(inner: &Inner, waker: &TerminalWaker) {
+fn writer_main(
+    inner: &Inner,
+    wake: impl Fn(&'static str),
+    mut sink: impl FnMut(&[u8]) -> std::io::Result<()>,
+) {
     loop {
         let msg = {
             let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
@@ -448,16 +477,17 @@ fn writer_main(inner: &Inner, waker: &TerminalWaker) {
         };
         let Some(msg) = msg else { break };
         if inner.clipboard_retry.swap(false, Ordering::SeqCst) {
-            wake_loop(waker, "clipboard capacity released");
+            wake("clipboard capacity released");
         }
-        let (errored, released_oob) = write_message(inner, msg, write_and_flush);
+        let (errored, released_oob) = write_message(inner, msg, &mut sink);
         if errored || oob_capacity_wake_requested(inner, released_oob) {
-            wake_loop(waker, "writer state changed");
+            wake("writer state changed");
         }
     }
     let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
     q.worker_done = true;
     inner.cv.notify_all();
+    inner.done_cv.notify_all();
 }
 
 fn wake_loop(waker: &TerminalWaker, reason: &'static str) {
@@ -494,6 +524,10 @@ fn write_message(
         (fatal, released)
     };
     if fatal.0 {
+        let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
+        q.completed_seq = q.completed_seq.saturating_add(1);
+        drop(q);
+        inner.done_cv.notify_all();
         return (false, fatal.1);
     }
     let stamp = match &msg {
@@ -531,7 +565,9 @@ fn write_message(
             q.metrics.record(stamp, started, finished, !errored);
         }
         apply_write_result(&mut q, result);
+        q.completed_seq = q.completed_seq.saturating_add(1);
     }
+    inner.done_cv.notify_all();
     (errored, released_oob)
 }
 
@@ -596,6 +632,8 @@ mod tests {
             parser_reset_pending: false,
             shutdown: false,
             worker_done: false,
+            submitted_seq: 0,
+            completed_seq: 0,
             metrics: WriterMetrics::default(),
         }
     }
@@ -605,6 +643,7 @@ mod tests {
             inner: Arc::new(Inner {
                 q: Mutex::new(q()),
                 cv: Condvar::new(),
+                done_cv: Condvar::new(),
                 metrics_deferrals: AtomicU64::new(0),
                 clipboard_retry: AtomicBool::new(false),
                 oob_retry: AtomicBool::new(false),
@@ -613,6 +652,114 @@ mod tests {
             handle: None,
             sync: false,
         }
+    }
+
+    fn gated_sync_writer(
+        gate: std::sync::mpsc::Receiver<()>,
+        log: Arc<Mutex<Vec<Vec<u8>>>>,
+        finished: Option<std::sync::mpsc::Sender<()>>,
+    ) -> FrameWriter {
+        FrameWriter::spawn_with(
+            true,
+            |_| {},
+            move |bytes| {
+                gate.recv().unwrap();
+                log.lock().unwrap().push(bytes.to_vec());
+                if let Some(finished) = &finished {
+                    finished.send(()).unwrap();
+                }
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
+    fn sync_submit_returns_within_bound_on_a_never_returning_sink() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let writer = gated_sync_writer(release_rx, Arc::clone(&log), None);
+        let started = Instant::now();
+        assert!(writer.submit_frame(vec![1], None));
+        assert!(started.elapsed() < SYNC_WRITE_BOUND + std::time::Duration::from_millis(150));
+        assert!(matches!(writer.take_status(), WriterStatus::Fatal(_)));
+        assert_eq!(writer.try_submit_oob(vec![2]), Err(vec![2]));
+        release_tx.send(()).unwrap();
+        drop(writer);
+        assert_eq!(*log.lock().unwrap(), vec![vec![1]]);
+    }
+
+    #[test]
+    fn sync_mode_preserves_frame_oob_clipboard_order_and_returns_after_completion() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let writer = FrameWriter::spawn_with(true, |_| {}, {
+            let log = Arc::clone(&log);
+            move |bytes| {
+                log.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            }
+        });
+        assert!(writer.submit_frame(vec![1], None));
+        assert_eq!(log.lock().unwrap().len(), 1);
+        assert_eq!(writer.try_submit_oob(vec![2]), Ok(()));
+        assert_eq!(log.lock().unwrap().len(), 2);
+        let retry_deadline = Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            match writer.try_submit_clipboard(vec![3], || {}) {
+                Ok(()) => break,
+                Err(bytes) => {
+                    assert_eq!(bytes, vec![3]);
+                    assert!(
+                        Instant::now() < retry_deadline,
+                        "clipboard admission did not retry"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+        }
+        assert_eq!(*log.lock().unwrap(), vec![vec![1], vec![2], vec![3]]);
+        drop(writer);
+    }
+
+    #[test]
+    fn drop_during_blocked_sync_write_is_bounded_and_emits_no_queued_bytes() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink_log = Arc::clone(&log);
+        let writer = Arc::new(FrameWriter::spawn_with(
+            true,
+            |_| {},
+            move |bytes| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                sink_log.lock().unwrap().push(bytes.to_vec());
+                finished_tx.send(()).unwrap();
+                Ok(())
+            },
+        ));
+        let first_writer = Arc::clone(&writer);
+        let first = std::thread::spawn(move || first_writer.submit_frame(vec![1], None));
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        {
+            let mut q = writer.inner.q.lock().unwrap();
+            assert_eq!(q.submitted_seq, 1);
+            q.submitted_seq = q.submitted_seq.saturating_add(1);
+            q.oob_in_flight += 1;
+            q.oob_bytes += 1;
+            q.msgs.push_back(Msg::Oob(vec![2]));
+        }
+        assert!(first.join().unwrap());
+        let started = Instant::now();
+        drop(writer);
+        assert!(started.elapsed() < WRITER_SHUTDOWN_BOUND + std::time::Duration::from_millis(150));
+        release_tx.send(()).unwrap();
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(*log.lock().unwrap(), vec![vec![1]]);
     }
 
     #[test]
