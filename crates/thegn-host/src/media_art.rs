@@ -419,12 +419,12 @@ fn local_path(url: &str) -> Option<std::path::PathBuf> {
             None | Some("") | Some("localhost") => {}
             Some(_) => return None,
         }
-        return parsed.to_file_path().ok();
+        parsed.to_file_path().ok()
+    } else if url.starts_with('/') {
+        Some(std::path::PathBuf::from(url))
+    } else {
+        None
     }
-    if url.starts_with('/') {
-        return Some(std::path::PathBuf::from(url));
-    }
-    None
 }
 
 /// Runtime allowlist for locally cached/player-library art. Non-absolute roots
