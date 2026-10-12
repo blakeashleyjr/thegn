@@ -190,28 +190,37 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
             return report;
         }
     };
-    let entries: Vec<_> = rows
-        .iter()
+    let mut entries = Vec::new();
+    for row in &rows {
         // A global queue may contain the same target name in unrelated repos.
-        // Exclude proven foreign Git identities before applying this repo's
-        // clock or reporting holds. Unknown/missing paths remain conservative
-        // candidates; the final cleanup admission still proves all ownership.
-        .filter(|row| {
-            crate::merge_lifecycle::repository_identity(Path::new(&row.worktree))
-                .map_or(true, |candidate| candidate == identity)
-        })
-        .filter(|row| {
-            if merge_sweep::CleanupHold::from_detail(row.error_detail.as_deref()).is_some() {
-                if force { report.kept.push((row.branch.clone(), "worktree previously collected; branch and queue evidence retained for explicit cleanup (THE-596)".into())); }
-                false
-            } else { true }
-        })
-        .map(|r| MergedEntry {
-            worktree: r.worktree.clone(),
-            branch: r.branch.clone(),
-            landed_at: r.updated_at,
-        })
-        .collect();
+        // Unknown/missing worktree identity cannot be safely assigned this
+        // repository's policy and must be refused before backfill or cleanup.
+        let candidate = match crate::merge_lifecycle::repository_identity(Path::new(&row.worktree))
+        {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                report.kept.push((
+                    row.branch.clone(),
+                    format!("repository identity unavailable; row left untouched: {error}"),
+                ));
+                continue;
+            }
+        };
+        if candidate != identity {
+            continue;
+        }
+        if merge_sweep::CleanupHold::from_detail(row.error_detail.as_deref()).is_some() {
+            if force {
+                report.kept.push((row.branch.clone(), "worktree previously collected; branch and queue evidence retained for explicit cleanup (THE-596)".into()));
+            }
+            continue;
+        }
+        entries.push(MergedEntry {
+            worktree: row.worktree.clone(),
+            branch: row.branch.clone(),
+            landed_at: row.updated_at,
+        });
+    }
     let now = util::now();
     let due: Vec<&MergedEntry> = if force {
         entries.iter().collect()
@@ -617,6 +626,79 @@ mod tests {
                 .iter()
                 .any(|row| row.worktree == wt.to_string_lossy())
         );
+    }
+
+    #[test]
+    #[expect(clippy::disallowed_methods)]
+    fn unknown_repository_identity_is_kept_before_landed_identity_backfill() {
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let db_path = parent.join("private.db");
+        let db = Db::open_at(&db_path).unwrap();
+        let (root, wt) = fixture(&parent, "unknown-repository", &db, &isolation);
+        std::fs::write(wt.join("landed.txt"), "landed\n").unwrap();
+        let output = isolation
+            .git(&wt)
+            .args(["-c", "core.hooksPath=/dev/null", "add", "landed.txt"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = isolation
+            .git(&wt)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-q",
+                "-m",
+                "landed",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = isolation
+            .git(&root)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                "plain merge",
+                "feature",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let missing = parent.join("no-longer-a-worktree");
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE merge_queue SET worktree=?1, result_oid=NULL, queued_at=1, updated_at=1 WHERE worktree=?2",
+                rusqlite::params![
+                    missing.to_string_lossy().into_owned(),
+                    wt.to_string_lossy().into_owned()
+                ],
+            )
+            .unwrap();
+
+        let mut cfg = local_config();
+        cfg.merge_queue.on_landed = OnLanded::Expire;
+        cfg.merge_queue.target_branch = "main".into();
+        let report = sweep_with_db(&cfg, &root, true, &db);
+        assert!(report.collected.is_empty());
+        assert!(report.kept.iter().any(|(branch, reason)| {
+            branch == "feature" && reason.contains("repository identity unavailable")
+        }));
+        assert!(
+            db.list_merge_queue().unwrap().iter().any(|row| {
+                row.worktree == missing.to_string_lossy().into_owned() && row.result_oid.is_none()
+            }),
+            "unknown row must remain unchanged and must not be backfilled"
+        );
+        assert!(wt.exists());
     }
 
     #[test]
