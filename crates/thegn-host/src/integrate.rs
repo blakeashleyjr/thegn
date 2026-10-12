@@ -1413,10 +1413,7 @@ fn run_fold_admitted(
         let landed_sources: Vec<Branch> = plan
             .landed
             .iter()
-            .map(|landed| Branch {
-                name: landed.branch.name.clone(),
-                tip: landed.branch.tip.clone(),
-            })
+            .map(|landed| landed.branch.clone())
             .collect();
         let advanced = match advance(&loc, &target_ref, &plan.final_tip, &base, &landed_sources) {
             Ok(advanced) => advanced,
@@ -1644,7 +1641,7 @@ fn attempt_land_admitted(
         }
         let branch = Branch {
             name: branch_name.to_string(),
-            tip: branch_tip,
+            tip: branch_tip.clone(),
         };
         adapter.history.revalidate()?;
         source_history.revalidate()?;
@@ -2961,7 +2958,40 @@ mod tests {
         assert!(report.landed.is_empty());
         assert_eq!(repo.out(&["rev-parse", "main"]), original);
         assert!(report.diagnostics.contains("refs/heads/b1"));
-        assert!(report.diagnostics.contains("moved after gate"));
+        assert!(
+            report
+                .diagnostics
+                .contains("after gate; fold must be retried")
+        );
+    }
+
+    #[test]
+    fn run_fold_fences_landed_source_deleted_by_gate() {
+        let repo = Repo::new("fold-source-missing");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "candidate.txt", "candidate\n");
+        let original = repo.out(&["rev-parse", "main"]);
+        let command = format!(
+            "git -C {} update-ref -d refs/heads/b1",
+            util::sh_quote(&repo.dir.to_string_lossy())
+        );
+        let config = cfg(&command);
+        if !repo.gate_supported_or_refused(&config) {
+            return;
+        }
+
+        let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        assert!(!report.advanced);
+        assert!(report.landed.is_empty());
+        assert_eq!(repo.out(&["rev-parse", "main"]), original);
+        assert!(report.diagnostics.contains("refs/heads/b1"));
+        assert!(
+            report
+                .diagnostics
+                .contains("disappeared after gate; fold must be retried")
+        );
     }
 
     #[test]
@@ -2972,7 +3002,7 @@ mod tests {
         }
         repo.feature("b1", "shared.txt", "b1\n");
         repo.feature("b2", "shared.txt", "b2\n");
-        let mut config = cfg(&gate_that_moves_branch(&repo, "b2"));
+        let config = cfg(&gate_that_moves_branch(&repo, "b2"));
         if !repo.gate_supported_or_refused(&config) {
             return;
         }

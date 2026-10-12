@@ -765,7 +765,6 @@ fn git_read_timeout() -> Option<std::time::Duration> {
 /// backoff. This always runs on a background worker (hydration / diff watcher),
 /// never the compositor loop, so the poll costs nothing the UI can feel.
 fn output_bounded(cmd: std::process::Command, args: &[&str]) -> Result<std::process::Output> {
-    GIT_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     output_bounded_with(cmd, args, git_read_timeout())
 }
 
@@ -793,22 +792,64 @@ pub fn git_spawn_count() -> u64 {
 /// [`output_bounded`] with the timeout injected — the seam the unit tests drive
 /// so they don't have to mutate the process-global `THEGN_GIT_READ_TIMEOUT_SECS`.
 fn output_bounded_with(
+    cmd: std::process::Command,
+    args: &[&str],
+    timeout: Option<std::time::Duration>,
+) -> Result<std::process::Output> {
+    output_bounded_with_input(cmd, args, None, timeout)
+}
+
+/// [`output_bounded_with`] with an optional stdin payload. The same bounded
+/// child lifecycle and spawn accounting apply to ref transactions and reads.
+pub(super) fn output_bounded_with_input(
     mut cmd: std::process::Command,
     args: &[&str],
+    input: Option<&[u8]>,
     timeout: Option<std::time::Duration>,
 ) -> Result<std::process::Output> {
     use std::io::Read;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
+    GIT_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Some(timeout) = timeout else {
+        if let Some(input) = input {
+            use std::io::Write;
+
+            let mut child = cmd
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            if let Some(mut stdin) = child.stdin.take() {
+                if let Err(error) = stdin.write_all(input) {
+                    stop_bounded_child(&mut child);
+                    return Err(error.into());
+                }
+            }
+            return Ok(child.wait_with_output()?);
+        }
         return Ok(cmd.output()?);
     };
     let mut child = cmd
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    if let Some(input) = input {
+        use std::io::Write;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(error) = stdin.write_all(input) {
+                stop_bounded_child(&mut child);
+                return Err(error.into());
+            }
+        }
+    }
     let mut so = child.stdout.take().expect("piped stdout");
     let mut se = child.stderr.take().expect("piped stderr");
     let so_h = std::thread::spawn(move || {
@@ -848,6 +889,15 @@ fn output_bounded_with(
         stdout,
         stderr,
     })
+}
+
+fn stop_bounded_child(child: &mut std::process::Child) {
+    if let Err(error) = child.kill() {
+        tracing::debug!(%error, "failed to stop git child after stdin write error");
+    }
+    if let Err(error) = child.wait() {
+        tracing::debug!(%error, "failed to reap git child after stdin write error");
+    }
 }
 
 /// Parse `git status --porcelain=v1 -z --no-renames` output into
