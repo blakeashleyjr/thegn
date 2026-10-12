@@ -2096,7 +2096,47 @@ fn the_query_window_reaches_the_plugin_as_environment() {
         r#"echo "{\"method\":\"events\",\"params\":{\"sync_token\":\"$THEGN_CAL_FROM..$THEGN_CAL_TO\"}}""#,
     )
     .unwrap();
-    assert_eq!(page.sync_token(), "2026-08-01..2026-08-31");
+    assert_eq!(
+        page.sync_token(),
+        ics_url::stored_cursor("UTC", "2026-08-01..2026-08-31")
+    );
+}
+
+#[tokio::test]
+async fn changing_home_zone_sends_an_empty_cursor_to_a_command_plugin() {
+    let tmp = Tmp::new("command-zone-cursor");
+    let seen = tmp.0.join("seen-tokens");
+    let script = format!(
+        "echo \"$THEGN_CAL_SYNC_TOKEN\" >> '{}'; echo '{{\"method\":\"events\",\"params\":{{\"sync_token\":\"plugin-cursor\"}}}}'",
+        seen.display()
+    );
+    let acct = command_account(&script);
+    let (from, to) = window();
+    let kolkata = AccountAdmission::isolated(
+        AdmissionBudget::default(),
+        thegn_core::calendar::Tz::Asia__Kolkata,
+    );
+    let first = command::CommandBackend::new(&acct, kolkata);
+    let one = first.list_events(from, to, "").await.unwrap();
+    assert_eq!(
+        one.sync_token(),
+        ics_url::stored_cursor("Asia/Kolkata", "plugin-cursor")
+    );
+
+    let los_angeles = AccountAdmission::isolated(
+        AdmissionBudget::default(),
+        thegn_core::calendar::Tz::America__Los_Angeles,
+    );
+    let second = command::CommandBackend::new(&acct, los_angeles);
+    let two = second
+        .list_events(from, to, one.sync_token())
+        .await
+        .unwrap();
+    assert_eq!(
+        two.sync_token(),
+        ics_url::stored_cursor("America/Los_Angeles", "plugin-cursor")
+    );
+    assert_eq!(std::fs::read_to_string(seen).unwrap(), "\n\n");
 }
 
 #[test]
@@ -2107,7 +2147,11 @@ fn several_event_messages_accumulate() {
     )
     .unwrap();
     assert_eq!(page.events().len(), 2, "pages accumulate");
-    assert_eq!(page.sync_token(), "t2", "the last token wins");
+    assert_eq!(
+        page.sync_token(),
+        ics_url::stored_cursor("UTC", "t2"),
+        "the last token wins"
+    );
 }
 
 #[test]
@@ -2635,7 +2679,7 @@ fn the_plugin_sees_the_real_budget() {
         r#"echo "{\"method\":\"events\",\"params\":{\"sync_token\":\"$THEGN_CAL_MAX_EVENTS\"}}""#,
     )
     .unwrap();
-    assert_eq!(page.sync_token(), "7");
+    assert_eq!(page.sync_token(), ics_url::stored_cursor("UTC", "7"));
 }
 
 #[test]
@@ -2713,10 +2757,10 @@ fn an_over_budget_plugin_delta_falls_back_to_a_full_fetch() {
     );
     let b = command::CommandBackend::new(&command_account(&script), budget_of(3));
     let (from, to) = window();
-    let page = block_on(b.list_events(from, to, "t1")).unwrap();
+    let page = block_on(b.list_events(from, to, &ics_url::stored_cursor("UTC", "t1"))).unwrap();
     assert_eq!(page.events().len(), 1);
     assert!(page.deleted().is_empty());
-    assert_eq!(page.sync_token(), "full");
+    assert_eq!(page.sync_token(), ics_url::stored_cursor("UTC", "full"));
     assert_eq!(page.mode(), PageMode::Snapshot);
 }
 
@@ -3098,14 +3142,20 @@ fn a_plugin_declares_its_page_mode() {
     let run = |script: &str, token: &str| {
         let b = command::CommandBackend::new(&command_account(script), adm());
         let (from, to) = window();
-        block_on(b.list_events(from, to, token))
+        block_on(b.list_events(from, to, &ics_url::stored_cursor("UTC", token)))
     };
     let snap = run(
         r#"echo '{"method":"events","params":{"mode":"snapshot","sync_token":"c2"}}'"#,
         "c1",
     )
     .unwrap();
-    assert_eq!((snap.mode(), snap.sync_token()), (PageMode::Snapshot, "c2"));
+    assert_eq!(
+        (snap.mode(), snap.sync_token()),
+        (
+            PageMode::Snapshot,
+            ics_url::stored_cursor("UTC", "c2").as_str()
+        )
+    );
     let delta = run(
         r#"echo '{"method":"events","params":{"mode":"delta"}}'"#,
         "c1",
@@ -3125,7 +3175,11 @@ fn a_plugin_declares_its_page_mode() {
     )
     .unwrap();
     assert!(same.is_unchanged());
-    assert_eq!(same.sync_token(), "c1", "the request cursor is kept");
+    assert_eq!(
+        same.sync_token(),
+        ics_url::stored_cursor("UTC", "c1"),
+        "the request cursor is kept"
+    );
     // Contradictions fail closed instead of guessing.
     assert!(
         run(

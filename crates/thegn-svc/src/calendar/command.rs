@@ -452,15 +452,18 @@ impl CalendarBackend for CommandBackend {
         sync_token: &'a str,
     ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
         Box::pin(async move {
+            // The persisted cursor is tagged with the home zone, like an ICS
+            // ETag. A stale or legacy token forces a full plugin snapshot.
+            let request_token = super::ics_url::request_etag(self.zone.name(), sync_token);
             // One absolute deadline for the whole fetch, fallback included, so
             // a plugin can never hold the sync thread for two full timeouts.
             let deadline = std::time::Instant::now() + self.timeout;
-            match self.run_once(from, to, sync_token, deadline).await {
+            match self.run_once(from, to, request_token, deadline).await {
                 // A delta over the account's own budget would be refused again
                 // on every tick, since the cursor is (correctly) not advanced.
                 // Ask once for a full snapshot instead; it may well fit.
                 Err(CalendarError::Admission(a))
-                    if !sync_token.is_empty() && a.is_account_limit() =>
+                    if !request_token.is_empty() && a.is_account_limit() =>
                 {
                     tracing::debug!(
                         target: "thegn::calendar::plugin",
@@ -564,7 +567,10 @@ impl CommandBackend {
                 } else {
                     a.sync_token.as_str()
                 };
-                Ok(EventPage::unchanged(token))
+                Ok(EventPage::unchanged(super::ics_url::stored_cursor(
+                    self.zone.name(),
+                    token,
+                )))
             }
             PageMode::Delta if !resumed => Err(CalendarError::Parse(
                 "plugin declared a delta for a request that carried no cursor".into(),
@@ -579,7 +585,13 @@ impl CommandBackend {
                 } else {
                     a.deleted
                 };
-                EventPage::from_meter(a.meter, mode, a.events, deleted, a.sync_token)
+                EventPage::from_meter(
+                    a.meter,
+                    mode,
+                    a.events,
+                    deleted,
+                    super::ics_url::stored_cursor(self.zone.name(), &a.sync_token),
+                )
             }
         }
     }

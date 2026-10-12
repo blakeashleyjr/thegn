@@ -863,20 +863,18 @@ pub(crate) fn due_reminders(
     let day = |at: chrono::DateTime<chrono::Utc>| at.with_timezone(&home).date_naive();
     let lead = |mins: u32| chrono::TimeDelta::minutes(i64::from(mins));
     // A reminder fires when its TRIGGER is in `(from, to]`, and the trigger is
-    // `lead` before the start. Begin with the configured default lead, plus a
-    // one-day date-bucket margin. Only widen when an event in those rows has a
-    // longer lead (THE-460).
+    // `lead` before the start. Read the maximum supported lead in one bounded,
+    // indexed query: a longer event lead cannot widen a query that never saw
+    // the event (THE-460).
     let defaults = cfg.default_reminders();
-    let initial_lead = thegn_core::calendar::reminders::max_lead_mins(&[], &defaults);
-    let range_for = |mins| reminder_cache_window(from_at, to_at, home, mins);
-    let first_range = range_for(initial_lead).ok_or_else(invalid)?;
-    let mut cached = load_cached_window(db, first_range)?;
-    let needed = thegn_core::calendar::reminders::max_lead_mins(&cached.events, &defaults);
-    if needed > initial_lead {
-        let wider =
-            range_for(thegn_core::calendar::reminders::MAX_LEAD_MINS).ok_or_else(invalid)?;
-        cached = load_cached_window(db, wider)?;
-    }
+    let range = reminder_cache_window(
+        from_at,
+        to_at,
+        home,
+        thegn_core::calendar::reminders::MAX_LEAD_MINS,
+    )
+    .ok_or_else(invalid)?;
+    let cached = load_cached_window(db, range)?;
     let unsupported_leads = cached
         .events
         .iter()
@@ -885,7 +883,7 @@ pub(crate) fn due_reminders(
         .count();
     let needed = thegn_core::calendar::reminders::max_lead_mins(&cached.events, &defaults);
     let reach = to_at.checked_add_signed(lead(needed)).ok_or_else(invalid)?;
-    let from = first_range.from;
+    let from = range.from;
     let to = day(reach).succ_opt().unwrap_or(day(reach));
     let expanded = thegn_core::calendar::expand_calendar(&cached.events, from, to, home)
         .map_err(CalendarViewError::Expansion)?;
