@@ -9,7 +9,7 @@ use std::path::Path;
 use thegn_core::ci_log::CiLogEntry;
 use thegn_core::config::{CiAutofixMode, Config};
 use thegn_core::forge::{FetchedPr, Forge};
-use thegn_core::pr_queue::{Blocker, PrqStatus};
+use thegn_core::pr_queue::{Blocker, PrQueueFacts, PrqStatus};
 use thegn_core::store::{CacheStore, NotificationStore, WorkspaceStore, WorktreeAuxStore};
 
 /// Consider one newly cached failed-job log.  Missing or stale context is
@@ -118,6 +118,29 @@ fn consider_candidate_with_forge(
         ));
         return;
     };
+    let row_status = match PrqStatus::parse(&item.status) {
+        Some(status)
+            if !status.is_settled()
+                && !matches!(status, PrqStatus::AgentRunning | PrqStatus::Merging) =>
+        {
+            status
+        }
+        Some(status) => {
+            notify(format!(
+                "CI autofix for PR #{} held: PR queue row is `{}`; agent dispatch refused",
+                item.number,
+                status.as_str()
+            ));
+            return;
+        }
+        None => {
+            notify(format!(
+                "CI autofix for PR #{} held: unknown PR queue status `{}`; agent dispatch refused",
+                item.number, item.status
+            ));
+            return;
+        }
+    };
     let Some(worktree) = item.worktree.as_deref().filter(|w| !w.trim().is_empty()) else {
         notify(format!(
             "CI job {} failed, but its PR has no local worktree",
@@ -183,6 +206,33 @@ fn consider_candidate_with_forge(
     let blocker = thegn_core::pr_queue::classify(&fetched.pr, &pq);
     if !matches!(blocker, Blocker::Ci(_)) {
         return;
+    }
+    let facts = PrQueueFacts {
+        worktree: item.worktree.clone(),
+        agent_attempts: item.agent_attempts,
+        last_head_oid: item.last_head_oid.clone(),
+        is_own: true, // fresh authorship proof follows before dispatch side effects
+        agent_available: true,
+    };
+    match thegn_core::pr_queue::admit_agent_dispatch(
+        row_status.as_str(),
+        &blocker,
+        &facts,
+        &fetched.pr.head_ref_oid,
+        &pq,
+    ) {
+        Ok(thegn_core::agent_task::TaskKind::PrCiFailure) => {}
+        Ok(_) => {
+            notify(format!(
+                "CI autofix for PR #{} held: PR queue policy selected a different agent task",
+                item.number
+            ));
+            return;
+        }
+        Err(reason) => {
+            notify(format!("CI autofix for PR #{} held: {reason}", item.number));
+            return;
+        }
     }
     let authorship = match crate::pr_authorship::acquire(
         pq.own_prs_only,
@@ -275,7 +325,7 @@ fn consider_candidate_with_forge(
         Some(&note),
         Some(entry.head_sha.as_str()),
     );
-    let _ = crate::agent_run::run(&crate::agent_run::AgentTaskRun {
+    let exited_zero = crate::agent_run::run(&crate::agent_run::AgentTaskRun {
         kind: thegn_core::agent_task::TaskKind::PrCiFailure,
         worktree,
         prompt: &prompt,
@@ -285,6 +335,39 @@ fn consider_candidate_with_forge(
         sandbox,
         credential_free: false,
     });
+    let outcome = if exited_zero {
+        "exit ok"
+    } else {
+        "exit failed"
+    };
+    restamp_after_agent(db, &item.key, outcome);
+}
+
+fn restamp_after_agent(db: &thegn_core::db::Db, key: &str, outcome: &str) {
+    let rows = match db.list_pr_queue() {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(target: "thegn::ci_autofix", %error, "could not re-read PR queue row after CI autofix");
+            return;
+        }
+    };
+    let Some(row) = rows.into_iter().find(|row| row.key == key) else {
+        return;
+    };
+    if row.status != PrqStatus::AgentRunning.as_str() {
+        return;
+    }
+    if let Err(error) = db.update_pr_status(
+        key,
+        PrqStatus::BlockedCi.as_str(),
+        Some("ci"),
+        Some(&format!(
+            "CI autofix finished ({outcome}); awaiting the next PR refresh"
+        )),
+        None,
+    ) {
+        tracing::warn!(target: "thegn::ci_autofix", %error, "could not record completed CI autofix status");
+    }
 }
 
 fn head_is_current(
@@ -304,6 +387,44 @@ mod authorship_tests {
     use super::*;
     use crate::pr_authorship::tests::Fixture;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn completed_agent_does_not_rearm_a_settled_row_or_replace_its_head() {
+        let fixture = Fixture::new();
+        let path = fixture.dir.path().to_str().unwrap();
+        let db = thegn_core::db::Db::open_at(&fixture.dir.path().join("ci.db")).unwrap();
+        db.enqueue_pr(path, 7, Some(path), "fixture", "main", "github")
+            .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        db.update_pr_status(
+            &row.key,
+            PrqStatus::Merged.as_str(),
+            Some("ci"),
+            None,
+            Some("newer-head"),
+        )
+        .unwrap();
+
+        restamp_after_agent(&db, &row.key, "exit ok");
+
+        let current = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(current.status, PrqStatus::Merged.as_str());
+        assert_eq!(current.last_head_oid.as_deref(), Some("newer-head"));
+
+        db.update_pr_status(
+            &row.key,
+            PrqStatus::AgentRunning.as_str(),
+            Some("ci"),
+            None,
+            None,
+        )
+        .unwrap();
+        restamp_after_agent(&db, &row.key, "exit failed");
+
+        let current = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(current.status, PrqStatus::BlockedCi.as_str());
+        assert_eq!(current.last_head_oid.as_deref(), Some("newer-head"));
+    }
 
     #[test]
     fn foreign_author_never_claims_or_spends_a_ci_attempt() {
@@ -360,6 +481,122 @@ mod authorship_tests {
                     .iter()
                     .any(|n| n.message.contains("own-PR automation held"))
             );
+        }
+    }
+
+    #[test]
+    fn every_shared_policy_hold_blocks_automatic_and_human_ci_handoffs() {
+        let cases = [
+            ("needs_human", false, false, "needs_human"),
+            ("closed", false, false, "closed"),
+            ("agent_running", false, false, "agent_running"),
+            ("blocked_ci", true, false, "CI is not in [pr_queue] watch"),
+            ("blocked_ci", false, true, "someone else pushed"),
+        ];
+        for (status, exclude_ci, foreign_push, reason) in cases {
+            for mode in [CiAutofixMode::Auto, CiAutofixMode::Suggest] {
+                for human_authorized in [false, true] {
+                    let fixture = Fixture::new();
+                    let path = fixture.dir.path().to_str().unwrap();
+                    let previous_head = if foreign_push {
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "private synchronous git setup inside the temporary fixture"
+                        )]
+                        let output = fixture
+                            .loc
+                            .git_command(&[
+                                "-c",
+                                "user.name=Fixture",
+                                "-c",
+                                "user.email=fixture@example.invalid",
+                                "-c",
+                                "commit.gpgsign=false",
+                                "commit",
+                                "--allow-empty",
+                                "-m",
+                                "teammate",
+                            ])
+                            .output()
+                            .unwrap();
+                        assert!(output.status.success());
+                        let previous = fixture.loc.git_out(&["rev-parse", "HEAD"]).unwrap();
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "restore the temporary fixture checkout to the fetched PR head"
+                        )]
+                        let reset = fixture
+                            .loc
+                            .git_command(&["reset", "--hard", &fixture.pr.head_ref_oid])
+                            .output()
+                            .unwrap();
+                        assert!(reset.status.success());
+                        Some(previous)
+                    } else {
+                        None
+                    };
+                    let db =
+                        thegn_core::db::Db::open_at(&fixture.dir.path().join("ci.db")).unwrap();
+                    db.enqueue_pr(path, 7, Some(path), "fixture", "main", "github")
+                        .unwrap();
+                    let row = db.list_pr_queue().unwrap().remove(0);
+                    db.update_pr_status(
+                        &row.key,
+                        status,
+                        Some("ci"),
+                        None,
+                        previous_head
+                            .as_deref()
+                            .or(Some(fixture.pr.head_ref_oid.as_str())),
+                    )
+                    .unwrap();
+
+                    let sentinel = fixture.dir.path().join("agent-must-not-run");
+                    let mut cfg = Config::default();
+                    cfg.ci.autofix.mode = mode;
+                    cfg.pr_queue.enabled = true;
+                    cfg.pr_queue.agent_command = format!("touch {}", sentinel.display());
+                    if exclude_ci {
+                        cfg.pr_queue.watch =
+                            vec![thegn_core::config_pr_queue::PrWatchKind::Conflict];
+                    }
+                    let mut forge = fixture.forge(vec![fixture.proof.clone()]);
+                    forge.pr.status_check_rollup = vec![
+                        serde_json::from_value(
+                            serde_json::json!({"name":"test", "conclusion":"FAILURE"}),
+                        )
+                        .unwrap(),
+                    ];
+                    let entry = CiLogEntry {
+                        worktree: path.into(),
+                        head_sha: fixture.pr.head_ref_oid.clone(),
+                        text: "fixture failure".into(),
+                        run_id: "run".into(),
+                        job_id: "job".into(),
+                        ..Default::default()
+                    };
+
+                    consider_candidate_with_forge(
+                        &cfg,
+                        &db,
+                        &entry,
+                        human_authorized,
+                        Some(&forge),
+                    );
+
+                    assert!(!sentinel.exists(), "{status}, human={human_authorized}");
+                    assert_eq!(db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+                    assert!(db.claim_ci_autofix(&entry.candidate()).unwrap());
+                    assert_eq!(forge.proof_calls.load(Ordering::SeqCst), 0);
+                    assert!(
+                        db.get_unread_notifications()
+                            .unwrap()
+                            .iter()
+                            .any(|n| { n.message.contains(reason) }),
+                        "missing reason `{reason}` for {status}, mode={mode:?}, human={human_authorized}"
+                    );
+                }
+            }
         }
     }
 }
