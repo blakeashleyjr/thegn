@@ -391,6 +391,12 @@ impl Placement {
         matches!(self, Placement::Provider(_))
     }
 
+    /// Whether a non-interactive control call forwards its stdin to the
+    /// command running on the placement.
+    pub fn control_forwards_stdin(&self) -> bool {
+        matches!(self, Placement::Ssh(_) | Placement::K8s(_))
+    }
+
     /// The transport/provider *family* only — no host/id — for terse chrome
     /// (e.g. the center tab bar): `local`, `ssh`, `mosh`, `k8s`, or the provider
     /// id (`sprite`, `daytona`, …). See [`Placement::label`] for the full detail.
@@ -853,6 +859,39 @@ mod tests {
         // No up/down command ⇒ ensure/teardown are no-ops.
         assert!(prov.ensure().is_ok());
         assert!(prov.teardown().is_ok());
+    }
+
+    #[test]
+    fn control_stdin_forwarding_is_explicit_by_placement() {
+        let k8s = Placement::K8s(K8sPlacement {
+            kubectl: "kubectl".into(),
+            context: None,
+            namespace: None,
+            pod: "p".into(),
+            container: None,
+            pod_template: None,
+            image: None,
+        });
+        let provider = Placement::Provider(ProviderPlacement {
+            provider: "daytona".into(),
+            id: "i".into(),
+            interactive_prefix: vec!["daytona".into()],
+            control_prefix: vec!["daytona".into()],
+            up_command: Vec::new(),
+            down_command: Vec::new(),
+        });
+        assert!(
+            Placement::Ssh(SshPlacement::plain(
+                "h".into(),
+                22,
+                false,
+                TransportKind::Ssh,
+            ))
+            .control_forwards_stdin()
+        );
+        assert!(k8s.control_forwards_stdin());
+        assert!(!Placement::Local.control_forwards_stdin());
+        assert!(!provider.control_forwards_stdin());
     }
 
     #[test]

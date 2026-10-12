@@ -438,6 +438,88 @@ fn run_output_timed_returns_fast_command_output() {
     assert_eq!(out, "hello");
 }
 
+/// Truncation on stderr must not reject complete stdout from `exec_in`.
+#[cfg(unix)]
+#[test]
+fn run_output_timed_allows_stderr_over_capture_limit() {
+    let argv = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        "head -c 100000 /dev/zero >&2; printf complete".to_string(),
+    ];
+    let (ok, out) = run_output_timed(&argv, Duration::from_secs(5)).unwrap();
+    assert!(ok);
+    assert_eq!(out, "complete");
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_runner_closes_pipe_held_by_descendant() {
+    let argv = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        "sleep 30 & printf hi".to_string(),
+    ];
+    let start = std::time::Instant::now();
+    let output = run_bounded(&argv, Duration::from_secs(2), 64, 64).unwrap();
+    assert!(start.elapsed() < Duration::from_secs(3));
+    assert_eq!(output.stdout, "hi");
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_runner_drains_flood_and_caps_capture() {
+    let argv = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        "head -c 2000000 /dev/zero; printf done".to_string(),
+    ];
+    let output = run_bounded(&argv, Duration::from_secs(10), 1024, 64).unwrap();
+    assert!(output.success);
+    assert!(output.truncated);
+    assert!(output.stdout.len() <= 1024);
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_runner_timeout_kills_descendant() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let pid_file = dir.path().join("child.pid");
+    let argv = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        "sleep 30 & echo $! > \"$1\"; wait".to_string(),
+        "_".to_string(),
+        pid_file.to_string_lossy().into_owned(),
+    ];
+    let start = std::time::Instant::now();
+    assert!(run_bounded(&argv, Duration::from_millis(300), 64, 64).is_err());
+    assert!(start.elapsed() < Duration::from_secs(2));
+    let pid: i32 = std::fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        // SAFETY: signal 0 only checks whether the recorded process still exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive || std::time::Instant::now() >= deadline {
+            assert!(
+                !alive,
+                "timed-out subprocess descendant {pid} is still alive"
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn filter_only_dns_suppresses_magicdns() {
     let mut c = ts_cfg();

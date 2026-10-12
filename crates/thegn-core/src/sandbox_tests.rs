@@ -1805,8 +1805,8 @@ fn remote_oci_sends_host_secrets_on_stdin_and_keeps_synthetic_env_inline() {
         false,
         TransportKind::Ssh,
     ));
-    let secret_env = ssh_oci_secret_env(&s);
-    let opts = oci_create_opts_with_ssh_secrets(&s, &secret_env).unwrap();
+    let secret_env = remote_stdin_oci_secret_env(&s);
+    let opts = oci_create_opts_with_remote_stdin_secrets(&s, &secret_env).unwrap();
     let (argv, input) = oci_create_argv_and_stdin(&s, opts, &secret_env);
     let j = argv.join(" ");
     assert!(!j.contains("ghp_secret"), "remote argv leaked secret: {j}");
@@ -1836,6 +1836,56 @@ fn remote_oci_sends_host_secrets_on_stdin_and_keeps_synthetic_env_inline() {
     assert!(
         !redact_stderr("remote rejected ghp_secret".into(), &["ghp_secret".into()])
             .contains("ghp_secret")
+    );
+}
+
+#[test]
+fn k8s_oci_sends_host_secrets_on_stdin_and_keeps_synthetic_env_inline() {
+    let state = tempfile::tempdir().unwrap();
+    let state_home = state.path().to_string_lossy().into_owned();
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("GH_TOKEN", Some("ghp_secret")),
+        ("THEGN_SANDBOX", None),
+        ("XDG_STATE_HOME", Some(&state_home)),
+    ]);
+    let mut s = spec(Backend::Podman);
+    s.env = vec![
+        ("GH_TOKEN".into(), "ghp_secret".into()),
+        ("THEGN_SANDBOX".into(), "1".into()),
+    ];
+    s.placement = Placement::K8s(crate::placement::K8sPlacement {
+        kubectl: "kubectl".into(),
+        context: None,
+        namespace: None,
+        pod: "pod".into(),
+        container: Some("dev".into()),
+        pod_template: None,
+        image: None,
+    });
+    let secret_env = remote_stdin_oci_secret_env(&s);
+    let opts = oci_create_opts_with_remote_stdin_secrets(&s, &secret_env).unwrap();
+    let (argv, input) = oci_create_argv_and_stdin(&s, opts, &secret_env);
+    let joined = argv.join(" ");
+    assert!(
+        !joined.contains("ghp_secret"),
+        "K8s argv leaked secret: {joined}"
+    );
+    assert!(
+        joined.contains("--env-file /dev/stdin"),
+        "stdin env-file: {joined}"
+    );
+    assert_eq!(
+        joined.matches("--env-file").count(),
+        1,
+        "one env-file: {joined}"
+    );
+    assert!(
+        joined.contains("-e THEGN_SANDBOX=1"),
+        "synthetic env inline: {joined}"
+    );
+    assert_eq!(
+        String::from_utf8(input.expect("K8s host secret stdin")).unwrap(),
+        "GH_TOKEN=ghp_secret\n"
     );
 }
 
@@ -1903,8 +1953,8 @@ fn secret_env_file_replaces_a_planted_symlink_without_touching_its_target() {
     let key = String::from("GH_TOKEN");
     let value = String::from("canary-secret");
 
-    let path =
-        write_secret_env_file_in(&dir, "launch", &[(&key, &value)]).expect("atomic env-file write");
+    let path = write_secret_env_file_in(&dir, "launch", &[(&key, &value)], false)
+        .expect("atomic env-file write");
     assert_eq!(std::fs::read(&victim).unwrap(), b"sentinel bytes");
     assert!(
         std::fs::symlink_metadata(&path)
@@ -1927,6 +1977,46 @@ fn secret_env_file_replaces_a_planted_symlink_without_touching_its_target() {
     );
 }
 
+#[test]
+fn oci_secret_env_generations_are_unique_and_keep_independent_bodies() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("sandbox-env");
+    let key = String::from("GH_TOKEN");
+    let first_value = String::from("first-secret");
+    let second_value = String::from("second-secret");
+    let first = write_secret_env_file_in(&dir, "launch", &[(&key, &first_value)], true)
+        .expect("first generated env-file");
+    let second = write_secret_env_file_in(&dir, "launch", &[(&key, &second_value)], true)
+        .expect("second generated env-file");
+    assert_ne!(first, second);
+    assert_eq!(
+        std::fs::read_to_string(first).unwrap(),
+        "GH_TOKEN=first-secret\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(second).unwrap(),
+        "GH_TOKEN=second-secret\n"
+    );
+}
+
+#[test]
+fn oci_env_cleanup_removes_only_env_files_inside_the_sandbox_env_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("sandbox-env");
+    let key = String::from("GH_TOKEN");
+    let value = String::from("canary-secret");
+    let generated = write_secret_env_file_in(&dir, "launch", &[(&key, &value)], true)
+        .expect("generated env-file");
+    let outside = temp.path().join("outside.env");
+    std::fs::write(&outside, b"outside sentinel").unwrap();
+
+    assert!(remove_oci_env_file_in(&dir, &generated).unwrap());
+    assert!(!generated.exists());
+    assert!(!remove_oci_env_file_in(&dir, std::path::Path::new("/dev/stdin")).unwrap());
+    assert!(!remove_oci_env_file_in(&dir, &outside).unwrap());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside sentinel");
+}
+
 #[cfg(unix)]
 #[test]
 fn secret_env_file_rejects_a_symlinked_directory() {
@@ -1938,7 +2028,7 @@ fn secret_env_file_rejects_a_symlinked_directory() {
     let key = String::from("GH_TOKEN");
     let value = String::from("canary-secret");
 
-    assert!(write_secret_env_file_in(&dir, "launch", &[(&key, &value)]).is_none());
+    assert!(write_secret_env_file_in(&dir, "launch", &[(&key, &value)], false).is_none());
     assert!(!target.join("launch.env").exists());
 }
 
@@ -1950,7 +2040,7 @@ fn secret_env_file_rejects_a_regular_file_in_place_of_directory() {
     let key = String::from("GH_TOKEN");
     let value = String::from("canary-secret");
 
-    assert!(write_secret_env_file_in(&dir, "launch", &[(&key, &value)]).is_none());
+    assert!(write_secret_env_file_in(&dir, "launch", &[(&key, &value)], false).is_none());
     assert_eq!(std::fs::read(&dir).unwrap(), b"not a directory");
 }
 

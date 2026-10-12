@@ -2717,14 +2717,17 @@ pub(crate) fn spawn_hunk_fetch(
     path: &str,
     session: &crate::session::Session,
     panel_ui: &crate::panel::PanelUi,
-    hunk_inflight: &mut std::collections::HashSet<String>,
-    hunk_tx: &tokio_mpsc::UnboundedSender<(u64, String, Vec<thegn_svc::git::Hunk>)>,
+    hunk_inflight: &mut crate::handlers::panel_changes::PreviewOwners,
+    hunk_tx: &tokio_mpsc::UnboundedSender<HunkMsg>,
     waker: &TerminalWaker,
     generation: u64,
 ) {
-    if panel_ui.hunks.contains_key(path) || !hunk_inflight.insert(path.to_string()) {
+    if panel_ui.hunks.contains_key(path) {
         return;
     }
+    let Some(token) = hunk_inflight.begin(path) else {
+        return;
+    };
     let tx = hunk_tx.clone();
     let waker = waker.clone();
     let wt = active_tab_path(session);
@@ -2735,23 +2738,61 @@ pub(crate) fn spawn_hunk_fetch(
         let hunks = thegn_svc::git::CliGit
             .diff_hunks(&loc, "HEAD", &path, 16)
             .unwrap_or_default();
-        if tx.send((generation, path, hunks)).is_ok() {
+        if tx.send((generation, token, path, hunks)).is_ok() {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
 
+pub(crate) type HunkMsg = (u64, u64, String, Vec<thegn_svc::git::Hunk>);
+
 type SubmoduleScanMsg = (
+    u64,
     u64,
     Option<Vec<thegn_core::submodule::SubmoduleDiff>>,
     Option<Vec<thegn_core::submodule::SubmoduleState>>,
 );
+
+#[derive(Debug, Default)]
+struct ScanCoalescer {
+    inflight: Option<u64>,
+    pending: bool,
+    next: u64,
+}
+
+impl ScanCoalescer {
+    fn request(&mut self) -> Option<u64> {
+        if self.inflight.is_some() {
+            self.pending = true;
+            return None;
+        }
+        self.next = self.next.checked_add(1).expect("scan token exhausted");
+        self.inflight = Some(self.next);
+        Some(self.next)
+    }
+
+    /// Complete only the currently owned scan. A true result means one
+    /// coalesced refresh should start now.
+    fn complete(&mut self, token: u64) -> bool {
+        if self.inflight != Some(token) {
+            return false;
+        }
+        self.inflight = None;
+        std::mem::take(&mut self.pending)
+    }
+
+    fn reset(&mut self) {
+        self.inflight = None;
+        self.pending = false;
+    }
+}
 
 /// Enrich hydrated change rows with gitlink data without putting git reads on
 /// either hydration's ordinary-file path or the event loop. Each read remains
 /// independently degradable (`None` retains the last-known field).
 fn spawn_submodule_scan(
     generation: u64,
+    token: u64,
     session: &crate::session::Session,
     tx: &tokio_mpsc::UnboundedSender<SubmoduleScanMsg>,
     waker: &TerminalWaker,
@@ -2765,10 +2806,23 @@ fn spawn_submodule_scan(
         let git = thegn_svc::git::CliGit;
         let diffs = git.submodule_diffs(&loc, "HEAD").ok();
         let states = git.submodule_states(&loc).ok();
-        if tx.send((generation, diffs, states)).is_ok() {
+        if tx.send((generation, token, diffs, states)).is_ok() {
             let _ = waker.wake(); // best-effort: a closed terminal is already exiting
         }
     });
+}
+
+fn active_submodules_enabled(
+    session: &crate::session::Session,
+    current_config: &thegn_core::config::Config,
+) -> bool {
+    let active_repo_root = session.repo_root().map(Path::to_path_buf);
+    active_repo_root
+        .as_deref()
+        .map(|root| {
+            current_config.repo_git(root).submodules != thegn_core::config::SubmoduleMode::Off
+        })
+        .unwrap_or(current_config.git.submodules != thegn_core::config::SubmoduleMode::Off)
 }
 
 // ---------------------------------------------------------------------------
@@ -6386,13 +6440,13 @@ async fn event_loop<T: Terminal>(
     // Inline hunk previews arrive from background `git diff` fetches tagged
     // with the hydration generation at request time; `hunk_inflight` dedupes
     // re-selects while a fetch is still out.
-    let (hunk_tx, mut hunk_rx) =
-        tokio_mpsc::unbounded_channel::<(u64, String, Vec<thegn_svc::git::Hunk>)>();
+    let (hunk_tx, mut hunk_rx) = tokio_mpsc::unbounded_channel::<HunkMsg>();
     let (submodule_scan_tx, mut submodule_scan_rx) =
         tokio_mpsc::unbounded_channel::<SubmoduleScanMsg>();
     let (submodule_preview_tx, mut submodule_preview_rx) =
         tokio_mpsc::unbounded_channel::<crate::handlers::panel_changes::SubmodulePreviewMsg>();
-    let mut submodule_preview_inflight = std::collections::HashSet::<String>::new();
+    let mut submodule_preview_inflight = crate::handlers::panel_changes::PreviewOwners::default();
+    let mut submodule_scans = ScanCoalescer::default();
     // Stale-while-revalidate switch cache: the last-known per-worktree slice
     // (panel + tab-bar chips + timeline — see `handlers::switch_cache`). On a
     // worktree switch we paint the cached slice instantly (no blank flash, no
@@ -6668,7 +6722,7 @@ async fn event_loop<T: Terminal>(
         keymap.config().limits.test_max_parallel.max(1),
     ));
     // Paths whose hunk fetch is still in flight (dedupes select storms).
-    let mut hunk_inflight: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut hunk_inflight = crate::handlers::panel_changes::PreviewOwners::default();
     // Sidebar interaction + persisted view state (collapse/sort/pins/width),
     // and the right panel's persisted accordion state (open section + wide
     // mode survive restarts; row mode is intentionally transient).
@@ -8703,6 +8757,8 @@ async fn event_loop<T: Terminal>(
             hydration_gen += 1;
             panel_ui.hunks.clear();
             hunk_inflight.clear();
+            submodule_preview_inflight.clear();
+            submodule_scans.reset();
             // NOTE: `materialize_inflight` deliberately PERSISTS across switches now
             // (a provisioning worktree keeps provisioning in the background); its
             // entries self-clear when each spec lands. `model.load_steps` is derived
@@ -9734,13 +9790,13 @@ async fn event_loop<T: Terminal>(
             }
         }
 
-        // Bank background hunk previews. Strays from before a worktree switch
-        // are dropped (`hunks_gen` records the acceptance cutoff); a fetch
-        // outliving an ordinary refresh is fine — same worktree, same diff.
-        while let Ok((generation, path, hunks)) = hunk_rx.try_recv() {
+        // Bank a hunk preview only while its ownership token still owns the
+        // path and its generation passes the acceptance cutoff. Completions
+        // from before a refresh or worktree switch are dropped.
+        while let Ok((generation, token, path, hunks)) = hunk_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Hunk);
-            hunk_inflight.remove(&path);
-            if generation >= panel_ui.hunks_gen {
+            let owns_path = hunk_inflight.finish(&path, token);
+            if owns_path && generation >= panel_ui.hunks_gen {
                 panel_ui.hunks.insert(path, hunks);
                 dirty = true;
             }
@@ -9748,8 +9804,9 @@ async fn event_loop<T: Terminal>(
 
         // Gitlink state/diffs and bounded drill summaries are separate reads:
         // either can fail without erasing the other or fabricating a clean row.
-        while let Ok((generation, diffs, states)) = submodule_scan_rx.try_recv() {
+        while let Ok((generation, token, diffs, states)) = submodule_scan_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Hunk);
+            let refresh = submodule_scans.complete(token);
             if generation == hydration_gen {
                 let before = model.panel.changes.clone();
                 crate::panel::merge_submodule_rows(
@@ -9759,11 +9816,25 @@ async fn event_loop<T: Terminal>(
                 );
                 dirty |= before != model.panel.changes;
             }
+            if refresh
+                && active_submodules_enabled(&session, &current_config)
+                && !model.panel.changes.is_empty()
+                && let Some(next_token) = submodule_scans.request()
+            {
+                spawn_submodule_scan(
+                    hydration_gen,
+                    next_token,
+                    &session,
+                    &submodule_scan_tx,
+                    &waker,
+                );
+            }
         }
-        while let Ok((generation, path, summary)) = submodule_preview_rx.try_recv() {
+        while let Ok((generation, token, path, summary)) = submodule_preview_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Hunk);
-            submodule_preview_inflight.remove(&path);
-            if generation >= panel_ui.hunks_gen
+            let owns_path = submodule_preview_inflight.finish(&path, token);
+            if owns_path
+                && generation >= panel_ui.hunks_gen
                 && let Some(submodule) = model
                     .panel
                     .changes
@@ -10352,14 +10423,7 @@ async fn event_loop<T: Terminal>(
             // scan cannot make a submodule row appear clean or textual.
             // The session id IS the repo root (pure): no `git rev-parse` on the
             // loop just to pick the repo's `[git]` overlay (THE-515).
-            let active_repo_root = session.repo_root().map(Path::to_path_buf);
-            let active_submodules_enabled = active_repo_root
-                .as_deref()
-                .map(|root| {
-                    current_config.repo_git(root).submodules
-                        != thegn_core::config::SubmoduleMode::Off
-                })
-                .unwrap_or(current_config.git.submodules != thegn_core::config::SubmoduleMode::Off);
+            let active_submodules_enabled = active_submodules_enabled(&session, &current_config);
             if active_submodules_enabled {
                 for row in &mut next_model.panel.changes {
                     row.submodule = model
@@ -10508,8 +10572,11 @@ async fn event_loop<T: Terminal>(
             model.ctrl_digits_reportable = ctrl_digits_reportable;
             model.notification_delivery = notification_delivery;
             model.notification_delivery_configured = notification_delivery_configured;
-            if active_submodules_enabled && !model.panel.changes.is_empty() {
-                spawn_submodule_scan(hydration_gen, &session, &submodule_scan_tx, &waker);
+            if active_submodules_enabled
+                && !model.panel.changes.is_empty()
+                && let Some(token) = submodule_scans.request()
+            {
+                spawn_submodule_scan(hydration_gen, token, &session, &submodule_scan_tx, &waker);
             }
             // The tab strip is LOOP-owned: `build_model` derived it from the
             // session snapshot the hydration thread was handed, which predates
@@ -24308,6 +24375,10 @@ async fn event_loop<T: Terminal>(
                 loop_perf.input_event();
                 if let Some(builder) = theme_builder.as_mut() {
                     builder.handle_paste(&s);
+                    dirty = true;
+                    continue;
+                }
+                if app_host.route_paste(&s) == crate::apps::PasteRoute::Consumed {
                     dirty = true;
                     continue;
                 }

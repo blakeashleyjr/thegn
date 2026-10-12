@@ -76,7 +76,7 @@
     EOF
     cat > $out/etc/nix/nix.conf <<EOF
     experimental-features = nix-command flakes
-    require-sigs = false
+    require-sigs = true
     build-users-group =
     EOF
     echo 'nameserver 1.1.1.1' > $out/etc/resolv.conf.fallback
@@ -95,7 +95,7 @@ in
       chmod 1777 ./tmp
       cat > ./home/${user}/.config/nix/nix.conf <<EOF
       experimental-features = nix-command flakes
-      require-sigs = false
+      require-sigs = true
       EOF
       chown -R ${uid}:${gid} ./home/${user} ./workspace
     '';

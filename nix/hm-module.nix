@@ -144,12 +144,12 @@ self: {
         description = "Log directory (empty = $XDG_STATE_HOME/thegn/logs).";
       };
       rotationSizeMb = lib.mkOption {
-        type = lib.types.int;
+        type = lib.types.ints.unsigned;
         default = 5;
         description = "Rotate the active log once it exceeds this many MiB.";
       };
       maxFiles = lib.mkOption {
-        type = lib.types.int;
+        type = lib.types.ints.unsigned;
         default = 5;
         description = "How many rotated log files to keep.";
       };
@@ -282,7 +282,7 @@ in {
     };
 
     repoScanDepth = lib.mkOption {
-      type = lib.types.int;
+      type = lib.types.ints.unsigned;
       default = 5;
       description = "Max directory depth when scanning repoRoots for git repos.";
     };
@@ -397,13 +397,13 @@ in {
     };
 
     prTtlSecs = lib.mkOption {
-      type = lib.types.int;
+      type = lib.types.ints.between 0 315360000;
       default = 30;
       description = "PR-status cache TTL (seconds) before a live `gh` re-fetch.";
     };
 
     watchPrIntervalSecs = lib.mkOption {
-      type = lib.types.int;
+      type = lib.types.ints.between 0 2678400;
       default = 20;
       description = "PR refresh interval (seconds) for the per-session watch daemon.";
     };

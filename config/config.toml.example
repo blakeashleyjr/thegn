@@ -3674,10 +3674,11 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # #                                 #   reverse tunnel, so in-sprite `nix develop`/`direnv`
 # #                                 #   SUBSTITUTE prebuilt store paths from your host
 # #                                 #   instead of building from source. A general cache
-# #                                 #   over the WHOLE host store. Unsigned + loopback-
-# #                                 #   tunnel-only (require-sigs=false in the sprite). The
-# #                                 #   host serves it from the thegn process; needs a
-# #                                 #   resident-bridge provider (sprites). Recommended.
+# #                                 #   over the WHOLE host store. It is unsigned and
+# #                                 #   loopback-tunnel-only; the sandbox keeps Nix signature
+# #                                 #   checks enabled, so this cache is inert until it has a
+# #                                 #   signing key. The host serves it from the thegn process;
+# #                                 #   needs a resident-bridge provider (sprites).
 # # push_devshell = false           # Deprecated and ignored: host-side devShell
 # #                                 #   evaluation and closure transfer are disabled.
 # # skip_devshell_warm = false      # skip the blocking devShell BUILD during

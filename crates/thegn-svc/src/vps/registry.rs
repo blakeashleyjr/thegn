@@ -10,6 +10,7 @@
 //! the host (attach bridge, reaper) read it — and every create/destroy flows
 //! through the provider, so no call site can forget the bookkeeping.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -74,6 +75,13 @@ fn record_path(d: &Path, name: &str) -> PathBuf {
 pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
     checked_name(&rec.name)?;
     std::fs::create_dir_all(d)?;
+    let metadata = std::fs::symlink_metadata(d)?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink()
+            && metadata.is_dir()
+            && thegn_core::fsperm::owned_by_current_user(&metadata),
+        "vps registry: registry root is not an owned real directory"
+    );
     let path = record_path(d, &rec.name);
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = d.join(format!(
@@ -121,8 +129,11 @@ pub fn write(rec: &VpsRecord) -> Result<()> {
 
 pub fn read_at(d: &Path, name: &str) -> Option<VpsRecord> {
     checked_name(name).ok()?;
-    let bytes = std::fs::read(record_path(d, name)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let mut file = thegn_core::fsperm::open_regular_file_nofollow(&record_path(d, name)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let rec: VpsRecord = serde_json::from_slice(&bytes).ok()?;
+    (rec.name == name).then_some(rec)
 }
 
 pub fn read(name: &str) -> Option<VpsRecord> {
@@ -132,6 +143,18 @@ pub fn read(name: &str) -> Option<VpsRecord> {
 /// Remove a record (and the instance's known_hosts pin). Idempotent.
 pub fn remove_at(d: &Path, name: &str) {
     if checked_name(name).is_err() {
+        return;
+    }
+    let Ok(root) = std::fs::symlink_metadata(d) else {
+        return;
+    };
+    if root.file_type().is_symlink() || !root.is_dir() {
+        return;
+    }
+    let known_hosts = d.join("known_hosts.d");
+    if let Ok(metadata) = std::fs::symlink_metadata(&known_hosts)
+        && (metadata.file_type().is_symlink() || !metadata.is_dir())
+    {
         return;
     }
     let _ = std::fs::remove_file(record_path(d, name)); // best-effort: idempotent removal; absence is fine
@@ -154,7 +177,10 @@ pub fn list_at(d: &Path) -> Vec<VpsRecord> {
             let path = e.path();
             let stem = path.file_stem()?.to_str()?;
             checked_name(stem).ok()?;
-            let rec: VpsRecord = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            let mut file = thegn_core::fsperm::open_regular_file_nofollow(&path).ok()?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).ok()?;
+            let rec: VpsRecord = serde_json::from_slice(&bytes).ok()?;
             (rec.name == stem && checked_name(&rec.name).is_ok()).then_some(rec)
         })
         .collect()
@@ -317,5 +343,106 @@ mod tests {
         let path = known_hosts_path("../../x");
         assert!(path.starts_with(root));
         assert!(path.ends_with("invalid.."));
+    }
+
+    #[test]
+    fn write_rejects_symlinked_registry_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let link = tmp.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        if let Err(error) = thegn_core::fsperm::create_symlink(&real, &link, true) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("could not create test symlink: {error}");
+        }
+        assert!(write_at(&link, &rec("a", "ready")).is_err());
+        assert!(!real.join("a.json").exists());
+    }
+
+    #[test]
+    fn read_rejects_record_with_mismatched_body_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        std::fs::write(
+            d.join("a.json"),
+            serde_json::to_vec(&rec("b", "ready")).unwrap(),
+        )
+        .unwrap();
+        assert!(read_at(d, "a").is_none());
+    }
+
+    #[test]
+    fn read_and_list_reject_symlinked_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("registry");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(
+            outside.join("x.json"),
+            serde_json::to_vec(&rec("x", "ready")).unwrap(),
+        )
+        .unwrap();
+        if let Err(error) =
+            thegn_core::fsperm::create_symlink(&outside.join("x.json"), &d.join("x.json"), false)
+        {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("could not create test symlink: {error}");
+        }
+        assert!(read_at(&d, "x").is_none());
+        assert!(list_at(&d).is_empty());
+    }
+
+    #[test]
+    fn remove_does_not_follow_symlinked_known_hosts_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("registry");
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("a"), b"keep").unwrap();
+        if let Err(error) =
+            thegn_core::fsperm::create_symlink(&victim, &d.join("known_hosts.d"), true)
+        {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("could not create test symlink: {error}");
+        }
+        remove_at(&d, "a");
+        assert!(victim.join("a").exists());
+    }
+
+    #[test]
+    fn remove_does_not_follow_symlinked_registry_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        let link = tmp.path().join("registry");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("a.json"), b"keep").unwrap();
+        if let Err(error) = thegn_core::fsperm::create_symlink(&victim, &link, true) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("could not create test symlink: {error}");
+        }
+        remove_at(&link, "a");
+        assert!(victim.join("a.json").exists());
     }
 }

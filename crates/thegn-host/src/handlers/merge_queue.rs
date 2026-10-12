@@ -369,48 +369,67 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                 fields,
             } => {
                 apply_step(&mut ctx.model.panel, &worktree, &branch, &status, &fields);
-                match status.as_str() {
-                    "landed" => {
-                        ctx.toasts.success(format!("Landed {branch}"), now);
-                        notify_queue(
-                            ctx,
-                            NotificationKind::QueueLanded,
-                            &worktree,
-                            format!("merge queue: {branch} landed"),
+                match MqStatus::parse(&status) {
+                    Some(status) => match step_reaction(status) {
+                        StepReaction::Landed => {
+                            ctx.toasts.success(format!("Landed {branch}"), now);
+                            notify_queue(
+                                ctx,
+                                NotificationKind::QueueLanded,
+                                &worktree,
+                                format!("merge queue: {branch} landed"),
+                            );
+                            *ctx.want_model_refresh = true;
+                            // The drive's `apply` may have removed this worktree.
+                            ctx.reap_removed_tabs();
+                        }
+                        StepReaction::Ready => {
+                            ctx.toasts
+                                .success(format!("{branch} ready — gated green"), now);
+                            notify_queue(
+                                ctx,
+                                NotificationKind::QueueReady,
+                                &worktree,
+                                format!("merge queue: {branch} ready to land"),
+                            );
+                            *ctx.want_model_refresh = true;
+                        }
+                        StepReaction::NeedsHuman => {
+                            ctx.toasts.info_ttl(
+                                format!("{branch} needs a human — {detail}"),
+                                now,
+                                std::time::Duration::from_secs(6),
+                            );
+                            notify_queue(
+                                ctx,
+                                NotificationKind::QueueNeedsHuman,
+                                &worktree,
+                                format!("merge queue: {branch} needs a human — {detail}"),
+                            );
+                            *ctx.want_model_refresh = true;
+                        }
+                        StepReaction::InfrastructureHeld => {
+                            let message = format!(
+                                "{branch} held: environment/policy, not a code verdict: `{detail}`"
+                            );
+                            ctx.toasts
+                                .info_ttl(message, now, std::time::Duration::from_secs(8));
+                            *ctx.want_model_refresh = true;
+                        }
+                        StepReaction::Held => {
+                            *ctx.want_model_refresh = true;
+                        }
+                        StepReaction::Transient => {}
+                    },
+                    None => {
+                        tracing::debug!(
+                            target: "thegn::merge",
+                            %branch,
+                            status,
+                            "unknown merge queue status in drive step"
                         );
                         *ctx.want_model_refresh = true;
-                        // The drive's `apply` may have removed this worktree.
-                        ctx.reap_removed_tabs();
                     }
-                    "ready" => {
-                        ctx.toasts
-                            .success(format!("{branch} ready — gated green"), now);
-                        notify_queue(
-                            ctx,
-                            NotificationKind::QueueReady,
-                            &worktree,
-                            format!("merge queue: {branch} ready to land"),
-                        );
-                        *ctx.want_model_refresh = true;
-                    }
-                    "needs_human" => {
-                        ctx.toasts.info_ttl(
-                            format!("{branch} needs a human — {detail}"),
-                            now,
-                            std::time::Duration::from_secs(6),
-                        );
-                        notify_queue(
-                            ctx,
-                            NotificationKind::QueueNeedsHuman,
-                            &worktree,
-                            format!("merge queue: {branch} needs a human — {detail}"),
-                        );
-                        *ctx.want_model_refresh = true;
-                    }
-                    "deferred" | "gate_failed" | "gate_error" | "agent_blocked" => {
-                        *ctx.want_model_refresh = true;
-                    }
-                    _ => {}
                 }
             }
             DriveMsg::Done(out) => {
@@ -430,7 +449,14 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                 }
                 for failure in &out.bookkeeping_failed {
                     ctx.toasts.info_ttl(
-                        format!("Ref advanced, bookkeeping failed for {}: {} → {}; rerun merge drain to reconcile", failure.target, failure.old_oid, failure.new_oid),
+                        format!(
+                            "Ref advanced, bookkeeping failed for {} on {}: {} → {}; queue DB error: {}; rerun `merge drain` to reconcile",
+                            failure.branch,
+                            failure.target,
+                            failure.old_oid,
+                            failure.new_oid,
+                            failure.error
+                        ),
                         now,
                         std::time::Duration::from_secs(10),
                     );
@@ -463,6 +489,29 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
             }
         }
         *ctx.dirty = true;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepReaction {
+    Landed,
+    Ready,
+    NeedsHuman,
+    InfrastructureHeld,
+    Held,
+    Transient,
+}
+
+fn step_reaction(status: MqStatus) -> StepReaction {
+    match status {
+        MqStatus::Landed => StepReaction::Landed,
+        MqStatus::Ready => StepReaction::Ready,
+        MqStatus::NeedsHuman => StepReaction::NeedsHuman,
+        MqStatus::GateError | MqStatus::AgentBlocked => StepReaction::InfrastructureHeld,
+        MqStatus::Deferred | MqStatus::GateFailed => StepReaction::Held,
+        MqStatus::Queued | MqStatus::Folding | MqStatus::Verifying | MqStatus::AgentRunning => {
+            StepReaction::Transient
+        }
     }
 }
 
@@ -1083,22 +1132,23 @@ fn add_all(cfg: &Config, any_path: &Path) -> String {
 /// `thegn merge land`, recording the outcome on the queue row. Returns the
 /// terminal `DriveMsg` (a `Done` clears the inflight flag).
 fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
-    let (branch, _target, outcome) = match crate::cmd::land::land_branch(cfg, Path::new(wt)) {
+    let (branch, target, outcome) = match crate::cmd::land::land_branch(cfg, Path::new(wt)) {
         Ok(r) => r,
         Err(e) => return DriveMsg::Failed(format!("land: {e}")),
     };
-    let db = Db::open().ok(); // best-effort: cache: queue record writes only; the land outcome is reported regardless
-    let record = |status: MqStatus, oid: Option<&str>, detail: Option<&str>| {
-        if let Some(db) = &db {
-            // best-effort: the DB is a cache; the ref move is the record.
-            let _ = db.update_merge_status(wt, status.as_str(), oid, detail, None);
-        }
+    let db = Db::open().map_err(|error| error.to_string());
+    let record = |status: MqStatus,
+                  oid: Option<&str>,
+                  conflict_paths: Option<&str>,
+                  error_detail: Option<&str>| match &db {
+        Ok(db) => record_queue_status(Ok(db), wt, status, oid, conflict_paths, error_detail),
+        Err(error) => Err(error.clone()),
     };
     // Drive the sidebar-folder lifecycle for this worktree (no-op unless
     // organize_folders is on). Any removal is reaped by drain_drive_msgs.
     // `branch` is a param (not captured) so the arms can still move it below.
     let lifecycle = |event: LifecycleEvent, branch: &str| {
-        if let (Some(db), Some(root)) = (&db, integrate::main_checkout(Path::new(wt))) {
+        if let (Ok(db), Some(root)) = (&db, integrate::main_checkout(Path::new(wt))) {
             crate::merge_lifecycle::apply(
                 &cfg.repo_merge_queue(&root),
                 db,
@@ -1111,7 +1161,9 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
     };
     match outcome {
         AttemptOutcome::Landed {
-            commit, resyncs, ..
+            commit,
+            old_oid,
+            resyncs,
         } => {
             // In-app, a checkout on the target is fast-forwarded by the ref
             // watcher (`git_watch::spawn_main_checkout_heal`); anything the fold
@@ -1126,8 +1178,17 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                     );
                 }
             }
-            record(MqStatus::Landed, Some(&commit), None);
-            if let (Some(db), Some(root)) = (&db, integrate::main_checkout(Path::new(wt))) {
+            let out = landed_outcome_after_record(
+                record(MqStatus::Landed, Some(&commit), None, None),
+                &branch,
+                &target,
+                &old_oid,
+                &commit,
+            );
+            if !out.bookkeeping_failed.is_empty() {
+                return DriveMsg::Done(out);
+            }
+            if let (Ok(db), Some(root)) = (&db, integrate::main_checkout(Path::new(wt))) {
                 crate::merge_lifecycle::apply_landed(
                     &cfg.repo_merge_queue(&root),
                     db,
@@ -1137,16 +1198,21 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                     &commit,
                 );
             }
-            DriveMsg::Done(DriveOutcome {
-                landed: vec![branch],
-                ..DriveOutcome::default()
-            })
+            DriveMsg::Done(out)
         }
         AttemptOutcome::UpToDate { commit } => {
-            record(MqStatus::Landed, Some(&commit), Some("already merged"));
-            lifecycle(LifecycleEvent::Landed, &branch);
+            let write = record(
+                MqStatus::Landed,
+                Some(&commit),
+                Some("already merged"),
+                None,
+            );
+            if write.is_ok() {
+                lifecycle(LifecycleEvent::Landed, &branch);
+            }
             DriveMsg::Done(DriveOutcome {
                 landed: vec![branch],
+                persistence_errors: write.err().into_iter().collect(),
                 ..DriveOutcome::default()
             })
         }
@@ -1156,11 +1222,13 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
         } => {
             let detail =
                 crate::integrate::conflict_details(&paths, &submodule_conflicts).join("\n");
-            record(MqStatus::Deferred, None, Some(&detail));
-            lifecycle(LifecycleEvent::Failed, &branch);
-            DriveMsg::Failed(format!(
-                "{branch} conflicts: {}",
-                detail.replace('\n', ", ")
+            let write = record(MqStatus::Deferred, None, Some(&detail), None);
+            if write.is_ok() {
+                lifecycle(LifecycleEvent::Failed, &branch);
+            }
+            DriveMsg::Failed(append_write_error(
+                format!("{branch} conflicts: {}", detail.replace('\n', ", ")),
+                write,
             ))
         }
         AttemptOutcome::GateFailed { log } => {
@@ -1171,9 +1239,14 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
             } else {
                 format!("breaks build\n{}", log.trim())
             };
-            record(MqStatus::GateFailed, None, Some(&detail));
-            lifecycle(LifecycleEvent::Failed, &branch);
-            DriveMsg::Failed(format!("{branch} breaks the build (gate red)"))
+            let write = record(MqStatus::GateFailed, None, None, Some(&detail));
+            if write.is_ok() {
+                lifecycle(LifecycleEvent::Failed, &branch);
+            }
+            DriveMsg::Failed(append_write_error(
+                format!("{branch} breaks the build (gate red)"),
+                write,
+            ))
         }
         AttemptOutcome::GateError { reason, log } => {
             // The gate could not run — an environment fact, not a verdict about
@@ -1183,29 +1256,183 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
             } else {
                 format!("{reason}\n{}", log.trim())
             };
-            record(MqStatus::GateError, None, Some(&detail));
-            lifecycle(LifecycleEvent::Failed, &branch);
-            DriveMsg::Failed(format!("{branch} was NOT gated — {reason}"))
+            let write = record(MqStatus::GateError, None, None, Some(&detail));
+            if write.is_ok() {
+                lifecycle(LifecycleEvent::Failed, &branch);
+            }
+            DriveMsg::Failed(append_write_error(
+                format!("{branch} was NOT gated — {reason}"),
+                write,
+            ))
         }
         AttemptOutcome::Unreachable { detail } => {
-            record(MqStatus::Deferred, None, Some(&detail));
-            lifecycle(LifecycleEvent::Failed, &branch);
-            DriveMsg::Failed(format!("{branch}: {detail}"))
+            let write = record(MqStatus::Deferred, None, Some(&detail), None);
+            if write.is_ok() {
+                lifecycle(LifecycleEvent::Failed, &branch);
+            }
+            DriveMsg::Failed(append_write_error(format!("{branch}: {detail}"), write))
         }
         AttemptOutcome::Ready { tip } => {
-            record(
+            let write = record(
                 MqStatus::Ready,
                 Some(&tip),
                 Some("gated green — awaiting land"),
+                None,
             );
-            DriveMsg::Failed(format!("{branch} is ready but was not landed"))
+            DriveMsg::Failed(append_write_error(
+                format!("{branch} is ready but was not landed"),
+                write,
+            ))
         }
+    }
+}
+
+fn record_queue_status(
+    db: Result<&Db, String>,
+    wt: &str,
+    status: MqStatus,
+    oid: Option<&str>,
+    conflict_paths: Option<&str>,
+    error_detail: Option<&str>,
+) -> Result<(), String> {
+    db?.update_merge_status(wt, status.as_str(), oid, conflict_paths, error_detail)
+        .map_err(|error| error.to_string())
+}
+
+fn landed_outcome_after_record(
+    record: Result<(), String>,
+    branch: &str,
+    target: &str,
+    old_oid: &str,
+    new_oid: &str,
+) -> DriveOutcome {
+    let mut out = DriveOutcome {
+        landed: vec![branch.to_owned()],
+        ..DriveOutcome::default()
+    };
+    if let Err(error) = record {
+        out.bookkeeping_failed
+            .push(crate::merge_driver::RefAdvancedBookkeepingFailed {
+                branch: branch.to_owned(),
+                target: target.to_owned(),
+                old_oid: old_oid.to_owned(),
+                new_oid: new_oid.to_owned(),
+                error,
+            });
+    }
+    out
+}
+
+fn append_write_error(message: String, write: Result<(), String>) -> String {
+    match write {
+        Ok(()) => message,
+        Err(error) => format!("{message}; queue state write failed: {error}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn landed_bookkeeping_failure_keeps_ref_details_and_is_degraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        let db = Db::open_at(&path).unwrap();
+        db.enqueue_merge("/wt/feature", "feature", "main").unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_landed BEFORE UPDATE OF status ON merge_queue \
+                 WHEN NEW.status = 'landed' BEGIN \
+                 SELECT RAISE(FAIL, 'injected landed write failure'); END;",
+            )
+            .unwrap();
+
+        let out = landed_outcome_after_record(
+            record_queue_status(
+                Ok(&db),
+                "/wt/feature",
+                MqStatus::Landed,
+                Some("new-commit-oid"),
+                None,
+                None,
+            ),
+            "feature",
+            "main",
+            "old-commit-oid",
+            "new-commit-oid",
+        );
+
+        assert_eq!(out.landed, vec!["feature".to_owned()]);
+        assert_eq!(out.bookkeeping_failed.len(), 1);
+        let failure = &out.bookkeeping_failed[0];
+        assert_eq!(failure.target, "main");
+        assert_eq!(failure.old_oid, "old-commit-oid");
+        assert_eq!(failure.new_oid, "new-commit-oid");
+        assert!(failure.error.contains("injected landed write failure"));
+        assert!(!drive_summary(&out).1);
+    }
+
+    #[test]
+    fn queue_status_keeps_conflict_paths_out_of_error_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("queue.sqlite")).unwrap();
+        db.enqueue_merge("/wt/feature", "feature", "main").unwrap();
+
+        record_queue_status(
+            Ok(&db),
+            "/wt/feature",
+            MqStatus::Deferred,
+            None,
+            Some("src/a.rs\nsrc/b.rs"),
+            None,
+        )
+        .unwrap();
+
+        let row = db.list_merge_queue().unwrap().remove(0);
+        assert_eq!(row.conflict_paths.as_deref(), Some("src/a.rs\nsrc/b.rs"));
+        assert_eq!(row.error_detail, None);
+    }
+
+    #[test]
+    fn queue_status_keeps_gate_failure_in_error_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("queue.sqlite")).unwrap();
+        db.enqueue_merge("/wt/feature", "feature", "main").unwrap();
+
+        record_queue_status(
+            Ok(&db),
+            "/wt/feature",
+            MqStatus::GateError,
+            None,
+            None,
+            Some("gate unavailable\nlog"),
+        )
+        .unwrap();
+
+        let row = db.list_merge_queue().unwrap().remove(0);
+        assert_eq!(row.conflict_paths, None);
+        assert_eq!(row.error_detail.as_deref(), Some("gate unavailable\nlog"));
+    }
+
+    #[test]
+    fn step_reaction_is_exhaustive_over_persisted_statuses() {
+        for status in MqStatus::ALL {
+            let expected = match status {
+                MqStatus::Landed => StepReaction::Landed,
+                MqStatus::Ready => StepReaction::Ready,
+                MqStatus::NeedsHuman => StepReaction::NeedsHuman,
+                MqStatus::GateError | MqStatus::AgentBlocked => StepReaction::InfrastructureHeld,
+                MqStatus::Deferred | MqStatus::GateFailed => StepReaction::Held,
+                MqStatus::Queued
+                | MqStatus::Folding
+                | MqStatus::Verifying
+                | MqStatus::AgentRunning => StepReaction::Transient,
+            };
+            assert_eq!(step_reaction(status), expected, "{status:?}");
+        }
+    }
 
     /// THE-515 fixture: a real git repo named `acme` plus an isolated state
     /// dir, and a config whose trusted overlay for it is ambiguous.

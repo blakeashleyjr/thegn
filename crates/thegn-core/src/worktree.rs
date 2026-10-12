@@ -639,22 +639,26 @@ pub fn add_checked_with_state(
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
     }
-    // Serialize against other thegn/agent git mutations on this repo's shared
+    // Serialize against other thegn callers on this repo's shared
     // `.git` (held until the subprocess returns). Without the lock the
     // pre-existence check below is worthless — two processes would both pass
     // it, and the loser's rollback would remove the WINNER's checkout — so an
     // unavailable lock refuses instead of proceeding unlocked.
-    let Some(_lock) = util::lock_git_mutations(root) else {
-        return Err(AddError {
-            message: format!(
-                "refusing to create worktree for {branch}: could not take the repository \
-                 mutation lock ({}); another thegn/agent git mutation may be in flight — retry",
-                root.join(".git/thegn-git.lock").display()
-            ),
-            branch_created: false,
-            destination_preexisted: false,
-            lock_unavailable: true,
-        });
+    let _lock = match util::try_lock_git_mutations(root) {
+        Ok(lock) => lock,
+        Err(error) => {
+            let lock_path = util::git_common_dir(root).join("thegn-git.lock");
+            return Err(AddError {
+                message: format!(
+                    "refusing to create worktree for {branch}: could not take the repository \
+                     mutation lock at {}: {error}; retry",
+                    lock_path.display()
+                ),
+                branch_created: false,
+                destination_preexisted: false,
+                lock_unavailable: true,
+            });
+        }
     };
     // A pre-created destination (directory, file or symlink — `git worktree
     // add` happily adopts an empty directory) is never reused: it may be
@@ -778,7 +782,13 @@ pub fn remove_detailed(
     branch: &str,
     delete_branch: bool,
 ) -> Result<(), String> {
-    let _lock = util::lock_git_mutations(root);
+    let _lock = util::try_lock_git_mutations(root).map_err(|error| {
+        format!(
+            "refusing to remove worktree at {}: could not take the repository mutation lock at {}: {error}; retry",
+            path.display(),
+            util::git_common_dir(root).join("thegn-git.lock").display()
+        )
+    })?;
     let path_s = path.to_string_lossy();
     let mut failure = None;
     let mut removed = true;
@@ -955,12 +965,13 @@ pub fn rename(
     }
     // As in `add_checked_with_state`: without the lock the preflight below
     // cannot fence a concurrent create/rename, so refuse rather than mutate.
-    let Some(_lock) = util::lock_git_mutations(root) else {
-        return Err(format!(
+    let _lock = util::try_lock_git_mutations(root).map_err(|error| {
+        format!(
             "refusing to rename {old_branch} → {new_branch}: could not take the repository \
-             mutation lock; another git mutation may be in flight — retry"
-        ));
-    };
+             mutation lock at {}: {error}; retry",
+            util::git_common_dir(root).join("thegn-git.lock").display()
+        )
+    })?;
     if std::fs::symlink_metadata(&new_path).is_ok() {
         return Err(format!(
             "refusing to rename {old_branch} → {new_branch}: destination {} already exists. \
@@ -1016,6 +1027,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tg-wt-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir); // best-effort: test setup: fresh scratch dir
         std::fs::create_dir_all(&dir).unwrap();
+        temp_repo_in(&dir);
+        dir
+    }
+
+    fn temp_repo_in(dir: &Path) {
         for args in [
             &["init", "-q", "-b", "main"][..],
             &["config", "user.email", "t@t.t"],
@@ -1026,9 +1042,113 @@ mod tests {
             &["config", "commit.gpgsign", "false"],
             &["commit", "--allow-empty", "-q", "-m", "init"],
         ] {
-            assert!(util::git_cmd(&dir).args(args).status().unwrap().success());
+            assert!(util::git_cmd(dir).args(args).status().unwrap().success());
         }
-        dir
+    }
+
+    #[test]
+    fn remove_detailed_refuses_when_the_mutation_lock_is_unavailable() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        temp_repo_in(&repo);
+        let path = repo.join(".wt-locked");
+        assert!(util::git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "locked",
+                &path.to_string_lossy()
+            ]
+        ));
+        let lock_path = util::git_common_dir(&repo).join("thegn-git.lock");
+        std::fs::create_dir(&lock_path).unwrap();
+
+        let error = remove_detailed(&repo, &path, "locked", true).unwrap_err();
+        assert!(error.contains("mutation lock"), "{error}");
+        assert!(
+            error.contains(&lock_path.to_string_lossy().to_string()),
+            "{error}"
+        );
+        assert!(path.exists(), "the worktree must remain untouched");
+        assert!(branch_exists(&repo, "locked"), "the branch must remain");
+    }
+
+    #[test]
+    fn add_reports_why_the_mutation_lock_was_unavailable() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        temp_repo_in(&repo);
+        let linked_root = repo.join(".wt-control");
+        assert!(util::git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "control",
+                &linked_root.to_string_lossy(),
+            ]
+        ));
+        let lock_path = util::git_common_dir(&linked_root).join("thegn-git.lock");
+        std::fs::create_dir(&lock_path).unwrap();
+        let path = repo.join(".wt-target");
+        let lock_error = match util::try_lock_git_mutations(&linked_root) {
+            Ok(_) => panic!("a directory at the lock path must be rejected"),
+            Err(error) => error.to_string(),
+        };
+
+        let cfg = scratch_cfg(&repo);
+        let error =
+            add_checked_with_state(&linked_root, "target", "main", &path, &cfg).unwrap_err();
+        assert!(error.lock_unavailable);
+        assert!(
+            error
+                .message
+                .contains(&lock_path.to_string_lossy().to_string())
+        );
+        assert!(error.message.contains(&lock_error));
+        assert!(error.message.contains("mutation lock"));
+        assert!(!path.exists());
+        assert!(!branch_exists(&repo, "target"));
+    }
+
+    #[test]
+    fn rename_refuses_when_the_mutation_lock_is_unavailable() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        temp_repo_in(&repo);
+        let path = repo.join(".wt-old");
+        assert!(util::git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "old",
+                &path.to_string_lossy()
+            ]
+        ));
+        let lock_path = util::git_common_dir(&repo).join("thegn-git.lock");
+        std::fs::create_dir(&lock_path).unwrap();
+
+        let cfg = scratch_cfg(&repo);
+        let error = rename(&repo, &path, "old", "new", &cfg).unwrap_err();
+        assert!(error.contains("mutation lock"), "{error}");
+        assert!(
+            error.contains(&lock_path.to_string_lossy().to_string()),
+            "{error}"
+        );
+        assert!(branch_exists(&repo, "old"));
+        assert!(!branch_exists(&repo, "new"));
+        assert!(path.exists());
     }
 
     #[test]
