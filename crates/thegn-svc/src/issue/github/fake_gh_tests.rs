@@ -338,3 +338,19 @@ async fn attached_short_repo_flag_scopes_and_disagreement_is_rejected() {
     };
     assert!(matches!(b.list_issues(&f).await, Err(IssueError::Parse(_))));
 }
+
+#[tokio::test]
+async fn zero_list_and_search_limits_use_the_gh_default_page_size() {
+    let d = tempfile::tempdir().unwrap();
+    let gh = fake_gh(d.path(), "");
+    let b = backend(d.path(), gh, &["--repo", "o/r"], true);
+
+    b.list_issues(&IssueFilter::default()).await.unwrap();
+    b.search("q", 0).await.unwrap();
+
+    let logged = calls(d.path());
+    assert_eq!(logged.len(), 2);
+    assert!(logged[0].contains("--limit 100"), "{}", logged[0]);
+    assert!(logged[1].contains("--limit 100"), "{}", logged[1]);
+    assert!(!logged.iter().any(|call| call.contains("--limit 0")));
+}
