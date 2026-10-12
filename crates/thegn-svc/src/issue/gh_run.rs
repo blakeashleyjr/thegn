@@ -118,11 +118,59 @@ fn read_capped(mut r: impl Read, cap: usize, over: &AtomicBool) -> Vec<u8> {
 /// How long the readers get to hit EOF once the process group is dead.
 const READER_GRACE: Duration = Duration::from_millis(500);
 
+fn set_io_failure_if_missing(failure: &mut Option<RunError>, error: std::io::Error) {
+    if failure.is_none() {
+        *failure = Some(RunError::Io(error.to_string()));
+    }
+}
+
 pub(crate) fn run_blocking(
-    mut cmd: Command,
+    cmd: Command,
     limits: Limits,
     cancel: &AtomicBool,
 ) -> Result<String, RunError> {
+    let out_over = Arc::new(AtomicBool::new(false));
+    let reader_over = out_over.clone();
+    let (stdout, _) =
+        run_blocking_core(cmd, limits, cancel, Some(out_over), false, move |reader| {
+            read_capped(reader, limits.max_stdout, &reader_over)
+        })?;
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
+
+/// Consume stdout on its reader thread. The consumer owns retention; after it
+/// returns, the runner drains and discards the remaining pipe bytes.
+#[allow(dead_code)] // The batch-21 ci.rs caller is deferred until that lane lands.
+pub(crate) fn run_blocking_streaming<T, F>(
+    cmd: Command,
+    limits: Limits,
+    cancel: &AtomicBool,
+    consume: F,
+) -> Result<(T, std::process::ExitStatus), RunError>
+where
+    F: FnOnce(&mut dyn Read) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    run_blocking_core(cmd, limits, cancel, None, true, consume)
+}
+
+enum ReaderMessage<T> {
+    Stdout(Result<T, String>),
+    Stderr(Result<Vec<u8>, String>),
+}
+
+fn run_blocking_core<T, F>(
+    mut cmd: Command,
+    limits: Limits,
+    cancel: &AtomicBool,
+    out_over: Option<Arc<AtomicBool>>,
+    strict_reader_errors: bool,
+    consume: F,
+) -> Result<(T, std::process::ExitStatus), RunError>
+where
+    F: FnOnce(&mut dyn Read) -> T + Send + 'static,
+    T: Send + 'static,
+{
     if !bounded_group_termination_supported() {
         return Err(RunError::Io(
             "bounded subprocess execution is not supported on this platform".into(),
@@ -143,23 +191,37 @@ pub(crate) fn run_blocking(
         }
     })?;
     let pid = child.id();
-    let out_over = Arc::new(AtomicBool::new(false));
-    let err_over = AtomicBool::new(false);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let (cap_out, cap_err) = (limits.max_stdout, limits.max_stderr);
-    let (tx, rx) = mpsc::channel::<(bool, Vec<u8>)>();
-    let o = out_over.clone();
+    let (tx, rx) = mpsc::channel::<ReaderMessage<T>>();
     let tx_out = tx.clone();
     std::thread::spawn(move || {
-        let buf = stdout.map_or_else(Vec::new, |s| read_capped(s, cap_out, &o));
-        if tx_out.send((true, buf)).is_err() {
+        let result = match stdout {
+            Some(mut stream) => {
+                let value = consume(&mut stream);
+                match std::io::copy(&mut stream, &mut std::io::sink()) {
+                    Ok(_) => Ok(value),
+                    Err(error) if strict_reader_errors => Err(error.to_string()),
+                    Err(_) => Ok(value),
+                }
+            }
+            None => Err("stdout pipe was not available".to_owned()),
+        };
+        if tx_out.send(ReaderMessage::Stdout(result)).is_err() {
             tracing::debug!("gh stdout reader detached: run already gave up");
         }
     });
     std::thread::spawn(move || {
-        let buf = stderr.map_or_else(Vec::new, |s| read_capped(s, cap_err, &err_over));
-        if tx.send((false, buf)).is_err() {
+        let result = match stderr {
+            Some(stream) if strict_reader_errors => read_capped_result(stream, limits.max_stderr),
+            Some(stream) => Ok(read_capped(
+                stream,
+                limits.max_stderr,
+                &AtomicBool::new(false),
+            )),
+            None => Err("stderr pipe was not available".to_owned()),
+        };
+        if tx.send(ReaderMessage::Stderr(result)).is_err() {
             tracing::debug!("gh stderr reader detached: run already gave up");
         }
     });
@@ -183,7 +245,10 @@ pub(crate) fn run_blocking(
             failure = Some(RunError::Cancelled);
             break;
         }
-        if out_over.load(Ordering::Relaxed) {
+        if out_over
+            .as_ref()
+            .is_some_and(|over| over.load(Ordering::Relaxed))
+        {
             failure = Some(RunError::Truncated);
             break;
         }
@@ -199,9 +264,21 @@ pub(crate) fn run_blocking(
         kill_group(pid);
     }
     let status = if pinned {
-        child.wait().ok()
+        match child.wait() {
+            Ok(status) => Some(status),
+            Err(error) => {
+                set_io_failure_if_missing(&mut failure, error);
+                None
+            }
+        }
     } else {
-        child.try_wait().ok().flatten()
+        match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                set_io_failure_if_missing(&mut failure, error);
+                None
+            }
+        }
     };
     if let Some(f) = failure {
         return Err(f);
@@ -213,22 +290,46 @@ pub(crate) fn run_blocking(
     while stdout.is_none() || stderr.is_none() {
         let left = drain_by.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left) {
-            Ok((true, b)) => stdout = Some(b),
-            Ok((false, b)) => stderr = Some(b),
+            Ok(ReaderMessage::Stdout(value)) => stdout = Some(value),
+            Ok(ReaderMessage::Stderr(value)) => stderr = Some(value),
             Err(_) => return Err(RunError::Timeout),
         }
     }
-    let (stdout, stderr) = (stdout.unwrap_or_default(), stderr.unwrap_or_default());
-    if out_over.load(Ordering::Relaxed) {
+    let stdout = stdout
+        .expect("stdout reader completed")
+        .map_err(RunError::Io)?;
+    let stderr = stderr
+        .expect("stderr reader completed")
+        .map_err(RunError::Io)?;
+    if out_over
+        .as_ref()
+        .is_some_and(|over| over.load(Ordering::Relaxed))
+    {
         return Err(RunError::Truncated);
     }
     match status {
-        Some(st) if st.success() => Ok(String::from_utf8_lossy(&stdout).into_owned()),
-        Some(st) => Err(RunError::Exit {
-            code: st.code(),
+        Some(status) if status.success() => Ok((stdout, status)),
+        Some(status) => Err(RunError::Exit {
+            code: status.code(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
         }),
         None => Err(RunError::Io("could not reap child".into())),
+    }
+}
+
+fn read_capped_result(mut reader: impl Read, cap: usize) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(buf),
+            Ok(n) => {
+                let room = cap.saturating_sub(buf.len());
+                buf.extend_from_slice(&chunk[..n.min(room)]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.to_string()),
+        }
     }
 }
 
