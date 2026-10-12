@@ -38,31 +38,44 @@ fn repo_membership_query_failure_is_not_local_git_fallback() {
 }
 
 #[test]
+#[expect(clippy::disallowed_methods)] // deterministic real-Git fixture, test only
 fn remote_unregistered_row_does_not_use_local_git_membership_fallback() {
     let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir(&repo).unwrap();
-    let status = util::git_cmd(&repo)
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir(&repo_dir).unwrap();
+    let status = util::git_cmd(&repo_dir)
         .args(["init", "-q"])
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .status()
         .unwrap();
     assert!(status.success());
+    let repo = repo_dir.canonicalize().unwrap();
 
     let path = dir.path().join("queue.sqlite");
     let db = Db::open_at(&path).unwrap();
     let repo_s = repo.to_string_lossy().into_owned();
     db.enqueue_merge(&repo_s, "feature", "main").unwrap();
-    rusqlite::Connection::open(&path)
-        .unwrap()
-        .execute(
-            "UPDATE merge_queue SET location=?1 WHERE worktree=?2",
-            [
-                r#"{"control_prefix":["provider","exec"],"path":"/repo"}"#,
-                &repo_s,
-            ],
-        )
-        .unwrap();
+
+    // The unregistered local row must first be attributable through Git. This
+    // proves the remote assertion below exercises the fallback under test.
+    assert_eq!(super::rows_for_repo(&db, &repo).unwrap().len(), 1);
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE merge_queue SET location='   ' WHERE worktree=?1",
+        [&repo_s],
+    )
+    .unwrap();
+    assert_eq!(super::rows_for_repo(&db, &repo).unwrap().len(), 1);
+
+    conn.execute(
+        "UPDATE merge_queue SET location=?1 WHERE worktree=?2",
+        [
+            r#"{"control_prefix":["provider","exec"],"path":"/repo"}"#,
+            &repo_s,
+        ],
+    )
+    .unwrap();
 
     assert!(super::rows_for_repo(&db, &repo).unwrap().is_empty());
 }
