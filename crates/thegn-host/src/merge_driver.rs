@@ -80,6 +80,7 @@ pub(crate) struct DriveOutcome {
     /// simply had nothing to fix.
     pub warnings: Vec<String>,
     /// Authoritative queue writes that failed while the drain was running.
+    /// A persistence failure aborts the remaining items so the drain fails closed.
     pub persistence_errors: Vec<String>,
     /// Git advanced, but the landed status could not be persisted.
     pub bookkeeping_failed: Vec<RefAdvancedBookkeepingFailed>,
@@ -469,11 +470,12 @@ fn drive_queue_with(
                 };
                 agent_runs += 1;
                 if let Err(error) = db.set_merge_agent_attempts(&item.worktree, agent_runs) {
-                    out.persistence_errors.push(format!(
-                        "{}: could not reserve agent attempt: {error}",
-                        item.worktree
-                    ));
-                    break;
+                    let detail = format!("could not reserve agent attempt: {error}");
+                    out.persistence_errors
+                        .push(format!("{}: {detail}", item.worktree));
+                    set(db, MqStatus::GateError, None, Some(&detail));
+                    stop_on_write_error!();
+                    break 'items;
                 }
                 let note = format!("agent fixing ({agent_runs}/{})", cfg.agent_max_attempts);
                 let fields = set(db, MqStatus::AgentRunning, None, Some(&note));
@@ -517,9 +519,12 @@ fn drive_queue_with(
                     };
                     let fields = conflict_fields(&paths, &submodule_conflicts);
                     if let Err(error) = replace_status(db, &item.worktree, status, &fields) {
+                        let detail = format!("could not persist conflict outcome: {error}");
                         out.persistence_errors
-                            .push(format!("{}: {error}", item.worktree));
-                        break;
+                            .push(format!("{}: {detail}", item.worktree));
+                        set(db, MqStatus::GateError, None, Some(&detail));
+                        stop_on_write_error!();
+                        break 'items;
                     }
                     progress(&DriveStep {
                         fields: &fields,
