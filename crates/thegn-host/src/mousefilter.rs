@@ -34,8 +34,8 @@ pub enum Verdict {
     Replay(Vec<KeyEvent>),
 }
 
-/// Stateful filter; feed every key event destined for dispatch. `swallow`
-/// returns `true` when the key is mouse residue and must be dropped.
+/// Stateful filter; feed every key event destined for dispatch and handle the
+/// resulting [`Verdict`] by passing, swallowing, emitting, or replaying keys.
 #[derive(Debug, Default)]
 pub struct MouseResidueFilter {
     state: State,
@@ -115,6 +115,7 @@ impl MouseResidueFilter {
     }
 
     /// Compatibility wrapper for the existing mouse-filter call sites/tests.
+    #[cfg(test)]
     pub fn swallow(&mut self, key: &KeyCode, mods: Modifiers) -> bool {
         matches!(self.feed(key, mods), Verdict::Swallow | Verdict::Emit(_))
     }
@@ -279,6 +280,31 @@ mod tests {
                     .collect()
             )
         );
+    }
+
+    #[test]
+    fn replayed_keys_pass_through_without_reentering_csi_state() {
+        let mut filter = MouseResidueFilter::default();
+        assert_eq!(
+            filter.feed(&KeyCode::Char('['), Modifiers::ALT),
+            Verdict::Swallow
+        );
+        assert_eq!(
+            filter.feed(&KeyCode::Char('5'), Modifiers::NONE),
+            Verdict::Swallow
+        );
+        assert_eq!(
+            filter.feed(&KeyCode::Char(';'), Modifiers::NONE),
+            Verdict::Swallow
+        );
+        let replay = match filter.feed(&KeyCode::Char('x'), Modifiers::NONE) {
+            Verdict::Replay(keys) => keys,
+            verdict => panic!("expected replay, got {verdict:?}"),
+        };
+
+        for key in replay {
+            assert_eq!(filter.feed(&key.key, key.modifiers), Verdict::Pass);
+        }
     }
 
     #[test]
