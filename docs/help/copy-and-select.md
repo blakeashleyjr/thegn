@@ -59,7 +59,17 @@ contents** in the worktree rather than terminal output. See [[search]].
 ## Replay
 
 `Alt-r` opens time-travel replay of the focused pane — scrub back through
-what it printed. Needs `[replay]` enabled; see [[configuration]].
+what it printed. Replay and `export-cast` (also available as `e` inside replay)
+use the focused center pane. They are unavailable for the corner pin, which does
+not keep byte replay history; see [[drawer-and-corner]]. Whole-session recording
+(`Ctrl-Alt-r`) is separate and is unaffected.
+
+Needs `[replay]` enabled; see [[configuration]]. When the replay overlay shows
+the **partial history** badge, earlier output was evicted or a chunk was
+truncated, so replay/search/export may not have the terminal state from before
+the retained window. `e` exports the retained history as a `.cast` file under
+the recordings directory; when history is partial, the toast and cast marker
+identify it as partial.
 
 ## Registers
 

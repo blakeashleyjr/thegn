@@ -21,14 +21,24 @@ When `[replay] enabled` is true, thegn SHALL record each pane's byte stream as t
 - **THEN** oldest events are dropped, and any keyframe whose byte range no longer
   exists is dropped with them
 
-### Requirement: Seek reconstructs the exact grid by re-feeding
+### Requirement: Seek discloses history loss
 
-Seeking to a time T SHALL reconstruct the pane's grid by spinning up a fresh emulator and re-feeding the retained byte slice up to T (forward playback may feed incrementally from the current position), with no changes to the `PaneEmulator` trait.
+When no history has been evicted or truncated, seeking to a time T SHALL
+reconstruct the pane's grid by spinning up a fresh emulator and re-feeding the
+recorded bytes up to T (forward playback may feed incrementally from the current
+position), with no changes to the `PaneEmulator` trait. Once history has been
+evicted or truncated, replay, time-search, and export MUST disclose that the
+retained history is partial; they MUST NOT claim exact reconstruction.
 
-#### Scenario: Seek determinism
+#### Scenario: Seek with complete history
 
-- **WHEN** the user seeks to time T
+- **WHEN** the user seeks to time T and no history has been evicted or truncated
 - **THEN** the reconstructed grid matches what the live emulator showed at T
+
+#### Scenario: Seek after eviction discloses partial history
+
+- **WHEN** the user seeks or searches after history has been evicted or truncated
+- **THEN** the replay overlay and search result disclose partial history
 
 ### Requirement: Replay playback adds no idle wakeups
 
@@ -87,8 +97,31 @@ an empty file.
 - **WHEN** `[replay] enabled` is false and the user invokes the export action
 - **THEN** no file is written and the message names the `[replay]` setting
 
-#### Scenario: The export replays faithfully
+#### Scenario: The export replays faithfully with complete history
 
-- **WHEN** an exported cast is fed to an asciicast v2 player at the recorded
-  geometry
+- **WHEN** an exported cast with no evicted or truncated history is fed to an
+  asciicast v2 player at the recorded geometry
 - **THEN** it reproduces the pane's retained visual history
+
+#### Scenario: Partial history is disclosed in an export
+
+- **WHEN** the recording has evicted or truncated earlier history
+- **THEN** the export includes a partial-history marker and the success toast
+  says "partial"
+
+### Requirement: Corner pins do not retain per-pane replay recordings
+
+Replay and cast export SHALL use the focused center pane only. A corner pin MUST
+not retain per-pane replay bytes, and the separate whole-session recorder MUST
+remain unaffected.
+
+#### Scenario: Replay and export with a corner pin
+
+- **WHEN** a corner pin is active while replay or cast export is invoked
+- **THEN** the action uses the focused center pane, and the corner pin has no
+  per-pane replay history to open or export
+
+#### Scenario: Whole-session recording with a corner pin
+
+- **WHEN** whole-session recording is enabled while a corner pin is active
+- **THEN** whole-session recording continues independently of per-pane replay
