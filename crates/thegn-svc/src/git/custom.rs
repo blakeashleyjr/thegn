@@ -11,11 +11,18 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use thegn_core::remote::GitLoc;
 
-const CUSTOM_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+pub const CUSTOM_COMMAND_TIMEOUT_SECS: u64 = 300;
+const CUSTOM_COMMAND_TIMEOUT: Duration = Duration::from_secs(CUSTOM_COMMAND_TIMEOUT_SECS);
 const STDOUT_LIMIT: usize = 1024 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const READER_GRACE: Duration = Duration::from_secs(2);
+pub const CUSTOM_OUTCOME_EXITED: &str = "exited";
+pub const CUSTOM_OUTCOME_TIMEOUT: &str = "timeout";
+pub const CUSTOM_OUTCOME_SPAWN: &str = "spawn";
+pub const CUSTOM_OUTCOME_WAIT: &str = "wait";
+pub const CUSTOM_OUTCOME_READ: &str = "read";
+pub const CUSTOM_OUTCOME_CLEANUP: &str = "cleanup";
 
 /// Bounded result from a custom command. Stderr is retained only so the
 /// non-template command path can preserve its historical failure summary.
@@ -42,12 +49,48 @@ impl CustomOutcome {
                 stdout,
                 stdout_truncated,
                 stderr,
-            } => ("exited", Some(status), stdout, stdout_truncated, stderr),
-            Self::Timeout => ("timeout", None, String::new(), false, String::new()),
-            Self::Spawn => ("spawn", None, String::new(), false, String::new()),
-            Self::Wait => ("wait", None, String::new(), false, String::new()),
-            Self::Read => ("read", None, String::new(), false, String::new()),
-            Self::IncompleteCleanup => ("cleanup", None, String::new(), false, String::new()),
+            } => (
+                CUSTOM_OUTCOME_EXITED,
+                Some(status),
+                stdout,
+                stdout_truncated,
+                stderr,
+            ),
+            Self::Timeout => (
+                CUSTOM_OUTCOME_TIMEOUT,
+                None,
+                String::new(),
+                false,
+                String::new(),
+            ),
+            Self::Spawn => (
+                CUSTOM_OUTCOME_SPAWN,
+                None,
+                String::new(),
+                false,
+                String::new(),
+            ),
+            Self::Wait => (
+                CUSTOM_OUTCOME_WAIT,
+                None,
+                String::new(),
+                false,
+                String::new(),
+            ),
+            Self::Read => (
+                CUSTOM_OUTCOME_READ,
+                None,
+                String::new(),
+                false,
+                String::new(),
+            ),
+            Self::IncompleteCleanup => (
+                CUSTOM_OUTCOME_CLEANUP,
+                None,
+                String::new(),
+                false,
+                String::new(),
+            ),
         }
     }
 }
@@ -183,9 +226,10 @@ fn run_bounded(
             }
             Err(_) => {
                 crate::plugin::proc::kill_group(pid);
-                return match child.wait() {
-                    Ok(_) | Err(_) => CustomOutcome::Wait,
-                };
+                if let Err(error) = child.wait() {
+                    tracing::debug!(%error, "custom command reap failed");
+                }
+                return CustomOutcome::Wait;
             }
         }
         if Instant::now() >= deadline {
@@ -199,9 +243,10 @@ fn run_bounded(
         Ok(status) => status,
         Err(_) => {
             crate::plugin::proc::kill_group(pid);
-            return match child.wait() {
-                Ok(_) | Err(_) => CustomOutcome::Wait,
-            };
+            if let Err(error) = child.wait() {
+                tracing::debug!(%error, "custom command reap failed");
+            }
+            return CustomOutcome::Wait;
         }
     };
 
@@ -279,7 +324,7 @@ fn read_bounded(
     limit: usize,
     keep_tail: bool,
 ) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut retained = Vec::with_capacity(limit);
+    let mut retained = Vec::with_capacity(limit.min(8192));
     let mut truncated = false;
     let mut chunk = [0u8; 8192];
     loop {
@@ -368,10 +413,10 @@ mod tests {
         let started = Instant::now();
         let outcome = CliGit.run_custom(&repo.loc(), "(sleep 30; echo late) & echo done", true);
         assert!(started.elapsed() < Duration::from_secs(5));
-        match outcome {
-            CustomOutcome::Exited { stdout, .. } => assert_eq!(stdout.trim(), "done"),
-            other => panic!("expected command output, got {other:?}"),
-        }
+        let (kind, status, stdout, _, _) = outcome;
+        assert_eq!(kind, CUSTOM_OUTCOME_EXITED);
+        assert!(status.is_some_and(|status| status.success()));
+        assert_eq!(stdout.trim(), "done");
     }
 
     #[test]
@@ -400,6 +445,25 @@ mod tests {
     }
 
     #[test]
+    fn none_mode_discards_output_body() {
+        if !supported() {
+            return;
+        }
+        let repo = TestRepo::new("custom-none-output");
+        match run_bounded(
+            repo.loc()
+                .sh_command("printf 'output that must be discarded'"),
+            false,
+            Duration::from_secs(5),
+            STDOUT_LIMIT,
+            STDERR_LIMIT,
+        ) {
+            CustomOutcome::Exited { stdout, .. } => assert!(stdout.is_empty()),
+            other => panic!("expected command completion without output body, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn timeout_kills_descendant_and_next_command_runs() {
         if !supported() {
             return;
@@ -419,9 +483,9 @@ mod tests {
         }
         std::thread::sleep(Duration::from_secs(2));
         assert!(!marker.exists(), "descendant survived group termination");
-        match CliGit.run_custom(&repo.loc(), "echo ok", true) {
-            CustomOutcome::Exited { stdout, .. } => assert_eq!(stdout.trim(), "ok"),
-            other => panic!("subsequent command failed: {other:?}"),
-        }
+        let (kind, status, stdout, _, _) = CliGit.run_custom(&repo.loc(), "echo ok", true);
+        assert_eq!(kind, CUSTOM_OUTCOME_EXITED);
+        assert!(status.is_some_and(|status| status.success()));
+        assert_eq!(stdout.trim(), "ok");
     }
 }
