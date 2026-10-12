@@ -40,7 +40,7 @@ pub fn ready() -> bool {
 }
 
 thread_local! {
-    /// The worktree tag for the current thread — a short slug attached to every
+    /// The worktree tag for the current thread — a bounded opaque tag attached to every
     /// log line the thread emits while a [`WtGuard`] is in scope. The `fmt`
     /// subscriber formats an event on the thread that emitted it, so a
     /// thread-local set for the duration of a worktree-scoped `spawn_blocking`
@@ -48,7 +48,7 @@ thread_local! {
     static CURRENT_WT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// RAII guard that tags the current thread's log lines with a worktree slug and
+/// RAII guard that tags the current thread's log lines with a worktree tag and
 /// restores the previous tag (usually `None`) on drop. Attach it at the top of a
 /// worktree-scoped unit of work (provisioning, pane spawn, a per-worktree
 /// refresh) so its diagnostics are attributable — the Logs panel then filters to
@@ -56,8 +56,8 @@ thread_local! {
 #[must_use = "the worktree log tag is cleared as soon as the guard is dropped"]
 pub struct WtGuard(Option<String>);
 
-/// Tag this thread's log lines with a worktree slug until the returned guard is
-/// dropped. Use [`wt_slug`] to derive a stable slug from a worktree path so both
+/// Tag this thread's log lines with a worktree tag until the returned guard is
+/// dropped. Use [`wt_slug`] to derive a stable tag from a worktree path so both
 /// the emitter and the Logs-panel filter agree on the key.
 pub fn enter_wt(slug: impl Into<String>) -> WtGuard {
     let slug = slug.into();
@@ -77,13 +77,34 @@ fn current_wt() -> Option<String> {
     CURRENT_WT.with(|c| c.borrow().clone())
 }
 
-/// A stable, short worktree tag derived from a worktree path — the directory's
-/// basename, slugified. Both the log emitter ([`enter_wt`]) and the Logs-panel
-/// filter derive the key this way so they compare equal. Empty path ⇒ `""`.
+/// A bounded worktree tag derived from normalized native path bytes. The slug is
+/// for display only; the versioned digest binds the tag to the complete path. If
+/// those bytes cannot be encoded within the identity bound, the `unbound` suffix
+/// marks the ambiguous fallback. Empty path ⇒ `""` (host-global).
 pub fn wt_slug(path: &Path) -> String {
-    path.file_name()
-        .map(|n| crate::util::slugify(&n.to_string_lossy()))
-        .unwrap_or_default()
+    if path.as_os_str().is_empty() {
+        return String::new();
+    }
+    let label = path
+        .file_name()
+        .map(|name| crate::util::slugify(&name.to_string_lossy()))
+        .filter(|label| !label.is_empty())
+        .unwrap_or_else(|| "worktree".to_string());
+    let label: String = label.chars().take(32).collect();
+    let max_path_bytes = crate::identity::MAX_IDENTITY_BYTES - 64;
+    let normalized_path: PathBuf = path.components().collect();
+    match crate::util::native_path_bytes_bounded(&normalized_path, max_path_bytes).and_then(
+        |bytes| {
+            crate::identity::digest_parts(
+                b"thegn/log-worktree",
+                &[crate::identity::BytePart::new(&bytes)],
+            )
+            .map_err(|_| crate::util::NativePathError::TooLong)
+        },
+    ) {
+        Ok(digest) => format!("{label}.{}", crate::identity::hex_bytes(&digest)),
+        Err(_) => format!("{label}.unbound"),
+    }
 }
 
 /// Is `size_bytes` over a `cap_mb`-MiB cap? (`cap_mb == 0` disables the cap.)
@@ -908,13 +929,46 @@ mod tests {
     }
 
     #[test]
-    fn wt_slug_is_basename_slug() {
-        assert_eq!(
-            wt_slug(Path::new("/home/me/wt/tg-solid-glen")),
-            "tg-solid-glen"
+    fn wt_slug_binds_complete_path_with_bounded_display_label() {
+        let first = wt_slug(Path::new("/repos/a/feat_x"));
+        let second = wt_slug(Path::new("/repos/b/feat-x"));
+        assert_ne!(first, second);
+        assert_ne!(wt_slug(Path::new("/a/x")), wt_slug(Path::new("/b/x")));
+        assert_ne!(
+            wt_slug(Path::new("/repo/feature")),
+            wt_slug(Path::new("/repo/Feature"))
         );
-        assert_eq!(wt_slug(Path::new("/repo/app feat")), "app-feat");
+        assert_ne!(
+            wt_slug(Path::new("/repo/feat.x")),
+            wt_slug(Path::new("/repo/feat-x"))
+        );
+        assert_ne!(
+            wt_slug(Path::new("/repo/café")),
+            wt_slug(Path::new("/repo/cafe\u{301}"))
+        );
+        assert!(wt_slug(Path::new("/")).starts_with("worktree."));
+        assert_eq!(first, wt_slug(Path::new("/repos/a/feat_x")));
+        assert!(first.starts_with("feat-x."));
+        assert!(first.len() <= 32 + 1 + 64);
+        assert!(!first.chars().any(char::is_whitespace));
+        assert!(!first.contains('='));
         assert_eq!(wt_slug(Path::new("")), "");
+    }
+
+    #[test]
+    fn wt_slug_normalizes_trailing_separator() {
+        assert_eq!(
+            wt_slug(Path::new("/repos/a/wt/")),
+            wt_slug(Path::new("/repos/a/wt"))
+        );
+    }
+
+    #[test]
+    fn wt_slug_marks_paths_outside_identity_bound_unbound() {
+        let long_path = "x".repeat(crate::identity::MAX_IDENTITY_BYTES);
+        let tag = wt_slug(Path::new(&long_path));
+        assert!(tag.ends_with(".unbound"));
+        assert!(tag.len() <= 32 + ".unbound".len());
     }
 
     #[test]
@@ -1078,9 +1132,10 @@ mod tests {
 
     #[test]
     fn ring_layer_records_message_fields_and_worktree() {
+        let tag = wt_slug(Path::new("/repos/a/ring-feature"));
         let subscriber = tracing_subscriber::registry().with(RingLayer);
         tracing::subscriber::with_default(subscriber, || {
-            let _guard = enter_wt("ring-wt");
+            let _guard = enter_wt(tag.clone());
             tracing::warn!(
                 target: "thegn::ring-test",
                 answer = 42,
@@ -1095,7 +1150,7 @@ mod tests {
             .unwrap_or_else(|| panic!("ring event missing from {snapshot:?}"));
         assert!(line.contains("WARN"), "{line}");
         assert!(line.contains("thegn::ring-test"), "{line}");
-        assert!(line.contains("wt=ring-wt"), "{line}");
+        assert!(line.contains(&format!("wt={tag}")), "{line}");
         assert!(line.contains("ring message"), "{line}");
         assert!(line.contains("answer=42"), "{line}");
         assert!(line.contains("healthy=true"), "{line}");
