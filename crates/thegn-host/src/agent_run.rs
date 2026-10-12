@@ -53,6 +53,7 @@ pub(crate) fn force_headless_unsupported() -> impl Drop {
     Reset
 }
 
+#[cfg(any(unix, test))]
 const MAX_RENDERED_COMMAND_BYTES: usize = 100 * 1024;
 
 #[cfg(any(unix, test))]
@@ -69,6 +70,9 @@ fn fit_command(
     let command = thegn_core::agent_task::substitute_command(template, prompt, vars)?;
     if !rendered_command_exceeds_limit(&command) {
         return Ok(Some((command, prompt.len())));
+    }
+    if !template.contains("{prompt}") {
+        return Ok(None);
     }
 
     let mut prompt_bytes = prompt.len() / 2;
@@ -235,31 +239,34 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
     use std::process::{Command, Stdio};
     use thegn_core::util;
 
-    let (command, kept_prompt_bytes) =
-        match fit_command(task.command_template, task.prompt, task.vars) {
-            Ok(Some(fit)) => fit,
-            Ok(None) => {
-                tracing::warn!(
-                    target: "thegn::agent",
-                    kind = %task.kind,
-                    prompt_bytes = task.prompt.len(),
-                    max_command_bytes = MAX_RENDERED_COMMAND_BYTES,
-                    "agent command remains oversized with an empty prompt; not dispatching"
-                );
-                return false;
-            }
-            Err(e) => {
-                // Validation runs at config time; reaching here means a template
-                // slipped through, so say so rather than spawning nonsense.
-                tracing::warn!(
-                    target: "thegn::agent",
-                    kind = %task.kind,
-                    error = %e,
-                    "agent command template is invalid; not dispatching"
-                );
-                return false;
-            }
-        };
+    let (command, kept_prompt_bytes) = match fit_command(
+        task.command_template,
+        task.prompt,
+        task.vars,
+    ) {
+        Ok(Some(fit)) => fit,
+        Ok(None) => {
+            tracing::warn!(
+                target: "thegn::agent",
+                kind = %task.kind,
+                prompt_bytes = task.prompt.len(),
+                max_command_bytes = MAX_RENDERED_COMMAND_BYTES,
+                "agent command exceeds the safe argument limit even without the prompt; not dispatching"
+            );
+            return false;
+        }
+        Err(e) => {
+            // Validation runs at config time; reaching here means a template
+            // slipped through, so say so rather than spawning nonsense.
+            tracing::warn!(
+                target: "thegn::agent",
+                kind = %task.kind,
+                error = %e,
+                "agent command template is invalid; not dispatching"
+            );
+            return false;
+        }
+    };
     if kept_prompt_bytes < task.prompt.len() {
         tracing::warn!(
             target: "thegn::agent",
@@ -1247,7 +1254,7 @@ mod tests {
 
     #[test]
     fn oversized_non_prompt_variable_cannot_be_fitted() {
-        let vars = TaskVars::new().set("branch", &"a".repeat(200 * 1024));
+        let vars = TaskVars::new().set("branch", "a".repeat(200 * 1024));
         assert!(
             fit_command("agent --branch {branch} -p {prompt}", "small", &vars)
                 .unwrap()
