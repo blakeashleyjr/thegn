@@ -10,11 +10,13 @@
 //! loop persists rows and re-syncs the [`crate::chrome::FrameModel`] from
 //! [`ShareSupervisor::views`].
 
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use termwiz::terminal::TerminalWaker;
 use thegn_core::config::ShareConfig;
 use thegn_core::share::build_share_spec;
+use thegn_svc::share::PublicEndpoint;
 use thegn_svc::share::ShareProvider;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -25,15 +27,21 @@ pub enum ShareEvent {
     Up {
         worktree: String,
         port: u16,
+        generation: u64,
         provider: &'static str,
-        url: String,
+        url: PublicEndpoint,
     },
     /// The tunnel client exited (clean stop, crash, or `stop()` kill).
-    Down { worktree: String, port: u16 },
+    Down {
+        worktree: String,
+        port: u16,
+        generation: u64,
+    },
     /// Bring-up failed (no URL within the timeout, spawn error, …).
     Failed {
         worktree: String,
         port: u16,
+        generation: u64,
         provider: &'static str,
         error: String,
     },
@@ -43,8 +51,9 @@ pub enum ShareEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShareState {
     Starting,
-    Up(String),
+    Up(PublicEndpoint),
     Failed(String),
+    Stopping,
 }
 
 /// A small render-facing snapshot of one share (mirrored into `FrameModel`).
@@ -52,10 +61,14 @@ pub enum ShareState {
 pub struct ShareView {
     pub worktree: String,
     pub port: u16,
-    /// The public URL (http(s)…) or, for iroh, the `dumbpipe connect-tcp …`
-    /// consumer command. `None` while starting or on failure.
+    /// The canonical public URL, socket authority, or opaque ticket.
+    /// `None` while starting/stopping or on failure.
     pub url: Option<String>,
+    /// Typed endpoint used by actions that need to distinguish a browser URL
+    /// from an opaque ticket or socket authority.
+    pub endpoint: Option<PublicEndpoint>,
     pub failed: bool,
+    pub stopping: bool,
     /// The failure reason when `failed` — surfaced in the panel row; without it
     /// the user saw the word "failed" and nothing else.
     pub error: Option<String>,
@@ -75,6 +88,14 @@ impl ShareView {
         } else {
             '\u{1f465}' // 👥
         }
+    }
+
+    pub fn copy_value(&self) -> Option<String> {
+        self.endpoint.as_ref().map(PublicEndpoint::canonical)
+    }
+
+    pub fn browser_url(&self) -> Option<&str> {
+        self.endpoint.as_ref().and_then(PublicEndpoint::as_url)
     }
 }
 
@@ -108,10 +129,13 @@ impl Shared {
 struct ShareInstance {
     worktree: String,
     port: u16,
+    generation: u64,
     provider: &'static str,
     public: bool,
     state: ShareState,
     shared: Arc<Shared>,
+    event_tx: Option<UnboundedSender<ShareEvent>>,
+    event_waker: Option<TerminalWaker>,
 }
 
 impl ShareInstance {
@@ -122,9 +146,34 @@ impl ShareInstance {
         }
         // Sidecar-serve teardown shells into the VPN sidecar; do it off the loop.
         if let Some(td) = self.shared.teardown.lock().unwrap().clone() {
-            std::thread::spawn(move || {
-                thegn_svc::share::serve_down(&td.sidecar, &td.serve);
-            });
+            let tx = self.event_tx.clone();
+            let waker = self.event_waker.clone();
+            let worktree = self.worktree.clone();
+            let port = self.port;
+            let generation = self.generation;
+            let spawn = std::thread::Builder::new()
+                .name("tgshare-down".into())
+                .spawn(move || {
+                    crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                    thegn_svc::share::serve_down(&td.sidecar, &td.serve);
+                    if let Some(tx) = tx
+                        && let Err(error) = tx.send(ShareEvent::Down {
+                            worktree,
+                            port,
+                            generation,
+                        })
+                    {
+                        tracing::debug!(%error, "share teardown acknowledgement receiver is gone");
+                    }
+                    if let Some(waker) = waker
+                        && let Err(error) = waker.wake()
+                    {
+                        tracing::debug!(%error, "share teardown waker is unavailable");
+                    }
+                });
+            if let Err(error) = spawn {
+                tracing::warn!(%error, "could not spawn share teardown worker");
+            }
         }
     }
 }
@@ -136,6 +185,9 @@ pub struct ShareSupervisor {
     instances: Vec<ShareInstance>,
 }
 
+static NEXT_SHARE_GENERATION: AtomicU64 = AtomicU64::new(1);
+static SHARE_PROCESS_NONCE: OnceLock<u64> = OnceLock::new();
+
 impl ShareSupervisor {
     pub fn new() -> Self {
         Self::default()
@@ -143,9 +195,15 @@ impl ShareSupervisor {
 
     /// Whether a share already exists for `(worktree, port)`.
     pub fn has(&self, worktree: &str, port: u16) -> bool {
+        self.instances.iter().any(|i| {
+            i.worktree == worktree && i.port == port && !matches!(i.state, ShareState::Stopping)
+        })
+    }
+
+    pub fn has_other_generation(&self, worktree: &str, port: u16, generation: u64) -> bool {
         self.instances
             .iter()
-            .any(|i| i.worktree == worktree && i.port == port)
+            .any(|i| i.worktree == worktree && i.port == port && i.generation != generation)
     }
 
     /// Render-facing snapshot of all shares for `worktree` (badge + panel).
@@ -157,10 +215,15 @@ impl ShareSupervisor {
                 worktree: i.worktree.clone(),
                 port: i.port,
                 url: match &i.state {
-                    ShareState::Up(u) => Some(u.clone()),
+                    ShareState::Up(u) => Some(u.canonical()),
+                    _ => None,
+                },
+                endpoint: match &i.state {
+                    ShareState::Up(endpoint) => Some(endpoint.clone()),
                     _ => None,
                 },
                 failed: matches!(i.state, ShareState::Failed(_)),
+                stopping: matches!(i.state, ShareState::Stopping),
                 error: match &i.state {
                     ShareState::Failed(e) => Some(e.clone()),
                     _ => None,
@@ -203,6 +266,19 @@ impl ShareSupervisor {
             );
         }
         let provider = thegn_svc::share::for_provider(&spec).kind();
+        let sequence = NEXT_SHARE_GENERATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| "share generation counter exhausted".to_string())?;
+        let process_nonce = *SHARE_PROCESS_NONCE.get_or_init(|| {
+            let started = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            started ^ u64::from(std::process::id()).rotate_left(17)
+        });
+        let generation = process_nonce.wrapping_add(sequence);
         let shared = Shared::new();
         let t_shared = shared.clone();
         let t_tx = tx.clone();
@@ -213,16 +289,19 @@ impl ShareSupervisor {
             .spawn(move || {
                 // Utility: the user started this share and is watching for its URL.
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                supervise(spec, wt, port, t_tx, t_waker, t_shared)
+                supervise(spec, wt, port, generation, t_tx, t_waker, t_shared)
             })
             .map_err(|e| format!("could not spawn share supervisor: {e}"))?;
         self.instances.push(ShareInstance {
             worktree: worktree.to_string(),
             port,
+            generation,
             provider,
             public,
             state: ShareState::Starting,
             shared,
+            event_tx: Some(tx.clone()),
+            event_waker: Some(waker.clone()),
         });
         Ok(())
     }
@@ -234,32 +313,63 @@ impl ShareSupervisor {
             ShareEvent::Up {
                 worktree,
                 port,
+                generation,
                 url,
                 ..
-            } => match self.find_mut(&worktree, port) {
-                Some(i) => {
+            } => match self.find_mut(&worktree, port, generation) {
+                Some(i) if matches!(i.state, ShareState::Starting) => {
                     i.state = ShareState::Up(url);
                     true
                 }
-                None => false,
+                _ => {
+                    tracing::debug!(%worktree, port, generation, "dropped stale share Up event");
+                    false
+                }
             },
             ShareEvent::Failed {
                 worktree,
                 port,
+                generation,
                 error,
                 ..
-            } => match self.find_mut(&worktree, port) {
-                Some(i) => {
+            } => match self
+                .instances
+                .iter()
+                .find(|i| i.worktree == worktree && i.port == port && i.generation == generation)
+                .map(|i| i.state.clone())
+            {
+                Some(ShareState::Starting) => {
+                    let Some(i) = self.find_mut(&worktree, port, generation) else {
+                        return false;
+                    };
                     i.state = ShareState::Failed(error);
                     true
                 }
-                None => false,
+                Some(ShareState::Stopping) => {
+                    self.instances.retain(|i| {
+                        !(i.worktree == worktree && i.port == port && i.generation == generation)
+                    });
+                    true
+                }
+                _ => {
+                    tracing::debug!(%worktree, port, generation, "dropped stale share Failed event");
+                    false
+                }
             },
-            ShareEvent::Down { worktree, port } => {
+            ShareEvent::Down {
+                worktree,
+                port,
+                generation,
+            } => {
                 let before = self.instances.len();
-                self.instances
-                    .retain(|i| !(i.worktree == worktree && i.port == port));
-                before != self.instances.len()
+                self.instances.retain(|i| {
+                    !(i.worktree == worktree && i.port == port && i.generation == generation)
+                });
+                let changed = before != self.instances.len();
+                if !changed {
+                    tracing::debug!(%worktree, port, generation, "dropped stale share Down event");
+                }
+                changed
             }
         }
     }
@@ -269,14 +379,26 @@ impl ShareSupervisor {
     /// the supervisor's own state, never a possibly-stale render mirror.
     pub fn stop(&mut self, worktree: &str, port: Option<u16>) -> Vec<u16> {
         let mut stopped = Vec::new();
+        // Failed instances already received a terminal event and have no
+        // worker left to await. Remove them before mutating the live records.
         self.instances.retain(|i| {
             let matched = i.worktree == worktree && port.is_none_or(|p| p == i.port);
-            if matched {
-                i.kill();
+            if matched && matches!(i.state, ShareState::Failed(_)) {
                 stopped.push(i.port);
+                false
+            } else {
+                true
             }
-            !matched
         });
+        for i in &mut self.instances {
+            let matched = i.worktree == worktree && port.is_none_or(|p| p == i.port);
+            if matched && !matches!(i.state, ShareState::Stopping) {
+                stopped.push(i.port);
+                i.kill();
+                // Retain this generation until its worker acknowledges teardown.
+                i.state = ShareState::Stopping;
+            }
+        }
         stopped
     }
 
@@ -288,10 +410,15 @@ impl ShareSupervisor {
         self.instances.clear();
     }
 
-    fn find_mut(&mut self, worktree: &str, port: u16) -> Option<&mut ShareInstance> {
+    fn find_mut(
+        &mut self,
+        worktree: &str,
+        port: u16,
+        generation: u64,
+    ) -> Option<&mut ShareInstance> {
         self.instances
             .iter_mut()
-            .find(|i| i.worktree == worktree && i.port == port)
+            .find(|i| i.worktree == worktree && i.port == port && i.generation == generation)
     }
 }
 
@@ -314,11 +441,11 @@ impl Drop for ShareSupervisor {
 /// The per-share supervisor thread: build the plan, bring the tunnel up, report
 /// its URL, then block on the child and report when it goes down.
 // off-loop: runs on the per-share supervisor std::thread (see the spawn above).
-#[expect(clippy::disallowed_methods)]
 fn supervise(
     spec: thegn_core::share::ShareSpec,
     worktree: String,
     port: u16,
+    generation: u64,
     tx: UnboundedSender<ShareEvent>,
     waker: TerminalWaker,
     shared: Arc<Shared>,
@@ -331,10 +458,24 @@ fn supervise(
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     };
     let fail = |e: String| {
+        if shared.shutdown.load(Ordering::SeqCst) {
+            if let Err(error) = tx.send(ShareEvent::Down {
+                worktree: worktree.clone(),
+                port,
+                generation,
+            }) {
+                tracing::debug!(%error, "share shutdown acknowledgement receiver is gone");
+            }
+            if let Err(error) = waker.wake() {
+                tracing::debug!(%error, "share shutdown waker is unavailable");
+            }
+            return;
+        }
         // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = tx.send(ShareEvent::Failed {
             worktree: worktree.clone(),
             port,
+            generation,
             provider,
             error: e,
         });
@@ -350,25 +491,41 @@ fn supervise(
         // Process providers (bore/frp/dumbpipe): spawn the child, report its URL,
         // then block on it so we emit `Down` when it exits.
         ShareLaunch::Process(plan) => {
-            let statedir = share::share_state_dir(&worktree, port);
+            let statedir = match share::share_state_dir(
+                std::path::Path::new(&worktree),
+                provider,
+                port,
+                generation,
+            ) {
+                Ok(path) => path,
+                Err(e) => return fail(e.to_string()),
+            };
             match share::start(&plan, &statedir, spec.ready_timeout) {
                 Ok(running) => {
                     *shared.pid.lock().unwrap() = Some(running.child.id());
                     if shared.shutdown.load(Ordering::SeqCst) {
                         running.stop();
-                        emit(ShareEvent::Down { worktree, port });
+                        emit(ShareEvent::Down {
+                            worktree,
+                            port,
+                            generation,
+                        });
                         return;
                     }
                     emit(ShareEvent::Up {
                         worktree: worktree.clone(),
                         port,
+                        generation,
                         provider,
                         url: running.public_url.clone(),
                     });
-                    let share::RunningShare { mut child, .. } = running;
-                    let _ = child.wait(); // best-effort: teardown: the child may already have exited or been reaped
+                    running.wait();
                     *shared.pid.lock().unwrap() = None;
-                    emit(ShareEvent::Down { worktree, port });
+                    emit(ShareEvent::Down {
+                        worktree,
+                        port,
+                        generation,
+                    });
                 }
                 Err(e) => fail(e.to_string()),
             }
@@ -395,12 +552,17 @@ fn supervise(
                             &shared.teardown.lock().unwrap().as_ref().unwrap().sidecar,
                             &serve,
                         );
-                        emit(ShareEvent::Down { worktree, port });
+                        emit(ShareEvent::Down {
+                            worktree,
+                            port,
+                            generation,
+                        });
                         return;
                     }
                     emit(ShareEvent::Up {
                         worktree,
                         port,
+                        generation,
                         provider,
                         url,
                     });
@@ -422,17 +584,21 @@ mod tests {
         sup.instances.push(ShareInstance {
             worktree: "/wt".into(),
             port: 3000,
+            generation: 7,
             provider: "bore",
             public: true,
             state: ShareState::Starting,
             shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
         });
         assert!(sup.views("/wt")[0].url.is_none());
         assert!(sup.on_event(ShareEvent::Up {
             worktree: "/wt".into(),
             port: 3000,
+            generation: 7,
             provider: "bore",
-            url: "http://bore.pub:1".into(),
+            url: PublicEndpoint::parse_url("http://bore.pub:1").expect("valid URL"),
         }));
         let v = sup.views("/wt");
         assert_eq!(v.len(), 1);
@@ -444,14 +610,16 @@ mod tests {
         assert!(!sup.on_event(ShareEvent::Up {
             worktree: "/other".into(),
             port: 9,
+            generation: 7,
             provider: "bore",
-            url: "x".into(),
+            url: PublicEndpoint::parse_url("https://other.test").expect("valid URL"),
         }));
 
         // Down removes it.
         assert!(sup.on_event(ShareEvent::Down {
             worktree: "/wt".into(),
             port: 3000,
+            generation: 7,
         }));
         assert!(sup.views("/wt").is_empty());
     }
@@ -462,19 +630,134 @@ mod tests {
         sup.instances.push(ShareInstance {
             worktree: "/wt".into(),
             port: 8080,
+            generation: 8,
             provider: "bore",
             public: true,
             state: ShareState::Starting,
             shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
         });
         assert!(sup.on_event(ShareEvent::Failed {
             worktree: "/wt".into(),
             port: 8080,
+            generation: 8,
             provider: "bore",
             error: "boom".into(),
         }));
         let v = sup.views("/wt");
         assert!(v[0].failed);
         assert!(v[0].url.is_none());
+    }
+
+    #[test]
+    fn stale_generation_cannot_change_or_remove_restarted_share() {
+        let mut sup = ShareSupervisor::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 22,
+            provider: "bore",
+            public: true,
+            state: ShareState::Up(
+                PublicEndpoint::parse_url("https://new.test").expect("valid URL"),
+            ),
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+        assert!(!sup.on_event(ShareEvent::Up {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 21,
+            provider: "bore",
+            url: PublicEndpoint::parse_url("https://old.test").expect("valid URL"),
+        }));
+        assert!(!sup.on_event(ShareEvent::Failed {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 21,
+            provider: "bore",
+            error: "late failure".into(),
+        }));
+        assert!(!sup.on_event(ShareEvent::Down {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 21
+        }));
+        assert_eq!(sup.views("/wt")[0].url.as_deref(), Some("https://new.test"));
+    }
+
+    #[test]
+    fn stop_retains_stopping_generation_until_down_acknowledgement() {
+        let mut sup = ShareSupervisor::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 31,
+            provider: "bore",
+            public: true,
+            state: ShareState::Starting,
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+        assert_eq!(sup.stop("/wt", Some(3000)), vec![3000]);
+        assert_eq!(sup.instances.len(), 1);
+        assert!(matches!(sup.instances[0].state, ShareState::Stopping));
+        assert!(sup.views("/wt")[0].stopping);
+        assert!(sup.on_event(ShareEvent::Down {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 31
+        }));
+        assert!(sup.instances.is_empty());
+    }
+
+    #[test]
+    fn failed_acknowledges_a_stopped_starting_generation() {
+        let mut sup = ShareSupervisor::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 51,
+            provider: "bore",
+            public: true,
+            state: ShareState::Starting,
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+        assert_eq!(sup.stop("/wt", Some(3000)), vec![3000]);
+        assert!(sup.on_event(ShareEvent::Failed {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 51,
+            provider: "bore",
+            error: "startup failed during stop".into(),
+        }));
+        assert!(sup.instances.is_empty());
+    }
+
+    #[test]
+    fn ticket_is_copied_as_data_and_never_opened_as_a_url() {
+        let endpoint = PublicEndpoint::parse_ticket("opaque-ticket_7").expect("valid ticket");
+        let view = ShareView {
+            worktree: "/wt".into(),
+            port: 3000,
+            url: Some(endpoint.canonical()),
+            endpoint: Some(endpoint),
+            failed: false,
+            stopping: false,
+            error: None,
+            provider: "iroh",
+            public: false,
+        };
+        assert_eq!(view.copy_value().as_deref(), Some("opaque-ticket_7"));
+        assert!(view.browser_url().is_none());
+        assert_eq!(
+            thegn_svc::lsp::sanitize_for_terminal(view.copy_value().as_deref().unwrap()),
+            "opaque-ticket_7"
+        );
     }
 }
