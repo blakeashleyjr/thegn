@@ -1897,6 +1897,7 @@ esac
         let expected = vec![
             format!("run\tlist\t--limit\t7\t--json\t{GH_RUN_FIELDS}\t--branch\tfeature&status=success\t--repo\tgithub.com/owner/repo\tGH_REPO=github.com/owner/repo\tGH_HOST=github.com"),
             format!("run\tview\t--json\t{GH_DETAIL_FIELDS}\t--repo\tgithub.com/owner/repo\t--\t123\tGH_REPO=github.com/owner/repo\tGH_HOST=github.com"),
+            format!("run\tview\t--json\t{GH_DETAIL_FIELDS}\t--repo\tgithub.com/owner/repo\t--\t124\tGH_REPO=github.com/owner/repo\tGH_HOST=github.com"),
             "run\tview\t--job\t456\t--log\t--repo\tgithub.com/owner/repo\tGH_REPO=github.com/owner/repo\tGH_HOST=github.com".into(),
             "workflow\tlist\t--json\tid,name,path,state\t--repo\tgithub.com/owner/repo\tGH_REPO=github.com/owner/repo\tGH_HOST=github.com".into(),
             "workflow\trun\t--repo\tgithub.com/owner/repo\t--\trelease/manual.yml\tGH_REPO=github.com/owner/repo\tGH_HOST=github.com".into(),
