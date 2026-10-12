@@ -1256,7 +1256,9 @@ pub(crate) fn persist_pin_state(supervisor: &crate::pins::PinSupervisor, session
     let json = supervisor.to_json();
     let now = now_secs();
     crate::db_task::persist_latest(format!("pin_state:{session_id}"), move |db| {
-        drop(Result::ok(db.set_pin_state(&session_id, &json, now)));
+        if let Err(error) = db.set_pin_state(&session_id, &json, now) {
+            tracing::debug!(target: "thegn::db", error = %error, "pin state persist failed");
+        }
     });
 }
 
@@ -1888,20 +1890,20 @@ fn persist_share_event(ev: &crate::share::ShareEvent) {
             let port = *port;
             let provider = (*provider).to_string();
             Some(Box::new(move |db: &thegn_core::db::Db| {
-                drop(Result::ok(db.upsert_share(
-                    &worktree,
-                    port,
-                    &provider,
-                    Some(&canonical),
-                    "up",
-                )));
+                if let Err(error) =
+                    db.upsert_share(&worktree, port, &provider, Some(&canonical), "up")
+                {
+                    tracing::debug!(target: "thegn::db", error = %error, "share persist failed");
+                }
             }))
         }
         ShareEvent::Failed { worktree, port, .. } | ShareEvent::Down { worktree, port, .. } => {
             let worktree = worktree.clone();
             let port = *port;
             Some(Box::new(move |db: &thegn_core::db::Db| {
-                drop(Result::ok(db.delete_share(&worktree, port)));
+                if let Err(error) = db.delete_share(&worktree, port) {
+                    tracing::debug!(target: "thegn::db", error = %error, "share delete persist failed");
+                }
             }))
         }
     };
@@ -5187,7 +5189,9 @@ fn persist_tests_for_worktree(ui: &crate::panel::PanelUi, worktree: &str) {
     if let Ok(json) = serde_json::to_string(&ui.tests.to_cache()) {
         let worktree = worktree.to_string();
         crate::db_task::persist(move |db| {
-            drop(Result::ok(db.put_test_cache(&worktree, &json)));
+            if let Err(error) = db.put_test_cache(&worktree, &json) {
+                tracing::debug!(target: "thegn::db", error = %error, "test cache persist failed");
+            }
         });
     }
 }
@@ -13131,7 +13135,9 @@ async fn event_loop<T: Terminal>(
                         let _ = preview_supervisor.provider_down(prev, port);
                         let worktree = prev.clone();
                         crate::db_task::persist(move |db| {
-                            drop(Result::ok(db.delete_forward(&worktree, port)));
+                            if let Err(error) = db.delete_forward(&worktree, port) {
+                                tracing::debug!(target: "thegn::db", error = %error, "forward delete persist failed");
+                            }
                         });
                     }
                     // Tear down the reverse model-proxy/host tunnels too.
@@ -13180,12 +13186,14 @@ async fn event_loop<T: Terminal>(
                                 let saved_url = started.url.clone();
                                 let host_port = started.host_port;
                                 crate::db_task::persist(move |db| {
-                                    drop(Result::ok(db.upsert_forward(
+                                    if let Err(error) = db.upsert_forward(
                                         &saved_worktree,
                                         container_port,
                                         host_port,
                                         &saved_url,
-                                    )));
+                                    ) {
+                                        tracing::debug!(target: "thegn::db", error = %error, "forward persist failed");
+                                    }
                                 });
                                 model.status = if started.remapped {
                                     format!(
@@ -13232,7 +13240,9 @@ async fn event_loop<T: Terminal>(
                         let preview_changed =
                             preview_supervisor.provider_down(&worktree, container_port);
                         crate::db_task::persist(move |db| {
-                            drop(Result::ok(db.delete_forward(&worktree, container_port)));
+                            if let Err(error) = db.delete_forward(&worktree, container_port) {
+                                tracing::debug!(target: "thegn::db", error = %error, "forward delete persist failed");
+                            }
                         });
                         model.forwards = current_forward_views(&forward_supervisor, &session);
                         if preview_changed {
@@ -17045,11 +17055,11 @@ async fn event_loop<T: Terminal>(
                             // it never reappears.
                             if m.tag == menu::MenuKindTag::KeymapPicker {
                                 crate::db_task::persist(|db| {
-                                    drop(Result::ok(db.set_ui_state(
-                                        "",
-                                        "keymap_preset",
-                                        "default",
-                                    )));
+                                    if let Err(error) =
+                                        db.set_ui_state("", "keymap_preset", "default")
+                                    {
+                                        tracing::debug!(target: "thegn::db", error = %error, "keymap state persist failed");
+                                    }
                                 });
                             }
                             // Esc on the sandbox-halt modal is a dismissal:
@@ -17915,7 +17925,9 @@ async fn event_loop<T: Terminal>(
                                 // Record frecency so the choice floats up next time.
                                 let saved_key = key.clone();
                                 crate::db_task::persist(move |db| {
-                                    drop(Result::ok(db.bump_palette_usage(&saved_key)));
+                                    if let Err(error) = db.bump_palette_usage(&saved_key) {
+                                        tracing::debug!(target: "thegn::db", error = %error, "palette usage persist failed");
+                                    }
                                 });
                                 // --- new: file/git/symbol dispatch prefixes ---
                                 if let Some(payload) = key.strip_prefix("open-file:") {
@@ -18439,9 +18451,11 @@ async fn event_loop<T: Terminal>(
                                     // jump to the Issues panel section.
                                     let wt = active_tab_path(&session);
                                     let wt_str = wt.to_string_lossy().to_string();
-                                    let issue_id = issue_id.to_string();
+                                    let saved_issue = issue_id.to_string();
                                     crate::db_task::persist(move |db| {
-                                        drop(Result::ok(db.link_issue(&wt_str, &issue_id)));
+                                        if let Err(error) = db.link_issue(&wt_str, &saved_issue) {
+                                            tracing::debug!(target: "thegn::db", error = %error, "issue link persist failed");
+                                        }
                                     });
                                     panel_ui.open = crate::panel::Section::Issues;
                                     hydration_gen += 1;
