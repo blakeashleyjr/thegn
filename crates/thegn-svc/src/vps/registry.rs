@@ -93,8 +93,13 @@ pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
             .with_context(|| format!("sync {}", tmp.display()))?;
         std::fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
         if let Ok(dir) = std::fs::File::open(d) {
-            dir.sync_all()
-                .with_context(|| format!("sync directory {}", d.display()))?;
+            if let Err(error) = dir.sync_all() {
+                tracing::warn!(
+                    %error,
+                    path = %d.display(),
+                    "VPS registry record was published but its directory could not be synced"
+                );
+            }
         }
         Ok(())
     })();
@@ -149,7 +154,7 @@ pub fn list_at(d: &Path) -> Vec<VpsRecord> {
             let path = e.path();
             let stem = path.file_stem()?.to_str()?;
             checked_name(stem).ok()?;
-            let rec: VpsRecord = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+            let rec: VpsRecord = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
             (rec.name == stem && checked_name(&rec.name).is_ok()).then_some(rec)
         })
         .collect()
