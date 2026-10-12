@@ -368,11 +368,26 @@ fn page_from_multistatus(
         meter.reserve_transient(copy)?;
         let ics = xml_unescape(r.ics_raw);
         let before = events.len();
-        let parsed = thegn_core::calendar::parse_ics_admitted(&ics, zone, &mut meter, &mut events);
+        let mut report = thegn_core::calendar::ics::IcsReport::default();
+        let parsed = thegn_core::calendar::ics::parse_ics_window_reported(
+            &ics,
+            zone,
+            None,
+            &mut meter,
+            &mut events,
+            || Ok(()),
+            &mut report,
+        );
         event_hrefs.extend(std::iter::repeat_n(r.href, events.len() - before));
         drop(ics);
         meter.release_transient(copy);
-        parsed.map_err(CalendarError::from)
+        parsed.map_err(CalendarError::from)?;
+        if report.is_document_failure() {
+            return Err(CalendarError::Parse(
+                "calendar resource is incomplete or structurally malformed".into(),
+            ));
+        }
+        Ok(())
     })?;
     let token = scope_token(calendar_ids, zone, &token);
     EventPage::from_meter_with_hrefs(
@@ -833,6 +848,47 @@ mod tests {
         let meter =
             AccountAdmission::isolated(Default::default(), thegn_core::calendar::Tz::UTC).meter();
         page_from_multistatus(&multistatus(), "UTC", &ids, PageMode::Delta, meter).unwrap()
+    }
+
+    fn resource(href: &str, calendar_data: &str) -> String {
+        format!(
+            "<d:response><d:href>{href}</d:href><d:propstat><d:prop><c:calendar-data>{calendar_data}</c:calendar-data></d:prop></d:propstat></d:response>"
+        )
+    }
+
+    fn test_meter() -> AdmissionMeter {
+        AccountAdmission::isolated(Default::default(), thegn_core::calendar::Tz::UTC).meter()
+    }
+
+    #[test]
+    fn a_truncated_caldav_resource_fails_snapshot_and_delta_pages() {
+        let good = resource(
+            "/cal/good.ics",
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:good\nDTSTART:20300101T100000Z\nEND:VEVENT\nEND:VCALENDAR",
+        );
+        let truncated = resource(
+            "/cal/cut.ics",
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:cut\nDTSTART:20300102T100000Z\n",
+        );
+        let xml = format!("<d:multistatus>{good}{truncated}</d:multistatus>");
+
+        for mode in [PageMode::Snapshot, PageMode::Delta] {
+            let error = page_from_multistatus(&xml, "UTC", &[], mode, test_meter()).unwrap_err();
+            assert!(matches!(error, CalendarError::Parse(_)), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn balanced_envelope_less_caldav_resource_remains_accepted() {
+        let data = "BEGIN:VEVENT\nUID:bare\nDTSTART:20300101T100000Z\nEND:VEVENT";
+        let xml = format!(
+            "<d:multistatus>{}</d:multistatus>",
+            resource("/cal/bare.ics", data)
+        );
+        let page =
+            page_from_multistatus(&xml, "UTC", &[], PageMode::Snapshot, test_meter()).unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].uid, "bare");
     }
 
     #[test]

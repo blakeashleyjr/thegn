@@ -7,6 +7,8 @@ pub struct TimeseriesRenderer;
 /// Samples per horizontal braille pixel above which a series is reduced. Below
 /// it every sample is drawn, so the output is identical to the naive walk.
 const SAMPLES_PER_PIXEL: usize = 4;
+/// Bound per-render scans while retaining the existing million-sample cases.
+const MAX_SAMPLES_PER_SERIES: usize = 1 << 21;
 /// Timestamp changes larger than three mean sample intervals break a line.
 const GAP_FACTOR: f64 = 3.0;
 
@@ -19,12 +21,14 @@ const GAP_FACTOR: f64 = 3.0;
 /// first non-finite sample of a bucket so gaps keep their position. Work and
 /// scratch are O(width), after one linear pass over the borrowed slice.
 fn plot_points(values: &[f64], width: usize) -> Vec<(f64, f64)> {
+    let start = values.len().saturating_sub(MAX_SAMPLES_PER_SERIES);
+    let values = &values[start..];
     let pixels = width.saturating_mul(2).max(1);
     if values.len() <= pixels.saturating_mul(SAMPLES_PER_PIXEL) {
         return values
             .iter()
             .enumerate()
-            .map(|(i, &v)| (i as f64, v))
+            .map(|(i, &v)| ((start + i) as f64, v))
             .collect();
     }
     let mut out = Vec::with_capacity(pixels * 4);
@@ -49,7 +53,7 @@ fn plot_points(values: &[f64], width: usize) -> Vec<(f64, f64)> {
         let mut idx: Vec<usize> = picks.iter().flatten().copied().collect();
         idx.sort_unstable();
         idx.dedup();
-        out.extend(idx.into_iter().map(|i| (i as f64, values[i])));
+        out.extend(idx.into_iter().map(|i| ((start + i) as f64, values[i])));
     }
     out
 }
@@ -57,11 +61,34 @@ fn plot_points(values: &[f64], width: usize) -> Vec<(f64, f64)> {
 /// Plot samples by their timestamp, preserving their input order within each
 /// time bucket. Out-of-order timestamps therefore remain out of order in the
 /// connected line. Non-finite timestamps are skipped.
+#[cfg(test)]
 fn plot_time_points(
     times: &[f64],
     values: &[f64],
     width: usize,
 ) -> (Vec<(f64, f64)>, Option<[f64; 2]>) {
+    plot_time_points_in(times, values, width, None)
+}
+
+/// Plot the newest bounded sample suffix by timestamp. A valid requested
+/// window is inclusive at both ends, supplies the X domain, and excludes
+/// samples before domain calculation, bucketing, and gap estimation. Invalid
+/// windows are treated as absent. Input order is retained, including for
+/// duplicate and out-of-order timestamps.
+fn plot_time_points_in(
+    times: &[f64],
+    values: &[f64],
+    width: usize,
+    window: Option<[f64; 2]>,
+) -> (Vec<(f64, f64)>, Option<[f64; 2]>) {
+    let window = window.filter(|[lo, hi]| lo.is_finite() && hi.is_finite() && lo < hi);
+    let samples = times.len().min(values.len());
+    let start = samples.saturating_sub(MAX_SAMPLES_PER_SERIES);
+    let times = &times[start..samples];
+    let values = &values[start..samples];
+    if let Some(window) = window {
+        return plot_time_points_in_window(times, values, width, window);
+    }
     let domain: Option<[f64; 2]> = times.iter().copied().filter(|time| time.is_finite()).fold(
         None,
         |domain, time| match domain {
@@ -78,7 +105,7 @@ fn plot_time_points(
     }
     let domain = Some([min_time, max_time]);
     let pixels = width.saturating_mul(2).max(1);
-    let samples = times.len().min(values.len());
+    let samples = times.len();
     if samples <= pixels.saturating_mul(SAMPLES_PER_PIXEL) {
         let points = times
             .iter()
@@ -126,6 +153,65 @@ fn plot_time_points(
     (points, domain)
 }
 
+fn plot_time_points_in_window(
+    times: &[f64],
+    values: &[f64],
+    width: usize,
+    window: [f64; 2],
+) -> (Vec<(f64, f64)>, Option<[f64; 2]>) {
+    let [min_time, max_time] = window;
+    let pixels = width.saturating_mul(2).max(1);
+    let samples = times.len().min(values.len());
+    let in_window_count = times
+        .iter()
+        .take(samples)
+        .filter(|time| time.is_finite() && **time >= min_time && **time <= max_time)
+        .count();
+    if in_window_count <= pixels.saturating_mul(SAMPLES_PER_PIXEL) {
+        let points = times
+            .iter()
+            .copied()
+            .zip(values.iter().copied())
+            .take(samples)
+            .filter(|(time, _)| time.is_finite() && *time >= min_time && *time <= max_time)
+            .collect();
+        return (points, Some(window));
+    }
+
+    let mut buckets: Vec<[Option<usize>; 5]> = vec![[None; 5]; pixels];
+    for (index, (&time, &value)) in times.iter().zip(values).enumerate() {
+        if !time.is_finite() || time < min_time || time > max_time {
+            continue;
+        }
+        let bucket =
+            (((time - min_time) / (max_time - min_time) * pixels as f64) as usize).min(pixels - 1);
+        let picks = &mut buckets[bucket];
+        if !value.is_finite() {
+            picks[4].get_or_insert(index);
+            continue;
+        }
+        picks[0].get_or_insert(index);
+        picks[3] = Some(index);
+        if picks[1].is_none_or(|min| value < values[min]) {
+            picks[1] = Some(index);
+        }
+        if picks[2].is_none_or(|max| value > values[max]) {
+            picks[2] = Some(index);
+        }
+    }
+    let mut indices = Vec::with_capacity(pixels.saturating_mul(5));
+    for picks in buckets {
+        indices.extend(picks.into_iter().flatten());
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    let points = indices
+        .into_iter()
+        .map(|index| (times[index], values[index]))
+        .collect();
+    (points, Some(window))
+}
+
 /// Convert ordered samples into drawable line segments, breaking at every
 /// sample with a non-finite coordinate so missing values remain visible gaps.
 fn segments(points: &[(f64, f64)]) -> impl Iterator<Item = [(f64, f64); 2]> + '_ {
@@ -142,8 +228,26 @@ fn segments(points: &[(f64, f64)]) -> impl Iterator<Item = [(f64, f64); 2]> + '_
 /// bucket reduction does not create artificial gaps. Consequently, holes
 /// narrower than two buckets are invisible at that width. Segment checks use
 /// the absolute timestamp delta, so out-of-order samples follow the same rule.
+#[cfg(test)]
 fn gap_threshold(times: &[f64], domain: [f64; 2], width: usize) -> Option<f64> {
-    let finite_count = times.iter().filter(|time| time.is_finite()).count();
+    gap_threshold_in(times, domain, width, None)
+}
+
+fn gap_threshold_in(
+    times: &[f64],
+    domain: [f64; 2],
+    width: usize,
+    window: Option<[f64; 2]>,
+) -> Option<f64> {
+    let window = window.filter(|[lo, hi]| lo.is_finite() && hi.is_finite() && lo < hi);
+    let start = times.len().saturating_sub(MAX_SAMPLES_PER_SERIES);
+    let times = &times[start..];
+    let finite_count = times
+        .iter()
+        .filter(|time| {
+            time.is_finite() && window.is_none_or(|[lo, hi]| **time >= lo && **time <= hi)
+        })
+        .count();
     if finite_count < 2 {
         return None;
     }
@@ -154,7 +258,12 @@ fn gap_threshold(times: &[f64], domain: [f64; 2], width: usize) -> Option<f64> {
     let mean_interval = span / (finite_count - 1) as f64;
     let mut threshold = GAP_FACTOR * mean_interval;
     let pixels = width.saturating_mul(2).max(1);
-    if times.len() > pixels.saturating_mul(SAMPLES_PER_PIXEL) {
+    let sample_count = if window.is_some() {
+        finite_count
+    } else {
+        times.len()
+    };
+    if sample_count > pixels.saturating_mul(SAMPLES_PER_PIXEL) {
         let bucket_width = span / pixels as f64;
         threshold = threshold.max(2.0 * bucket_width);
     }
@@ -177,6 +286,18 @@ impl TimeseriesRenderer {
         bounds: [f64; 4], // [x_min, x_max, y_min, y_max]
         width: usize,
     ) -> Canvas<'a, impl Fn(&mut ratatui::widgets::canvas::Context) + 'a> {
+        Self::render_in_window(frame, title, bounds, None, width)
+    }
+
+    /// Render a time series against an optional inclusive timestamp window.
+    /// Frames without a matching time field continue to use index bounds.
+    pub fn render_in_window<'a>(
+        frame: &'a Frame,
+        title: &str,
+        bounds: [f64; 4], // [x_min, x_max, y_min, y_max]
+        window: Option<[f64; 2]>,
+        width: usize,
+    ) -> Canvas<'a, impl Fn(&mut ratatui::widgets::canvas::Context) + 'a> {
         let y_field = frame.fields.iter().find(|f| f.ty == FieldType::Float64);
         let time_field = y_field.and_then(|y| {
             frame
@@ -186,12 +307,14 @@ impl TimeseriesRenderer {
         });
         let (points, x_bounds, gap) = match (time_field, y_field) {
             (Some(time), Some(y)) => {
-                let (points, domain) = plot_time_points(time.floats(), y.floats(), width);
+                let times = time.floats();
+                let times = &times[..times.len().min(y.floats().len())];
+                let (points, domain) = plot_time_points_in(times, y.floats(), width, window);
                 let x_bounds = domain.unwrap_or([bounds[0], bounds[1]]);
                 (
                     points,
                     x_bounds,
-                    gap_threshold(time.floats(), x_bounds, width),
+                    gap_threshold_in(times, x_bounds, width, window),
                 )
             }
             (_, Some(y)) => (plot_points(y.floats(), width), [bounds[0], bounds[1]], None),
@@ -310,6 +433,16 @@ mod tests {
     }
 
     #[test]
+    fn index_points_preserve_offset_after_sample_limit() {
+        let count = MAX_SAMPLES_PER_SERIES + 10;
+        let values = vec![1.0; count];
+        let points = plot_points(&values, 40);
+
+        assert!(points.iter().all(|&(x, _)| x >= 10.0));
+        assert_eq!(points.last().map(|&(x, _)| x), Some((count - 1) as f64));
+    }
+
+    #[test]
     fn time_points_use_timestamp_coordinates_and_domain() {
         let (points, domain) = plot_time_points(&[0.0, 1.0, 2.0, 100.0], &[2.0, 4.0, 3.0, 8.0], 20);
         assert_eq!(
@@ -317,6 +450,97 @@ mod tests {
             vec![(0.0, 2.0), (1.0, 4.0), (2.0, 3.0), (100.0, 8.0)]
         );
         assert_eq!(domain, Some([0.0, 100.0]));
+    }
+
+    #[test]
+    fn requested_window_excludes_outliers_and_sets_domain() {
+        let (points, domain) = plot_time_points_in(
+            &[0.0, 1.0, 2.0, 3.0, 10_000.0],
+            &[0.0; 5],
+            20,
+            Some([0.0, 4.0]),
+        );
+
+        assert_eq!(points, vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0)]);
+        assert_eq!(domain, Some([0.0, 4.0]));
+    }
+
+    #[test]
+    fn dense_requested_window_is_bounded_and_keeps_spike() {
+        let times: Vec<f64> = (0..10_000).map(f64::from).collect();
+        let mut values = vec![1.0; times.len()];
+        values[150] = 10_000.0;
+        let (points, domain) = plot_time_points_in(&times, &values, 10, Some([100.0, 200.0]));
+
+        assert!(points.len() <= 20 * 5);
+        assert!(
+            points
+                .iter()
+                .any(|&(time, value)| time == 150.0 && value == 10_000.0)
+        );
+        assert!(
+            points
+                .iter()
+                .all(|&(time, _)| (100.0..=200.0).contains(&time))
+        );
+        assert_eq!(domain, Some([100.0, 200.0]));
+    }
+
+    #[test]
+    fn empty_requested_window_keeps_window_domain() {
+        let (points, domain) =
+            plot_time_points_in(&[0.0, 1.0, 2.0], &[1.0; 3], 20, Some([5.0, 8.0]));
+
+        assert!(points.is_empty());
+        assert_eq!(domain, Some([5.0, 8.0]));
+    }
+
+    #[test]
+    fn invalid_requested_window_behaves_like_no_window() {
+        let times = [0.0, 1.0, 2.0];
+        let values = [1.0, 2.0, 3.0];
+        let unbounded = plot_time_points(&times, &values, 20);
+
+        assert_eq!(
+            plot_time_points_in(&times, &values, 20, Some([2.0, 2.0])),
+            unbounded
+        );
+        assert_eq!(
+            plot_time_points_in(&times, &values, 20, Some([f64::NAN, 2.0])),
+            unbounded
+        );
+    }
+
+    #[test]
+    fn requested_window_gap_threshold_ignores_outside_samples() {
+        let threshold = gap_threshold_in(
+            &[0.0, 1.0, 2.0, 3.0, 10_000.0],
+            [0.0, 3.0],
+            20,
+            Some([0.0, 3.0]),
+        );
+
+        assert_eq!(threshold, Some(3.0));
+    }
+
+    #[test]
+    fn no_window_gap_threshold_uses_all_samples_for_reduction_trigger() {
+        let mut times = vec![0.0, 1.0, 2.0, 3.0, 100.0];
+        times.extend(std::iter::repeat_n(f64::NAN, 20));
+
+        let threshold = gap_threshold_in(&times, [0.0, 100.0], 1, None);
+
+        assert_eq!(threshold, Some(100.0));
+    }
+
+    #[test]
+    fn per_series_sample_limit_omits_oldest_samples() {
+        let count = MAX_SAMPLES_PER_SERIES + 10;
+        let times: Vec<f64> = (0..count).map(|index| index as f64).collect();
+        let values = vec![1.0; count];
+        let (points, _) = plot_time_points(&times, &values, 20);
+
+        assert!(points.iter().all(|&(time, _)| time >= 10.0));
     }
 
     #[test]

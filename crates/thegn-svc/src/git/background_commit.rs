@@ -7,7 +7,7 @@
 //! not used for general Git writes: remote fetch/push operations must not
 //! inherit this local-commit deadline.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::io::{Read, Write};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -17,6 +17,7 @@ use super::GIT_SPAWNS;
 
 const MAX_CAPTURE_BYTES: u64 = 1024 * 1024;
 const MAX_STREAM_CAPTURE_BYTES: usize = (MAX_CAPTURE_BYTES / 2) as usize;
+const MAX_BACKGROUND_COMMIT_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_BACKGROUND_COMMIT_TIMEOUT: Duration = Duration::from_secs(3600);
 const CAPTURE_JOIN_GRACE: Duration = Duration::from_millis(500);
 
@@ -38,6 +39,89 @@ impl std::fmt::Display for BackgroundCommitTimeout {
 }
 
 impl std::error::Error for BackgroundCommitTimeout {}
+
+/// A typed failure from the bounded background commit runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackgroundCommitFailure {
+    MessageTooLarge {
+        len: usize,
+        limit: usize,
+    },
+    OutputTruncated {
+        command: String,
+        stream: &'static str,
+        limit: usize,
+    },
+    LockUnavailable {
+        lock_path: String,
+        error: String,
+    },
+    StdinWriterPanicked,
+    StdinWrite {
+        error: String,
+    },
+    CaptureCleanup {
+        stream: &'static str,
+        detail: &'static str,
+    },
+    Spawn {
+        command: String,
+        error: String,
+    },
+    Wait {
+        operation: &'static str,
+        error: String,
+    },
+    Exited {
+        command: String,
+        detail: String,
+        truncated: bool,
+    },
+}
+
+impl std::fmt::Display for BackgroundCommitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MessageTooLarge { len, limit } => write!(
+                f,
+                "background git commit message is {len} bytes, exceeding the {limit} byte limit"
+            ),
+            Self::OutputTruncated {
+                command,
+                stream,
+                limit,
+            } => write!(
+                f,
+                "git {command} {stream} exceeded its {limit} byte capture limit"
+            ),
+            Self::LockUnavailable { lock_path, error } => {
+                write!(f, "git mutation lock `{lock_path}` is unavailable: {error}")
+            }
+            Self::StdinWriterPanicked => f.write_str("background git stdin writer panicked"),
+            Self::StdinWrite { error } => {
+                write!(f, "write background git commit message: {error}")
+            }
+            Self::CaptureCleanup { stream, detail } => {
+                write!(f, "background git {stream} reader {detail}")
+            }
+            Self::Spawn { command, error } => write!(f, "git {command}: {error}"),
+            Self::Wait { operation, error } => write!(f, "{operation}: {error}"),
+            Self::Exited {
+                command,
+                detail,
+                truncated,
+            } => {
+                write!(f, "git {command} failed: {}", bounded_error_detail(detail))?;
+                if *truncated {
+                    f.write_str("\n[output truncated]")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for BackgroundCommitFailure {}
 
 const BACKGROUND_COMMIT_TIMEOUT_ENV: &str = "THEGN_BACKGROUND_COMMIT_TIMEOUT_SECS";
 
@@ -74,9 +158,27 @@ pub(crate) fn run_with_timeout(
     stdin: &[u8],
     timeout: Duration,
 ) -> Result<String> {
-    let _lock = (!loc.is_remote())
-        .then(|| thegn_core::util::lock_git_mutations(std::path::Path::new(&loc.path())))
-        .flatten();
+    if stdin.len() > MAX_BACKGROUND_COMMIT_MESSAGE_BYTES {
+        return Err(BackgroundCommitFailure::MessageTooLarge {
+            len: stdin.len(),
+            limit: MAX_BACKGROUND_COMMIT_MESSAGE_BYTES,
+        }
+        .into());
+    }
+    let _lock = if loc.is_remote() {
+        None
+    } else {
+        let worktree = std::path::Path::new(&loc.path()).to_path_buf();
+        let lock_path = thegn_core::util::git_common_dir(&worktree).join("thegn-git.lock");
+        Some(
+            thegn_core::util::try_lock_git_mutations(&worktree).map_err(|error| {
+                BackgroundCommitFailure::LockUnavailable {
+                    lock_path: lock_path.display().to_string(),
+                    error: error.to_string(),
+                }
+            })?,
+        )
+    };
     let mut env: Vec<(&str, &str)> = vec![
         ("GIT_TERMINAL_PROMPT", "0"),
         ("GIT_ASKPASS", ""),
@@ -102,7 +204,10 @@ pub(crate) fn run_with_timeout(
     GIT_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("git {}", args.join(" ")))?;
+        .map_err(|error| BackgroundCommitFailure::Spawn {
+            command: args.join(" "),
+            error: error.to_string(),
+        })?;
     let pid = child.id();
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
@@ -134,7 +239,7 @@ pub(crate) fn run_with_timeout(
         kill_process_tree(pid);
         kill_and_reap(&mut child);
         collect_captures_best_effort(stdout_rx, stderr_rx);
-        anyhow::bail!("background git stdin writer panicked");
+        return Err(BackgroundCommitFailure::StdinWriterPanicked.into());
     }
     let mut backoff = Duration::from_millis(1);
     loop {
@@ -148,14 +253,22 @@ pub(crate) fn run_with_timeout(
                     kill_process_tree(pid);
                     kill_and_reap(&mut child);
                     collect_captures_best_effort(stdout_rx, stderr_rx);
-                    return Err(error).context("wait for background git commit");
+                    return Err(BackgroundCommitFailure::Wait {
+                        operation: "wait for background git commit",
+                        error: error.to_string(),
+                    }
+                    .into());
                 }
             },
             Err(error) => {
                 kill_process_tree(pid);
                 kill_and_reap(&mut child);
                 collect_captures_best_effort(stdout_rx, stderr_rx);
-                return Err(error).context("observe background git commit exit");
+                return Err(BackgroundCommitFailure::Wait {
+                    operation: "observe background git commit exit",
+                    error: error.to_string(),
+                }
+                .into());
             }
         };
         if exited {
@@ -181,15 +294,19 @@ pub(crate) fn run_with_timeout(
         .unwrap_or_else(Instant::now);
     let stdout_result = collect_capture(stdout_rx, "stdout", capture_deadline);
     let stderr_result = collect_capture(stderr_rx, "stderr", capture_deadline);
-    let status = status.context("reap background git commit")?;
+    let status = status.map_err(|error| BackgroundCommitFailure::Wait {
+        operation: "reap background git commit",
+        error: error.to_string(),
+    })?;
     let (stdout, stdout_truncated) = stdout_result?;
     let (stderr, stderr_truncated) = stderr_result?;
     if stdout_truncated && status.success() {
-        anyhow::bail!(
-            "git {} stdout exceeded its {} byte capture limit",
-            args.join(" "),
-            MAX_STREAM_CAPTURE_BYTES
-        );
+        return Err(BackgroundCommitFailure::OutputTruncated {
+            command: args.join(" "),
+            stream: "stdout",
+            limit: MAX_STREAM_CAPTURE_BYTES,
+        }
+        .into());
     }
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr);
@@ -201,26 +318,24 @@ pub(crate) fn run_with_timeout(
             (error, output) => format!("{error}\n{output}"),
         };
         let truncated = stdout_truncated || stderr_truncated;
-        let suffix = if truncated {
-            "\n[output truncated]"
-        } else {
-            ""
-        };
-        anyhow::bail!(
-            "git {} failed: {}{}",
-            args.join(" "),
-            bounded_error_detail(&detail),
-            suffix
-        );
+        return Err(BackgroundCommitFailure::Exited {
+            command: args.join(" "),
+            detail,
+            truncated,
+        }
+        .into());
     }
     if stderr_truncated {
-        anyhow::bail!(
-            "git {} stderr exceeded its {} byte capture limit",
-            args.join(" "),
-            MAX_STREAM_CAPTURE_BYTES
-        );
+        return Err(BackgroundCommitFailure::OutputTruncated {
+            command: args.join(" "),
+            stream: "stderr",
+            limit: MAX_STREAM_CAPTURE_BYTES,
+        }
+        .into());
     }
-    input_result.context("write background git commit message")?;
+    input_result.map_err(|error| BackgroundCommitFailure::StdinWrite {
+        error: error.to_string(),
+    })?;
     Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 
@@ -272,10 +387,18 @@ fn collect_capture(
     match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(capture) => Ok(capture),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            anyhow::bail!("background git {name} reader exceeded its cleanup grace")
+            Err(BackgroundCommitFailure::CaptureCleanup {
+                stream: if name == "stdout" { "stdout" } else { "stderr" },
+                detail: "exceeded its cleanup grace",
+            }
+            .into())
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            anyhow::bail!("background git {name} reader stopped without a capture")
+            Err(BackgroundCommitFailure::CaptureCleanup {
+                stream: if name == "stdout" { "stdout" } else { "stderr" },
+                detail: "stopped without a capture",
+            }
+            .into())
         }
     }
 }
@@ -352,8 +475,9 @@ fn kill_process_tree(_pid: u32) {}
 #[cfg(all(test, unix))]
 mod unix_tests {
     use super::{
-        BackgroundCommitTimeout, MAX_BACKGROUND_COMMIT_TIMEOUT, collect_capture,
-        parse_background_commit_timeout, run_with_timeout,
+        BackgroundCommitFailure, BackgroundCommitTimeout, MAX_BACKGROUND_COMMIT_MESSAGE_BYTES,
+        MAX_BACKGROUND_COMMIT_TIMEOUT, collect_capture, parse_background_commit_timeout,
+        run_with_timeout,
     };
     use crate::git::testutil::{TestRepo, git_in};
     use std::os::unix::fs::PermissionsExt;
@@ -363,6 +487,36 @@ mod unix_tests {
         git_in(dir, &["config", "user.name", "t"]);
         git_in(dir, &["config", "user.email", "t@e"]);
         git_in(dir, &["config", "commit.gpgsign", "false"]);
+    }
+
+    #[test]
+    fn io_failures_include_the_underlying_cause_in_display() {
+        let failures = [
+            (
+                BackgroundCommitFailure::Spawn {
+                    command: "commit-tree".to_string(),
+                    error: "No such file or directory (os error 2)".to_string(),
+                },
+                "git commit-tree: No such file or directory (os error 2)",
+            ),
+            (
+                BackgroundCommitFailure::Wait {
+                    operation: "wait for background git commit",
+                    error: "wait failed".to_string(),
+                },
+                "wait for background git commit: wait failed",
+            ),
+            (
+                BackgroundCommitFailure::StdinWrite {
+                    error: "Broken pipe (os error 32)".to_string(),
+                },
+                "write background git commit message: Broken pipe (os error 32)",
+            ),
+        ];
+
+        for (failure, expected) in failures {
+            assert_eq!(failure.to_string(), expected);
+        }
     }
 
     #[test]
@@ -414,6 +568,68 @@ mod unix_tests {
         )
         .expect("a large configured timeout is clamped before spawn");
         assert_eq!(repo.out(&["cat-file", "-t", sha.trim()]), "commit");
+    }
+
+    #[test]
+    fn oversized_message_is_refused_before_commit_creation() {
+        let repo = TestRepo::new("plumb-oversized-message");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c0");
+        let loc = repo.loc();
+        let head = repo.head();
+        let tree = repo.out(&["rev-parse", "HEAD^{tree}"]);
+        let message = vec![b'x'; MAX_BACKGROUND_COMMIT_MESSAGE_BYTES + 1];
+
+        let error = run_with_timeout(
+            &loc,
+            &[],
+            &["commit-tree", &tree, "-p", &head],
+            &message,
+            std::time::Duration::from_secs(2),
+        )
+        .expect_err("oversized commit messages must be rejected before spawning git");
+
+        assert!(
+            matches!(
+                error.downcast_ref::<BackgroundCommitFailure>(),
+                Some(BackgroundCommitFailure::MessageTooLarge { len, limit })
+                    if *len == MAX_BACKGROUND_COMMIT_MESSAGE_BYTES + 1
+                        && *limit == MAX_BACKGROUND_COMMIT_MESSAGE_BYTES
+            ),
+            "message limit must be a typed failure: {error:#}"
+        );
+        assert_eq!(repo.head(), head);
+    }
+
+    #[test]
+    fn lock_failure_fails_closed_without_committing() {
+        let repo = TestRepo::new("plumb-lock-failure");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c0");
+        let loc = repo.loc();
+        let head = repo.head();
+        std::fs::create_dir(repo.dir.join(".git/thegn-git.lock")).unwrap();
+        std::fs::write(repo.dir.join("staged.txt"), "staged\n").unwrap();
+        git_in(&repo.dir, &["add", "staged.txt"]);
+
+        let error = run_with_timeout(
+            &loc,
+            &[],
+            &["commit", "-F", "-"],
+            b"must remain staged\n",
+            std::time::Duration::from_secs(2),
+        )
+        .expect_err("a required local mutation lock failure must stop the commit");
+
+        assert!(
+            matches!(
+                error.downcast_ref::<BackgroundCommitFailure>(),
+                Some(BackgroundCommitFailure::LockUnavailable { .. })
+            ),
+            "lock failure must be typed: {error:#}"
+        );
+        assert_eq!(repo.head(), head);
+        assert_eq!(repo.out(&["diff", "--cached", "--name-only"]), "staged.txt");
     }
 
     #[test]
@@ -601,6 +817,16 @@ mod unix_tests {
             std::time::Duration::from_secs(5),
         )
         .expect_err("the hook fails after writing oversized stderr");
+        assert!(
+            matches!(
+                error.downcast_ref::<BackgroundCommitFailure>(),
+                Some(BackgroundCommitFailure::Exited {
+                    truncated: true,
+                    ..
+                })
+            ),
+            "the nonzero hook exit and its truncation must be typed: {error:#}"
+        );
         assert!(
             error.to_string().len() <= 1024 * 1024,
             "error was {} bytes",

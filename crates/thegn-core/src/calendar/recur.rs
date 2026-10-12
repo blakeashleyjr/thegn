@@ -198,18 +198,118 @@ impl Recurrence {
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty() && self.rdates.is_empty()
     }
+
+    /// Render this recurrence set as iCalendar properties, preserving each
+    /// value's DATE, floating, TZID, or UTC form. Values that cannot be
+    /// represented without loss make the whole result unavailable.
+    pub fn to_ics_properties(&self) -> Option<Vec<String>> {
+        fn format_datetime(local: NaiveDateTime) -> Option<String> {
+            (local.nanosecond() == 0).then(|| local.format("%Y%m%dT%H%M%S").to_string())
+        }
+
+        fn format_value(value: &EventTime, name: &str) -> Option<String> {
+            Some(match value {
+                EventTime::Date { date } => {
+                    format!("{name};VALUE=DATE:{}", date.format("%Y%m%d"))
+                }
+                EventTime::Instant { at } => {
+                    let local = at.naive_utc();
+                    format!("{name}:{}Z", format_datetime(local)?)
+                }
+                EventTime::Zoned { local, zone } => {
+                    let local = format_datetime(*local)?;
+                    let zone = zone.as_str();
+                    if zone.trim().is_empty() {
+                        format!("{name}:{local}")
+                    } else {
+                        if zone.contains('"') || zone.chars().any(|ch| ch.is_ascii_control()) {
+                            return None;
+                        }
+                        let parameter = if zone.contains([':', ';', ',']) {
+                            format!("\"{zone}\"")
+                        } else {
+                            zone.to_string()
+                        };
+                        format!("{name};TZID={parameter}:{local}")
+                    }
+                }
+            })
+        }
+
+        let mut properties = Vec::new();
+        properties.extend(
+            self.rules
+                .iter()
+                .map(|rule| format!("RRULE:{}", rule.to_rrule())),
+        );
+        for value in &self.rdates {
+            properties.push(format_value(value, "RDATE")?);
+        }
+        for value in &self.exdates {
+            properties.push(format_value(value, "EXDATE")?);
+        }
+        Some(properties)
+    }
 }
 
-/// Reject recurrence values that cannot be represented in the DTSTART frame
-/// without silently changing their meaning during local-time expansion.
-pub(crate) fn check_values(rec: &Recurrence, start: &EventTime) -> Result<(), ExpansionError> {
-    for date in &rec.rdates {
-        match (start, date) {
-            (EventTime::Date { .. }, EventTime::Zoned { .. } | EventTime::Instant { .. })
-            | (EventTime::Zoned { .. } | EventTime::Instant { .. }, EventTime::Date { .. }) => {
-                return Err(ExpansionError::InvalidSpan);
-            }
-            _ => {}
+/// Which recurrence-set property contains a value that cannot be represented
+/// in the DTSTART frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecurProperty {
+    Rdate,
+    Exdate,
+}
+
+/// Why an RDATE or EXDATE is incompatible with the series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecurValueDefect {
+    ShapeMismatch,
+    UnknownZone,
+}
+
+/// A value-free recurrence-set validation diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecurValueError {
+    pub property: RecurProperty,
+    pub index: usize,
+    pub defect: RecurValueDefect,
+}
+
+impl std::fmt::Display for RecurValueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let property = match self.property {
+            RecurProperty::Rdate => "RDATE",
+            RecurProperty::Exdate => "EXDATE",
+        };
+        let defect = match self.defect {
+            RecurValueDefect::ShapeMismatch => "incompatible value shape",
+            RecurValueDefect::UnknownZone => "unknown time zone",
+        };
+        write!(f, "{property} value {}: {defect}", self.index + 1)
+    }
+}
+
+impl std::error::Error for RecurValueError {}
+
+/// Diagnose incompatible recurrence values without including the value or
+/// zone name, which may contain user supplied feed data.
+pub fn diagnose_values(rec: &Recurrence, start: &EventTime) -> Result<(), RecurValueError> {
+    for (index, value) in rec.rdates.iter().enumerate() {
+        if matches!(
+            (start, value),
+            (
+                EventTime::Date { .. },
+                EventTime::Zoned { .. } | EventTime::Instant { .. }
+            ) | (
+                EventTime::Zoned { .. } | EventTime::Instant { .. },
+                EventTime::Date { .. }
+            )
+        ) {
+            return Err(RecurValueError {
+                property: RecurProperty::Rdate,
+                index,
+                defect: RecurValueDefect::ShapeMismatch,
+            });
         }
     }
 
@@ -217,15 +317,41 @@ pub(crate) fn check_values(rec: &Recurrence, start: &EventTime) -> Result<(), Ex
         EventTime::Zoned { zone, .. } => Some(zone),
         EventTime::Date { .. } | EventTime::Instant { .. } => None,
     };
-    for value in rec.rdates.iter().chain(&rec.exdates) {
-        if let EventTime::Zoned { zone, .. } = value
-            && zone.resolve().is_none()
-            && start_zone != Some(zone)
-        {
-            return Err(ExpansionError::InvalidSpan);
+    for (property, values) in [
+        (RecurProperty::Rdate, rec.rdates.as_slice()),
+        (RecurProperty::Exdate, rec.exdates.as_slice()),
+    ] {
+        for (index, value) in values.iter().enumerate() {
+            if let EventTime::Zoned { zone, .. } = value
+                && zone.as_str().trim().is_empty()
+                && matches!(start, EventTime::Date { .. })
+            {
+                return Err(RecurValueError {
+                    property,
+                    index,
+                    defect: RecurValueDefect::ShapeMismatch,
+                });
+            }
+            if let EventTime::Zoned { zone, .. } = value
+                && !zone.as_str().trim().is_empty()
+                && zone.resolve().is_none()
+                && start_zone != Some(zone)
+            {
+                return Err(RecurValueError {
+                    property,
+                    index,
+                    defect: RecurValueDefect::UnknownZone,
+                });
+            }
         }
     }
     Ok(())
+}
+
+/// Reject recurrence values that cannot be represented in the DTSTART frame
+/// without silently changing their meaning during local-time expansion.
+pub(crate) fn check_values(rec: &Recurrence, start: &EventTime) -> Result<(), ExpansionError> {
+    diagnose_values(rec, start).map_err(|_| ExpansionError::InvalidSpan)
 }
 
 fn weekday(s: &str) -> Option<Weekday> {

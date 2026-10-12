@@ -41,7 +41,9 @@ pub trait AppTile {
     fn pump(&mut self) -> bool;
 
     /// Whether the tile needs a redraw. The host re-runs [`render`] only when
-    /// this is `true`; otherwise it re-blits the cached buffer.
+    /// this is `true`; otherwise it re-blits the cached buffer. The standalone
+    /// harness honours this contract; the thegn host does not yet use the
+    /// redraw signal or cached buffer.
     ///
     /// [`render`]: AppTile::render
     fn wants_redraw(&self) -> bool;
@@ -64,7 +66,9 @@ pub trait AppTile {
         None
     }
 
-    /// Focus gained/lost. Default: ignore.
+    /// Focus gained/lost. The thegn host currently calls this alongside
+    /// [`on_visible`](AppTile::on_visible) when the active app tab changes.
+    /// Default: ignore.
     fn on_focus(&mut self, _focused: bool) {}
 
     /// The tile became the visible app tab (`true`) or was hidden behind
@@ -81,6 +85,9 @@ pub trait AppTile {
     fn on_resize(&mut self, _cols: u16, _rows: u16) {}
 
     /// Tear down: abort spawned tasks and drop clients. Long-lived external
-    /// daemons an app may talk to are intentionally NOT killed here.
+    /// daemons an app may talk to are intentionally NOT killed here. The thegn
+    /// host calls this once when a running slot is dropped, including removal
+    /// on disable or reload and host exit. `on_resize` and the redraw buffer
+    /// cache are not yet driven by the thegn host.
     fn shutdown(&mut self) {}
 }

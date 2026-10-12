@@ -1368,6 +1368,9 @@ fn test_identify_orphans_empty_inputs() {
 
 #[test]
 fn test_run_gc_noop_when_no_backend_available() {
+    let state = tempfile::tempdir().unwrap();
+    let state_home = state.path().to_string_lossy().into_owned();
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[("XDG_STATE_HOME", Some(&state_home))]);
     // run_gc with an empty DB set and no containers should return empty
     // without panicking (even if podman/docker aren't installed).
     let removed = run_gc(&["/wt/alive".to_string()]);
@@ -1762,6 +1765,7 @@ fn systemd_local_secrets_go_to_environment_file_not_argv() {
         ("THEGN_SANDBOX".into(), "1".into()),   // synthetic
     ];
     let argv = backend_enter_argv(&s, "exec true");
+    let argv_again = backend_enter_argv(&s, "exec true");
     let j = argv.join(" ");
     assert!(
         !j.contains("sk_secret"),
@@ -1774,6 +1778,21 @@ fn systemd_local_secrets_go_to_environment_file_not_argv() {
         .find(|a| a.starts_with("EnvironmentFile="))
         .expect("EnvironmentFile property");
     let path = std::path::PathBuf::from(ef.trim_start_matches("EnvironmentFile="));
+    let ef_again = argv_again
+        .iter()
+        .find(|a| a.starts_with("EnvironmentFile="))
+        .expect("second EnvironmentFile property");
+    let path_again = std::path::PathBuf::from(ef_again.trim_start_matches("EnvironmentFile="));
+    assert_ne!(path, path_again, "systemd launches need isolated env-files");
+    let rm = crate::util::which_path("rm").expect("rm on PATH for cleanup assertion");
+    let cleanup = format!("ExecStopPost=-+{rm} -f -- {}", path.display());
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == "-p" && pair[1] == cleanup)
+    );
+    assert!(!argv.windows(2).any(|pair| {
+        pair[0] == "-p" && pair[1].starts_with("ExecStopPost=") && pair[1] != cleanup
+    }));
     let body = std::fs::read_to_string(&path).unwrap();
     assert!(body.contains("API_KEY=sk_secret"));
     // Synthetic pair stays on --setenv.
@@ -1783,6 +1802,101 @@ fn systemd_local_secrets_go_to_environment_file_not_argv() {
     );
     let _ = std::fs::remove_file(&path); // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&state); // best-effort test cleanup
+}
+
+#[test]
+fn systemd_cleanup_property_rejects_systemd_expansion_and_quoting_chars() {
+    let path = std::path::Path::new("/state/thegn/sandbox-env/name-1.env");
+    assert_eq!(
+        systemd_env_cleanup_prop("/nix/store/coreutils/bin/rm", path).as_deref(),
+        Some(
+            "ExecStopPost=-+/nix/store/coreutils/bin/rm -f -- /state/thegn/sandbox-env/name-1.env"
+        )
+    );
+    for unsafe_value in [
+        "/bin/rm x",
+        "/bin/rm%f",
+        "/bin/rm$HOME",
+        "/bin/rm;true",
+        "/bin/rm\\x",
+        "/bin/rm\"x",
+        "/bin/rm'x",
+    ] {
+        assert!(systemd_env_cleanup_prop(unsafe_value, path).is_none());
+    }
+    assert!(systemd_env_cleanup_prop("bin/rm", path).is_none());
+    assert!(systemd_env_cleanup_prop("/bin/rm", std::path::Path::new("state/name.env")).is_none());
+    assert!(systemd_env_cleanup_prop("/bin/rm", std::path::Path::new("/state/a b.env")).is_none());
+}
+
+#[test]
+fn stale_env_file_sweep_removes_only_old_env_entries_without_following_links() {
+    use std::time::{Duration, SystemTime};
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("sandbox-env");
+    std::fs::create_dir(&dir).unwrap();
+    let old = dir.join("old.env");
+    let fresh = dir.join("fresh.env");
+    let other = dir.join("keep.txt");
+    let nested = dir.join("x.env");
+    std::fs::write(&old, b"old").unwrap();
+    std::fs::write(&fresh, b"fresh").unwrap();
+    std::fs::write(&other, b"other").unwrap();
+    std::fs::create_dir(&nested).unwrap();
+    let now = SystemTime::now();
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(now - Duration::from_secs(120))
+        .unwrap();
+    assert_eq!(
+        sweep_stale_env_files_in(&dir, now, Duration::from_secs(60)),
+        1
+    );
+    assert!(!old.exists());
+    assert!(fresh.exists());
+    assert!(other.exists());
+    assert!(nested.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_env_file_sweep_unlinks_symlink_but_preserves_target() {
+    use std::os::unix::fs::symlink;
+    use std::time::{Duration, SystemTime};
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("sandbox-env");
+    std::fs::create_dir(&dir).unwrap();
+    let victim = parent.path().join("victim");
+    let link = dir.join("hostile.env");
+    std::fs::write(&victim, b"canary").unwrap();
+    symlink(&victim, &link).unwrap();
+    assert_eq!(
+        sweep_stale_env_files_in(&dir, SystemTime::now(), Duration::from_secs(1)),
+        1
+    );
+    assert!(!link.exists());
+    assert_eq!(std::fs::read(victim).unwrap(), b"canary");
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_env_file_sweep_does_not_traverse_symlinked_directory() {
+    use std::os::unix::fs::symlink;
+    use std::time::{Duration, SystemTime};
+    let parent = tempfile::tempdir().unwrap();
+    let outside = parent.path().join("outside");
+    let link = parent.path().join("sandbox-env");
+    std::fs::create_dir(&outside).unwrap();
+    let old = outside.join("old.env");
+    std::fs::write(&old, b"keep").unwrap();
+    symlink(&outside, &link).unwrap();
+    assert_eq!(
+        sweep_stale_env_files_in(&link, SystemTime::now(), Duration::ZERO),
+        0
+    );
+    assert!(old.exists());
 }
 
 #[test]
@@ -1930,6 +2044,42 @@ fn stderr_with_timeout_stdin_kills_and_reaps_on_timeout() {
             .is_none(),
         "a command exceeding its deadline returns None"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn stderr_with_timeout_stdin_deadline_kills_descendant_holding_stdin() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let pid_file = dir.path().join("stdin-descendant-pid");
+    let script = format!(
+        "exec 3<&0; sleep 30 & echo $! > '{}'; exit 0",
+        pid_file.display()
+    );
+    let argv = vec!["sh".into(), "-c".into(), script];
+    let started = Instant::now();
+    let (success, _) =
+        stderr_with_timeout_stdin(&argv, Duration::from_millis(300), vec![b'x'; 1024 * 1024])
+            .expect("leader exit and captured stderr are returned after bounded feeder wait");
+
+    assert!(!success, "stdin left in a descendant makes delivery fail");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let pid: i32 = std::fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "stdin-holding descendant {pid} survived"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
