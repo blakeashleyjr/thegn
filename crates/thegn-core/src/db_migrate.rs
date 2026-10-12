@@ -1158,6 +1158,25 @@ pub(crate) fn verify_v73_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v74: one automatic CI retry reservation per PR head. The reservation is
+/// durable before contacting the forge, so restart or an ambiguous provider
+/// error cannot spend it again. `ci_rerun_head` is cleared only when the
+/// observed `last_head_oid` changes.
+pub(crate) fn migrate_v74(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "pr_queue", "ci_rerun_head") {
+        conn.execute("ALTER TABLE pr_queue ADD COLUMN ci_rerun_head TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// Verify the v74 retry reservation column before the version stamp.
+pub(crate) fn verify_v74_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "pr_queue", "ci_rerun_head") {
+        bail!("schema v74 migration did not add pr_queue.ci_rerun_head");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -1698,6 +1717,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stamp(&conn), Some(5), "an explicit stamp wins");
+    }
+
+    #[test]
+    fn v74_adds_ci_rerun_reservation_idempotently_and_preserves_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pr_queue (
+                 key TEXT PRIMARY KEY, last_head_oid TEXT, status TEXT NOT NULL);
+             INSERT INTO pr_queue(key,last_head_oid,status)
+                 VALUES ('/repo#7','head-a','watching');",
+        )
+        .unwrap();
+        assert!(super::verify_v74_schema(&conn).is_err());
+        super::migrate_v74(&conn).unwrap();
+        super::migrate_v74(&conn).unwrap();
+        super::verify_v74_schema(&conn).unwrap();
+        let (head, status, rerun): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT last_head_oid,status,ci_rerun_head FROM pr_queue WHERE key='/repo#7'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (head.as_str(), status.as_str(), rerun),
+            ("head-a", "watching", None)
+        );
     }
 
     #[test]

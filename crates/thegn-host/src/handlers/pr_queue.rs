@@ -800,6 +800,7 @@ mod tests {
             blocker: None,
             detail: None,
             agent_attempts: 0,
+            ci_rerun_head: None,
             last_head_oid: None,
             queued_at: 0,
             updated_at: 0,

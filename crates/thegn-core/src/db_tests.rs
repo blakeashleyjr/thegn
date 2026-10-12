@@ -894,6 +894,56 @@ fn merge_queue_enqueue_update_list_and_remove() {
 }
 
 #[test]
+fn pr_ci_rerun_reservation_is_atomic_and_head_changes_rearm_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pr-rerun.db");
+    {
+        let db = Db::open_at(&path).unwrap();
+        db.enqueue_pr("/repo", 7, None, "feat", "main", "github")
+            .unwrap();
+    }
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let db = Db::open_at(&path).unwrap();
+                barrier.wait();
+                db.reserve_pr_ci_rerun("/repo#7", None, "head-a").unwrap()
+            })
+        })
+        .collect();
+    let reservations = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .filter(|reserved| *reserved)
+        .count();
+    assert_eq!(
+        reservations, 1,
+        "only one concurrent worker reserves the head"
+    );
+
+    let db = Db::open_at(&path).unwrap();
+    assert!(
+        !db.reserve_pr_ci_rerun("/repo#7", Some("head-a"), "head-a")
+            .unwrap()
+    );
+    db.update_pr_status("/repo#7", "blocked_ci", None, None, Some("head-b"))
+        .unwrap();
+    let row = db.list_pr_queue().unwrap().remove(0);
+    assert_eq!(
+        row.ci_rerun_head, None,
+        "observing a new head clears the old reservation"
+    );
+    assert!(
+        db.reserve_pr_ci_rerun("/repo#7", Some("head-b"), "head-b")
+            .unwrap()
+    );
+}
+
+#[test]
 fn pr_queue_enqueue_update_list_and_remove() {
     let db = db();
     assert!(db.list_pr_queue().unwrap().is_empty());
