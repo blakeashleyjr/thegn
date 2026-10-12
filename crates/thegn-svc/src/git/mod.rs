@@ -2032,10 +2032,10 @@ impl GitBackend for CliGit {
         if let Some(branch) = branch {
             // Best-effort: the branch may still be checked out elsewhere.
             // A dash-named branch is refused by the validator, not reinterpreted.
-            if let Ok(b) = op::branch_name(&branch) {
-                if let Err(error) = run_root(root, &["branch", "-D", b]) {
-                    tracing::debug!(target: "thegn::git", %error, "branch delete after worktree removal failed");
-                }
+            if let Ok(b) = op::branch_name(&branch)
+                && let Err(error) = run_root(root, &["branch", "-D", b])
+            {
+                tracing::debug!(target: "thegn::git", %error, "branch delete after worktree removal failed");
             }
         }
         Ok(())
