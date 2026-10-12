@@ -177,6 +177,11 @@ impl CiFlight {
         if different_key {
             running.cancel.store(true, Ordering::Relaxed);
         }
+        if let Some(queued) = self.queued.as_ref()
+            && queued.key != request.key
+        {
+            queued.cancel.store(true, Ordering::Relaxed);
+        }
         let force = self
             .queued
             .as_ref()
