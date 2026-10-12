@@ -6772,8 +6772,8 @@ async fn event_loop<T: Terminal>(
     let mut hover_inflight = false;
     let hover_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let (logs_tx, mut logs_rx) =
-        tokio_mpsc::unbounded_channel::<Vec<thegn_core::log::parser::ParsedLog>>();
+    // Bounded drop-oldest ingress; overload is shown as a gap in the Logs panel.
+    let logs_ingress = thegn_svc::log::ingress::LogIngress::new();
 
     let mut hover_popup: Option<crate::hover::HoverPopup> = None;
     // A bar-item detail popup/modal (CPU history graph, notifications list, …),
@@ -8238,7 +8238,7 @@ async fn event_loop<T: Terminal>(
         let log_w = waker.clone();
         thegn_svc::log::provider::LogProvider::start_stream(
             &p,
-            logs_tx.clone(),
+            logs_ingress.clone(),
             std::sync::Arc::new(move || {
                 let _ = log_w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }),
@@ -12807,23 +12807,25 @@ async fn event_loop<T: Terminal>(
         }
 
         // -- 23. Log streams
-        while let Ok(batch) = logs_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Other);
-            model.panel.log_lines_structured.extend(batch);
-            if model.panel.log_lines_structured.len() > 1000 {
-                let overflow = model.panel.log_lines_structured.len() - 1000;
-                model.panel.log_lines_structured.drain(0..overflow);
+        let log_backlog = {
+            let slice = logs_ingress.take(crate::loop_policy::log_apply_budget(
+                !pending_input.is_empty(),
+            ));
+            if !slice.is_empty() {
+                loop_perf.tick(crate::perf::WakeSource::Other);
+                model.panel.log_lines_structured.extend(slice);
+                let retain = crate::loop_policy::LOG_RETAIN;
+                if model.panel.log_lines_structured.len() > retain {
+                    let overflow = model.panel.log_lines_structured.len() - retain;
+                    model.panel.log_lines_structured.drain(0..overflow);
+                }
+                // Avoid the render -> own-log -> tail -> render feedback loop.
+                if want_panel && panel_ui.open == crate::panel::Section::Logs {
+                    dirty = true;
+                }
             }
-            // Only repaint when the Logs section is actually on screen. thegn
-            // tails its OWN thegn.log; under a verbose `THEGN_LOG` every
-            // rendered frame writes a log line, so an unconditional repaint here
-            // would feed the tailer → dirty → render → another log line → a
-            // ~10Hz full-frame feedback loop (0%-idle regression). Lines still
-            // accumulate into the model so they're present when the panel opens.
-            if want_panel && panel_ui.open == crate::panel::Section::Logs {
-                dirty = true;
-            }
-        }
+            logs_ingress.has_pending()
+        };
 
         // Ingress-share state from the supervisor threads: persist the row,
         // update the supervisor, and re-sync the model so the badge + Share
@@ -14170,7 +14172,7 @@ async fn event_loop<T: Terminal>(
             defer_timeout,
             dirty,
             !pending_input.is_empty(),
-            budget_exhausted,
+            budget_exhausted || log_backlog,
         );
         let polled = match pending_input.pop_front() {
             Some(ev) => Ok(Some(ev)),

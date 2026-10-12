@@ -41,6 +41,14 @@ pub fn drain_budget(input_pending: bool) -> DrainBudget {
     }
 }
 
+/// Display rows retained for the Logs panel.
+pub const LOG_RETAIN: usize = 1000;
+
+/// Log records applied per host iteration; input pending gets a smaller slice.
+pub fn log_apply_budget(input_pending: bool) -> usize {
+    if input_pending { 32 } else { 256 }
+}
+
 /// Stash high-water: stop receiving from the PTY channel once this many bytes
 /// are stashed unparsed. The bounded(256) channel then fills, reader threads
 /// block on `blocking_send`, and ultimately the child blocks writing its PTY —
@@ -133,6 +141,13 @@ pub fn frame_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_application_budget_is_bounded_and_yields_to_input() {
+        assert!(log_apply_budget(true) < log_apply_budget(false));
+        assert!(log_apply_budget(false) <= LOG_RETAIN);
+        assert!(log_apply_budget(true) > 0);
+    }
 
     #[test]
     fn input_pending_shrinks_the_budget() {
