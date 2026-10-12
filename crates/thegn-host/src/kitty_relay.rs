@@ -36,8 +36,10 @@
 //! to the emulator (so its cursor tracks mpv's home); APC-`G` commands are pulled
 //! out, validated, and rebuilt for the outer terminal. A DISPLAY command
 //! (`a=T`/`a=p`) is prefixed with an absolute CUP to the corner origin ([`cup`])
-//! and receives cell dimensions bounded by the content rect. Delete/continuation
-//! APCs are also rebuilt with quiet mode. A query (`a=q`) is answered locally
+//! and receives cell dimensions bounded by the content rect. Continuation APCs
+//! are buffered into their transfer, then one ordered unit is emitted at `m=0`
+//! with a single CUP. Delete APCs are rebuilt with quiet mode. An orphan `Gm=`
+//! is rejected until a fresh `a=T` or `a=d`. A query (`a=q`) is answered locally
 //! and never forwarded (forwarding it would make the OUTER terminal reply to us).
 //!
 //! The child acknowledgement contract is deliberately limited to local `a=q`
@@ -58,7 +60,7 @@ pub enum Piece {
     /// An APC-`G` command that DISPLAYS (`a=T` / `a=p`): the caller prefixes a
     /// [`cup`] to the corner before forwarding to the outer terminal.
     GfxDisplay(Vec<u8>),
-    /// Any other accepted APC-`G` (for example delete or transmit-only): no CUP.
+    /// Any other accepted APC-`G` (for example delete): no CUP.
     GfxOther(Vec<u8>),
     /// An APC-`G` query (`a=q`): write this reply back to the pane; never forward.
     GfxAnswer(Vec<u8>),
@@ -119,7 +121,6 @@ pub struct KittyRelay {
 struct Transfer {
     bytes: Vec<u8>,
     chunks: usize,
-    display: bool,
 }
 
 impl KittyRelay {
@@ -241,30 +242,12 @@ impl KittyRelay {
                 let mut transfer = Transfer {
                     bytes: Vec::new(),
                     chunks: 1,
-                    display: true,
                 };
                 if append_transfer(&mut transfer, bytes) {
                     self.transfer = Some(transfer);
                 } else {
                     emit(Piece::Rejected);
                 }
-            }
-            Piece::GfxOther(bytes) if is_multi_transmit(&bytes) => {
-                self.transfer = None;
-                let mut transfer = Transfer {
-                    bytes: Vec::new(),
-                    chunks: 1,
-                    display: false,
-                };
-                if append_transfer(&mut transfer, bytes) {
-                    self.transfer = Some(transfer);
-                } else {
-                    emit(Piece::Rejected);
-                }
-            }
-            Piece::GfxOther(bytes) if is_transmit(&bytes) => {
-                self.transfer = None;
-                emit(Piece::GfxOther(bytes));
             }
             Piece::GfxOther(bytes) if is_continuation(&bytes) => {
                 let final_chunk = has_multi(&bytes, b"0");
@@ -279,11 +262,7 @@ impl KittyRelay {
                 }
                 if final_chunk {
                     if valid_transfer(&transfer.bytes) {
-                        emit(if transfer.display {
-                            Piece::GfxDisplay(transfer.bytes)
-                        } else {
-                            Piece::GfxOther(transfer.bytes)
-                        });
+                        emit(Piece::GfxDisplay(transfer.bytes));
                     } else {
                         emit(Piece::Rejected);
                     }
@@ -328,9 +307,6 @@ fn classify(seq: Vec<u8>, content_size: (usize, usize)) -> Piece {
     let ctrl = &body[1..ctrl_end];
     let payload = if ctrl_end < body.len() {
         let payload_start = ctrl_end + 3;
-        if payload_start > seq.len() - 2 {
-            return Piece::Rejected;
-        }
         &seq[payload_start..seq.len() - 2]
     } else {
         &[]
@@ -374,20 +350,8 @@ fn is_multi_transmit(seq: &[u8]) -> bool {
     control_and_payload(seq)
         .and_then(|(ctrl, _)| Control::parse(ctrl))
         .is_some_and(|control| {
-            control
-                .get(b"a")
-                .is_some_and(|action| action == b"T" || action == b"t")
+            control.get(b"a").is_some_and(|action| action == b"T")
                 && control.get(b"m") == Some(b"1".as_slice())
-        })
-}
-
-fn is_transmit(seq: &[u8]) -> bool {
-    control_and_payload(seq)
-        .and_then(|(ctrl, _)| Control::parse(ctrl))
-        .is_some_and(|control| {
-            control
-                .get(b"a")
-                .is_some_and(|action| action == b"T" || action == b"t")
         })
 }
 
@@ -590,7 +554,7 @@ fn canonical_graphics(
         if !valid_base64_alphabet(payload) {
             return None;
         }
-    } else if !matches!(action, b"T" | b"t" | b"p" | b"d") {
+    } else if !matches!(action, b"T" | b"p" | b"d") {
         return None;
     }
     if action == b"d" {
@@ -657,7 +621,7 @@ fn canonical_graphics(
         {
             return None;
         }
-    } else if matches!(action, b"T" | b"t") {
+    } else if action == b"T" {
         let format = get(b"f")?;
         let width = parse_positive(get(b"s")?)?;
         let height = parse_positive(get(b"v")?)?;
@@ -984,6 +948,20 @@ mod tests {
     }
 
     #[test]
+    fn near_apc_cap_single_chunk_is_classified() {
+        let mut sequence = b"\x1b_Ga=T,f=24,s=1,v=1;".to_vec();
+        sequence.resize(MAX_APC_BYTES - 4, b'A');
+        sequence.extend_from_slice(ST);
+        assert_eq!(sequence.len(), MAX_APC_BYTES - 2);
+
+        let mut relay = KittyRelay::new();
+        assert_eq!(relay.feed(&sequence), [Piece::Rejected]);
+        assert_eq!(relay.scanned, sequence.len());
+        assert!(relay.partial.is_empty());
+        assert!(matches!(relay.state, ScanState::Text));
+    }
+
+    #[test]
     fn oversized_apc_discards_through_split_st_then_recovers() {
         for graphics in [true, false] {
             let mut relay = KittyRelay::new();
@@ -1107,22 +1085,18 @@ mod tests {
     }
 
     #[test]
-    fn explicit_transmit_only_is_a_fresh_boundary_without_corner_placement() {
+    fn explicit_transmit_only_is_rejected_and_its_continuations_are_orphans() {
         let mut relay = KittyRelay::new();
         assert_eq!(relay.feed(&apc("Gm=0;AQID")), [Piece::Rejected]);
         assert_eq!(
             relay.feed(&apc("Ga=t,f=24,s=1,v=1;AQID")),
-            [Piece::GfxOther(apc("Ga=t,f=24,s=1,v=1,q=2;AQID"))]
+            [Piece::Rejected]
         );
-        assert!(relay.feed(&apc("Ga=t,m=1,f=24,s=1,v=1;AQ")).is_empty());
         assert_eq!(
-            relay.feed(&apc("Gm=0;ID")),
-            [Piece::GfxOther({
-                let mut unit = apc("Ga=t,m=1,f=24,s=1,v=1,q=2;AQ");
-                unit.extend(apc("Gm=0,q=2;ID"));
-                unit
-            })]
+            relay.feed(&apc("Ga=t,m=1,f=24,s=1,v=1;AQ")),
+            [Piece::Rejected]
         );
+        assert_eq!(relay.feed(&apc("Gm=0;ID")), [Piece::Rejected]);
     }
 
     #[test]
@@ -1321,7 +1295,12 @@ mod tests {
         }
         assert!(pieces.is_empty(), "an unfinished transfer is retained");
         relay.feed_with_rect(&apc("Gm=0;ID"), (8, 5), |piece| pieces.push(piece));
-        assert!(matches!(&pieces[..], [Piece::GfxDisplay(bytes)] if bytes.ends_with(b";AQ\x1b\\")));
+        assert!(matches!(
+            &pieces[..],
+            [Piece::GfxDisplay(bytes)]
+                if bytes.starts_with(b"\x1b_Ga=T,m=1,f=24,s=1,v=1,q=2,C=1,z=-1,c=8,r=5;AQ\x1b\\")
+                    && bytes.ends_with(b"\x1b_Gm=0,q=2;ID\x1b\\")
+        ));
         assert_eq!(
             relayed("Ga=T,m=1,f=24,s=1,v=1;AQ?", (8, 5)),
             [Piece::Rejected]
