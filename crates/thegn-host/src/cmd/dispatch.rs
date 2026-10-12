@@ -161,11 +161,12 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
-    /// Advance one dispatch's status. Marking a row `done` is gated: when the
+    /// Advance one dispatch's status through the checked transition table.
+    /// Marking a row `done` is gated: when the
     /// row carries an artifact, it must exist and be committed and unchanged
     /// in `HEAD` (a session exiting is not a handoff — see `dispatch verify`).
-    /// `failed`/`abandoned`/`merged` are never gated: recording a bad outcome
-    /// must always be possible.
+    /// `failed`/`abandoned`/`merged` are gated only by the transition table;
+    /// recording a legal bad outcome must always be possible.
     SetStatus {
         /// The dispatch row id (see `dispatch list`).
         id: i64,
@@ -1124,27 +1125,46 @@ fn set_status(id: i64, status: &str, force: bool, why: Option<&str>, json: bool)
         );
     }
     let db = Db::open()?;
+    set_status_on(&db, id, parsed, force, why, json)
+}
+
+fn set_status_on(
+    db: &Db,
+    id: i64,
+    parsed: AgentDispatchStatus,
+    force: bool,
+    why: Option<&str>,
+    json: bool,
+) -> Result<()> {
     let row = db
         .get_dispatch(id)?
         .ok_or_else(|| anyhow::anyhow!("no dispatch with id {id}"))?;
-    // Only `done` is gated, and only for rows that carry an artifact — see
-    // `done_gate`. Every other status stays unconditional: a supervisor must
-    // always be able to record a bad outcome. This comment is the rule a
-    // future edit will erode; keep it.
+    if !thegn_core::db::set_status_transition_allowed(row.status, parsed) {
+        return Err(anyhow::Error::new(
+            thegn_core::db::DispatchTransitionConflict::Illegal {
+                id,
+                from: row.status,
+                to: parsed,
+            },
+        ));
+    }
+    // Only `done` has artifact evidence requirements, and `--force` overrides
+    // that gate. The typed transition check below still applies when forced.
     if parsed == AgentDispatchStatus::Done && !force {
-        done_gate_bound(&db, &row)?;
+        done_gate_bound(db, &row)?;
     }
     // A supplied reason is primary audit data, not cache context: commit it
     // atomically with the status so the command cannot claim success after
     // silently losing the explanation.
     if let Some(w) = why.map(str::trim).filter(|w| !w.is_empty()) {
-        db.update_dispatch_status_with_note(
+        db.set_dispatch_status_checked(
             id,
+            row.status,
             parsed,
-            &format!("set-status {}: {w}", parsed.as_str()),
+            Some(&format!("set-status {}: {w}", parsed.as_str())),
         )?;
     } else {
-        db.update_dispatch_status(id, parsed)?;
+        db.set_dispatch_status_checked(id, row.status, parsed, None)?;
     }
     let unexplained = wants_a_reason(
         parsed,
@@ -2210,6 +2230,47 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_at(&dir.path().join(format!("{name}.db"))).unwrap();
         (dir, db)
+    }
+
+    #[test]
+    fn set_status_refuses_resurrecting_a_done_row() {
+        let (_dir, db) = db("set-status-terminal");
+        let id = db
+            .put_agent_dispatch(NewDispatch::new("linear:THE-242", "/wt/done", "claude"))
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Done)
+            .unwrap();
+
+        let err =
+            set_status_on(&db, id, AgentDispatchStatus::Running, false, None, true).unwrap_err();
+        assert!(err.to_string().contains("done to running"));
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Done
+        );
+    }
+
+    #[test]
+    fn set_status_reports_illegal_transition_before_done_artifact_gate() {
+        let (_dir, db) = db("set-status-illegal-before-gate");
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                artifact_path: Some("missing-handoff.md"),
+                ..NewDispatch::new("linear:THE-242", "/wt/merged", "claude")
+            })
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Merged)
+            .unwrap();
+
+        let err = set_status_on(&db, id, AgentDispatchStatus::Done, false, None, true).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<thegn_core::db::DispatchTransitionConflict>(),
+            Some(thegn_core::db::DispatchTransitionConflict::Illegal {
+                from: AgentDispatchStatus::Merged,
+                to: AgentDispatchStatus::Done,
+                ..
+            })
+        ));
     }
 
     #[test]

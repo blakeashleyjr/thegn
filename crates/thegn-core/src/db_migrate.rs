@@ -1293,6 +1293,93 @@ pub(crate) fn verify_v78_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v79: normalize statuses the typed parser already treats as canonical and
+/// index active admission plus issue/worktree history lookups.
+pub(crate) fn migrate_v79(conn: &Connection) -> Result<()> {
+    // Rust's status parser trims Unicode whitespace, while SQLite's trim()
+    // only removes ASCII spaces. Keep the migration aligned with that parser.
+    let rows = {
+        let mut stmt =
+            conn.prepare("SELECT id, status, status_changed_at_ms FROM agent_dispatches")?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.v79_dispatch_status_stamps;
+         CREATE TEMP TABLE v79_dispatch_status_stamps (
+             id INTEGER PRIMARY KEY,
+             status_changed_at_ms INTEGER
+         );",
+    )?;
+    for (id, status, status_changed_at_ms) in rows {
+        let parsed = crate::issue::AgentDispatchStatus::parse(&status);
+        if parsed != crate::issue::AgentDispatchStatus::Unknown && status != parsed.as_str() {
+            conn.execute(
+                "INSERT INTO temp.v79_dispatch_status_stamps (id, status_changed_at_ms)
+                 VALUES (?1, ?2)",
+                params![id, status_changed_at_ms],
+            )?;
+            conn.execute(
+                "UPDATE agent_dispatches SET status=?1 WHERE id=?2",
+                params![parsed.as_str(), id],
+            )?;
+        }
+    }
+    conn.execute(
+        "UPDATE agent_dispatches
+            SET status_changed_at_ms=(
+                SELECT status_changed_at_ms FROM temp.v79_dispatch_status_stamps
+                 WHERE v79_dispatch_status_stamps.id=agent_dispatches.id
+            )
+          WHERE id IN (SELECT id FROM temp.v79_dispatch_status_stamps)",
+        [],
+    )?;
+    conn.execute_batch("DROP TABLE temp.v79_dispatch_status_stamps;")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_agent_dispatches_status
+             ON agent_dispatches(status);
+         CREATE INDEX IF NOT EXISTS idx_agent_dispatches_issue_worktree
+             ON agent_dispatches(issue_id, worktree_path);",
+    )?;
+    Ok(())
+}
+
+/// Verify the v79 indexes used by compact dispatch admission projections.
+pub(crate) fn verify_v79_schema(conn: &Connection) -> Result<()> {
+    for (index_name, expected_columns) in [
+        ("idx_agent_dispatches_status", vec!["status"]),
+        (
+            "idx_agent_dispatches_issue_worktree",
+            vec!["issue_id", "worktree_path"],
+        ),
+    ] {
+        let table: Option<String> = conn
+            .query_row(
+                "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?1",
+                [index_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if table.as_deref() != Some("agent_dispatches") {
+            bail!("schema v79 migration did not add {index_name} to agent_dispatches");
+        }
+        let mut stmt = conn.prepare(&format!("PRAGMA index_info('{index_name}')"))?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(2))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if columns.iter().map(String::as_str).collect::<Vec<_>>() != expected_columns {
+            bail!("schema v79 index {index_name} has unexpected columns");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -2038,6 +2125,78 @@ mod tests {
             conn.execute_batch(table_sql).unwrap();
             conn.execute_batch(index_sql).unwrap();
             assert!(super::verify_v78_schema(&conn).is_err());
+        }
+    }
+
+    #[test]
+    fn v79_trims_statuses_and_creates_admission_indexes_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_dispatches (
+                 id INTEGER PRIMARY KEY, issue_id TEXT NOT NULL,
+                 worktree_path TEXT NOT NULL, status TEXT NOT NULL,
+                 status_changed_at_ms INTEGER);
+             INSERT INTO agent_dispatches VALUES
+                 (1, 'linear:THE-259', '/wt/a', ' running ', 1234),
+                 (2, 'linear:THE-259', '/wt/b', char(9)||'running'||char(10), 5678);",
+        )
+        .unwrap();
+        super::migrate_v73(&conn).unwrap();
+        conn.execute(
+            "UPDATE agent_dispatches SET status_changed_at_ms=1234 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE agent_dispatches SET status_changed_at_ms=5678 WHERE id=2",
+            [],
+        )
+        .unwrap();
+        assert!(super::verify_v79_schema(&conn).is_err());
+        super::migrate_v79(&conn).unwrap();
+        super::migrate_v79(&conn).unwrap();
+        super::verify_v79_schema(&conn).unwrap();
+        let (status, stamp): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT status, status_changed_at_ms FROM agent_dispatches WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "running");
+        assert_eq!(stamp, Some(1234));
+        let (unicode_status, unicode_stamp): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT status, status_changed_at_ms FROM agent_dispatches WHERE id=2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(unicode_status, "running");
+        assert_eq!(unicode_stamp, Some(5678));
+    }
+
+    #[test]
+    fn v79_verification_rejects_same_named_indexes_on_wrong_table_or_columns() {
+        for (tables_sql, indexes_sql) in [
+            (
+                "CREATE TABLE agent_dispatches (status TEXT, issue_id TEXT, worktree_path TEXT);
+                 CREATE TABLE other (status TEXT);",
+                "CREATE INDEX idx_agent_dispatches_status ON other(status);
+                 CREATE INDEX idx_agent_dispatches_issue_worktree
+                     ON agent_dispatches(issue_id, worktree_path);",
+            ),
+            (
+                "CREATE TABLE agent_dispatches (status TEXT, issue_id TEXT, worktree_path TEXT);",
+                "CREATE INDEX idx_agent_dispatches_status ON agent_dispatches(status);
+                 CREATE INDEX idx_agent_dispatches_issue_worktree
+                     ON agent_dispatches(worktree_path, issue_id);",
+            ),
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(tables_sql).unwrap();
+            conn.execute_batch(indexes_sql).unwrap();
+            assert!(super::verify_v79_schema(&conn).is_err());
         }
     }
 
