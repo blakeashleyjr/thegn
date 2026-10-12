@@ -1989,12 +1989,35 @@ fn bwrap_resolver_bind_is_covered_for_nested_user_mounts() {
 
 #[test]
 fn bwrap_network_none_argv_has_no_resolver_bind() {
-    let mut s = spec(Backend::Bwrap);
-    s.network = Network::None;
-    let argv = enter_argv(&s, "true").unwrap();
+    let resolver_dir = std::path::Path::new("/run/systemd/resolve");
+    let resolver_dirs = [
+        "/run/systemd/resolve",
+        "/run/NetworkManager",
+        "/run/resolvconf",
+        "/run/connman",
+    ];
+    let contains_resolver_dir = |argv: &[String]| {
+        argv.iter().any(|arg| {
+            resolver_dirs
+                .iter()
+                .any(|dir| arg.as_str() == *dir || arg.starts_with(*dir))
+        })
+    };
+
+    let mut nat = spec(Backend::Bwrap);
+    nat.network = Network::Nat;
+    let nat_argv = backend_enter_argv_with_resolver_dir(&nat, "true", Some(resolver_dir));
     assert!(
-        argv.windows(3)
-            .all(|w| { !(w[0] == "--ro-bind" && w[1].starts_with("/run/") && w[1] == w[2]) }),
+        nat_argv
+            .windows(3)
+            .any(|w| { w[0] == "--ro-bind" && w[1] == "/run/systemd/resolve" && w[2] == w[1] })
+    );
+
+    let mut none = spec(Backend::Bwrap);
+    none.network = Network::None;
+    let argv = backend_enter_argv_with_resolver_dir(&none, "true", Some(resolver_dir));
+    assert!(
+        !contains_resolver_dir(&argv),
         "unexpected resolver bind in argv: {}",
         argv.join(" ")
     );
@@ -2074,10 +2097,8 @@ fn systemd_launch_refuses_mount_paths_systemd_would_misparse() {
         ro: false,
         cache: false,
     });
-    assert!(matches!(
-        enter_argv(&sealed, "true"),
-        Err(EnterError::Refused(_))
-    ));
+    let refusal = systemd_mount_props(&sealed).unwrap_err();
+    assert!(refusal.contains("/host/My Code/repo"), "{refusal}");
 
     // The default writable carve-outs are encoded by the same checked path
     // property builder, including a HOME that systemd would split/expand.

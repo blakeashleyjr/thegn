@@ -647,7 +647,11 @@ pub fn sealed_view(spec: &SandboxSpec) -> std::borrow::Cow<'_, SandboxSpec> {
     let ok = |m: &Mount| {
         let keep = crate::sandbox_mounts::sealed_mount_still_ok(m, home);
         if !keep && !crate::sandbox_mounts::is_builtin_agent_carve(&m.host) {
-            warn_dropped_mount_once(&m.host, &m.host);
+            warn_dropped_mount_once(
+                &m.host,
+                &m.host,
+                "sealed profile mount reaches a protected $HOME path",
+            );
         }
         keep
     };
@@ -902,10 +906,9 @@ pub fn resolve_placed_exact(
     resolve_placed_with(cfg, loc, name, profile, placement, Fallthrough::Exact)
 }
 
-/// Warn (once per path per process) about a USER-authored `[sandbox] mounts` entry
-/// a sealed launch drops. The built-in defaults (`~/.gnupg:rw` …) are always
-/// dropped and would warn on every resolve; `thegn doctor` lists those.
-fn warn_dropped_mount_once(raw: &str, host: &str) {
+/// Warn once per path when a USER-authored `[sandbox] mounts` entry is dropped.
+/// Built-in defaults (`~/.gnupg:rw` …) are listed by `thegn doctor` instead.
+fn warn_dropped_mount_once(raw: &str, host: &str, reason: &str) {
     use std::sync::{Mutex, OnceLock};
     if SandboxConfig::default().mounts.iter().any(|d| d == raw) {
         return;
@@ -920,7 +923,8 @@ fn warn_dropped_mount_once(raw: &str, host: &str) {
         tracing::warn!(
             target: "thegn::sandbox",
             path = %host,
-            "sealed profile: dropping [sandbox] mounts entry that reaches a protected $HOME path"
+            reason = %reason,
+            "dropping [sandbox] mounts entry"
         );
     }
 }
@@ -1121,7 +1125,11 @@ fn resolve_placed_with(
             && !home.is_empty()
             && crate::sandbox_mounts::sealed_denies_mount(&parsed, std::path::Path::new(home))
         {
-            warn_dropped_mount_once(m, &parsed.host);
+            warn_dropped_mount_once(
+                m,
+                &parsed.host,
+                "sealed profile mount reaches a protected $HOME path",
+            );
             continue;
         }
         // Skip mounts whose source doesn't exist — silently, since config
@@ -2379,7 +2387,6 @@ fn systemd_mount_props_with_carveouts(
 ) -> Result<Vec<String>, String> {
     let mut props = Vec::new();
     if spec.read_only_root {
-        let sealed_home = spec.seal_home.is_some();
         let under_home = |dest: &str| {
             spec.seal_home
                 .as_deref()
@@ -2432,6 +2439,16 @@ fn bwrap_mount_covered(mount: &Mount, hardcoded_parents: &[&str]) -> bool {
 
 /// The backend-specific argv that runs `/bin/sh -lc <script>` in the sandbox.
 fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
+    backend_enter_argv_with_resolver_dir(spec, script, None)
+}
+
+/// Build backend argv with an optional injected resolver directory for tests.
+/// Production callers leave it unset and use the host resolver probe.
+fn backend_enter_argv_with_resolver_dir(
+    spec: &SandboxSpec,
+    script: &str,
+    resolved_resolver_dir: Option<&std::path::Path>,
+) -> Vec<String> {
     let wt = spec.worktree.to_string_lossy().into_owned();
     // Keyed on the backend *family* (one arm per way of driving a sandbox),
     // so a new OCI runtime is a profile row, not a new arm here.
@@ -2512,7 +2529,10 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             let resolver_dir = if spec.placement.is_local()
                 && !matches!(spec.file_access, FileAccess::All | FileAccess::Host)
             {
-                bwrap_resolver_bind(spec, &hardcoded_parents)
+                match resolved_resolver_dir {
+                    Some(dir) => resolver_bind_filter(spec, &hardcoded_parents, dir),
+                    None => bwrap_resolver_bind(spec, &hardcoded_parents),
+                }
             } else {
                 None
             };
@@ -2527,6 +2547,16 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                 // cannot create a mount-point inside a read-only bind.
                 let covered = bwrap_mount_covered(m, &hardcoded_parents);
                 if covered {
+                    if resolver_dir
+                        .as_deref()
+                        .is_some_and(|dir| std::path::Path::new(&m.dest).starts_with(dir))
+                    {
+                        warn_dropped_mount_once(
+                            &m.host,
+                            &m.dest,
+                            "bwrap resolver bind covers the mount destination",
+                        );
+                    }
                     continue;
                 }
                 // Also skip exact duplicates of already-hardcoded paths.
