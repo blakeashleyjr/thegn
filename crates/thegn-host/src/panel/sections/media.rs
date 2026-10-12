@@ -2,7 +2,7 @@
 //! data: provider work, queue reads, and cover-art decoding remain in the
 //! off-loop media tasks.
 
-use thegn_core::media::{MediaRenderPolicy, MediaState, MediaWidth};
+use thegn_core::media::{MediaRenderPolicy, MediaState, MediaWidth, display_text};
 use thegn_core::theme::Hue;
 
 use crate::seg::{Line, seg};
@@ -52,7 +52,7 @@ fn detail_rows(
     if !state.album.is_empty() {
         rows.push(PanelRow::plain(Line::segs(vec![seg(
             d(),
-            state.album.clone(),
+            display_text(&state.album),
         )])));
     }
     if let (Some(pos), Some(len)) = (state.position, state.length)
@@ -131,7 +131,7 @@ pub(super) fn content(ctx: &SectionCtx<'_>) -> Vec<PanelRow> {
                         },
                         format!("{} ", crate::caps::active_glyphs().dot_filled),
                     ),
-                    seg(t(), source.clone()),
+                    seg(t(), display_text(source)),
                 ]))
                 .with_hit(PanelHit::Row(Section::Media, i)),
             );
