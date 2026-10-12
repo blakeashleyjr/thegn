@@ -1725,7 +1725,7 @@ fn collect_sidebar_status(
     };
     // Cache lock now protects only map lookups and cloning. Suspended remote
     // paths with no row remain absent instead of being fabricated clean.
-    let (to_scan, mut reused, prior_for_scan) = {
+    let (to_scan, reused, prior_for_scan) = {
         let cache = glyph_cache().lock().unwrap();
         partition_glyph_paths(
             &paths,
