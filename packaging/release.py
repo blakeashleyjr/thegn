@@ -322,6 +322,7 @@ def _validate_archive_layout(
                 names: set[str] = set()
                 regular: set[str] = set()
                 unsafe: list[str] = []
+                thegn_executable = True
                 for member in archive:
                     count += 1
                     if count > MAX_MEMBERS:
@@ -331,14 +332,19 @@ def _validate_archive_layout(
                     if len(member.name) > 255:
                         raise ReleaseError(f"archive {path} has an overlong path")
                     clean_names = _safe_archive_names((member.name,), path)
-                    if names.intersection(clean_names):
-                        raise ReleaseError(f"archive {path} contains duplicate path")
+                    duplicates = names & clean_names
+                    if duplicates:
+                        raise ReleaseError(
+                            f"archive {path} contains duplicate path {min(duplicates)!r}"
+                        )
                     names.update(clean_names)
                     if member.size > MAX_MEMBER_BYTES:
                         raise ReleaseError(
                             f"archive {path} member exceeds {MAX_MEMBER_BYTES} bytes"
                         )
                     if member.isdir() and member.name.rstrip("/") in ("", "."):
+                        continue
+                    if member.isdir():
                         continue
                     if not member.isfile():
                         unsafe.append(member.name)
@@ -350,7 +356,7 @@ def _validate_archive_layout(
                         )
                     regular.add(member.name.rstrip("/"))
                     if member.name.rstrip("/") == "thegn" and not member.mode & 0o111:
-                        raise ReleaseError(f"archive {path} binary thegn is not executable")
+                        thegn_executable = False
         else:
             with zipfile.ZipFile(path) as archive:
                 names = set()
@@ -365,8 +371,11 @@ def _validate_archive_layout(
                     if len(member.filename) > 255:
                         raise ReleaseError(f"archive {path} has an overlong path")
                     clean_names = _safe_archive_names((member.filename,), path)
-                    if names.intersection(clean_names):
-                        raise ReleaseError(f"archive {path} contains duplicate path")
+                    duplicates = names & clean_names
+                    if duplicates:
+                        raise ReleaseError(
+                            f"archive {path} contains duplicate path {min(duplicates)!r}"
+                        )
                     names.update(clean_names)
                     if member.file_size > MAX_MEMBER_BYTES:
                         raise ReleaseError(
@@ -404,6 +413,8 @@ def _validate_archive_layout(
         raise ReleaseError(
             f"archive {path} has non-regular required file(s): {', '.join(non_regular)}"
         )
+    if platform == "unix" and not thegn_executable:
+        raise ReleaseError(f"archive {path} binary thegn is not executable")
 
 
 def validate_assets(

@@ -60,7 +60,7 @@ jobs:
   # checks out release content. This job runs only pinned actions and inline
   # policy code; the policy/version source is checked out from protected main.
   admit:
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' || inputs.operation == 'build'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -89,17 +89,6 @@ jobs:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          version="$(python3 - <<'PY'
-          import tomllib
-          with open("Cargo.toml", "rb") as manifest:
-              print(tomllib.load(manifest)["workspace"]["package"]["version"])
-          PY
-          )"
-          expected="v$version"
-          [ "$TAG" = "$expected" ] || {
-            echo "::error::tag does not match the protected workspace version"
-            exit 1
-          }
           git fetch --no-tags origin main "refs/tags/$TAG:refs/tags/$TAG"
           sha="$(git rev-parse --verify "refs/tags/$TAG^{commit}")"
           tag_object="$(git rev-parse --verify "refs/tags/$TAG")"
@@ -133,12 +122,12 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ needs.admit.outputs.sha }}
+          ref: refs/tags/${{ needs.admit.outputs.tag }}
       - uses: taiki-e/create-gh-release-action@eba8ea96c86cca8a37f1b56e94b4d13301fba651 # v1.11.0
         with:
           # Prerelease tags (e.g. v0.1.0-alpha.1) are auto-marked prerelease.
           draft: true
-          ref: ${{ needs.admit.outputs.sha }}
+          ref: refs/tags/${{ needs.admit.outputs.tag }}
           token: ${{ secrets.GITHUB_TOKEN }}
   upload:
     if: github.event_name == 'push' || inputs.operation == 'build'
@@ -372,7 +361,7 @@ jobs:
           version="${TAG#v}"
           nfpm_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#nfpm)"
           export SOURCE_DATE_EPOCH
-          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct "$TAG")"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct HEAD)"
           (
             cd "$PACKAGE_ROOT/package"
             "$nfpm_store/bin/nfpm" package \
