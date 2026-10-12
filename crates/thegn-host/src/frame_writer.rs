@@ -69,7 +69,6 @@ struct Q {
     msgs: VecDeque<Msg>,
     /// Failed OOB/clipboard writes remain charged until replay or abandonment.
     deferred: VecDeque<DeferredWrite>,
-    frame_submitted: bool,
     /// How many `Msg::Frame`s are queued (the 2-deep bound).
     frames_queued: usize,
     clipboard_queued: usize,
@@ -94,6 +93,9 @@ struct DeferredWrite {
 
 struct Inner {
     q: Mutex<Q>,
+    /// Termwiz paints frames directly, so its OOB writes have no worker frame
+    /// boundary to wait for before being dropped after failure.
+    worker_frames: bool,
     cv: Condvar,
     done_cv: Condvar,
     metrics_deferrals: AtomicU64,
@@ -133,9 +135,10 @@ impl FrameWriter {
     /// Spawn the owned writer thread.
     /// `waker` pulses the loop when the status changes so an error is acted
     /// on promptly even while idle.
-    pub(crate) fn spawn(waker: TerminalWaker, sync: bool) -> Self {
+    pub(crate) fn spawn(waker: TerminalWaker, sync: bool, worker_frames: bool) -> Self {
         Self::spawn_with(
             sync,
+            worker_frames,
             move |reason| wake_loop(&waker, reason),
             write_and_flush,
         )
@@ -143,6 +146,7 @@ impl FrameWriter {
 
     fn spawn_with(
         sync: bool,
+        worker_frames: bool,
         wake: impl Fn(&'static str) + Send + 'static,
         sink: impl FnMut(&[u8]) -> std::io::Result<()> + Send + 'static,
     ) -> Self {
@@ -150,7 +154,6 @@ impl FrameWriter {
             q: Mutex::new(Q {
                 msgs: VecDeque::new(),
                 deferred: VecDeque::new(),
-                frame_submitted: false,
                 frames_queued: 0,
                 clipboard_queued: 0,
                 clipboard_bytes: 0,
@@ -165,6 +168,7 @@ impl FrameWriter {
                 completed_seq: 0,
                 metrics: WriterMetrics::default(),
             }),
+            worker_frames,
             cv: Condvar::new(),
             done_cv: Condvar::new(),
             metrics_deferrals: AtomicU64::new(0),
@@ -218,7 +222,6 @@ impl FrameWriter {
         }
         q.submitted_seq = q.submitted_seq.saturating_add(1);
         let target = q.submitted_seq;
-        q.frame_submitted = true;
         q.frames_queued += 1;
         q.msgs.push_back(Msg::Frame(bytes, stamp, target));
         drop(q);
@@ -617,7 +620,8 @@ fn write_message(
     };
     {
         let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
-        if result.is_err() && q.frame_submitted && matches!(&msg, Msg::Oob(_) | Msg::Clipboard(_)) {
+        if result.is_err() && inner.worker_frames && matches!(&msg, Msg::Oob(_) | Msg::Clipboard(_))
+        {
             let defer_after = q.submitted_seq;
             q.deferred.push_back(DeferredWrite { msg, defer_after });
         } else {
@@ -780,7 +784,6 @@ mod tests {
         Q {
             msgs: VecDeque::new(),
             deferred: VecDeque::new(),
-            frame_submitted: false,
             frames_queued: 0,
             clipboard_queued: 0,
             clipboard_bytes: 0,
@@ -801,6 +804,7 @@ mod tests {
         FrameWriter {
             inner: Arc::new(Inner {
                 q: Mutex::new(q()),
+                worker_frames: true,
                 cv: Condvar::new(),
                 done_cv: Condvar::new(),
                 metrics_deferrals: AtomicU64::new(0),
@@ -819,6 +823,7 @@ mod tests {
         finished: Option<std::sync::mpsc::Sender<()>>,
     ) -> FrameWriter {
         FrameWriter::spawn_with(
+            true,
             true,
             |_| {},
             move |bytes| {
@@ -850,7 +855,7 @@ mod tests {
     #[test]
     fn sync_mode_preserves_frame_oob_clipboard_order_and_returns_after_completion() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let writer = FrameWriter::spawn_with(true, |_| {}, {
+        let writer = FrameWriter::spawn_with(true, true, |_| {}, {
             let log = Arc::clone(&log);
             move |bytes| {
                 log.lock().unwrap().push(bytes.to_vec());
@@ -887,6 +892,7 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let sink_log = Arc::clone(&log);
         let writer = Arc::new(FrameWriter::spawn_with(
+            true,
             true,
             |_| {},
             move |bytes| {
@@ -1211,7 +1217,6 @@ mod tests {
     #[test]
     fn repeated_deferred_replay_failure_becomes_fatal_and_abandon_releases_capacity() {
         let writer = test_writer();
-        writer.inner.q.lock().unwrap().frame_submitted = true;
         assert!(writer.try_submit_oob(vec![b'A']).is_ok());
         let oob = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
         assert!(
@@ -1235,7 +1240,7 @@ mod tests {
             assert!(writer.submit_frame(vec![b'F'], None));
             let frame = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
             let (errored, _, _) = write_message(&writer.inner, frame, |bytes| {
-                if bytes == [b'A'] || bytes == [b'C'] {
+                if bytes == *b"A" || bytes == *b"C" {
                     Err(std::io::ErrorKind::Interrupted.into())
                 } else {
                     Ok(())
@@ -1258,7 +1263,7 @@ mod tests {
 
     #[test]
     fn termwiz_parity_drops_failed_oob_without_a_worker_frame() {
-        let writer = test_writer();
+        let writer = FrameWriter::spawn_with(false, false, |_| {}, |_| Ok(()));
         assert!(writer.try_submit_oob(vec![b'A']).is_ok());
         let oob = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
         assert!(
@@ -1277,6 +1282,7 @@ mod tests {
     fn normal_shutdown_releases_deferred_write_reservations() {
         let writer = FrameWriter::spawn_with(
             false,
+            true,
             |_| {},
             |_| Err(std::io::ErrorKind::Interrupted.into()),
         );
@@ -1316,6 +1322,7 @@ mod tests {
         let sink_log = Arc::clone(&log);
         let writer = Arc::new(FrameWriter::spawn_with(
             true,
+            true,
             |_| {},
             move |bytes| {
                 if bytes == PARSER_RESET {
@@ -1342,8 +1349,7 @@ mod tests {
     #[test]
     fn fatal_during_first_replay_abandons_remaining_oob_and_releases_capacity() {
         let writer = test_writer();
-        writer.inner.q.lock().unwrap().frame_submitted = true;
-        for byte in [b'A', b'B'] {
+        for byte in *b"AB" {
             assert!(writer.try_submit_oob(vec![byte]).is_ok());
             let oob = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
             assert!(
@@ -1358,7 +1364,7 @@ mod tests {
         let mut calls = Vec::new();
         let (errored, released_oob, _) = write_message(&writer.inner, frame, |bytes| {
             calls.push(bytes.to_vec());
-            if bytes == [b'A'] {
+            if bytes == *b"A" {
                 writer.inner.q.lock().unwrap().status = WriterStatus::Fatal("sink deadline".into());
             }
             Ok(())
