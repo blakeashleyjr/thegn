@@ -24,6 +24,7 @@ pub mod locale;
 pub mod recur;
 pub mod reminders;
 pub mod tz;
+pub mod validate;
 
 pub use admission::{
     AdmissionBudget, AdmissionError, AdmissionLease, AdmissionLimit, AdmissionMeter, AdmissionPool,
@@ -999,8 +1000,6 @@ fn nominal_span(e: &CalEvent) -> Option<chrono::Duration> {
         (EventTime::Instant { at: a }, EventTime::Instant { at: b }) if b >= a => {
             Some(b.signed_duration_since(*a))
         }
-        // THE-474 admission validation has not landed, so mixed shapes remain
-        // row-local InvalidSpan errors and are counted in skipped_rows.
         _ => None,
     }
 }
