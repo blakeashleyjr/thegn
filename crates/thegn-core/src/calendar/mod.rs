@@ -902,7 +902,15 @@ impl CalEvent {
             return Err(ExpansionError::InvalidSpan);
         };
         let zone = Some(recur::series_zone(&self.start, home));
-        let locals = recur::expand_local_in(rec, seed, zone, rec_from, rec_to, budget)?;
+        let locals = recur::expand_local_with_gap(
+            rec,
+            seed,
+            zone,
+            rec_from,
+            rec_to,
+            budget,
+            GapPolicy::ShiftForward,
+        )?;
         let mut out = Vec::new();
         for local in locals {
             // One transient instance at a time: nothing is retained (or

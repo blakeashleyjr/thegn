@@ -930,6 +930,10 @@ fn an_out_of_range_by_value_is_rejected_at_parse() {
         "FREQ=MONTHLY;BYDAY=MO;BYSETPOS=0",
         "FREQ=MONTHLY;BYDAY=MO;BYSETPOS=367",
         "FREQ=MONTHLY;BYDAY=MO;BYSETPOS=-2147483648",
+        "FREQ=MONTHLY;BYSETPOS=-9223372036854775808",
+        "FREQ=MONTHLY;BYMONTHDAY=-9223372036854775808",
+        "FREQ=YEARLY;BYYEARDAY=-9223372036854775808",
+        "FREQ=YEARLY;BYWEEKNO=-9223372036854775808",
     ] {
         assert!(
             matches!(RRule::parse(rule), Err(RecurError::OutOfRange(_))),
@@ -993,6 +997,14 @@ fn malformed_byday_count_until_and_wkst_reject_the_rule() {
             .to_string()
             .contains("BYHOUR=24")
     );
+}
+
+#[test]
+fn non_ascii_byday_is_rejected_without_panicking() {
+    assert!(matches!(
+        RRule::parse("FREQ=WEEKLY;BYDAY=é1"),
+        Err(RecurError::BadValue(_))
+    ));
 }
 
 #[test]
@@ -1215,6 +1227,94 @@ fn a_utc_exdate_tracks_the_offset_across_a_dst_transition() {
         })
         .collect();
     assert_eq!(days, vec![6, 8, 10]);
+}
+
+#[test]
+fn a_utc_exdate_matches_the_realized_instant_of_a_gap_occurrence() {
+    // Nominal 02:30 is shifted to 03:30 CDT, which is 08:30Z.
+    let start = EventTime::Zoned {
+        local: dt(2026, 3, 7, 2, 30),
+        zone: TzRef::new("America/Chicago"),
+    };
+    let rec = Recurrence {
+        rules: vec![RRule::parse("FREQ=DAILY").unwrap()],
+        exdates: vec![utc(2026, 3, 8, 8, 30)],
+        ..Default::default()
+    };
+    let got = occurrences(
+        &rec,
+        &start,
+        d(2026, 3, 7),
+        d(2026, 3, 9),
+        chrono_tz::Tz::UTC,
+        GapPolicy::ShiftForward,
+    );
+    let days: Vec<u32> = got
+        .iter()
+        .map(|t| match t {
+            EventTime::Zoned { local, .. } => local.day(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(days, vec![7, 9]);
+}
+
+#[test]
+fn a_utc_until_compares_a_gap_occurrence_by_its_realized_instant() {
+    // The nominal 02:30 occurrence resolves to 08:30Z. UNTIL=08:15Z is
+    // later than the nominal wall time converted naïvely, but earlier as an
+    // instant, so the March 8 occurrence must be excluded.
+    let start = EventTime::Zoned {
+        local: dt(2026, 3, 7, 2, 30),
+        zone: TzRef::new("America/Chicago"),
+    };
+    let rec = Recurrence {
+        rules: vec![RRule::parse("FREQ=DAILY;UNTIL=20260308T081500Z").unwrap()],
+        ..Default::default()
+    };
+    let got = occurrences(
+        &rec,
+        &start,
+        d(2026, 3, 7),
+        d(2026, 3, 9),
+        chrono_tz::Tz::UTC,
+        GapPolicy::ShiftForward,
+    );
+    let days: Vec<u32> = got
+        .iter()
+        .map(|t| match t {
+            EventTime::Zoned { local, .. } => local.day(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(days, vec![7]);
+}
+
+#[test]
+fn a_utc_until_keeps_a_fold_occurrence_before_its_instant_bound() {
+    // At the fall-back transition 01:30 CDT is 06:30Z. The UTC bound at
+    // 07:00Z is later, despite converting to the nominal local time 01:00 CST.
+    let start = EventTime::Zoned {
+        local: dt(2026, 11, 1, 0, 30),
+        zone: TzRef::new("America/Chicago"),
+    };
+    let rec = Recurrence {
+        rules: vec![RRule::parse("FREQ=HOURLY;UNTIL=20261101T070000Z").unwrap()],
+        ..Default::default()
+    };
+    let got = occurrences(
+        &rec,
+        &start,
+        d(2026, 11, 1),
+        d(2026, 11, 1),
+        chrono_tz::Tz::UTC,
+        GapPolicy::ShiftForward,
+    );
+    assert!(
+        got.iter().any(
+            |t| matches!(t, EventTime::Zoned { local, .. } if *local == dt(2026, 11, 1, 1, 30))
+        )
+    );
 }
 
 #[test]
