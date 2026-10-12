@@ -14,6 +14,7 @@ use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -1504,6 +1505,66 @@ fn control_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketCon
 /// server-side attach succeeds, so a healthy connect never comes near this.
 const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Maximum encoded bytes retained in one svc-side stream queue.
+const STREAM_BYTE_BUDGET: usize = 4 * MAX_WIRE_FRAME;
+
+/// Sender-side accounting for frames still waiting in the downstream queue.
+/// The sender reconciles against channel occupancy before each reservation so
+/// frames already consumed by the receiver release their byte charges.
+struct ByteBudget {
+    limit: usize,
+    sizes: VecDeque<usize>,
+    queued: usize,
+}
+
+impl ByteBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            sizes: VecDeque::new(),
+            queued: 0,
+        }
+    }
+
+    fn reconcile(&mut self, frames: &tokio_mpsc::Sender<EventFrame>) {
+        let in_queue = frames.max_capacity() - frames.capacity();
+        while self.sizes.len() > in_queue {
+            if let Some(size) = self.sizes.pop_front() {
+                self.queued -= size;
+            }
+        }
+    }
+
+    async fn reserve<'a>(
+        &mut self,
+        frames: &'a tokio_mpsc::Sender<EventFrame>,
+        charge: usize,
+    ) -> Result<tokio_mpsc::Permit<'a, EventFrame>, tokio_mpsc::error::SendError<()>> {
+        self.reconcile(frames);
+        if self.queued + charge > self.limit && !self.sizes.is_empty() {
+            let mut released = 0;
+            let mut oldest = 0;
+            for size in &self.sizes {
+                released += size;
+                oldest += 1;
+                if self.queued - released + charge <= self.limit {
+                    break;
+                }
+            }
+            let permits = frames
+                .reserve_many(frames.max_capacity() - self.sizes.len() + oldest)
+                .await?;
+            drop(permits);
+            self.reconcile(frames);
+        }
+
+        let permit = frames.reserve().await?;
+        self.sizes.push_back(charge);
+        self.queued += charge;
+        Ok(permit)
+    }
+}
+
 /// Read the daemon's greeting, enforce protocol compatibility, forward the
 /// initial frame(s), then hand the socket to the long-lived pump.
 ///
@@ -1606,6 +1667,7 @@ where
 {
     use tokio_tungstenite::tungstenite::Message;
     let mut guard = StreamGuard::new(mode);
+    let mut budget = ByteBudget::new(STREAM_BYTE_BUDGET);
     let mut idle_deadline = liveness.map(|l| tokio::time::Instant::now() + l.read_idle);
     let mut ping = liveness.map(|l| tokio::time::interval(l.ping_every));
     if let Some(interval) = &mut ping {
@@ -1616,12 +1678,15 @@ where
         tokio::select! {
             msg = ws.next() => match msg {
                 Some(Ok(Message::Binary(bytes))) => {
+                    let charge = bytes.len();
                     match EventDecoder::decode_message(&bytes) {
                         Ok(frame) => {
                             if let Err(end) = guard.admit(&frame) { return end; }
                             match send_frame_while_servicing_control(
                                 frames,
                                 frame,
+                                charge,
+                                &mut budget,
                                 &mut ws,
                                 &mut ctrl,
                                 liveness,
@@ -1689,6 +1754,8 @@ where
 async fn send_frame_while_servicing_control<S>(
     frames: &tokio_mpsc::Sender<EventFrame>,
     frame: EventFrame,
+    charge: usize,
+    budget: &mut ByteBudget,
     ws: &mut Ws<S>,
     ctrl: &mut tokio_mpsc::Receiver<AttachControl>,
     liveness: Option<Liveness>,
@@ -1698,7 +1765,7 @@ where
 {
     loop {
         tokio::select! {
-            permit = frames.reserve() => match permit {
+            permit = budget.reserve(frames, charge) => match permit {
                 Ok(permit) => {
                     permit.send(frame);
                     return Ok(true);
@@ -1958,6 +2025,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::control_wire::MAX_WIRE_PAYLOAD;
     use thegn_core::db::Db;
 
     #[tokio::test]
@@ -2072,6 +2140,8 @@ mod tests {
         let delivered = send_frame_while_servicing_control(
             &frames,
             EventFrame::Sessions,
+            0,
+            &mut ByteBudget::new(STREAM_BYTE_BUDGET),
             &mut ws,
             &mut ctrl_rx,
             None,
@@ -2083,6 +2153,165 @@ mod tests {
             "Close ends the pump without waiting for capacity"
         );
         assert!(server.await.unwrap(), "the peer must receive Close");
+    }
+
+    #[tokio::test]
+    async fn byte_budget_blocks_until_oldest_frames_drain() {
+        let (frames, mut rx) = tokio_mpsc::channel(256);
+        let mut budget = ByteBudget::new(10);
+        let first = budget.reserve(&frames, 6).await.unwrap();
+        first.send(EventFrame::Sessions);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), budget.reserve(&frames, 6))
+                .await
+                .is_err()
+        );
+
+        assert!(matches!(rx.recv().await, Some(EventFrame::Sessions)));
+        let second = tokio::time::timeout(Duration::from_secs(1), budget.reserve(&frames, 6))
+            .await
+            .unwrap()
+            .unwrap();
+        second.send(EventFrame::Sessions);
+    }
+
+    #[tokio::test]
+    async fn byte_budget_admits_a_maximum_wire_frame_when_empty() {
+        let frame = EventFrame::Activity {
+            json: "x".repeat(MAX_WIRE_PAYLOAD),
+        };
+        let charge = frame.encode().len();
+        assert_eq!(charge, MAX_WIRE_FRAME);
+
+        let (frames, _rx) = tokio_mpsc::channel(256);
+        let mut budget = ByteBudget::new(STREAM_BYTE_BUDGET);
+        budget.reserve(&frames, charge).await.unwrap().send(frame);
+        assert_eq!(budget.queued, MAX_WIRE_FRAME);
+    }
+
+    #[tokio::test]
+    async fn attach_close_is_sent_while_byte_budget_is_full() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            matches!(ws.next().await, Some(Ok(Message::Close(_))))
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let (frames, _receiver) = tokio_mpsc::channel(256);
+        let mut budget = ByteBudget::new(10);
+        budget
+            .reserve(&frames, 6)
+            .await
+            .unwrap()
+            .send(EventFrame::Sessions);
+        let (ctrl_tx, mut ctrl_rx) = tokio_mpsc::channel(1);
+        ctrl_tx.send(AttachControl::Close).await.unwrap();
+
+        let delivered = send_frame_while_servicing_control(
+            &frames,
+            EventFrame::Sessions,
+            6,
+            &mut budget,
+            &mut ws,
+            &mut ctrl_rx,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(delivered, Ok(false)),
+            "Close ends the pump while the byte budget blocks delivery"
+        );
+        assert!(server.await.unwrap(), "the peer must receive Close");
+    }
+
+    #[tokio::test]
+    async fn attach_byte_budget_bounds_maximum_payload_frames() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = STREAM_BYTE_BUDGET / (MAX_WIRE_PAYLOAD / 2) + 3;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for seq in 0..count {
+                let frame = if seq == 0 {
+                    EventFrame::PaneSnapshot {
+                        session: "s1".into(),
+                        seq: 0,
+                        cols: 80,
+                        rows: 24,
+                        bytes: vec![b'x'; MAX_WIRE_PAYLOAD / 2],
+                    }
+                } else {
+                    EventFrame::PaneDelta {
+                        session: "s1".into(),
+                        seq: seq as u64,
+                        bytes: vec![b'x'; MAX_WIRE_PAYLOAD / 2],
+                    }
+                };
+                ws.send(Message::Binary(frame.encode().into()))
+                    .await
+                    .unwrap();
+            }
+            ws.send(Message::Close(None)).await.unwrap();
+        });
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let (frames, mut rx) = tokio_mpsc::channel(256);
+        let (_ctrl_tx, ctrl_rx) = tokio_mpsc::channel(1);
+        let pump = tokio::spawn(async move {
+            pump_attach_inner(
+                ws,
+                &frames,
+                ctrl_rx,
+                StreamMode::Attach {
+                    session: "s1".into(),
+                },
+                None,
+            )
+            .await
+        });
+        let encoded_len = EventFrame::PaneSnapshot {
+            session: "s1".into(),
+            seq: 0,
+            cols: 80,
+            rows: 24,
+            bytes: vec![b'x'; MAX_WIRE_PAYLOAD / 2],
+        }
+        .encode()
+        .len();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            rx.len() * encoded_len <= STREAM_BYTE_BUDGET,
+            "queued wire-frame bytes must stay within the stream budget"
+        );
+
+        for seq in 0..count {
+            let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if seq == 0 {
+                assert!(matches!(frame, EventFrame::PaneSnapshot { seq: 0, .. }));
+            } else {
+                assert!(
+                    matches!(frame, EventFrame::PaneDelta { seq: got, .. } if got == seq as u64)
+                );
+            }
+        }
+        assert!(matches!(pump.await.unwrap(), StreamEnd::CleanClose));
+        server.await.unwrap();
     }
 
     #[test]
