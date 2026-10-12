@@ -332,7 +332,12 @@ pub fn dotfile_targets(
         .iter()
         .filter_map(|name| {
             let spec = cfg.bundle.get(name)?.dotfiles.as_ref()?;
-            let home = managed_home_checked(cfg, name)?;
+            let Some(home) = managed_home_checked(cfg, name) else {
+                crate::msg::warn(&format!(
+                    "bundle: dotfiles HOME for {name:?} is ambiguous or invalid; skipped"
+                ));
+                return None;
+            };
             Some((spec.clone(), home))
         })
         .collect()
