@@ -1664,7 +1664,9 @@ command = "git diff"
 #   agent        the [[agents]]/[[tools]] entry that runs the stage (a bare
 #                harness id — "claude", "codex", "aider" — also resolves). NOT a
 #                shell command: a stage worker is launched by name.
-#   prompt       the template the Lead renders for this stage's worker. Variables:
+#   prompt       configurable task text the Lead renders for this stage's worker;
+#                thegn appends its generated completion/report contract at runtime.
+#                Variables:
 #                {issue_number} {issue_title} {issue_body} {issue_url} {branch}
 #                {worktree} {stage} {artifact} {parent_artifact}. A typo is a
 #                `config validate` error, never a silent empty expansion.

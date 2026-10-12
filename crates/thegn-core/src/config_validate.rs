@@ -404,10 +404,8 @@ pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<Str
     // concurrency, `next` targets and cycles). Structure only — thegn
     // validates the org chart it will never execute.
     batch!(crate::config_pipeline::validate_pipeline(cfg));
-    // The handoff contract: a stage prompt that never names `{row}` or
-    // never asks for `thegn dispatch report` produces rows the done-gate
-    // can never close, so the roster grows without bound. Checked here
-    // because it is a property of the prompt string, not the org chart.
+    // Compatibility validation entry point; completion policy is generated
+    // by the host at runtime and is not inferred from configurable task text.
     batch!(crate::config_pipeline::validate_stage_contracts(cfg));
     // `model` / `env` on [[agents]]/[[tools]] and stage overrides: a
     // model must land on a harness with a model flag, env keys must be
@@ -1891,20 +1889,13 @@ on_blocked = "escalate"
 "#;
         assert!(validate_str(body).is_empty(), "{:#?}", validate_str(body));
 
-        // The handoff-contract channel: drop the report instruction and the
-        // stage can no longer produce a closable row, so validation must say so
-        // even though the org chart is still perfectly well-formed.
+        // Completion policy is generated at runtime, so task text does not
+        // need to mention the report command or the row placeholder.
         let no_contract = body.replace(", then `thegn dispatch report {row}`", "");
-        let errs = validate_str(&no_contract);
-        assert!(
-            errs.iter()
-                .any(|e| e.contains("dispatch report") && e.contains("architect")),
-            "{errs:#?}"
-        );
-        // And dropping `{row}` is reported as its own, separate gap.
+        assert!(validate_str(&no_contract).is_empty());
+        // Dropping `{row}` is also valid because the renderer binds the row.
         let no_row = body.replace("Row {row}: ", "").replace(" {row}", " <id>");
-        let errs = validate_str(&no_row);
-        assert!(errs.iter().any(|e| e.contains("{row}")), "{errs:#?}");
+        assert!(validate_str(&no_row).is_empty());
 
         // Schema walk: an unknown `on_blocked` spelling.
         let errs = validate_str(&body.replace("\"escalate\"", "\"retry\""));
