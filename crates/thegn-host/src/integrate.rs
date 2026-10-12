@@ -339,7 +339,6 @@ fn has_custom_driver(repo_root: &Path, paths: &[String]) -> bool {
 /// written tree oid only if the merge ends with NO unmerged paths; otherwise
 /// `None` (caller defers). Never leaves a worktree behind.
 // off-loop: the fold runs from the CLI / spawn_blocking (see the module doc).
-#[expect(clippy::disallowed_methods)]
 fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Option<String> {
     // Operands sit in option-parsing positions; refuse dash-led ones before spawn.
     thegn_core::git_operand::revision(ours).ok()?;
@@ -432,7 +431,10 @@ fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Opt
 
 /// Run the one real merge while retaining only a bounded tail from each pipe.
 /// Reader workers drain the complete pipes so a verbose driver cannot block Git.
-#[expect(clippy::disallowed_methods)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "waits for the merge child off the event loop"
+)]
 fn run_driver_merge(
     dir: &Path,
     args: &[&str],
@@ -2495,11 +2497,9 @@ mod tests {
         // Count invocations and write an untracked file in the temporary merge
         // worktree. Neither side effect may be repeated or swept into the tree.
         let counter = repo.dir.join("driver-count");
-        let stray = repo.dir.join("stray.txt");
         let driver = format!(
-            "printf x >> {}; printf stray > {}; true %O %A %B %L %P",
+            "printf x >> {}; printf stray > stray.txt; true %O %A %B %L %P",
             thegn_core::util::sh_quote(&counter.to_string_lossy()),
-            thegn_core::util::sh_quote(&stray.to_string_lossy())
         );
         git(&repo.dir, &["config", "merge.takeours.driver", &driver]);
         repo.commit(".gitattributes", "data.txt merge=takeours\n", "attrs");
@@ -2526,6 +2526,7 @@ mod tests {
                 .lines()
                 .any(|path| path == "stray.txt")
         );
+        assert!(!repo.dir.join("stray.txt").exists());
     }
 
     #[test]

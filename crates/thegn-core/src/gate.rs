@@ -179,6 +179,7 @@ mod tests {
             assert_eq!(classify_run(true, end), GateClass::Error);
             assert!(!run_error_reason(true, end).is_empty());
         }
+        assert!(!run_error_reason(true, RunEnd::Exited(1)).is_empty());
         assert!(run_error_reason(false, RunEnd::Unknown).contains("did not start"));
     }
 }
