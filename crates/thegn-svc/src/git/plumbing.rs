@@ -99,6 +99,92 @@ fn run_status(loc: &GitLoc, args: &[&str]) -> Result<(i32, String, String)> {
     ))
 }
 
+/// Run a small local ref transaction with the same bound as `run_status`.
+/// Unlike the general stdin runner, this operation must not let a stuck ref
+/// lock or filesystem block the fold actor indefinitely.
+fn run_stdin_bounded(loc: &GitLoc, args: &[&str], input: &[u8]) -> Result<String> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let timeout_secs = std::env::var("THEGN_GIT_READ_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(60);
+    let timeout = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
+    let mut child = loc
+        .git_command(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("git {}", args.join(" ")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(error) = stdin.write_all(input) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error.into());
+        }
+    }
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let stdout_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    let mut backoff = Duration::from_millis(1);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.into());
+            }
+        }
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "git {} timed out after {}s (killed)",
+                    args.join(" "),
+                    timeout_secs
+                );
+            }
+            std::thread::sleep(backoff.min(remaining));
+            backoff = (backoff * 2).min(Duration::from_millis(25));
+        } else {
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_millis(25));
+        }
+    };
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    if !status.success() {
+        let stdout = String::from_utf8_lossy(&stdout);
+        let stderr = String::from_utf8_lossy(&stderr);
+        let detail = match (stderr.trim(), stdout.trim()) {
+            ("", "") => String::new(),
+            ("", out) => out.to_string(),
+            (err, "") => err.to_string(),
+            (err, out) => format!("{err}\n{out}"),
+        };
+        anyhow::bail!("git {} failed: {}", args.join(" "), detail);
+    }
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
+
 /// A git object id is 40 (SHA-1) or 64 (SHA-256) hex chars. Validate a parsed
 /// `merge-tree` tree oid before handing it to `commit-tree`: a truncated or
 /// garbled output (lossy SSH/bridge transport) would otherwise flow downstream
@@ -394,7 +480,7 @@ pub trait PlumbingOps: GitBackend {
             transaction.push_str(&format!("verify {name} {oid}\n"));
         }
         transaction.push_str(&format!("update {target} {new} {old}\nprepare\ncommit\n"));
-        match super::run_stdin(loc, &[], &["update-ref", "--stdin"], transaction.as_bytes()) {
+        match run_stdin_bounded(loc, &["update-ref", "--stdin"], transaction.as_bytes()) {
             Ok(_) => Ok(CasOutcome::Advanced),
             Err(error) => {
                 // The transaction error itself is locale-dependent; classify
