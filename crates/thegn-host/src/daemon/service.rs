@@ -1761,6 +1761,36 @@ impl ControlApi for DaemonService {
         })
     }
 
+    /// `calendar.events`: the recurrence-expanded occurrences in `[from, to]`
+    /// as a flat, start-sorted list.
+    ///
+    /// This serves thegn's calendar *cache*, which is populated by hydration
+    /// and sync. A daemon with no UI hydration (or one whose accounts have not
+    /// synced) may therefore return a stale or empty window; nothing here
+    /// fetches from a provider.
+    fn calendar_events<'a>(
+        &'a self,
+        from: &'a str,
+        to: &'a str,
+    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::calendar::CalEvent>>> {
+        Box::pin(async move {
+            let (from, to) = super::calendar_api::parse_window(from, to)?;
+            let home = super::calendar_api::home_zone(&self.config.calendar);
+            self.with_db(move |db| Ok(super::calendar_api::events_in_window(db, from, to, home)))
+                .await?
+        })
+    }
+
+    /// `calendar.clocks`: the home row plus configured world clocks, now.
+    fn calendar_clocks(&self) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async move {
+            Ok(super::calendar_api::clocks_json(
+                &self.config.calendar,
+                chrono::Utc::now(),
+            ))
+        })
+    }
+
     /// `notify.push`: append a tray notification, exactly like the other
     /// producers (`thegn notify push`, the hydration diff engines) — via
     /// [`thegn_core::store::NotificationStore::put_notification`]. Urgency
@@ -3724,6 +3754,53 @@ mod tests {
         assert_eq!(alert.kind.as_str(), "agent_attention");
         assert_eq!(alert.source_ref, "ci");
         assert_eq!(alert.message, "build broke", "empty body ⇒ title only");
+    }
+
+    /// `calendar.events` reads the cache through the service and rejects a
+    /// malformed window as a bad request; `calendar.clocks` leads with home.
+    #[tokio::test]
+    async fn calendar_reads_serve_the_cache_and_config() {
+        use thegn_core::calendar::{CalEvent, EventTime};
+        use thegn_core::store::{CalendarRow, CalendarStore};
+        let mut config = thegn_core::config::Config::default();
+        config.calendar.home_zone = "UTC".into();
+        let (svc, _rx) = service_with_config(0, config);
+        let at: chrono::DateTime<chrono::Utc> = "2026-03-10T09:00:00Z".parse().unwrap();
+        let ev = CalEvent::new(
+            "u1",
+            "standup",
+            EventTime::Instant { at },
+            EventTime::Instant {
+                at: at + chrono::Duration::hours(1),
+            },
+        );
+        {
+            let db = svc.db.lock().unwrap();
+            db.put_calendar_events(
+                "work",
+                &[CalendarRow {
+                    uid: "u1".into(),
+                    calendar: String::new(),
+                    start_ms: at.timestamp_millis(),
+                    end_ms: at.timestamp_millis() + 3_600_000,
+                    recurring: false,
+                    json: serde_json::to_string(&ev).unwrap(),
+                }],
+            )
+            .unwrap();
+        }
+        let got = svc
+            .calendar_events("2026-03-01", "2026-03-31")
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].title, "standup");
+        assert!(matches!(
+            svc.calendar_events("garbage", "2026-03-31").await,
+            Err(ControlError::InvalidArgument(_))
+        ));
+        let clocks = svc.calendar_clocks().await.unwrap();
+        assert_eq!(clocks[0]["is_home"], true);
     }
 
     /// grace_ms == 0 ⇒ the never-reap default: an UNTIMED relay lease
