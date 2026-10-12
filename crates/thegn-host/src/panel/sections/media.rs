@@ -154,7 +154,9 @@ pub(super) fn content(ctx: &SectionCtx<'_>) -> Vec<PanelRow> {
                 "queue unavailable",
             )])));
         } else {
-            let cursor = if ctx.ui.open == Section::Media {
+            let cursor = if ctx.ui.open == Section::Media
+                && (offset..offset + media.queue.len()).contains(&ctx.ui.cursor)
+            {
                 ctx.ui.cursor.saturating_sub(offset)
             } else {
                 0
@@ -540,6 +542,30 @@ mod tests {
                 }));
             }
         }
+    }
+
+    #[test]
+    fn stale_queue_cursor_renders_head_rows_in_full_panel() {
+        let (model, mut ui) = collection_fixture(thegn_core::media::MAX_QUEUE_ITEMS);
+        ui.open = Section::Media;
+        let sources = ui.media.sources.len();
+        ui.cursor = sources + thegn_core::media::MAX_QUEUE_ITEMS + 50;
+
+        let frame = crate::panel::frame::build_panel(&model, &ui, 60, 40, true);
+        let queue_rows = frame
+            .rows
+            .iter()
+            .filter(|row| {
+                matches!(row.hit, Some(PanelHit::Row(Section::Media, index)) if index >= sources)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!queue_rows.is_empty());
+        assert!(
+            queue_rows
+                .iter()
+                .all(|row| !line_text(&row.line).trim().is_empty())
+        );
     }
 
     #[test]
