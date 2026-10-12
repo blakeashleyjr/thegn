@@ -29,10 +29,26 @@ pub struct Placement {
 /// Encode `rgba` (`px_w`×`px_h`, 4 bytes/pixel) as a kitty transmit-and-display
 /// APC stream, preceded by an absolute CUP to `place.origin` and scaled to
 /// `place.cols`×`place.rows` cells. `C=1` keeps the cursor put; `q=2` silences
-/// the terminal's ack. Returns empty when the buffer size doesn't match.
-pub fn kitty_image(rgba: &[u8], px_w: u32, px_h: u32, place: Placement) -> Vec<u8> {
-    if px_w == 0 || px_h == 0 || rgba.len() != (px_w as usize * px_h as usize * 4) {
-        return Vec::new();
+/// the terminal's ack. Fails (nothing to emit) on zero dimensions, a length
+/// that doesn't match `px_w*px_h*4`, or dimensions whose byte size overflows.
+pub fn kitty_image(
+    rgba: &[u8],
+    px_w: u32,
+    px_h: u32,
+    place: Placement,
+) -> Result<Vec<u8>, RasterError> {
+    if px_w == 0 || px_h == 0 {
+        return Err(RasterError::ZeroDimension);
+    }
+    let expected = (px_w as usize)
+        .checked_mul(px_h as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or(RasterError::SizeOverflow)?;
+    if rgba.len() != expected {
+        return Err(RasterError::LengthMismatch {
+            expected,
+            actual: rgba.len(),
+        });
     }
     let payload = base64(rgba);
     let chunks: Vec<&[u8]> = payload.as_bytes().chunks(CHUNK).collect();
@@ -64,7 +80,18 @@ pub fn kitty_image(rgba: &[u8], px_w: u32, px_h: u32, place: Placement) -> Vec<u
         out.extend_from_slice(chunk);
         out.extend_from_slice(ST);
     }
-    out
+    Ok(out)
+}
+
+/// Why a raster cannot be encoded as a kitty image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RasterError {
+    /// Width or height is zero.
+    ZeroDimension,
+    /// `width*height*4` does not fit in `usize`.
+    SizeOverflow,
+    /// The pixel buffer length differs from `width*height*4`.
+    LengthMismatch { expected: usize, actual: usize },
 }
 
 /// Delete all first-party images from the outer terminal (on dismiss / switch /
@@ -125,14 +152,36 @@ mod tests {
 
     #[test]
     fn rejects_mismatched_buffer() {
-        assert!(kitty_image(&[0; 3], 1, 1, place()).is_empty()); // need 4 bytes
-        assert!(kitty_image(&[], 0, 0, place()).is_empty());
+        assert_eq!(
+            kitty_image(&[0; 3], 1, 1, place()),
+            Err(RasterError::LengthMismatch {
+                expected: 4,
+                actual: 3
+            })
+        ); // need 4 bytes
+        assert_eq!(
+            kitty_image(&[], 0, 0, place()),
+            Err(RasterError::ZeroDimension)
+        );
+        assert_eq!(
+            kitty_image(&[0; 4], 0, 1, place()),
+            Err(RasterError::ZeroDimension)
+        );
+    }
+
+    #[test]
+    fn rejects_overflowing_dimensions_without_panicking() {
+        // u32::MAX x u32::MAX x 4 overflows usize on every target width.
+        assert_eq!(
+            kitty_image(&[0; 4], u32::MAX, u32::MAX, place()),
+            Err(RasterError::SizeOverflow)
+        );
     }
 
     #[test]
     fn single_pixel_has_cup_control_and_terminated_apc() {
         let px = [1u8, 2, 3, 4]; // 1x1 RGBA
-        let out = kitty_image(&px, 1, 1, place());
+        let out = kitty_image(&px, 1, 1, place()).unwrap();
         // Leading CUP to (origin_row+1, origin_col+1) = 4;11H
         assert!(out.starts_with(b"\x1b[4;11H"), "leads with CUP to origin");
         let s = String::from_utf8_lossy(&out);
@@ -146,7 +195,7 @@ mod tests {
     fn large_image_is_chunked_with_continuation_flags() {
         // 40x40 RGBA = 6400 bytes → base64 ~8536 chars → ≥3 chunks of 4096.
         let rgba = vec![7u8; 40 * 40 * 4];
-        let out = kitty_image(&rgba, 40, 40, place());
+        let out = kitty_image(&rgba, 40, 40, place()).unwrap();
         let s = String::from_utf8_lossy(&out);
         let apc_count = s.matches("\x1b_G").count();
         assert!(
