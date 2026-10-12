@@ -5,10 +5,16 @@
 //! **event-driven, not polled**: a dedicated thread does blocking
 //! `crossterm::event::read()`, the tile's [`ChangeHook`] posts a wake-up on the
 //! same channel, and the main thread blocks on `recv()` — so a standalone app
-//! sits at ~0% idle just like it does embedded in thegn.
+//! sits at ~0% idle just like it does embedded in thegn. One reader is reused
+//! per process. It can consume and park at most one event after the last run
+//! returns; blocking `read()` cannot be cancelled without crossterm's
+//! `event-stream` feature (polling would break the ~0%-idle contract).
 
+use std::collections::VecDeque;
 use std::io::{self, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{LazyLock, Mutex, Once};
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -29,6 +35,97 @@ enum Wake {
     Pump,
 }
 
+const PENDING_EVENT_CAPACITY: usize = 16;
+
+#[derive(Default)]
+struct InputRouter {
+    sink: Option<mpsc::Sender<Wake>>,
+    reader_alive: bool,
+    pending: VecDeque<Event>,
+}
+
+struct Attach {
+    spawn_reader: bool,
+    replay: Vec<Event>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AlreadyActive;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Route {
+    Continue,
+    Exit,
+}
+
+impl InputRouter {
+    fn attach(&mut self, sink: mpsc::Sender<Wake>) -> Result<Attach, AlreadyActive> {
+        if self.sink.is_some() {
+            return Err(AlreadyActive);
+        }
+        self.sink = Some(sink);
+        let replay = self.pending.drain(..).collect();
+        let spawn_reader = !self.reader_alive;
+        self.reader_alive = true;
+        Ok(Attach {
+            spawn_reader,
+            replay,
+        })
+    }
+
+    fn detach(&mut self) {
+        self.sink = None;
+    }
+
+    fn route(&mut self, event: Event) -> Route {
+        if let Some(sink) = &self.sink {
+            if let Err(mpsc::SendError(Wake::Event(event))) = sink.send(Wake::Event(event)) {
+                self.park(event);
+                self.sink = None;
+                self.reader_alive = false;
+                return Route::Exit;
+            }
+            return Route::Continue;
+        }
+
+        self.park(event);
+        self.reader_alive = false;
+        Route::Exit
+    }
+
+    fn reader_stopped(&mut self) {
+        self.reader_alive = false;
+    }
+
+    fn reader_spawn_finished(&mut self, should_spawn: bool, spawned: bool) {
+        if should_spawn && !spawned {
+            self.reader_stopped();
+        }
+    }
+
+    fn park(&mut self, event: Event) {
+        if self.pending.len() < PENDING_EVENT_CAPACITY {
+            self.pending.push_back(event);
+        }
+    }
+}
+
+static INPUT: LazyLock<Mutex<InputRouter>> = LazyLock::new(|| Mutex::new(InputRouter::default()));
+static HARNESS_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PANIC_HOOK: Once = Once::new();
+
+struct InputAttachment;
+
+impl Drop for InputAttachment {
+    fn drop(&mut self) {
+        let mut input = INPUT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        input.detach();
+        HARNESS_ACTIVE.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Run `build`'s tile to completion as a standalone TUI. `build` receives the
 /// [`ChangeHook`] to wire into the tile's async side. Returns when the tile
 /// signals [`InputResult::Exit`] or input ends.
@@ -37,39 +134,105 @@ pub fn run(
 ) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel::<Wake>();
 
+    let Attach {
+        spawn_reader,
+        replay,
+    } = {
+        let mut input = INPUT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let attached = input
+            .attach(tx.clone())
+            .map_err(|_| anyhow::anyhow!("standalone harness already running"))?;
+        HARNESS_ACTIVE.store(true, Ordering::SeqCst);
+        attached
+    };
+    let _attachment = InputAttachment;
+
+    for event in replay {
+        if let Err(_error) = tx.send(Wake::Event(event)) {
+            // The fresh receiver is alive here; keep a defensive best-effort boundary.
+            break;
+        }
+    }
+
+    install_panic_hook_once();
+
     let hook_tx = tx.clone();
     let hook: ChangeHook = std::sync::Arc::new(move || {
         // A closed channel just means we're shutting down; ignore.
-        let _ = hook_tx.send(Wake::Pump); // best-effort: closed channel means shutdown (see above)
+        if let Err(_error) = hook_tx.send(Wake::Pump) {
+            // best-effort: a closed channel means the harness is shutting down.
+        }
     });
 
-    let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let tile = build(hook)?;
+    let mut spawned = false;
+    let result = (|| {
+        let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        let tile = build(hook)?;
 
-    let mut ops = CrosstermTerminalOps;
-    run_lifecycle(&mut ops, tile, |tile| {
-        // Keep standalone panic output visible on the main screen. Hook
-        // generation ownership remains process-global, as it was before the
-        // terminal lifecycle guard was introduced.
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            let _ = disable_raw_mode(); // best-effort: panic hook: restore what we can, never mask the panic
-            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste); // best-effort: panic hook: restore what we can, never mask the panic
-            prev(info);
-        }));
+        let mut ops = CrosstermTerminalOps;
+        run_lifecycle(&mut ops, tile, |tile| {
+            // Start blocking input only after terminal setup succeeded.
+            if spawn_reader {
+                std::thread::Builder::new()
+                    .name("tg-kit-input".into())
+                    .spawn(input_reader)?;
+                spawned = true;
+            }
+            event_loop(tile, &mut term, &rx)
+        })
+    })();
 
-        // Start blocking input only after terminal setup succeeded. The reader
-        // remains detached because crossterm's blocking read has no cancel API.
-        let in_tx = tx;
-        std::thread::spawn(move || {
-            while let Ok(ev) = event::read() {
-                if in_tx.send(Wake::Event(ev)).is_err() {
-                    break; // loop gone
+    let mut input = INPUT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    input.reader_spawn_finished(spawn_reader, spawned);
+    result
+}
+
+fn input_reader() {
+    loop {
+        match event::read() {
+            Ok(event) => {
+                let route = {
+                    let mut input = INPUT
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    input.route(event)
+                };
+                if route == Route::Exit {
+                    return;
                 }
             }
-        });
-        event_loop(tile, &mut term, &rx)
-    })
+            Err(_) => {
+                let mut input = INPUT
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                input.reader_stopped();
+                return;
+            }
+        }
+    }
+}
+
+fn install_panic_hook_once() {
+    PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if HARNESS_ACTIVE.load(Ordering::SeqCst) {
+                if let Err(_error) = disable_raw_mode() {
+                    // best-effort: panic reporting must not mask the panic.
+                }
+                if let Err(_error) =
+                    execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste)
+                {
+                    // best-effort: panic reporting must not mask the panic.
+                }
+            }
+            previous(info);
+        }));
+    });
 }
 
 fn event_loop(
@@ -302,11 +465,16 @@ fn run_lifecycle<O: TerminalOps>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{buffer::Buffer, layout::Rect};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    fn key_a() -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+    }
 
     #[derive(Default)]
     struct FakeTerminal {
@@ -484,5 +652,74 @@ mod tests {
                 "paste+", "paste-", "alt-", "raw-", "cursor+",
             ]
         );
+    }
+
+    #[test]
+    fn sequential_runs_reuse_reader_and_replay_parked_event() {
+        let mut input = InputRouter::default();
+        let (tx, _rx) = mpsc::channel();
+        let first = input.attach(tx).unwrap();
+        assert!(first.spawn_reader);
+        assert!(first.replay.is_empty());
+
+        input.detach();
+        assert_eq!(input.route(key_a()), Route::Exit);
+
+        let (tx, _rx) = mpsc::channel();
+        let second = input.attach(tx).unwrap();
+        assert!(second.spawn_reader);
+        assert_eq!(second.replay, [key_a()]);
+
+        input.detach();
+        let (tx, _rx) = mpsc::channel();
+        let third = input.attach(tx).unwrap();
+        assert!(!third.spawn_reader);
+        assert!(third.replay.is_empty());
+    }
+
+    #[test]
+    fn concurrent_attach_is_refused() {
+        let mut input = InputRouter::default();
+        let (tx, _rx) = mpsc::channel();
+        input.attach(tx).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        assert!(matches!(input.attach(tx), Err(AlreadyActive)));
+    }
+
+    #[test]
+    fn route_to_dropped_receiver_parks_instead_of_losing() {
+        let mut input = InputRouter::default();
+        let (tx, rx) = mpsc::channel();
+        input.attach(tx).unwrap();
+        drop(rx);
+
+        assert_eq!(input.route(key_a()), Route::Exit);
+        assert_eq!(input.pending, [key_a()]);
+        assert!(input.sink.is_none());
+        assert!(!input.reader_alive);
+    }
+
+    #[test]
+    fn pending_is_bounded() {
+        let mut input = InputRouter::default();
+        for _ in 0..=PENDING_EVENT_CAPACITY {
+            input.park(key_a());
+        }
+        assert_eq!(input.pending.len(), PENDING_EVENT_CAPACITY);
+    }
+
+    #[test]
+    fn failed_reader_spawn_allows_next_run_to_spawn() {
+        let mut input = InputRouter::default();
+        let (tx, _rx) = mpsc::channel();
+        let first = input.attach(tx).unwrap();
+        assert!(first.spawn_reader);
+
+        input.reader_spawn_finished(first.spawn_reader, false);
+        input.detach();
+
+        let (tx, _rx) = mpsc::channel();
+        let second = input.attach(tx).unwrap();
+        assert!(second.spawn_reader);
     }
 }
