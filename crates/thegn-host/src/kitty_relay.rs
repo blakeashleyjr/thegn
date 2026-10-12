@@ -36,8 +36,10 @@
 //! to the emulator (so its cursor tracks mpv's home); APC-`G` commands are pulled
 //! out, validated, and rebuilt for the outer terminal. A DISPLAY command
 //! (`a=T`/`a=p`) is prefixed with an absolute CUP to the corner origin ([`cup`])
-//! and receives cell dimensions bounded by the content rect. Delete/continuation
-//! APCs are also rebuilt with quiet mode. A query (`a=q`) is answered locally
+//! and receives cell dimensions bounded by the content rect. Continuation APCs
+//! are buffered into their transfer, then one ordered unit is emitted at `m=0`
+//! with a single CUP. Delete APCs are rebuilt with quiet mode. An orphan `Gm=`
+//! is rejected until a fresh `a=T` or `a=d`. A query (`a=q`) is answered locally
 //! and never forwarded (forwarding it would make the OUTER terminal reply to us).
 //!
 //! The child acknowledgement contract is deliberately limited to local `a=q`
@@ -58,7 +60,7 @@ pub enum Piece {
     /// An APC-`G` command that DISPLAYS (`a=T` / `a=p`): the caller prefixes a
     /// [`cup`] to the corner before forwarding to the outer terminal.
     GfxDisplay(Vec<u8>),
-    /// Any other accepted APC-`G` (delete, continuation chunk): rebuilt, no CUP.
+    /// Any other accepted APC-`G` (for example delete): no CUP.
     GfxOther(Vec<u8>),
     /// An APC-`G` query (`a=q`): write this reply back to the pane; never forward.
     GfxAnswer(Vec<u8>),
@@ -84,6 +86,10 @@ pub(crate) fn coalesce_gfx(mut seqs: Vec<Vec<u8>>) -> Vec<u8> {
 /// Hard limit on a complete APC, including introducer and ST. Oversize APCs
 /// are discarded through their terminator; their tail is never ordinary text.
 const MAX_APC_BYTES: usize = 4 * 1024 * 1024;
+/// Leave room for the CUP prefix added by `pty_drain` so an admitted logical
+/// transfer always fits the writer's 4 MiB OOB message ceiling.
+const MAX_TRANSFER_BYTES: usize = MAX_APC_BYTES - 64;
+const MAX_TRANSFER_CHUNKS: usize = 4096;
 /// Text is emitted incrementally even when the caller supplies a huge slice.
 const TEXT_PIECE_BYTES: usize = 8192;
 
@@ -106,8 +112,15 @@ enum ScanState {
 pub struct KittyRelay {
     state: ScanState,
     partial: Vec<u8>,
+    transfer: Option<Transfer>,
     #[cfg(test)]
     scanned: usize,
+}
+
+#[derive(Debug)]
+struct Transfer {
+    bytes: Vec<u8>,
+    chunks: usize,
 }
 
 impl KittyRelay {
@@ -119,6 +132,7 @@ impl KittyRelay {
     pub fn reset(&mut self) {
         self.state = ScanState::Text;
         self.partial = Vec::new();
+        self.transfer = None;
     }
 
     /// Emit pieces as they complete instead of accumulating an input-sized
@@ -176,6 +190,9 @@ impl KittyRelay {
                         // Release capacity too: a discarded oversized command
                         // does not retain its 4 MiB allocation indefinitely.
                         self.partial = Vec::new();
+                        // An oversized/malformed APC inside a logical transfer
+                        // invalidates the whole unit; later Gm chunks are orphans.
+                        self.transfer = None;
                         self.state = if ended {
                             ScanState::Text
                         } else {
@@ -187,7 +204,8 @@ impl KittyRelay {
                         self.partial.push(byte);
                         if ended {
                             let seq = std::mem::take(&mut self.partial);
-                            emit(classify(seq, content_size));
+                            let piece = classify(seq, content_size);
+                            self.accept_piece(piece, &mut emit);
                             self.state = ScanState::Text;
                         } else {
                             self.state = ScanState::Apc {
@@ -215,6 +233,59 @@ impl KittyRelay {
         }
     }
 
+    fn accept_piece(&mut self, piece: Piece, emit: &mut impl FnMut(Piece)) {
+        match piece {
+            Piece::GfxDisplay(bytes) if is_multi_transmit(&bytes) => {
+                // A fresh transmit is an unambiguous boundary. It supersedes
+                // any incomplete transfer and lets recovery start again.
+                self.transfer = None;
+                let mut transfer = Transfer {
+                    bytes: Vec::new(),
+                    chunks: 1,
+                };
+                if append_transfer(&mut transfer, bytes) {
+                    self.transfer = Some(transfer);
+                } else {
+                    emit(Piece::Rejected);
+                }
+            }
+            Piece::GfxOther(bytes) if is_continuation(&bytes) => {
+                let final_chunk = has_multi(&bytes, b"0");
+                let Some(mut transfer) = self.transfer.take() else {
+                    emit(Piece::Rejected);
+                    return;
+                };
+                transfer.chunks += 1;
+                if transfer.chunks > MAX_TRANSFER_CHUNKS || !append_transfer(&mut transfer, bytes) {
+                    emit(Piece::Rejected);
+                    return;
+                }
+                if final_chunk {
+                    if valid_transfer(&transfer.bytes) {
+                        emit(Piece::GfxDisplay(transfer.bytes));
+                    } else {
+                        emit(Piece::Rejected);
+                    }
+                } else {
+                    self.transfer = Some(transfer);
+                }
+            }
+            Piece::GfxOther(bytes) if is_delete(&bytes) => {
+                self.transfer = None;
+                emit(Piece::GfxOther(bytes));
+            }
+            Piece::GfxDisplay(bytes) => {
+                self.transfer = None;
+                emit(Piece::GfxDisplay(bytes));
+            }
+            Piece::Rejected => {
+                self.transfer = None;
+                emit(Piece::Rejected);
+            }
+            other => emit(other),
+        }
+    }
+
     #[cfg(test)]
     fn feed(&mut self, input: &[u8]) -> Vec<Piece> {
         let mut pieces = Vec::new();
@@ -235,7 +306,8 @@ fn classify(seq: Vec<u8>, content_size: (usize, usize)) -> Piece {
     let ctrl_end = body.iter().position(|&b| b == b';').unwrap_or(body.len());
     let ctrl = &body[1..ctrl_end];
     let payload = if ctrl_end < body.len() {
-        &seq[ctrl_end + 3..seq.len() - 2]
+        let payload_start = ctrl_end + 3;
+        &seq[payload_start..seq.len() - 2]
     } else {
         &[]
     };
@@ -244,6 +316,111 @@ fn classify(seq: Vec<u8>, content_size: (usize, usize)) -> Piece {
         Some(Canonical::Display(bytes)) => Piece::GfxDisplay(bytes),
         Some(Canonical::Other(bytes)) => Piece::GfxOther(bytes),
         None => Piece::Rejected,
+    }
+}
+
+fn append_transfer(transfer: &mut Transfer, bytes: Vec<u8>) -> bool {
+    let Some(total) = transfer.bytes.len().checked_add(bytes.len()) else {
+        return false;
+    };
+    if total > MAX_TRANSFER_BYTES {
+        return false;
+    }
+    transfer.bytes.extend_from_slice(&bytes);
+    true
+}
+
+fn control_and_payload(seq: &[u8]) -> Option<(&[u8], &[u8])> {
+    if !seq.starts_with(b"\x1b_G") || !seq.ends_with(ST) || seq.len() < 5 {
+        return None;
+    }
+    let body = &seq[2..seq.len() - 2];
+    let separator = body.iter().position(|&byte| byte == b';')?;
+    Some((&body[1..separator], &body[separator + 1..]))
+}
+
+fn has_multi(seq: &[u8], value: &[u8]) -> bool {
+    control_and_payload(seq)
+        .and_then(|(ctrl, _)| Control::parse(ctrl))
+        .and_then(|control| control.get(b"m").map(|found| found == value))
+        .unwrap_or(false)
+}
+
+fn is_multi_transmit(seq: &[u8]) -> bool {
+    control_and_payload(seq)
+        .and_then(|(ctrl, _)| Control::parse(ctrl))
+        .is_some_and(|control| {
+            control.get(b"a").is_some_and(|action| action == b"T")
+                && control.get(b"m") == Some(b"1".as_slice())
+        })
+}
+
+fn is_continuation(seq: &[u8]) -> bool {
+    control_and_payload(seq)
+        .and_then(|(ctrl, _)| Control::parse(ctrl))
+        .is_some_and(|control| control.get(b"a").is_none() && control.get(b"m").is_some())
+}
+
+fn is_delete(seq: &[u8]) -> bool {
+    control_and_payload(seq)
+        .and_then(|(ctrl, _)| Control::parse(ctrl))
+        .is_some_and(|control| control.get(b"a") == Some(b"d".as_slice()))
+}
+
+/// Validate the reassembled payload once at the semantic boundary. The input
+/// is capped by `MAX_TRANSFER_BYTES`; this second bounded buffer is at most the
+/// encoded payload size and decoding is capped by `MAX_DECODED`.
+fn valid_transfer(bytes: &[u8]) -> bool {
+    let mut cursor = 0;
+    let mut encoded = Vec::new();
+    let mut first_control = None;
+    while cursor < bytes.len() {
+        let mut end = cursor;
+        while end + ST.len() <= bytes.len() && &bytes[end..end + ST.len()] != ST {
+            end += 1;
+        }
+        if end + ST.len() > bytes.len() {
+            return false;
+        }
+        end += ST.len();
+        let Some((control, payload)) = control_and_payload(&bytes[cursor..end]) else {
+            return false;
+        };
+        if first_control.is_none() {
+            first_control = Control::parse(control);
+        }
+        if encoded.len().saturating_add(payload.len()) > MAX_TRANSFER_BYTES {
+            return false;
+        }
+        encoded.extend_from_slice(payload);
+        cursor = end;
+    }
+    let Some(control) = first_control else {
+        return false;
+    };
+    let Some(format) = control.get(b"f") else {
+        return false;
+    };
+    let Some(width) = control.get(b"s").and_then(parse_positive) else {
+        return false;
+    };
+    let Some(height) = control.get(b"v").and_then(parse_positive) else {
+        return false;
+    };
+    let Some(pixels) = width.checked_mul(height) else {
+        return false;
+    };
+    if pixels > MAX_DECODED {
+        return false;
+    }
+    let Some(decoded) = decode_base64(&encoded) else {
+        return false;
+    };
+    match format {
+        b"24" => pixels.checked_mul(3) == Some(decoded.len()),
+        b"32" => pixels.checked_mul(4) == Some(decoded.len()),
+        b"100" => valid_png(&decoded, width, height),
+        _ => false,
     }
 }
 
@@ -750,26 +927,38 @@ mod tests {
     }
 
     #[test]
-    fn near_cap_bytewise_input_has_linear_scan_work_and_no_prefix_copy() {
+    fn near_cap_bytewise_input_has_linear_scan_work_and_bounded_transfer_state() {
         let mut seq = b"\x1b_Ga=T,m=1,f=24,s=1,v=1;".to_vec();
-        seq.resize(MAX_APC_BYTES - 2, b'A');
+        seq.resize(MAX_TRANSFER_BYTES - 128, b'A');
         seq.extend_from_slice(ST);
         for chunk in [1, 17, 8192, MAX_APC_BYTES] {
             let mut relay = KittyRelay::new();
             let mut count = 0;
             for bytes in seq.chunks(chunk) {
-                relay.feed_with(bytes, |piece| {
-                    assert!(matches!(piece, Piece::GfxDisplay(ref b) if b.starts_with(b"\x1b_Ga=T,m=1,f=24,s=1,v=1,q=2,C=1,z=-1,c=65535,r=65535;")));
-                    count += 1;
-                });
+                relay.feed_with(bytes, |_| count += 1);
                 assert!(relay.partial.len() <= MAX_APC_BYTES);
                 assert!(relay.partial.capacity() <= MAX_APC_BYTES);
             }
-            assert_eq!(count, 1);
+            assert_eq!(count, 0, "m=1 is retained until its semantic boundary");
+            assert!(relay.transfer.is_some());
             // Framing scans every byte once. Classification walks only the
             // complete control prefix and never revisits partial input.
             assert_eq!(relay.scanned, seq.len());
         }
+    }
+
+    #[test]
+    fn near_apc_cap_single_chunk_is_classified() {
+        let mut sequence = b"\x1b_Ga=T,f=24,s=1,v=1;".to_vec();
+        sequence.resize(MAX_APC_BYTES - 4, b'A');
+        sequence.extend_from_slice(ST);
+        assert_eq!(sequence.len(), MAX_APC_BYTES - 2);
+
+        let mut relay = KittyRelay::new();
+        assert_eq!(relay.feed(&sequence), [Piece::Rejected]);
+        assert_eq!(relay.scanned, sequence.len());
+        assert!(relay.partial.is_empty());
+        assert!(matches!(relay.state, ScanState::Text));
     }
 
     #[test]
@@ -844,18 +1033,19 @@ mod tests {
         // mpv's per-frame shape: delete, clear+home (text), transmit+display, chunks.
         let mut stream = apc("Ga=d");
         stream.extend_from_slice(b"\x1b[2J\x1b[0;0f");
-        stream.extend(apc("Ga=T,f=24,s=320,v=240,C=1,q=2,m=1;AAAA"));
-        stream.extend(apc("Gm=0;BBBB"));
+        stream.extend(apc("Ga=T,f=24,s=1,v=1,C=1,q=2,m=1;AQ"));
+        stream.extend(apc("Gm=0;ID"));
         let pieces = r.feed(&stream);
         assert_eq!(
             pieces,
             vec![
                 Piece::GfxOther(apc("Ga=d,q=2;")),
                 Piece::Emulator(b"\x1b[2J\x1b[0;0f".to_vec()),
-                Piece::GfxDisplay(apc(
-                    "Ga=T,f=24,s=320,v=240,C=1,q=2,m=1,z=-1,c=65535,r=65535;AAAA"
-                )),
-                Piece::GfxOther(apc("Gm=0,q=2;BBBB")),
+                Piece::GfxDisplay({
+                    let mut unit = apc("Ga=T,f=24,s=1,v=1,C=1,q=2,m=1,z=-1,c=65535,r=65535;AQ");
+                    unit.extend(apc("Gm=0,q=2;ID"));
+                    unit
+                }),
             ]
         );
     }
@@ -868,9 +1058,118 @@ mod tests {
         let first = r.feed(head);
         assert!(first.is_empty(), "incomplete APC yields nothing yet");
         let second = r.feed(tail);
-        assert!(
-            matches!(&second[..], [Piece::GfxDisplay(bytes)] if bytes.starts_with(b"\x1b_Ga=T,m=1,f=24,s=1,v=1,q=2,C=1,z=-1,c=65535,r=65535;"))
+        assert!(second.is_empty(), "m=1 remains buffered across feeds");
+    }
+
+    #[test]
+    fn separate_read_transfer_is_emitted_as_one_ordered_display_unit() {
+        let mut relay = KittyRelay::new();
+        let mut got = relay.feed(&apc("Ga=T,m=1,f=24,s=1,v=1;AQ"));
+        assert!(got.is_empty());
+        got.extend(relay.feed(&apc("Gm=0;ID")));
+        let mut expected = apc("Ga=T,m=1,f=24,s=1,v=1,q=2,C=1,z=-1,c=65535,r=65535;AQ");
+        expected.extend(apc("Gm=0,q=2;ID"));
+        assert_eq!(got, [Piece::GfxDisplay(expected)]);
+    }
+
+    #[test]
+    fn orphan_continuations_are_rejected_until_a_fresh_transmit_boundary() {
+        let mut relay = KittyRelay::new();
+        for continuation in ["Gm=0;AQID", "Gm=1;AQID"] {
+            let pieces = relay.feed(&apc(continuation));
+            assert_eq!(pieces, [Piece::Rejected]);
+            assert!(!pieces.iter().any(|piece| matches!(piece, Piece::GfxDisplay(b) | Piece::GfxOther(b) if b.starts_with(b"\x1b_Gm="))));
+        }
+        assert_eq!(relay.feed(&apc("Ga=T,m=1,f=24,s=1,v=1;AQ")), []);
+        assert_eq!(relay.feed(&apc("Gm=0;ID")).len(), 1);
+    }
+
+    #[test]
+    fn explicit_transmit_only_is_rejected_and_its_continuations_are_orphans() {
+        let mut relay = KittyRelay::new();
+        assert_eq!(relay.feed(&apc("Gm=0;AQID")), [Piece::Rejected]);
+        assert_eq!(
+            relay.feed(&apc("Ga=t,f=24,s=1,v=1;AQID")),
+            [Piece::Rejected]
         );
+        assert_eq!(
+            relay.feed(&apc("Ga=t,m=1,f=24,s=1,v=1;AQ")),
+            [Piece::Rejected]
+        );
+        assert_eq!(relay.feed(&apc("Gm=0;ID")), [Piece::Rejected]);
+    }
+
+    #[test]
+    fn transfer_byte_and_chunk_limits_discard_and_recover_at_transmit() {
+        let mut relay = KittyRelay::new();
+        assert!(relay.feed(&apc("Ga=T,m=1,f=24,s=1,v=1;AQ")).is_empty());
+        let oversized = apc(&format!("Gm=1;{}", "A".repeat(MAX_TRANSFER_BYTES - 32)));
+        assert_eq!(relay.feed(&oversized), [Piece::Rejected]);
+        assert_eq!(relay.feed(&apc("Gm=0;ID")), [Piece::Rejected]);
+        let complete = relay.feed(&apc("Ga=T,f=24,s=1,v=1;AQID"));
+        assert!(matches!(complete.as_slice(), [Piece::GfxDisplay(_)]));
+
+        let mut relay = KittyRelay::new();
+        assert!(relay.feed(&apc("Ga=T,m=1,f=24,s=1,v=1;AQ")).is_empty());
+        for _ in 0..MAX_TRANSFER_CHUNKS - 1 {
+            assert!(relay.feed(&apc("Gm=1;AA")).is_empty());
+        }
+        assert_eq!(relay.feed(&apc("Gm=1;AA")), [Piece::Rejected]);
+        assert_eq!(relay.feed(&apc("Gm=0;ID")), [Piece::Rejected]);
+        assert!(matches!(
+            relay.feed(&apc("Ga=T,f=24,s=1,v=1;AQID")).as_slice(),
+            [Piece::GfxDisplay(_)]
+        ));
+    }
+
+    #[test]
+    fn reset_discards_an_in_progress_logical_transfer() {
+        let mut relay = KittyRelay::new();
+        assert!(relay.feed(&apc("Ga=T,m=1,f=24,s=1,v=1;AQ")).is_empty());
+        relay.reset();
+        assert_eq!(relay.feed(&apc("Gm=0;ID")), [Piece::Rejected]);
+    }
+
+    #[test]
+    fn multi_megabyte_transfer_spans_many_event_loop_feeds() {
+        let mut relay = KittyRelay::new();
+        // 2 MiB of base64 is a 1.5 MiB RGB payload, split at 64 KiB.
+        let encoded_len = 2 * 1024 * 1024;
+        let encoded = vec![b'A'; encoded_len];
+        let chunk_size = 64 * 1024;
+        let height = encoded_len / 4;
+        let start_len = chunk_size;
+        let mut first = format!("Ga=T,m=1,f=24,s=1,v={height};").into_bytes();
+        first.extend_from_slice(&encoded[..start_len]);
+        let mut first_apc = b"\x1b_".to_vec();
+        first_apc.extend_from_slice(&first);
+        first_apc.extend_from_slice(ST);
+        assert!(relay.feed(&first_apc).is_empty());
+        for chunk in encoded[start_len..].chunks(chunk_size) {
+            let final_chunk = chunk.as_ptr() == encoded[encoded_len - chunk_size..].as_ptr();
+            let mut apc_bytes = if final_chunk {
+                b"\x1b_Gm=0;".to_vec()
+            } else {
+                b"\x1b_Gm=1;".to_vec()
+            };
+            apc_bytes.extend_from_slice(chunk);
+            apc_bytes.extend_from_slice(ST);
+            let pieces = relay.feed(&apc_bytes);
+            if final_chunk {
+                assert!(
+                    matches!(pieces.as_slice(), [Piece::GfxDisplay(bytes)] if bytes.len() > 2 * 1024 * 1024)
+                );
+            } else {
+                assert!(pieces.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_aggregated_rgb_length_is_rejected() {
+        let mut relay = KittyRelay::new();
+        assert!(relay.feed(&apc("Ga=T,m=1,f=24,s=1,v=1;AQ")).is_empty());
+        assert_eq!(relay.feed(&apc("Gm=0;I")), [Piece::Rejected]);
     }
 
     #[test]
@@ -994,7 +1293,14 @@ mod tests {
         for byte in sequence.chunks(1) {
             relay.feed_with_rect(byte, (8, 5), |piece| pieces.push(piece));
         }
-        assert!(matches!(&pieces[..], [Piece::GfxDisplay(bytes)] if bytes.ends_with(b";AQ\x1b\\")));
+        assert!(pieces.is_empty(), "an unfinished transfer is retained");
+        relay.feed_with_rect(&apc("Gm=0;ID"), (8, 5), |piece| pieces.push(piece));
+        assert!(matches!(
+            &pieces[..],
+            [Piece::GfxDisplay(bytes)]
+                if bytes.starts_with(b"\x1b_Ga=T,m=1,f=24,s=1,v=1,q=2,C=1,z=-1,c=8,r=5;AQ\x1b\\")
+                    && bytes.ends_with(b"\x1b_Gm=0,q=2;ID\x1b\\")
+        ));
         assert_eq!(
             relayed("Ga=T,m=1,f=24,s=1,v=1;AQ?", (8, 5)),
             [Piece::Rejected]

@@ -56,10 +56,6 @@ const ALLOWLIST: &[&str] = &[
     // `[mcp.serve]` location, which also explains the overlay clamping pattern.
     "profiles.*.mcp_serve",
     "project.*.mcp_serve",
-    // `[[plugins]]` manifests are developer-facing (see `plugin_api.rs`); the
-    // schema (id/name/version/api/capabilities/contributions) is an internal
-    // contract for bundled plugins, not an end-user configuration surface.
-    "plugins",
     // `[host.<n>] capacity` reuses the `ResourcesDecl` shape for its cpu/memory
     // declaration; the ceiling fields (cpu_max/memory_max) are container-limit
     // knobs that have no meaning for a host spec and are never consulted there.

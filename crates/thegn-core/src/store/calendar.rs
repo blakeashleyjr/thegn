@@ -9,7 +9,7 @@ use anyhow::Result;
 ///
 /// `start_ms`/`end_ms` are denormalized *only* so a range query can prefilter;
 /// the authoritative expansion is [`crate::calendar::recur`] over `json`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CalendarRow {
     pub uid: String,
     pub calendar: String,
@@ -21,6 +21,9 @@ pub struct CalendarRow {
     pub recurring: bool,
     /// The serde-JSON `CalEvent`.
     pub json: String,
+    /// Opaque provider resource key (CalDAV href). `None` for providers or
+    /// legacy rows without a resource identity.
+    pub href: Option<String>,
 }
 
 /// Per-account sync bookkeeping.
@@ -60,6 +63,14 @@ pub trait CalendarStore {
 
     /// Delete specific uids (tombstones from an incremental sync).
     fn delete_calendar_events(&self, account: &str, uids: &[String]) -> Result<()>;
+
+    /// Delete every cached component represented by each provider resource.
+    /// `legacy_uid` is used only for rows whose href is NULL.
+    fn delete_calendar_events_by_href(
+        &self,
+        account: &str,
+        resources: &[(String, String)],
+    ) -> Result<()>;
 
     /// Replace an account's whole cache in ONE transaction (the full-fetch path).
     ///

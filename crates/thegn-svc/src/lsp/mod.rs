@@ -27,6 +27,7 @@ pub use diagnostics_queue::{
 pub use registry::{Registry, RegistryEntry, Resolution, binary_on_path};
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -37,6 +38,66 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+
+/// Variables available to local language servers after clearing the inherited
+/// process environment. Keep this list limited to process basics and common
+/// language toolchain discovery. Credentials, Git targeting, loader injection,
+/// runtime injection, and THEGN control variables are deliberately excluded.
+const SERVER_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LANGUAGE",
+    "TZ",
+    "TERM",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "NIX_PROFILES",
+    "NIX_SSL_CERT_FILE",
+    "SSL_CERT_FILE",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "GOPATH",
+    "GOROOT",
+    "GOMODCACHE",
+    "GOCACHE",
+    "NODE_PATH",
+    "VIRTUAL_ENV",
+    "PYTHONHOME",
+    "JAVA_HOME",
+    "SystemRoot",
+    "PATHEXT",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "COMSPEC",
+];
+
+fn server_env<I>(vars: I) -> Vec<(OsString, OsString)>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    vars.into_iter()
+        .filter(|(name, _)| {
+            name.to_str().is_some_and(|name| {
+                SERVER_ENV_ALLOWLIST
+                    .iter()
+                    .any(|allowed| name.eq_ignore_ascii_case(allowed))
+                    || name.starts_with("LC_")
+            })
+        })
+        .collect()
+}
 
 /// The LSP resource contract.  These are protocol safety limits, not user
 /// configuration: every edge is inclusive and the first byte/item over an
@@ -1492,6 +1553,8 @@ impl LspClient {
         let spawned = Command::new(cmd)
             .args(rest)
             .current_dir(root)
+            .env_clear()
+            .envs(server_env(std::env::vars_os()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -2118,6 +2181,105 @@ fn dispatch(msg: &Value, ctx: &ReaderContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_environment_keeps_process_and_toolchain_basics() {
+        let env = server_env([
+            (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from("HOME"), OsString::from("/home/test")),
+            (
+                OsString::from("XDG_RUNTIME_DIR"),
+                OsString::from("/run/user/1"),
+            ),
+            (OsString::from("LC_CTYPE"), OsString::from("C.UTF-8")),
+            (
+                OsString::from("CARGO_HOME"),
+                OsString::from("/home/test/.cargo"),
+            ),
+        ]);
+
+        assert_eq!(
+            env,
+            vec![
+                (OsString::from("PATH"), OsString::from("/bin")),
+                (OsString::from("HOME"), OsString::from("/home/test")),
+                (
+                    OsString::from("XDG_RUNTIME_DIR"),
+                    OsString::from("/run/user/1"),
+                ),
+                (OsString::from("LC_CTYPE"), OsString::from("C.UTF-8")),
+                (
+                    OsString::from("CARGO_HOME"),
+                    OsString::from("/home/test/.cargo"),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn server_environment_drops_credentials_targeting_and_injection() {
+        let env = server_env([
+            (OsString::from("GH_TOKEN"), OsString::from("secret")),
+            (
+                OsString::from("ANTHROPIC_API_KEY"),
+                OsString::from("secret"),
+            ),
+            (
+                OsString::from("AWS_SECRET_ACCESS_KEY"),
+                OsString::from("secret"),
+            ),
+            (
+                OsString::from("SSH_AUTH_SOCK"),
+                OsString::from("/agent.sock"),
+            ),
+            (OsString::from("GIT_DIR"), OsString::from("/private/repo")),
+            (
+                OsString::from("GIT_INDEX_FILE"),
+                OsString::from("/private/index"),
+            ),
+            (
+                OsString::from("LD_PRELOAD"),
+                OsString::from("/tmp/inject.so"),
+            ),
+            (
+                OsString::from("DYLD_INSERT_LIBRARIES"),
+                OsString::from("/tmp/inject.dylib"),
+            ),
+            (
+                OsString::from("NODE_OPTIONS"),
+                OsString::from("--require=/tmp/hook.js"),
+            ),
+            (
+                OsString::from("THEGN_CONTROL_TOKEN"),
+                OsString::from("secret"),
+            ),
+        ]);
+
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn server_environment_requires_exact_names_except_lc_prefix() {
+        let env = server_env([
+            (OsString::from("Path"), OsString::from("/bin")),
+            (OsString::from("ComSpec"), OsString::from("cmd.exe")),
+            (OsString::from("PATHX"), OsString::from("/tmp/shadow")),
+            (
+                OsString::from("HOMEBREW_GITHUB_API_TOKEN"),
+                OsString::from("secret"),
+            ),
+            (OsString::from("LC_CTYPE"), OsString::from("C.UTF-8")),
+        ]);
+
+        assert_eq!(
+            env,
+            vec![
+                (OsString::from("Path"), OsString::from("/bin")),
+                (OsString::from("ComSpec"), OsString::from("cmd.exe")),
+                (OsString::from("LC_CTYPE"), OsString::from("C.UTF-8")),
+            ]
+        );
+    }
 
     struct BlockingWriter {
         entered: Option<Sender<()>>,

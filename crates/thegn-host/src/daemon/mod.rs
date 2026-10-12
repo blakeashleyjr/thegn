@@ -72,16 +72,154 @@ pub(crate) fn scope_key() -> String {
 /// Resolve the control-socket path from config + env (the pure helper lives in
 /// core; this binds the ambient env).
 pub(crate) fn socket_path(dcfg: &thegn_core::config::DaemonConfig) -> PathBuf {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok(); // best-effort: optional input: the variable may legitimately be unset
-    let natural = dcfg.socket_path(
-        runtime_dir.as_deref(),
+    socket_path_for(
+        dcfg,
+        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+        &thegn_core::util::xdg_state_home().join("thegn"),
+        effective_uid(),
+        short_runtime_dir(),
+    )
+}
+
+/// Whether pane startup can safely route to a daemon endpoint. This deliberately
+/// performs only metadata checks and a legacy connect probe; it never creates a
+/// directory on the UI thread.
+pub(crate) fn daemon_socket_usable(dcfg: &thegn_core::config::DaemonConfig) -> bool {
+    let socket = socket_path(dcfg);
+    static PROBES: std::sync::OnceLock<Mutex<HashMap<PathBuf, bool>>> = std::sync::OnceLock::new();
+    let probes = PROBES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut probes = probes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(usable) = probes.get(&socket) {
+        return *usable;
+    }
+    let legacy = thegn_core::config_daemon::legacy_socket_path(
         &thegn_core::util::xdg_state_home().join("thegn"),
     );
+    let usable = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            socket_usable_decision(
+                legacy_socket_state(),
+                &socket,
+                &legacy,
+                &private_tmp_socket_path(
+                    &thegn_core::util::xdg_state_home().join("thegn"),
+                    effective_uid(),
+                ),
+                !dcfg.socket.is_empty(),
+                &|path| {
+                    let metadata = if path == std::path::Path::new("/tmp") {
+                        std::fs::metadata(path).ok()?
+                    } else {
+                        std::fs::symlink_metadata(path).ok()?
+                    };
+                    Some(DirMeta {
+                        is_dir: metadata.is_dir(),
+                        is_symlink: metadata.file_type().is_symlink(),
+                        owned: metadata.uid() == effective_uid(),
+                        mode: metadata.permissions().mode(),
+                    })
+                },
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            legacy_socket_state() != LegacySocketState::Live && socket != legacy
+        }
+    };
+    probes.insert(socket, usable);
+    usable
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct DirMeta {
+    is_dir: bool,
+    is_symlink: bool,
+    owned: bool,
+    mode: u32,
+}
+
+#[cfg(unix)]
+fn socket_usable_decision(
+    legacy_state: LegacySocketState,
+    socket: &std::path::Path,
+    legacy: &std::path::Path,
+    private_tmp: &std::path::Path,
+    explicit: bool,
+    probe: &dyn Fn(&std::path::Path) -> Option<DirMeta>,
+) -> bool {
+    if legacy_state == LegacySocketState::Live || socket == legacy {
+        return false;
+    }
+    if explicit {
+        return true;
+    }
+    let Some(parent) = socket.parent() else {
+        return false;
+    };
+    if let Some(metadata) = probe(parent) {
+        return metadata.is_dir
+            && !metadata.is_symlink
+            && metadata.owned
+            && metadata.mode & 0o777 == 0o700;
+    }
+    if socket == private_tmp {
+        return probe(std::path::Path::new("/tmp")).is_some_and(|metadata| {
+            metadata.is_dir && !metadata.is_symlink && metadata.mode & 0o1000 != 0
+        });
+    }
+    parent.parent().and_then(probe).is_some_and(|metadata| {
+        metadata.is_dir && !metadata.is_symlink && metadata.owned && metadata.mode & 0o777 == 0o700
+    })
+}
+
+fn effective_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+fn private_tmp_socket_path(state_dir: &std::path::Path, euid: u32) -> PathBuf {
+    let legacy = thegn_core::config_daemon::legacy_socket_path(state_dir);
+    std::path::Path::new("/tmp")
+        .join(format!(
+            "thegn-{euid}-{}",
+            thegn_core::util::short_hash(&legacy.to_string_lossy(), 12)
+        ))
+        .join("daemon.sock")
+}
+
+fn socket_path_for(
+    dcfg: &thegn_core::config::DaemonConfig,
+    runtime_dir: Option<&str>,
+    state_dir: &std::path::Path,
+    euid: u32,
+    private_runtime_dir: Option<PathBuf>,
+) -> PathBuf {
+    let natural = dcfg.socket_path(runtime_dir, state_dir);
     // An explicit `[daemon] socket` is the user's word — never relocate it.
     // (They may be pointing two thegns at one daemon deliberately.)
     if !dcfg.socket.is_empty() {
         return natural;
     }
+    let natural = if runtime_dir.is_none_or(str::is_empty) {
+        let legacy = thegn_core::config_daemon::legacy_socket_path(state_dir);
+        match private_runtime_dir {
+            Some(private) => thegn_core::config_daemon::short_socket_path(&private, &legacy),
+            None => private_tmp_socket_path(state_dir, euid),
+        }
+    } else {
+        natural
+    };
     let max = thegn_core::config_daemon::max_socket_path_len(cfg!(target_os = "linux"));
     thegn_core::config_daemon::resolve_socket_path(
         natural,
@@ -89,6 +227,96 @@ pub(crate) fn socket_path(dcfg: &thegn_core::config::DaemonConfig) -> PathBuf {
         max,
         cfg!(windows),
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegacySocketState {
+    Absent,
+    Stale,
+    Live,
+}
+
+pub(crate) fn legacy_socket_decision(
+    exists: bool,
+    error: Option<std::io::ErrorKind>,
+) -> LegacySocketState {
+    if !exists {
+        LegacySocketState::Absent
+    } else {
+        match error {
+            None => LegacySocketState::Live,
+            Some(std::io::ErrorKind::ConnectionRefused) => LegacySocketState::Stale,
+            Some(_) => LegacySocketState::Live,
+        }
+    }
+}
+
+pub(crate) fn legacy_socket_state() -> LegacySocketState {
+    let legacy = thegn_core::config_daemon::legacy_socket_path(
+        &thegn_core::util::xdg_state_home().join("thegn"),
+    );
+    let exists = std::fs::symlink_metadata(&legacy).is_ok();
+    #[cfg(unix)]
+    let connect_error = std::os::unix::net::UnixStream::connect(&legacy)
+        .err()
+        .map(|e| e.kind());
+    #[cfg(not(unix))]
+    let connect_error = Some(std::io::ErrorKind::Other);
+    legacy_socket_decision(exists, connect_error)
+}
+
+#[cfg(unix)]
+fn validate_private_fallback_parent(socket: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Some(parent) = socket.parent() else {
+        anyhow::bail!("private fallback socket has no parent directory");
+    };
+    match std::fs::symlink_metadata(parent) {
+        Ok(metadata)
+            if metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == effective_uid()
+                && metadata.permissions().mode() & 0o777 == 0o700 =>
+        {
+            Ok(())
+        }
+        Ok(_) => anyhow::bail!(
+            "private fallback directory {} already exists with the wrong owner or mode; move it aside before starting the daemon",
+            parent.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("inspect private fallback directory {}", parent.display())),
+    }
+}
+
+pub(crate) fn reconcile_legacy_socket(_dcfg: &thegn_core::config::DaemonConfig) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        let legacy = thegn_core::config_daemon::legacy_socket_path(
+            &thegn_core::util::xdg_state_home().join("thegn"),
+        );
+        if (!_dcfg.socket.is_empty() && socket_path(_dcfg) == legacy)
+            || legacy_socket_state() != LegacySocketState::Stale
+        {
+            return;
+        }
+        match std::fs::symlink_metadata(&legacy) {
+            Ok(md) if md.file_type().is_socket() => {
+                if let Err(error) = std::fs::remove_file(&legacy) {
+                    tracing::warn!(path = %legacy.display(), %error, "could not remove stale legacy daemon socket");
+                }
+            }
+            Ok(_) => {
+                tracing::warn!(path = %legacy.display(), "legacy daemon endpoint is not a socket; leaving it untouched")
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!(path = %legacy.display(), %error, "could not inspect legacy daemon endpoint");
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 /// A short, private directory to host the control socket when the natural path
@@ -112,11 +340,22 @@ fn short_runtime_dir() -> Option<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let dir = PathBuf::from(std::env::var_os("TMPDIR")?);
-        let md = std::fs::metadata(&dir).ok()?;
-        let ours = md.uid() == unsafe { libc::geteuid() };
-        let private = md.permissions().mode() & 0o077 == 0;
-        (md.is_dir() && ours && private).then_some(dir)
+        let mut candidates = Vec::new();
+        let uid = unsafe { libc::geteuid() };
+        if cfg!(target_os = "linux") {
+            candidates.push(PathBuf::from(format!("/run/user/{uid}")));
+        } else if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+            candidates.push(PathBuf::from(tmpdir));
+        }
+        candidates.into_iter().find(|dir| {
+            let Ok(md) = std::fs::symlink_metadata(dir) else {
+                return false;
+            };
+            md.is_dir()
+                && !md.file_type().is_symlink()
+                && md.uid() == uid
+                && md.permissions().mode() & 0o777 == 0o700
+        })
     }
     #[cfg(not(unix))]
     {
@@ -208,7 +447,43 @@ async fn run(
         .transpose()
         .map_err(anyhow::Error::msg)
         .context("invalid remote control transport")?;
+    let has_socket_override = socket_override.is_some();
     let sock = socket_override.unwrap_or_else(|| socket_path(&cfg.daemon));
+    #[cfg(unix)]
+    if sock
+        == private_tmp_socket_path(
+            &thegn_core::util::xdg_state_home().join("thegn"),
+            effective_uid(),
+        )
+    {
+        validate_private_fallback_parent(&sock)?;
+    }
+    if !has_socket_override && cfg.daemon.socket.is_empty() {
+        reconcile_legacy_socket(&cfg.daemon);
+        if legacy_socket_state() == LegacySocketState::Live {
+            let legacy = thegn_core::config_daemon::legacy_socket_path(
+                &thegn_core::util::xdg_state_home().join("thegn"),
+            );
+            anyhow::bail!(
+                "legacy daemon is still live at {}; detach its panes, then run `thegn daemon stop` before starting a new daemon",
+                legacy.display()
+            );
+        }
+    }
+    let legacy = thegn_core::config_daemon::legacy_socket_path(
+        &thegn_core::util::xdg_state_home().join("thegn"),
+    );
+    if !has_socket_override
+        && cfg.daemon.socket.is_empty()
+        && std::env::var("XDG_RUNTIME_DIR")
+            .map(|value| value.is_empty())
+            .unwrap_or(true)
+        && sock == legacy
+    {
+        anyhow::bail!(
+            "no secure private runtime directory is available for the control socket; set XDG_RUNTIME_DIR or an explicit [daemon] socket"
+        );
+    }
     if let Some(parent) = sock.parent() {
         thegn_svc::ipc::prepare_control_directory(parent, cfg.serve.local_admin)
             .with_context(|| format!("harden control directory {}", parent.display()))?;
@@ -689,6 +964,177 @@ async fn idle_exit_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_tmp_socket_names_include_uid_and_state_hash_without_state_dir() {
+        let a = private_tmp_socket_path(std::path::Path::new("/state/one"), 1000);
+        let b = private_tmp_socket_path(std::path::Path::new("/state/two"), 1000);
+        let other_uid = private_tmp_socket_path(std::path::Path::new("/state/one"), 1001);
+        assert!(a.starts_with("/tmp"));
+        assert!(a.to_string_lossy().contains("thegn-1000-"));
+        assert_ne!(
+            a, b,
+            "distinct state dirs must not share a control directory"
+        );
+        assert_ne!(
+            a, other_uid,
+            "distinct effective uids must not share a control directory"
+        );
+        assert!(!a.starts_with("/state/one"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_private_runtime_uses_uid_scoped_tmp_socket() {
+        let state = std::path::Path::new("/isolated/state/thegn");
+        let socket = socket_path_for(
+            &thegn_core::config::DaemonConfig::default(),
+            None,
+            state,
+            4242,
+            None,
+        );
+        assert_eq!(socket, private_tmp_socket_path(state, 4242));
+        assert!(socket.to_string_lossy().starts_with("/tmp/thegn-4242-"));
+        assert!(!socket.starts_with(state));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_private_fallback_directory_must_have_private_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let td = tempfile::tempdir().unwrap();
+        let parent = td.path().join("thegn-fallback");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let socket = parent.join("daemon.sock");
+        assert!(validate_private_fallback_parent(&socket).is_err());
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(validate_private_fallback_parent(&socket).is_ok());
+    }
+
+    #[test]
+    fn legacy_socket_decision_covers_absent_stale_and_live() {
+        assert_eq!(
+            legacy_socket_decision(true, Some(std::io::ErrorKind::ConnectionRefused)),
+            LegacySocketState::Stale
+        );
+        assert_eq!(legacy_socket_decision(true, None), LegacySocketState::Live);
+        assert_eq!(
+            legacy_socket_decision(true, Some(std::io::ErrorKind::PermissionDenied)),
+            LegacySocketState::Live
+        );
+        assert_eq!(
+            legacy_socket_decision(true, Some(std::io::ErrorKind::WouldBlock)),
+            LegacySocketState::Live
+        );
+        assert_eq!(
+            legacy_socket_decision(false, Some(std::io::ErrorKind::ConnectionRefused)),
+            LegacySocketState::Absent
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_usable_decision_checks_legacy_private_tmp_and_runtime_paths() {
+        let legacy = std::path::Path::new("/state/thegn/run/daemon.sock");
+        let state = std::path::Path::new("/home/blake/.local/state/thegn");
+        let tmp_socket = private_tmp_socket_path(state, 1000);
+        let hash = tmp_socket
+            .parent()
+            .and_then(std::path::Path::file_name)
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(|name| name.rsplit_once('-').map(|(_, hash)| hash))
+            .unwrap();
+        assert!(hash.bytes().any(|byte| (b'g'..=b'z').contains(&byte)));
+        let runtime_socket = std::path::Path::new("/run/user/1000/thegn/daemon.sock");
+        let absent = |_: &std::path::Path| None;
+        assert!(!socket_usable_decision(
+            LegacySocketState::Live,
+            std::path::Path::new("/run/user/1000/thegn/daemon.sock"),
+            legacy,
+            &tmp_socket,
+            false,
+            &absent,
+        ));
+        assert!(!socket_usable_decision(
+            LegacySocketState::Absent,
+            legacy,
+            legacy,
+            &tmp_socket,
+            false,
+            &absent,
+        ));
+
+        let tmp_probe = |path: &std::path::Path| match path {
+            p if p == std::path::Path::new("/tmp") => Some(DirMeta {
+                is_dir: true,
+                is_symlink: false,
+                owned: false,
+                mode: 0o1777,
+            }),
+            _ => None,
+        };
+        assert!(socket_usable_decision(
+            LegacySocketState::Absent,
+            &tmp_socket,
+            legacy,
+            &tmp_socket,
+            false,
+            &tmp_probe,
+        ));
+
+        let bad_mode_probe = |path: &std::path::Path| {
+            (path == tmp_socket.parent().unwrap()).then_some(DirMeta {
+                is_dir: true,
+                is_symlink: false,
+                owned: true,
+                mode: 0o755,
+            })
+        };
+        assert!(!socket_usable_decision(
+            LegacySocketState::Absent,
+            &tmp_socket,
+            legacy,
+            &tmp_socket,
+            false,
+            &bad_mode_probe,
+        ));
+        let foreign_probe = |path: &std::path::Path| {
+            (path == tmp_socket.parent().unwrap()).then_some(DirMeta {
+                is_dir: true,
+                is_symlink: false,
+                owned: false,
+                mode: 0o700,
+            })
+        };
+        assert!(!socket_usable_decision(
+            LegacySocketState::Absent,
+            &tmp_socket,
+            legacy,
+            &tmp_socket,
+            false,
+            &foreign_probe,
+        ));
+
+        let runtime_probe = |path: &std::path::Path| {
+            (path == std::path::Path::new("/run/user/1000")).then_some(DirMeta {
+                is_dir: true,
+                is_symlink: false,
+                owned: true,
+                mode: 0o700,
+            })
+        };
+        assert!(socket_usable_decision(
+            LegacySocketState::Absent,
+            runtime_socket,
+            legacy,
+            &tmp_socket,
+            false,
+            &runtime_probe,
+        ));
+    }
 
     fn row(id: &str, scope: &str, pid: i64) -> DaemonRow {
         DaemonRow {

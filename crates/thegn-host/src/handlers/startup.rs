@@ -41,6 +41,27 @@ pub(crate) fn daemon_active(cfg: &thegn_core::config::Config) -> bool {
         && std::env::var_os("THEGN_BENCH_FIRST_FRAME_EXIT").is_none()
         && std::env::var_os("THEGN_NO_DAEMON").is_none()
         && socket_path_fits(cfg)
+        && daemon_socket_usable(cfg)
+}
+
+pub(crate) fn daemon_socket_usable(cfg: &thegn_core::config::Config) -> bool {
+    if crate::daemon::daemon_socket_usable(&cfg.daemon) {
+        return true;
+    }
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        let legacy = crate::daemon::legacy_socket_state() == crate::daemon::LegacySocketState::Live;
+        if legacy {
+            thegn_core::msg::warn(
+                "pane daemon disabled: an old daemon is still using the legacy socket; detach its panes, run `thegn daemon stop`, then restart thegn. Panes will run in-process until restart.",
+            );
+        } else {
+            thegn_core::msg::warn(
+                "pane daemon disabled: no secure private control socket location is available. Panes will run in-process; set XDG_RUNTIME_DIR to an owner-only directory.",
+            );
+        }
+    });
+    false
 }
 
 /// Whether the resolved control socket fits the platform's `sun_path` bound.

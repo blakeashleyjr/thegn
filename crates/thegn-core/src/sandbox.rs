@@ -671,16 +671,27 @@ pub fn sealed_view(spec: &SandboxSpec) -> std::borrow::Cow<'_, SandboxSpec> {
 /// `$HOME` gate, and the OCI `-v` path syntax check.
 fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, EnterError> {
     admit_volumes(spec)?;
-    // Compose-file volumes never enter `spec.mounts`, so the deny filter and the
-    // `$HOME` gate cannot see them: a sealed spec refuses compose outright.
-    if spec.seal_home.is_some() && spec.compose_spec().is_some() {
-        return Err(EnterError::Refused(
-            "sealed profile cannot verify compose volumes; remove the compose config or use a \
-             non-sealed profile"
-                .into(),
-        ));
+    if let Some(message) = compose_policy_refusal(spec) {
+        return Err(EnterError::Refused(message));
     }
-    let view = sealed_view(spec);
+    let mut view = if !spec.backend.is_oci() && spec.compose.is_some() {
+        let mut owned = spec.clone();
+        owned.compose = None;
+        std::borrow::Cow::Owned(sealed_view(&owned).into_owned())
+    } else {
+        sealed_view(spec)
+    };
+    let mut canonical_view = view.into_owned();
+    for mount in &mut canonical_view.mounts {
+        if spec.placement.is_local()
+            && let Ok(source) = std::path::Path::new(&mount.host).canonicalize()
+        {
+            // Validate and emit the same host identity while preserving the
+            // path-visible destination used by bwrap, OCI, and systemd.
+            mount.host = source.to_string_lossy().into_owned();
+        }
+    }
+    view = std::borrow::Cow::Owned(canonical_view);
     if let Some(m) = crate::sandbox_floor::home_gate(&view) {
         return Err(EnterError::Refused(m));
     }
@@ -700,6 +711,36 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
         systemd_mount_props(&view).map_err(EnterError::Refused)?;
     }
     Ok(view)
+}
+
+/// Refusal for a Compose-backed OCI launch whose requested restrictions Compose
+/// cannot apply. Reused by the candidate walk so a miss cannot fall through to
+/// a host shell.
+pub fn compose_policy_refusal(spec: &SandboxSpec) -> Option<String> {
+    (spec.backend.is_oci() && spec.compose_spec().is_some() && compose_cannot_enforce(spec)).then(
+        || {
+            "Compose cannot enforce the requested sandbox restrictions on OCI backends: \
+         read_only_root, no_new_privileges, pids_limit, dropped capabilities, sealed home, \
+         network-none or network filters, oci_runtime, per-pane CPU/memory limits, and VPN. \
+         Remove the conflicting restriction or Compose config."
+                .to_string()
+        },
+    )
+}
+
+fn compose_cannot_enforce(spec: &SandboxSpec) -> bool {
+    spec.read_only_root
+        || spec.no_new_privileges
+        || spec.pids_limit.is_some()
+        || !spec.drop_capabilities.is_empty()
+        || spec.seal_home.is_some()
+        || spec.network == Network::None
+        || !spec.network_allow.is_empty()
+        || !spec.network_block.is_empty()
+        || spec.oci_runtime.is_some()
+        || spec.limits.cpu.is_some()
+        || spec.limits.memory.is_some()
+        || spec.vpn.is_some()
 }
 
 /// The portable Thegn named-volume lexical policy. A source must begin with
@@ -2266,7 +2307,7 @@ pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Result<Vec<String>, EnterE
     // `docker compose exec <service>` — no container-name guessing.
     let backend_argv = spec
         .compose_spec()
-        .filter(|c| c.has_service())
+        .filter(|c| spec.backend.is_oci() && c.has_service())
         .and_then(|c| {
             let workdir = (spec.file_access != FileAccess::None)
                 .then(|| spec.worktree.to_string_lossy().into_owned());
@@ -2439,15 +2480,51 @@ fn bwrap_mount_covered(mount: &Mount, hardcoded_parents: &[&str]) -> bool {
 
 /// The backend-specific argv that runs `/bin/sh -lc <script>` in the sandbox.
 fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
-    backend_enter_argv_with_resolver_dir(spec, script, None)
+    backend_enter_argv_with_env(
+        spec,
+        script,
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: systemd_runtime_dir(std::env::var_os("XDG_RUNTIME_DIR")),
+        },
+    )
+}
+
+fn systemd_runtime_dir(value: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    value
+        .map(std::path::PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| Some(std::path::PathBuf::from("/run/user")))
 }
 
 /// Build backend argv with an optional injected resolver directory for tests.
 /// Production callers leave it unset and use the host resolver probe.
+#[cfg(test)]
 fn backend_enter_argv_with_resolver_dir(
     spec: &SandboxSpec,
     script: &str,
     resolved_resolver_dir: Option<&std::path::Path>,
+) -> Vec<String> {
+    backend_enter_argv_with_env(
+        spec,
+        script,
+        SandboxArgvEnv {
+            resolver_dir: resolved_resolver_dir.map(std::path::Path::to_path_buf),
+            runtime_dir: None,
+        },
+    )
+}
+
+#[derive(Default)]
+struct SandboxArgvEnv {
+    resolver_dir: Option<std::path::PathBuf>,
+    runtime_dir: Option<std::path::PathBuf>,
+}
+
+fn backend_enter_argv_with_env(
+    spec: &SandboxSpec,
+    script: &str,
+    env: SandboxArgvEnv,
 ) -> Vec<String> {
     let wt = spec.worktree.to_string_lossy().into_owned();
     // Keyed on the backend *family* (one arm per way of driving a sandbox),
@@ -2529,7 +2606,7 @@ fn backend_enter_argv_with_resolver_dir(
             let resolver_dir = if spec.placement.is_local()
                 && !matches!(spec.file_access, FileAccess::All | FileAccess::Host)
             {
-                match resolved_resolver_dir {
+                match env.resolver_dir.as_deref() {
                     Some(dir) => resolver_bind_filter(spec, &hardcoded_parents, dir),
                     None => bwrap_resolver_bind(spec, &hardcoded_parents),
                 }
@@ -2645,6 +2722,17 @@ fn backend_enter_argv_with_resolver_dir(
                 // allowlist, worktree and caches are bound back in below.
                 let protect_home = if sealed_home { "tmpfs" } else { "read-only" };
                 v.extend(["-p".into(), format!("ProtectHome={protect_home}")]);
+                if let Some(runtime_dir) = env.runtime_dir.as_deref() {
+                    let control_dir = if runtime_dir == std::path::Path::new("/run/user") {
+                        runtime_dir.to_path_buf()
+                    } else {
+                        runtime_dir.join("thegn")
+                    };
+                    v.extend([
+                        "-p".into(),
+                        format!("InaccessiblePaths=-{}", control_dir.display()),
+                    ]);
+                }
             }
             for property in systemd_mount_props(spec)
                 .unwrap_or_else(|_| vec!["ThegnRefusedUnsafeMountPath=yes".into()])

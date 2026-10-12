@@ -80,6 +80,39 @@ pub struct HostConfig {
     pub cloud: HostCloudConfig,
 }
 
+/// Compare the connection authority behind two host definitions. Display and
+/// provisioning preferences intentionally do not participate: re-adding the
+/// same machine may update its image or install consent without rebinding the
+/// host name to a different authority.
+pub fn same_host_authority(a: &HostConfig, b: &HostConfig) -> bool {
+    if a.reach != b.reach {
+        return false;
+    }
+    match a.reach {
+        HostReach::Local => true,
+        HostReach::Ssh => {
+            a.ssh.host == b.ssh.host
+                && a.ssh.port == b.ssh.port
+                && a.ssh.transport == b.ssh.transport
+                && a.ssh.ssh_config == b.ssh.ssh_config
+                && a.ssh.jump_host == b.ssh.jump_host
+                && a.ssh.identity == b.ssh.identity
+                && a.ssh.extra_args == b.ssh.extra_args
+        }
+        HostReach::Iroh => {
+            a.iroh.ticket == b.iroh.ticket
+                && a.iroh.user == b.iroh.user
+                && a.iroh.ssh_port == b.iroh.ssh_port
+        }
+        HostReach::Cloud => {
+            a.cloud.provider == b.cloud.provider
+                && a.cloud.api_base == b.cloud.api_base
+                && a.cloud.template == b.cloud.template
+                && a.cloud.api_key_env == b.cloud.api_key_env
+        }
+    }
+}
+
 /// `[host.<n>.iroh]` — a NAT'd host behind a dumbpipe listener.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -917,6 +950,183 @@ mod tests {
                 == 22,
             "non-numeric suffix is part of the hostname, not a port"
         );
+    }
+
+    #[test]
+    fn host_authority_comparison_covers_each_reach() {
+        use crate::config::RemoteTransport;
+
+        let ssh = HostConfig {
+            reach: HostReach::Ssh,
+            ssh: crate::config::EnvSshConfig {
+                host: "me@box".into(),
+                ..crate::config::EnvSshConfig::default()
+            },
+            ..HostConfig::default()
+        };
+        assert!(same_host_authority(&ssh, &ssh));
+        for changed in [
+            HostConfig {
+                ssh: crate::config::EnvSshConfig {
+                    host: "you@box".into(),
+                    ..ssh.ssh.clone()
+                },
+                ..ssh.clone()
+            },
+            HostConfig {
+                ssh: crate::config::EnvSshConfig {
+                    port: 2200,
+                    ..ssh.ssh.clone()
+                },
+                ..ssh.clone()
+            },
+            HostConfig {
+                ssh: crate::config::EnvSshConfig {
+                    transport: RemoteTransport::Ssh,
+                    ..ssh.ssh.clone()
+                },
+                ..ssh.clone()
+            },
+            HostConfig {
+                ssh: crate::config::EnvSshConfig {
+                    ssh_config: "config".into(),
+                    ..ssh.ssh.clone()
+                },
+                ..ssh.clone()
+            },
+            HostConfig {
+                ssh: crate::config::EnvSshConfig {
+                    jump_host: "jump".into(),
+                    ..ssh.ssh.clone()
+                },
+                ..ssh.clone()
+            },
+            HostConfig {
+                ssh: crate::config::EnvSshConfig {
+                    identity: "identity".into(),
+                    ..ssh.ssh.clone()
+                },
+                ..ssh.clone()
+            },
+            HostConfig {
+                ssh: crate::config::EnvSshConfig {
+                    extra_args: vec!["-x".into()],
+                    ..ssh.ssh.clone()
+                },
+                ..ssh.clone()
+            },
+        ] {
+            assert!(!same_host_authority(&ssh, &changed));
+        }
+        assert!(!same_host_authority(
+            &ssh,
+            &HostConfig {
+                reach: HostReach::Local,
+                ..HostConfig::default()
+            }
+        ));
+
+        let iroh = HostConfig {
+            reach: HostReach::Iroh,
+            iroh: HostIrohConfig {
+                ticket: "ticket".into(),
+                user: "me".into(),
+                ssh_port: 2222,
+            },
+            ..HostConfig::default()
+        };
+        assert!(same_host_authority(&iroh, &iroh));
+        for changed in [
+            HostConfig {
+                iroh: HostIrohConfig {
+                    ticket: "other".into(),
+                    ..iroh.iroh.clone()
+                },
+                ..iroh.clone()
+            },
+            HostConfig {
+                iroh: HostIrohConfig {
+                    user: "other".into(),
+                    ..iroh.iroh.clone()
+                },
+                ..iroh.clone()
+            },
+            HostConfig {
+                iroh: HostIrohConfig {
+                    ssh_port: 2200,
+                    ..iroh.iroh.clone()
+                },
+                ..iroh.clone()
+            },
+        ] {
+            assert!(!same_host_authority(&iroh, &changed));
+        }
+
+        let cloud = HostConfig {
+            reach: HostReach::Cloud,
+            cloud: HostCloudConfig {
+                provider: "p".into(),
+                api_base: "https://api.invalid".into(),
+                template: "t".into(),
+                api_key_env: "TOKEN".into(),
+            },
+            ..HostConfig::default()
+        };
+        assert!(same_host_authority(&cloud, &cloud));
+        for changed in [
+            HostConfig {
+                cloud: HostCloudConfig {
+                    provider: "q".into(),
+                    ..cloud.cloud.clone()
+                },
+                ..cloud.clone()
+            },
+            HostConfig {
+                cloud: HostCloudConfig {
+                    api_base: "https://other.invalid".into(),
+                    ..cloud.cloud.clone()
+                },
+                ..cloud.clone()
+            },
+            HostConfig {
+                cloud: HostCloudConfig {
+                    template: "other".into(),
+                    ..cloud.cloud.clone()
+                },
+                ..cloud.clone()
+            },
+            HostConfig {
+                cloud: HostCloudConfig {
+                    api_key_env: "OTHER".into(),
+                    ..cloud.cloud.clone()
+                },
+                ..cloud.clone()
+            },
+        ] {
+            assert!(!same_host_authority(&cloud, &changed));
+        }
+
+        let local = HostConfig {
+            reach: HostReach::Local,
+            ..HostConfig::default()
+        };
+        assert!(same_host_authority(&local, &local));
+        assert!(same_host_authority(
+            &local,
+            &HostConfig {
+                image: "changed:image".into(),
+                install_runtime: InstallConsent::Auto,
+                ..local.clone()
+            }
+        ));
+        assert!(same_host_authority(
+            &ssh,
+            &HostConfig {
+                image: "changed:image".into(),
+                install_runtime: InstallConsent::Auto,
+                ..ssh.clone()
+            }
+        ));
     }
 
     #[test]

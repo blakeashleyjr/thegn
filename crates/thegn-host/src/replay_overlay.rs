@@ -30,6 +30,7 @@ use crate::seg::{self, Line, Tok, seg};
 
 /// Seek granularity for the `←`/`→` keys.
 const SEEK_STEP_MS: u64 = 5_000;
+const PARTIAL_HISTORY_BADGE: &str = " partial history ";
 /// Cap query normalization and substring work independently of recording size.
 const SEARCH_MAX_QUERY_BYTES: usize = 1024;
 type ReplayConfigVersion = (bool, u64, u64, u64, u64, u64, bool);
@@ -322,7 +323,18 @@ impl ReplayOverlay {
                     self.note = format!("match: {query}");
                 }
             }
+            SearchResult::PartialMatch(at) => {
+                if at < rec.start_ms() {
+                    self.note = format!("match evicted: {query} (partial history)");
+                } else {
+                    self.seek(rec, at);
+                    self.note = format!("match: {query} (partial history)");
+                }
+            }
             SearchResult::NoMatch => self.note = format!("no match: {query}"),
+            SearchResult::PartialNoMatch => {
+                self.note = format!("no match: {query} (partial history)")
+            }
             SearchResult::Incomplete => self.note = format!("search incomplete: {query}"),
             SearchResult::Cancelled => return false,
         }
@@ -479,7 +491,17 @@ impl ReplayOverlay {
         let end = rec.end_ms();
         let span = end.saturating_sub(start).max(1);
         let frac = (self.cursor_ms.saturating_sub(start)) as f64 / span as f64;
-        let bar_w = rect.cols.saturating_sub(2).clamp(4, 40);
+        let full_bar_w = rect.cols.saturating_sub(2).clamp(4, 40);
+        let badge_w = if rec.history_truncated() {
+            PARTIAL_HISTORY_BADGE.len()
+        } else {
+            0
+        };
+        // The persistent badge takes its width from the scrub track, so the
+        // truncated layout retains the same left-side footprint as an intact
+        // recording. The small-width floor keeps the track useful in narrow
+        // overlays.
+        let bar_w = full_bar_w.saturating_sub(badge_w).max(4);
         let filled = ((frac * bar_w as f64).round() as usize).min(bar_w);
         // Keyframe positions become faint tick marks so the timeline shows where
         // activity clustered.
@@ -506,12 +528,15 @@ impl ReplayOverlay {
         let clock = format!(" {} / {}  ", fmt_ms(self.cursor_ms), fmt_ms(end));
         let speed = format!("{}x", trim_speed(self.speed));
 
-        let mut left = vec![
-            seg(Tok::Slot(S::Accent), icon).bold(),
+        let mut left = vec![seg(Tok::Slot(S::Accent), icon).bold()];
+        if rec.history_truncated() {
+            left.push(seg(Tok::Slot(S::Ghost3), PARTIAL_HISTORY_BADGE));
+        }
+        left.extend([
             seg(Tok::Slot(S::Accent), track),
             seg(Tok::Slot(S::Text), clock),
             seg(Tok::Slot(S::Ghost2), speed),
-        ];
+        ]);
         if !self.note.is_empty() {
             left.push(seg(Tok::Slot(S::Ghost3), format!("   {}", self.note)));
         }
@@ -519,12 +544,17 @@ impl ReplayOverlay {
             Tok::Slot(S::Ghost),
             "space ⏯  ←→ seek  j/k step  [ ] speed  r rev  / find  e export  q quit",
         )];
+        let min_left = seg::seg_width(&left).min(rect.cols);
         seg::draw_line(
             surface,
             rect.x,
             by,
             rect.cols,
-            &Line::split(left, right),
+            &Line::SplitMinLeft {
+                l: left,
+                r: right,
+                min_l: min_left,
+            },
             panel,
         );
 
@@ -1092,6 +1122,76 @@ mod tests {
                 rows: 3,
             },
             &rec,
+        );
+    }
+
+    #[test]
+    fn render_shows_partial_history_badge_only_after_boundary_loss() {
+        let mut truncated = Recording::from_config(
+            &ReplayConfig {
+                max_bytes_per_pane: 140,
+                max_duration_secs: 0,
+                ..ReplayConfig::default()
+            },
+            24,
+            80,
+        );
+        let epoch = truncated.epoch();
+        truncated.push_bytes(b"\x1b[2;3H  ", epoch);
+        truncated.push_bytes(b"X", epoch + std::time::Duration::from_millis(1));
+        let truncated_overlay = ReplayOverlay::new(1, &truncated, 1000);
+        let mut truncated_surface = Surface::new(80, 5);
+        truncated_overlay.render(
+            &mut truncated_surface,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 80,
+                rows: 5,
+            },
+            &truncated,
+        );
+        let truncated_text: String = truncated_surface
+            .screen_cells()
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.str()).collect::<String>())
+            .collect::<Vec<_>>()
+            .concat();
+        assert!(truncated_text.contains("partial history"));
+        let track_cells = truncated_text
+            .chars()
+            .filter(|ch| matches!(ch, '━' | '┿' | '─'))
+            .count();
+        assert!(track_cells > 12);
+
+        let fresh = recording_with(&[(b"hello", 10)]);
+        let fresh_overlay = ReplayOverlay::new(1, &fresh, 1000);
+        let mut fresh_surface = Surface::new(80, 5);
+        fresh_overlay.render(
+            &mut fresh_surface,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 80,
+                rows: 5,
+            },
+            &fresh,
+        );
+        let fresh_text: String = fresh_surface
+            .screen_cells()
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.str()).collect::<String>())
+            .collect::<Vec<_>>()
+            .concat();
+        assert!(!fresh_text.contains("partial history"));
+        let fresh_track_cells = fresh_text
+            .chars()
+            .filter(|ch| matches!(ch, '━' | '┿' | '─'))
+            .count();
+        assert_eq!(
+            track_cells + PARTIAL_HISTORY_BADGE.len(),
+            fresh_track_cells,
+            "the badge should consume only its own width from the scrub track"
         );
     }
 

@@ -632,6 +632,7 @@ pub fn prepare_sandbox_env(
     let mut floor_miss: Option<thegn_core::sandbox_floor::FloorMiss> = None;
     // Same, for a sealed profile whose `$HOME` confidentiality no candidate met.
     let mut home_miss: Option<String> = None;
+    let mut compose_miss: Option<String> = None;
     for candidate in sandbox_candidates(&sb) {
         // `resolve_placed_exact`, not `resolve_placed`: `sandbox_candidates` has
         // ALREADY expanded the chain into one explicit candidate per entry, so a
@@ -762,6 +763,20 @@ pub fn prepare_sandbox_env(
                 home_miss = Some(m);
                 continue;
             }
+            if let Some(m) = thegn_core::sandbox::compose_policy_refusal(&spec) {
+                if explicit_choice {
+                    anyhow::bail!("{m} for {worktree}");
+                }
+                thegn_core::msg::warn(&format!("{m} for {worktree}; trying next backend"));
+                compose_miss = Some(m);
+                continue;
+            }
+            if !spec.backend.is_oci() && spec.compose.is_some() {
+                warnings.push(format!(
+                    "sandbox {} does not support Compose; the Compose services were omitted",
+                    spec.backend.label()
+                ));
+            }
             // Say which hardening knobs this runtime can't express, rather than
             // shipping a quietly weaker profile than the config asked for.
             let dropped = thegn_core::sandbox::unsupported_hardening(&spec);
@@ -836,6 +851,16 @@ pub fn prepare_sandbox_env(
     // to launch rather than drop to the host (the VPN `on_error = "fail"`
     // doctrine). This fires for local and remote alike — nothing has spawned.
     if let Some(m) = home_miss {
+        return Err(SandboxHalt {
+            env_name: env_name.clone(),
+            placement: placement_label.clone(),
+            reason: m,
+            ask,
+            dormant: None,
+        }
+        .into());
+    }
+    if let Some(m) = compose_miss {
         return Err(SandboxHalt {
             env_name: env_name.clone(),
             placement: placement_label.clone(),

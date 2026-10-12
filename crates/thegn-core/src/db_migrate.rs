@@ -1177,6 +1177,41 @@ pub(crate) fn verify_v74_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v75: retain the provider resource key for each cached calendar component.
+/// Existing cache rows keep their event data with `href = NULL`; clearing
+/// CalDAV sync tokens forces a full snapshot to repopulate those rows with hrefs.
+pub(crate) fn migrate_v75(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "calendar_events", "href") {
+        conn.execute("ALTER TABLE calendar_events ADD COLUMN href TEXT", [])?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS calendar_events_href ON calendar_events(account, href)",
+    )?;
+    conn.execute(
+        "UPDATE calendar_sync SET sync_token = '' WHERE provider = 'caldav'",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Verify the v75 resource identity column and lookup index.
+pub(crate) fn verify_v75_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "calendar_events", "href") {
+        bail!("schema v75 migration did not add calendar_events.href");
+    }
+    let index: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='calendar_events_href'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if index.is_none() {
+        bail!("schema v75 migration did not create calendar_events_href");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -1624,7 +1659,8 @@ mod tests {
     use crate::autopilot::AutopilotIssueKey;
     use crate::db::Db;
     use crate::store::{
-        AutopilotStore, ClaimOutcome, NotificationStore, SessionForkStore, WorkspaceStore,
+        AutopilotStore, CalendarRow, CalendarStore, ClaimOutcome, NotificationStore,
+        SessionForkStore, WorkspaceStore,
     };
     use rusqlite::{Connection, params};
 
@@ -1743,6 +1779,106 @@ mod tests {
         assert_eq!(
             (head.as_str(), status.as_str(), rerun),
             ("head-a", "watching", None)
+        );
+    }
+
+    #[test]
+    fn v75_adds_calendar_href_idempotently_and_preserves_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE calendar_events (
+                 account TEXT NOT NULL, uid TEXT NOT NULL, calendar TEXT NOT NULL,
+                 start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
+                 recurring INTEGER NOT NULL, json TEXT NOT NULL, fetched_at INTEGER NOT NULL,
+                 PRIMARY KEY(account, uid));
+             INSERT INTO calendar_events VALUES ('a','abc','','1','2',0,'{}',3);
+             CREATE TABLE calendar_sync (
+                 account TEXT PRIMARY KEY, provider TEXT NOT NULL,
+                 sync_token TEXT NOT NULL DEFAULT ''
+             );
+             INSERT INTO calendar_sync VALUES ('caldav-account','caldav','token-1');
+             INSERT INTO calendar_sync VALUES ('ics-account','ics_url','etag-1');",
+        )
+        .unwrap();
+        assert!(super::verify_v75_schema(&conn).is_err());
+        super::migrate_v75(&conn).unwrap();
+        super::migrate_v75(&conn).unwrap();
+        super::verify_v75_schema(&conn).unwrap();
+        let (uid, href): (String, Option<String>) = conn
+            .query_row(
+                "SELECT uid, href FROM calendar_events WHERE account='a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(uid, "abc");
+        assert_eq!(href, None);
+        let caldav_token: String = conn
+            .query_row(
+                "SELECT sync_token FROM calendar_sync WHERE account='caldav-account'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ics_token: String = conn
+            .query_row(
+                "SELECT sync_token FROM calendar_sync WHERE account='ics-account'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(caldav_token.is_empty(), "v75 forces a CalDAV snapshot");
+        assert_eq!(ics_token, "etag-1", "non-CalDAV cursors are preserved");
+    }
+
+    #[test]
+    fn calendar_href_delete_removes_resource_components_and_only_legacy_uid_fallback() {
+        let db = Db::open_memory().unwrap();
+        db.put_calendar_events(
+            "a",
+            &[
+                CalendarRow {
+                    uid: "abc".into(),
+                    href: Some("/cal/opaque-123.ics".into()),
+                    json: r#"{"uid":"abc","href":"/cal/opaque-123.ics"}"#.into(),
+                    ..Default::default()
+                },
+                CalendarRow {
+                    uid: "opaque-123".into(),
+                    href: Some("/cal/other.ics".into()),
+                    json: r#"{"uid":"opaque-123","href":"/cal/other.ics"}"#.into(),
+                    ..Default::default()
+                },
+                CalendarRow {
+                    uid: "gone".into(),
+                    href: None,
+                    json: r#"{"uid":"gone"}"#.into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+        db.delete_calendar_events_by_href(
+            "a",
+            &[
+                ("/cal/opaque-123.ics".into(), "opaque-123".into()),
+                ("/cal/gone.ics".into(), "gone".into()),
+            ],
+        )
+        .unwrap();
+        let mut stmt = db
+            .conn()
+            .prepare("SELECT uid, href FROM calendar_events WHERE account='a'")
+            .unwrap();
+        let survivor: Vec<(String, Option<String>)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            survivor,
+            [("opaque-123".to_owned(), Some("/cal/other.ics".to_owned()))],
+            "only the unrelated resource survives; abc and gone are deleted"
         );
     }
 
@@ -2100,6 +2236,7 @@ mod tests {
                 end_ms: 1_800_003_600_000,
                 recurring: false,
                 json: "{}".into(),
+                ..Default::default()
             }],
         )
         .unwrap();
@@ -2464,6 +2601,7 @@ mod tests {
             end_ms: start + 3_600_000,
             recurring,
             json: format!("{{\"uid\":\"{uid}\"}}"),
+            ..Default::default()
         };
         db.replace_calendar_account("a", &[row("a1", 1_000_000, false)])
             .unwrap();
@@ -2542,6 +2680,7 @@ mod tests {
             end_ms: end,
             recurring: false,
             json: format!("{{\"uid\":\"{uid}\"}}"),
+            ..Default::default()
         };
         db.replace_calendar_account(
             "a",
@@ -2578,6 +2717,7 @@ mod tests {
                 end_ms: 2_000_000,
                 recurring: false,
                 json: "{}".into(),
+                ..Default::default()
             }],
         )
         .unwrap();
@@ -2626,6 +2766,7 @@ mod tests {
             end_ms: 2_000,
             recurring,
             json: format!("{{\"uid\":\"{uid}\"}}"),
+            ..Default::default()
         };
         db.replace_calendar_account("a", &[row("old", false), row("weekly", true)])
             .unwrap();

@@ -1207,8 +1207,8 @@ fn done_gate(row: &AgentDispatch) -> Result<()> {
 /// Gather the filesystem/git facts for one roster row — the single
 /// implementation shared by `dispatch verify`, the `done` gate, and
 /// `session open --resume-work`'s finisher facts. A row with
-/// no artifact is never gated, so no git subprocess is spent on it; the facts
-/// read as all-false and `verify_report`'s first rule turns that into `ok`.
+/// no artifact is never sent to git; stage-less rows retain plain-dispatch
+/// behavior while pipeline rows are refused by `verify_report`.
 /// `pub(crate)`: the resume path in `cmd/session.rs` reads the same facts —
 /// one implementation, two callers.
 pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
@@ -1224,6 +1224,7 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
         .map(str::to_string)
     else {
         return pipeline_run::VerifyFacts {
+            stage: row.stage.clone(),
             artifact: None,
             exists: false,
             tracked: false,
@@ -1270,6 +1271,7 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
     // `verify_report` turns the missing case into an `ok=false` reason that
     // names the `dispatch report` command as the fix.
     pipeline_run::VerifyFacts {
+        stage: row.stage.clone(),
         artifact: Some(artifact),
         exists,
         tracked,
@@ -1610,20 +1612,9 @@ fn note(id: i64, text: &str, json: bool) -> Result<()> {
 /// THE-88 — the DB-bound half of `dispatch note`.
 pub(crate) fn write_note(db: &Db, id: i64, text: &str, json: bool) -> Result<()> {
     let validated = pipeline_report::note_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let note_id = db.append_dispatch_note(id, &validated)?;
-    let note = db
-        .dispatch_notes(id, None, 0)?
-        .into_iter()
-        .find(|n| n.id == note_id)
-        .ok_or_else(|| anyhow::anyhow!("note {note_id} vanished after insert"))?;
+    let note = db.append_dispatch_note_record(id, &validated)?;
     if json {
-        let v = serde_json::json!({
-            "id": id,
-            "note": validated,
-            "note_id": note.id,
-            "created_at_ms": note.created_at_ms,
-        });
-        super::emit_json(&v)?;
+        super::emit_json(&note_json(id, &note))?;
     } else {
         outln!(
             "note recorded on dispatch {} ({} chars)",
@@ -1634,9 +1625,18 @@ pub(crate) fn write_note(db: &Db, id: i64, text: &str, json: bool) -> Result<()>
     Ok(())
 }
 
+fn note_json(id: i64, note: &DispatchNote) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "note": &note.text,
+        "note_id": note.id,
+        "created_at_ms": note.created_at_ms,
+    })
+}
+
 /// The row-mode status display is bounded to the newest notes. The digest
-/// itself receives the full since-filtered set so its `note_count` remains a
-/// count of all matching notes, not merely the displayed suffix.
+/// itself receives the bounded suffix; `read_status` supplies the full
+/// matching count separately from SQL.
 fn newest_status_notes(notes: &[DispatchNote]) -> &[DispatchNote] {
     if notes.len() > 20 {
         &notes[notes.len() - 20..]
@@ -1650,7 +1650,7 @@ fn newest_status_notes(notes: &[DispatchNote]) -> &[DispatchNote] {
 /// `pipeline_report::digest`: without `row` → active rows only
 /// (`is_active()`), `--all` → every row; with `row` → that row (error
 /// naming the id when unknown), report verbatim + notes since `--since`
-/// (default all, capped last 20 via `db.dispatch_notes`). JSON: the
+/// (default all, count plus newest 20 via bounded SQL queries). JSON: the
 /// digest array (row mode: one digest + `notes` array). Human: one line
 /// per row `id status stage issue notes=N last=<truncated latest>` and, in
 /// row mode, the report body printed verbatim under a `report:` line.
@@ -1680,12 +1680,15 @@ pub(crate) fn read_status(
 
     let row_mode = row.is_some();
     let mut notes_map: HashMap<i64, Vec<DispatchNote>> = HashMap::new();
+    let mut note_counts = HashMap::new();
     for r in &rows {
-        // Keep the full since-filtered set for `digest`: the output is capped,
-        // but `note_count` must still describe the complete queue window.
-        notes_map.insert(r.id, db.dispatch_notes(r.id, since_ms, 0)?);
+        note_counts.insert(r.id, db.dispatch_note_count(r.id, since_ms)?);
+        notes_map.insert(r.id, db.newest_dispatch_notes(r.id, since_ms, 20)?);
     }
-    let digests = pipeline_report::digest(&rows, &notes_map, since_ms);
+    let mut digests = pipeline_report::digest(&rows, &notes_map, since_ms);
+    for digest in &mut digests {
+        digest.note_count = note_counts.get(&digest.id).copied().unwrap_or_default();
+    }
     if json {
         if row_mode {
             let digest = digests.into_iter().next().expect("one selected row");
@@ -1880,9 +1883,8 @@ struct FencedWaitTarget {
 /// A gone session is not evidence of a handoff. Verify the exact current row
 /// using the same completion facts as `dispatch verify`, then fence the result
 /// against the selected session and generation.
-/// Artifactless rows retain plain-dispatch semantics: a non-empty report is
-/// their complete row handoff. This does not validate pipeline report evidence
-/// or bypass THE-241, which owns that contract.
+/// Artifactless plain rows retain their report-based handoff semantics;
+/// artifactless pipeline reservations are unverified candidates.
 fn wake_handoff(
     db: Result<Db>,
     target: &FencedWaitTarget,
@@ -1916,7 +1918,7 @@ fn wake_handoff(
     let verdict = pipeline_run::verify_report(&facts);
     let outcome = if facts.worktree_state == Some(pipeline_run::WorktreeState::Unknown) {
         pipeline_run::HandoffOutcome::InfrastructureUnknown
-    } else if facts.artifact.is_none() {
+    } else if facts.artifact.is_none() && facts.stage.is_none() {
         if facts.report_present {
             pipeline_run::HandoffOutcome::VerifiedHandoff
         } else {
@@ -1924,6 +1926,8 @@ fn wake_handoff(
         }
     } else if verdict.ok {
         pipeline_run::HandoffOutcome::VerifiedHandoff
+    } else if facts.stage.is_some() && facts.artifact.is_none() {
+        pipeline_run::HandoffOutcome::UnverifiedCandidate
     } else if !facts.exists && !facts.report_present {
         pipeline_run::HandoffOutcome::Absent
     } else {
@@ -2127,6 +2131,37 @@ mod tests {
         assert_eq!(artifact.as_deref(), Some("handoff.md"));
         assert_eq!(outcome, pipeline_run::HandoffOutcome::Absent);
         assert!(!outcome.handoff_present(), "assigned path is not a handoff");
+    }
+
+    #[test]
+    fn artifactless_pipeline_reservation_is_not_a_verified_wake_handoff() {
+        let (_dir, db) = db("wake-reservation");
+        let (_worktree_dir, worktree) = git_repo("wake-reservation-worktree");
+        let id = db
+            .put_agent_dispatch(thegn_core::issue::NewDispatch {
+                stage: Some("code"),
+                ..thegn_core::issue::NewDispatch::new(
+                    "linear:THE-241",
+                    worktree.to_str().unwrap(),
+                    "coder",
+                )
+            })
+            .unwrap();
+        db.set_dispatch_report(id, "verdict: done").unwrap();
+        db.bind_dispatch_session(id, "reservation-session").unwrap();
+        let run = db.dispatch_run_ref(id).unwrap().unwrap();
+        let target = FencedWaitTarget {
+            target: WaitTarget {
+                id,
+                session_id: run.session_id,
+                stage: Some("code".into()),
+                issue_id: "linear:THE-241".into(),
+            },
+            run_gen: run.run_gen,
+        };
+        let (outcome, _, artifact) = wake_handoff(Ok(db), &target);
+        assert_eq!(artifact, None);
+        assert_eq!(outcome, pipeline_run::HandoffOutcome::UnverifiedCandidate);
     }
 
     #[test]
@@ -2841,7 +2876,23 @@ mod tests {
     #[test]
     fn the_done_gate_passes_by_construction_for_a_row_without_artifact() {
         let (_d, root) = git_repo("gate-none");
-        done_gate(&row_in(&root, None)).unwrap();
+        let mut row = row_in(&root, None);
+        row.stage = None;
+        done_gate(&row).unwrap();
+    }
+
+    #[test]
+    fn the_done_gate_refuses_a_pipeline_reservation_without_artifact() {
+        let (_d, root) = git_repo("gate-reservation");
+        let row = row_in(&root, None);
+        let facts = verify_facts(&row);
+        assert_eq!(facts.stage.as_deref(), Some("code"));
+        let err = done_gate(&row).unwrap_err().to_string();
+        assert!(
+            err.contains("no artifact path") && err.contains("publish"),
+            "{err}"
+        );
+        assert!(err.contains("--force"), "{err}");
     }
 
     // --- THE-88: report / note / status verbs ------------------------------
@@ -2887,6 +2938,12 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].text, "first");
         assert_eq!(all[1].text, "second");
+        let inserted = db.append_dispatch_note_record(row.id, "direct").unwrap();
+        assert_eq!(inserted.text, "direct");
+        assert_eq!(inserted.dispatch_id, row.id);
+        let json = note_json(row.id, &inserted);
+        assert_eq!(json["note_id"], inserted.id);
+        assert_eq!(json["created_at_ms"], inserted.created_at_ms);
         // Unknown row refused.
         let err = write_note(&db, 99, "x", false).unwrap_err().to_string();
         assert!(err.contains("99"), "{err}");

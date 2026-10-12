@@ -776,6 +776,7 @@ pub fn apply_font_family(family: &str) -> Result<PathBuf, String> {
 /// [`apply_font_family`] with the terminal chosen by the caller — the seam the
 /// tests drive.
 pub fn apply_font_family_for(kind: TerminalKind, family: &str) -> Result<PathBuf, String> {
+    validate_family(family)?;
     match kind {
         TerminalKind::Alacritty => {
             let path = alacritty_config_path().ok_or_else(|| {
@@ -819,7 +820,12 @@ pub fn apply_font_family_for(kind: TerminalKind, family: &str) -> Result<PathBuf
 /// both terminals treat a missing config as empty defaults, so writing one is
 /// the same as editing it.
 fn write_simple_key(path: &Path, key: &str, new_line: &str, family: &str) -> Result<(), String> {
-    let current = std::fs::read_to_string(path).unwrap_or_default();
+    validate_family(family)?;
+    let current = match std::fs::read_to_string(path) {
+        Ok(current) => current,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read {} failed: {e}", path.display())),
+    };
     let mut out: Vec<String> = Vec::new();
     let mut replaced = false;
     for line in current.lines() {
@@ -839,7 +845,6 @@ fn write_simple_key(path: &Path, key: &str, new_line: &str, family: &str) -> Res
     if !replaced {
         out.push(new_line.to_string());
     }
-    let _ = family;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("create {} failed: {e}", dir.display()))?;
@@ -857,6 +862,7 @@ fn apply_font_family_to_path(path: &Path, family: &str) -> Result<(), String> {
 }
 
 pub fn patch_alacritty_font_family(input: &str, family: &str) -> Result<String, String> {
+    validate_family(family)?;
     let escaped = family.replace('\\', "\\\\").replace('"', "\\\"");
     let mut changed = false;
     let mut out = Vec::new();
@@ -879,6 +885,19 @@ pub fn patch_alacritty_font_family(input: &str, family: &str) -> Result<String, 
         rendered.push('\n');
     }
     Ok(rendered)
+}
+
+fn validate_family(family: &str) -> Result<(), String> {
+    if family.trim().is_empty() {
+        return Err("font family must not be empty or whitespace-only".into());
+    }
+    if family.chars().any(char::is_control) {
+        return Err("font family must not contain control characters".into());
+    }
+    if family.len() > 256 {
+        return Err("font family must be no more than 256 bytes".into());
+    }
+    Ok(())
 }
 
 fn normalize_family(family: &str) -> String {
@@ -1035,6 +1054,65 @@ mod tests {
         .unwrap();
         let out = std::fs::read_to_string(&k).unwrap();
         assert_eq!(out.trim(), "font_family Iosevka Nerd Font");
+    }
+
+    #[test]
+    fn simple_key_read_failures_preserve_the_original_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let invalid_utf8 = tmp.path().join("invalid.conf");
+        let original = [0xff, 0xfe, b'\n'];
+        std::fs::write(&invalid_utf8, original).unwrap();
+
+        let err =
+            write_simple_key(&invalid_utf8, "font_family", "font_family Hack", "Hack").unwrap_err();
+        assert!(err.starts_with("read "), "{err}");
+        assert_eq!(std::fs::read(&invalid_utf8).unwrap(), original);
+
+        let directory = tmp.path().join("is-a-directory");
+        std::fs::create_dir(&directory).unwrap();
+        let err =
+            write_simple_key(&directory, "font_family", "font_family Hack", "Hack").unwrap_err();
+        assert!(err.starts_with("read "), "{err}");
+        assert!(directory.is_dir());
+    }
+
+    #[test]
+    fn font_family_control_characters_are_rejected_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        let original = b"font_family Menlo\nbackground #101010\n";
+        std::fs::write(&config, original).unwrap();
+
+        for family in ["Hack\ninclude /tmp/evil", "A\rB", "A\u{1b}B"] {
+            let err = validate_family(family).unwrap_err();
+            assert!(err.contains("control characters"), "{err}");
+            assert!(!err.contains('\n') && !err.contains('\r') && !err.contains('\u{1b}'));
+
+            let err = write_simple_key(
+                &config,
+                "font_family",
+                &format!("font_family {family}"),
+                family,
+            )
+            .unwrap_err();
+            assert!(err.contains("control characters"), "{err}");
+            assert_eq!(std::fs::read(&config).unwrap(), original);
+        }
+
+        let input = "[font]\nnormal = { family = \"Menlo\" }\n";
+        for family in ["A\rB", "A\u{1b}B"] {
+            let err = patch_alacritty_font_family(input, family).unwrap_err();
+            assert!(err.contains("control characters"), "{err}");
+        }
+    }
+
+    #[test]
+    fn font_family_validation_rejects_blank_and_oversized_values() {
+        let oversized = "x".repeat(257);
+        for family in [" \t", oversized.as_str()] {
+            let err = validate_family(family).unwrap_err();
+            assert!(err.contains("empty") || err.contains("256 bytes"), "{err}");
+        }
     }
 
     fn sh(script: &str) -> Command {

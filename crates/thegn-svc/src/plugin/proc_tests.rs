@@ -130,6 +130,40 @@ fn output_is_capped_rather_than_buffered_without_limit() {
 }
 
 #[test]
+fn an_oversized_frame_is_discarded_as_one_frame() {
+    let oversized_bytes = MAX_LINE_BYTES * 5 / 2;
+    let script = format!(
+        r#"head -c {oversized_bytes} /dev/zero | tr '\000' x; printf '\n{{"method":"ok","params":{{}}}}\n'"#
+    );
+    let out = run(&script).unwrap();
+    assert!(out.truncated, "oversized frame must be reported");
+    assert_eq!(out.messages.len(), 1, "the following frame must survive");
+    assert_eq!(out.messages[0].method, "ok");
+    assert!(
+        out.junk.is_empty(),
+        "oversized fragments are not pseudo-lines"
+    );
+}
+
+#[test]
+fn an_exited_leader_cannot_hold_pipe_reader_joins_open() {
+    let start = std::time::Instant::now();
+    let out = spawn_ndjson(
+        &sh(r#"sleep 30 & printf '{"method":"ok","params":{}}\n'"#),
+        &BTreeMap::new(),
+        None,
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    assert_eq!(out.messages.len(), 1);
+    assert_eq!(out.messages[0].method, "ok");
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "inherited pipe handles must be closed within the bounded drain grace"
+    );
+}
+
+#[test]
 fn a_plugin_that_writes_a_lot_of_stderr_does_not_deadlock() {
     // Both pipes are drained concurrently; reading only stdout would block once
     // the stderr pipe filled.

@@ -80,8 +80,10 @@ fn sanitize(raw: &str, fallback: &str) -> String {
 /// (which owns the worktree) and passed to [`verify_report`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyFacts {
-    /// The row's `artifact_path` column. `None` = a plain (non-pipeline)
-    /// dispatch.
+    /// The row's pipeline stage, if any. Artifact absence is only ungated for
+    /// stage-less plain dispatches; pipeline rows can be awaiting publication.
+    pub stage: Option<String>,
+    /// The row's `artifact_path` column.
     pub artifact: Option<String>,
     /// The file exists under the worktree.
     pub exists: bool,
@@ -152,10 +154,9 @@ pub struct VerifyReport {
 ///
 /// Rules, and why:
 ///
-/// - `artifact == None` ⇒ `ok`, no reasons. A row with no artifact is a plain
-///   (non-pipeline) dispatch; the column has been optional since the roster
-///   gained pipeline columns, and gating those would break `set-status done`
-///   for every non-pipeline user while catching nothing.
+/// - `artifact == None && stage == None` ⇒ plain dispatch, `ok`.
+/// - `artifact == None && stage != None` ⇒ unpublished pipeline reservation,
+///   refused until its handoff path is assigned (or an operator forces done).
 /// - Otherwise `ok = exists && tracked && report_present`, with one reason per
 ///   miss. The tracked check is what catches the real pilot failure ("session
 ///   exit ≠ done": the worker wrote the file and never committed it) — git is
@@ -166,8 +167,13 @@ pub struct VerifyReport {
 ///   mid-review, and the tracked check already holds the line.
 pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
     let Some(a) = &f.artifact else {
+        let reasons = if f.stage.is_some() {
+            vec!["pipeline row has no artifact path; its handoff is not published (claim with `--artifact` or publish the session artifact)".into()]
+        } else {
+            Vec::new()
+        };
         return VerifyReport {
-            ok: true,
+            ok: reasons.is_empty(),
             artifact: None,
             exists: f.exists,
             tracked: f.tracked,
@@ -175,7 +181,7 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
             worktree_state: f.worktree_state.clone(),
             report_present: f.report_present,
             report_gate_valid: f.report_gate_valid,
-            reasons: Vec::new(),
+            reasons,
             warnings: Vec::new(),
         };
     };
@@ -522,6 +528,7 @@ mod tests {
         report_present: bool,
     ) -> VerifyFacts {
         VerifyFacts {
+            stage: None,
             artifact: artifact.map(str::to_string),
             exists,
             tracked,
@@ -544,6 +551,20 @@ mod tests {
         assert!(r.ok);
         assert!(r.reasons.is_empty());
         assert_eq!(r.artifact, None);
+    }
+
+    #[test]
+    fn a_pipeline_row_without_an_artifact_is_refused_until_publication() {
+        let mut f = facts(None, false, false, false);
+        f.stage = Some("code".into());
+        let r = verify_report(&f);
+        assert!(!r.ok);
+        assert!(
+            r.reasons
+                .iter()
+                .any(|reason| reason.contains("no artifact path") && reason.contains("publish")),
+            "{r:?}"
+        );
     }
 
     #[test]

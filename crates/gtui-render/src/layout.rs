@@ -15,7 +15,7 @@ pub const GRID_COLS: u32 = 24;
 pub fn grid_rows(panels: &[Panel]) -> u32 {
     panels
         .iter()
-        .map(|p| p.grid_pos.y + p.grid_pos.h)
+        .map(|p| p.grid_pos.y.saturating_add(p.grid_pos.h))
         .max()
         .unwrap_or(1)
         .max(1)
@@ -150,5 +150,10 @@ mod tests {
         let panels = vec![panel(0, 0, 12, 8), panel(0, 8, 24, 6)];
         assert_eq!(grid_rows(&panels), 14);
         assert_eq!(grid_rows(&[]), 1);
+    }
+
+    #[test]
+    fn grid_rows_saturates_adversarial_position() {
+        assert_eq!(grid_rows(&[panel(0, u32::MAX, 1, u32::MAX)]), u32::MAX);
     }
 }

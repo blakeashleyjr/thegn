@@ -252,6 +252,10 @@ pub struct EventPage {
     /// Ids removed since the request cursor — only ever non-empty for a
     /// [`PageMode::Delta`].
     deleted: Vec<String>,
+    /// Opaque resource hrefs parallel to events when supplied by the provider.
+    event_hrefs: Vec<String>,
+    /// Resource hrefs parallel to legacy UID tombstones.
+    deleted_hrefs: Vec<String>,
     /// Opaque provider cursor to resume from next time (an ETag, a CalDAV
     /// sync-token). Empty means "no cursor": the next fetch is a full one.
     /// Independent of `mode`.
@@ -277,10 +281,32 @@ impl EventPage {
     /// unchanged page carries no data (use [`Self::unchanged`]), and only a
     /// delta can carry tombstones.
     pub fn from_meter(
+        meter: AdmissionMeter,
+        mode: PageMode,
+        events: Vec<CalEvent>,
+        deleted: Vec<String>,
+        sync_token: String,
+    ) -> Result<Self, CalendarError> {
+        Self::from_meter_with_hrefs(
+            meter,
+            mode,
+            events,
+            deleted,
+            Vec::new(),
+            Vec::new(),
+            sync_token,
+        )
+    }
+
+    /// CalDAV constructor retaining the provider resource key for every
+    /// admitted event and tombstone.
+    pub(crate) fn from_meter_with_hrefs(
         mut meter: AdmissionMeter,
         mode: PageMode,
         events: Vec<CalEvent>,
         deleted: Vec<String>,
+        event_hrefs: Vec<String>,
+        deleted_hrefs: Vec<String>,
         sync_token: String,
     ) -> Result<Self, CalendarError> {
         // Every event and deletion handed over must have been admitted through
@@ -299,11 +325,23 @@ impl EventPage {
                 "only a delta page can carry deletions".into(),
             ));
         }
+        if (!event_hrefs.is_empty() && event_hrefs.len() != events.len())
+            || (!deleted_hrefs.is_empty() && deleted_hrefs.len() != deleted.len())
+        {
+            return Err(CalendarError::Parse(
+                "resource hrefs do not match page rows".into(),
+            ));
+        }
+        for href in event_hrefs.iter().chain(&deleted_hrefs) {
+            meter.charge_retained(href.len())?;
+        }
         meter.charge_retained(sync_token.len())?;
         Ok(EventPage {
             mode,
             events,
             deleted,
+            event_hrefs,
+            deleted_hrefs,
             sync_token,
             lease: meter.into_lease(),
         })
@@ -328,12 +366,48 @@ impl EventPage {
         Self::from_meter(meter, mode, events, deleted, sync_token.into())
     }
 
+    /// Admit an in-memory page while retaining provider resource identities.
+    pub fn try_new_with_hrefs(
+        mode: PageMode,
+        events: Vec<CalEvent>,
+        deleted: Vec<String>,
+        event_hrefs: Vec<String>,
+        deleted_hrefs: Vec<String>,
+        sync_token: impl Into<String>,
+        admission: &AccountAdmission,
+    ) -> Result<Self, CalendarError> {
+        let mut meter = admission.meter();
+        for event in &events {
+            meter.admit_materialized(event)?;
+        }
+        for deleted_id in &deleted {
+            meter.admit_deletion(deleted_id.len())?;
+        }
+        Self::from_meter_with_hrefs(
+            meter,
+            mode,
+            events,
+            deleted,
+            event_hrefs,
+            deleted_hrefs,
+            sync_token.into(),
+        )
+    }
+
     pub fn events(&self) -> &[CalEvent] {
         &self.events
     }
 
     pub fn deleted(&self) -> &[String] {
         &self.deleted
+    }
+
+    pub fn event_hrefs(&self) -> &[String] {
+        &self.event_hrefs
+    }
+
+    pub fn deleted_hrefs(&self) -> &[String] {
+        &self.deleted_hrefs
     }
 
     pub fn sync_token(&self) -> &str {

@@ -25,11 +25,16 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn is_legacy_unix_addr(addr: &ControlAddr, legacy: &std::path::Path) -> bool {
+    matches!(addr, ControlAddr::Unix(path) if path == legacy)
+}
+
 /// Find a live daemon for this state dir WITHOUT spawning one: registry
 /// discovery, then a probe of the configured socket. `None` = no daemon is
 /// running (so there is nothing to kill/list — callers must not spawn one as
 /// a side effect).
 pub(crate) async fn connect_daemon(dcfg: &DaemonConfig) -> Option<ControlClient> {
+    super::reconcile_legacy_socket(dcfg);
     let scope = super::scope_key();
     // 1. Registry discovery (freshest live heartbeat), verified by connect.
     let discovered = tokio::task::spawn_blocking({
@@ -42,7 +47,10 @@ pub(crate) async fn connect_daemon(dcfg: &DaemonConfig) -> Option<ControlClient>
     .await
     .ok()
     .flatten();
-    if let Some(addr) = discovered {
+    let legacy = thegn_core::config_daemon::legacy_socket_path(
+        &thegn_core::util::xdg_state_home().join("thegn"),
+    );
+    if let Some(addr) = discovered.filter(|addr| !is_legacy_unix_addr(addr, &legacy)) {
         let client = ControlClient::new(addr);
         if client.health().await.is_ok() {
             start_error_state_bridge(&client);
@@ -53,10 +61,12 @@ pub(crate) async fn connect_daemon(dcfg: &DaemonConfig) -> Option<ControlClient>
     // 2. The configured socket may host a daemon the registry missed (e.g. a
     //    fresh DB): probe it before giving up.
     let sock = super::socket_path(dcfg);
-    let client = ControlClient::new(ControlAddr::Unix(sock));
-    if client.health().await.is_ok() {
-        start_error_state_bridge(&client);
-        return Some(client);
+    if !dcfg.socket.is_empty() || sock != legacy {
+        let client = ControlClient::new(ControlAddr::Unix(sock));
+        if client.health().await.is_ok() {
+            start_error_state_bridge(&client);
+            return Some(client);
+        }
     }
     None
 }
@@ -65,8 +75,25 @@ pub(crate) async fn connect_daemon(dcfg: &DaemonConfig) -> Option<ControlClient>
 /// its socket. The registry row is a hint; a successful `/health` round-trip
 /// is the truth.
 pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> {
+    let legacy = thegn_core::config_daemon::legacy_socket_path(
+        &thegn_core::util::xdg_state_home().join("thegn"),
+    );
     if let Some(client) = connect_daemon(dcfg).await {
         return Ok(client);
+    }
+    if super::legacy_socket_state() == super::LegacySocketState::Live {
+        let legacy = thegn_core::config_daemon::legacy_socket_path(
+            &thegn_core::util::xdg_state_home().join("thegn"),
+        );
+        return Err(anyhow!(
+            "legacy daemon is still live at {}; detach its panes, then run `thegn daemon stop` before starting a new daemon",
+            legacy.display()
+        ));
+    }
+    if dcfg.socket.is_empty() && super::socket_path(dcfg) == legacy {
+        return Err(anyhow!(
+            "no secure private runtime directory is available for the pane daemon; set XDG_RUNTIME_DIR to an owner-only directory"
+        ));
     }
     let sock = super::socket_path(dcfg);
     let client = ControlClient::new(ControlAddr::Unix(sock.clone()));
@@ -552,6 +579,26 @@ impl ExecSource for LazyDaemonSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_discovery_does_not_adopt_legacy_unix_socket() {
+        let legacy = std::path::Path::new("/state/thegn/run/daemon.sock");
+        assert!(is_legacy_unix_addr(
+            &ControlAddr::Unix(legacy.to_path_buf()),
+            legacy
+        ));
+        assert!(!is_legacy_unix_addr(
+            &ControlAddr::Unix("/run/user/7/thegn/daemon.sock".into()),
+            legacy
+        ));
+        assert!(!is_legacy_unix_addr(
+            &ControlAddr::Tcp {
+                addr: "127.0.0.1:1".into(),
+                token: "secret".into(),
+            },
+            legacy
+        ));
+    }
 
     #[tokio::test]
     async fn attach_close_is_forwarded_when_pane_output_queue_is_full() {
