@@ -1012,7 +1012,7 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("token-only bind must reject a replaceable lock path"),
         };
-        assert_eq!(lock_error.kind(), io::ErrorKind::FilesystemLoop);
+        assert_eq!(lock_error.raw_os_error(), Some(libc::ELOOP));
         assert!(
             !lock_sock.exists(),
             "failed lock acquisition must not create the endpoint"
