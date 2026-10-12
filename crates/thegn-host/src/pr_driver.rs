@@ -422,6 +422,20 @@ pub(crate) fn drive_queue(
             }
 
             QueueAction::DispatchAgent(kind) => {
+                if let Some(reason) = crate::agent_run::headless_unsupported() {
+                    if let Err(error) = db.update_pr_status(
+                        &item.key,
+                        PrqStatus::BlockedCi.as_str(),
+                        Some(blocker.as_str()),
+                        Some(&reason),
+                        Some(&head),
+                    ) {
+                        tracing::debug!(%error, "could not persist unsupported-platform PR hold");
+                    }
+                    out.blocked.push(item.number);
+                    step(PrqStatus::BlockedCi.as_str(), &reason, &mut progress);
+                    continue;
+                }
                 let authorship = match crate::pr_authorship::acquire(
                     cfg.own_prs_only,
                     db,
@@ -519,6 +533,25 @@ pub(crate) fn drive_queue(
                     continue;
                 };
                 let Some((vars, prompt)) = compose(cfg, kind, wt, &item, &fetched, &blocker) else {
+                    let reason = format!(
+                        "agent not dispatched: [pr_queue.prompts] template for {kind} is invalid"
+                    );
+                    if let Err(error) = db.update_pr_status(
+                        &item.key,
+                        PrqStatus::for_blocker(&blocker).as_str(),
+                        Some(blocker.as_str()),
+                        Some(&reason),
+                        Some(&head),
+                    ) {
+                        tracing::debug!(%error, "could not persist invalid PR prompt refusal");
+                    }
+                    out.warnings.push(format!("PR #{}: {reason}", item.number));
+                    out.blocked.push(item.number);
+                    step(
+                        PrqStatus::for_blocker(&blocker).as_str(),
+                        &reason,
+                        &mut progress,
+                    );
                     continue;
                 };
                 // Preparation can block. Recheck author/account/head before
@@ -863,7 +896,7 @@ pub(crate) fn compose_with_log(
         _ => {}
     }
 
-    match thegn_core::agent_task::render_prompt(cfg.prompts.resolve(kind), &vars) {
+    match thegn_core::agent_task::render_kind_prompt(kind, cfg.prompts.resolve(kind), &vars) {
         Ok(p) => Some((vars, p)),
         Err(e) => {
             tracing::warn!(
@@ -1375,6 +1408,43 @@ mod tests {
     }
 
     #[test]
+    fn compose_bounds_large_pr_log_and_review_threads() {
+        let mut config = cfg();
+        config.own_prs_only = false;
+        let mut pr = fetched(vec![thread("reviewer", "src/lib.rs", Some(1), false)]);
+        pr.pr.title = "P".repeat(40_000);
+        let ci = compose_with_log(
+            &config,
+            TaskKind::PrCiFailure,
+            "/w/feat",
+            &item(),
+            &pr,
+            &Blocker::Ci(vec!["test".into()]),
+            Some(&"L".repeat(40_000)),
+        )
+        .unwrap()
+        .1;
+        assert!(ci.len() <= thegn_core::agent_task::MAX_RENDERED_PROMPT_BYTES);
+        assert!(ci.contains("task data omitted"));
+
+        let mut review_pr = fetched(vec![thread("reviewer", "src/lib.rs", Some(1), false)]);
+        review_pr.threads[0].snippet = "R".repeat(40_000);
+        let (_, review) = compose_with_log(
+            &config,
+            TaskKind::PrReview,
+            "/w/feat",
+            &item(),
+            &review_pr,
+            &Blocker::ChangesRequested,
+            None,
+        )
+        .unwrap();
+        assert!(review.contains("src/lib.rs"));
+        assert!(review.contains("task data omitted"));
+        assert!(review.len() <= thegn_core::agent_task::MAX_RENDERED_PROMPT_BYTES);
+    }
+
+    #[test]
     fn own_pr_denial_never_reruns_ci_spends_budget_or_launches_an_agent() {
         for mismatched_number in [false, true] {
             use crate::pr_authorship::tests::Fixture;
@@ -1878,5 +1948,72 @@ mod tests {
         );
         assert_eq!(db.list_review_tasks().unwrap(), before);
         assert!(out.warnings.iter().any(|warning| warning.contains("stale")));
+    }
+
+    #[test]
+    fn unsupported_platform_holds_pr_before_rerun_reservation_or_agent_attempt() {
+        let (dir, db) = temp_db("prq-unsupported-platform");
+        let sentinel = dir.path().join("agent-was-run");
+        let mut config = cfg();
+        config.watch = vec![PrWatchKind::Ci];
+        config.own_prs_only = false;
+        config.agent_command = format!("touch {}", sentinel.display());
+        db.enqueue_pr("/repo", 7, Some("/w/feat"), "feat", "main", "github")
+            .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(1);
+        let unsupported = crate::agent_run::force_headless_unsupported();
+        let out = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+        drop(unsupported);
+
+        assert_eq!(out.blocked, vec![7]);
+        assert!(!forge.calls().iter().any(|call| call.starts_with("rerun")));
+        let row = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(row.ci_rerun_head, None);
+        assert_eq!(row.agent_attempts, 0);
+        assert_eq!(row.status, "blocked_ci");
+        assert!(!sentinel.exists());
+        assert!(row.detail.unwrap().contains("THE-235"));
+    }
+
+    #[test]
+    fn invalid_prompt_template_is_a_durable_pr_refusal_without_attempt_spend() {
+        let (_dir, db) = temp_db("prq-invalid-prompt");
+        let mut config = cfg();
+        config.watch = vec![PrWatchKind::Ci];
+        config.own_prs_only = false;
+        config.prompts.ci_failure = "{nope}".into();
+        config.agent_command = "true {prompt}".into();
+        db.enqueue_pr("/repo", 7, Some("/w/feat"), "feat", "main", "github")
+            .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(0);
+        let out = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+        assert_eq!(out.blocked, vec![7]);
+        assert!(
+            out.warnings
+                .iter()
+                .any(|warning| warning.contains("template for pr_ci_failure is invalid"))
+        );
+        let row = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(row.status, "blocked_ci");
+        assert!(row.detail.unwrap().contains("template"));
+        assert_eq!(row.agent_attempts, 0);
     }
 }
