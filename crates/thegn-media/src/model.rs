@@ -148,17 +148,14 @@ fn url_extension(value: &str) -> Option<String> {
         if after_scheme.as_bytes()[boundary] != b'/' {
             return None;
         }
-        &after_scheme[boundary..]
+        let path = after_scheme[boundary..]
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(&after_scheme[boundary..]);
+        percent_decode(path).unwrap_or_else(|| path.to_string())
     } else {
-        value
+        value.to_string()
     };
-    let path = if value.contains("://") {
-        path.split(['?', '#']).next().unwrap_or(path)
-    } else {
-        path
-    };
-    let decoded_path = percent_decode(path)?;
-    let path = decoded_path.as_str();
     let filename = path.rsplit('/').next()?;
     let (_, extension) = filename.rsplit_once('.')?;
     if extension.is_empty() {
@@ -480,12 +477,20 @@ mod tests {
             MediaKind::Audio
         );
         assert_eq!(
+            MediaKind::from_hints("x", None, Some("100% Hits.flac")),
+            MediaKind::Audio
+        );
+        assert_eq!(
             MediaKind::from_hints("x", None, Some("https://h/watch?v=abc")),
             MediaKind::Unknown
         );
         assert_eq!(
             MediaKind::from_hints("x", None, Some("https://h/a%2Emp4")),
             MediaKind::Video
+        );
+        assert_eq!(
+            MediaKind::from_hints("x", None, Some("https://h/a%ZZ.mp3")),
+            MediaKind::Audio
         );
         assert_eq!(
             MediaKind::from_hints("x", None, Some("https://h?x=/a.mp4")),
