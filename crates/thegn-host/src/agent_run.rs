@@ -848,7 +848,7 @@ fn legacy_env(task: &AgentTaskRun<'_>) -> Vec<(&'static str, String)> {
 /// Keep rendered prose out of argv-backed command templates. When a command
 /// does not consume `{prompt}`, expose it once under the generalized task key.
 #[cfg(any(unix, test))]
-fn prompt_env(task: &AgentTaskRun<'_>) -> Option<(&'static str, &str)> {
+fn prompt_env<'a>(task: &'a AgentTaskRun<'_>) -> Option<(&'static str, &'a str)> {
     if thegn_core::agent_task::template_vars(task.command_template)
         .is_ok_and(|vars| vars.iter().any(|name| name == "prompt"))
     {
