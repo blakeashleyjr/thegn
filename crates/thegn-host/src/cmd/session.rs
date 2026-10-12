@@ -353,20 +353,16 @@ fn now_ms() -> i64 {
 /// and verify it answers. `Err` carries the user-facing no-daemon message.
 /// Shared with `thegn attach` (`cmd::attach`), the local interactive client.
 pub(crate) async fn connect(cfg: &Config) -> Result<ControlClient> {
+    let scopes = crate::daemon::scope_aliases();
     let addr = Db::open()
         .ok()
         .and_then(|db| {
-            thegn_svc::control::client::discover(&db, &crate::daemon::scope_key(), now_ms())
+            scopes
+                .iter()
+                .find_map(|scope| thegn_svc::control::client::discover(&db, scope, now_ms()))
         })
         .unwrap_or_else(|| ControlAddr::Unix(crate::daemon::socket_path(&cfg.daemon)));
-    let client = ControlClient::new(addr);
-    if client.health().await.is_err() {
-        anyhow::bail!(
-            "no thegn pane daemon is running — start one with `thegn serve`, \
-             or enable `[daemon]` in config so the compositor keeps one warm"
-        );
-    }
-    Ok(client)
+    crate::daemon::client::verify_local_daemon(ControlClient::new(addr), &scopes).await
 }
 
 /// Run a session verb. Exit-code semantics: daemon absent ⇒ 1 with the clear
