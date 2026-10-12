@@ -9,7 +9,11 @@ use std::pin::Pin;
 use gtui_core::datasource::{DataSource, Query, QueryError};
 use gtui_core::frame::Frame;
 
+use crate::http::read_limited;
 use crate::prom_parser::parse_prometheus_response;
+
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct PrometheusSource {
     base_url: String,
@@ -23,7 +27,11 @@ impl PrometheusSource {
         Self {
             base_url: base_url.into(),
             token: token.into(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(TOTAL_TIMEOUT)
+                .build()
+                .expect("valid Prometheus HTTP client settings"),
         }
     }
 }
@@ -59,10 +67,13 @@ impl DataSource for PrometheusSource {
                     .send()
                     .await
                     .map_err(|e| QueryError::Network(e.to_string()))?;
-                let body = resp
-                    .text()
-                    .await
-                    .map_err(|e| QueryError::Network(e.to_string()))?;
+                if !resp.status().is_success() {
+                    return Err(QueryError::Network(format!(
+                        "Prometheus HTTP status {}",
+                        resp.status()
+                    )));
+                }
+                let body = read_limited(resp, "Prometheus").await?;
                 frames.extend(parse_prometheus_response(&body)?);
             }
             Ok(frames)
@@ -73,10 +84,78 @@ impl DataSource for PrometheusSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     #[test]
     fn constructs_with_endpoint() {
         let s = PrometheusSource::new("http://localhost:9090/", "");
         assert_eq!(s.base_url, "http://localhost:9090/");
+    }
+
+    #[tokio::test]
+    async fn non_success_http_status_is_reported_before_body_parsing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0, "client closed before sending its request");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno").await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let source = PrometheusSource::new(format!("http://{address}"), "");
+        let now = Utc::now();
+        let error = source
+            .query(vec![Query {
+                ref_id: "A".into(),
+                expr: "up".into(),
+                time_range: gtui_core::datasource::TimeRange { from: now, to: now },
+            }])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, QueryError::Network(message) if message.contains("503")));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_content_length_over_four_mib_is_rejected() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0, "client closed before sending its request");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 4194305\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let source = PrometheusSource::new(format!("http://{address}"), "");
+        let now = Utc::now();
+        let error = source
+            .query(vec![Query {
+                ref_id: "A".into(),
+                expr: "up".into(),
+                time_range: gtui_core::datasource::TimeRange { from: now, to: now },
+            }])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, QueryError::Other(message) if message.contains("4 MiB")));
+        server.await.unwrap();
     }
 }
