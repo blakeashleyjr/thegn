@@ -462,13 +462,13 @@ impl StreamGuard {
     }
 
     fn check_identity(&self, got: &str) -> Result<(), StreamEnd> {
-        if let StreamMode::Attach { session: expected } = &self.mode {
-            if got != expected {
-                return Err(StreamEnd::IdentityMismatch {
-                    expected: expected.clone(),
-                    got: got.to_owned(),
-                });
-            }
+        if let StreamMode::Attach { session: expected } = &self.mode
+            && got != expected
+        {
+            return Err(StreamEnd::IdentityMismatch {
+                expected: expected.clone(),
+                got: got.to_owned(),
+            });
         }
         Ok(())
     }
@@ -1554,9 +1554,10 @@ where
     // Queue the greeting before starting the data pump: Hello is the first
     // client-visible attach frame, even if the daemon has already sent a
     // snapshot while we were validating its greeting.
+    let pump_frames = frames.clone();
     queue_hello_before_pump(&frames, hello, move || {
         tokio::spawn(async move {
-            let end = pump_attach_inner(ws, frames.clone(), ctrl, mode, liveness).await;
+            let end = pump_attach_inner(ws, &pump_frames, ctrl, mode, liveness).await;
             Result::ok(end_tx.send(end));
         });
     })
@@ -1579,7 +1580,7 @@ async fn queue_hello_before_pump(
 
 async fn pump_attach_inner<S>(
     mut ws: Ws<S>,
-    frames: tokio_mpsc::Sender<EventFrame>,
+    frames: &tokio_mpsc::Sender<EventFrame>,
     mut ctrl: tokio_mpsc::Receiver<AttachControl>,
     mode: StreamMode,
     liveness: Option<Liveness>,
@@ -1603,8 +1604,18 @@ where
                         Ok(frame) => {
                             idle_deadline = liveness.map(|l| tokio::time::Instant::now() + l.read_idle);
                             if let Err(end) = guard.admit(&frame) { return end; }
-                            if !send_frame_while_servicing_control(&frames, frame, &mut ws, &mut ctrl).await {
-                                return StreamEnd::ConsumerGone;
+                            match send_frame_while_servicing_control(
+                                frames,
+                                frame,
+                                &mut ws,
+                                &mut ctrl,
+                                liveness,
+                            )
+                            .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => return StreamEnd::ConsumerGone,
+                                Err(end) => return end,
                             }
                             idle_deadline = liveness.map(|l| tokio::time::Instant::now() + l.read_idle);
                         }
@@ -1626,13 +1637,26 @@ where
                 }
             },
             c = ctrl.recv() => {
-                if !send_attach_control(&mut ws, c).await {
+                let sent = match idle_deadline {
+                    Some(deadline) => match tokio::time::timeout_at(deadline, send_attach_control(&mut ws, c)).await {
+                        Ok(sent) => sent,
+                        Err(_) => return StreamEnd::LivenessTimeout,
+                    },
+                    None => send_attach_control(&mut ws, c).await,
+                };
+                if !sent {
                     return StreamEnd::ConsumerGone;
                 }
             },
             _ = async { tokio::time::sleep_until(idle_deadline.expect("enabled with liveness")).await }, if liveness.is_some() => return StreamEnd::LivenessTimeout,
             _ = async { if let Some(interval) = &mut ping { interval.tick().await; } }, if liveness.is_some() => {
-                if ws.send(Message::Ping(Vec::new().into())).await.is_err() { return StreamEnd::TransportLost("failed to send websocket ping".into()); }
+                let send = ws.send(Message::Ping(Vec::new().into()));
+                let result = tokio::time::timeout_at(idle_deadline.expect("enabled with liveness"), send).await;
+                match result {
+                    Err(_) => return StreamEnd::LivenessTimeout,
+                    Ok(Err(_)) => return StreamEnd::TransportLost("failed to send websocket ping".into()),
+                    Ok(Ok(())) => {}
+                }
             },
         }
     }
@@ -1646,7 +1670,8 @@ async fn send_frame_while_servicing_control<S>(
     frame: EventFrame,
     ws: &mut Ws<S>,
     ctrl: &mut tokio_mpsc::Receiver<AttachControl>,
-) -> bool
+    liveness: Option<Liveness>,
+) -> Result<bool, StreamEnd>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1655,13 +1680,23 @@ where
             permit = frames.reserve() => match permit {
                 Ok(permit) => {
                     permit.send(frame);
-                    return true;
+                    return Ok(true);
                 }
-                Err(_) => return false,
+                Err(_) => return Ok(false),
             },
             control = ctrl.recv() => {
-                if !send_attach_control(ws, control).await {
-                    return false;
+                let sent = match liveness {
+                    Some(liveness) => {
+                        let deadline = tokio::time::Instant::now() + liveness.read_idle;
+                        match tokio::time::timeout_at(deadline, send_attach_control(ws, control)).await {
+                            Ok(sent) => sent,
+                            Err(_) => return Err(StreamEnd::LivenessTimeout),
+                        }
+                    }
+                    None => send_attach_control(ws, control).await,
+                };
+                if !sent {
+                    return Ok(false);
                 }
             }
         }
@@ -2018,11 +2053,12 @@ mod tests {
             EventFrame::Sessions,
             &mut ws,
             &mut ctrl_rx,
+            None,
         )
         .await;
 
         assert!(
-            !delivered,
+            matches!(delivered, Ok(false)),
             "Close ends the pump without waiting for capacity"
         );
         assert!(server.await.unwrap(), "the peer must receive Close");
