@@ -880,10 +880,9 @@ impl CalEvent {
                 last: last.min(to),
             }]);
         };
-        // The nominal LOCAL span, carried onto every instance — so a one-hour
-        // meeting stays one hour of wall time even across a boundary, rather
-        // than becoming 0 or 2 hours' worth of instants.
-        let span = nominal_span(self, home).ok_or(ExpansionError::InvalidSpan)?;
+        // Carry the event's own duration semantics onto every instance:
+        // calendar days for Date, wall time for Zoned, elapsed time for Instant.
+        let span = nominal_span(self).ok_or(ExpansionError::InvalidSpan)?;
         // Instances starting up to one duration before the window still reach
         // into it, and a zone's local date can sit up to two days either side
         // of `home`'s. Nothing starts before the first representable date, so
@@ -898,7 +897,7 @@ impl CalEvent {
         let rec_to = to
             .checked_add_days(Days::new(ZONE_SLACK_DAYS))
             .unwrap_or(NaiveDate::MAX);
-        let Some(seed) = recur::seed_of(&self.start, home) else {
+        let Some(seed) = recur::seed_of(&self.start) else {
             return Err(ExpansionError::InvalidSpan);
         };
         let zone = Some(recur::series_zone(&self.start, home));
@@ -915,7 +914,7 @@ impl CalEvent {
         for local in locals {
             // One transient instance at a time: nothing is retained (or
             // charged) until it is known to overlap the window.
-            let start = recur::instance_time(local, &self.start, home);
+            let start = recur::instance_time(local, &self.start);
             if !start.is_all_day() && start.instant_in(home, GapPolicy::ShiftForward).is_none() {
                 continue;
             }
@@ -982,21 +981,24 @@ const BUCKET_KEY_BYTES: usize = std::mem::size_of::<NaiveDate>()
     + std::mem::size_of::<Vec<Arc<CalEvent>>>()
     + MAP_ENTRY_OVERHEAD;
 
-/// DTEND − DTSTART measured in local wall time; `None` for an inverted or
-/// unrepresentable span.
-fn nominal_span(e: &CalEvent, home: chrono_tz::Tz) -> Option<chrono::Duration> {
-    let local = |t: &EventTime| -> Option<NaiveDateTime> {
-        match t {
-            EventTime::Date { date } => date.and_hms_opt(0, 0, 0),
-            EventTime::Zoned { local, .. } => Some(*local),
-            EventTime::Instant { at } => {
-                use chrono::TimeZone;
-                Some(home.from_utc_datetime(&at.naive_utc()).naive_local())
-            }
+/// DTEND − DTSTART in the event's own frame: calendar days for Date, wall
+/// time for Zoned, and elapsed UTC time for Instant. `None` for a mixed-shape,
+/// inverted, or unrepresentable span.
+fn nominal_span(e: &CalEvent) -> Option<chrono::Duration> {
+    match (&e.start, &e.end) {
+        (EventTime::Date { date: a }, EventTime::Date { date: b }) if b >= a => {
+            Some(b.signed_duration_since(*a))
         }
-    };
-    match (local(&e.start), local(&e.end)) {
-        (Some(a), Some(b)) if b >= a => Some(b.signed_duration_since(a)),
+        (EventTime::Zoned { local: a, zone: za }, EventTime::Zoned { local: b, zone: zb })
+            if za == zb && b >= a =>
+        {
+            Some(b.signed_duration_since(*a))
+        }
+        (EventTime::Instant { at: a }, EventTime::Instant { at: b }) if b >= a => {
+            Some(b.signed_duration_since(*a))
+        }
+        // THE-474 admission validation has not landed, so mixed shapes remain
+        // row-local InvalidSpan errors and are counted in skipped_rows.
         _ => None,
     }
 }
