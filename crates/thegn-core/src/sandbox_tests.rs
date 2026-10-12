@@ -320,6 +320,102 @@ fn oci_prefix_injects_remote_daemon_connection() {
 }
 
 #[test]
+fn compose_target_selects_runtime_connection_and_placement() {
+    use crate::sandbox_compose::{ComposeSpec, ComposeTarget, ps_argv, up_argv};
+
+    let compose = ComposeSpec {
+        files: vec!["compose.yml".into()],
+        service: Some("app".into()),
+        run_services: Vec::new(),
+    };
+    let mut docker = spec(Backend::Docker);
+    let target = ComposeTarget::for_spec(&docker).unwrap();
+    assert_eq!(
+        up_argv(&target, "proj", &compose),
+        [
+            "docker",
+            "compose",
+            "-f",
+            "compose.yml",
+            "-p",
+            "proj",
+            "up",
+            "-d",
+            "app"
+        ]
+    );
+    docker.oci_host = Some("tcp://h".into());
+    let target = ComposeTarget::for_spec(&docker).unwrap();
+    assert_eq!(
+        up_argv(&target, "proj", &compose)[..4],
+        ["docker", "-H", "tcp://h", "compose"]
+    );
+
+    let mut podman = spec(Backend::Podman);
+    podman.oci_host = Some("ssh://u@h/run/podman.sock".into());
+    let target = ComposeTarget::for_spec(&podman).unwrap();
+    assert_eq!(
+        up_argv(&target, "proj", &compose)[..4],
+        ["podman", "--url", "ssh://u@h/run/podman.sock", "compose"]
+    );
+    let rootful = ComposeTarget::for_spec(&spec(Backend::PodmanRootful)).unwrap();
+    assert_eq!(
+        up_argv(&rootful, "proj", &compose)[..4],
+        ["sudo", "-n", "podman", "compose"]
+    );
+
+    for backend in [Backend::Apple, Backend::Smol, Backend::Wsl] {
+        assert!(matches!(
+            ComposeTarget::for_spec(&spec(backend)),
+            Err(crate::sandbox_compose::ComposeError::Unsupported { .. })
+        ));
+    }
+
+    let mut remote = spec(Backend::Docker);
+    remote.placement = Placement::Ssh(SshPlacement::plain(
+        "host".into(),
+        22,
+        false,
+        TransportKind::Ssh,
+    ));
+    let target = ComposeTarget::for_spec(&remote).unwrap();
+    let local_up = up_argv(&target, &remote.name, &compose);
+    let local_ps = ps_argv(&target, &remote.name, &compose);
+    assert_eq!(
+        target.control_argv(&local_up),
+        remote.placement.control_argv(&local_up)
+    );
+    assert_eq!(
+        target.control_argv(&local_ps),
+        remote.placement.control_argv(&local_ps)
+    );
+    let routed_up = target.control_argv(&local_up);
+    assert!(routed_up.first().is_some_and(|arg| arg == "ssh"));
+    assert!(
+        routed_up
+            .last()
+            .is_some_and(|arg| arg.contains("docker compose"))
+    );
+}
+
+#[test]
+fn compose_enter_refuses_unsupported_apple_backend() {
+    let mut s = spec(Backend::Apple);
+    s.compose = Some(
+        crate::sandbox_compose::ComposeSpec {
+            files: vec!["compose.yml".into()],
+            service: Some("app".into()),
+            run_services: Vec::new(),
+        }
+        .encode(),
+    );
+    assert!(matches!(
+        enter_argv(&s, "true"),
+        Err(EnterError::Refused(_))
+    ));
+}
+
+#[test]
 fn podman_exec_preserves_paths() {
     let argv =
         enter_argv(&spec(Backend::Podman), "${SHELL:-/bin/sh} -l").expect("valid volume names");
@@ -2103,8 +2199,14 @@ fn secret_env_file_replaces_a_planted_symlink_without_touching_its_target() {
     let key = String::from("GH_TOKEN");
     let value = String::from("canary-secret");
 
-    let path = write_secret_env_file_in(&dir, "launch", &[(&key, &value)], false)
-        .expect("atomic env-file write");
+    let path = write_secret_env_file_in(
+        parent.path(),
+        std::path::Path::new("sandbox-env"),
+        "launch",
+        &[(&key, &value)],
+        false,
+    )
+    .expect("atomic env-file write");
     assert_eq!(std::fs::read(&victim).unwrap(), b"sentinel bytes");
     assert!(
         std::fs::symlink_metadata(&path)
@@ -2130,14 +2232,25 @@ fn secret_env_file_replaces_a_planted_symlink_without_touching_its_target() {
 #[test]
 fn oci_secret_env_generations_are_unique_and_keep_independent_bodies() {
     let temp = tempfile::tempdir().unwrap();
-    let dir = temp.path().join("sandbox-env");
     let key = String::from("GH_TOKEN");
     let first_value = String::from("first-secret");
     let second_value = String::from("second-secret");
-    let first = write_secret_env_file_in(&dir, "launch", &[(&key, &first_value)], true)
-        .expect("first generated env-file");
-    let second = write_secret_env_file_in(&dir, "launch", &[(&key, &second_value)], true)
-        .expect("second generated env-file");
+    let first = write_secret_env_file_in(
+        temp.path(),
+        std::path::Path::new("sandbox-env"),
+        "launch",
+        &[(&key, &first_value)],
+        true,
+    )
+    .expect("first generated env-file");
+    let second = write_secret_env_file_in(
+        temp.path(),
+        std::path::Path::new("sandbox-env"),
+        "launch",
+        &[(&key, &second_value)],
+        true,
+    )
+    .expect("second generated env-file");
     assert_ne!(first, second);
     assert_eq!(
         std::fs::read_to_string(first).unwrap(),
@@ -2155,8 +2268,14 @@ fn oci_env_cleanup_removes_only_env_files_inside_the_sandbox_env_directory() {
     let dir = temp.path().join("sandbox-env");
     let key = String::from("GH_TOKEN");
     let value = String::from("canary-secret");
-    let generated = write_secret_env_file_in(&dir, "launch", &[(&key, &value)], true)
-        .expect("generated env-file");
+    let generated = write_secret_env_file_in(
+        temp.path(),
+        std::path::Path::new("sandbox-env"),
+        "launch",
+        &[(&key, &value)],
+        true,
+    )
+    .expect("generated env-file");
     let outside = temp.path().join("outside.env");
     std::fs::write(&outside, b"outside sentinel").unwrap();
 
@@ -2178,7 +2297,16 @@ fn secret_env_file_rejects_a_symlinked_directory() {
     let key = String::from("GH_TOKEN");
     let value = String::from("canary-secret");
 
-    assert!(write_secret_env_file_in(&dir, "launch", &[(&key, &value)], false).is_none());
+    assert!(
+        write_secret_env_file_in(
+            parent.path(),
+            std::path::Path::new("sandbox-env"),
+            "launch",
+            &[(&key, &value)],
+            false,
+        )
+        .is_none()
+    );
     assert!(!target.join("launch.env").exists());
 }
 
@@ -2190,8 +2318,64 @@ fn secret_env_file_rejects_a_regular_file_in_place_of_directory() {
     let key = String::from("GH_TOKEN");
     let value = String::from("canary-secret");
 
-    assert!(write_secret_env_file_in(&dir, "launch", &[(&key, &value)], false).is_none());
+    assert!(
+        write_secret_env_file_in(
+            parent.path(),
+            std::path::Path::new("sandbox-env"),
+            "launch",
+            &[(&key, &value)],
+            false,
+        )
+        .is_none()
+    );
     assert_eq!(std::fs::read(&dir).unwrap(), b"not a directory");
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_env_file_rejects_a_symlinked_intermediate_component() {
+    let parent = tempfile::tempdir().unwrap();
+    let target = parent.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, parent.path().join("thegn")).unwrap();
+    let key = String::from("GH_TOKEN");
+    let value = String::from("canary-secret");
+
+    assert!(
+        write_secret_env_file_in(
+            parent.path(),
+            std::path::Path::new("thegn/sandbox-env"),
+            "launch",
+            &[(&key, &value)],
+            false,
+        )
+        .is_none()
+    );
+    assert!(!target.join("sandbox-env").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_env_file_rejects_a_group_writable_intermediate_component() {
+    let parent = tempfile::tempdir().unwrap();
+    let intermediate = parent.path().join("thegn");
+    std::fs::create_dir(&intermediate).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&intermediate, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let key = String::from("GH_TOKEN");
+    let value = String::from("canary-secret");
+
+    assert!(
+        write_secret_env_file_in(
+            parent.path(),
+            std::path::Path::new("thegn/sandbox-env"),
+            "launch",
+            &[(&key, &value)],
+            false,
+        )
+        .is_none()
+    );
+    assert!(!intermediate.join("sandbox-env").exists());
 }
 
 #[test]
