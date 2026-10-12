@@ -116,9 +116,9 @@ for var in "${!GIT_CONFIG_KEY_@}" "${!GIT_CONFIG_VALUE_@}"; do
   unset "$var"
 done
 : >"$GIT_CONFIG_GLOBAL"
-# Isolate the runtime dir too: the daemon control socket prefers
-# $XDG_RUNTIME_DIR/thegn/daemon.sock, so leaving the real one exported would
-# let the socket probe cross-connect these checks to a live daemon.
+# Isolate the runtime dir too: the daemon control socket lives under
+# $XDG_RUNTIME_DIR/thegn/<scope>/daemon.sock, so leaving the real one exported
+# would let the socket probe cross-connect these checks to a live daemon.
 export XDG_RUNTIME_DIR="$TMP/run"
 mkdir -p "$XDG_RUNTIME_DIR"
 # Isolate the `[database]` migration policy. These are ambient in any shell

@@ -1,9 +1,45 @@
 use super::*;
 // Relocated domain methods now live behind store-seam traits (`db_*.rs`).
 use crate::store::{
-    AccountStore, CacheStore, NotificationStore, PoolStore, WorkspaceStore, WorktreeAuxStore,
+    AccountStore, CacheStore, NotificationStore, PoolStore, SemanticStore, WorkspaceStore,
+    WorktreeAuxStore,
 };
 use rusqlite::params;
+
+#[test]
+fn semantic_sweep_pages_until_all_missing_file_rows_are_removed() {
+    use crate::semantic::EntityKind;
+    use crate::store::SemEntityRow;
+
+    let db = Db::open_memory().unwrap();
+    for index in 0..3 {
+        db.upsert_entity(&SemEntityRow {
+            id: format!("sweep-missing-{index}"),
+            file: format!("/__thegn_missing_semantic_sweep_test__/file-{index}.rs"),
+            name: format!("missing_{index}"),
+            kind: EntityKind::Function,
+            start_line: 1,
+            end_line: 1,
+            source_hash: "test".to_string(),
+        })
+        .unwrap();
+    }
+
+    assert_eq!(sweep_missing_semantic_files(&db, 1).unwrap(), 3);
+    let remaining: i64 = db
+        .conn()
+        .query_row("SELECT count(*) FROM sem_entity", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[test]
+fn semantic_sweep_returns_prune_errors_to_its_caller() {
+    let db = Db::open_memory().unwrap();
+    db.conn().execute("DROP TABLE sem_entity", []).unwrap();
+
+    assert!(sweep_missing_semantic_files(&db, 1).is_err());
+}
 
 #[test]
 fn remote_enqueue_compare_and_write_is_one_registry_transaction() {

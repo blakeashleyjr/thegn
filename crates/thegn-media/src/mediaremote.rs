@@ -14,7 +14,6 @@
 //! Pure JSON decoding lives in `mediaremote_parse` (Linux-testable).
 
 use futures::future::BoxFuture;
-use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -36,10 +35,20 @@ impl MediaRemote {
     pub async fn connect() -> Option<MediaRemote> {
         let argv = discover_argv();
         let mr = MediaRemote { argv };
-        // A successful `get` (even with an empty payload) proves the adapter runs.
+        // A successful, contract-valid `get` (even with an empty payload)
+        // proves the adapter runs.
         match mr.run(&["get"]).await {
-            Ok(_) => Some(mr),
-            Err(_) => None,
+            Ok(out) => match mediaremote_parse::decode_get(&out) {
+                Ok(_) => Some(mr),
+                Err(error) => {
+                    tracing::debug!(target: "thegn::media", %error, "MediaRemote adapter probe returned an invalid response");
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::debug!(target: "thegn::media", %error, "MediaRemote adapter probe failed");
+                None
+            }
         }
     }
 
@@ -103,17 +112,8 @@ impl MediaRemote {
 impl MediaBackend for MediaRemote {
     fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
         Box::pin(async move {
-            let out = match self.run(&["get"]).await {
-                Ok(o) => o,
-                Err(MediaError::Unavailable(_)) => return Ok(None),
-                Err(e) => return Err(e),
-            };
-            if out.is_empty() {
-                return Ok(None);
-            }
-            let v: Value = serde_json::from_str(&out)
-                .map_err(|e| MediaError::Backend(format!("mediaremote json: {e}")))?;
-            Ok(mediaremote_parse::to_state(&v))
+            let out = self.run(&["get"]).await?;
+            mediaremote_parse::decode_get(&out)
         })
     }
 
