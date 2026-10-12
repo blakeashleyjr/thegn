@@ -505,8 +505,7 @@ act *ARGS: _act-check
 act-job name: _act-check
     act push -j {{name}}
 
-# Remove act's reused job containers (.actrc keeps them warm between runs);
-# use this to reset a wedged/half-installed container.
+# Remove containers left by `--reuse` runs or a wedged/half-installed run.
 act-clean:
     -docker ps -aq --filter 'name=act-' | xargs -r docker rm -f
     @echo "act containers removed"
@@ -997,7 +996,7 @@ _apply-backend backend="":
           overlay_body='env = "sprites"'; \
           ;; \
         podman|docker|apple|bwrap|systemd|none) \
-          overlay_body="[sandbox] backend = \"$backend\""; \
+          overlay_body="$(printf '[sandbox]\nbackend = "%s"' "$backend")"; \
           ;; \
         *) echo "unknown backend '$backend' — expected: sprites | podman | docker | apple | bwrap | systemd | none" >&2; exit 1;; \
       esac; \
@@ -1009,7 +1008,7 @@ _apply-backend backend="":
       fi; \
       overlay_matches=false; \
       if [ -e "$overlay" ]; then \
-        for known in 'env = "sprites"' '[sandbox] backend = "podman"' '[sandbox] backend = "docker"' '[sandbox] backend = "apple"' '[sandbox] backend = "bwrap"' '[sandbox] backend = "systemd"' '[sandbox] backend = "none"'; do \
+        for known in 'env = "sprites"' "$(printf '[sandbox]\nbackend = "%s"' podman)" "$(printf '[sandbox]\nbackend = "%s"' docker)" "$(printf '[sandbox]\nbackend = "%s"' apple)" "$(printf '[sandbox]\nbackend = "%s"' bwrap)" "$(printf '[sandbox]\nbackend = "%s"' systemd)" "$(printf '[sandbox]\nbackend = "%s"' none)"; do \
           if printf '%s\n' "$known" | cmp -s - "$overlay"; then overlay_matches=true; break; fi; \
         done; \
         if [ "$overlay_matches" != true ]; then \
