@@ -224,6 +224,8 @@ pub(crate) struct WorkspacePicker {
     truncated: bool,
     generation: u64,
     cancel: Option<Arc<AtomicBool>>,
+    scan_roots: Vec<String>,
+    scan_depth: usize,
     result_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>,
     result_rx: tokio::sync::mpsc::Receiver<DiscoveryEvent>,
 }
@@ -239,7 +241,7 @@ fn entry(path: String) -> RepoEntry {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.clone());
-    let haystack = format!("{} {}", name.to_lowercase(), path.to_lowercase());
+    let haystack = format!("{} {}", name, path);
     RepoEntry {
         path,
         name,
@@ -264,6 +266,8 @@ impl WorkspacePicker {
             truncated: false,
             generation: 0,
             cancel: None,
+            scan_roots: Vec::new(),
+            scan_depth: 0,
             result_tx,
             result_rx,
         };
@@ -328,6 +332,8 @@ impl WorkspacePicker {
         self.result_rx = rx;
         self.generation = generation;
         self.cancel = Some(cancel.clone());
+        self.scan_roots.clone_from(&cfg.repo_roots);
+        self.scan_depth = cfg.repo_scan_depth;
         self.truncated = false;
         self.scanning = true;
         tokio::task::spawn_blocking(move || {
@@ -363,9 +369,13 @@ impl WorkspacePicker {
         cfg: thegn_core::config::Config,
         waker: TerminalWaker,
     ) {
-        if self.cancel.is_some() {
+        if self.discovery_config_changed(&cfg) {
             self.spawn_discovery(cfg, waker);
         }
+    }
+
+    fn discovery_config_changed(&self, cfg: &thegn_core::config::Config) -> bool {
+        cfg.repo_roots != self.scan_roots || cfg.repo_scan_depth != self.scan_depth
     }
 
     /// Merge any finished discovery results into the list (seed entries keep
@@ -1063,9 +1073,23 @@ mod tests {
     fn query_uses_precomputed_haystack() {
         let mut p = picker(&["/code/Alpha"]);
         let haystack = p.items[0].haystack.clone();
+        assert_eq!(haystack, "Alpha /code/Alpha");
         type_str(&mut p, "alpha");
         assert_eq!(p.items[0].haystack, haystack);
         assert_eq!(p.matches().len(), 1);
+    }
+
+    #[test]
+    fn config_reload_restarts_discovery_only_for_scan_config_changes() {
+        let mut p = picker(&[]);
+        let cfg = thegn_core::config::Config::default();
+        p.scan_roots.clone_from(&cfg.repo_roots);
+        p.scan_depth = cfg.repo_scan_depth;
+        assert!(!p.discovery_config_changed(&cfg));
+
+        let mut changed = cfg;
+        changed.repo_scan_depth += 1;
+        assert!(p.discovery_config_changed(&changed));
     }
 
     #[test]

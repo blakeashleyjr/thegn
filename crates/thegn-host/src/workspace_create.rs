@@ -19,6 +19,7 @@ use crate::run::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedWorkspaceUrl {
     clone_url: String,
+    canonical_origin: String,
     label: String,
     destination_name: String,
 }
@@ -104,7 +105,7 @@ fn parse_workspace_url(input: &str) -> Result<ParsedWorkspaceUrl> {
             "embedded URL credentials are not supported; use a git credential helper"
         );
         anyhow::ensure!(
-            parsed.username().is_empty() || parsed.username() == "git",
+            parsed.scheme() == "ssh" || parsed.username().is_empty(),
             "embedded URL credentials are not supported; use a git credential helper"
         );
         anyhow::ensure!(
@@ -142,7 +143,8 @@ fn parse_workspace_url(input: &str) -> Result<ParsedWorkspaceUrl> {
     );
     let canonical_origin = canonical_origin
         .trim_end_matches('/')
-        .trim_end_matches(".git");
+        .trim_end_matches(".git")
+        .to_owned();
     let slug: String = repo
         .chars()
         .map(|c| {
@@ -163,9 +165,42 @@ fn parse_workspace_url(input: &str) -> Result<ParsedWorkspaceUrl> {
         .collect::<String>();
     Ok(ParsedWorkspaceUrl {
         clone_url,
+        canonical_origin,
         label: repo.to_string(),
         destination_name: format!("{slug}-{suffix}"),
     })
+}
+
+fn configured_origin(dest: &std::path::Path) -> Result<Option<String>> {
+    let config = std::fs::read_to_string(dest.join(".git/config"))?;
+    let mut in_origin = false;
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_origin = line[1..line.len() - 1].trim() == "remote \"origin\"";
+        } else if in_origin
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case("url")
+        {
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or(value);
+            return Ok(parse_workspace_url(value)
+                .ok()
+                .map(|parsed| parsed.canonical_origin));
+        }
+    }
+    Ok(None)
+}
+
+fn existing_origin_matches(dest: &std::path::Path, expected: &str) -> bool {
+    dest.join(".git").is_dir()
+        && configured_origin(dest)
+            .ok()
+            .flatten()
+            .is_some_and(|origin| origin == expected)
 }
 
 fn workspace_repo_display(input: &str) -> String {
@@ -305,12 +340,25 @@ pub(crate) fn plan_new_workspace_input(
             Ok(parsed) => parsed,
             Err(error) => return SubmitPlan::Invalid(error.to_string()),
         };
-        let dest = std::path::PathBuf::from(thegn_core::util::expand_tilde(&cfg.workspaces_dir))
-            .join(&parsed.destination_name);
+        let dest = workspace_clone_dest(input, cfg).expect("validated URL has a clone destination");
         if dest.exists() {
+            if existing_origin_matches(&dest, &parsed.canonical_origin) {
+                return SubmitPlan::Local(input.to_string());
+            }
             return SubmitPlan::Invalid(format!(
-                "workspace destination already exists: {}; choose or move it before cloning",
+                "workspace destination already exists with a different or unreadable origin: {}",
                 dest.display()
+            ));
+        }
+        let legacy = std::path::PathBuf::from(thegn_core::util::expand_tilde(&cfg.workspaces_dir))
+            .join(&parsed.label);
+        if legacy.exists() {
+            if existing_origin_matches(&legacy, &parsed.canonical_origin) {
+                return SubmitPlan::Local(input.to_string());
+            }
+            return SubmitPlan::Invalid(format!(
+                "workspace destination already exists with a different or unreadable origin: {}",
+                legacy.display()
             ));
         }
         return SubmitPlan::Clone {
@@ -411,7 +459,16 @@ pub(crate) fn create_workspace_from_input_with_config(
     let input = input.trim();
     anyhow::ensure!(!input.is_empty(), "no project path or URL given");
 
-    let root = if let Some(dest) = workspace_clone_dest(input, cfg) {
+    let root = if let Some(parsed) = parse_workspace_url(input).ok() {
+        let workspaces_dir =
+            std::path::PathBuf::from(thegn_core::util::expand_tilde(&cfg.workspaces_dir));
+        let dest = workspace_clone_dest(input, cfg).expect("parsed URL has a clone destination");
+        let legacy = workspaces_dir.join(&parsed.label);
+        let dest = if !dest.exists() && existing_origin_matches(&legacy, &parsed.canonical_origin) {
+            legacy
+        } else {
+            dest
+        };
         // URL inputs are cloned OFF the loop before this runs (NewWorkspace
         // handler → spawn_blocking → workspace_clone_rx drain); by the time
         // this is called the clone must already be on disk.
@@ -435,10 +492,13 @@ pub(crate) fn create_workspace_from_input_with_config(
     };
 
     let root_s = root.to_string_lossy().into_owned();
-    let name = root
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "workspace".into());
+    let name = parse_workspace_url(input)
+        .map(|parsed| parsed.label)
+        .unwrap_or_else(|_| {
+            root.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "workspace".into())
+        });
     let kind = if thegn_core::repo::main_worktree(&root).is_some() {
         "repo"
     } else {
@@ -735,6 +795,18 @@ Receiving objects: 100% (10/10)\rdone.\n";
             plan_new_workspace_input("git@github.com:acme/widget.git", &cfg),
             SubmitPlan::Clone { .. }
         ));
+        for url in [
+            "ssh://blake@host/repo.git",
+            "ssh://APKA123@git-codecommit.us-east-1.amazonaws.com/v1/repos/repo",
+        ] {
+            assert!(
+                matches!(
+                    plan_new_workspace_input(url, &cfg),
+                    SubmitPlan::Clone { .. }
+                ),
+                "SSH usernames are part of clone transport identity: {url}"
+            );
+        }
     }
 
     #[test]
@@ -761,17 +833,46 @@ Receiving objects: 100% (10/10)\rdone.\n";
     }
 
     #[test]
-    fn existing_url_destination_is_refused_instead_of_opening_url_text_as_path() {
+    fn existing_url_destination_is_reused_only_when_origin_matches() {
         let mut cfg = thegn_core::config::Config::default();
         let root = tmp("existing-url-dest");
         std::fs::remove_dir_all(&root).unwrap_or(());
         std::fs::create_dir_all(&root).unwrap();
         cfg.workspaces_dir = root.to_string_lossy().into_owned();
         let url = "https://github.com/acme/repo.git";
-        std::fs::create_dir_all(workspace_clone_dest(url, &cfg).unwrap()).unwrap();
+        let dest = workspace_clone_dest(url, &cfg).unwrap();
+        std::fs::create_dir_all(dest.join(".git")).unwrap();
+        std::fs::write(
+            dest.join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://github.com/acme/repo.git\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            plan_new_workspace_input(url, &cfg),
+            SubmitPlan::Local(ref path) if path == url
+        ));
+
+        std::fs::write(
+            dest.join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://github.com/other/repo.git\n",
+        )
+        .unwrap();
         assert!(matches!(
             plan_new_workspace_input(url, &cfg),
             SubmitPlan::Invalid(_)
+        ));
+
+        std::fs::remove_dir_all(&dest).unwrap();
+        let legacy = root.join("repo");
+        std::fs::create_dir_all(legacy.join(".git")).unwrap();
+        std::fs::write(
+            legacy.join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://github.com/acme/repo.git\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            plan_new_workspace_input(url, &cfg),
+            SubmitPlan::Local(ref path) if path == url
         ));
         std::fs::remove_dir_all(&root).unwrap();
     }
