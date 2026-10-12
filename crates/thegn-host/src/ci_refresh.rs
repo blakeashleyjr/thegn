@@ -611,7 +611,6 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
                 continue;
             }
             if !call_budget.take() {
-                run_complete = false;
                 tracing::debug!(target: "thegn::ci", budget = MAX_LOG_INGEST_CALLS, "CI log ingestion provider-call budget exhausted");
                 break 'runs;
             }
@@ -865,10 +864,9 @@ mod tests {
     }
 
     fn private_tempdir() -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .permissions(0o700)
-            .tempdir()
-            .expect("private tempdir")
+        let temp = tempfile::tempdir().expect("tempdir");
+        thegn_core::fsperm::restrict_dir_to_owner(temp.path()).expect("restrict tempdir");
+        temp
     }
 
     #[test]
