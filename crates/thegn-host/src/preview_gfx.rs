@@ -23,6 +23,8 @@ pub struct PreviewGfx {
     /// Content revision of `img`, bumped by every [`set`](PreviewGfx::set) so a
     /// replacement at the same path and placement still redraws.
     rev: u64,
+    /// Revision whose invalid raster has already been logged.
+    invalid_logged_rev: Option<u64>,
     /// The placement and content revision currently drawn, or `None` when
     /// nothing is drawn.
     drawn: Option<(Placement, u64)>,
@@ -78,7 +80,15 @@ impl PreviewGfx {
                         self.drawn = Some((place, self.rev));
                         out
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        if self.invalid_logged_rev != Some(self.rev) {
+                            tracing::warn!(
+                                target: "thegn::preview",
+                                error = ?e,
+                                "invalid preview raster"
+                            );
+                            self.invalid_logged_rev = Some(self.rev);
+                        }
                         // Invalid raster: never claim it is drawn; clear any
                         // stale image that is still on screen.
                         if self.drawn.take().is_some() {
