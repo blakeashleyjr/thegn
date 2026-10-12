@@ -751,6 +751,18 @@ pub fn resolver_bind_dir(link: &Path, runtime_root: &Path, substrate: &[&str]) -
     if dir == runtime_root || !dir.starts_with(runtime_root) {
         return None;
     }
+    // Only expose directories used by known host resolver implementations.
+    // In particular, never make arbitrary /run state such as per-user sockets
+    // visible inside the sandbox.
+    let allowed = [
+        runtime_root.join("systemd/resolve"),
+        runtime_root.join("NetworkManager"),
+        runtime_root.join("resolvconf"),
+        runtime_root.join("connman"),
+    ];
+    if !allowed.iter().any(|path| dir == path) {
+        return None;
+    }
     if substrate.iter().any(|s| dir.starts_with(s)) {
         return None;
     }
@@ -969,6 +981,15 @@ mod tests {
         let dangling = root.join("dangling");
         std::os::unix::fs::symlink(run.join("gone").join("x"), &dangling).unwrap();
         assert_eq!(resolver_bind_dir(&dangling, &run, &[]), None);
+        // Even though this is below /run, exposing a user session directory
+        // would reveal sockets such as the session bus and agent credentials.
+        let user_dir = run.join("user").join("1000");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        let user_target = user_dir.join("resolv.conf");
+        std::fs::write(&user_target, "x").unwrap();
+        let user_link = root.join("user-link");
+        std::os::unix::fs::symlink(&user_target, &user_link).unwrap();
+        assert_eq!(resolver_bind_dir(&user_link, &run, &[]), None);
     }
 
     #[test]
