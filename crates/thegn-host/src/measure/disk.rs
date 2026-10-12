@@ -882,19 +882,37 @@ mod generation_tests {
             thegn_core::disk::DiskUsage::default(),
         )];
         assert_eq!(
-            reap_generation_footprints(&fresh, None, &[], 14, thegn_core::util::now()),
+            reap_generation_footprints(
+                &fresh,
+                None,
+                &[],
+                14,
+                thegn_core::util::now().max(0) as u64,
+            ),
             0
         );
         GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 2));
         assert_eq!(
-            reap_generation_footprints(&fresh, None, &[], 14, thegn_core::util::now()),
+            reap_generation_footprints(
+                &fresh,
+                None,
+                &[],
+                14,
+                thegn_core::util::now().max(0) as u64,
+            ),
             0
         );
         GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 2));
 
         fs::write(debug_profile.join(".fingerprint/touched"), b"mtime change").unwrap();
         assert_eq!(
-            reap_generation_footprints(&fresh, None, &[], 14, thegn_core::util::now()),
+            reap_generation_footprints(
+                &fresh,
+                None,
+                &[],
+                14,
+                thegn_core::util::now().max(0) as u64,
+            ),
             0
         );
         GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 3));
@@ -916,7 +934,7 @@ mod generation_tests {
             root.to_string_lossy().into_owned(),
             thegn_core::disk::DiskUsage::default(),
         )];
-        let now = thegn_core::util::now();
+        let now = thegn_core::util::now().max(0) as u64;
         assert_eq!(reap_generation_footprints(&fresh, None, &[], 14, now), 0);
         GENERATION_STATUS_PROBES.with(|calls| assert_eq!(calls.get(), 1));
         GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 1));
