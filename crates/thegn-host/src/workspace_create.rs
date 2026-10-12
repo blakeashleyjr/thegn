@@ -4,6 +4,9 @@
 //! arm. Extracted from `run.rs` (god-file ratchet).
 
 use anyhow::{Context, Result};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use thegn_core::store::WorkspaceStore;
 
@@ -15,6 +18,121 @@ use crate::run::{
     DrawerRuntime, ResidentWorkspace, SidebarState, WorkspacePool, persist_session_layout,
     refresh_tab_model, remap_cold_workspace_ids,
 };
+
+const MAX_PROGRESS_SEGMENT: usize = 512;
+const CLONE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const CLONE_TERMINATE_GRACE: Duration = Duration::from_millis(300);
+const CLONE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+static CLONE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+struct CloneJob {
+    generation: u64,
+    url: String,
+    dest: std::path::PathBuf,
+    cfg: thegn_core::config::Config,
+    tx: tokio::sync::mpsc::UnboundedSender<CloneEvent>,
+    waker: termwiz::terminal::TerminalWaker,
+}
+
+#[derive(Default)]
+struct CloneSupervisorState {
+    running: bool,
+    pending: Option<CloneJob>,
+}
+
+static CLONE_SUPERVISOR: OnceLock<Mutex<CloneSupervisorState>> = OnceLock::new();
+
+fn clone_supervisor_state() -> &'static Mutex<CloneSupervisorState> {
+    CLONE_SUPERVISOR.get_or_init(|| Mutex::new(CloneSupervisorState::default()))
+}
+
+fn next_clone_generation() -> u64 {
+    CLONE_GENERATION
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1)
+}
+
+fn clone_event_is_current(event_generation: u64, current_generation: u64) -> bool {
+    event_generation == current_generation
+}
+
+fn send_clone_event_best_effort(
+    tx: &tokio::sync::mpsc::UnboundedSender<CloneEvent>,
+    event: CloneEvent,
+) {
+    if tx.send(event).is_err() {
+        // The picker/loop may have gone away while the clone was running.
+    }
+}
+
+fn wake_clone_loop_best_effort(waker: &termwiz::terminal::TerminalWaker) {
+    if waker.wake().is_err() {
+        // A wake pulse is only a nudge; the loop may already be shutting down.
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloneStep {
+    Continue,
+    Terminate,
+    Kill,
+}
+
+fn clone_step(
+    now: Instant,
+    started: Instant,
+    deadline: Instant,
+    cancelled: bool,
+    term_sent_at: Option<Instant>,
+) -> CloneStep {
+    if let Some(sent) = term_sent_at {
+        if now.duration_since(sent) >= CLONE_TERMINATE_GRACE {
+            CloneStep::Kill
+        } else {
+            CloneStep::Continue
+        }
+    } else if cancelled
+        || now >= deadline
+        || now.saturating_duration_since(started) >= CLONE_TOTAL_TIMEOUT
+    {
+        CloneStep::Terminate
+    } else {
+        CloneStep::Continue
+    }
+}
+
+struct ProgressThrottle {
+    min_interval: Duration,
+    last_emit: Option<Instant>,
+    pending: Option<String>,
+}
+
+impl ProgressThrottle {
+    fn new(min_interval: Duration) -> Self {
+        Self {
+            min_interval,
+            last_emit: None,
+            pending: None,
+        }
+    }
+
+    fn offer(&mut self, line: String, now: Instant) -> Option<String> {
+        self.pending = Some(line);
+        let ready = self
+            .last_emit
+            .is_none_or(|last| now.duration_since(last) >= self.min_interval);
+        if ready {
+            self.last_emit = Some(now);
+            self.pending.take()
+        } else {
+            None
+        }
+    }
+
+    fn flush(&mut self) -> Option<String> {
+        self.pending.take()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedWorkspaceUrl {
@@ -226,14 +344,17 @@ pub(crate) fn workspace_clone_dest(
     })
 }
 
-/// Clone `url` into `dest`, forwarding each `git clone --progress` line to
-/// `on_progress`. BLOCKING (a clone can take minutes) — only call inside
-/// `spawn_blocking`; the NewWorkspace flow completes over `workspace_clone_rx`.
-pub(crate) fn clone_workspace_repo(
+fn clone_workspace_repo_with_deadline(
     url: &str,
     dest: &std::path::Path,
-    on_progress: impl FnMut(String),
+    deadline: Instant,
+    mut cancelled: impl FnMut() -> bool,
+    on_progress: impl FnMut(String) + Send + 'static,
 ) -> Result<()> {
+    anyhow::ensure!(
+        !cancelled() && Instant::now() < deadline,
+        "workspace clone cancelled or timed out before admission"
+    );
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
@@ -242,25 +363,109 @@ pub(crate) fn clone_workspace_repo(
     let cwd = dest.parent().unwrap_or(std::path::Path::new("."));
     // `--progress` forces git to emit its transfer counters even though stderr
     // is a pipe, not a TTY; we stream them to the picker's cloning panel.
-    let mut child = thegn_core::util::git_cmd(cwd)
+    let mut command = thegn_core::util::git_cmd(cwd);
+    command
         .arg("clone")
         .arg("--progress")
         .arg(url)
         .arg(dest)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+        .stderr(std::process::Stdio::piped());
+    let (mut child, group) = crate::platform::spawn_grouped(&mut command)
         .with_context(|| format!("git clone into {}", dest.display()))?;
-    if let Some(stderr) = child.stderr.take() {
-        stream_progress_lines(std::io::BufReader::new(stderr), on_progress);
+    let started = Instant::now();
+    let mut reader = if let Some(stderr) = child.stderr.take() {
+        match std::thread::Builder::new()
+            .name("workspace-clone-progress".into())
+            .spawn(move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+                stream_progress_lines(std::io::BufReader::new(stderr), on_progress);
+            }) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                group.kill();
+                #[expect(clippy::disallowed_methods)]
+                if let Err(wait_error) = child.wait() {
+                    return Err(wait_error).context("reap clone after reader spawn failure");
+                }
+                return Err(error).context("spawn workspace clone progress reader");
+            }
+        }
+    } else {
+        None
+    };
+    let mut term_sent_at = None;
+    let mut status = None;
+    loop {
+        let polled = match child.try_wait() {
+            Ok(polled) => polled,
+            Err(error) => {
+                group.kill();
+                #[expect(clippy::disallowed_methods)]
+                if let Err(wait_error) = child.wait() {
+                    return Err(wait_error).context("reap clone after poll failure");
+                }
+                if let Some(reader) = reader.take() {
+                    reader
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("workspace clone progress reader panicked"))?;
+                }
+                return Err(error).context("poll git clone");
+            }
+        };
+        if let Some(exit) = polled {
+            status = Some(exit);
+            // A helper may keep stderr open after git exits. Reap the whole
+            // owned group so the progress reader reaches EOF as well.
+            if !group.is_empty() {
+                group.terminate();
+                term_sent_at = Some(Instant::now());
+            }
+            break;
+        }
+        match clone_step(Instant::now(), started, deadline, cancelled(), term_sent_at) {
+            CloneStep::Continue => std::thread::sleep(CLONE_POLL_INTERVAL),
+            CloneStep::Terminate => {
+                group.terminate();
+                term_sent_at = Some(Instant::now());
+            }
+            CloneStep::Kill => {
+                group.kill();
+                break;
+            }
+        }
     }
-    // off-loop: this blocks until the clone finishes, but the whole helper only
-    // runs inside spawn_blocking (see spawn_workspace_clone).
-    #[expect(clippy::disallowed_methods)]
-    let status = child
-        .wait()
-        .with_context(|| format!("git clone into {}", dest.display()))?;
-    anyhow::ensure!(status.success(), "git clone failed");
+    if status.is_none() {
+        // The child may have exited while the group was being killed.
+        #[expect(clippy::disallowed_methods)]
+        let exit = child.wait().context("wait for terminated git clone")?;
+        status = Some(exit);
+    }
+    // Ensure no pipe-holding descendant survives a completed git process.
+    let reap_deadline = Instant::now() + CLONE_TERMINATE_GRACE;
+    while !group.is_empty() && Instant::now() < reap_deadline {
+        std::thread::sleep(CLONE_POLL_INTERVAL);
+    }
+    if !group.is_empty() {
+        group.kill();
+    }
+    let group_reap_deadline = Instant::now() + Duration::from_secs(2);
+    while !group.is_empty() && Instant::now() < group_reap_deadline {
+        std::thread::sleep(CLONE_POLL_INTERVAL);
+    }
+    anyhow::ensure!(group.is_empty(), "git clone process group did not exit");
+    if let Some(reader) = reader.take() {
+        reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("workspace clone progress reader panicked"))?;
+    }
+    let status = status.expect("clone loop always records or waits for child status");
+    if !status.success() {
+        anyhow::bail!("git clone failed");
+    }
+    if Instant::now() >= deadline || cancelled() {
+        anyhow::bail!("git clone cancelled or timed out");
+    }
     Ok(())
 }
 
@@ -273,7 +478,9 @@ pub(crate) fn stream_progress_lines<R: std::io::BufRead>(
 ) {
     let mut buf: Vec<u8> = Vec::new();
     let flush = |buf: &mut Vec<u8>, on_line: &mut dyn FnMut(String)| {
-        let s = String::from_utf8_lossy(buf).trim().to_string();
+        let decoded = String::from_utf8_lossy(buf);
+        let clean: String = decoded.chars().filter(|ch| !ch.is_control()).collect();
+        let s = thegn_core::ci_log::redact(clean.trim());
         buf.clear();
         if !s.is_empty() {
             on_line(s);
@@ -283,7 +490,7 @@ pub(crate) fn stream_progress_lines<R: std::io::BufRead>(
         let Ok(b) = byte else { break };
         if b == b'\r' || b == b'\n' {
             flush(&mut buf, &mut on_line);
-        } else {
+        } else if buf.len() < MAX_PROGRESS_SEGMENT {
             buf.push(b);
         }
     }
@@ -293,6 +500,7 @@ pub(crate) fn stream_progress_lines<R: std::io::BufRead>(
 /// Result of a background workspace clone, delivered to the loop's
 /// `workspace_clone_rx` drain arm.
 pub(crate) struct WorkspaceCloneOutcome {
+    pub(crate) generation: u64,
     pub(crate) url: String,
     pub(crate) dest: std::path::PathBuf,
     pub(crate) result: Result<()>,
@@ -301,7 +509,11 @@ pub(crate) struct WorkspaceCloneOutcome {
 /// What the background clone sends over `workspace_clone_rx`: streamed progress
 /// lines while it runs, then a terminal `Done`.
 pub(crate) enum CloneEvent {
-    Progress { url: String, line: String },
+    Progress {
+        generation: u64,
+        url: String,
+        line: String,
+    },
     Done(WorkspaceCloneOutcome),
 }
 
@@ -410,44 +622,138 @@ pub(crate) fn init_new_project(leaf: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Run the (minutes-scale) clone on `spawn_blocking`; the loop completes the
+/// Submit a clone to the single blocking supervisor; the loop completes the
 /// create+switch in its `workspace_clone_rx` drain arm.
 pub(crate) fn spawn_workspace_clone(
+    generation: u64,
     url: String,
     dest: std::path::PathBuf,
     cfg: thegn_core::config::Config,
     tx: tokio::sync::mpsc::UnboundedSender<CloneEvent>,
     waker: termwiz::terminal::TerminalWaker,
 ) {
-    tokio::task::spawn_blocking(move || {
-        let progress_url = url.clone();
-        let progress_tx = tx.clone();
-        let progress_waker = waker.clone();
-        let result = clone_workspace_repo(&url, &dest, |line| {
-            // best-effort: the picker may have been cancelled
-            let _ = progress_tx.send(CloneEvent::Progress {
+    let should_start = {
+        let mut state = clone_supervisor_state()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending = Some(CloneJob {
+            generation,
+            url,
+            dest,
+            cfg,
+            tx,
+            waker,
+        });
+        if state.running {
+            false
+        } else {
+            state.running = true;
+            true
+        }
+    };
+    if should_start {
+        tokio::task::spawn_blocking(run_clone_supervisor);
+    }
+}
+
+fn run_clone_supervisor() {
+    loop {
+        let job = {
+            let mut state = clone_supervisor_state()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match state.pending.take() {
+                Some(job) => job,
+                None => {
+                    state.running = false;
+                    return;
+                }
+            }
+        };
+        run_clone_job(job);
+    }
+}
+
+fn run_clone_job(job: CloneJob) {
+    let CloneJob {
+        generation,
+        url,
+        dest,
+        cfg,
+        tx,
+        waker,
+    } = job;
+    let progress_url = url.clone();
+    let reader_url = progress_url.clone();
+    let progress_tx = tx.clone();
+    let progress_waker = waker.clone();
+    let throttle = std::sync::Arc::new(std::sync::Mutex::new(ProgressThrottle::new(
+        Duration::from_millis(100),
+    )));
+    let reader_throttle = throttle.clone();
+    let result = clone_workspace_repo_with_deadline(
+        &url,
+        &dest,
+        Instant::now() + CLONE_TOTAL_TIMEOUT,
+        || !clone_event_is_current(generation, CLONE_GENERATION.load(Ordering::SeqCst)),
+        move |line| {
+            let pending = reader_throttle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .offer(line, Instant::now());
+            if let Some(line) = pending {
+                send_clone_event_best_effort(
+                    &progress_tx,
+                    CloneEvent::Progress {
+                        generation,
+                        url: reader_url.clone(),
+                        line,
+                    },
+                );
+                wake_clone_loop_best_effort(&progress_waker);
+            }
+        },
+    );
+    let pending = throttle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .flush();
+    if let Some(line) = pending {
+        // best-effort: send the newest coalesced progress before terminal outcome
+        send_clone_event_best_effort(
+            &progress_tx,
+            CloneEvent::Progress {
+                generation,
                 url: progress_url.clone(),
                 line,
-            });
-            let _ = progress_waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-        });
-        if result.is_ok()
-            && let Err(error) = crate::git_worktree::initialize(&cfg, &dest, &dest, None)
-        {
-            let _ = progress_tx.send(CloneEvent::Progress {
+            },
+        );
+        wake_clone_loop_best_effort(&progress_waker);
+    }
+    if result.is_ok()
+        && clone_event_is_current(generation, CLONE_GENERATION.load(Ordering::SeqCst))
+        && let Err(error) = crate::git_worktree::initialize(&cfg, &dest, &dest, None)
+    {
+        send_clone_event_best_effort(
+            &progress_tx,
+            CloneEvent::Progress {
+                generation,
                 url: progress_url,
-                line: error,
-            });
-            let _ = progress_waker.wake();
-        }
-        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-        let _ = tx.send(CloneEvent::Done(WorkspaceCloneOutcome {
+                line: thegn_core::ci_log::redact(&error.to_string()),
+            },
+        );
+        wake_clone_loop_best_effort(&progress_waker);
+    }
+    send_clone_event_best_effort(
+        &tx,
+        CloneEvent::Done(WorkspaceCloneOutcome {
+            generation,
             url,
             dest,
             result,
-        }));
-        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-    });
+        }),
+    );
+    wake_clone_loop_best_effort(&waker);
 }
 
 pub(crate) fn create_workspace_from_input_with_config(
@@ -582,8 +888,13 @@ pub(crate) fn apply_clone_event(
     center: Rect,
 ) -> bool {
     match ev {
-        CloneEvent::Progress { url, line } => {
-            if let Some(p) = picker.as_mut()
+        CloneEvent::Progress {
+            generation,
+            url,
+            line,
+        } => {
+            if clone_event_is_current(generation, CLONE_GENERATION.load(Ordering::SeqCst))
+                && let Some(p) = picker.as_mut()
                 && p.cloning_url() == Some(url.as_str())
             {
                 p.set_clone_progress(line);
@@ -594,9 +905,11 @@ pub(crate) fn apply_clone_event(
             // Only honor a result the picker is still awaiting — a cancel (or a
             // move to another clone) abandons it rather than yanking the user
             // into a workspace they dismissed.
-            let awaited = picker
-                .as_ref()
-                .is_some_and(|p| p.cloning_url() == Some(o.url.as_str()));
+            let awaited =
+                clone_event_is_current(o.generation, CLONE_GENERATION.load(Ordering::SeqCst))
+                    && picker
+                        .as_ref()
+                        .is_some_and(|p| p.cloning_url() == Some(o.url.as_str()));
             if !awaited {
                 return false;
             }
@@ -620,7 +933,10 @@ pub(crate) fn apply_clone_event(
                 }
                 Err(e) => {
                     if let Some(p) = picker.as_mut() {
-                        p.set_error(format!("clone failed: {e}"));
+                        p.set_error(format!(
+                            "clone failed: {}",
+                            thegn_core::ci_log::redact(&e.to_string())
+                        ));
                     }
                     false
                 }
@@ -681,35 +997,15 @@ pub(crate) fn handle_picker_outcome(
     match outcome {
         PickerOutcome::Pending => false,
         PickerOutcome::Cancel => {
+            next_clone_generation();
             *picker = None;
             model.status = "project creation cancelled".into();
             false
         }
-        PickerOutcome::OpenRepo(path) => create(
-            &path,
-            picker,
-            session,
-            panes,
-            workspace_pool,
-            active_menu,
-            focus,
-            model,
-            sb,
-            drawer_runtime,
-        ),
-        PickerOutcome::Manual(input) => match plan_new_workspace_input(&input, cfg) {
-            SubmitPlan::Clone { url, dest } => {
-                // Keep the picker on screen in its cloning phase — apply_clone_event
-                // streams progress and closes it (or shows an error) on done.
-                model.status = format!("Cloning {}…", workspace_repo_display(&url));
-                if let Some(p) = picker.as_mut() {
-                    p.begin_clone(url.clone());
-                }
-                spawn_workspace_clone(url, dest, cfg.clone(), clone_tx.clone(), waker.clone());
-                false
-            }
-            SubmitPlan::Local(input) => create(
-                &input,
+        PickerOutcome::OpenRepo(path) => {
+            next_clone_generation();
+            create(
+                &path,
                 picker,
                 session,
                 panes,
@@ -719,8 +1015,44 @@ pub(crate) fn handle_picker_outcome(
                 model,
                 sb,
                 drawer_runtime,
-            ),
+            )
+        }
+        PickerOutcome::Manual(input) => match plan_new_workspace_input(&input, cfg) {
+            SubmitPlan::Clone { url, dest } => {
+                // Keep the picker on screen in its cloning phase — apply_clone_event
+                // streams progress and closes it (or shows an error) on done.
+                model.status = format!("Cloning {}…", workspace_repo_display(&url));
+                if let Some(p) = picker.as_mut() {
+                    p.begin_clone(url.clone());
+                }
+                let generation = next_clone_generation();
+                spawn_workspace_clone(
+                    generation,
+                    url,
+                    dest,
+                    cfg.clone(),
+                    clone_tx.clone(),
+                    waker.clone(),
+                );
+                false
+            }
+            SubmitPlan::Local(input) => {
+                next_clone_generation();
+                create(
+                    &input,
+                    picker,
+                    session,
+                    panes,
+                    workspace_pool,
+                    active_menu,
+                    focus,
+                    model,
+                    sb,
+                    drawer_runtime,
+                )
+            }
             SubmitPlan::CreateNew { leaf } => {
+                next_clone_generation();
                 *picker = None;
                 *active_menu = Some(menu::create_project_menu(
                     leaf.to_string_lossy().into_owned(),
@@ -728,6 +1060,7 @@ pub(crate) fn handle_picker_outcome(
                 false
             }
             SubmitPlan::Invalid(msg) => {
+                next_clone_generation();
                 // Stay open with the error inline so the input can be fixed.
                 if let Some(p) = picker.as_mut() {
                     p.set_error(msg);
@@ -773,6 +1106,122 @@ Receiving objects: 100% (10/10)\rdone.\n";
             lines.push(l)
         });
         assert_eq!(lines, vec!["no newline"]);
+    }
+
+    #[test]
+    fn progress_lines_cap_delimiter_free_segments() {
+        let data = vec![b'x'; 1024 * 1024];
+        let mut lines = Vec::new();
+        stream_progress_lines(std::io::Cursor::new(data), |line| lines.push(line));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), MAX_PROGRESS_SEGMENT);
+    }
+
+    #[test]
+    fn progress_lines_redact_credentials_and_strip_controls() {
+        let mut lines = Vec::new();
+        stream_progress_lines(
+            std::io::Cursor::new(b"https://user:tok@host/x \x1b[31mred\x1b[0m\n".as_slice()),
+            |line| lines.push(line),
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].contains("tok"));
+        assert!(!lines[0].contains('\u{1b}'));
+    }
+
+    #[test]
+    fn progress_throttle_coalesces_and_flushes_newest_line() {
+        let start = Instant::now();
+        let mut throttle = ProgressThrottle::new(Duration::from_millis(100));
+        let mut emitted = Vec::new();
+        for index in 0..10_000 {
+            if let Some(line) = throttle.offer(
+                format!("line-{index}"),
+                start + Duration::from_micros(index * 100),
+            ) {
+                emitted.push(line);
+            }
+        }
+        emitted.extend(throttle.flush());
+        assert!(emitted.len() <= 11, "emitted {} events", emitted.len());
+        assert_eq!(emitted.last().map(String::as_str), Some("line-9999"));
+    }
+
+    #[test]
+    fn clone_generation_fences_old_events_and_each_begin_is_unique() {
+        let first = next_clone_generation();
+        let second = next_clone_generation();
+        assert_ne!(first, second);
+        assert!(!clone_event_is_current(first, second));
+        assert!(clone_event_is_current(second, second));
+    }
+
+    #[test]
+    fn clone_step_terminates_then_escalates_after_grace() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(5);
+        assert_eq!(
+            clone_step(started, started, deadline, true, None),
+            CloneStep::Terminate
+        );
+        let sent = started + Duration::from_secs(1);
+        assert_eq!(
+            clone_step(
+                sent + CLONE_TERMINATE_GRACE,
+                started,
+                deadline,
+                false,
+                Some(sent)
+            ),
+            CloneStep::Kill
+        );
+        assert_eq!(
+            clone_step(started, started, started, false, None),
+            CloneStep::Terminate
+        );
+    }
+
+    #[test]
+    fn hung_clone_deadline_reaps_local_http_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let accept_thread = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => return Some(stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return None;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept clone connection: {error}"),
+                }
+            }
+        });
+        let dest = temp.path().join("clone");
+        let url = format!("http://{address}/x.git");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = clone_workspace_repo_with_deadline(
+                &url,
+                &dest,
+                Instant::now() + Duration::from_millis(300),
+                || false,
+                |_| {},
+            );
+            tx.send(result.map_err(|error| error.to_string())).unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(result.is_err(), "a nonresponsive HTTP peer must time out");
+        worker.join().unwrap();
+        assert!(
+            accept_thread.join().unwrap().is_some(),
+            "git contacted local peer"
+        );
     }
 
     #[test]
