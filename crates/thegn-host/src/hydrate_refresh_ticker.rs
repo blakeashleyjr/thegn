@@ -101,7 +101,6 @@ pub(crate) fn spawn_refresh_ticker(
             disk_path: Some(disk_path),
             sampler: None,
             last_stats: None,
-            daemon_scope: None,
             delivery: ContainerDelivery::default(),
             last_footprint_tick: None,
         },
@@ -636,7 +635,6 @@ struct LiveIo {
     disk_path: Option<std::path::PathBuf>,
     sampler: Option<thegn_metrics::StatsSampler>,
     last_stats: Option<Instant>,
-    daemon_scope: Option<String>,
     delivery: ContainerDelivery,
     last_footprint_tick: Option<u64>,
 }
@@ -700,9 +698,17 @@ impl LiveIo {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| thegn_core::time_policy::saturating_i64(d.as_millis()))
             .unwrap_or(0);
-        let scope = self.daemon_scope.as_deref().expect("daemon primed");
-        let status = thegn_core::db::Db::open()
-            .and_then(|db| crate::handlers::status::snapshot(&db, scope, now_ms));
+        let scopes = crate::daemon::scope_aliases();
+        let status = thegn_core::db::Db::open().and_then(|db| {
+            let statuses = scopes
+                .iter()
+                .map(|scope| crate::handlers::status::snapshot(&db, scope, now_ms))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok(statuses
+                .into_iter()
+                .find(|status| status.present || status.stale)
+                .unwrap_or_default())
+        });
         match status {
             Ok(status) => {
                 self.sampler
@@ -738,7 +744,6 @@ impl TickerIo for LiveIo {
     }
 
     fn prime_daemon(&mut self) {
-        self.daemon_scope = Some(crate::daemon::scope_key());
         if let Some(status) = self.read_daemon() {
             drop(self.daemon_tx.send(status));
         }

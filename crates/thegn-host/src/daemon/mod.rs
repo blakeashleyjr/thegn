@@ -66,6 +66,18 @@ pub(crate) fn scope_key() -> String {
     scope_key_for(&thegn_core::util::xdg_state_home().join("thegn"))
 }
 
+/// Current and pre-upgrade registry scopes for this state dir. The legacy
+/// spelling is available only for UTF-8 paths; those paths were lossless under
+/// the old scheme, so it cannot alias a distinct state dir.
+pub(crate) fn scope_aliases() -> Vec<String> {
+    let state_dir = thegn_core::util::xdg_state_home().join("thegn");
+    let mut aliases = vec![scope_key_for(&state_dir)];
+    if let Some(legacy) = state_dir.to_str() {
+        aliases.push(legacy.to_owned());
+    }
+    aliases
+}
+
 fn scope_key_for(state_dir: &std::path::Path) -> String {
     thegn_core::config_daemon::state_scope_identity(state_dir)
 }
@@ -446,6 +458,18 @@ async fn run(
         .transpose()
         .map_err(anyhow::Error::msg)
         .context("invalid remote control transport")?;
+    let db: service::SharedDb = Arc::new(Mutex::new(Db::open()?));
+    let state_dir = thegn_core::util::xdg_state_home().join("thegn");
+    let scope = scope_key_for(&state_dir);
+    let legacy_scope = state_dir.to_str();
+    {
+        let db = db.lock().expect("daemon db lock");
+        if live_legacy_scope_daemon(&db.daemons()?, legacy_scope, pid_alive) {
+            anyhow::bail!(
+                "a pre-upgrade daemon is still registered for this state directory (pid alive); stop it with `thegn daemon stop` before starting a new daemon"
+            );
+        }
+    }
     let has_socket_override = socket_override.is_some();
     let sock = socket_override.unwrap_or_else(|| socket_path(&cfg.daemon));
     #[cfg(unix)]
@@ -537,10 +561,6 @@ async fn run(
         }
     };
 
-    let db: service::SharedDb = Arc::new(Mutex::new(Db::open()?));
-    let state_dir = thegn_core::util::xdg_state_home().join("thegn");
-    let scope = scope_key_for(&state_dir);
-    let legacy_scope = state_dir.to_str();
     let daemon_id = {
         let mut b = [0u8; 8];
         getrandom::fill(&mut b).expect("csprng for daemon id");
@@ -851,6 +871,17 @@ fn boot_sweep_targets(
         })
         .map(|r| r.daemon_id.clone())
         .collect()
+}
+
+fn live_legacy_scope_daemon(
+    rows: &[DaemonRow],
+    legacy_scope: Option<&str>,
+    pid_alive: impl Fn(i64) -> bool,
+) -> bool {
+    legacy_scope.is_some_and(|legacy_scope| {
+        rows.iter()
+            .any(|row| row.scope == legacy_scope && pid_alive(row.pid))
+    })
 }
 
 /// Idle-exit policy (pure): a plain pane daemon with a nonzero window runs the
@@ -1216,6 +1247,30 @@ mod tests {
         assert!(boot_sweep_targets(&rows, "v1-scope-c", Some("/scope/c"), alive).is_empty());
         // Invalid UTF-8 state paths cannot match rows from the lossy legacy scheme.
         assert!(boot_sweep_targets(&rows, "v1-scope-c", None, alive).is_empty());
+    }
+
+    #[test]
+    fn live_legacy_scope_row_blocks_startup() {
+        let rows = vec![
+            row("old-live", "/state/a", 22),
+            row("old-dead", "/state/a", 11),
+        ];
+        let alive = |pid: i64| pid == 22;
+        assert!(live_legacy_scope_daemon(&rows, Some("/state/a"), alive));
+        assert!(!live_legacy_scope_daemon(&rows, Some("/state/b"), alive));
+        assert!(!live_legacy_scope_daemon(&rows, None, alive));
+    }
+
+    #[test]
+    fn scope_aliases_include_legacy_utf8_path() {
+        let state_dir = thegn_core::util::xdg_state_home().join("thegn");
+        let aliases = scope_aliases();
+        assert_eq!(aliases[0], scope_key_for(&state_dir));
+        assert_eq!(aliases.get(1).map(String::as_str), state_dir.to_str());
+        assert_eq!(
+            aliases.len(),
+            if state_dir.to_str().is_some() { 2 } else { 1 }
+        );
     }
 
     /// The idle-exit janitor arms only for a plain pane daemon: `0` = never,
