@@ -1177,6 +1177,7 @@ mod tests {
     fn moved_nested_gitlink_matches_cli_for_worktree_and_tree_range() {
         let repo = TestRepo::new("nd-moved-gitlink");
         repo.commit_file("base.txt", "base\n", "base");
+        std::fs::create_dir_all(repo.dir.join("sub")).unwrap();
         repo.out(&["-C", "sub", "init", "-q"]);
         repo.out(&["-C", "sub", "config", "user.name", "Test"]);
         repo.out(&["-C", "sub", "config", "user.email", "test@example.invalid"]);
