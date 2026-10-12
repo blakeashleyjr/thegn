@@ -295,9 +295,14 @@ const HOOK_LOG_PRUNE_INTERVAL_SECS: i64 = 60 * 60;
 static LAST_LOG_PRUNE: OnceLock<Mutex<std::collections::HashMap<PathBuf, i64>>> = OnceLock::new();
 
 pub(crate) fn log_root() -> PathBuf {
-    thegn_core::util::xdg_state_home()
-        .join("thegn")
-        .join("hooks")
+    let state_home = thegn_core::util::xdg_state_home();
+    #[cfg(test)]
+    assert_ne!(
+        state_home,
+        thegn_core::util::home().join(".local/state"),
+        "THE-744: hook test resolved the real XDG state home"
+    );
+    state_home.join("thegn").join("hooks")
 }
 
 /// Prune direct hook-log children on the background disk lane. The hourly
@@ -539,6 +544,16 @@ fn run_all_with_log_root(
 mod tests {
     use super::*;
     use thegn_core::hooks::{HookEvent, HookFailure, HookScope};
+
+    #[test]
+    fn log_root_panics_when_xdg_state_home_is_the_real_default() {
+        let real_state_home = thegn_core::util::home()
+            .join(".local/state")
+            .to_string_lossy()
+            .into_owned();
+        let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", &real_state_home)]);
+        assert!(std::panic::catch_unwind(log_root).is_err());
+    }
 
     fn spec(command: &str, timeout_secs: u64) -> HookSpec {
         HookSpec {

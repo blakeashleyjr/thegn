@@ -46,9 +46,23 @@ pub fn xdg_config_home() -> PathBuf {
 
 #[cfg(not(windows))]
 pub fn xdg_state_home() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
+    let path = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/state"))
+        .unwrap_or_else(|| home().join(".local/state"));
+    #[cfg(test)]
+    assert_isolated_state_home(&path);
+    path
+}
+
+#[cfg(test)]
+fn assert_isolated_state_home(path: &Path) {
+    let real_state_home = home().join(".local/state");
+    assert_ne!(
+        path,
+        &real_state_home,
+        "THE-744: unit test resolved the real XDG state home ({})",
+        real_state_home.display()
+    );
 }
 
 #[cfg(windows)]
@@ -1685,6 +1699,26 @@ fn platform_hostname() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xdg_state_home_panics_when_it_resolves_to_the_real_default() {
+        let _env = crate::testenv::EnvGuard::unset(&["XDG_STATE_HOME"]);
+        assert!(std::panic::catch_unwind(xdg_state_home).is_err());
+    }
+
+    #[test]
+    fn nextest_ambient_state_home_is_isolated() {
+        let _lock = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if std::env::var_os("NEXTEST").is_some() {
+            assert_ne!(
+                xdg_state_home(),
+                home().join(".local/state"),
+                "THE-744: nextest did not isolate XDG_STATE_HOME"
+            );
+        }
+    }
 
     #[test]
     fn git_write_epoch_advances_on_scope_drop_and_lock_release() {
