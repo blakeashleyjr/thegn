@@ -44,7 +44,7 @@ pub fn run(
     });
 
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let mut tile = build(hook)?;
+    let tile = build(hook)?;
 
     let mut ops = CrosstermTerminalOps;
     run_lifecycle(&mut ops, tile, |tile| {
@@ -269,7 +269,7 @@ impl std::fmt::Display for LifecycleError {
 
 impl std::error::Error for LifecycleError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.primary.as_ref().map(|primary| &**primary)
+        None
     }
 }
 
@@ -290,7 +290,11 @@ fn run_lifecycle<O: TerminalOps>(
     let teardown = terminal.finish();
     tile.finish();
     if primary.is_err() || !teardown.is_empty() {
-        return Err(LifecycleError { primary, teardown }.into());
+        return Err(LifecycleError {
+            primary: primary.err(),
+            teardown,
+        }
+        .into());
     }
     Ok(())
 }
