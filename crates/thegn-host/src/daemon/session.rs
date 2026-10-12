@@ -1573,7 +1573,7 @@ mod tests {
             mut actor,
             pane_rx,
             msg_rx,
-            harness,
+            mut harness,
         } = build_actor_cfg("cat", None, "sh", cfg);
         let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
         actor.recording_done_tx = Some(completed_tx);
