@@ -291,7 +291,7 @@ impl PlumbingAdapter {
                 &self.repo_root,
                 ours,
                 theirs,
-                &self.regenerate_paths,
+                &paths,
                 &self.regenerate_command,
             )
         {
@@ -507,7 +507,7 @@ fn regenerate_merge(
     repo_root: &Path,
     ours: &str,
     theirs: &str,
-    regenerate_paths: &[String],
+    conflict_paths: &[String],
     regenerate_command: &str,
 ) -> Option<String> {
     thegn_core::git_operand::revision(ours).ok()?;
@@ -536,12 +536,25 @@ fn regenerate_merge(
             .ok()?;
         // Take the incoming version of each regenerate path so it's a valid file
         // (not conflict-marked), then the regen command reconciles it.
-        for p in regenerate_paths {
+        for p in conflict_paths {
             scratch.verify().ok()?;
             let _ = util::git_cmd(&tmp) // best-effort: regenerate paths are rewritten below; the unmerged check catches the rest
                 .args(["checkout", "--theirs", "--", p])
                 .output();
         }
+        // Resolve only the declared conflict entries to establish the clean
+        // merge baseline before running the configured command.
+        let mut add_args = vec!["--literal-pathspecs", "add", "--"];
+        add_args.extend(conflict_paths.iter().map(String::as_str));
+        let staged = util::git_cmd(&tmp).args(&add_args).output().ok()?;
+        if !staged.status.success() {
+            return None;
+        }
+        scratch.verify().ok()?;
+        if !util::git_out_allow_empty(&tmp, &["ls-files", "-u"])?.is_empty() {
+            return None;
+        }
+        let baseline_tree = util::git_out(&tmp, &["write-tree"])?;
         // Rebuild the regenerate artifacts from the merged manifests.
         scratch.verify().ok()?;
         let ok = std::process::Command::new("sh")
@@ -555,24 +568,78 @@ fn regenerate_merge(
             return None;
         }
         scratch.verify().ok()?;
-        let _ = util::git_cmd(&tmp).args(["add", "-A"]).output(); // best-effort: stage: the unmerged-path check below catches a failed stage
+        let staged = util::git_cmd(&tmp).args(&add_args).output().ok()?;
+        if !staged.status.success() {
+            return None;
+        }
+        // The merge's index-side conflict resolution is expected. Any change
+        // left in the worktree, or any untracked output, is outside the exact
+        // conflict set and makes this repair unsafe to accept.
+        scratch.verify().ok()?;
+        let status = util::git_out_allow_empty(
+            &tmp,
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignored=no",
+            ],
+        )?;
+        if status
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .any(|entry| {
+                let bytes = entry.as_bytes();
+                bytes.len() < 3
+                    || bytes[2] != b' '
+                    || bytes[0] == b'?' && bytes[1] == b'?'
+                    || bytes[1] != b' '
+            })
+        {
+            return None;
+        }
         // Bail if any path is still unmerged — we only handle regenerable cases.
         scratch.verify().ok()?;
-        let unmerged =
-            util::git_out(&tmp, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
-        if !unmerged.trim().is_empty() {
+        let unmerged = util::git_out_allow_empty(&tmp, &["ls-files", "-u"])?;
+        if !unmerged.is_empty() {
             return None;
         }
         scratch.verify().ok()?;
         let tree = util::git_out(&tmp, &["write-tree"])?;
         let tree = tree.trim().to_string();
+        let diff = util::git_cmd(&tmp)
+            .args([
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "--no-renames",
+                "-r",
+                "-z",
+                &baseline_tree,
+                &tree,
+            ])
+            .output()
+            .ok()?;
+        if !diff.status.success() {
+            return None;
+        }
+        let approved: HashSet<&[u8]> = conflict_paths.iter().map(|path| path.as_bytes()).collect();
+        if diff
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .any(|path| !approved.iter().any(|approved_path| *approved_path == path))
+        {
+            return None;
+        }
         (!tree.is_empty()).then_some(tree)
     })();
     remove_scratch_worktree(repo_root, scratch);
     if tree.is_some() {
         thegn_core::msg::info(&format!(
             "merge queue: regenerated {} for a lockfile-only merge",
-            regenerate_paths.join(", ")
+            conflict_paths.join(", ")
         ));
     }
     tree
@@ -623,6 +690,8 @@ pub struct FoldReport {
     pub final_tip: String,
     pub advanced: bool,
     pub landed: Vec<LandedReport>,
+    /// Exact ordered source tips included in and gated as part of this fold.
+    pub gated_sources: Vec<(String, String)>,
     /// Object-DB folds not committed to the target. Never authorizes cleanup.
     pub prepared: Vec<LandedReport>,
     /// Candidates held before a complete fold plan could be produced.
@@ -696,6 +765,30 @@ fn record_gate(diagnostics: &mut String, phase: &str, verdict: &GateVerdict) {
         diagnostics.push_str(TRUNCATED);
     } else {
         diagnostics.push_str(&clean);
+    }
+}
+
+/// Bind the union gate diagnostics to the target base and ordered captured
+/// source tips. Keep this one line bounded even for unusually large queues.
+fn record_gate_sources(diagnostics: &mut String, base: &str, plan: &FoldPlan) {
+    const MAX_LINE: usize = 4000;
+    const MAX_DIAGNOSTICS: usize = 32 * 1024;
+    if diagnostics.ends_with("\n[additional gate diagnostics omitted]\n") {
+        return;
+    }
+    let mut line = format!("[union provenance] target base {base}; sources");
+    for landed in &plan.landed {
+        let item = format!(" {}={}", landed.branch.name, landed.branch.tip);
+        let sanitized: String = item.chars().filter(|c| diagnostic_char(*c)).collect();
+        if line.len() + sanitized.len() > MAX_LINE {
+            line.push_str(" [source list truncated]");
+            break;
+        }
+        line.push_str(&sanitized);
+    }
+    line.push('\n');
+    if diagnostics.len() + line.len() <= MAX_DIAGNOSTICS {
+        diagnostics.push_str(&line);
     }
 }
 
@@ -1136,6 +1229,11 @@ fn build_report(
             commit: l.commit.clone(),
         })
         .collect();
+    let gated_sources = plan
+        .landed
+        .iter()
+        .map(|landed| (landed.branch.name.clone(), landed.branch.tip.clone()))
+        .collect();
     FoldReport {
         resyncs: Vec::new(),
         target_branch: target_branch.to_string(),
@@ -1143,6 +1241,7 @@ fn build_report(
         final_tip: plan.final_tip.clone(),
         advanced: false,
         landed: Vec::new(),
+        gated_sources,
         prepared,
         unprepared: Vec::new(),
         deferred,
@@ -1410,6 +1509,7 @@ fn run_fold_admitted(
                 &mut diagnostics,
                 &adapter.history,
             );
+            record_gate_sources(&mut diagnostics, &base, &plan);
             // The gate could not run: report the environment and hold everything
             // back. Never bisect — the failure is identical at every prefix.
             if let GateVerdict::Error { reason, .. } = &verdict {
@@ -2174,12 +2274,26 @@ mod tests {
         }
         repo.feature("b1", "a.txt", "a\n");
         repo.feature("b2", "b.txt", "b\n");
+        let expected_sources: Vec<(String, String)> = repo
+            .branch_set()
+            .into_iter()
+            .map(|branch| (branch.name, branch.tip))
+            .collect();
         let before = repo.out(&["rev-parse", "main"]);
 
-        let report = run_fold(&cfg(""), &repo.dir, repo.branch_set()).unwrap();
+        let report = run_fold(&cfg("true"), &repo.dir, repo.branch_set()).unwrap();
         assert!(report.advanced);
         assert_eq!(report.landed.len(), 2);
         assert!(report.deferred.is_empty());
+        assert_eq!(report.gated_sources, expected_sources);
+        assert!(
+            report
+                .diagnostics
+                .contains(&format!("target base {before}"))
+        );
+        for (_, tip) in &expected_sources {
+            assert!(report.diagnostics.contains(tip), "{}", report.diagnostics);
+        }
         // main moved and now contains both files.
         assert_ne!(repo.out(&["rev-parse", "main"]), before);
         let files = repo.out(&["ls-tree", "-r", "--name-only", "main"]);
@@ -3432,6 +3546,118 @@ mod tests {
         assert_eq!(repo.out(&["show", "main:Cargo.lock"]), "regenerated");
         let files = repo.out(&["ls-tree", "-r", "--name-only", "main"]);
         assert!(files.contains("a.txt"), "{files}");
+    }
+
+    #[test]
+    fn regeneration_rejects_changes_to_unrelated_tracked_files() {
+        let repo = regen_repo("regen-outside-tracked");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        let mut c = cfg("");
+        c.regenerate_command = "printf 'regenerated\\n' > Cargo.lock; printf evil > a.txt".into();
+
+        let report = run_fold(&c, &repo.dir, repo.branch_set()).unwrap();
+        assert!(
+            !report.advanced,
+            "undeclared tracked output must be rejected"
+        );
+        assert_eq!(report.deferred.len(), 1);
+        assert_eq!(report.deferred[0].branch, "b1");
+        assert_eq!(report.deferred[0].kind, ConflictKind::Regenerable);
+        assert!(
+            !repo
+                .out(&["ls-tree", "-r", "--name-only", "main"])
+                .lines()
+                .any(|path| path == "a.txt")
+        );
+    }
+
+    #[test]
+    fn regeneration_rejects_unrelated_changes_staged_by_the_command() {
+        let repo = regen_repo("regen-staged-outside");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        let mut c = cfg("");
+        c.regenerate_command =
+            "printf 'regenerated\\n' > Cargo.lock; printf evil > a.txt; git add -- a.txt".into();
+
+        let report = run_fold(&c, &repo.dir, repo.branch_set()).unwrap();
+        assert!(
+            !report.advanced,
+            "staged undeclared output must be rejected"
+        );
+        assert_eq!(report.deferred.len(), 1);
+        assert_eq!(report.deferred[0].branch, "b1");
+        assert_eq!(report.deferred[0].kind, ConflictKind::Regenerable);
+        assert!(
+            !repo
+                .out(&["ls-tree", "-r", "--name-only", "main"])
+                .lines()
+                .any(|path| path == "a.txt")
+        );
+    }
+
+    #[test]
+    fn regeneration_rejects_untracked_outputs() {
+        let repo = regen_repo("regen-outside-untracked");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        let mut c = cfg("");
+        c.regenerate_command = "printf 'regenerated\\n' > Cargo.lock; touch stray.txt".into();
+
+        let report = run_fold(&c, &repo.dir, repo.branch_set()).unwrap();
+        assert!(
+            !report.advanced,
+            "undeclared untracked output must be rejected"
+        );
+        assert_eq!(report.deferred.len(), 1);
+        assert_eq!(report.deferred[0].branch, "b1");
+        assert_eq!(report.deferred[0].kind, ConflictKind::Regenerable);
+        assert!(
+            !repo
+                .out(&["ls-tree", "-r", "--name-only", "main"])
+                .lines()
+                .any(|path| path == "stray.txt")
+        );
+    }
+
+    #[test]
+    fn scratch_worktree_cleanup_does_not_follow_replaced_symlink() {
+        if !crate::platform::gate_path::verified_workspace_supported() {
+            return;
+        }
+        let repo = Repo::new("scratch-symlink-victim");
+        let scratch = ScratchDirectory::create("tg-drivermerge-test-").unwrap();
+        let path = scratch.path().to_path_buf();
+        let moved = path.with_file_name(format!(
+            "{}-owned",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        git(
+            &repo.dir,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                path.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::rename(&path, &moved).unwrap();
+        let victim = tempfile::tempdir().unwrap();
+        crate::platform::gate_path::history_test_symlink(victim.path(), &path).unwrap();
+
+        remove_scratch_worktree(&repo.dir, scratch);
+
+        assert!(victim.path().is_dir(), "victim directory must remain");
+        assert!(std::fs::read_dir(victim.path()).unwrap().next().is_none());
+        // Repair only this test's deliberately moved registration and owned dir.
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(&moved).unwrap();
+        git(&repo.dir, &["worktree", "prune"]);
     }
 
     #[test]
