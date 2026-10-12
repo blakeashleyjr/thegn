@@ -1758,6 +1758,9 @@ check "dispatch list shows the new row's stage" \
   "'$SZ' dispatch list | grep -q 'architect'"
 check "dispatch put rejects a parent that does not exist" \
   "'$SZ' dispatch put linear:SMOKE-2 '$R' claude --parent 999999 >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+plain_row="$("$SZ" dispatch put linear:SMOKE-PLAIN "$R" claude | sed -n 's/^dispatch \([0-9]*\) .*/\1/p')"
+check "dispatch put creates a stage-less plain row" \
+  "[[ -n '$plain_row' ]]"
 
 # --- run-completion contract (THE-76): wait / verify / the gated done --------
 # The wait verbs answer from the local roster alone when the selection has
@@ -1771,7 +1774,7 @@ wnot_out="$("$SZ" dispatch wait --any 2>&1)"
 wnot_rc=$?
 wrow_out="$("$SZ" dispatch wait --row 999999 2>&1)"
 wrow_rc=$?
-v1_out="$("$SZ" dispatch verify 1 2>&1)"
+v1_out="$("$SZ" dispatch verify "$plain_row" 2>&1)"
 v1_rc=$?
 set -e
 wany_ok=1
