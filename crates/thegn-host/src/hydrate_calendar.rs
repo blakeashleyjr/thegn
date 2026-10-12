@@ -534,7 +534,7 @@ fn sync_accounts_with_generation(
     // Each account's page is applied and dropped inside the sink, releasing its
     // share of the global admission budget before the next account is fetched.
     let mut changed = false;
-    let network_accounts = network_account_names(accounts);
+    let network_accounts = network_account_names(&accounts);
     let mut connectivity = ConnectivityEvidenceBatch::default();
     rt.block_on(router.list_events_each(window, &tokens, |r| {
         connectivity.observe(connectivity_evidence(
@@ -1178,7 +1178,7 @@ fn deliver(
             target: "thegn::calendar",
             error = %error,
             year = coverage.year,
-            month: coverage.month,
+            month = coverage.month,
             "calendar month is unavailable or incomplete"
         );
     }
