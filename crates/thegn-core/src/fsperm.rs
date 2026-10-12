@@ -173,6 +173,26 @@ pub fn owned_by_current_user(meta: &std::fs::Metadata) -> bool {
     }
 }
 
+/// Carry an existing config's permissions to its replacement while limiting
+/// the result to owner-only access. This keeps deliberate read-only configs
+/// read-only and drops group/other access on Unix.
+pub fn preserve_owner_only_permissions(
+    source: &std::fs::Metadata,
+    destination: &Path,
+) -> std::io::Result<()> {
+    let mut permissions = std::fs::metadata(destination)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        permissions.set_mode(source.mode() & 0o600);
+    }
+    #[cfg(not(unix))]
+    {
+        permissions.set_readonly(source.permissions().readonly());
+    }
+    std::fs::set_permissions(destination, permissions)
+}
+
 /// Atomically rename `from` over `to` (replacing it, never following a
 /// final-component link in `to`). Windows needs `MoveFileExW`.
 pub fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -183,6 +203,19 @@ pub fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(not(windows))]
     {
         std::fs::rename(from, to)
+    }
+}
+
+/// Sync the directory entry after an atomic replacement. Windows replacement
+/// uses `MOVEFILE_WRITE_THROUGH`; Unix explicitly fsyncs the containing dir.
+pub fn sync_parent_dir(_parent: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(_parent)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(())
     }
 }
 
@@ -393,6 +426,27 @@ Set-Acl -LiteralPath $path -AclObject $acl"#
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn carried_permissions_keep_read_only_and_drop_group_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::write(&destination, b"new").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let source_metadata = std::fs::metadata(&source).unwrap();
+        preserve_owner_only_permissions(&source_metadata, &destination).unwrap();
+
+        let mode = std::fs::metadata(&destination)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o400);
+    }
 
     #[test]
     fn atomic_write_rename_failure_errors_and_leaves_no_temp() {
