@@ -249,7 +249,7 @@ pub(crate) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<s
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
             .open(path)
     }
     #[cfg(not(unix))]

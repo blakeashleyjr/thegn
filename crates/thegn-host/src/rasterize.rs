@@ -26,23 +26,41 @@ const MAX_DIM: u32 = 800;
 /// buffer is allocated. [`MAX_DIM`] only caps the final raster; without these a
 /// tiny compressed file declaring enormous dimensions would still be fully
 /// decoded first.
-const MAX_INPUT_DIM: u32 = 8192;
-const MAX_INPUT_PIXELS: u64 = 32 * 1024 * 1024;
-/// Decoder allocation ceiling (RGBA of [`MAX_INPUT_PIXELS`] is 128 MiB).
-const MAX_DECODE_ALLOC: u64 = 192 * 1024 * 1024;
-/// Largest image file [`image_file`] will read (callers may pass a lower cap
-/// through [`image_file_capped`]).
-const MAX_IMAGE_FILE_BYTES: u64 = 32 * 1024 * 1024;
+#[derive(Clone, Copy)]
+pub(crate) struct DecodeLimits {
+    max_dim: u32,
+    max_pixels: u64,
+    max_alloc: u64,
+}
+
+/// Keep player supplied cover art to a modest decode budget.
+pub(crate) const MEDIA_ART_LIMITS: DecodeLimits = DecodeLimits {
+    max_dim: 8192,
+    max_pixels: 32 * 1024 * 1024,
+    max_alloc: 192 * 1024 * 1024,
+};
+/// Bound preview source dimensions while allowing high resolution photos.
+const MAX_PREVIEW_INPUT_DIM: u32 = 16384;
+/// Bound preview pixel count to 256 MP before decoder allocation.
+const MAX_PREVIEW_INPUT_PIXELS: u64 = 256 * 1024 * 1024;
+/// Larger camera images remain previewable while the pixel buffer stays bounded to 1 GiB.
+const PREVIEW_LIMITS: DecodeLimits = DecodeLimits {
+    max_dim: MAX_PREVIEW_INPUT_DIM,
+    max_pixels: MAX_PREVIEW_INPUT_PIXELS,
+    max_alloc: 1024 * 1024 * 1024,
+};
+/// Bound preview file reads to 256 MiB while covering large camera JPEGs.
+const MAX_PREVIEW_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Whether declared source dimensions are within the decode budget. Pure.
-fn check_dimensions(w: u32, h: u32) -> Result<(), String> {
+fn check_dimensions(w: u32, h: u32, limits: DecodeLimits) -> Result<(), String> {
     if w == 0 || h == 0 {
         return Err("image has no pixels".to_string());
     }
-    if w > MAX_INPUT_DIM || h > MAX_INPUT_DIM {
+    if w > limits.max_dim || h > limits.max_dim {
         return Err(format!("image dimensions {w}x{h} exceed the decode limit"));
     }
-    if u64::from(w) * u64::from(h) > MAX_INPUT_PIXELS {
+    if u64::from(w) * u64::from(h) > limits.max_pixels {
         return Err(format!("image {w}x{h} exceeds the pixel limit"));
     }
     Ok(())
@@ -50,7 +68,7 @@ fn check_dimensions(w: u32, h: u32) -> Result<(), String> {
 
 /// Decode encoded image `bytes` to RGBA, downscaling to fit [`MAX_DIM`]. The
 /// header dimensions are validated and decoder limits installed first.
-fn decode_and_fit(bytes: &[u8]) -> Result<Raster, String> {
+fn decode_and_fit(bytes: &[u8], limits: DecodeLimits) -> Result<Raster, String> {
     let reader = || {
         image::ImageReader::new(std::io::Cursor::new(bytes))
             .with_guessed_format()
@@ -59,13 +77,13 @@ fn decode_and_fit(bytes: &[u8]) -> Result<Raster, String> {
     let (w, h) = reader()?
         .into_dimensions()
         .map_err(|e| format!("image decode failed: {e}"))?;
-    check_dimensions(w, h)?;
+    check_dimensions(w, h, limits)?;
     let mut r = reader()?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_INPUT_DIM);
-    limits.max_image_height = Some(MAX_INPUT_DIM);
-    limits.max_alloc = Some(MAX_DECODE_ALLOC);
-    r.limits(limits);
+    let mut decoder_limits = image::Limits::default();
+    decoder_limits.max_image_width = Some(limits.max_dim);
+    decoder_limits.max_image_height = Some(limits.max_dim);
+    decoder_limits.max_alloc = Some(limits.max_alloc);
+    r.limits(decoder_limits);
     let img = r
         .decode()
         .map_err(|e| format!("image decode failed: {e}"))?;
@@ -115,18 +133,30 @@ fn read_regular_capped(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
 
 /// Rasterize an image file (PNG/JPEG) to RGBA. Blocking.
 pub fn image_file(path: &Path) -> Result<Raster, String> {
-    image_file_capped(path, MAX_IMAGE_FILE_BYTES)
+    image_file_with_limits(path, MAX_PREVIEW_FILE_BYTES, PREVIEW_LIMITS)
 }
 
-/// [`image_file`] with a caller-chosen encoded-size cap. Blocking.
-pub fn image_file_capped(path: &Path, cap: u64) -> Result<Raster, String> {
-    let bytes = read_regular_capped(path, cap.min(MAX_IMAGE_FILE_BYTES))?;
-    decode_and_fit(&bytes)
+/// Rasterize a file with caller-chosen byte and decode limits. Blocking.
+pub(crate) fn image_file_with_limits(
+    path: &Path,
+    cap: u64,
+    limits: DecodeLimits,
+) -> Result<Raster, String> {
+    let bytes = read_regular_capped(path, cap)?;
+    decode_and_fit(&bytes, limits)
 }
 
 /// Decode encoded image `bytes` (e.g. cover art fetched over HTTP) to RGBA.
 pub fn image_bytes(bytes: &[u8]) -> Result<Raster, String> {
-    decode_and_fit(bytes)
+    decode_and_fit(bytes, PREVIEW_LIMITS)
+}
+
+/// Decode bytes with caller-chosen limits (cover art uses the tighter budget).
+pub(crate) fn image_bytes_with_limits(
+    bytes: &[u8],
+    limits: DecodeLimits,
+) -> Result<Raster, String> {
+    decode_and_fit(bytes, limits)
 }
 
 /// Rasterize page 1 of a PDF via `pdftoppm` (poppler) → PNG on stdout → RGBA.
@@ -140,7 +170,7 @@ pub fn pdf_page1(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
         .arg("-"); // write PNG to stdout
     let out = crate::preview_jobs::run_renderer(&mut cmd, cancel)
         .map_err(|e| format!("pdftoppm: {}", capture_err(&e)))?;
-    decode_and_fit(&out)
+    decode_and_fit(&out, PREVIEW_LIMITS)
 }
 
 /// Extract a PDF's text via `pdftotext` (the no-graphics fallback). Output cut
@@ -173,7 +203,7 @@ pub fn mermaid(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
     let result = match crate::preview_jobs::run_renderer_quiet(&mut cmd, cancel) {
         Ok(()) => std::fs::read(&tmp)
             .map_err(|e| format!("mmdc output read failed: {e}"))
-            .and_then(|bytes| decode_and_fit(&bytes)),
+            .and_then(|bytes| decode_and_fit(&bytes, PREVIEW_LIMITS)),
         Err(e) => Err(format!("mmdc: {}", capture_err(&e))),
     };
     let _ = std::fs::remove_file(&tmp); // best-effort: temp cleanup
@@ -211,7 +241,7 @@ mod tests {
         image::DynamicImage::ImageRgba8(img)
             .write_to(&mut buf, image::ImageFormat::Png)
             .unwrap();
-        let r = decode_and_fit(buf.get_ref()).unwrap();
+        let r = decode_and_fit(buf.get_ref(), PREVIEW_LIMITS).unwrap();
         assert_eq!((r.w, r.h), (2, 3));
         assert_eq!(r.rgba.len(), 2 * 3 * 4);
         assert_eq!(&r.rgba[0..4], &[255, 0, 0, 255]);
@@ -224,7 +254,7 @@ mod tests {
         image::DynamicImage::ImageRgba8(img)
             .write_to(&mut buf, image::ImageFormat::Png)
             .unwrap();
-        let r = decode_and_fit(buf.get_ref()).unwrap();
+        let r = decode_and_fit(buf.get_ref(), PREVIEW_LIMITS).unwrap();
         assert!(r.w <= MAX_DIM && r.h <= MAX_DIM);
         assert!(
             r.w == MAX_DIM || r.h == MAX_DIM,
@@ -234,13 +264,29 @@ mod tests {
 
     #[test]
     fn dimension_guard_bounds_width_height_and_pixels() {
-        assert!(check_dimensions(800, 800).is_ok());
-        assert!(check_dimensions(MAX_INPUT_DIM, 1).is_ok());
-        assert!(check_dimensions(0, 10).is_err());
-        assert!(check_dimensions(MAX_INPUT_DIM + 1, 1).is_err());
-        assert!(check_dimensions(1, MAX_INPUT_DIM + 1).is_err());
+        assert!(check_dimensions(800, 800, MEDIA_ART_LIMITS).is_ok());
+        assert!(check_dimensions(MEDIA_ART_LIMITS.max_dim, 1, MEDIA_ART_LIMITS).is_ok());
+        assert!(check_dimensions(0, 10, MEDIA_ART_LIMITS).is_err());
+        assert!(check_dimensions(MEDIA_ART_LIMITS.max_dim + 1, 1, MEDIA_ART_LIMITS).is_err());
+        assert!(check_dimensions(1, MEDIA_ART_LIMITS.max_dim + 1, MEDIA_ART_LIMITS).is_err());
         // Each side is legal but the area is not.
-        assert!(check_dimensions(MAX_INPUT_DIM, MAX_INPUT_DIM).is_err());
+        assert!(
+            check_dimensions(
+                MEDIA_ART_LIMITS.max_dim,
+                MEDIA_ART_LIMITS.max_dim,
+                MEDIA_ART_LIMITS
+            )
+            .is_err()
+        );
+        assert!(check_dimensions(MAX_PREVIEW_INPUT_DIM, 1, PREVIEW_LIMITS).is_ok());
+        assert!(
+            check_dimensions(
+                MAX_PREVIEW_INPUT_DIM,
+                MAX_PREVIEW_INPUT_PIXELS as u32 / MAX_PREVIEW_INPUT_DIM,
+                PREVIEW_LIMITS
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -253,8 +299,12 @@ mod tests {
         let mut png = buf.into_inner();
         png[16..20].copy_from_slice(&60000u32.to_be_bytes());
         png[20..24].copy_from_slice(&60000u32.to_be_bytes());
-        let err = decode_and_fit(&png).err().expect("must refuse");
-        assert!(!err.is_empty());
+        let crc = crc32fast::hash(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+        let err = decode_and_fit(&png, MEDIA_ART_LIMITS)
+            .err()
+            .expect("must refuse");
+        assert!(err.contains("dimensions 60000x60000 exceed the decode limit"));
     }
 
     #[test]
@@ -277,7 +327,7 @@ mod tests {
 
     #[test]
     fn garbage_bytes_error_not_panic() {
-        assert!(decode_and_fit(b"not an image").is_err());
+        assert!(decode_and_fit(b"not an image", PREVIEW_LIMITS).is_err());
     }
 
     #[test]
