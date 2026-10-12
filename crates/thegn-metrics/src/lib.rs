@@ -16,6 +16,7 @@ mod coverage;
 mod gpu;
 mod gpu_exec;
 mod gpu_monitor;
+mod net_medium;
 mod procs;
 mod sample;
 mod thermal;
@@ -33,6 +34,7 @@ pub fn run_command_bounded(
 
 pub use battery::{read_battery, read_battery_power};
 pub use coverage::{AbsentReason, Coverage, FamilyReport, MetricFamily, coverage};
+pub use net_medium::{IfaceFact, NetMedium, select_medium};
 pub use procs::{
     MIN_INTERVAL as PROC_MIN_INTERVAL, ProcOwner, ProcSample, ProcSampler, ProcSnapshot,
 };
@@ -81,6 +83,9 @@ pub struct StatsSnapshot {
     pub net_bps: Option<(u64, u64)>,
     /// Per-interface (name, rx bytes/sec, tx bytes/sec), non-loopback.
     pub net_ifaces: Vec<(String, u64, u64)>,
+    /// Selected medium for the system network path. Unknown means the path
+    /// could not be identified without guessing.
+    pub net_medium: NetMedium,
     /// Battery as (percent 0–100, on AC). The bool is "plugged in", not
     /// "actively charging", so a charge-capped battery still reads as on AC.
     /// Absent on desktops / machines without a battery.
