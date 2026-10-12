@@ -437,9 +437,9 @@ impl QueryEngine {
                 Ok((id, (panel_id, targets))) => {
                     drop(job_ids.remove(&id));
                     // Best-effort: the UI may be gone during shutdown.
-                    drop(Result::ok(
-                        self.frames_tx.send(PanelUpdate { panel_id, targets }),
-                    ));
+                    match self.frames_tx.send(PanelUpdate { panel_id, targets }) {
+                        Ok(()) | Err(_) => {}
+                    }
                     self.gate.wake(&self.waker);
                 }
                 Err(join_error) => {
@@ -452,9 +452,9 @@ impl QueryEngine {
                                 result: Err(message.clone()),
                             })
                             .collect();
-                        drop(Result::ok(
-                            self.frames_tx.send(PanelUpdate { panel_id, targets }),
-                        ));
+                        match self.frames_tx.send(PanelUpdate { panel_id, targets }) {
+                            Ok(()) | Err(_) => {}
+                        }
                         self.gate.wake(&self.waker);
                     }
                 }
