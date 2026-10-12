@@ -191,6 +191,30 @@ pub fn retention_prune(manifests: &[SnapshotManifest], keep: usize) -> Vec<Strin
     ordered[keep..].iter().map(|m| m.id.clone()).collect()
 }
 
+/// Retention that always keeps the just-published manifest, even when its id
+/// sorts below another capture with the same timestamp.
+pub fn retention_prune_keeping(
+    manifests: &[SnapshotManifest],
+    keep: usize,
+    current_id: &str,
+) -> Vec<String> {
+    let keep = keep.max(1);
+    let current_is_listed = manifests.iter().any(|m| m.id == current_id);
+    let keep_others = if current_is_listed {
+        keep.saturating_sub(1)
+    } else {
+        keep
+    };
+    let mut ordered: Vec<&SnapshotManifest> =
+        manifests.iter().filter(|m| m.id != current_id).collect();
+    ordered.sort_by(|a, b| (b.created_at, &b.id).cmp(&(a.created_at, &a.id)));
+    ordered
+        .iter()
+        .skip(keep_others)
+        .map(|m| m.id.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +375,17 @@ mod tests {
         let del = retention_prune(&[a.clone(), b.clone()], 1);
         // Same created_at: the lexicographically larger id wins the keep slot.
         assert_eq!(del, vec![a.id]);
+    }
+
+    #[test]
+    fn retention_keeps_current_capture_when_same_second_id_sorts_lower() {
+        let current = m(42, "abcdef1234567890").with_generation("0000000000000000");
+        let previous = m(42, "abcdef1234567890").with_generation("ffffffffffffffff");
+        let all = [current.clone(), previous.clone()];
+
+        assert_eq!(
+            retention_prune_keeping(&all, 1, &current.id),
+            vec![previous.id]
+        );
     }
 }
