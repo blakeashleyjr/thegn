@@ -1098,6 +1098,120 @@ mod tests {
         assert_eq!(got, want, "numstat totals diverged for spec {spec:?}");
     }
 
+    fn assert_backend_rows_match_cli(repo: &TestRepo, spec: &str) {
+        use super::super::{CliGit, GitBackend as _, GitLoc, GixGit};
+
+        let loc = GitLoc::Local(repo.dir.clone());
+        let rows = |mut entries: Vec<DiffEntry>| {
+            entries.sort_by(|left, right| left.path.cmp(&right.path));
+            entries
+                .into_iter()
+                .map(|entry| (entry.path, entry.added, entry.deleted, entry.binary))
+                .collect::<Vec<_>>()
+        };
+        let expected = CliGit.diff_files(&loc, spec).expect("CLI diff rows");
+        let actual = GixGit::new()
+            .diff_files(&loc, spec)
+            .unwrap_or_else(|error| panic!("gix diff {spec}: {error}"));
+        assert_eq!(
+            rows(actual),
+            rows(expected),
+            "GixGit rows diverged from CliGit for {spec:?}"
+        );
+    }
+
+    #[test]
+    fn staged_and_unstaged_edits_to_one_path_match_cli_rows() {
+        let repo = TestRepo::new("nd-staged-plus-unstaged");
+        repo.commit_file("same.txt", "one\ntwo\n", "seed");
+        std::fs::write(repo.dir.join("same.txt"), "one\nstaged\n").unwrap();
+        repo.out(&["add", "same.txt"]);
+        std::fs::write(repo.dir.join("same.txt"), "one\nstaged\nunstaged\n").unwrap();
+
+        assert_backend_rows_match_cli(&repo, "HEAD");
+    }
+
+    #[test]
+    fn intent_to_add_matches_cli_rows() {
+        let repo = TestRepo::new("nd-intent-to-add");
+        repo.commit_file("base.txt", "base\n", "seed");
+        std::fs::write(repo.dir.join("intent.txt"), "new\nfile\n").unwrap();
+        repo.out(&["add", "-N", "intent.txt"]);
+
+        assert_backend_rows_match_cli(&repo, "HEAD");
+    }
+
+    #[test]
+    fn worktree_symlink_retarget_matches_cli_rows() {
+        use std::process::Command;
+
+        let repo = TestRepo::new("nd-symlink-retarget");
+        let link = repo.dir.join("link");
+        let created = Command::new("ln")
+            .args(["-s", "old-target"])
+            .arg(&link)
+            .output();
+        let Ok(created) = created else {
+            return;
+        };
+        if !created.status.success() {
+            return;
+        }
+        repo.out(&["add", "link"]);
+        repo.out(&["commit", "-q", "-m", "seed"]);
+        let retargeted = Command::new("ln")
+            .args(["-sfn", "new-target"])
+            .arg(&link)
+            .output();
+        let Ok(retargeted) = retargeted else {
+            return;
+        };
+        if !retargeted.status.success() {
+            return;
+        }
+
+        assert_backend_rows_match_cli(&repo, "HEAD");
+    }
+
+    #[test]
+    fn moved_nested_gitlink_matches_cli_for_worktree_and_tree_range() {
+        let repo = TestRepo::new("nd-moved-gitlink");
+        repo.commit_file("base.txt", "base\n", "base");
+        repo.out(&["-C", "sub", "init", "-q"]);
+        repo.out(&["-C", "sub", "config", "user.name", "Test"]);
+        repo.out(&["-C", "sub", "config", "user.email", "test@example.invalid"]);
+        std::fs::write(repo.dir.join("sub/nested.txt"), "first\n").unwrap();
+        repo.out(&["-C", "sub", "add", "nested.txt"]);
+        repo.out(&[
+            "-C",
+            "sub",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "first",
+        ]);
+        repo.out(&["-c", "advice.addEmbeddedRepo=false", "add", "sub"]);
+        repo.out(&["commit", "-q", "-m", "add gitlink"]);
+
+        std::fs::write(repo.dir.join("sub/nested.txt"), "first\nsecond\n").unwrap();
+        repo.out(&["-C", "sub", "add", "nested.txt"]);
+        repo.out(&[
+            "-C",
+            "sub",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "move nested HEAD",
+        ]);
+        assert_backend_rows_match_cli(&repo, "HEAD");
+        repo.out(&["add", "sub"]);
+        repo.out(&["commit", "-q", "-m", "advance gitlink"]);
+
+        assert_backend_rows_match_cli(&repo, "HEAD~1..HEAD");
+    }
+
     #[test]
     fn symmetric_range_matches_the_cli() {
         let repo = TestRepo::new("nd-sym");
