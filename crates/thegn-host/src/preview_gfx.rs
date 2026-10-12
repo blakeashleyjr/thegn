@@ -74,7 +74,7 @@ impl PreviewGfx {
                         // Delete any stale image first, then transmit + display.
                         let mut out = Vec::new();
                         if self.drawn.is_some() {
-                            out.extend_from_slice(graphics::delete_all());
+                            out.extend_from_slice(&graphics::delete_preview());
                         }
                         out.extend_from_slice(&image);
                         self.drawn = Some((place, self.rev));
@@ -92,7 +92,7 @@ impl PreviewGfx {
                         // Invalid raster: never claim it is drawn; clear any
                         // stale image that is still on screen.
                         if self.drawn.take().is_some() {
-                            graphics::delete_all().to_vec()
+                            graphics::delete_preview()
                         } else {
                             Vec::new()
                         }
@@ -102,7 +102,7 @@ impl PreviewGfx {
             Some(_) => Vec::new(), // already drawn at this placement and revision
             None if self.drawn.is_some() => {
                 self.drawn = None;
-                graphics::delete_all().to_vec()
+                graphics::delete_preview()
             }
             None => Vec::new(),
         }
@@ -168,6 +168,39 @@ mod tests {
     }
 
     #[test]
+    fn draw_then_occlude_emits_only_preview_scoped_graphics() {
+        let mut g = PreviewGfx::new();
+        g.set("a.png".to_string(), raster());
+        let mut bytes = g.frame(Some(panel()), Some("a.png"), false, true);
+        bytes.extend(g.frame(Some(panel()), Some("a.png"), true, true));
+
+        let wire = String::from_utf8_lossy(&bytes);
+        let ids: Vec<u32> = wire
+            .match_indices("i=")
+            .map(|(start, _)| {
+                let digits = wire[start + 2..]
+                    .split(|ch: char| !ch.is_ascii_digit())
+                    .next()
+                    .expect("ID field has a value");
+                digits.parse().expect("ID field is numeric")
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            [graphics::PREVIEW_IMAGE_ID, graphics::PREVIEW_IMAGE_ID]
+        );
+        assert!(ids.iter().all(|id| {
+            *id < crate::kitty_relay::CORNER_ID_BASE
+                || *id >= crate::kitty_relay::CORNER_ID_BASE + crate::kitty_relay::CORNER_IDS as u32
+        }));
+        assert!(
+            !bytes
+                .windows(b"\x1b_Ga=d\x1b\\".len())
+                .any(|window| { window == b"\x1b_Ga=d\x1b\\" })
+        );
+    }
+
+    #[test]
     fn invalid_raster_draws_nothing_and_is_not_marked_drawn() {
         let mut g = PreviewGfx::new();
         g.set(
@@ -206,7 +239,7 @@ mod tests {
         );
         assert_eq!(
             g.frame(Some(panel()), Some("a.png"), false, true),
-            graphics::delete_all().to_vec()
+            graphics::delete_preview()
         );
         assert!(g.drawn.is_none());
     }
@@ -228,11 +261,11 @@ mod tests {
         );
         let second = g.frame(Some(panel()), Some("a.png"), false, true);
         assert!(
-            second.starts_with(graphics::delete_all()),
+            second.starts_with(&graphics::delete_preview()),
             "stale image deleted"
         );
-        assert!(second.len() > graphics::delete_all().len());
-        assert_ne!(first, second[graphics::delete_all().len()..].to_vec());
+        assert!(second.len() > graphics::delete_preview().len());
+        assert_ne!(first, second[graphics::delete_preview().len()..].to_vec());
         // And steady state is quiet again.
         assert!(
             g.frame(Some(panel()), Some("a.png"), false, true)
@@ -248,7 +281,7 @@ mod tests {
         // Preview closed → no open path → the image is deleted next frame.
         assert_eq!(
             g.frame(Some(panel()), None, false, true),
-            graphics::delete_all().to_vec()
+            graphics::delete_preview()
         );
     }
 
@@ -260,7 +293,7 @@ mod tests {
         // Overlay comes up → delete.
         assert_eq!(
             g.frame(Some(panel()), Some("a.png"), true, true),
-            graphics::delete_all().to_vec()
+            graphics::delete_preview()
         );
         // Overlay clears → redraw.
         assert!(
@@ -277,7 +310,7 @@ mod tests {
         // A different file is open now → the stale image is deleted.
         assert_eq!(
             g.frame(Some(panel()), Some("b.rs"), false, true),
-            graphics::delete_all().to_vec()
+            graphics::delete_preview()
         );
     }
 

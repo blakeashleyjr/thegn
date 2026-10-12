@@ -1575,6 +1575,35 @@ mod tests {
     }
 
     #[test]
+    fn preview_reserved_id_is_namespaced_and_cannot_be_child_deleted() {
+        let preview_id = crate::graphics::PREVIEW_IMAGE_ID;
+        let mut relay = KittyRelay::new();
+        let mut transmitted = Vec::new();
+        relay.feed_with_rect(
+            &apc(&format!("Ga=T,i={preview_id},f=24,s=1,v=1;AQID")),
+            (8, 5),
+            |piece| transmitted.push(piece),
+        );
+        let [Piece::GfxDisplay(bytes)] = transmitted.as_slice() else {
+            panic!("transmit expected")
+        };
+        assert!(
+            bytes.starts_with(
+                format!("\x1b_Ga=T,f=24,s=1,v=1,i={},", CORNER_ID_BASE + 1).as_bytes()
+            )
+        );
+
+        let mut fresh_relay = KittyRelay::new();
+        let mut deleted = Vec::new();
+        fresh_relay.feed_with_rect(
+            &apc(&format!("Ga=d,d=I,i={preview_id};")),
+            (8, 5),
+            |piece| deleted.push(piece),
+        );
+        assert_eq!(deleted, [Piece::Rejected]);
+    }
+
+    #[test]
     fn anonymous_transmit_uses_the_default_reserved_id() {
         let pieces = relayed("Ga=T,f=24,s=1,v=1;AQID", (8, 5));
         let [Piece::GfxDisplay(bytes)] = pieces.as_slice() else {
