@@ -35,22 +35,31 @@ fn is_legacy_unix_addr(addr: &ControlAddr, legacy: &std::path::Path) -> bool {
 /// a side effect).
 pub(crate) async fn connect_daemon(dcfg: &DaemonConfig) -> Option<ControlClient> {
     super::reconcile_legacy_socket(dcfg);
-    let scope = super::scope_key();
+    let scopes = super::scope_aliases();
     // 1. Registry discovery (freshest live heartbeat), verified by connect.
     let discovered = tokio::task::spawn_blocking({
-        let scope = scope.clone();
+        let scopes = scopes.clone();
         move || {
             let db = Db::open().ok()?;
-            thegn_svc::control::client::discover(&db, &scope, now_ms())
+            Some(
+                scopes
+                    .iter()
+                    .filter_map(|scope| thegn_svc::control::client::discover(&db, scope, now_ms()))
+                    .collect::<Vec<_>>(),
+            )
         }
     })
     .await
     .ok()
-    .flatten();
+    .flatten()
+    .unwrap_or_default();
     let legacy = thegn_core::config_daemon::legacy_socket_path(
         &thegn_core::util::xdg_state_home().join("thegn"),
     );
-    if let Some(addr) = discovered.filter(|addr| !is_legacy_unix_addr(addr, &legacy)) {
+    for addr in discovered
+        .into_iter()
+        .filter(|addr| !is_legacy_unix_addr(addr, &legacy))
+    {
         let client = ControlClient::new(addr);
         if client.health().await.is_ok() {
             start_error_state_bridge(&client);
