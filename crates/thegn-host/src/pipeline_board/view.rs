@@ -313,8 +313,8 @@ fn group_head(col: &Column, width: usize) -> Line {
 /// One row, fitted to exactly `w` cells.
 ///
 /// Layout, left to right, every part a fixed width so columns stay aligned:
-/// the cursor bar, the edge mark (inbound arrow, tree connector, or a space),
-/// the status glyph, the worktree name, then the outbound tick and the age.
+/// the cursor bar, the edge mark (with its source stage when inbound), the
+/// status glyph, the worktree name, then the outbound tick, age and model.
 fn row_cell(r: &BoardRow, selected: bool, w: usize) -> Vec<Seg> {
     let gl = crate::caps::active_glyphs();
     let mut segs: Vec<Seg> = Vec::new();
@@ -332,12 +332,10 @@ fn row_cell(r: &BoardRow, selected: bool, w: usize) -> Vec<Seg> {
     match r.edge {
         Edge::Inbound => {
             segs.push(seg(Tok::Hue(Hue::Teal), gl.arrow_right));
+            segs.push(sp(1));
             segs.push(seg(
                 Tok::Slot(S::Dim),
-                trunc(
-                    &r.row.stage,
-                    w.saturating_sub(crate::seg::seg_width(&segs) + 10),
-                ),
+                trunc(r.inbound_from.as_deref().unwrap_or_default(), w / 4),
             ));
             segs.push(sp(1));
         }
@@ -608,16 +606,55 @@ mod tests {
     }
 
     #[test]
-    fn cross_stage_rows_label_the_target_and_render_model_origin() {
-        let b = fixture(120);
-        let rendered = text(&body(&b, 1, None, 120));
+    fn cross_stage_rows_label_the_parent_and_render_model_origin() {
+        let mut stages = [stage("architect", Some("code")), stage("code", None)];
+        stages[0].agent = "worker".into();
+        stages[1].agent = "worker".into();
+        stages[1].model = Some("opus".into());
+        let mut cfg = config(&stages);
+        cfg.agents.push(thegn_core::config::NamedCommand {
+            name: "worker".into(),
+            command: "claude".into(),
+            hints: Vec::new(),
+            provider: None,
+            harness: Some("claude".into()),
+            model: Some("sonnet".into()),
+            env: Default::default(),
+            permissions: Vec::new(),
+            resume: false,
+            route_via_proxy: false,
+            drawer_scope: None,
+            drawer_cwd: None,
+        });
+        let names: Vec<String> = stages.iter().map(|s| s.name.clone()).collect();
+        let mut rows = ordered_rows(
+            &[
+                d(1, Some("architect"), None, 0),
+                d(2, Some("code"), Some(1), 10),
+            ],
+            &names,
+            120_000,
+        );
+        for row in &mut rows {
+            row.agent_name = "worker".into();
+        }
+        let b = super::super::layout::board(&rows, &cfg, 160, 120_000, false);
+        let parent_cell = row_cell(&b.columns[0].rows[0], false, 80);
+        let child_cell = row_cell(&b.columns[1].rows[0], false, 80);
+        let parent_rendered: String = parent_cell.iter().map(|s| s.text.clone()).collect();
+        let child_rendered: String = child_cell.iter().map(|s| s.text.clone()).collect();
+        let arrow = crate::caps::active_glyphs().arrow_right;
         assert!(
-            rendered.contains("code"),
-            "inbound target label missing: {rendered}"
+            child_rendered.contains(&format!("{arrow} architect")),
+            "inbound label must name its parent stage: {child_rendered}"
         );
         assert!(
-            rendered.contains("model error"),
-            "resolution error was blank: {rendered}"
+            child_rendered.contains("stage: opus"),
+            "configured stage override must render in this row: {child_rendered}"
+        );
+        assert!(
+            parent_rendered.contains("entry: sonnet"),
+            "configured entry default must render in this row: {parent_rendered}"
         );
 
         assert_eq!(
