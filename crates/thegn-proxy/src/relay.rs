@@ -396,6 +396,80 @@ impl StreamSink for OpenAiSink {
 mod tests {
     use super::*;
 
+    async fn stalled_upstream(send_chunk: bool) -> String {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            if send_chunk {
+                let event = b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n";
+                socket
+                    .write_all(format!("{:x}\r\n", event.len()).as_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(event).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn mock_upstream_first_byte_deadline_falls_through() {
+        let url = stalled_upstream(false).await;
+        let response = reqwest::Client::new().get(url).send().await.unwrap();
+        let outcome = peek(
+            response,
+            OpenAiSink::default(),
+            RelayConfig {
+                first_byte: Duration::from_millis(20),
+                idle: Duration::from_millis(50),
+                heartbeat: Duration::from_millis(5),
+            },
+        )
+        .await;
+        assert!(matches!(outcome, Peek::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn mock_upstream_idle_deadline_ends_committed_stream() {
+        let url = stalled_upstream(true).await;
+        let response = reqwest::Client::new().get(url).send().await.unwrap();
+        let cfg = RelayConfig {
+            first_byte: Duration::from_millis(100),
+            idle: Duration::from_millis(35),
+            heartbeat: Duration::from_millis(5),
+        };
+        let Peek::Commit {
+            prefix_out,
+            rest,
+            sink,
+        } = peek(response, OpenAiSink::default(), cfg).await
+        else {
+            panic!("mock upstream should produce a first event");
+        };
+        let body = spawn_relay(prefix_out, rest, sink, cfg, |_| {});
+        let mut data = body.into_data_stream();
+        let result = tokio::time::timeout(Duration::from_millis(250), async {
+            let mut chunks = Vec::new();
+            while let Some(chunk) = data.next().await {
+                chunks.extend_from_slice(&chunk.unwrap());
+            }
+            chunks
+        })
+        .await
+        .unwrap();
+        assert!(result.windows(1).any(|window| window == b"x"));
+    }
+
     #[test]
     fn parses_content_delta() {
         let c = parse_sse_data_line(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n")

@@ -13,7 +13,7 @@
 //! logic is deterministic under test.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// A classic refilling token bucket. `rps` tokens are added per second up to
@@ -28,13 +28,21 @@ pub struct TokenBucket {
 
 impl TokenBucket {
     /// Creates a bucket starting full (`burst` tokens), anchored at `now`.
-    pub fn new(rps: f64, burst: f64, now: Instant) -> Self {
-        Self {
+    pub fn new(rps: f64, burst: f64, now: Instant) -> Option<Self> {
+        if !rps.is_finite()
+            || rps < MIN_RPM / 60.0
+            || rps > MAX_RATE
+            || !burst.is_finite()
+            || !(1.0..=MAX_RATE).contains(&burst)
+        {
+            return None;
+        }
+        Some(Self {
             rps,
             burst,
             tokens: burst,
             last: now,
-        }
+        })
     }
 
     /// Advances the bucket to `now`, accumulating tokens up to `burst`.
@@ -69,6 +77,9 @@ impl TokenBucket {
         }
         let deficit = 1.0 - self.tokens;
         let secs = deficit / self.rps;
+        if !secs.is_finite() || secs >= u64::MAX as f64 {
+            return Duration::MAX;
+        }
         let wait = Duration::from_secs_f64(secs.max(0.0));
         // Mirror Go's floor of 1ms so a busy-wait can't spin.
         wait.max(Duration::from_millis(1))
@@ -83,11 +94,27 @@ pub struct RatePolicy {
 }
 
 impl RatePolicy {
+    /// True only when both the source values and derived refill rate are usable.
+    pub fn is_valid(&self) -> bool {
+        self.rpm.is_finite()
+            && (MIN_RPM..=MAX_RATE).contains(&self.rpm)
+            && self.burst.is_finite()
+            && (1.0..=MAX_RATE).contains(&self.burst)
+            && (self.rpm / 60.0).is_finite()
+            && self.rpm / 60.0 > 0.0
+    }
+
     /// Tokens-per-second the bucket refills at.
     pub fn rps(&self) -> f64 {
         self.rpm / 60.0
     }
 }
+
+/// Upper bound for configured rates and burst sizes; larger values are almost
+/// always unit mistakes and can make reserve durations unrepresentable.
+pub const MAX_RATE: f64 = 1_000_000_000.0;
+/// Lower bound keeps refill reservations representable as finite durations.
+pub const MIN_RPM: f64 = 0.000001;
 
 /// Parses `"<rpm>"` or `"<rpm>:<burst>"`. A zero/negative rpm is rejected so a
 /// bad override can't wedge the limiter. Port of `parseRatePolicy` — note the Go
@@ -102,16 +129,17 @@ pub fn parse_rate_policy(s: &str) -> Option<RatePolicy> {
         None => (s, None),
     };
     let rpm: f64 = rpm_str.trim().parse().ok()?;
-    if rpm <= 0.0 {
+    if !rpm.is_finite() || !(MIN_RPM..=MAX_RATE).contains(&rpm) {
         return None;
     }
     let burst = match burst_str {
-        Some(b) => b
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .filter(|v| *v >= 1.0)
-            .unwrap_or(rpm),
+        Some(b) => {
+            let burst = b.trim().parse::<f64>().ok()?;
+            if !burst.is_finite() || !(1.0..=MAX_RATE).contains(&burst) {
+                return None;
+            }
+            burst
+        }
         None => 5.0,
     };
     Some(RatePolicy { rpm, burst })
@@ -134,10 +162,15 @@ impl RateLimiter {
     /// sustainable rate, so the caller should cascade to the next backend. The
     /// bucket is created from `policy` on first use.
     pub fn try_acquire(&self, identity: &str, policy: RatePolicy, now: Instant) -> bool {
+        if !policy.is_valid() {
+            return false;
+        }
         let mut buckets = self.buckets.lock().unwrap();
         buckets
             .entry(identity.to_string())
-            .or_insert_with(|| TokenBucket::new(policy.rps(), policy.burst, now))
+            .or_insert_with(|| {
+                TokenBucket::new(policy.rps(), policy.burst, now).expect("validated policy")
+            })
             .try_take(now)
     }
 
@@ -145,10 +178,15 @@ impl RateLimiter {
     /// [`Duration::ZERO`] means a token can be taken now. Does not consume a
     /// token (the caller calls [`try_acquire`](Self::try_acquire) after waking).
     pub fn reserve(&self, identity: &str, policy: RatePolicy, now: Instant) -> Duration {
+        if !policy.is_valid() {
+            return Duration::ZERO;
+        }
         let mut buckets = self.buckets.lock().unwrap();
         buckets
             .entry(identity.to_string())
-            .or_insert_with(|| TokenBucket::new(policy.rps(), policy.burst, now))
+            .or_insert_with(|| {
+                TokenBucket::new(policy.rps(), policy.burst, now).expect("validated policy")
+            })
             .reserve(now)
     }
 }
@@ -172,37 +210,39 @@ impl InflightTracker {
         Self::default()
     }
 
-    /// Whether `identity` is already at or above `cap` without mutating the
-    /// counter. A `cap` of 0 means "no limit".
-    pub fn at_cap(&self, identity: &str, cap: u32) -> bool {
-        if cap == 0 {
-            return false;
+    /// Atomically admits one backend attempt. A zero cap is unlimited. The
+    /// returned permit decrements the identity count on every exit path.
+    pub fn try_acquire(self: &Arc<Self>, identity: &str, cap: u32) -> Option<InflightPermit> {
+        let mut counts = self.count.lock().unwrap();
+        let count = counts.entry(identity.to_string()).or_insert(0);
+        if (cap > 0 && *count >= cap) || count.checked_add(1).is_none() {
+            return None;
         }
-        *self.count.lock().unwrap().get(identity).unwrap_or(&0) >= cap
-    }
-
-    /// Increments the in-flight count for an identity.
-    pub fn enter(&self, identity: &str) {
-        *self
-            .count
-            .lock()
-            .unwrap()
-            .entry(identity.to_string())
-            .or_insert(0) += 1;
-    }
-
-    /// Decrements the in-flight count, flooring at 0 so a double-decrement can't
-    /// drive the gauge negative.
-    pub fn leave(&self, identity: &str) {
-        let mut count = self.count.lock().unwrap();
-        if let Some(n) = count.get_mut(identity) {
-            *n = n.saturating_sub(1);
-        }
+        *count += 1;
+        Some(InflightPermit {
+            tracker: self.clone(),
+            identity: identity.to_string(),
+        })
     }
 
     /// Current in-flight count for an identity (for the metrics gauge).
     pub fn get(&self, identity: &str) -> u32 {
         *self.count.lock().unwrap().get(identity).unwrap_or(&0)
+    }
+}
+
+/// RAII ownership of one admitted backend attempt.
+pub struct InflightPermit {
+    tracker: Arc<InflightTracker>,
+    identity: String,
+}
+
+impl Drop for InflightPermit {
+    fn drop(&mut self) {
+        let mut counts = self.tracker.count.lock().unwrap();
+        if let Some(count) = counts.get_mut(&self.identity) {
+            *count = count.saturating_sub(1);
+        }
     }
 }
 
@@ -213,7 +253,7 @@ mod tests {
     #[test]
     fn bucket_starts_full_then_drains() {
         let t0 = Instant::now();
-        let mut b = TokenBucket::new(60.0 / 60.0, 3.0, t0); // 1 rps, burst 3
+        let mut b = TokenBucket::new(60.0 / 60.0, 3.0, t0).unwrap(); // 1 rps, burst 3
         assert!(b.try_take(t0));
         assert!(b.try_take(t0));
         assert!(b.try_take(t0));
@@ -223,7 +263,7 @@ mod tests {
     #[test]
     fn bucket_refills_over_time() {
         let t0 = Instant::now();
-        let mut b = TokenBucket::new(2.0, 2.0, t0); // 2 rps
+        let mut b = TokenBucket::new(2.0, 2.0, t0).unwrap(); // 2 rps
         assert!(b.try_take(t0));
         assert!(b.try_take(t0));
         assert!(!b.try_take(t0));
@@ -236,7 +276,7 @@ mod tests {
     #[test]
     fn refill_caps_at_burst() {
         let t0 = Instant::now();
-        let mut b = TokenBucket::new(10.0, 2.0, t0);
+        let mut b = TokenBucket::new(10.0, 2.0, t0).unwrap();
         b.try_take(t0);
         b.try_take(t0);
         // A long idle should not over-fill beyond burst (2).
@@ -249,14 +289,14 @@ mod tests {
     #[test]
     fn reserve_returns_zero_when_token_available() {
         let t0 = Instant::now();
-        let mut b = TokenBucket::new(1.0, 1.0, t0);
+        let mut b = TokenBucket::new(1.0, 1.0, t0).unwrap();
         assert_eq!(b.reserve(t0), Duration::ZERO);
     }
 
     #[test]
     fn reserve_estimates_wait_when_empty() {
         let t0 = Instant::now();
-        let mut b = TokenBucket::new(1.0, 1.0, t0); // 1 rps
+        let mut b = TokenBucket::new(1.0, 1.0, t0).unwrap(); // 1 rps
         assert!(b.try_take(t0));
         let wait = b.reserve(t0);
         // Need ~1 full token at 1 rps => ~1s.
@@ -274,9 +314,62 @@ mod tests {
         assert!(parse_rate_policy("").is_none());
         assert!(parse_rate_policy("0").is_none());
         assert!(parse_rate_policy("-5").is_none());
-        // Invalid burst falls back to rpm.
-        let p = parse_rate_policy("60:abc").unwrap();
-        assert_eq!(p.burst, 60.0);
+        assert!(parse_rate_policy("60:abc").is_none());
+        assert!(parse_rate_policy("NaN").is_none());
+        assert!(parse_rate_policy("inf").is_none());
+        assert!(parse_rate_policy("60:NaN").is_none());
+        assert!(parse_rate_policy("60:inf").is_none());
+        assert!(parse_rate_policy("1000000001").is_none());
+        assert!(parse_rate_policy("60:0").is_none());
+    }
+
+    #[test]
+    fn bucket_constructor_rejects_invalid_numeric_values() {
+        let now = Instant::now();
+        for rps in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+        ] {
+            assert!(TokenBucket::new(rps, 1.0, now).is_none());
+        }
+        for burst in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+        ] {
+            assert!(TokenBucket::new(1.0, burst, now).is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_policies_never_create_limiter_state() {
+        let now = Instant::now();
+        let limiter = RateLimiter::new();
+        for rpm in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+        ] {
+            let policy = RatePolicy { rpm, burst: 1.0 };
+            assert!(!limiter.try_acquire("invalid", policy, now));
+            assert_eq!(limiter.reserve("invalid", policy, now), Duration::ZERO);
+        }
+        for burst in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::MAX] {
+            let policy = RatePolicy { rpm: 60.0, burst };
+            assert!(!limiter.try_acquire("invalid", policy, now));
+        }
+        assert!(limiter.buckets.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -309,17 +402,53 @@ mod tests {
     }
 
     #[test]
-    fn inflight_enter_leave_floor() {
-        let t = InflightTracker::new();
-        t.enter("x");
-        t.enter("x");
+    fn inflight_permits_release_on_drop_and_zero_is_unlimited() {
+        let t = Arc::new(InflightTracker::new());
+        let first = t.try_acquire("x", 2).unwrap();
+        let second = t.try_acquire("x", 2).unwrap();
         assert_eq!(t.get("x"), 2);
-        assert!(t.at_cap("x", 2));
-        assert!(!t.at_cap("x", 3));
-        assert!(!t.at_cap("x", 0)); // 0 == no limit
-        t.leave("x");
-        t.leave("x");
-        t.leave("x"); // floors at 0
+        assert!(t.try_acquire("x", 2).is_none());
+        drop(first);
+        assert_eq!(t.get("x"), 1);
+        drop(second);
         assert_eq!(t.get("x"), 0);
+        let unlimited = t.try_acquire("x", 0).unwrap();
+        assert_eq!(t.get("x"), 1);
+        drop(unlimited);
+        assert_eq!(t.get("x"), 0);
+    }
+
+    #[test]
+    fn concurrent_inflight_admission_never_exceeds_cap() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        const THREADS: usize = 32;
+        const CAP: u32 = 3;
+        let tracker = Arc::new(InflightTracker::new());
+        let start = Arc::new(Barrier::new(THREADS));
+        let acquired = Arc::new(Barrier::new(THREADS));
+        let mut workers = Vec::new();
+        for _ in 0..THREADS {
+            let tracker = tracker.clone();
+            let start = start.clone();
+            let acquired = acquired.clone();
+            workers.push(thread::spawn(move || {
+                start.wait();
+                let permit = tracker.try_acquire("shared", CAP);
+                let observed = tracker.get("shared");
+                let accepted = permit.is_some();
+                acquired.wait();
+                drop(permit);
+                (accepted, observed)
+            }));
+        }
+        let observed: Vec<(bool, u32)> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert_eq!(
+            observed.iter().filter(|(accepted, _)| *accepted).count(),
+            CAP as usize
+        );
+        assert!(observed.iter().all(|(_, count)| *count <= CAP));
+        assert_eq!(tracker.get("shared"), 0);
     }
 }

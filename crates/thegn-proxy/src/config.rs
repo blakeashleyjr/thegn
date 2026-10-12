@@ -40,6 +40,12 @@ pub fn from_env() -> Result<ProxyConfig> {
 /// Builds the runtime routing model from a `[model_proxy]` section, resolving
 /// SecretRefs and expanding multi-key providers into lanes.
 pub fn build(cfg: &ModelProxyConfig) -> Result<ProxyConfig> {
+    let validation_errors = cfg.validate();
+    anyhow::ensure!(
+        validation_errors.is_empty(),
+        "invalid model-proxy config: {}",
+        validation_errors.join("; ")
+    );
     let listen: SocketAddr = cfg
         .listen
         .parse()

@@ -283,6 +283,57 @@ impl ModelProxyConfig {
             // A disabled section is never validated further — it changes nothing.
             return errs;
         }
+        if self.first_byte_timeout_secs == 0
+            || self.first_byte_timeout_secs > crate::time_policy::MAX_DURATION_SECS
+        {
+            errs.push(format!(
+                "[model_proxy] first_byte_timeout_secs = {} must be between 1 and {} seconds",
+                self.first_byte_timeout_secs,
+                crate::time_policy::MAX_DURATION_SECS
+            ));
+        }
+        if self.idle_timeout_secs == 0
+            || self.idle_timeout_secs > crate::time_policy::MAX_DURATION_SECS
+        {
+            errs.push(format!(
+                "[model_proxy] idle_timeout_secs = {} must be between 1 and {} seconds",
+                self.idle_timeout_secs,
+                crate::time_policy::MAX_DURATION_SECS
+            ));
+        }
+        if self.heartbeat_secs == 0
+            || self.heartbeat_secs > crate::time_policy::MAX_CADENCE_SECS
+            || self.heartbeat_secs > self.idle_timeout_secs
+        {
+            errs.push(format!(
+                "[model_proxy] heartbeat_secs = {} must be between 1 and {} seconds and no greater than idle_timeout_secs",
+                self.heartbeat_secs,
+                crate::time_policy::MAX_CADENCE_SECS
+            ));
+        }
+        for p in &self.providers {
+            if !p.rpm.is_finite()
+                || p.rpm < crate::proxy::ratelimit::MIN_RPM
+                || p.rpm > crate::proxy::ratelimit::MAX_RATE
+                || !(p.rpm / 60.0).is_finite()
+                || p.rpm / 60.0 <= 0.0
+            {
+                errs.push(format!(
+                    "[[model_proxy.providers]] name = {:?}: rpm must be finite and between {} and {}",
+                    p.name,
+                    crate::proxy::ratelimit::MIN_RPM,
+                    crate::proxy::ratelimit::MAX_RATE
+                ));
+            }
+            if !p.burst.is_finite() || p.burst < 1.0 || p.burst > crate::proxy::ratelimit::MAX_RATE
+            {
+                errs.push(format!(
+                    "[[model_proxy.providers]] name = {:?}: burst must be finite and between 1 and {}",
+                    p.name,
+                    crate::proxy::ratelimit::MAX_RATE
+                ));
+            }
+        }
         if self.listen.parse::<std::net::SocketAddr>().is_err() {
             errs.push(format!(
                 "[model_proxy] listen = {:?} is not a valid host:port",
@@ -552,6 +603,85 @@ mod tests {
             ..Default::default()
         };
         assert!(c.validate().iter().any(|e| e.contains("valid host:port")));
+    }
+
+    #[test]
+    fn invalid_rate_numbers_are_field_specific_errors() {
+        for rpm in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+        ] {
+            let mut c = ModelProxyConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            let mut p = provider("p", "env:KEY");
+            p.rpm = rpm;
+            c.providers.push(p);
+            assert!(
+                c.validate().iter().any(|e| e.contains("rpm")),
+                "rpm {rpm:?} was accepted"
+            );
+        }
+        for burst in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+        ] {
+            let mut c = ModelProxyConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            let mut p = provider("p", "env:KEY");
+            p.burst = burst;
+            c.providers.push(p);
+            assert!(
+                c.validate().iter().any(|e| e.contains("burst")),
+                "burst {burst:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_timeout_values_are_field_specific_errors() {
+        for (field, set) in [
+            ("first_byte_timeout_secs", 0),
+            (
+                "first_byte_timeout_secs",
+                crate::time_policy::MAX_DURATION_SECS + 1,
+            ),
+            ("idle_timeout_secs", 0),
+            (
+                "idle_timeout_secs",
+                crate::time_policy::MAX_DURATION_SECS + 1,
+            ),
+            ("heartbeat_secs", 0),
+            ("heartbeat_secs", crate::time_policy::MAX_CADENCE_SECS + 1),
+            ("heartbeat_secs", 121),
+        ] {
+            let mut c = ModelProxyConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            match field {
+                "first_byte_timeout_secs" => c.first_byte_timeout_secs = set,
+                "idle_timeout_secs" => c.idle_timeout_secs = set,
+                "heartbeat_secs" => c.heartbeat_secs = set,
+                _ => unreachable!(),
+            }
+            assert!(
+                c.validate().iter().any(|e| e.contains(field)),
+                "{field} = {set} was accepted"
+            );
+        }
     }
 
     #[test]
