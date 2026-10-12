@@ -67,9 +67,14 @@ fn plot_time_points(
             Some([min, max]) => Some([min.min(time), max.max(time)]),
         },
     );
-    let Some([min_time, max_time]) = domain else {
+    let Some([mut min_time, mut max_time]) = domain else {
         return (Vec::new(), None);
     };
+    if min_time == max_time {
+        min_time -= 0.5;
+        max_time += 0.5;
+    }
+    let domain = Some([min_time, max_time]);
     let pixels = width.saturating_mul(2).max(1);
     let samples = times.len().min(values.len());
     if samples <= pixels.saturating_mul(SAMPLES_PER_PIXEL) {
@@ -119,6 +124,16 @@ fn plot_time_points(
     (points, domain)
 }
 
+/// Convert ordered samples into drawable line segments, breaking at every
+/// sample with a non-finite coordinate so missing values remain visible gaps.
+fn segments(points: &[(f64, f64)]) -> impl Iterator<Item = [(f64, f64); 2]> + '_ {
+    points.windows(2).filter_map(|pair| {
+        let [left, right] = [pair[0], pair[1]];
+        (left.0.is_finite() && left.1.is_finite() && right.0.is_finite() && right.1.is_finite())
+            .then_some([left, right])
+    })
+}
+
 impl TimeseriesRenderer {
     /// `width` is the panel width in columns; it bounds how many samples are
     /// walked (see [`plot_points`]).
@@ -152,18 +167,14 @@ impl TimeseriesRenderer {
             .x_bounds(x_bounds)
             .y_bounds([bounds[2], bounds[3]])
             .paint(move |ctx| {
-                let mut prev: Option<(f64, f64)> = None;
-                for (x, v) in &points {
-                    if let Some((px, py)) = prev {
-                        ctx.draw(&Line {
-                            x1: px,
-                            y1: py,
-                            x2: *x,
-                            y2: *v,
-                            color: Color::Green,
-                        });
-                    }
-                    prev = Some((*x, *v));
+                for [(x1, y1), (x2, y2)] in segments(&points) {
+                    ctx.draw(&Line {
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        color: Color::Green,
+                    });
                 }
             })
     }
@@ -255,6 +266,20 @@ mod tests {
             vec![(0.0, 2.0), (1.0, 4.0), (2.0, 3.0), (100.0, 8.0)]
         );
         assert_eq!(domain, Some([0.0, 100.0]));
+    }
+
+    #[test]
+    fn single_timestamp_domain_is_widened() {
+        let (_, domain) = plot_time_points(&[42.0], &[1.0], 20);
+        assert_eq!(domain, Some([41.5, 42.5]));
+    }
+
+    #[test]
+    fn non_finite_samples_break_line_segments() {
+        assert_eq!(
+            segments(&[(0.0, 1.0), (1.0, f64::NAN), (2.0, 1.0), (3.0, 2.0)]).collect::<Vec<_>>(),
+            vec![[(2.0, 1.0), (3.0, 2.0)]]
+        );
     }
 
     #[test]
