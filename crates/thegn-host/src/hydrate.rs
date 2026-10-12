@@ -2196,14 +2196,14 @@ fn record_branch_failure(root: &Path, now: Instant) {
     failures.retain(|_, failed_at| {
         now.saturating_duration_since(*failed_at) < crate::branch_cache::BRANCH_CACHE_TTL
     });
-    if !failures.contains_key(root) && failures.len() >= BRANCH_FAILURE_CACHE_CAPACITY {
-        if let Some(oldest) = failures
+    if !failures.contains_key(root)
+        && failures.len() >= BRANCH_FAILURE_CACHE_CAPACITY
+        && let Some(oldest) = failures
             .iter()
             .min_by_key(|(_, failed_at)| **failed_at)
             .map(|(path, _)| path.clone())
-        {
-            failures.remove(&oldest);
-        }
+    {
+        failures.remove(&oldest);
     }
     failures.insert(root.to_path_buf(), now);
 }
