@@ -9262,6 +9262,26 @@ async fn event_loop<T: Terminal>(
             playback_clock.set(ov.is_playing(), crate::replay_overlay::REPLAY_FRAME_DT_MS);
         }
 
+        // Replay search results arrive only after the worker pulses the waker;
+        // this drain therefore adds no idle polling. Pane close drops the
+        // overlay (and cancels its worker), while recording replacement
+        // invalidates the captured generation.
+        if let Some(pane_id) = replay.as_ref().map(|ov| ov.pane_id()) {
+            if let Some(rec) = panes.table.get(&pane_id).and_then(|p| p.recording()) {
+                let ov = replay.as_mut().expect("replay pane id came from overlay");
+                if ov.invalidate_changed_config(&current_config.replay)
+                    || ov.invalidate_changed_recording(rec)
+                    || ov.drain_search_result(rec)
+                {
+                    dirty = true;
+                }
+            } else {
+                replay = None;
+                playback_clock.set(false, crate::replay_overlay::REPLAY_FRAME_DT_MS);
+                dirty = true;
+            }
+        }
+
         // Hydrated models replace the whole FrameModel; re-apply the loop-owned
         // fields (stats, bars, accent, pins, hints). Stale generations are
         // dropped — a fresh hydration is always in flight for the current one.
@@ -23684,11 +23704,14 @@ async fn event_loop<T: Terminal>(
                                 // it has a recording (replay enabled + some output).
                                 match panes.table.get(&focused).and_then(|p| p.recording()) {
                                     Some(rec) if !rec.is_empty() => {
-                                        replay = Some(crate::replay_overlay::ReplayOverlay::new(
+                                        let mut overlay = crate::replay_overlay::ReplayOverlay::new(
                                             focused,
                                             rec,
                                             current_config.replay.idle_threshold_ms,
-                                        ));
+                                        );
+                                        overlay.set_search_waker(waker.clone());
+                                        overlay.set_search_config(&current_config.replay);
+                                        replay = Some(overlay);
                                     }
                                     Some(_) => toasts.info(
                                         "Replay: nothing recorded for this pane yet",
