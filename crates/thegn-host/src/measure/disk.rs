@@ -14,12 +14,13 @@ use super::LOG;
 
 static INFLIGHT: AtomicBool = AtomicBool::new(false);
 
-type GenerationMemo = std::collections::HashMap<std::path::PathBuf, (u128, Option<u64>)>;
+type GenerationMemo = std::collections::HashMap<std::path::PathBuf, (u128, u64, Option<u64>)>;
 static GENERATION_MEMO: OnceLock<Mutex<GenerationMemo>> = OnceLock::new();
 
 #[cfg(test)]
 thread_local! {
     static GENERATION_INVENTORY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GENERATION_STATUS_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn fingerprint_mtime(profile_dir: &std::path::Path) -> Option<u128> {
@@ -42,17 +43,19 @@ fn fingerprint_mtime(profile_dir: &std::path::Path) -> Option<u128> {
     Some(since_epoch.as_nanos())
 }
 
-fn generation_memoized(profile_dir: &std::path::Path, now_secs: u64) -> bool {
+fn generation_memoized(profile_dir: &std::path::Path, min_age_secs: u64, now_secs: u64) -> bool {
     let Some(mtime) = fingerprint_mtime(profile_dir) else {
         return false;
     };
     let memo = GENERATION_MEMO
         .get_or_init(|| Mutex::new(GenerationMemo::new()))
         .lock()
-        .expect("generation prune memo mutex poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     memo.get(profile_dir)
-        .is_some_and(|(recorded_mtime, recheck)| {
-            *recorded_mtime == mtime && recheck.is_none_or(|at| now_secs < at)
+        .is_some_and(|(recorded_mtime, recorded_min_age_secs, recheck)| {
+            *recorded_mtime == mtime
+                && *recorded_min_age_secs == min_age_secs
+                && recheck.is_none_or(|at| now_secs < at)
         })
 }
 
@@ -68,8 +71,11 @@ fn remember_generation_noop(
     GENERATION_MEMO
         .get_or_init(|| Mutex::new(GenerationMemo::new()))
         .lock()
-        .expect("generation prune memo mutex poisoned")
-        .insert(profile_dir.to_path_buf(), (mtime, recheck));
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            profile_dir.to_path_buf(),
+            (mtime, policy.min_age_secs, recheck),
+        );
 }
 
 /// Walk a worktree unconditionally once this long has passed since its last
@@ -439,9 +445,19 @@ fn reap_generation_footprints(
         let worktree_path = std::path::Path::new(worktree);
         let target = worktree_path.join("target");
         let profiles = [target.join("debug"), target.join("release")];
-        if profiles
+        let min_age_secs = u64::from(min_age_days).saturating_mul(86_400);
+        let prunable_profiles: Vec<_> = profiles
             .iter()
-            .all(|profile| generation_memoized(profile, now_secs))
+            .filter(|profile| {
+                safe_regular_file(&profile.join(".cargo-lock"))
+                    && safe_directory(profile)
+                    && fingerprint_mtime(profile).is_some()
+            })
+            .collect();
+        if !prunable_profiles.is_empty()
+            && prunable_profiles
+                .iter()
+                .all(|profile| generation_memoized(profile, min_age_secs, now_secs))
         {
             continue;
         }
@@ -454,8 +470,12 @@ fn reap_generation_footprints(
         if active == Some(worktree.as_str())
             || awaiting_verification.iter().any(|path| path == worktree)
             || crate::task::slot_active(worktree_path)
-            || thegn_core::util::git_out_allow_empty(worktree_path, &["status", "--porcelain"])
-                .is_none_or(|output| !output.trim().is_empty())
+            || {
+                #[cfg(test)]
+                GENERATION_STATUS_PROBES.with(|calls| calls.set(calls.get() + 1));
+                thegn_core::util::git_out_allow_empty(worktree_path, &["status", "--porcelain"])
+                    .is_none_or(|output| !output.trim().is_empty())
+            }
         {
             continue;
         }
@@ -466,7 +486,7 @@ fn reap_generation_footprints(
             if !safe_regular_file(&lock_path) || !safe_directory(&profile_dir) {
                 continue;
             }
-            if generation_memoized(&profile_dir, now_secs) {
+            if generation_memoized(&profile_dir, min_age_secs, now_secs) {
                 continue;
             }
             let Ok(lock) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
@@ -511,9 +531,7 @@ fn reap_generation_footprints(
                 })
                 .collect();
             let before_bytes = inventory.iter().map(|entry| entry.bytes).sum::<u64>();
-            let generation_policy = GenerationPolicy {
-                min_age_secs: u64::from(min_age_days).saturating_mul(86_400),
-            };
+            let generation_policy = GenerationPolicy { min_age_secs };
             let plan =
                 thegn_core::disk_reclaim::plan_generations(&inventory, generation_policy, now_secs);
             let mut planned_bytes = 0u64;
@@ -563,7 +581,7 @@ fn reap_generation_footprints(
                 GENERATION_MEMO
                     .get_or_init(|| Mutex::new(GenerationMemo::new()))
                     .lock()
-                    .expect("generation prune memo mutex poisoned")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&profile_dir);
             }
             all_removed = all_removed.saturating_add(removed_bytes);
@@ -864,22 +882,52 @@ mod generation_tests {
             thegn_core::disk::DiskUsage::default(),
         )];
         assert_eq!(
-            reap_generation_footprints(&fresh, None, &[], 14, u64::MAX - 1),
+            reap_generation_footprints(&fresh, None, &[], 14, thegn_core::util::now()),
             0
         );
         GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 2));
         assert_eq!(
-            reap_generation_footprints(&fresh, None, &[], 14, u64::MAX - 1),
+            reap_generation_footprints(&fresh, None, &[], 14, thegn_core::util::now()),
             0
         );
         GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 2));
 
         fs::write(debug_profile.join(".fingerprint/touched"), b"mtime change").unwrap();
         assert_eq!(
-            reap_generation_footprints(&fresh, None, &[], 14, u64::MAX - 1),
+            reap_generation_footprints(&fresh, None, &[], 14, thegn_core::util::now()),
             0
         );
         GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 3));
+        assert!(debug_profile.join(".fingerprint/pkg-a").exists());
+        assert!(debug_profile.join(".fingerprint/pkg-z").exists());
+        assert!(debug_profile.join("deps/libpkg-a.rlib").exists());
+        assert!(debug_profile.join("deps/libpkg-z.rlib").exists());
+        assert!(debug_profile.join("incremental/pkg-a/cache").exists());
+        assert!(release.join(".fingerprint/only-one/marker").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn memoized_debug_only_profile_skips_git_status_probe() {
+        let (root, _) = profile_tree();
+        GENERATION_INVENTORY_CALLS.with(|calls| calls.set(0));
+        GENERATION_STATUS_PROBES.with(|calls| calls.set(0));
+        let fresh = [(
+            root.to_string_lossy().into_owned(),
+            thegn_core::disk::DiskUsage::default(),
+        )];
+        let now = thegn_core::util::now();
+        assert_eq!(reap_generation_footprints(&fresh, None, &[], 14, now), 0);
+        GENERATION_STATUS_PROBES.with(|calls| assert_eq!(calls.get(), 1));
+        GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+
+        assert_eq!(reap_generation_footprints(&fresh, None, &[], 14, now), 0);
+        GENERATION_STATUS_PROBES.with(|calls| assert_eq!(calls.get(), 1));
+        GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+
+        assert_eq!(reap_generation_footprints(&fresh, None, &[], 13, now), 0);
+        GENERATION_STATUS_PROBES.with(|calls| assert_eq!(calls.get(), 2));
+        GENERATION_INVENTORY_CALLS.with(|calls| assert_eq!(calls.get(), 2));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -306,7 +306,7 @@ pub(crate) fn prune_logs(root: &Path, now_secs: i64) {
     let mut last_run = LAST_LOG_PRUNE
         .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
         .lock()
-        .expect("hook log prune timestamp mutex poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if last_run
         .get(root)
         .is_some_and(|last| now_secs.saturating_sub(*last) < HOOK_LOG_PRUNE_INTERVAL_SECS)
@@ -369,10 +369,6 @@ pub(crate) fn prune_logs(root: &Path, now_secs: i64) {
         for name in remove {
             // best-effort: hook logs are diagnostics; inability to prune one must not stop the disk scan.
             let _ = std::fs::remove_file(path.join(name));
-        }
-        if std::fs::read_dir(&path).is_ok_and(|mut entries| entries.next().is_none()) {
-            // best-effort: an empty slug directory has no retention value.
-            let _ = std::fs::remove_dir(path);
         }
     }
 }
