@@ -23,6 +23,8 @@ const PLAYER_IFACE: &str = "org.mpris.MediaPlayer2.Player";
 const PLAYLISTS_IFACE: &str = "org.mpris.MediaPlayer2.Playlists";
 const TRACKLIST_IFACE: &str = "org.mpris.MediaPlayer2.TrackList";
 
+type PlayerPropertyRead = (String, Result<HashMap<String, OwnedValue>, MediaError>);
+
 /// A connected MPRIS controller. Holds one session-bus connection; the active
 /// player is re-resolved per call so launching/quitting a player is picked up.
 pub struct MprisZbus {
@@ -702,7 +704,7 @@ fn playback_state(props: &HashMap<String, OwnedValue>) -> PlaybackState {
 /// Keep only players whose property read succeeded. If every present player
 /// failed its read, surface an error so the caller can fall back to playerctl.
 fn readable_candidates(
-    reads: Vec<(String, Result<HashMap<String, OwnedValue>, MediaError>)>,
+    reads: Vec<PlayerPropertyRead>,
 ) -> Result<Vec<(String, PlaybackState)>, MediaError> {
     let had_players = !reads.is_empty();
     let mut candidates = Vec::with_capacity(reads.len());
