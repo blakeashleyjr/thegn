@@ -227,6 +227,13 @@ fn parse_host_port(s: &str) -> Result<EndpointKind, MpdEndpointError> {
 /// A live MPD connection with its greeting consumed and password (if any) sent.
 struct MpdConn {
     io: BufReader<Box<dyn Duplex>>,
+    // Bytes consumed from the transport but not yet terminated by `\n`.
+    // Kept on the connection so dropping an `idle` future is safe.
+    line_buffer: Vec<u8>,
+    line_wire_bytes: usize,
+    line_too_long: bool,
+    idle_pending: bool,
+    idle_response_bytes: usize,
 }
 
 impl MpdConn {
@@ -252,6 +259,11 @@ impl MpdConn {
             .map_err(|_| MediaError::Unavailable("mpd connect timed out".into()))??;
         let mut conn = MpdConn {
             io: BufReader::new(stream),
+            line_buffer: Vec::new(),
+            line_wire_bytes: 0,
+            line_too_long: false,
+            idle_pending: false,
+            idle_response_bytes: 0,
         };
         // Greeting: `OK MPD <version>`, bounded in size and time.
         let line = tokio::time::timeout(
@@ -315,18 +327,24 @@ impl MpdConn {
         let mut pairs = Vec::new();
         let mut total = 0usize;
         loop {
-            let Some(buf) = read_bounded_line(&mut self.io, MAX_LINE_BYTES)
+            let Some((buf, line_bytes)) = self
+                .next_response_line(MAX_RESPONSE_BYTES - total)
                 .await
                 .map_err(|e| MediaError::Backend(format!("mpd read: {e}")))?
             else {
                 return Err(MediaError::Backend("mpd closed the connection".into()));
             };
-            total += buf.len() + 1;
+            total += line_bytes;
             if total > MAX_RESPONSE_BYTES {
                 return Err(MediaError::Backend(format!(
                     "mpd response exceeds {MAX_RESPONSE_BYTES} bytes"
                 )));
             }
+            let Some(buf) = buf else {
+                // A tag may contain a very large embedded cue sheet. Drop that
+                // record, but keep framing the response at the next newline.
+                continue;
+            };
             let t = buf.trim_end_matches('\r');
             if t == "OK" {
                 return Ok(pairs);
@@ -344,6 +362,95 @@ impl MpdConn {
                     )));
                 }
                 pairs.push(p);
+            }
+        }
+    }
+
+    /// Read one response line, retaining partial bytes across cancellation.
+    /// An overlong line is drained through its newline and returned as `None`;
+    /// its actual wire size is still charged against the response byte cap.
+    async fn next_response_line(
+        &mut self,
+        remaining_response_bytes: usize,
+    ) -> Result<Option<(Option<String>, usize)>, String> {
+        loop {
+            let buf = self.io.fill_buf().await.map_err(|e| e.to_string())?;
+            if buf.is_empty() {
+                return if self.line_wire_bytes == 0 {
+                    Ok(None)
+                } else {
+                    Err("unterminated line before EOF".into())
+                };
+            }
+            let nl = buf.iter().position(|b| *b == b'\n');
+            let take = nl.unwrap_or(buf.len());
+            self.line_wire_bytes = self.line_wire_bytes.saturating_add(take);
+            if self.line_wire_bytes + 1 > remaining_response_bytes {
+                return Err(format!("mpd response exceeds {MAX_RESPONSE_BYTES} bytes"));
+            }
+            if !self.line_too_long {
+                if self.line_buffer.len().saturating_add(take) > MAX_LINE_BYTES {
+                    self.line_too_long = true;
+                    self.line_buffer.clear();
+                } else {
+                    self.line_buffer.extend_from_slice(&buf[..take]);
+                }
+            }
+            let consumed = nl.map_or(take, |i| i + 1);
+            self.io.consume(consumed);
+            if nl.is_some() {
+                let parsed = if self.line_too_long {
+                    None
+                } else {
+                    Some(
+                        String::from_utf8(std::mem::take(&mut self.line_buffer))
+                            .map_err(|_| "line is not valid UTF-8".to_string())?,
+                    )
+                };
+                let line_bytes = self.line_wire_bytes + 1;
+                self.line_buffer.clear();
+                self.line_wire_bytes = 0;
+                self.line_too_long = false;
+                return Ok(Some((parsed, line_bytes)));
+            }
+        }
+    }
+
+    /// Start or resume MPD's long-poll command. `idle_pending` is set only
+    /// after its complete frame is written; response bytes remain on `self`
+    /// when the caller drops this future.
+    async fn idle_changed(&mut self) -> Result<(), MediaError> {
+        if !self.idle_pending {
+            let line = b"idle player mixer options\n";
+            tokio::time::timeout(WRITE_TIMEOUT, self.io.get_mut().write_all(line))
+                .await
+                .map_err(|_| MediaError::Backend("mpd write timed out".into()))?
+                .map_err(|e| MediaError::Backend(format!("mpd write: {e}")))?;
+            self.idle_pending = true;
+        }
+        loop {
+            let Some((line, bytes)) = self
+                .next_response_line(MAX_RESPONSE_BYTES - self.idle_response_bytes)
+                .await
+                .map_err(|e| MediaError::Backend(format!("mpd read: {e}")))?
+            else {
+                return Err(MediaError::Backend("mpd closed the connection".into()));
+            };
+            self.idle_response_bytes += bytes;
+            let Some(line) = line else { continue };
+            let t = line.trim_end_matches('\r');
+            if t == "OK" {
+                self.idle_pending = false;
+                self.idle_response_bytes = 0;
+                return Ok(());
+            }
+            if let Some(err) = t.strip_prefix("ACK") {
+                self.idle_pending = false;
+                self.idle_response_bytes = 0;
+                return Err(MediaError::Backend(format!(
+                    "mpd ACK{}",
+                    sanitize_diag(err)
+                )));
             }
         }
     }
@@ -608,9 +715,9 @@ impl MediaBackend for Mpd {
     }
 }
 
-/// A push watcher blocked on MPD's `idle` command. Each `changed()` issues
-/// `idle player mixer options` (the subsystems that move the badge) and resolves
-/// when MPD reports one changed. A dropped connection ends the stream.
+/// A push watcher blocked on MPD's `idle` command. Each `changed()` starts
+/// `idle player mixer options` once and resumes the same response after future
+/// cancellation. A dropped connection ends the stream.
 pub struct MpdWatch {
     conn: Option<MpdConn>,
 }
@@ -623,9 +730,9 @@ impl MediaWatch for MpdWatch {
             let Some(conn) = self.conn.as_mut() else {
                 return false;
             };
-            match conn.command_budget("idle player mixer options", None).await {
-                Ok(changed) => {
-                    tracing::debug!(target: "thegn::media", ?changed, "MPD idle tick");
+            match conn.idle_changed().await {
+                Ok(()) => {
+                    tracing::debug!(target: "thegn::media", "MPD idle tick");
                     true
                 }
                 Err(e) => {
@@ -773,12 +880,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_password_is_rejected_without_echoing_it() {
+        let ep = fake_server(b"OK MPD 0.23.0\n".to_vec(), Vec::new()).await;
+        let ep = MpdEndpoint::resolve(
+            &format!(
+                "127.0.0.1:{}",
+                match ep.kind {
+                    EndpointKind::Tcp { port, .. } => port,
+                    EndpointKind::Unix(_) => unreachable!(),
+                }
+            ),
+            Some(crate::MpdPassword::new("secret\nvalue".into())),
+        )
+        .unwrap();
+        let err = MpdConn::dial(&ep).await.err().unwrap().to_string();
+        assert!(err.contains("forbidden control character"));
+        assert!(!err.contains("secret"));
+    }
+
+    #[tokio::test]
     async fn endless_rows_hit_the_pair_cap() {
         let reply = "a: b\n".repeat(MAX_RESPONSE_PAIRS + 10).into_bytes();
         let ep = fake_server(b"OK MPD 0.23.0\n".to_vec(), reply).await;
         let mut c = MpdConn::dial(&ep).await.unwrap();
         let err = c.command("status").await.unwrap_err().to_string();
         assert!(err.contains("rows"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn oversized_reply_line_is_discarded_and_later_rows_survive() {
+        let reply = format!(
+            "comment: {}\nTitle: visible\nOK\n",
+            "x".repeat(MAX_LINE_BYTES + 100)
+        );
+        let ep = fake_server(b"OK MPD 0.23.0\n".to_vec(), reply.into_bytes()).await;
+        let mut c = MpdConn::dial(&ep).await.unwrap();
+        let rows = c.command("currentsong").await.unwrap();
+        assert_eq!(mpd_parse::field(&rows, "Title"), Some("visible"));
+        assert_eq!(rows.len(), 1);
     }
 
     #[tokio::test]
@@ -798,6 +937,48 @@ mod tests {
         let ep = fake_server(b"OK MPD 0.23.0\n".to_vec(), b"OK\n".to_vec()).await;
         let mut c = MpdConn::dial(&ep).await.unwrap();
         assert!(c.command("status\nclear").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn idle_resume_after_cancellation_does_not_send_a_second_frame() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (idle_tx, idle_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (r, mut w) = tokio::io::split(sock);
+            w.write_all(b"OK MPD 0.23.0\n").await.unwrap();
+            let mut r = BufReader::new(r);
+            let first = read_bounded_line(&mut r, 1024).await.unwrap().unwrap();
+            let _ = idle_tx.send(first);
+            let second =
+                tokio::time::timeout(Duration::from_millis(100), read_bounded_line(&mut r, 1024))
+                    .await;
+            w.write_all(b"changed: player\nOK\n").await.unwrap();
+            second
+        });
+        let ep = MpdEndpoint::resolve(&format!("127.0.0.1:{port}"), None).unwrap();
+        let watch = MpdWatch {
+            conn: Some(MpdConn::dial(&ep).await.unwrap()),
+        };
+        let mut watch = watch;
+        async fn cancel_after_write(
+            watch: &mut MpdWatch,
+            idle_rx: tokio::sync::oneshot::Receiver<String>,
+        ) {
+            let changed = watch.changed();
+            tokio::pin!(changed);
+            tokio::select! {
+                _ = &mut changed => panic!("idle unexpectedly completed"),
+                first = idle_rx => assert_eq!(first.unwrap(), "idle player mixer options"),
+            }
+        }
+        cancel_after_write(&mut watch, idle_rx).await;
+        assert!(watch.changed().await);
+        assert!(
+            server.await.unwrap().is_err(),
+            "server received a duplicate idle frame"
+        );
     }
 
     fn tcp(s: &str) -> Result<(String, u16), MpdEndpointError> {
