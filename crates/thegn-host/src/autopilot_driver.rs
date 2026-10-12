@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use thegn_core::agent_task::{TaskKind, TaskVars, default_prompt, render_prompt};
+use thegn_core::agent_task::{TaskKind, TaskVars, default_prompt, render_task_prompt};
 use thegn_core::autopilot::{AutopilotIssueKey, AutopilotState, bounded_reason, matches_issue};
 use thegn_core::config::{AutopilotConfig, Config};
 use thegn_core::db::Db;
@@ -273,7 +273,7 @@ fn drive_claim(
         .set("issue_url", &issue.url)
         .set("branch", &branch)
         .set("worktree", &wt);
-    let prompt = match render_prompt(default_prompt(TaskKind::Issue), &vars) {
+    let prompt = match render_task_prompt(default_prompt(TaskKind::Issue), &vars) {
         Ok(p) => p,
         Err(e) => {
             mark_worker_failed(

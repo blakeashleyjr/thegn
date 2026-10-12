@@ -6,8 +6,10 @@
 //! things have to be composed to do that, and conflating them is a footgun:
 //!
 //! 1. **The prompt** — prose describing the blocker, rendered from a
-//!    user-configurable template. It is never shell-quoted; it is also handed to
-//!    the child verbatim in `THEGN_TASK_PROMPT`.
+//!    user-configurable template. Agent task prompts use the bounded
+//!    [`render_task_prompt`] entry point. Prompt prose is never shell-quoted;
+//!    the command renderer quotes substitutions, and the runner routes the
+//!    prompt through one configured channel.
 //! 2. **The command line** — how the agent is invoked, rendered from a second
 //!    template in which every substituted value **is** shell-quoted. Command
 //!    templates therefore take *bare* placeholders (`claude -p {prompt}`);
@@ -289,10 +291,65 @@ fn parse(template: &str) -> Result<Vec<Piece>, TemplateError> {
 }
 
 /// Render a **prompt** template: `{var}` substitution with no shell quoting.
-/// The result is prose — it also goes to the child verbatim as
-/// `THEGN_TASK_PROMPT`, so mangling it here would corrupt both paths.
 pub fn render_prompt(template: &str, vars: &TaskVars) -> Result<String, TemplateError> {
     render(template, vars, false)
+}
+
+/// Render an agent task prompt and cap aggregate output while preserving
+/// head/tail context.
+pub fn render_task_prompt(template: &str, vars: &TaskVars) -> Result<String, TemplateError> {
+    Ok(bound_text(
+        &render_prompt(template, vars)?,
+        MAX_RENDERED_PROMPT_BYTES,
+    ))
+}
+
+/// Maximum rendered task prompt size, including the truncation marker.
+pub const MAX_RENDERED_PROMPT_BYTES: usize = 64 * 1024;
+const TEXT_OMISSION_MARKER: &str = "\n... task data omitted ...\n";
+const MAX_PATH_ITEMS: usize = 200;
+const MAX_PATH_BYTES: usize = 16 * 1024;
+
+/// Bound text by UTF-8 bytes, retaining useful context from both ends.
+/// The returned string never exceeds `max_bytes` and always ends on a char boundary.
+pub fn bound_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+    let marker = if TEXT_OMISSION_MARKER.len() <= max_bytes {
+        TEXT_OMISSION_MARKER
+    } else {
+        ""
+    };
+    let content_budget = max_bytes - marker.len();
+    let head_budget = content_budget / 2;
+    let tail_budget = content_budget - head_budget;
+    let head_end = floor_char_boundary(text, head_budget);
+    let tail_start = ceil_char_boundary(text, text.len().saturating_sub(tail_budget));
+    let mut out = String::with_capacity(max_bytes);
+    out.push_str(&text[..head_end]);
+    out.push_str(marker);
+    out.push_str(&text[tail_start..]);
+    out
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 /// Render a **command** template: same syntax, but every substituted value is
@@ -543,7 +600,30 @@ const DEFAULT_ISSUE: &str = concat!(
 /// Format conflict paths the way the built-in prompt's `{paths}` expects: one
 /// `  - path` line each, including a trailing newline.
 pub fn format_paths(paths: &[String]) -> String {
-    paths.iter().map(|p| format!("  - {p}\n")).collect()
+    let mut out = String::new();
+    let mut included = 0;
+    for path in paths.iter().take(MAX_PATH_ITEMS) {
+        let line_bytes = path.len().saturating_add(4);
+        if out.len().saturating_add(line_bytes) > MAX_PATH_BYTES {
+            break;
+        }
+        out.push_str("  - ");
+        out.push_str(path);
+        out.push('\n');
+        included += 1;
+    }
+    let omitted = paths.len().saturating_sub(included);
+    if omitted > 0 {
+        let note = format!("... {omitted} more path(s) omitted\n");
+        let room = MAX_PATH_BYTES.saturating_sub(out.len());
+        if note.len() <= room {
+            out.push_str(&note);
+        } else {
+            out = bound_text(&out, MAX_PATH_BYTES.saturating_sub(note.len()));
+            out.push_str(&note);
+        }
+    }
+    out
 }
 
 /// Format typed gitlink conflicts for a merge prompt. Raw paths remain
@@ -1421,7 +1501,7 @@ mod tests {
 
     #[test]
     fn prompt_rendering_never_quotes() {
-        // The prompt is prose and also goes to THEGN_TASK_PROMPT verbatim.
+        // Prompt prose remains unquoted; command substitution owns quoting.
         let vars = TaskVars::new().set("log", "it's red");
         assert_eq!(render_prompt("{log}", &vars).unwrap(), "it's red");
     }
@@ -1737,6 +1817,58 @@ mod tests {
             "  - a.rs\n  - b.rs\n"
         );
         assert_eq!(format_paths(&[]), "");
+    }
+
+    #[test]
+    fn format_paths_caps_item_count_and_bytes_with_omission_count() {
+        let many: Vec<String> = (0..10_000).map(|i| format!("path-{i}")).collect();
+        let rendered = format_paths(&many);
+        assert!(rendered.len() <= MAX_PATH_BYTES);
+        assert!(rendered.contains("more path(s) omitted"));
+        assert!(rendered.contains("path-0"));
+
+        let long = vec!["界".repeat(MAX_PATH_BYTES)];
+        let rendered = format_paths(&long);
+        assert!(rendered.len() <= MAX_PATH_BYTES);
+        assert!(rendered.contains("1 more path(s) omitted"));
+
+        let near_limit = vec![
+            "p".repeat(MAX_PATH_BYTES - 14),
+            "overflowing-second-path".to_string(),
+        ];
+        let rendered = format_paths(&near_limit);
+        assert!(rendered.len() <= MAX_PATH_BYTES);
+        assert!(rendered.contains("1 more path(s) omitted"));
+    }
+
+    #[test]
+    fn bound_text_keeps_utf8_boundaries_and_never_exceeds_byte_cap() {
+        let value = format!("{}{}{}", "前".repeat(20), "middle", "後".repeat(20));
+        let bounded = bound_text(&value, TEXT_OMISSION_MARKER.len() + 12);
+        assert!(bounded.len() <= TEXT_OMISSION_MARKER.len() + 12);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert!(bounded.starts_with("前"));
+        assert!(bounded.ends_with("後"));
+        assert!(bounded.contains("omitted"));
+        assert_eq!(bound_text("large", 2), "le");
+        assert!(bound_text("large", 0).is_empty());
+    }
+
+    #[test]
+    fn render_prompt_caps_aggregate_output_and_reports_omissions() {
+        let vars = TaskVars::new().set("issue_body", "界".repeat(MAX_RENDERED_PROMPT_BYTES * 2));
+        let rendered = render_task_prompt("{issue_body}", &vars).unwrap();
+        assert!(rendered.len() <= MAX_RENDERED_PROMPT_BYTES);
+        assert!(rendered.contains("task data omitted"));
+        assert!(rendered.starts_with("界"));
+        assert!(rendered.ends_with("界"));
+    }
+
+    #[test]
+    fn generic_prompt_rendering_does_not_apply_agent_task_cap() {
+        let value = "x".repeat(MAX_RENDERED_PROMPT_BYTES + 1);
+        let vars = TaskVars::new().set("issue_body", &value);
+        assert_eq!(render_prompt("{issue_body}", &vars).unwrap(), value);
     }
 
     #[test]
