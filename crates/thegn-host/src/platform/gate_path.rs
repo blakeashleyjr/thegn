@@ -30,18 +30,33 @@ pub(crate) struct ScratchDirectory(Directory);
 
 impl ScratchDirectory {
     pub(crate) fn create(prefix: &str) -> io::Result<Self> {
-        if !verified_workspace_supported() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "verified scratch directories are unsupported on this platform",
-            ));
+        let result = (|| {
+            if !verified_workspace_supported() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "verified scratch directories are unsupported on this platform",
+                ));
+            }
+            let parent = std::fs::canonicalize(std::env::temp_dir())?;
+            let temporary = tempfile::Builder::new().prefix(prefix).tempdir_in(parent)?;
+            let directory = Directory::open(temporary.path(), Some(temporary.path()))?;
+            // Keep only after the no-follow descriptor and identity checks succeed.
+            drop(temporary.keep());
+            Ok(Self(directory))
+        })();
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::Unsupported)
+        {
+            static WARNED_UNSUPPORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            WARNED_UNSUPPORTED.get_or_init(|| {
+                tracing::warn!(
+                    target: "thegn::integrate",
+                    "secure scratch worktrees are unsupported on this platform; merge-driver and lockfile-regeneration resolution are disabled"
+                );
+            });
         }
-        let parent = std::fs::canonicalize(std::env::temp_dir())?;
-        let temporary = tempfile::Builder::new().prefix(prefix).tempdir_in(parent)?;
-        let directory = Directory::open(temporary.path(), Some(temporary.path()))?;
-        // Keep only after the no-follow descriptor and identity checks succeed.
-        drop(temporary.keep());
-        Ok(Self(directory))
+        result
     }
 
     pub(crate) fn path(&self) -> &Path {

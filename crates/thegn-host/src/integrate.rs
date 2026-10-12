@@ -366,7 +366,6 @@ fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Opt
         if rerere {
             args.extend_from_slice(&["-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=true"]);
         }
-        scratch.verify().ok()?;
         // A background merge must never sign or prompt.
         args.extend_from_slice(&[
             "-c",
@@ -439,7 +438,6 @@ fn regenerate_merge(
         scratch.verify().ok()?;
         // Merge theirs in (conflicts on the lockfiles are expected → ignore the
         // exit status; we resolve them next).
-        scratch.verify().ok()?;
         util::git_cmd(&tmp)
             .args(["merge", "--no-commit", "--no-ff", theirs])
             .output()
@@ -1131,14 +1129,7 @@ pub fn run_fold(
     repo_root: &Path,
     candidates: Vec<Branch>,
 ) -> Result<FoldReport> {
-    run_fold_with_cas(
-        cfg,
-        repo_root,
-        candidates,
-        |loc, target, tip, base, sources| {
-            advance_with_source_fence(loc, target, tip, base, sources)
-        },
-    )
+    run_fold_with_cas(cfg, repo_root, candidates, advance_with_source_fence)
 }
 
 fn advance_with_source_fence(
@@ -1195,9 +1186,7 @@ fn run_fold_observed(
         candidates,
         GitLoc::Local(repo_root.to_path_buf()),
         history,
-        |loc, target, tip, base, sources| {
-            advance_with_source_fence(loc, target, tip, base, sources)
-        },
+        advance_with_source_fence,
     )
 }
 
@@ -1421,7 +1410,15 @@ fn run_fold_admitted(
             ));
         }
         cas_attempts += 1;
-        let advanced = match advance(&loc, &target_ref, &plan.final_tip, &base, &candidates) {
+        let landed_sources: Vec<Branch> = plan
+            .landed
+            .iter()
+            .map(|landed| Branch {
+                name: landed.branch.name.clone(),
+                tip: landed.branch.tip.clone(),
+            })
+            .collect();
+        let advanced = match advance(&loc, &target_ref, &plan.final_tip, &base, &landed_sources) {
             Ok(advanced) => advanced,
             Err(error) => {
                 let reason = "target CAS operation failed".to_string();
@@ -1702,16 +1699,40 @@ fn attempt_land_admitted(
         cas_attempts += 1;
         adapter.history.revalidate()?;
         source_history.revalidate()?;
-        if CliGit.update_ref_cas(&loc, &target_ref, &folded_tip, &base)? {
-            // Every live checkout of the target, not just the main one — and the
-            // outcomes ride out on the result so the caller can report the ones
-            // left stale. Dropping `Skipped` here is what made the desync silent.
-            let resyncs =
-                util::resync_branch_checkouts(repo_root, &target_branch, &base, &folded_tip);
-            return Ok(AttemptOutcome::Landed {
-                commit: folded_tip,
-                resyncs,
-            });
+        let source_refs = [(branch_ref.clone(), branch_tip.clone())];
+        match CliGit.update_ref_cas_with_sources(
+            &loc,
+            &target_ref,
+            &folded_tip,
+            &base,
+            &source_refs,
+        )? {
+            CasOutcome::Advanced => {
+                // Every live checkout of the target, not just the main one — and the
+                // outcomes ride out on the result so the caller can report the ones
+                // left stale. Dropping `Skipped` here is what made the desync silent.
+                let resyncs =
+                    util::resync_branch_checkouts(repo_root, &target_branch, &base, &folded_tip);
+                return Ok(AttemptOutcome::Landed {
+                    commit: folded_tip,
+                    resyncs,
+                });
+            }
+            CasOutcome::Moved { .. } => {}
+            CasOutcome::SourceMoved { name, actual } => {
+                return Ok(AttemptOutcome::GateError {
+                    reason: "source moved after gate; retry".into(),
+                    log: format!("source ref {name} moved to {actual}"),
+                });
+            }
+            CasOutcome::SourceMissing { name } => {
+                return Ok(AttemptOutcome::GateError {
+                    reason: "source moved after gate; retry".into(),
+                    log: format!("source ref {name} disappeared"),
+                });
+            }
+            CasOutcome::Missing => anyhow::bail!("target ref disappeared during fold"),
+            CasOutcome::Other(message) => anyhow::bail!("fenced ref transaction failed: {message}"),
         }
         if cas_attempts >= 5 {
             anyhow::bail!("merge queue: {target_branch} kept moving under the fold");
@@ -1984,6 +2005,23 @@ mod tests {
             gate_reuse_worktree: false,
             ..MergeQueueConfig::default()
         }
+    }
+
+    fn gate_that_moves_branch(repo: &Repo, branch: &str) -> String {
+        let moved_branch = format!("{branch}-gate-move");
+        git(&repo.dir, &["checkout", "-q", "-b", &moved_branch, branch]);
+        repo.commit(
+            &format!("{moved_branch}.txt"),
+            "advanced during gate\n",
+            "gate source advance",
+        );
+        let moved_tip = repo.out(&["rev-parse", "HEAD"]);
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        git(&repo.dir, &["branch", "-D", &moved_branch]);
+        format!(
+            "git -C {} update-ref refs/heads/{branch} {moved_tip}",
+            util::sh_quote(&repo.dir.to_string_lossy())
+        )
     }
 
     #[test]
@@ -2715,7 +2753,7 @@ mod tests {
         let original = repo.out(&["rev-parse", "main"]);
         let mut config = cfg("printf 'union-failure-proof\\n'; exit 1");
         config.bisect_on_red = false;
-        if !repo.gate_supported_or_refused(&config) {
+        if !repo.gate_supported_or_refused(&cfg("true")) {
             return;
         }
         let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
@@ -2740,7 +2778,7 @@ mod tests {
         repo.feature("b1", "a.txt", "candidate\n");
         let original = repo.out(&["rev-parse", "main"]);
         let config = cfg("printf 'infrastructure-proof\\n'; exit 127");
-        if !repo.gate_supported_or_refused(&config) {
+        if !repo.gate_supported_or_refused(&cfg("true")) {
             return;
         }
         let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
@@ -2763,7 +2801,7 @@ mod tests {
         let original = repo.out(&["rev-parse", "main"]);
         let config =
             cfg("if test -f a.txt; then printf union-red; else printf base-red; fi; exit 1");
-        if !repo.gate_supported_or_refused(&config) {
+        if !repo.gate_supported_or_refused(&cfg("true")) {
             return;
         }
         let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
@@ -2904,6 +2942,78 @@ mod tests {
         assert!(report.diagnostics.contains("private-cas-error-proof"));
         assert_eq!(repo.out(&["rev-parse", "main"]), original);
         assert_held_persistence(&repo, config, &report);
+    }
+
+    #[test]
+    fn run_fold_fences_landed_source_moved_by_gate() {
+        let repo = Repo::new("fold-source-moved");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "candidate.txt", "candidate\n");
+        let original = repo.out(&["rev-parse", "main"]);
+        let config = cfg(&gate_that_moves_branch(&repo, "b1"));
+        if !repo.gate_supported_or_refused(&config) {
+            return;
+        }
+        let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        assert!(!report.advanced);
+        assert!(report.landed.is_empty());
+        assert_eq!(repo.out(&["rev-parse", "main"]), original);
+        assert!(report.diagnostics.contains("refs/heads/b1"));
+        assert!(report.diagnostics.contains("moved after gate"));
+    }
+
+    #[test]
+    fn run_fold_does_not_fence_conflict_deferred_source() {
+        let repo = Repo::new("fold-deferred-source");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "shared.txt", "b1\n");
+        repo.feature("b2", "shared.txt", "b2\n");
+        let mut config = cfg(&gate_that_moves_branch(&repo, "b2"));
+        if !repo.gate_supported_or_refused(&config) {
+            return;
+        }
+        let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        assert!(report.advanced);
+        assert_eq!(
+            report
+                .landed
+                .iter()
+                .map(|landed| landed.branch.as_str())
+                .collect::<Vec<_>>(),
+            ["b1"]
+        );
+        assert_eq!(
+            report
+                .deferred
+                .iter()
+                .map(|deferred| deferred.branch.as_str())
+                .collect::<Vec<_>>(),
+            ["b2"]
+        );
+    }
+
+    #[test]
+    fn attempt_land_does_not_land_source_moved_by_gate() {
+        let repo = Repo::new("single-source-moved");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "candidate.txt", "candidate\n");
+        let original = repo.out(&["rev-parse", "main"]);
+        let config = cfg(&gate_that_moves_branch(&repo, "b1"));
+        if !repo.gate_supported_or_refused(&config) {
+            return;
+        }
+        let loc = GitLoc::Local(repo.dir.clone());
+        let outcome = attempt_land(&config, &repo.dir, "b1", &loc).unwrap();
+        assert!(matches!(&outcome, AttemptOutcome::GateError { reason, log }
+            if reason.contains("source moved after gate; retry")
+                && log.contains("refs/heads/b1")));
+        assert_eq!(repo.out(&["rev-parse", "main"]), original);
     }
 
     #[test]
