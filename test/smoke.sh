@@ -1817,9 +1817,8 @@ prompt = "row={row} artifact={artifact}; run thegn dispatch report {row} --text 
 name = "smoke-chunk"
 agent = "claude"
 concurrency = 4
-# Config admission refuses a stage whose prompt never tells the worker to
-# run thegn dispatch report: the done-gate requires a report, so such a row
-# could only ever be closed by force. Same shape as smoke-live above.
+# This stage prompt includes the worker's report command, matching the
+# configured smoke-live stage above.
 # (No backticks: this heredoc is unquoted, so the shell would run them.)
 prompt = "row={row} chunk={artifact} on {branch}; run thegn dispatch report {row} --text DONE"
 EOF
