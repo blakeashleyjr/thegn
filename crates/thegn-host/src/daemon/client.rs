@@ -394,18 +394,22 @@ fn adapt(session_id: String, stream: AttachStream) -> ExecSession {
     let AttachStream {
         mut frames,
         control,
+        end: _,
     } = stream;
     let (out_tx, out_rx) = tokio_mpsc::channel::<ExecFrame>(256);
     let (in_tx, mut in_rx) = tokio_mpsc::channel::<ExecControl>(64);
-    let (sid_tx, sid_rx) = tokio::sync::watch::channel(Some(session_id));
+    let (sid_tx, sid_rx) = tokio::sync::watch::channel(Some(session_id.clone()));
 
     tokio::spawn(async move {
         let _sid_tx = sid_tx; // keep the watch alive for the session's lifetime
         loop {
             tokio::select! {
                 frame = frames.recv() => match frame {
-                    Some(EventFrame::PaneSnapshot { bytes, .. })
-                    | Some(EventFrame::PaneDelta { bytes, .. }) => {
+                    Some(EventFrame::PaneSnapshot { session, bytes, .. })
+                    | Some(EventFrame::PaneDelta { session, bytes, .. }) => {
+                        if session != session_id {
+                            return;
+                        }
                         if !forward_frame_while_servicing_control(
                             &out_tx,
                             ExecFrame::Stdout(bytes),
@@ -607,6 +611,7 @@ mod tests {
         let stream = AttachStream {
             frames: frame_rx,
             control: attach_control_tx,
+            end: tokio::sync::oneshot::channel().1,
         };
         let session = adapt("session-1".into(), stream);
         let snapshot = || EventFrame::PaneSnapshot {
@@ -633,6 +638,34 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(close, Some(AttachControl::Close)));
+    }
+
+    #[tokio::test]
+    async fn wrong_session_pane_frame_is_not_forwarded() {
+        let (frame_tx, frame_rx) = tokio_mpsc::channel(1);
+        let (attach_control_tx, _attach_control_rx) = tokio_mpsc::channel(1);
+        let stream = AttachStream {
+            frames: frame_rx,
+            control: attach_control_tx,
+            end: tokio::sync::oneshot::channel().1,
+        };
+        let session = adapt("session-1".into(), stream);
+        frame_tx
+            .send(EventFrame::PaneSnapshot {
+                session: "session-2".into(),
+                seq: 0,
+                cols: 80,
+                rows: 24,
+                bytes: b"wrong".to_vec(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), session.frames.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The daemon reports `code: None` exactly when the exit is unreapable
