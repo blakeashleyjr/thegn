@@ -55,22 +55,18 @@ type BridgeWork = Box<dyn FnOnce() + Send + 'static>;
 struct AdmissionJob {
     cancel: Arc<AtomicBool>,
     work: BridgeWork,
-    ticket: Option<u64>,
 }
 
 #[derive(Default)]
 struct AdmissionQueue {
     active: usize,
     jobs: VecDeque<AdmissionJob>,
-    next_ticket: u64,
 }
 
 #[derive(Default)]
 struct AdmissionLimiter {
     active: std::sync::atomic::AtomicUsize,
     queue: Mutex<AdmissionQueue>,
-    next_start: Mutex<u64>,
-    start_order: std::sync::Condvar,
 }
 
 #[derive(Debug)]
@@ -86,17 +82,14 @@ impl AdmissionLimiter {
         work: impl FnOnce() + Send + 'static,
     ) -> std::result::Result<(), AdmissionError> {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut job = AdmissionJob {
+        let job = AdmissionJob {
             cancel,
             work: Box::new(work),
-            ticket: None,
         };
         if queue.active >= MAX_BRIDGE_WORK {
             if queue.jobs.len() >= MAX_QUEUED_BRIDGE_WORK {
                 return Err(AdmissionError::Busy);
             }
-            job.ticket = Some(queue.next_ticket);
-            queue.next_ticket += 1;
             queue.jobs.push_back(job);
             return Ok(());
         }
@@ -121,23 +114,7 @@ impl AdmissionLimiter {
         let mut next = Some(first);
         loop {
             if let Some(job) = next.take() {
-                if let Some(ticket) = job.ticket {
-                    let next_start = limiter
-                        .next_start
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    let mut next_start = limiter
-                        .start_order
-                        .wait_while(next_start, |next_start| *next_start != ticket)
-                        .unwrap_or_else(PoisonError::into_inner);
-                    *next_start += 1;
-                    limiter.start_order.notify_all();
-                    if !job.cancel.load(Ordering::Acquire)
-                        && std::panic::catch_unwind(std::panic::AssertUnwindSafe(job.work)).is_err()
-                    {
-                        tracing::error!(target: "thegn::bridge", "bridge RPC worker panicked");
-                    }
-                } else if !job.cancel.load(Ordering::Acquire)
+                if !job.cancel.load(Ordering::Acquire)
                     && std::panic::catch_unwind(std::panic::AssertUnwindSafe(job.work)).is_err()
                 {
                     tracing::error!(target: "thegn::bridge", "bridge RPC worker panicked");
@@ -3029,6 +3006,59 @@ mod tests {
     #[test]
     fn bridge_admission_starts_queued_jobs_in_submission_order() {
         let limiter = Arc::new(AdmissionLimiter::default());
+        let gates: Vec<_> = (0..MAX_BRIDGE_WORK)
+            .map(|_| Arc::new((Mutex::new(false), std::sync::Condvar::new())))
+            .collect();
+        let (started_tx, started_rx) = channel();
+        for (index, gate) in gates.iter().enumerate() {
+            let gate = gate.clone();
+            let started = started_tx.clone();
+            limiter
+                .submit(Arc::new(AtomicBool::new(false)), move || {
+                    started.send(index).unwrap();
+                    let (lock, cv) = &*gate;
+                    let open = lock.lock().unwrap();
+                    drop(cv.wait_while(open, |open| !*open).unwrap());
+                })
+                .unwrap();
+        }
+        let mut initial_workers = Vec::new();
+        for _ in 0..MAX_BRIDGE_WORK {
+            initial_workers.push(started_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        let (order_tx, order_rx) = channel();
+        for index in 0..12 {
+            let order = order_tx.clone();
+            limiter
+                .submit(Arc::new(AtomicBool::new(false)), move || {
+                    order.send(Some(index)).unwrap();
+                })
+                .unwrap();
+        }
+        let (lock, cv) = &*gates[initial_workers[0]];
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        let observed: Vec<_> = (0..12)
+            .map(|_| order_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
+        for index in initial_workers.into_iter().skip(1) {
+            let (lock, cv) = &*gates[index];
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        let start = Instant::now();
+        while limiter.active.load(Ordering::Acquire) != 0
+            && start.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(observed, (0..12).map(Some).collect::<Vec<_>>());
+        assert_eq!(limiter.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn bridge_admission_runs_queued_jobs_concurrently() {
+        let limiter = Arc::new(AdmissionLimiter::default());
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let (started_tx, started_rx) = channel();
         for _ in 0..MAX_BRIDGE_WORK {
@@ -3046,22 +3076,39 @@ mod tests {
         for _ in 0..MAX_BRIDGE_WORK {
             started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         }
-        let (order_tx, order_rx) = channel();
-        for index in 0..12 {
-            let order = order_tx.clone();
-            limiter
-                .submit(Arc::new(AtomicBool::new(false)), move || {
-                    order.send(Some(index)).unwrap();
-                })
-                .unwrap();
-        }
+
+        let (first_tx, first_rx) = channel();
+        let (second_tx, second_rx) = channel();
+        let (done_tx, done_rx) = channel();
+        let first_done = done_tx.clone();
+        limiter
+            .submit(Arc::new(AtomicBool::new(false)), move || {
+                first_tx.send(()).unwrap();
+                second_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                first_done.send(()).unwrap();
+            })
+            .unwrap();
+        limiter
+            .submit(Arc::new(AtomicBool::new(false)), move || {
+                second_tx.send(()).unwrap();
+                first_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                done_tx.send(()).unwrap();
+            })
+            .unwrap();
+
         let (lock, cv) = &*gate;
         *lock.lock().unwrap() = true;
         cv.notify_all();
-        let observed: Vec<_> = (0..12)
-            .map(|_| order_rx.recv_timeout(Duration::from_secs(5)).unwrap())
-            .collect();
-        assert_eq!(observed, (0..12).map(Some).collect::<Vec<_>>());
+        for _ in 0..2 {
+            done_rx.recv_timeout(Duration::from_secs(6)).unwrap();
+        }
+        let start = Instant::now();
+        while limiter.active.load(Ordering::Acquire) != 0
+            && start.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(limiter.active.load(Ordering::Acquire), 0);
     }
 
     #[test]
