@@ -823,7 +823,7 @@ mod tests {
             chunk_scope: None,
         });
 
-        let mut legacy_json = serde_json::to_value(&current).unwrap();
+        let legacy_json = serde_json::to_value(&current).unwrap();
         assert!(
             !legacy_json["dispatches"][0]
                 .as_object()
