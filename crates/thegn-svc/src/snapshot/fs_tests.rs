@@ -95,7 +95,7 @@ fn accepts_legacy_private_directories_and_rejects_writable_ones() {
 
     assert_eq!(s.get_manifest(&k, &m.id).unwrap(), m);
     assert_eq!(s.get(&k, &m.id, "bundle").unwrap(), b"data");
-    assert_eq!(s.list(&k).unwrap(), vec![m]);
+    assert_eq!(s.list(&k).unwrap(), vec![m.clone()]);
 
     fs::set_permissions(&prefix, fs::Permissions::from_mode(0o775)).unwrap();
     assert!(s.get_manifest(&k, &m.id).is_err());

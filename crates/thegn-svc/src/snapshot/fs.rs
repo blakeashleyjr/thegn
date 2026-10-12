@@ -122,7 +122,8 @@ impl FsSnapshotStore {
             .and_then(|()| sync_directory(dir));
         if let Err(error) = result {
             drop(file);
-            let publish_error = error.context(format!("publish {}", dst.display()));
+            let publish_error =
+                anyhow::Error::new(error).context(format!("publish {}", dst.display()));
             return match fs::remove_file(&tmp) {
                 Ok(()) => Err(publish_error),
                 Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {
