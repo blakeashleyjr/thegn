@@ -16,7 +16,7 @@
 //! latest request may own the (tracked) task. Local art is limited to files
 //! under the system temporary directory, `$XDG_RUNTIME_DIR`, `$XDG_CACHE_HOME`
 //! (or `$HOME/.cache` when unset), and `$HOME/Music`; paths are canonicalized
-//! before admission so traversal and symlinks cannot escape those roots.
+//! against those roots before bounded reads.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
@@ -315,16 +315,16 @@ async fn load_raster(art_url: &str) -> Result<crate::rasterize::Raster, Reject> 
         return Err(Reject::TooLong);
     }
     if let Some(path) = local_path(art_url) {
-        let path = admit_local_art(&path, &local_art_roots())?;
         return admitted_blocking(&DECODE_SLOT, move || {
+            let path = admit_local_art(&path, &local_art_roots())?;
             crate::rasterize::image_file_with_limits(
                 &path,
                 MAX_ART_BYTES as u64,
                 crate::rasterize::MEDIA_ART_LIMITS,
             )
+            .map_err(|_| Reject::Decode)
         })
-        .await?
-        .map_err(|_| Reject::Decode);
+        .await?;
     }
     if !(art_url.starts_with("http://") || art_url.starts_with("https://")) {
         return Err(Reject::Scheme);

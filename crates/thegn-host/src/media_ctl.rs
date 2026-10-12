@@ -5,12 +5,14 @@
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::panel::media::{MediaQueueDelivery, MediaRequest, MediaSourcesDelivery};
 
 const MAX_PENDING_MEDIA_OPS: usize = 8;
+const MEDIA_OP_BUDGET: Duration = Duration::from_secs(5);
 
 type MediaOpTail = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
 
@@ -48,11 +50,12 @@ where
         let _pending = pending_guard;
         if let Some(previous) = previous {
             match previous.await {
-                Ok(()) => {}
-                Err(_) => {}
+                Ok(()) | Err(_) => {}
             }
         }
-        future.await;
+        if tokio::time::timeout(MEDIA_OP_BUDGET, future).await.is_err() {
+            tracing::warn!(target: "thegn::media", budget_secs = MEDIA_OP_BUDGET.as_secs(), "media operation exceeded its time budget");
+        }
     }));
     true
 }
@@ -478,6 +481,25 @@ mod tests {
         release_tx.send(()).unwrap();
         let last = tail.lock().unwrap().take().unwrap();
         last.await.unwrap();
+        assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_transport_operation_does_not_block_the_queue() {
+        let tail = Arc::new(Mutex::new(None));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+
+        assert!(chain_op(&tail, &pending, 8, async {
+            std::future::pending::<()>().await;
+        }));
+        assert!(chain_op(&tail, &pending, 8, async move {
+            assert!(second_tx.send(()).is_ok());
+        }));
+
+        let last = tail.lock().unwrap().take().unwrap();
+        last.await.unwrap();
+        second_rx.await.unwrap();
         assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 }
