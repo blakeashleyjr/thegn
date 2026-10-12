@@ -118,6 +118,12 @@ fn read_capped(mut r: impl Read, cap: usize, over: &AtomicBool) -> Vec<u8> {
 /// How long the readers get to hit EOF once the process group is dead.
 const READER_GRACE: Duration = Duration::from_millis(500);
 
+fn set_io_failure_if_missing(failure: &mut Option<RunError>, error: std::io::Error) {
+    if failure.is_none() {
+        *failure = Some(RunError::Io(error.to_string()));
+    }
+}
+
 pub(crate) fn run_blocking(
     cmd: Command,
     limits: Limits,
@@ -125,9 +131,10 @@ pub(crate) fn run_blocking(
 ) -> Result<String, RunError> {
     let out_over = Arc::new(AtomicBool::new(false));
     let reader_over = out_over.clone();
-    let (stdout, _) = run_blocking_core(cmd, limits, cancel, Some(out_over), move |reader| {
-        read_capped(reader, limits.max_stdout, &reader_over)
-    })?;
+    let (stdout, _) =
+        run_blocking_core(cmd, limits, cancel, Some(out_over), false, move |reader| {
+            read_capped(reader, limits.max_stdout, &reader_over)
+        })?;
     Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 
@@ -144,7 +151,7 @@ where
     F: FnOnce(&mut dyn Read) -> T + Send + 'static,
     T: Send + 'static,
 {
-    run_blocking_core(cmd, limits, cancel, None, consume)
+    run_blocking_core(cmd, limits, cancel, None, true, consume)
 }
 
 enum ReaderMessage<T> {
@@ -157,6 +164,7 @@ fn run_blocking_core<T, F>(
     limits: Limits,
     cancel: &AtomicBool,
     out_over: Option<Arc<AtomicBool>>,
+    strict_reader_errors: bool,
     consume: F,
 ) -> Result<(T, std::process::ExitStatus), RunError>
 where
@@ -193,7 +201,8 @@ where
                 let value = consume(&mut stream);
                 match std::io::copy(&mut stream, &mut std::io::sink()) {
                     Ok(_) => Ok(value),
-                    Err(error) => Err(error.to_string()),
+                    Err(error) if strict_reader_errors => Err(error.to_string()),
+                    Err(_) => Ok(value),
                 }
             }
             None => Err("stdout pipe was not available".to_owned()),
@@ -204,7 +213,12 @@ where
     });
     std::thread::spawn(move || {
         let result = match stderr {
-            Some(stream) => read_capped_result(stream, limits.max_stderr),
+            Some(stream) if strict_reader_errors => read_capped_result(stream, limits.max_stderr),
+            Some(stream) => Ok(read_capped(
+                stream,
+                limits.max_stderr,
+                &AtomicBool::new(false),
+            )),
             None => Err("stderr pipe was not available".to_owned()),
         };
         if tx.send(ReaderMessage::Stderr(result)).is_err() {
@@ -253,7 +267,7 @@ where
         match child.wait() {
             Ok(status) => Some(status),
             Err(error) => {
-                failure = Some(RunError::Io(error.to_string()));
+                set_io_failure_if_missing(&mut failure, error);
                 None
             }
         }
@@ -261,7 +275,7 @@ where
         match child.try_wait() {
             Ok(status) => status,
             Err(error) => {
-                failure = Some(RunError::Io(error.to_string()));
+                set_io_failure_if_missing(&mut failure, error);
                 None
             }
         }

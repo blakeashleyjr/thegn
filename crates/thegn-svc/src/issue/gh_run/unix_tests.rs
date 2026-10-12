@@ -128,6 +128,17 @@ fn cancel_flag_kills_run() {
     assert!(t.elapsed() < Duration::from_secs(5));
 }
 
+#[test]
+fn reap_error_does_not_replace_an_existing_run_failure() {
+    let mut failure = Some(RunError::Timeout);
+    set_io_failure_if_missing(&mut failure, std::io::Error::other("wait failed"));
+    assert!(matches!(failure, Some(RunError::Timeout)));
+
+    let mut failure = None;
+    set_io_failure_if_missing(&mut failure, std::io::Error::other("wait failed"));
+    assert!(matches!(failure, Some(RunError::Io(message)) if message == "wait failed"));
+}
+
 #[tokio::test]
 async fn concurrency_is_bounded() {
     let dir = tempfile::tempdir().unwrap();
