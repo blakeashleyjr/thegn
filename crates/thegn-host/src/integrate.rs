@@ -2939,7 +2939,6 @@ mod tests {
         repo.feature("feat", "other.txt", "other\n");
         let ours = repo.out(&["rev-parse", "main"]);
         let ours_tree = repo.out(&["rev-parse", "main^{tree}"]);
-        let theirs = repo.out(&["rev-parse", "feat"]);
         assert!(
             driver_merge(
                 &repo.dir,
@@ -2980,7 +2979,7 @@ mod tests {
     }
 
     #[test]
-    fn driver_merge_rejects_staged_paths_outside_conflict_set() {
+    fn driver_merge_rejects_resolved_paths_outside_approval_set() {
         let repo = Repo::new("driver-unapproved-output");
         if !repo.history_supported_or_refused() {
             return;
@@ -2990,7 +2989,7 @@ mod tests {
             &[
                 "config",
                 "merge.stage-stray.driver",
-                "printf stray > stray.txt; git add stray.txt; true %O %A %B %L %P",
+                "printf stray > stray.txt; true %O %A %B %L %P",
             ],
         );
         repo.commit(".gitattributes", "data.txt merge=stage-stray\n", "attrs");
@@ -3015,7 +3014,21 @@ mod tests {
                 false,
                 Duration::from_secs(3),
             )
-            .is_none()
+            .is_some(),
+            "the driver should resolve the approved conflict path",
+        );
+        assert!(
+            driver_merge(
+                &repo.dir,
+                &ours,
+                &theirs,
+                &tree,
+                &[],
+                false,
+                Duration::from_secs(3),
+            )
+            .is_none(),
+            "the resolved data.txt change must be rejected when no paths are approved",
         );
         let worktrees = repo.out(&["worktree", "list", "--porcelain"]);
         assert!(!worktrees.contains("tg-drivermerge-"), "{worktrees}");

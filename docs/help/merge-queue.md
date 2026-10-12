@@ -266,12 +266,14 @@ keep its quarantined lease held. The matching environment overrides are
 `THEGN_MERGE_QUEUE_GATE_TIMEOUT_SECS`.
 
 When a red union is being localized, `diagnosis_max_gates` (default `8`) caps
-the total gate attempts and `diagnosis_timeout_secs` (default `3600`) caps the
-aggregate diagnosis time, including active setup and gate commands. Diagnosis
-stops without blaming a candidate when either cap is reached. Set either value
-to `0` to disable diagnosis and hold the batch without localization. Increase
-the caps for large repositories whose failures need more prefixes or longer
-setup and test runs.
+the total gate attempts and `diagnosis_timeout_secs` (default `3600`) bounds
+each setup and gate phase by the diagnosis time remaining when that prefix
+starts. Setup and gate deadlines for a prefix are calculated together, so the
+phase deadlines can outlast the aggregate diagnosis deadline when setup uses
+most of the remaining time. Diagnosis stops without blaming a candidate when
+either cap is reached. Set either value to `0` to disable diagnosis and hold the
+batch without localization. Increase the caps for large repositories whose
+failures need more prefixes or longer setup and test runs.
 
 That split matters, because a gate can fail two different ways and only
 one of them is about your branch:
