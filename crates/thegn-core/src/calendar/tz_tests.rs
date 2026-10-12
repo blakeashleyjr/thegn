@@ -92,18 +92,18 @@ fn vtimezone_rules_evaluate_nth_weekday_onsets_and_prefer_the_default_zone() {
     .unwrap();
     let rules = VtzRules::new(vec![daylight, standard]).unwrap();
     assert_eq!(
-        rules.match_zone(2025, Some(chrono_tz::Europe__Berlin)),
-        Some(chrono_tz::Europe__Berlin)
+        rules.match_zone(2025, Some(chrono_tz::Europe::Berlin)),
+        Some(chrono_tz::Europe::Berlin)
     );
     assert_eq!(
-        rules.match_zone(2025, Some(chrono_tz::Europe__Paris)),
-        Some(chrono_tz::Europe__Paris)
+        rules.match_zone(2025, Some(chrono_tz::Europe::Paris)),
+        Some(chrono_tz::Europe::Paris)
     );
     let fixed = VtzRules::new(vec![
         VtzRules::observance("20250101T000000", "+0000", "+0000", None, false).unwrap(),
     ])
     .unwrap();
-    assert_eq!(fixed.match_zone(2025, None), Some(chrono_tz::Etc__GMT));
+    assert_eq!(fixed.match_zone(2025, None), Some(chrono_tz::Etc::GMT));
     assert_eq!(
         nth_weekday(2025, 10, -1, chrono::Weekday::Sun).unwrap(),
         chrono::NaiveDate::from_ymd_opt(2025, 10, 26).unwrap()
@@ -134,7 +134,7 @@ fn old_one_shot_onset_does_not_override_preferred_zone_history() {
     ])
     .unwrap();
     assert_eq!(
-        rules.match_zone(2025, Some(chrono_tz::Asia__Dubai)),
-        Some(chrono_tz::Asia__Dubai)
+        rules.match_zone(2025, Some(chrono_tz::Asia::Dubai)),
+        Some(chrono_tz::Asia::Dubai)
     );
 }
