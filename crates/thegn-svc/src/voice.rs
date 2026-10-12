@@ -7,6 +7,7 @@
 
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -95,6 +96,17 @@ impl CommandVoiceProvider {
         wav: &[u8],
         cancelled: &AtomicBool,
     ) -> Result<String, VoiceError> {
+        self.transcribe_push_to_talk_cancellable_with_reaper(wav, cancelled, || {})
+    }
+
+    /// Variant that reports when a handed-off child has been waited on.
+    pub fn transcribe_push_to_talk_cancellable_with_reaper(
+        &self,
+        wav: &[u8],
+        cancelled: &AtomicBool,
+        on_reaped: impl Fn() + Send + Sync + 'static,
+    ) -> Result<String, VoiceError> {
+        let on_reaped: Arc<dyn Fn() + Send + Sync> = Arc::new(on_reaped);
         if wav.is_empty() {
             return Err(VoiceError::InvalidInput("capture produced no WAV".into()));
         }
@@ -131,21 +143,21 @@ impl CommandVoiceProvider {
         let mut stdin = match child.stdin.take() {
             Some(stdin) => stdin,
             None => {
-                terminate_child(child);
+                terminate_child(child, &on_reaped);
                 return Err(VoiceError::Failed("transcriber stdin unavailable".into()));
             }
         };
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                terminate_child(child);
+                terminate_child(child, &on_reaped);
                 return Err(VoiceError::Failed("transcriber stdout unavailable".into()));
             }
         };
         let stderr = match child.stderr.take() {
             Some(stderr) => stderr,
             None => {
-                terminate_child(child);
+                terminate_child(child, &on_reaped);
                 return Err(VoiceError::Failed("transcriber stderr unavailable".into()));
             }
         };
@@ -184,12 +196,12 @@ impl CommandVoiceProvider {
         let mut error = None;
         let status = loop {
             if cancelled.load(Ordering::Acquire) {
-                let terminated = terminate_child(child);
+                let terminated = terminate_child(child, &on_reaped);
                 let settled = workers.discard(written, output, error);
                 return Err(shutdown_error("transcriber cancelled", terminated, settled));
             }
             if Instant::now() >= deadline {
-                let terminated = terminate_child(child);
+                let terminated = terminate_child(child, &on_reaped);
                 let settled = workers.discard(written, output, error);
                 return Err(shutdown_error("transcriber timed out", terminated, settled));
             }
@@ -197,7 +209,7 @@ impl CommandVoiceProvider {
                 written = try_recv(&workers.write_rx);
                 if let Some(Err(reason)) = written.as_ref() {
                     let reason = reason.clone();
-                    let terminated = terminate_child(child);
+                    let terminated = terminate_child(child, &on_reaped);
                     let settled = workers.discard(written, output, error);
                     if !terminated || !settled {
                         return Err(VoiceError::UnresolvedProcess(reason));
@@ -209,7 +221,7 @@ impl CommandVoiceProvider {
                 output = try_recv(&workers.out_rx);
                 if let Some(Err(reason)) = output.as_ref() {
                     let reason = reason.clone();
-                    let terminated = terminate_child(child);
+                    let terminated = terminate_child(child, &on_reaped);
                     let settled = workers.discard(written, output, error);
                     if !terminated || !settled {
                         return Err(VoiceError::UnresolvedProcess(reason));
@@ -221,7 +233,7 @@ impl CommandVoiceProvider {
                 error = try_recv(&workers.err_rx);
                 if let Some(Err(reason)) = error.as_ref() {
                     let reason = reason.clone();
-                    let terminated = terminate_child(child);
+                    let terminated = terminate_child(child, &on_reaped);
                     let settled = workers.discard(written, output, error);
                     if !terminated || !settled {
                         return Err(VoiceError::UnresolvedProcess(
@@ -235,7 +247,7 @@ impl CommandVoiceProvider {
                 Ok(Some(status)) => break status,
                 Ok(None) => thread::sleep(Duration::from_millis(5)),
                 Err(e) => {
-                    let terminated = terminate_child(child);
+                    let terminated = terminate_child(child, &on_reaped);
                     let settled = workers.discard(written, output, error);
                     if !terminated || !settled {
                         return Err(VoiceError::UnresolvedProcess(format!(
@@ -250,7 +262,7 @@ impl CommandVoiceProvider {
         // pipes. Close that whole process group before joining helpers so an
         // otherwise successful child cannot leave a reader or writer behind.
         if written.is_none() || output.is_none() || error.is_none() {
-            if !terminate_child(child) {
+            if !terminate_child(child, &on_reaped) {
                 if !workers.discard(written, output, error) {
                     tracing::warn!(
                         "voice transcriber pipe workers did not settle after child exit"
@@ -358,7 +370,7 @@ fn try_recv<T>(rx: &Receiver<Result<T, String>>) -> Option<Result<T, String>> {
     rx.try_recv().ok()
 }
 
-fn terminate_child(mut child: Child) -> bool {
+fn terminate_child(mut child: Child, on_reaped: &Arc<dyn Fn() + Send + Sync>) -> bool {
     // The command is isolated in the plugin process seam's process group/job,
     // so descendants cannot retain our pipes after cancellation or timeout.
     crate::plugin::proc::kill_group(child.id());
@@ -374,17 +386,23 @@ fn terminate_child(mut child: Child) -> bool {
     let deadline = Instant::now() + TERMINATE_GRACE;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return true,
+            Ok(Some(_)) => {
+                on_reaped();
+                return true;
+            }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(2)),
             Ok(None) | Err(_) => break,
         }
     }
+    let reaped = Arc::clone(on_reaped);
     match thread::Builder::new()
         .name("voice-transcriber-reaper".into())
         .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            // thegn-svc has no QoS seam; reaper scheduling follows the platform default.
             if let Err(error) = child.wait() {
                 tracing::warn!(%error, "voice transcriber reaper failed");
+            } else {
+                reaped();
             }
         }) {
         Ok(_) => false,
