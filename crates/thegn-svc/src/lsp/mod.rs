@@ -27,7 +27,7 @@ pub use diagnostics_queue::{
 pub use registry::{Registry, RegistryEntry, Resolution, binary_on_path};
 
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -88,15 +88,65 @@ where
     I: IntoIterator<Item = (OsString, OsString)>,
 {
     vars.into_iter()
-        .filter(|(name, _)| {
-            name.to_str().is_some_and(|name| {
-                SERVER_ENV_ALLOWLIST
-                    .iter()
-                    .any(|allowed| name.eq_ignore_ascii_case(allowed))
-                    || name.starts_with("LC_")
-            })
+        .filter_map(|(name, value)| {
+            name.to_str()
+                .is_some_and(|name| {
+                    SERVER_ENV_ALLOWLIST
+                        .iter()
+                        .any(|allowed| name.eq_ignore_ascii_case(allowed))
+                        || name.starts_with("LC_")
+                })
+                .then(|| {
+                    if name.eq_ignore_ascii_case("PATH") {
+                        let absolute = std::env::split_paths(&value)
+                            .filter(|entry| entry.is_absolute())
+                            .collect::<Vec<_>>();
+                        let filtered = std::env::join_paths(absolute).unwrap_or_default();
+                        (name, filtered)
+                    } else {
+                        (name, value)
+                    }
+                })
         })
         .collect()
+}
+
+/// Resolve a bare language-server name only through absolute PATH entries.
+/// Commands containing a path separator preserve their configured spelling;
+/// the process working directory continues to determine relative explicit paths.
+pub fn resolve_server_command(cmd: &str, path: Option<&OsStr>) -> Result<PathBuf, LspError> {
+    let configured = Path::new(cmd);
+    if cmd.contains('/') || cmd.contains('\\') {
+        return Ok(configured.to_path_buf());
+    }
+    let Some(path) = path else {
+        return Err(LspError::Spawn(format!(
+            "{cmd} not found on absolute PATH entries"
+        )));
+    };
+    for entry in std::env::split_paths(path).filter(|entry| entry.is_absolute()) {
+        let candidate = entry.join(cmd);
+        let Ok(canonical) = candidate.canonicalize() else {
+            continue;
+        };
+        let Ok(metadata) = canonical.metadata() else {
+            continue;
+        };
+        if metadata.is_file() && crate::plugin::platform::is_executable_file(&metadata) {
+            tracing::debug!(
+                target: "thegn::lsp",
+                command = %candidate.display(),
+                canonical_path = %canonical.display(),
+                "resolved language server executable"
+            );
+            // Preserve the candidate's final path component for argv[0]-based
+            // shims such as mise, rustup, volta, and busybox.
+            return Ok(candidate);
+        }
+    }
+    Err(LspError::Spawn(format!(
+        "{cmd} not found on absolute PATH entries"
+    )))
 }
 
 /// The LSP resource contract.  These are protocol safety limits, not user
@@ -1812,6 +1862,9 @@ impl LspClient {
     /// Tell the server a document is open (text is the on-disk content). Uses
     /// the connection's `languageId` (from the resolved registry entry).
     pub fn did_open(&self, uri: &str, text: &str) -> Result<(), LspError> {
+        if text.len() > limits::MAX_OUTBOUND_BODY_BYTES {
+            return Err(LspError::Bounded("outbound LSP body limit".into()));
+        }
         ensure_identity_uri(uri)?;
         self.notify(
             "textDocument/didOpen",
@@ -2227,6 +2280,145 @@ fn dispatch(msg: &Value, ctx: &ReaderContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_bare_commands_only_from_absolute_path_entries() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix(".lsp-resolve-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let shadow = dir.path().join("shadow");
+        let absolute = dir.path().join("absolute");
+        std::fs::create_dir(&shadow).unwrap();
+        std::fs::create_dir(&absolute).unwrap();
+        let shadow_executable = shadow.join("srv");
+        let executable = absolute.join("srv");
+        std::fs::write(&shadow_executable, "relative shadow").unwrap();
+        std::fs::write(&executable, "absolute executable").unwrap();
+        for fixture in [&shadow_executable, &executable] {
+            if let Err(error) = thegn_core::fsperm::make_executable_for_test(fixture) {
+                if error.kind() == std::io::ErrorKind::Unsupported {
+                    continue;
+                }
+                panic!("make server fixture executable: {error}");
+            }
+        }
+        let relative_shadow = shadow.strip_prefix(&cwd).unwrap();
+        let path = std::env::join_paths([
+            Path::new("").to_path_buf(),
+            Path::new(".").to_path_buf(),
+            relative_shadow.to_path_buf(),
+            absolute.clone(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            resolve_server_command("srv", Some(&path)).unwrap(),
+            executable
+        );
+        assert!(matches!(
+            resolve_server_command("missing-lsp-server", Some(&path)),
+            Err(LspError::Spawn(message))
+                if message == "missing-lsp-server not found on absolute PATH entries"
+        ));
+    }
+
+    #[test]
+    fn non_executable_path_candidate_does_not_shadow_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        let allowed = dir.path().join("allowed");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::create_dir(&allowed).unwrap();
+        let non_executable = blocked.join("srv");
+        let executable = allowed.join("srv");
+        std::fs::write(&non_executable, "not executable").unwrap();
+        std::fs::write(&executable, "executable").unwrap();
+        if let Err(error) = thegn_core::fsperm::make_executable_for_test(&executable) {
+            if error.kind() == std::io::ErrorKind::Unsupported {
+                return;
+            }
+            panic!("make server fixture executable: {error}");
+        }
+        let path = std::env::join_paths([blocked, allowed]).unwrap();
+
+        assert_eq!(
+            resolve_server_command("srv", Some(&path)).unwrap(),
+            executable
+        );
+    }
+
+    #[test]
+    fn server_environment_removes_relative_path_entries() {
+        let env = server_env([(
+            OsString::from("PATH"),
+            OsString::from("/usr/bin::.:relative"),
+        )]);
+        assert_eq!(
+            env,
+            vec![(OsString::from("PATH"), OsString::from("/usr/bin"))]
+        );
+    }
+
+    #[test]
+    fn spawned_server_receives_filtered_environment() {
+        let shell = Path::new("/bin/sh");
+        if !shell.is_file() || std::env::var_os("CARGO_MANIFEST_DIR").is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let capture = root.path().join("server-env.txt");
+        let (diagnostics, _receiver) = diagnostics_channel();
+        let generation = diagnostics.register(root.path(), "capture").unwrap();
+        let client = LspClient::start_argv_with_identity(
+            &[
+                shell.display().to_string(),
+                "-c".into(),
+                "env > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec cat >/dev/null".into(),
+                "lsp-env-capture".into(),
+                capture.display().to_string(),
+            ],
+            "fixture",
+            root.path(),
+            diagnostics,
+            "capture".into(),
+            generation,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !capture.exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let captured = std::fs::read_to_string(&capture).unwrap();
+        drop(client);
+
+        assert!(captured.lines().any(|entry| entry.starts_with("PATH=")));
+        assert!(
+            !captured
+                .lines()
+                .any(|entry| entry.starts_with("CARGO_MANIFEST_DIR="))
+        );
+    }
+
+    #[test]
+    fn did_open_rejects_text_over_body_limit() {
+        let (diagnostics, _) = diagnostics_channel();
+        let client = LspClient::from_io(
+            Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+            Box::new(std::io::sink()),
+            "fixture",
+            Path::new("/fixture"),
+            diagnostics,
+        )
+        .unwrap();
+        let text = "x".repeat(limits::MAX_OUTBOUND_BODY_BYTES + 1);
+
+        assert!(matches!(
+            client.did_open("file:///fixture/main.rs", &text),
+            Err(LspError::Bounded(message)) if message == "outbound LSP body limit"
+        ));
+    }
 
     #[test]
     fn server_environment_keeps_process_and_toolchain_basics() {
