@@ -192,6 +192,14 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
     };
     let mut entries = Vec::new();
     for row in &rows {
+        // Held rows have already completed worktree collection. Their paths
+        // are expected to be gone, so preserve the hold semantics first.
+        if merge_sweep::CleanupHold::from_detail(row.error_detail.as_deref()).is_some() {
+            if force {
+                report.kept.push((row.branch.clone(), "worktree previously collected; branch and queue evidence retained for explicit cleanup (THE-596)".into()));
+            }
+            continue;
+        }
         // A non-local worktree identifier is opaque. Do not pass it to Git or
         // treat it as a filesystem path while trying to infer repository
         // ownership; remote rows cannot be cleaned by this local sweep.
@@ -203,14 +211,6 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
                 ));
             } else {
                 tracing::debug!(branch = %row.branch, location = %row.location, "landed row has non-local worktree location; leaving it untouched");
-            }
-            continue;
-        }
-        // Held rows have already completed worktree collection. Their paths
-        // are expected to be gone, so preserve the hold semantics first.
-        if merge_sweep::CleanupHold::from_detail(row.error_detail.as_deref()).is_some() {
-            if force {
-                report.kept.push((row.branch.clone(), "worktree previously collected; branch and queue evidence retained for explicit cleanup (THE-596)".into()));
             }
             continue;
         }
@@ -576,7 +576,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::disallowed_methods)]
     fn remote_location_is_refused_before_probing_its_worktree_as_a_local_path() {
         let isolation = crate::merge_lifecycle::TestIsolation::new();
         let dir = tempfile::tempdir().unwrap();
@@ -622,6 +621,20 @@ mod tests {
         assert_eq!(rows[0].location, "remote-placement");
         assert_eq!(rows[0].status, "landed");
         assert!(root_one.join("tracked").exists() && root_two.join("tracked").exists());
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE merge_queue SET error_detail=?1 WHERE worktree=?2",
+            [
+                merge_sweep::CleanupHold::BranchRetained.marker(),
+                worktree_two.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        let held_report = sweep_with_db(&cfg, &root_one, true, &db);
+        assert_eq!(held_report.kept.len(), 1);
+        assert!(held_report.kept[0].1.contains("previously collected"));
     }
 
     #[test]
