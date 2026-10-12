@@ -44,7 +44,7 @@ fn strict_frame_decoder_accepts_only_canonical_rpc_frames() {
     let valid_error =
         decode_frame(r#"{"id":7,"error":{"code":"invalid","message":"bad"}}"#).unwrap();
     assert!(
-        matches!(valid_error, Frame::Response(response) if response.error.is_some_and(|error| error.code == RpcErrorCode::Invalid))
+        matches!(valid_error, Frame::Response(response) if response.error.as_ref().is_some_and(|error| error.code == RpcErrorCode::Invalid))
     );
 
     let overlong_method = format!(r#"{{"method":"{}"}}"#, "m".repeat(MAX_METHOD_BYTES + 1));
