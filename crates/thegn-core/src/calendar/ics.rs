@@ -9,7 +9,7 @@
 //! the other ninety-nine, so unparseable properties are skipped rather than
 //! failing the whole document.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::NaiveDate;
 
@@ -26,6 +26,100 @@ pub struct ContentLine {
     pub name: String,
     pub params: BTreeMap<String, String>,
     pub value: String,
+}
+
+/// Value-free parser diagnostics. They deliberately contain no feed text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IcsDiagnostic {
+    MalformedLine,
+    MismatchedEnd,
+    UnclosedChild,
+    NestedEvent,
+    EventWithoutStart,
+    InvalidEvent,
+    DuplicateProperty(&'static str),
+    Truncated,
+    MissingEnvelope,
+}
+
+/// Bounded diagnostics from one iCalendar parse.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IcsReport {
+    diagnostics: Vec<IcsDiagnostic>,
+    overflow: usize,
+}
+
+pub const MAX_ICS_DIAGNOSTICS: usize = 32;
+
+impl IcsReport {
+    /// The recorded diagnostics, up to [`MAX_ICS_DIAGNOSTICS`].
+    pub fn diagnostics(&self) -> &[IcsDiagnostic] {
+        &self.diagnostics
+    }
+
+    /// Number of diagnostics omitted after the cap was reached.
+    pub fn overflow(&self) -> usize {
+        self.overflow
+    }
+
+    /// Whether component boundaries or document completeness cannot be trusted.
+    pub fn is_document_failure(&self) -> bool {
+        self.overflow > 0
+            || self.diagnostics.iter().any(|diagnostic| {
+                matches!(
+                    diagnostic,
+                    IcsDiagnostic::Truncated
+                        | IcsDiagnostic::MismatchedEnd
+                        | IcsDiagnostic::NestedEvent
+                        | IcsDiagnostic::UnclosedChild
+                )
+            })
+    }
+
+    fn record(&mut self, diagnostic: IcsDiagnostic) {
+        if self.diagnostics.len() < MAX_ICS_DIAGNOSTICS {
+            self.diagnostics.push(diagnostic);
+        } else {
+            self.overflow = self.overflow.saturating_add(1);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ComponentName {
+    Calendar,
+    Event,
+    Alarm,
+    Other(u64, usize),
+}
+
+impl ComponentName {
+    fn parse(name: &str) -> Self {
+        match name.to_ascii_uppercase().as_str() {
+            "VCALENDAR" => Self::Calendar,
+            "VEVENT" => Self::Event,
+            "VALARM" => Self::Alarm,
+            _ => {
+                // Fixed-size identity keeps arbitrary extension names out of the stack.
+                let mut hash = 0xcbf2_9ce4_8422_2325u64;
+                for byte in name.bytes().map(|byte| byte.to_ascii_uppercase()) {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x100_0000_01b3);
+                }
+                Self::Other(hash, name.len())
+            }
+        }
+    }
+
+    fn matches(self, name: &str) -> bool {
+        match (self, Self::parse(name)) {
+            (Self::Calendar, Self::Calendar)
+            | (Self::Event, Self::Event)
+            | (Self::Alarm, Self::Alarm) => true,
+            (Self::Other(a, al), Self::Other(b, bl)) => a == b && al == bl,
+            _ => false,
+        }
+    }
 }
 
 /// Unfold RFC 5545 line folding: a CRLF followed by a space or tab is a
@@ -430,15 +524,38 @@ pub fn parse_ics_window_checked(
     window: Option<(NaiveDate, NaiveDate)>,
     meter: &mut AdmissionMeter,
     out: &mut Vec<CalEvent>,
-    mut check: impl FnMut() -> Result<(), AdmissionError>,
+    check: impl FnMut() -> Result<(), AdmissionError>,
 ) -> Result<(), AdmissionError> {
+    parse_ics_window_reported(
+        input,
+        default_zone,
+        window,
+        meter,
+        out,
+        check,
+        &mut IcsReport::default(),
+    )
+}
+
+/// Windowed parser that reports bounded structural and per-event diagnostics.
+/// Existing lenient entry points retain their historical output behavior.
+pub fn parse_ics_window_reported(
+    input: &str,
+    default_zone: &str,
+    window: Option<(NaiveDate, NaiveDate)>,
+    meter: &mut AdmissionMeter,
+    out: &mut Vec<CalEvent>,
+    mut check: impl FnMut() -> Result<(), AdmissionError>,
+    report: &mut IcsReport,
+) -> Result<(), AdmissionError> {
+    report.diagnostics.clear();
+    report.overflow = 0;
     let mut cur: Option<Builder> = None;
-    // Nested non-VEVENT components inside the event being built (notably
-    // VALARM, and VTIMEZONE's STANDARD/DAYLIGHT), so their properties don't
-    // leak into it. Only "is this a VALARM" is ever consulted, so that is all
-    // that is kept — the depth is capped, not the names.
-    let mut nested: Vec<bool> = Vec::new();
+    let mut components: Vec<ComponentName> = Vec::new();
+    let mut event_depth: Option<usize> = None;
     let mut cal_name = String::new();
+    let mut saw_calendar = false;
+    let mut closed_calendar = false;
 
     for raw in LogicalLines::new(input) {
         check()?;
@@ -446,14 +563,22 @@ pub fn parse_ics_window_checked(
             // Classify from the first physical line without unfolding.
             let hint = raw.name_hint();
             let in_event = cur.is_some();
-            let in_alarm = nested.last().copied().unwrap_or(false);
+            let in_alarm = event_depth.is_some_and(|depth| {
+                components
+                    .get(depth..)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|part| matches!(part, ComponentName::Alarm))
+            });
             let retained = match hint.as_deref() {
                 _ if !in_event => hint.as_deref() == Some("X-WR-CALNAME"),
                 // Inside an event, a line whose name is itself folded can't be
                 // classified, and an oversized BEGIN/END would desynchronize
                 // the component stack if skipped — refuse rather than guess.
                 None | Some("BEGIN") | Some("END") => true,
-                Some(n) if nested.is_empty() => is_retained_property(n),
+                Some(n) if event_depth.map_or(true, |depth| components.len() <= depth) => {
+                    is_retained_property(n)
+                }
                 Some(n) => in_alarm && n == "TRIGGER",
             };
             if retained {
@@ -468,50 +593,95 @@ pub fn parse_ics_window_checked(
         }
         let text = raw.text();
         let Some(line) = parse_line(&text) else {
+            if !components.is_empty() {
+                report.record(IcsDiagnostic::MalformedLine);
+            }
             continue;
         };
         match line.name.as_str() {
-            "BEGIN" if line.value.eq_ignore_ascii_case("VEVENT") => {
-                meter.begin_event();
-                meter.charge_event(2 * std::mem::size_of::<CalEvent>(), 0)?;
-                cur = Some(Builder::default());
-                nested.clear();
-                continue;
-            }
-            "END" if line.value.eq_ignore_ascii_case("VEVENT") => {
-                match cur.take() {
-                    Some(b) if window.is_some_and(|w| !b.may_occur_in(w, default_zone)) => {
-                        // Parsed within the per-event ceilings, but outside
-                        // the sync window: released, never admitted.
-                        meter.abandon_event();
-                    }
-                    Some(b) if b.start.is_some() => {
-                        // The calendar name is copied into every event, and a
-                        // synthesized UID is built — both are charged first.
-                        let extra =
-                            cal_name.len() + if b.uid.is_empty() { ENTRY_OVERHEAD } else { 0 };
-                        meter.charge_event(extra, 0)?;
-                        meter.admit_event()?;
-                        if let Some(mut e) = b.finish(default_zone) {
-                            e.calendar = cal_name.clone();
-                            out.push(e);
-                        }
-                    }
-                    _ => meter.abandon_event(),
-                }
-                continue;
-            }
             "BEGIN" => {
-                if cur.is_some() {
-                    if nested.len() >= MAX_COMPONENT_DEPTH {
-                        return Err(AdmissionError::new(AdmissionLimit::Nesting));
-                    }
-                    nested.push(line.value.eq_ignore_ascii_case("VALARM"));
+                let component = ComponentName::parse(&line.value);
+                let depth_exceeded = if cur.is_some() && !matches!(component, ComponentName::Event)
+                {
+                    event_depth.is_some_and(|depth| {
+                        components.len().saturating_sub(depth) >= MAX_COMPONENT_DEPTH
+                    })
+                } else {
+                    components.len() >= MAX_COMPONENT_DEPTH
+                };
+                if depth_exceeded {
+                    report.record(IcsDiagnostic::Truncated);
+                    return Err(AdmissionError::new(AdmissionLimit::Nesting));
                 }
-                continue;
+                if matches!(component, ComponentName::Calendar) {
+                    saw_calendar = true;
+                }
+                if matches!(component, ComponentName::Event) {
+                    if cur.is_some() {
+                        report.record(IcsDiagnostic::NestedEvent);
+                    }
+                    meter.begin_event();
+                    meter.charge_event(2 * std::mem::size_of::<CalEvent>(), 0)?;
+                    cur = Some(Builder::default());
+                    event_depth = Some(components.len() + 1);
+                }
+                components.push(component);
+                if matches!(component, ComponentName::Event) {
+                    continue;
+                }
+                if cur.is_some() {
+                    continue;
+                }
             }
             "END" => {
-                nested.pop();
+                let matched = components
+                    .last()
+                    .is_some_and(|component| component.matches(&line.value));
+                if !matched {
+                    report.record(IcsDiagnostic::MismatchedEnd);
+                }
+                let ending_event = line.value.eq_ignore_ascii_case("VEVENT");
+                if ending_event && event_depth.is_some_and(|depth| components.len() > depth) {
+                    report.record(IcsDiagnostic::UnclosedChild);
+                }
+                if matched
+                    && let Some(component) = components.pop()
+                    && matches!(component, ComponentName::Calendar)
+                    && line.value.eq_ignore_ascii_case("VCALENDAR")
+                {
+                    closed_calendar = true;
+                }
+                if ending_event {
+                    event_depth = None;
+                }
+                if ending_event {
+                    match cur.take() {
+                        Some(b) if window.is_some_and(|w| !b.may_occur_in(w, default_zone)) => {
+                            meter.abandon_event();
+                        }
+                        Some(b) if b.start.is_some() => {
+                            let extra =
+                                cal_name.len() + if b.uid.is_empty() { ENTRY_OVERHEAD } else { 0 };
+                            meter.charge_event(extra, 0)?;
+                            meter.admit_event()?;
+                            if let Some(mut e) = b.finish(default_zone) {
+                                e.calendar = cal_name.clone();
+                                out.push(e);
+                            } else {
+                                report.record(IcsDiagnostic::InvalidEvent);
+                            }
+                        }
+                        Some(_) => {
+                            report.record(IcsDiagnostic::EventWithoutStart);
+                            meter.abandon_event();
+                        }
+                        None => meter.abandon_event(),
+                    }
+                    continue;
+                }
+                if !matched {
+                    continue;
+                }
                 continue;
             }
             _ => {}
@@ -521,9 +691,17 @@ pub fn parse_ics_window_checked(
             continue;
         }
         let Some(b) = cur.as_mut() else { continue };
-        // Inside a VALARM: pick up the reminder trigger, ignore everything else.
-        if nested.last().copied().unwrap_or(false) {
-            if line.name == "TRIGGER"
+        let child_components = event_depth.is_some_and(|depth| components.len() > depth);
+        if child_components {
+            let in_alarm = event_depth.is_some_and(|depth| {
+                components
+                    .get(depth..)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|part| matches!(part, ComponentName::Alarm))
+            });
+            if in_alarm
+                && line.name == "TRIGGER"
                 && let Some(mins) = parse_trigger_minutes(&line.value)
             {
                 meter.charge_event(ENTRY_OVERHEAD, 1)?;
@@ -533,12 +711,22 @@ pub fn parse_ics_window_checked(
             }
             continue;
         }
-        if !nested.is_empty() {
-            continue;
-        }
-        b.property(&line, meter)?;
+        b.property(&line, meter, report)?;
     }
-    // A document that ends mid-event keeps nothing of it.
+    if cur.is_some() || !components.is_empty() {
+        report.record(IcsDiagnostic::Truncated);
+        if components
+            .iter()
+            .any(|part| !matches!(part, ComponentName::Calendar | ComponentName::Event))
+        {
+            report.record(IcsDiagnostic::UnclosedChild);
+        }
+    }
+    // Report absent envelopes, and calendars that began but never closed.
+    if !saw_calendar || !closed_calendar {
+        report.record(IcsDiagnostic::MissingEnvelope);
+    }
+    // A document that ends mid-event keeps nothing of it, as before.
     meter.abandon_event();
     Ok(())
 }
@@ -610,6 +798,25 @@ struct Builder {
     categories: String,
     last_modified: i64,
     extra: BTreeMap<String, String>,
+    seen_singletons: BTreeSet<&'static str>,
+}
+
+fn singleton_property(name: &str) -> Option<&'static str> {
+    match name {
+        "UID" => Some("UID"),
+        "SUMMARY" => Some("SUMMARY"),
+        "DESCRIPTION" => Some("DESCRIPTION"),
+        "LOCATION" => Some("LOCATION"),
+        "URL" => Some("URL"),
+        "STATUS" => Some("STATUS"),
+        "DTSTART" => Some("DTSTART"),
+        "DTEND" => Some("DTEND"),
+        "DURATION" => Some("DURATION"),
+        "ORGANIZER" => Some("ORGANIZER"),
+        "LAST-MODIFIED" => Some("LAST-MODIFIED"),
+        "DTSTAMP" => Some("DTSTAMP"),
+        _ => None,
+    }
 }
 
 /// The calendar date a time falls on (its local date; UTC for an instant).
@@ -671,9 +878,15 @@ impl Builder {
         &mut self,
         line: &ContentLine,
         meter: &mut AdmissionMeter,
+        report: &mut IcsReport,
     ) -> Result<(), AdmissionError> {
         let text = line.value.len() + ENTRY_OVERHEAD;
         let tz = line.params.get("TZID").map_or(0, String::len);
+        if let Some(name) = singleton_property(&line.name)
+            && !self.seen_singletons.insert(name)
+        {
+            report.record(IcsDiagnostic::DuplicateProperty(name));
+        }
         match line.name.as_str() {
             "UID" => {
                 meter.charge_event(text, 0)?;
@@ -712,18 +925,33 @@ impl Builder {
                 self.status = match line.value.trim().to_ascii_uppercase().as_str() {
                     "TENTATIVE" => Some(EventStatus::Tentative),
                     "CANCELLED" => Some(EventStatus::Cancelled),
-                    _ => Some(EventStatus::Confirmed),
+                    "CONFIRMED" => Some(EventStatus::Confirmed),
+                    _ => {
+                        report.record(IcsDiagnostic::InvalidEvent);
+                        Some(EventStatus::Confirmed)
+                    }
                 }
             }
             "DTSTART" => {
                 meter.charge_event(tz + ENTRY_OVERHEAD, 0)?;
                 self.start = parse_time(line, "");
+                if self.start.is_none() {
+                    report.record(IcsDiagnostic::InvalidEvent);
+                }
             }
             "DTEND" => {
                 meter.charge_event(tz + ENTRY_OVERHEAD, 0)?;
                 self.end = parse_time(line, "");
+                if self.end.is_none() {
+                    report.record(IcsDiagnostic::InvalidEvent);
+                }
             }
-            "DURATION" => self.duration = parse_duration(&line.value),
+            "DURATION" => {
+                self.duration = parse_duration(&line.value);
+                if self.duration.is_none() {
+                    report.record(IcsDiagnostic::InvalidEvent);
+                }
+            }
             "RRULE" => {
                 // A rule's BY* lists are at most one entry per comma, each at
                 // most 8 bytes — charged before the rule is parsed.
@@ -734,8 +962,9 @@ impl Builder {
                         .saturating_add(ENTRY_OVERHEAD),
                     parts.saturating_add(1),
                 )?;
-                if let Ok(r) = RRule::parse(&line.value) {
-                    self.rrules.push(r);
+                match RRule::parse(&line.value) {
+                    Ok(r) => self.rrules.push(r),
+                    Err(_) => report.record(IcsDiagnostic::InvalidEvent),
                 }
             }
             "RDATE" | "EXDATE" => {
@@ -883,3 +1112,7 @@ pub fn parse_duration(v: &str) -> Option<chrono::Duration> {
 #[cfg(test)]
 #[path = "ics_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ics_structure_tests.rs"]
+mod structure_tests;
