@@ -266,11 +266,11 @@ impl PlumbingAdapter {
     ///
     /// 1. A conflict confined to regenerable artifacts (e.g. `Cargo.lock`) is
     ///    rebuilt via the throwaway-worktree path and landed.
-    /// 2. When a conflicted path is governed by a custom `.gitattributes
-    ///    merge=<driver>` — which the object-DB `merge-tree` may not honor — or
-    ///    when `rerere` is on, the branch is merged in a throwaway worktree where
-    ///    a real `git merge` runs the driver and rerere can auto-apply a recorded
-    ///    resolution. A clean result feeds the fold; anything else defers.
+    /// 2. When the plumbing merge reports a conflict on a path governed by a
+    ///    custom `.gitattributes merge=<driver>`, or when `rerere` is on, the
+    ///    branch is merged in a throwaway worktree where a real `git merge` runs
+    ///    the driver and rerere can auto-apply a recorded resolution. A clean
+    ///    result feeds the fold; anything else defers.
     ///
     /// Clean folds never reach here, so they pay none of this cost.
     fn resolve_conflict(
@@ -2873,7 +2873,6 @@ mod tests {
             "printf x >> {}; printf stray > stray.txt; true %O %A %B %L %P",
             thegn_core::util::sh_quote(&counter.to_string_lossy()),
         );
-        git(&repo.dir, &["config", "merge.takeours.driver", &driver]);
         repo.commit(".gitattributes", "data.txt merge=takeours\n", "attrs");
         repo.commit("data.txt", "base\n", "seed");
         // Two textually-conflicting edits to the driver-governed file.
@@ -2882,9 +2881,18 @@ mod tests {
         git(&repo.dir, &["checkout", "-q", "main"]);
         repo.commit("data.txt", "main\n", "main edit");
 
-        // merge-tree conflicts (it does not run a custom *command* driver), so the
-        // fold routes the branch through a throwaway-worktree real merge where the
-        // driver runs → the branch LANDS instead of deferring.
+        let ours = repo.out(&["rev-parse", "main"]);
+        let theirs = repo.out(&["rev-parse", "feat"]);
+        assert!(matches!(
+            CliGit
+                .merge_tree(&GitLoc::Local(repo.dir.clone()), &ours, &theirs)
+                .unwrap(),
+            MergeTreeOutcome::Conflict { .. }
+        ));
+        git(&repo.dir, &["config", "merge.takeours.driver", &driver]);
+
+        // The fold routes the conflict through a throwaway-worktree real merge,
+        // where the custom driver runs and the branch lands instead of deferring.
         let report = run_fold(&cfg(""), &repo.dir, repo.branch_set()).unwrap();
         assert!(report.advanced, "{report:?}");
         assert_eq!(report.landed.len(), 1, "driver-resolved branch should land");
@@ -2984,14 +2992,6 @@ mod tests {
         if !repo.history_supported_or_refused() {
             return;
         }
-        git(
-            &repo.dir,
-            &[
-                "config",
-                "merge.stage-stray.driver",
-                "printf stray > stray.txt; true %O %A %B %L %P",
-            ],
-        );
         repo.commit(".gitattributes", "data.txt merge=stage-stray\n", "attrs");
         repo.commit("data.txt", "base\n", "seed");
         git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
@@ -3016,6 +3016,14 @@ mod tests {
         else {
             panic!("fixture must produce a merge-tree conflict");
         };
+        git(
+            &repo.dir,
+            &[
+                "config",
+                "merge.stage-stray.driver",
+                "printf stray > stray.txt; true %O %A %B %L %P",
+            ],
+        );
         assert!(
             driver_merge(
                 &repo.dir,
@@ -3052,16 +3060,25 @@ mod tests {
         if !repo.history_supported_or_refused() {
             return;
         }
-        git(
-            &repo.dir,
-            &["config", "merge.fail.driver", "false %O %A %B %L %P"],
-        );
         repo.commit(".gitattributes", "data.txt merge=fail\n", "attrs");
         repo.commit("data.txt", "base\n", "seed");
         git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
         repo.commit("data.txt", "feat\n", "feature edit");
         git(&repo.dir, &["checkout", "-q", "main"]);
         repo.commit("data.txt", "main\n", "main edit");
+
+        let ours = repo.out(&["rev-parse", "main"]);
+        let theirs = repo.out(&["rev-parse", "feat"]);
+        assert!(matches!(
+            CliGit
+                .merge_tree(&GitLoc::Local(repo.dir.clone()), &ours, &theirs)
+                .unwrap(),
+            MergeTreeOutcome::Conflict { .. }
+        ));
+        git(
+            &repo.dir,
+            &["config", "merge.fail.driver", "false %O %A %B %L %P"],
+        );
 
         let report = run_fold(&cfg(""), &repo.dir, repo.branch_set()).unwrap();
         assert_eq!(
@@ -3083,14 +3100,6 @@ mod tests {
         if !repo.history_supported_or_refused() {
             return;
         }
-        git(
-            &repo.dir,
-            &[
-                "config",
-                "merge.slow.driver",
-                "sleep 30; true %O %A %B %L %P",
-            ],
-        );
         repo.commit(".gitattributes", "data.txt merge=slow\n", "attrs");
         repo.commit("data.txt", "base\n", "seed");
         git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
@@ -3100,7 +3109,6 @@ mod tests {
 
         let ours = repo.out(&["rev-parse", "main"]);
         let theirs = repo.out(&["rev-parse", "feat"]);
-        let started = Instant::now();
         let merge_tree = util::git_cmd(&repo.dir)
             .args(["merge-tree", "--write-tree", &ours, &theirs])
             .output()
@@ -3117,6 +3125,15 @@ mod tests {
         else {
             panic!("fixture must produce a merge-tree conflict");
         };
+        git(
+            &repo.dir,
+            &[
+                "config",
+                "merge.slow.driver",
+                "sleep 30; true %O %A %B %L %P",
+            ],
+        );
+        let started = Instant::now();
         assert!(
             driver_merge(
                 &repo.dir,
