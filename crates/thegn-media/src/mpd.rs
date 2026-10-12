@@ -950,7 +950,9 @@ mod tests {
             w.write_all(b"OK MPD 0.23.0\n").await.unwrap();
             let mut r = BufReader::new(r);
             let first = read_bounded_line(&mut r, 1024).await.unwrap().unwrap();
-            let _ = idle_tx.send(first);
+            idle_tx
+                .send(first)
+                .expect("idle receiver remains alive until the first frame arrives");
             let second =
                 tokio::time::timeout(Duration::from_millis(100), read_bounded_line(&mut r, 1024))
                     .await;
