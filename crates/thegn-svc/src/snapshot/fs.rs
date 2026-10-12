@@ -3,7 +3,7 @@
 //! with `<root>` = `[lifecycle.snapshot] dir` or
 //! `$XDG_STATE_HOME/thegn/snapshots`.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -99,6 +99,7 @@ impl FsSnapshotStore {
 
     fn write_atomic(&self, dir: &Path, name: &str, data: &[u8]) -> Result<()> {
         check_component(name)?;
+        check_size(data.len() as u64)?;
         self.prepare_dir(dir)?;
         let dst = dir.join(name);
         match fs::symlink_metadata(&dst) {
@@ -121,11 +122,17 @@ impl FsSnapshotStore {
             .and_then(|()| sync_directory(dir));
         if let Err(error) = result {
             drop(file);
-            if tmp.exists() {
-                fs::remove_file(&tmp)
-                    .with_context(|| format!("remove staging file {}", tmp.display()))?;
-            }
-            return Err(error).with_context(|| format!("publish {}", dst.display()));
+            let publish_error = error.context(format!("publish {}", dst.display()));
+            return match fs::remove_file(&tmp) {
+                Ok(()) => Err(publish_error),
+                Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {
+                    Err(publish_error)
+                }
+                Err(cleanup_error) => Err(publish_error.context(format!(
+                    "also failed to remove staging file {}: {cleanup_error}",
+                    tmp.display()
+                ))),
+            };
         }
         Ok(())
     }
@@ -158,21 +165,14 @@ fn create_staging_file(dir: &Path, name: &str) -> Result<(PathBuf, File)> {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         let path = dir.join(format!(".tmp-{name}-{suffix}"));
-        match open_staging_file(&path) {
+        match thegn_core::fsperm::create_owner_only_exclusive(&path) {
             Ok(file) => {
                 let meta = file.metadata().context("stat open snapshot staging file")?;
                 if !meta.file_type().is_file() {
                     anyhow::bail!("snapshot staging file is not a private regular file");
                 }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    if meta.nlink() != 1 {
-                        anyhow::bail!("snapshot staging file has unexpected hard links");
-                    }
-                    if !thegn_core::fsperm::owned_by_current_user(&meta) {
-                        anyhow::bail!("snapshot staging file is owned by another user");
-                    }
+                if !thegn_core::fsperm::owned_by_current_user(&meta) {
+                    anyhow::bail!("snapshot staging file is owned by another user");
                 }
                 return Ok((path, file));
             }
@@ -186,23 +186,6 @@ fn create_staging_file(dir: &Path, name: &str) -> Result<(PathBuf, File)> {
     anyhow::bail!("could not allocate a unique snapshot staging file for {name:?}")
 }
 
-fn open_staging_file(path: &Path) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options.open(path)?;
-    if let Err(error) = thegn_core::fsperm::restrict_to_owner(path) {
-        drop(file);
-        fs::remove_file(path)?;
-        return Err(error);
-    }
-    Ok(file)
-}
-
 fn sync_directory(path: &Path) -> std::io::Result<()> {
     File::open(path)?.sync_all()
 }
@@ -214,14 +197,27 @@ fn check_private_directory(path: &Path, meta: &fs::Metadata) -> Result<()> {
             path.display()
         );
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if !thegn_core::fsperm::owned_by_current_user(meta)
-            || meta.permissions().mode() & 0o777 != 0o700
-        {
-            anyhow::bail!("snapshot directory {} is not owner-private", path.display());
-        }
+    if !thegn_core::fsperm::owned_by_current_user(meta) {
+        anyhow::bail!(
+            "snapshot directory {} is owned by another user",
+            path.display()
+        );
+    }
+    if thegn_core::fsperm::mode_bits(path)?.is_some_and(|mode| mode & 0o022 != 0) {
+        anyhow::bail!(
+            "snapshot directory {} is group- or world-writable",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn check_size(len: u64) -> Result<()> {
+    if len > MAX_SNAPSHOT_FILE_BYTES {
+        anyhow::bail!(
+            "snapshot file exceeds the {} byte limit",
+            MAX_SNAPSHOT_FILE_BYTES
+        );
     }
     Ok(())
 }
@@ -302,8 +298,17 @@ impl SnapshotStore for FsSnapshotStore {
                     entry.path().display()
                 );
             }
-            let manifest = self.get_manifest(key, &id)?;
-            out.push(manifest);
+            match self.get_manifest(key, &id) {
+                Ok(manifest) => out.push(manifest),
+                Err(error)
+                    if error
+                        .root_cause()
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io_error| {
+                            io_error.kind() == std::io::ErrorKind::NotFound
+                        }) => {}
+                Err(error) => return Err(error),
+            }
         }
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
@@ -432,41 +437,6 @@ mod tests {
         assert!(s.get(&k, "..", "bundle").is_err());
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn refuses_symlink_destinations_and_reads() {
-        let tmp = tempfile::tempdir().unwrap();
-        let s = store(tmp.path());
-        let k = key();
-        let id = "snapshot";
-        let dir = s.snap_dir(&k, id).unwrap();
-        s.prepare_dir(&dir).unwrap();
-        let target = tmp.path().join("canary");
-        fs::write(&target, b"safe").unwrap();
-        std::os::unix::fs::symlink(&target, dir.join("bundle")).unwrap();
-        assert!(s.put(&k, id, "bundle", b"clobber").is_err());
-        assert!(s.get(&k, id, "bundle").is_err());
-        assert_eq!(fs::read(target).unwrap(), b"safe");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn refuses_symlinked_staging_candidate() {
-        let tmp = tempfile::tempdir().unwrap();
-        let s = store(tmp.path());
-        let k = key();
-        let id = "snapshot";
-        let dir = s.snap_dir(&k, id).unwrap();
-        s.prepare_dir(&dir).unwrap();
-        let target = tmp.path().join("canary");
-        fs::write(&target, b"safe").unwrap();
-        // This was the old predictable staging name. The new publication
-        // chooses a random sibling and must never write through this link.
-        std::os::unix::fs::symlink(&target, dir.join(".tmp-bundle")).unwrap();
-        s.put(&k, id, "bundle", b"data").unwrap();
-        assert_eq!(fs::read(target).unwrap(), b"safe");
-    }
-
     #[test]
     fn rejects_manifest_whose_id_does_not_match_its_directory() {
         let tmp = tempfile::tempdir().unwrap();
@@ -482,4 +452,14 @@ mod tests {
         assert!(s.get_manifest(&k, "directory-id").is_err());
         assert!(s.list(&k).is_err());
     }
+
+    #[test]
+    fn rejects_oversized_snapshot_data_before_writing() {
+        assert!(check_size(MAX_SNAPSHOT_FILE_BYTES + 1).is_err());
+        assert!(check_size(MAX_SNAPSHOT_FILE_BYTES).is_ok());
+    }
 }
+
+#[cfg(test)]
+#[path = "fs_tests.rs"]
+mod fs_tests;
