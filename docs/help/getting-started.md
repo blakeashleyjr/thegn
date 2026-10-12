@@ -44,4 +44,5 @@ reach for the Shift variant.
 - The bottom status bar always shows the keys that work _right now_.
 - `F1` opens help for whatever has focus; `/` searches all of it.
 - `Ctrl-g` is the keybind lock: every chord passes through to the pane
-  until you press it again — for when a TUI inside a pane needs your keys.
+  until you press it again — modified arrows, navigation keys, and F-keys
+  retain their modifiers for TUIs inside the pane.
