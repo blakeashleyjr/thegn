@@ -37,6 +37,12 @@ merging, rerunning checks, or launching an agent. On upgrade, older active rows
 have no recorded identity and are held for a human; re-add the PR with
 `thegn pr queue add --pr 42` to verify and bind it.
 
+Press `r` on a settled row to re-verify it with the forge selected from the
+repository root. For a row without a recorded identity, this binds the verified
+PR URL and starts watching again. If the fetched PR does not match a bound
+identity or forge, re-watch is refused; deliberately rebind it with
+`thegn pr queue add --pr 42`.
+
 ## What blocks a PR
 
 Each pass classifies one blocker, most actionable first:
@@ -151,7 +157,8 @@ while thegn is working on one, dim when the queue is merely populated,
 silent when empty. Merged / ready / needs-you transitions toast and land
 in the notifications inbox.
 
-In the section: `a` add · `x` remove · `r` re-watch a settled row ·
+In the section: `a` add · `x` remove · `r` re-watch a settled row after forge
+verification ·
 `h` handle a queued review task · `c` clear · `D` refresh now · `o` open in a
 browser. CLI equivalents for queue rows are
 `thegn pr queue add|rm|clear|drain|list|status`, all with `--json`.

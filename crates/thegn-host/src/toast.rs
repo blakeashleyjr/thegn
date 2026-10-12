@@ -17,6 +17,7 @@ use crate::compositor::Rect;
 use crate::layer::{Anchor, LayerSpec, open_layer};
 use crate::seg::{Line, Tok, seg};
 use thegn_core::notification::Priority;
+use thegn_core::pipeline_report::display_cell;
 use thegn_core::theme::Hue;
 
 /// The neutral (default text) toast color — a plain acknowledgement that must
@@ -58,7 +59,7 @@ impl Toasts {
     /// stack to the most recent [`MAX_TOASTS`].
     pub fn push(&mut self, color: Tok, message: impl Into<String>, now: Instant, ttl: Duration) {
         self.stack.push(Toast {
-            message: message.into(),
+            message: display_cell(&message.into()),
             color,
             expires: now + ttl,
         });
@@ -209,6 +210,25 @@ mod tests {
     fn empty_stack_has_no_lines() {
         let toasts = Toasts::default();
         assert!(toasts.lines().is_empty());
+    }
+
+    #[test]
+    fn info_toast_replaces_terminal_and_format_controls() {
+        let mut toasts = Toasts::default();
+        toasts.info("ok\r\nforged\u{202e}".to_string(), Instant::now());
+        let lines = toasts.lines();
+        let Line::Segs(segs) = &lines[0] else {
+            panic!("toast line should contain segments");
+        };
+        let text = segs
+            .iter()
+            .map(|part| part.text.as_str())
+            .collect::<String>();
+
+        for ch in ['\r', '\n', '\u{202e}'] {
+            assert!(!text.contains(ch), "rendered toast contains {ch:?}");
+        }
+        assert!(text.contains("ok��forged�"));
     }
 
     /// All on-screen text, row by row, for substring assertions.

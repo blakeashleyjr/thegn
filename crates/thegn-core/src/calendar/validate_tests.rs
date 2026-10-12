@@ -120,6 +120,40 @@ fn accepts_nonrecurring_zoned_endpoints_in_different_zones() {
 }
 
 #[test]
+fn unknown_zones_are_rejected_while_blank_and_iana_zones_are_admitted() {
+    let date = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+    let local = date.and_hms_opt(9, 0, 0).unwrap();
+    let end = date.and_hms_opt(10, 0, 0).unwrap();
+    let zoned_event = |zone: &str| {
+        CalEvent::new(
+            "event",
+            "meeting",
+            EventTime::Zoned {
+                local,
+                zone: TzRef::new(zone),
+            },
+            EventTime::Zoned {
+                local: end,
+                zone: TzRef::new(zone),
+            },
+        )
+    };
+
+    assert_eq!(
+        validate_event(&zoned_event("Nowhere/Land")),
+        Err(EventDefect::UnknownZone)
+    );
+    let mut unknown_end = zoned_event("Europe/Berlin");
+    unknown_end.end = EventTime::Zoned {
+        local: end,
+        zone: TzRef::new("Nowhere/Land"),
+    };
+    assert_eq!(validate_event(&unknown_end), Err(EventDefect::UnknownZone));
+    assert_eq!(validate_event(&zoned_event("  ")), Ok(()));
+    assert_eq!(validate_event(&zoned_event("Europe/Berlin")), Ok(()));
+}
+
+#[test]
 fn event_defect_display_values_are_stable() {
     assert_eq!(EventDefect::EmptyUid.to_string(), "empty UID");
     assert_eq!(
@@ -131,4 +165,5 @@ fn event_defect_display_values_are_stable() {
         EventDefect::RecurrenceShape.to_string(),
         "incompatible recurrence values"
     );
+    assert_eq!(EventDefect::UnknownZone.to_string(), "unknown time zone");
 }

@@ -67,7 +67,10 @@ impl fmt::Display for TemplateError {
 impl std::error::Error for TemplateError {}
 
 mod command;
-pub use command::{ExpandedCommand, compile, validate_commands, validate_write};
+pub use command::{
+    DEFAULT_TIMEOUT_SECS, ExpandedCommand, MAX_TIMEOUT_SECS, compile, validate_commands,
+    validate_write,
+};
 #[cfg(test)]
 mod command_tests;
 

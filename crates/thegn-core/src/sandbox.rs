@@ -2145,30 +2145,14 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
 }
 
 /// Tear down the container for a worktree identified only by its local path.
-/// Tries all OCI backends; silently ignores errors. Intended for background
+/// Tries all OCI backends; logs best-effort failures at debug level. Intended for background
 /// cleanup when a worktree is closed and only its path is known (no cfg/loc).
 pub fn teardown_by_path(worktree: &str) {
     let name = container_name(worktree);
-    // Also remove any LEGACY separate agent container (`thegn-{slug}-tgagent`,
-    // created by older builds); `rm -f` of a non-existent name is a harmless
-    // no-op.
-    let agent = agent_container_name(&name);
-    // Also remove the VPN sidecar (`thegn-{slug}-tgvpn`) when one was started;
-    // `rm -f` of a missing name is a harmless no-op. (Ephemeral node de-register
-    // is the host's job via `thegn-svc::vpn::down` before this runs.)
-    let vpn = vpn_sidecar_name(&name);
     let placement = Placement::Local;
     for b in Backend::oci_runtimes() {
         if available(&placement, b) == RuntimeProbe::Present {
-            let mut argv = backend_prefix(b);
-            argv.extend([
-                "rm".into(),
-                "-f".into(),
-                name.to_string(),
-                agent.clone(),
-                vpn.clone(),
-            ]);
-            let _ = run_control_t_owned(&placement, &argv, PROBE_TIMEOUT); // best-effort: teardown: rm -f of a missing container is a harmless no-op (see comment above)
+            run_teardown_argvs(&placement, b, teardown_argvs(b, None, &name));
         }
     }
 }
@@ -2180,11 +2164,6 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
         return;
     }
     let placement = placement_from_loc(cfg, loc);
-    // Remove both the worktree container and any LEGACY separate agent
-    // container left behind by older builds; `rm -f` of a missing name is a
-    // harmless no-op.
-    let agent = agent_container_name(name);
-    let vpn = vpn_sidecar_name(name);
     // Drive the same remote daemon the create used, or `None` for the local
     // daemon; without this an `[sandbox] oci_host` container is never removed
     // (rm hits the local daemon, which never held it) and leaks forever.
@@ -2192,17 +2171,48 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
     // Try whichever OCI runtimes are available; the container only exists under one.
     for b in Backend::oci_runtimes() {
         if available(&placement, b) == RuntimeProbe::Present {
-            let mut argv = oci_prefix_for(b, oci_host);
-            argv.extend([
-                "rm".into(),
-                "-f".into(),
-                name.to_string(),
-                agent.clone(),
-                vpn.clone(),
-            ]);
-            let _ = run_control_t_owned(&placement, &argv, PROBE_TIMEOUT); // best-effort: teardown: rm -f of a missing container is a harmless no-op (see comment above)
+            run_teardown_argvs(&placement, b, teardown_argvs(b, oci_host, name));
         }
     }
+}
+
+fn run_teardown_argvs(placement: &Placement, backend: Backend, argvs: Vec<Vec<String>>) {
+    for argv in argvs {
+        let timeout = if argv.iter().any(|arg| arg == "down") {
+            crate::sandbox_compose::COMPOSE_DOWN_TIMEOUT
+        } else {
+            PROBE_TIMEOUT
+        };
+        match run_control_t_owned(placement, &argv, timeout) {
+            Some(true) => {}
+            Some(false) => {
+                tracing::debug!(backend = backend.label(), "sandbox teardown command failed")
+            }
+            None => tracing::debug!(
+                backend = backend.label(),
+                "sandbox teardown command unavailable or timed out"
+            ),
+        }
+    }
+}
+
+/// Build container and Compose cleanup commands for one runtime. Compose down
+/// is intentionally separate from `rm -f`: it removes the project network and
+/// any orphan services while using the same OCI daemon connection.
+pub(crate) fn teardown_argvs(
+    backend: Backend,
+    oci_host: Option<&str>,
+    name: &str,
+) -> Vec<Vec<String>> {
+    let agent = agent_container_name(name);
+    let vpn = vpn_sidecar_name(name);
+    let mut remove = oci_prefix_for(backend, oci_host);
+    remove.extend(["rm".into(), "-f".into(), name.into(), agent, vpn]);
+    let mut commands = vec![remove];
+    if let Some(down) = crate::sandbox_compose::down_argv_for(backend, oci_host, name) {
+        commands.push(down);
+    }
+    commands
 }
 
 /// Stop or restart a container by name (OCI backends): `action` is `"stop"`
@@ -2972,8 +2982,14 @@ fn systemd_env_cleanup_prop(rm: &str, path: &std::path::Path) -> Option<String> 
 /// leave plaintext credentials for at most one hour before the next startup GC.
 const SECRET_ENV_FILE_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
-fn sweep_stale_env_files_in(dir: &std::path::Path, now: SystemTime, max_age: Duration) -> usize {
-    match std::fs::symlink_metadata(dir) {
+fn sweep_stale_env_files_in(
+    anchor: &std::path::Path,
+    rel: &std::path::Path,
+    now: SystemTime,
+    max_age: Duration,
+) -> usize {
+    let dir = anchor.join(rel);
+    match std::fs::symlink_metadata(&dir) {
         Ok(metadata) if metadata.file_type().is_dir() => {}
         Ok(_) => return 0,
         Err(error) => {
@@ -2981,64 +2997,16 @@ fn sweep_stale_env_files_in(dir: &std::path::Path, now: SystemTime, max_age: Dur
             return 0;
         }
     }
-    // Residual race: read_dir and remove_file re-resolve `dir`, so a parent
-    // replacement after this check can redirect the sweep. Ancestor custody is
-    // handled by fsperm; this path-based sweep does not pin the directory.
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
+    if rel.starts_with("thegn") {
+        tighten_owned_state_dir(&anchor.join("thegn"));
+    }
+    match crate::fsperm::ensure_private_dir_beneath(anchor, rel) {
+        Ok(dir) => dir.remove_stale_files("env", now, max_age),
         Err(error) => {
-            tracing::debug!(target: "thegn::sandbox", %error, "unable to read sandbox env-file directory");
-            return 0;
-        }
-    };
-    let mut removed = 0;
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                tracing::debug!(target: "thegn::sandbox", %error, "unable to inspect sandbox env-file entry");
-                continue;
-            }
-        };
-        if entry.path().extension().and_then(std::ffi::OsStr::to_str) != Some("env") {
-            continue;
-        }
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(error) => {
-                tracing::debug!(target: "thegn::sandbox", %error, "unable to inspect sandbox env-file type");
-                continue;
-            }
-        };
-        let stale = if file_type.is_symlink() {
-            true
-        } else if file_type.is_dir() {
-            false
-        } else {
-            match std::fs::symlink_metadata(entry.path()) {
-                Ok(metadata) => match metadata.modified() {
-                    Ok(modified) => now.duration_since(modified).is_ok_and(|age| age >= max_age),
-                    Err(error) => {
-                        tracing::debug!(target: "thegn::sandbox", %error, "unable to read sandbox env-file modification time");
-                        false
-                    }
-                },
-                Err(error) => {
-                    tracing::debug!(target: "thegn::sandbox", %error, "unable to inspect sandbox env-file metadata");
-                    false
-                }
-            }
-        };
-        if stale {
-            match std::fs::remove_file(entry.path()) {
-                Ok(()) => removed += 1,
-                Err(error) => {
-                    tracing::debug!(target: "thegn::sandbox", %error, "unable to remove stale sandbox env-file")
-                }
-            }
+            tracing::debug!(target: "thegn::sandbox", %error, "unable to pin sandbox env-file directory");
+            0
         }
     }
-    removed
 }
 
 fn oci_env_file_arg(argv: &[String]) -> Option<PathBuf> {
@@ -3644,13 +3612,12 @@ fn parse_sandbox_stats(output: &str) -> Option<SandboxStats> {
 }
 
 pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> Vec<String> {
-    // A live worktree owns EVERY container that reduces to its slug: the plain
-    // `thegn-{slug}`, the profile variant `thegn-{profile}-{slug}`
-    // (`container_name_with_profile`), and the `-tgagent` / `-tgvpn` companions of
-    // either. Reconcile by reverse-mapping each candidate back to a worktree slug
-    // rather than allow-listing exact names — the old allow-list only knew the
-    // plain + `-tgagent` forms, so a session launched with a non-default profile
-    // or a VPN sidecar was misread as an orphan and force-removed while live.
+    // A live worktree owns its plain `thegn-{slug}` container, the profile
+    // variant `thegn-{profile}-{slug}`, the `-tgagent` / `-tgvpn` companions,
+    // and Compose service replicas ending in `-{service}-{n}` or `_{service}_{n}`.
+    // Reconcile by reverse-mapping each candidate back to a worktree slug rather
+    // than allow-listing exact names: profile, sidecar, and service containers
+    // must not be misread as orphans and force-removed while their worktree lives.
     // Reaping is fail-closed: any container that maps to an active worktree by any
     // of these forms is kept.
     let active_slugs: Vec<String> = active_worktrees.iter().map(|w| util::slugify(w)).collect();
@@ -3665,11 +3632,33 @@ pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> V
             let Some(rest) = base.strip_prefix(CONTAINER_PREFIX) else {
                 return true;
             };
-            // Orphan unless `rest` is an active slug (plain form) or ends with
-            // `-{slug}` (profile-prefixed form) for some active worktree.
-            !active_slugs
-                .iter()
-                .any(|s| rest == s || rest.ends_with(&format!("-{s}")))
+            // Keep plain/profile bases and service-replica suffixes for every
+            // active slug; unknown forms remain eligible for orphan cleanup.
+            !active_slugs.iter().any(|slug| {
+                if rest == slug || rest.ends_with(&format!("-{slug}")) {
+                    return true;
+                }
+                let suffix = rest.strip_prefix(slug).or_else(|| {
+                    rest.find(&format!("-{slug}"))
+                        .map(|index| &rest[index + slug.len() + 1..])
+                });
+                let Some(suffix) = suffix else {
+                    return false;
+                };
+                let Some(separator) = suffix.chars().next().filter(|ch| *ch == '-' || *ch == '_')
+                else {
+                    return false;
+                };
+                let service_and_replica = &suffix[separator.len_utf8()..];
+                let Some((service, replica)) = service_and_replica.rsplit_once(separator) else {
+                    return false;
+                };
+                // Known fail-closed over-keep: dead `wt-feat-fix-2` can look
+                // like service `fix` replica 2 while live `wt-feat` exists.
+                !service.is_empty()
+                    && !replica.is_empty()
+                    && replica.bytes().all(|byte| byte.is_ascii_digit())
+            })
         })
         .cloned()
         .collect()
@@ -3736,8 +3725,13 @@ pub fn run_gc(db_worktrees: &[String]) -> Vec<String> {
 /// `thegn sandbox gc` report ("removed N on `<backend>`"). The startup sweep
 /// uses the flattened [`run_gc`]; both share this loop.
 pub fn run_gc_detailed(db_worktrees: &[String]) -> Vec<(&'static str, Vec<String>)> {
-    let env_dir = util::xdg_state_home().join("thegn/sandbox-env");
-    sweep_stale_env_files_in(&env_dir, SystemTime::now(), SECRET_ENV_FILE_MAX_AGE);
+    let state_home = util::xdg_state_home();
+    sweep_stale_env_files_in(
+        &state_home,
+        std::path::Path::new("thegn/sandbox-env"),
+        SystemTime::now(),
+        SECRET_ENV_FILE_MAX_AGE,
+    );
     let mut out = Vec::new();
     for backend in Backend::all_oci() {
         let Some(list) = gc_list_argv(backend) else {

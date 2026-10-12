@@ -9,23 +9,23 @@
 //! the write lock is contended). Routing those writes through this thread keeps
 //! the loop non-blocking: [`persist`] queues a closure and returns immediately.
 //!
-//! **Scope: best-effort cache writes only.** Git is the source of truth and the
-//! DB is a cache (see CLAUDE.md). A write remains queued across a failed DB
-//! open and is retried when another run or flush message arrives. The
-//! session-layout persist is also routed through this thread
+//! Git is the source of truth and the DB is a cache (see CLAUDE.md). Best-effort
+//! writes may be dropped at the cap; required layout/removal writes use a
+//! critical class accepted beyond the cap and retained across failed DB opens.
+//! A write remains queued across a failed DB open and is retried when another
+//! run or flush message arrives. The session-layout persist is routed through this thread
 //! (`run::persist_session_layout` captures rows on the loop and queues the
 //! transaction): main.rs performs a bounded shutdown flush, and the cold
 //! workspace-switch path calls [`flush`] before resurrecting a session whose
-//! rows may still be queued. Queue overflow and shutdown failures are counted
-//! and reported; in-session UI surfacing and a never-dropped critical-write
-//! class are separate follow-ups.
+//! rows may still be queued. Queue overflow and critical loss are counted and
+//! reported both in-session and during shutdown.
 //!
 //! The thread blocks on `recv()` (no polling, no timer, no `TerminalWaker`
 //! pulse), so it adds zero idle wakes — the 0%-idle contract is untouched.
 //!
 //! The FIFO is bounded. Overflow drops new best-effort writes and preserves
 //! the order of writes already queued; [`shutdown_flush`] exposes the total
-//! drop count for shutdown reporting and a later UI surfacing slice.
+//! drop count for shutdown reporting and in-session notices.
 //! Replaceable writes retain one pending job per key, regardless of how often
 //! a caller updates that key.
 
@@ -35,6 +35,7 @@ use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use termwiz::terminal::TerminalWaker;
 use thegn_core::db::Db;
 
 /// A unit of best-effort work run against the writer's connection.
@@ -47,12 +48,18 @@ const MAX_QUEUED_JOBS: usize = 4096;
 const MAX_QUEUED_JOBS: usize = 8;
 
 enum Msg {
-    Run(Job),
+    Run(QueuedJob),
+    RunCritical(QueuedJob),
     RunLatest {
         key: String,
     },
     /// A barrier: the writer acks once every earlier job has run or been retained.
     Flush(SyncSender<()>),
+}
+
+struct QueuedJob {
+    job: Job,
+    critical: bool,
 }
 
 struct Writer {
@@ -66,6 +73,7 @@ struct QueueState {
     depth: AtomicUsize,
     in_flight: AtomicUsize,
     dropped: AtomicU64,
+    critical_lost: AtomicU64,
     overflow_warned: AtomicBool,
 }
 
@@ -121,6 +129,10 @@ fn run(rx: Receiver<Msg>, open: impl Fn() -> anyhow::Result<Db>, state: Arc<Queu
                 retain_job(&mut retained, job, &state);
                 drain_retained(&mut db, &mut warned, &open, &mut retained, &state);
             }
+            Msg::RunCritical(job) => {
+                retain_job(&mut retained, job, &state);
+                drain_retained(&mut db, &mut warned, &open, &mut retained, &state);
+            }
             Msg::RunLatest { key } => {
                 let job = state
                     .latest
@@ -128,7 +140,14 @@ fn run(rx: Receiver<Msg>, open: impl Fn() -> anyhow::Result<Db>, state: Arc<Queu
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&key);
                 if let Some(job) = job {
-                    retain_job(&mut retained, job, &state);
+                    retain_job(
+                        &mut retained,
+                        QueuedJob {
+                            job,
+                            critical: false,
+                        },
+                        &state,
+                    );
                     drain_retained(&mut db, &mut warned, &open, &mut retained, &state);
                 } else {
                     dequeue(&state);
@@ -169,23 +188,75 @@ fn dequeue(state: &QueueState) {
     }
 }
 
-fn retain_job(retained: &mut VecDeque<Job>, job: Job, state: &QueueState) {
-    retained.push_back(job);
-    if retained.len() >= MAX_QUEUED_JOBS
-        && let Some(_oldest) = retained.pop_front()
-    {
-        dequeue(state);
-        note_drop(state);
+fn retain_job(retained: &mut VecDeque<QueuedJob>, job: QueuedJob, state: &QueueState) {
+    if job.critical {
+        if retained.len() >= MAX_QUEUED_JOBS
+            && let Some(oldest_best_effort) = retained.iter().position(|queued| !queued.critical)
+        {
+            retained.remove(oldest_best_effort);
+            dequeue(state);
+            note_drop(state);
+        }
+        retained.push_back(job);
+    } else {
+        retained.push_back(job);
+        if retained.len() >= MAX_QUEUED_JOBS
+            && let Some(oldest_best_effort) = retained.iter().position(|queued| !queued.critical)
+        {
+            retained.remove(oldest_best_effort);
+            dequeue(state);
+            note_drop(state);
+        }
     }
 }
 
-fn note_drop(state: &QueueState) {
+fn note_drop(state: &QueueState) -> bool {
     state.dropped.fetch_add(1, Ordering::Relaxed);
-    if !state.overflow_warned.swap(true, Ordering::AcqRel) {
+    let first = !state.overflow_warned.swap(true, Ordering::AcqRel);
+    if first {
         tracing::warn!(
             dropped = state.dropped.load(Ordering::Relaxed),
             "db-writer dropped a best-effort write"
         );
+    }
+    if first {
+        notify_drop_target("Database writes are being dropped while the database is busy");
+    }
+    first
+}
+
+struct DropNoticeTarget {
+    tx: tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    waker: TerminalWaker,
+}
+
+fn drop_notice_target() -> &'static Mutex<Option<DropNoticeTarget>> {
+    static TARGET: OnceLock<Mutex<Option<DropNoticeTarget>>> = OnceLock::new();
+    TARGET.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn install_drop_notice(
+    tx: tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    waker: TerminalWaker,
+) {
+    if let Ok(mut target) = drop_notice_target().lock() {
+        *target = Some(DropNoticeTarget { tx, waker });
+    }
+}
+
+fn notify_drop_target(message: &str) {
+    if let Ok(target) = drop_notice_target().lock()
+        && let Some(target) = target.as_ref()
+    {
+        if let Err(error) = target.tx.send(crate::hydrate::RefreshKind::Toast {
+            message: message.to_owned(),
+            priority: thegn_core::notification::Priority::Alert,
+        }) {
+            tracing::debug!(%error, "failed to send database write-loss toast");
+        }
+        if let Err(error) = target.waker.wake() {
+            tracing::debug!(%error, "failed to wake after database write-loss toast");
+        }
     }
 }
 
@@ -194,10 +265,34 @@ fn enqueue(writer: &Writer, job: impl FnOnce(&Db) + Send + 'static) -> bool {
         note_drop(&writer.state);
         return false;
     }
-    if let Err(error) = writer.tx.send(Msg::Run(Box::new(job))) {
+    if let Err(error) = writer.tx.send(Msg::Run(QueuedJob {
+        job: Box::new(job),
+        critical: false,
+    })) {
         dequeue(&writer.state);
         note_drop(&writer.state);
         tracing::debug!(%error, "db-writer stopped before write could be queued");
+        return false;
+    }
+    true
+}
+
+/// Queue required resurrection/removal state. Critical jobs bypass the
+/// best-effort cap and are never evicted while a DB open is unavailable.
+pub(crate) fn persist_critical(job: impl FnOnce(&Db) + Send + 'static) {
+    persist_critical_for(writer(), job);
+}
+
+fn persist_critical_for(writer: &Writer, job: impl FnOnce(&Db) + Send + 'static) -> bool {
+    writer.state.depth.fetch_add(1, Ordering::AcqRel);
+    if let Err(error) = writer.tx.send(Msg::RunCritical(QueuedJob {
+        job: Box::new(job),
+        critical: true,
+    })) {
+        writer.state.depth.fetch_sub(1, Ordering::AcqRel);
+        writer.state.critical_lost.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(%error, "db-writer stopped before critical write could be queued");
+        notify_drop_target("A required database write was lost");
         return false;
     }
     true
@@ -207,7 +302,7 @@ fn drain_retained(
     db: &mut Option<Db>,
     warned: &mut bool,
     open: &impl Fn() -> anyhow::Result<Db>,
-    retained: &mut VecDeque<Job>,
+    retained: &mut VecDeque<QueuedJob>,
     state: &QueueState,
 ) {
     if db.is_none() && !retained.is_empty() {
@@ -229,7 +324,7 @@ fn drain_retained(
         while let Some(job) = retained.pop_front() {
             let _in_flight = InFlightGuard::new(state);
             dequeue(state);
-            job(d);
+            (job.job)(d);
         }
     }
 }
@@ -293,6 +388,7 @@ pub(crate) struct ShutdownFlush {
     pub(crate) drained: bool,
     pub(crate) pending: usize,
     pub(crate) dropped: u64,
+    pub(crate) critical_lost: u64,
 }
 
 /// Bounded shutdown barrier with enough detail to report writes still queued or lost.
@@ -309,14 +405,15 @@ fn shutdown_flush_for(writer: &Writer, timeout: Duration) -> ShutdownFlush {
         drained: acked && pending == 0,
         pending,
         dropped: writer.state.dropped.load(Ordering::Relaxed),
+        critical_lost: writer.state.critical_lost.load(Ordering::Relaxed),
     }
 }
 
 pub(crate) fn shutdown_notice(flush: &ShutdownFlush) -> Option<String> {
-    if flush.drained && flush.dropped == 0 {
+    if flush.drained && flush.dropped == 0 && flush.critical_lost == 0 {
         return None;
     }
-    if flush.drained {
+    if flush.drained && flush.critical_lost == 0 {
         return Some(format!(
             "thegn: {} best-effort database write(s) were dropped this session",
             flush.dropped
@@ -326,6 +423,9 @@ pub(crate) fn shutdown_notice(flush: &ShutdownFlush) -> Option<String> {
     details.push(format!("{} write(s) still pending", flush.pending));
     if flush.dropped > 0 {
         details.push(format!("{} write(s) dropped", flush.dropped));
+    }
+    if flush.critical_lost > 0 {
+        details.push(format!("{} required write(s) lost", flush.critical_lost));
     }
     Some(format!(
         "thegn: database shutdown flush incomplete ({})",
@@ -536,12 +636,36 @@ mod tests {
     }
 
     #[test]
+    fn critical_send_to_stopped_writer_has_separate_loss_accounting() {
+        let (tx, rx) = channel();
+        drop(rx);
+        let writer = Writer {
+            tx,
+            state: Arc::new(QueueState::default()),
+        };
+
+        assert!(!persist_critical_for(&writer, |_db| {}));
+        assert_eq!(writer.state.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(writer.state.critical_lost.load(Ordering::Relaxed), 1);
+        assert_eq!(writer.state.depth.load(Ordering::Relaxed), 0);
+        let notice = shutdown_notice(&ShutdownFlush {
+            drained: false,
+            pending: 0,
+            dropped: 0,
+            critical_lost: 1,
+        })
+        .unwrap();
+        assert!(notice.contains("1 required write(s) lost"));
+    }
+
+    #[test]
     fn shutdown_notice_reports_pending_and_dropped_writes() {
         assert_eq!(
             shutdown_notice(&ShutdownFlush {
                 drained: true,
                 pending: 0,
-                dropped: 0
+                dropped: 0,
+                critical_lost: 0,
             }),
             None
         );
@@ -549,6 +673,7 @@ mod tests {
             drained: false,
             pending: 3,
             dropped: 0,
+            critical_lost: 0,
         })
         .unwrap();
         assert!(timed_out.contains("3 write(s) still pending"));
@@ -556,6 +681,7 @@ mod tests {
             drained: true,
             pending: 0,
             dropped: 2,
+            critical_lost: 0,
         })
         .unwrap();
         assert_eq!(
@@ -638,10 +764,10 @@ mod tests {
             assert!(reserve(&state));
         }
 
-        note_drop(&state);
+        assert!(note_drop(&state));
         dequeue(&state);
         assert!(state.overflow_warned.load(Ordering::Acquire));
-        note_drop(&state);
+        assert!(!note_drop(&state));
         assert_eq!(state.dropped.load(Ordering::Relaxed), 2);
         assert!(state.overflow_warned.load(Ordering::Acquire));
 
@@ -649,6 +775,79 @@ mod tests {
             dequeue(&state);
         }
         assert!(!state.overflow_warned.load(Ordering::Acquire));
+        assert!(note_drop(&state));
+    }
+
+    #[test]
+    fn critical_write_evicts_best_effort_and_runs_after_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("critical-recovery.db");
+        let opener_path = path.clone();
+        let recover = Arc::new(AtomicBool::new(false));
+        let should_recover = Arc::clone(&recover);
+        let writer = spawn_writer(move || {
+            if !should_recover.load(Ordering::SeqCst) {
+                anyhow::bail!("database remains unavailable until recovery")
+            }
+            Db::open_at(&opener_path)
+        });
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let initial_critical_order = Arc::clone(&order);
+        assert!(persist_critical_for(&writer, move |_db| {
+            initial_critical_order.lock().unwrap().push(usize::MIN);
+        }));
+        for value in 0..(MAX_QUEUED_JOBS - 1) {
+            let order = Arc::clone(&order);
+            assert!(enqueue(&writer, move |_db| {
+                order.lock().unwrap().push(value);
+            }));
+        }
+        barrier(&writer);
+
+        let critical_ran = Arc::new(AtomicBool::new(false));
+        let critical_ran_job = Arc::clone(&critical_ran);
+        let critical_order = Arc::clone(&order);
+        persist_critical_for(&writer, move |db| {
+            db.set_ui_state("t", "required", "saved").unwrap();
+            critical_ran_job.store(true, Ordering::SeqCst);
+            critical_order.lock().unwrap().push(usize::MAX);
+        });
+        recover.store(true, Ordering::SeqCst);
+        barrier(&writer);
+
+        assert!(critical_ran.load(Ordering::SeqCst));
+        assert_eq!(writer.state.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *order.lock().unwrap(),
+            std::iter::once(usize::MIN)
+                .chain(1..(MAX_QUEUED_JOBS - 1))
+                .chain(std::iter::once(usize::MAX))
+                .collect::<Vec<_>>()
+        );
+        let db = Db::open_at(&path).unwrap();
+        assert_eq!(
+            db.get_ui_state("t", "required").unwrap().as_deref(),
+            Some("saved")
+        );
+    }
+
+    #[test]
+    fn critical_writes_are_accepted_past_the_queue_cap() {
+        let writer = spawn_writer(|| anyhow::bail!("database stays unavailable"));
+        let ran = Arc::new(AtomicUsize::new(0));
+        for _ in 0..(MAX_QUEUED_JOBS + 3) {
+            let ran = Arc::clone(&ran);
+            assert!(persist_critical_for(&writer, move |_db| {
+                ran.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        barrier(&writer);
+        assert_eq!(
+            writer.state.depth.load(Ordering::Relaxed),
+            MAX_QUEUED_JOBS + 3
+        );
+        assert_eq!(writer.state.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(writer.state.critical_lost.load(Ordering::Relaxed), 0);
     }
 
     #[test]

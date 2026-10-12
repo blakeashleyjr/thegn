@@ -293,24 +293,35 @@ pub(crate) fn spawn_mutate(tx: &PrqTx, waker: &TerminalWaker, any_path: PathBuf,
             }
             // Re-queue: the same "watch it again" reset the CLI's `add` performs,
             // which is how a `needs_human` row is re-armed.
-            Mutation::Rewatch {
-                number,
-                worktree,
-                branch,
-                base,
-            } => {
-                if let Err(e) = db.enqueue_pr(
-                    &root_s,
-                    number,
-                    worktree.as_deref(),
-                    &branch,
-                    &base,
-                    "github",
-                ) {
-                    format!("re-watch failed: {e}")
-                } else {
-                    format!("Watching PR #{number} again")
+            Mutation::Rewatch { key, number } => {
+                let rows = match db.list_pr_queue() {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        send(PrqMsg::Failed(format!("re-watch failed: {error}")));
+                        return;
+                    }
+                };
+                let Some(row) = rows.iter().find(|row| row.key == key) else {
+                    send(PrqMsg::Note(format!("PR #{number} is no longer queued")));
+                    return;
+                };
+                if row.repo_root != root_s || row.number != number {
+                    send(PrqMsg::Note(format!(
+                        "re-watch refused: PR #{number} is not queued for this repository"
+                    )));
+                    return;
                 }
+                if !matches!(row.status.as_str(), "needs_human" | "merged" | "closed") {
+                    send(PrqMsg::Note(format!(
+                        "re-watch refused: PR #{number} is no longer settled"
+                    )));
+                    return;
+                }
+                let loc = thegn_core::remote::GitLoc::from_db(&root_s, None);
+                let forges = crate::forge_handle::get();
+                let forge = forges.for_loc(&loc);
+                let fetched = forge.pr_status(&loc, thegn_core::forge::PrRef::Number(number));
+                rewatch_row(&db, row, forge.id(), fetched).unwrap_or_else(|message| message)
             }
         };
         send(PrqMsg::Note(msg));
@@ -345,17 +356,76 @@ pub(crate) fn spawn_handle(
 
 /// A one-shot queue mutation.
 pub(crate) enum Mutation {
-    Remove {
-        key: String,
-        number: u64,
-    },
+    Remove { key: String, number: u64 },
     Clear,
-    Rewatch {
-        number: u64,
-        worktree: Option<String>,
-        branch: String,
-        base: String,
-    },
+    Rewatch { key: String, number: u64 },
+}
+
+/// Re-verify a held row against the forge selected from its repository root,
+/// then bind the fetched identity while re-arming it.
+fn rewatch_row(
+    db: &Db,
+    row: &PrQueueRow,
+    forge_id: &str,
+    fetched: Result<thegn_core::forge::model::PrStatus, thegn_core::forge::ForgeError>,
+) -> Result<String, String> {
+    let number = row.number;
+    let fetched = fetched.map_err(|error| {
+        format!(
+            "re-watch failed: could not verify PR #{number}: {}",
+            error.describe()
+        )
+    })?;
+    if fetched.number != number
+        || thegn_core::forge::model::repo_identity_from_pr_url(&fetched.url).is_none()
+    {
+        return Err(format!(
+            "re-watch refused: fetched identity does not verify PR #{number}; use `thegn pr queue add --pr {number}` to rebind"
+        ));
+    }
+    // Validate fetched URL route and number when an unbound row has no identity to compare against.
+    if let Err(reason) = thegn_core::pr_queue::attest_pr_identity(
+        Some(&fetched.url),
+        number,
+        &fetched.url,
+        fetched.number,
+    ) {
+        return Err(format!(
+            "re-watch refused: {reason}; use `thegn pr queue add --pr {number}` to rebind"
+        ));
+    }
+    if row.pr_url.is_some() {
+        if row.forge != forge_id {
+            return Err(format!(
+                "re-watch refused: queued forge `{}` differs from `{forge_id}`; use `thegn pr queue add --pr {number}` to rebind",
+                row.forge
+            ));
+        }
+        if let Err(reason) = thegn_core::pr_queue::attest_pr_identity(
+            row.pr_url.as_deref(),
+            number,
+            &fetched.url,
+            fetched.number,
+        ) {
+            return Err(format!(
+                "re-watch refused: {reason}; use `thegn pr queue add --pr {number}` to rebind"
+            ));
+        }
+    }
+    let worktree = (fetched.head_ref_name == row.branch)
+        .then_some(row.worktree.as_deref())
+        .flatten();
+    db.enqueue_bound_pr(
+        &row.repo_root,
+        number,
+        worktree,
+        &fetched.head_ref_name,
+        &fetched.base_ref_name,
+        forge_id,
+        &fetched.url,
+    )
+    .map_err(|error| format!("re-watch failed: {error}"))?;
+    Ok(format!("Watching PR #{number} again"))
 }
 
 // ---------------------------------------------------------------------------
@@ -649,10 +719,8 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: PrqKeyCtx) -> bool {
                     ctx.waker,
                     ctx.active_wt.clone(),
                     Mutation::Rewatch {
+                        key: r.key,
                         number: r.number,
-                        worktree: r.worktree,
-                        branch: r.branch,
-                        base: r.base_branch,
                     },
                 );
             }
@@ -724,6 +792,156 @@ pub(crate) fn selected_review_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn held_db_row(
+        forge: &str,
+        branch: &str,
+        bound_url: Option<&str>,
+    ) -> (tempfile::TempDir, Db, PrQueueRow) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("q.db")).unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let key = format!("{root}#7");
+        match bound_url {
+            Some(url) => db
+                .enqueue_bound_pr(&root, 7, Some("/worktree"), branch, "main", forge, url)
+                .unwrap(),
+            None => db
+                .enqueue_pr(&root, 7, Some("/worktree"), branch, "main", forge)
+                .unwrap(),
+        }
+        db.update_pr_status(&key, "needs_human", None, None, None)
+            .unwrap();
+        let row = db
+            .list_pr_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.key == key)
+            .unwrap();
+        (dir, db, row)
+    }
+
+    fn fetched(number: u64, url: &str, branch: &str) -> thegn_core::forge::model::PrStatus {
+        thegn_core::forge::model::PrStatus {
+            number,
+            url: url.into(),
+            head_ref_name: branch.into(),
+            base_ref_name: "main".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rewatch_binds_unbound_row_with_the_resolved_forge() {
+        let (_dir, db, row) = held_db_row("gitlab", "feature", None);
+        let result = rewatch_row(
+            &db,
+            &row,
+            "gitlab",
+            Ok(fetched(
+                7,
+                "https://gitlab.com/acme/project/-/merge_requests/7",
+                "feature",
+            )),
+        );
+        assert!(result.is_ok());
+        let updated = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(updated.status, "watching");
+        assert_eq!(
+            updated.pr_url.as_deref(),
+            Some("https://gitlab.com/acme/project/-/merge_requests/7")
+        );
+        assert_eq!(updated.forge, "gitlab");
+    }
+
+    #[test]
+    fn rewatch_refuses_a_bound_row_from_another_project() {
+        let (_dir, db, row) = held_db_row(
+            "github",
+            "feature",
+            Some("https://github.com/acme/project/pull/7"),
+        );
+        let result = rewatch_row(
+            &db,
+            &row,
+            "github",
+            Ok(fetched(
+                7,
+                "https://github.com/other/project/pull/7",
+                "feature",
+            )),
+        );
+        assert!(result.unwrap_err().contains("thegn pr queue add --pr 7"));
+        let unchanged = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(unchanged.status, "needs_human");
+        assert_eq!(unchanged.pr_url, row.pr_url);
+    }
+
+    #[test]
+    fn rewatch_refuses_a_bound_row_when_the_forge_changed() {
+        let (_dir, db, row) = held_db_row(
+            "github",
+            "feature",
+            Some("https://github.com/acme/project/pull/7"),
+        );
+        let result = rewatch_row(
+            &db,
+            &row,
+            "gitlab",
+            Ok(fetched(
+                7,
+                "https://github.com/acme/project/pull/7",
+                "feature",
+            )),
+        );
+        assert!(result.unwrap_err().contains("thegn pr queue add --pr 7"));
+        let unchanged = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(unchanged.status, "needs_human");
+        assert_eq!(unchanged.forge, "github");
+    }
+
+    #[test]
+    fn rewatch_fetch_error_leaves_held_row_unchanged() {
+        let (_dir, db, row) = held_db_row(
+            "github",
+            "feature",
+            Some("https://github.com/acme/project/pull/7"),
+        );
+        let result = rewatch_row(
+            &db,
+            &row,
+            "github",
+            Err(thegn_core::forge::ForgeError::NoPr),
+        );
+        assert!(result.unwrap_err().contains("could not verify PR #7"));
+        let unchanged = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(unchanged.status, "needs_human");
+        assert_eq!(unchanged.pr_url, row.pr_url);
+        assert_eq!(unchanged.agent_attempts, row.agent_attempts);
+    }
+
+    #[test]
+    fn rewatch_clears_checkout_binding_when_pr_branch_changed() {
+        let (_dir, db, row) = held_db_row("github", "feature", None);
+        rewatch_row(
+            &db,
+            &row,
+            "github",
+            Ok(fetched(
+                7,
+                "https://github.com/acme/project/pull/7",
+                "renamed-feature",
+            )),
+        )
+        .unwrap();
+        let updated = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(updated.status, "watching");
+        assert_eq!(
+            updated.pr_url.as_deref(),
+            Some("https://github.com/acme/project/pull/7")
+        );
+        assert_eq!(updated.worktree, None);
+    }
 
     /// THE-515 fixture: a real git repo named `acme` plus an isolated state
     /// dir, and a config whose trusted overlay for it is ambiguous.

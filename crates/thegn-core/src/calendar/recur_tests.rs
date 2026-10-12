@@ -1785,9 +1785,12 @@ fn recurrence_writer_quotes_parameters_and_refuses_lossy_values() {
 }
 
 #[test]
-fn instant_and_date_series_use_utc_while_unknown_zoned_series_use_home() {
+fn instant_and_date_series_use_utc_unknown_zones_fail_and_floating_uses_home() {
     let home = chrono_tz::America::Chicago;
-    assert_eq!(series_zone(&utc(2026, 8, 3, 14, 0), home), chrono_tz::UTC);
+    assert_eq!(
+        series_zone(&utc(2026, 8, 3, 14, 0), home),
+        Some(chrono_tz::UTC)
+    );
     assert_eq!(
         series_zone(
             &EventTime::Date {
@@ -1795,13 +1798,18 @@ fn instant_and_date_series_use_utc_while_unknown_zoned_series_use_home() {
             },
             home
         ),
-        chrono_tz::UTC
+        Some(chrono_tz::UTC)
     );
     let unknown = EventTime::Zoned {
         local: dt(2026, 8, 3, 9, 0),
         zone: TzRef::new("Nowhere/Land"),
     };
-    assert_eq!(series_zone(&unknown, home), home);
+    assert_eq!(series_zone(&unknown, home), None);
+    let floating = EventTime::Zoned {
+        local: dt(2026, 8, 3, 9, 0),
+        zone: TzRef::default(),
+    };
+    assert_eq!(series_zone(&floating, home), Some(home));
     // A timed EXDATE does not match the DATE recurrence-id's UTC midnight.
     let rec = Recurrence {
         rules: vec![RRule::parse("FREQ=DAILY").unwrap()],

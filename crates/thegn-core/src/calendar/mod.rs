@@ -434,23 +434,57 @@ pub enum EventTime {
     },
 }
 
+/// Why an event time could not be resolved to an instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstantError {
+    /// The event named a non-blank zone this build cannot resolve.
+    UnknownZone,
+    /// The local wall time falls in a skipped interval under `GapPolicy::Skip`.
+    Nonexistent,
+}
+
+impl std::fmt::Display for InstantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UnknownZone => "unknown time zone",
+            Self::Nonexistent => "nonexistent local time",
+        })
+    }
+}
+
+impl std::error::Error for InstantError {}
+
 impl EventTime {
     /// Resolve to an absolute instant, interpreting a floating date as midnight
     /// in `home`.
     ///
-    /// Returns `None` only for a local time that genuinely does not exist (the
-    /// spring-forward gap) under [`GapPolicy::Skip`]; every other policy always
-    /// yields an instant.
+    /// Returns `None` for an unknown explicit zone or for a local time that
+    /// does not exist under [`GapPolicy::Skip`]. Use [`Self::try_instant_in`]
+    /// when the cause needs to be distinguished.
     pub fn instant_in(&self, home: chrono_tz::Tz, gap: GapPolicy) -> Option<DateTime<Utc>> {
+        self.try_instant_in(home, gap).ok()
+    }
+
+    /// Resolve this event time, distinguishing an unknown explicit zone from
+    /// a local time skipped by a DST gap.
+    pub fn try_instant_in(
+        &self,
+        home: chrono_tz::Tz,
+        gap: GapPolicy,
+    ) -> Result<DateTime<Utc>, InstantError> {
         match self {
-            EventTime::Instant { at } => Some(*at),
+            EventTime::Instant { at } => Ok(*at),
             EventTime::Date { date } => {
-                let midnight = date.and_hms_opt(0, 0, 0)?;
-                tz::resolve_local(midnight, home, gap)
+                let midnight = date.and_hms_opt(0, 0, 0).ok_or(InstantError::Nonexistent)?;
+                tz::resolve_local(midnight, home, gap).ok_or(InstantError::Nonexistent)
             }
             EventTime::Zoned { local, zone } => {
-                let z = zone.resolve().unwrap_or(home);
-                tz::resolve_local(*local, z, gap)
+                let z = if zone.as_str().trim().is_empty() {
+                    home
+                } else {
+                    zone.resolve().ok_or(InstantError::UnknownZone)?
+                };
+                tz::resolve_local(*local, z, gap).ok_or(InstantError::Nonexistent)
             }
         }
     }
@@ -903,7 +937,7 @@ impl CalEvent {
         let Some(seed) = recur::seed_of(&self.start) else {
             return Err(ExpansionError::InvalidSpan);
         };
-        let zone = Some(recur::series_zone(&self.start, home));
+        let zone = Some(recur::series_zone(&self.start, home).ok_or(ExpansionError::InvalidSpan)?);
         let locals = recur::expand_local_with_gap(
             rec,
             seed,

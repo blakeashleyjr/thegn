@@ -644,11 +644,20 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
             }
             Err(e) => GitOpResult::Err(first_line(&e)),
         },
-        GitOp::Custom { command, capture } => {
-            custom_command_result(g.run_custom(loc, &command, capture), capture, false)
-        }
+        GitOp::Custom { command, capture } => custom_command_result(
+            g.run_custom(loc, &command, capture),
+            capture,
+            false,
+            CUSTOM_COMMAND_TIMEOUT_SECS,
+        ),
         GitOp::CustomTemplate { command, capture } => {
-            custom_command_result(g.run_custom_template(loc, &command, capture), capture, true)
+            let timeout_secs = command.timeout().as_secs();
+            custom_command_result(
+                g.run_custom_template(loc, &command, capture),
+                capture,
+                true,
+                timeout_secs,
+            )
         }
     }
 }
@@ -670,6 +679,7 @@ fn custom_command_result(
     ),
     capture: bool,
     redact_failure: bool,
+    timeout_secs: u64,
 ) -> GitOpResult {
     let (kind, status, stdout, stdout_truncated, stderr) = outcome;
     match kind {
@@ -705,7 +715,7 @@ fn custom_command_result(
             }
         }
         CUSTOM_OUTCOME_TIMEOUT => GitOpResult::Err(format!(
-            "custom command timed out after {CUSTOM_COMMAND_TIMEOUT_SECS}s and was killed"
+            "custom command timed out after {timeout_secs}s and was killed"
         )),
         CUSTOM_OUTCOME_SPAWN => GitOpResult::Err("could not start custom command".into()),
         CUSTOM_OUTCOME_WAIT => GitOpResult::Err("custom command could not be reaped".into()),
@@ -970,6 +980,41 @@ mod tests {
         }
         if let Err(error) = std::fs::remove_dir_all(&dir) {
             tracing::debug!(%error, "custom popup test repo cleanup failed");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_template_uses_configured_timeout_in_error() {
+        let dir = tmp_repo("custom-template-timeout");
+        let loc = GitLoc::Local(dir.clone());
+        let configured: thegn_core::config::GitCommand = toml::from_str(
+            r#"
+key = "x"
+argv = ["sh", "-c", "sleep 30"]
+output = "popup"
+timeout_secs = 1
+"#,
+        )
+        .unwrap();
+        let command = thegn_core::custom_cmd::compile(
+            &configured,
+            &thegn_core::custom_cmd::TemplateCtx::default(),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let result = execute(
+            GitOp::CustomTemplate {
+                command,
+                capture: true,
+            },
+            &loc,
+            false,
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(matches!(result, GitOpResult::Err(message) if message.contains("after 1s")));
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::debug!(%error, "custom template timeout test repo cleanup failed");
         }
     }
 

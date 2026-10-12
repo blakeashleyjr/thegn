@@ -253,6 +253,37 @@ fn trigger_durations_convert_to_minutes_before() {
 }
 
 #[test]
+fn valarm_related_controls_reminder_reference_point() {
+    let parse_reminder = |duration: &str, trigger: &str| {
+        let doc = format!(
+            "BEGIN:VEVENT\r\nUID:event\r\nDTSTART:20260821T090000Z\r\nDTEND:20260821T{}Z\r\nBEGIN:VALARM\r\nTRIGGER{}:{}\r\nEND:VALARM\r\nEND:VEVENT\r\n",
+            duration,
+            trigger.split_once(':').map_or("", |(params, _)| params),
+            trigger.split_once(':').map_or(trigger, |(_, value)| value),
+        );
+        let (result, events) = admitted(&doc, 10);
+        result.unwrap();
+        events.into_iter().next().unwrap().reminders
+    };
+
+    assert_eq!(
+        parse_reminder("110000", ";RELATED=END:-PT150M"),
+        vec![Reminder { minutes_before: 30 }]
+    );
+    assert!(parse_reminder("100000", ";RELATED=END:-PT15M").is_empty());
+    assert!(parse_reminder("100000", ";RELATED=BOGUS:-PT10M").is_empty());
+    assert_eq!(
+        parse_reminder("100000", ";RELATED=START:-PT10M"),
+        vec![Reminder { minutes_before: 10 }]
+    );
+
+    let mismatched_zones = "BEGIN:VEVENT\r\nUID:event\r\nDTSTART;TZID=America/Los_Angeles:20260821T090000\r\nDTEND;TZID=Europe/London:20260821T180000\r\nBEGIN:VALARM\r\nTRIGGER;RELATED=END:-PT120M\r\nEND:VALARM\r\nEND:VEVENT\r\n";
+    let (result, events) = admitted(mismatched_zones, 10);
+    result.unwrap();
+    assert!(events[0].reminders.is_empty());
+}
+
+#[test]
 fn a_valarm_does_not_leak_its_properties_into_the_event() {
     // VALARM has its own SUMMARY/DESCRIPTION; a parser that ignores nesting
     // silently overwrites the event's.
