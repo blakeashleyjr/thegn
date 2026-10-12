@@ -814,9 +814,11 @@ fn stage_env_file(plan: &SidecarPlan) -> Result<Option<std::path::PathBuf>> {
     Ok(Some(path))
 }
 
+type StagedSecrets = (Vec<(String, String)>, Option<PathBuf>);
+
 /// Stage both secret classes as one operation so a failure cannot leave only
 /// one class of the sidecar's credentials behind.
-fn stage_all(plan: &SidecarPlan) -> Result<(Vec<(String, String)>, Option<PathBuf>)> {
+fn stage_all(plan: &SidecarPlan) -> Result<StagedSecrets> {
     match stage_all_inner(plan) {
         Ok(staged) => Ok(staged),
         Err(error) => {
@@ -826,7 +828,7 @@ fn stage_all(plan: &SidecarPlan) -> Result<(Vec<(String, String)>, Option<PathBu
     }
 }
 
-fn stage_all_inner(plan: &SidecarPlan) -> Result<(Vec<(String, String)>, Option<PathBuf>)> {
+fn stage_all_inner(plan: &SidecarPlan) -> Result<StagedSecrets> {
     let staged = stage_files(plan)?;
     let env_file = stage_env_file(plan)?;
     Ok((staged, env_file))
