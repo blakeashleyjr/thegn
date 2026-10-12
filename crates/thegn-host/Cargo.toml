@@ -43,6 +43,7 @@ profiling = ["dep:pprof"]
 dev = []
 
 [dependencies]
+url.workspace = true
 clap = { workspace = true, features = ["derive"] }
 clap_complete.workspace = true
 thegn-core.workspace = true

@@ -11813,6 +11813,9 @@ async fn event_loop<T: Terminal>(
                         &mut model,
                         &waker,
                     );
+                    if let Some(picker) = workspace_picker.as_mut() {
+                        picker.config_reloaded(new_cfg.clone(), waker.clone());
+                    }
                     current_config = new_cfg;
                     // Rebuild only the effective hydration schedule. This is
                     // intentionally after successful config admission; the
