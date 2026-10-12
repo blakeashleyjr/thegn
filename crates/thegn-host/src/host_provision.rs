@@ -318,6 +318,9 @@ fn fill_agent_config_staging(
             for (abs, inner, exec) in crate::agent_configs::collect_agent_config_files(&src) {
                 let base = safe_relative_path(&rel)?;
                 let inner = safe_relative_path(&inner)?;
+                if is_agent_secret_path(&inner) {
+                    continue;
+                }
                 // Agent config collection intentionally follows links (for
                 // NixOS hooks); resolve that policy explicitly, then use a
                 // no-follow open on the resolved regular file.
@@ -328,13 +331,16 @@ fn fill_agent_config_staging(
         }
         for rel in files {
             let rel = safe_relative_path(&rel)?;
-            let source = host_home.join(&rel);
-            match std::fs::symlink_metadata(&source) {
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(format!("inspect {}: {error}", source.display())),
+            if is_agent_secret_path(&rel) {
+                continue;
             }
-            stage_file(staging, &source, &staging.join(rel), false)?;
+            let source = host_home.join(&rel);
+            let resolved = match std::fs::canonicalize(&source) {
+                Ok(resolved) => resolved,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("resolve {}: {error}", source.display())),
+            };
+            stage_file(staging, &resolved, &staging.join(rel), false)?;
         }
     }
     Ok(())
@@ -344,22 +350,45 @@ fn fill_atuin_staging(
     staging: &std::path::Path,
     host_home: &std::path::Path,
 ) -> Result<(), String> {
-    // Config and key are required for sync; session exists only while logged in.
-    for rel in [".config/atuin/config.toml", ".local/share/atuin/key"] {
-        let rel = safe_relative_path(rel)?;
-        stage_file(staging, &host_home.join(&rel), &staging.join(rel), false)?;
+    // Atuin runs on defaults without config.toml; its encryption key is required.
+    let config = safe_relative_path(".config/atuin/config.toml")?;
+    let config_source = host_home.join(&config);
+    match std::fs::canonicalize(&config_source) {
+        Ok(resolved) => stage_file(staging, &resolved, &staging.join(config), false)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("resolve {}: {error}", config_source.display())),
     }
-    let session = host_home.join(".local/share/atuin/session");
-    match std::fs::symlink_metadata(&session) {
-        Ok(_) => stage_file(
-            staging,
-            &session,
-            &staging.join(".local/share/atuin/session"),
-            false,
-        ),
+
+    let key = safe_relative_path(".local/share/atuin/key")?;
+    let key_source = host_home.join(&key);
+    let resolved_key = std::fs::canonicalize(&key_source)
+        .map_err(|error| format!("resolve {}: {error}", key_source.display()))?;
+    stage_file(staging, &resolved_key, &staging.join(key), false)?;
+
+    // Session exists only while logged in.
+    let session = safe_relative_path(".local/share/atuin/session")?;
+    let session_source = host_home.join(&session);
+    match std::fs::canonicalize(&session_source) {
+        Ok(resolved) => stage_file(staging, &resolved, &staging.join(session), false),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("inspect {}: {error}", session.display())),
+        Err(error) => Err(format!("resolve {}: {error}", session_source.display())),
     }
+}
+
+/// Agent config staging deliberately excludes credentials. Sealed panes only
+/// receive the managed per-account credential directory created under thegn's
+/// state; `docs/help/sandboxing.md` says ambient `~/.claude` / `~/.codex`
+/// credentials are never mounted into sealed panes. Keep host credentials out
+/// of this separate host-to-container provisioning path too.
+fn is_agent_secret_path(path: &std::path::Path) -> bool {
+    let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    name.contains("credential")
+        || name.contains("token")
+        || name == "auth.json"
+        || name.ends_with(".auth.json")
 }
 
 fn with_private_staging(
@@ -728,24 +757,55 @@ mod tests {
     fn agent_config_staging_preserves_root_and_file_paths() {
         let home = tempfile::tempdir().unwrap();
         let staging = tempfile::tempdir().unwrap();
-        std::fs::write(home.path().join(".claude.json"), "claude auth\n").unwrap();
+        std::fs::write(home.path().join(".claude.json"), "claude config\n").unwrap();
         std::fs::create_dir(home.path().join(".claude")).unwrap();
         std::fs::write(home.path().join(".claude/settings.json"), "{}\n").unwrap();
+        std::fs::write(home.path().join(".claude/.credentials.json"), "secret\n").unwrap();
+        std::fs::write(home.path().join(".claude/oauth_token.json"), "secret\n").unwrap();
+        std::fs::create_dir(home.path().join(".codex")).unwrap();
+        std::fs::write(home.path().join(".codex/auth.json"), "secret\n").unwrap();
 
-        fill_agent_config_staging(staging.path(), home.path(), &["claude".into()]).unwrap();
+        fill_agent_config_staging(
+            staging.path(),
+            home.path(),
+            &["claude".into(), "codex".into()],
+        )
+        .unwrap();
 
         assert_eq!(
             std::fs::read(staging.path().join(".claude.json")).unwrap(),
-            b"claude auth\n"
+            b"claude config\n"
         );
         assert_eq!(
             std::fs::read(staging.path().join(".claude/settings.json")).unwrap(),
             b"{}\n"
         );
+        assert!(!staging.path().join(".claude/.credentials.json").exists());
+        assert!(!staging.path().join(".claude/oauth_token.json").exists());
+        assert!(!staging.path().join(".codex/auth.json").exists());
     }
 
     #[test]
-    fn atuin_session_is_optional_but_config_and_key_are_required() {
+    fn top_level_agent_config_symlink_is_resolved_before_staging() {
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let target = home.path().join("claude-config-target");
+        std::fs::write(&target, "{}\n").unwrap();
+        crate::platform::test_symlink(&target, &home.path().join(".claude.json")).unwrap();
+
+        fill_agent_config_staging(staging.path(), home.path(), &["claude".into()]).unwrap();
+
+        assert_eq!(
+            std::fs::read(staging.path().join(".claude.json")).unwrap(),
+            b"{}\n"
+        );
+    }
+
+    #[test]
+    fn atuin_session_and_config_are_optional_but_key_is_required() {
         let home = tempfile::tempdir().unwrap();
         let staging = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".config/atuin")).unwrap();
@@ -765,6 +825,54 @@ mod tests {
         std::fs::remove_file(home.path().join(".local/share/atuin/key")).unwrap();
         let missing_key = tempfile::tempdir().unwrap();
         assert!(fill_atuin_staging(missing_key.path(), home.path()).is_err());
+    }
+
+    #[test]
+    fn atuin_config_symlink_is_resolved_and_config_may_be_missing() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".config/atuin")).unwrap();
+        std::fs::create_dir_all(home.path().join(".local/share/atuin")).unwrap();
+        let config_target = home.path().join("atuin-config-target");
+        std::fs::write(&config_target, "sync = true\n").unwrap();
+        if crate::platform::test_symlink_supported() {
+            crate::platform::test_symlink(
+                &config_target,
+                &home.path().join(".config/atuin/config.toml"),
+            )
+            .unwrap();
+            std::fs::write(home.path().join(".local/share/atuin/key"), "key\n").unwrap();
+            let staging = tempfile::tempdir().unwrap();
+
+            fill_atuin_staging(staging.path(), home.path()).unwrap();
+
+            assert_eq!(
+                std::fs::read(staging.path().join(".config/atuin/config.toml")).unwrap(),
+                b"sync = true\n"
+            );
+        }
+
+        std::fs::remove_file(home.path().join(".config/atuin/config.toml")).unwrap_or_else(
+            |error| {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            },
+        );
+        std::fs::write(home.path().join(".local/share/atuin/key"), "key\n").unwrap();
+        let missing_config = tempfile::tempdir().unwrap();
+
+        fill_atuin_staging(missing_config.path(), home.path()).unwrap();
+
+        assert!(
+            !missing_config
+                .path()
+                .join(".config/atuin/config.toml")
+                .exists()
+        );
+        assert!(
+            missing_config
+                .path()
+                .join(".local/share/atuin/key")
+                .is_file()
+        );
     }
 
     #[test]
