@@ -20,8 +20,9 @@
 //! The thread blocks on `recv()` (no polling, no timer, no `TerminalWaker`
 //! pulse), so it adds zero idle wakes — the 0%-idle contract is untouched.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use thegn_core::db::Db;
@@ -31,28 +32,45 @@ type Job = Box<dyn FnOnce(&Db) + Send>;
 
 enum Msg {
     Run(Job),
+    RunLatest {
+        key: String,
+        generation: u64,
+        job: Job,
+    },
     /// A barrier: the writer acks once every earlier `Run` has completed.
     Flush(SyncSender<()>),
 }
 
 struct Writer {
     tx: Sender<Msg>,
+    generations: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 fn writer() -> &'static Writer {
     static W: OnceLock<Writer> = OnceLock::new();
-    W.get_or_init(|| Writer {
-        tx: spawn(Db::open),
+    W.get_or_init(|| {
+        let generations = Arc::new(Mutex::new(HashMap::new()));
+        Writer {
+            tx: spawn_with_generations(Db::open, Arc::clone(&generations)),
+            generations,
+        }
     })
 }
 
 /// Spawn the writer thread with a connection opener and return its send handle.
 /// Split from [`writer`] so tests can drive [`run`] with an isolated DB.
 fn spawn(open: impl Fn() -> anyhow::Result<Db> + Send + 'static) -> Sender<Msg> {
+    spawn_with_generations(open, Arc::new(Mutex::new(HashMap::new())))
+}
+
+fn spawn_with_generations(
+    open: impl Fn() -> anyhow::Result<Db> + Send + 'static,
+    generations: Arc<Mutex<HashMap<String, u64>>>,
+) -> Sender<Msg> {
     let (tx, rx) = channel::<Msg>();
     std::thread::Builder::new()
         .name("thegn-db-writer".into())
-        .spawn(move || run(rx, open))
+        .spawn(move || run(rx, open, generations))
         .expect("spawn db-writer thread");
     tx
 }
@@ -60,29 +78,31 @@ fn spawn(open: impl Fn() -> anyhow::Result<Db> + Send + 'static) -> Sender<Msg> 
 /// Drain jobs in FIFO order against a lazily-opened connection. A failed open is
 /// logged once and its job dropped (best-effort semantics); the next job retries
 /// the open, so a transient failure self-heals. Returns when the channel closes.
-fn run(rx: Receiver<Msg>, open: impl Fn() -> anyhow::Result<Db>) {
+fn run(
+    rx: Receiver<Msg>,
+    open: impl Fn() -> anyhow::Result<Db>,
+    generations: Arc<Mutex<HashMap<String, u64>>>,
+) {
     let mut db: Option<Db> = None;
     let mut warned = false;
     while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Run(job) => {
-                if db.is_none() {
-                    match open() {
-                        Ok(d) => {
-                            db = Some(d);
-                            warned = false;
-                        }
-                        Err(e) => {
-                            if !warned {
-                                tracing::warn!("db-writer: open failed, dropping write: {e}");
-                                warned = true;
-                            }
-                            continue;
-                        }
-                    }
-                }
-                if let Some(d) = &db {
-                    job(d);
+                run_job(&mut db, &mut warned, &open, job);
+            }
+            Msg::RunLatest {
+                key,
+                generation,
+                job,
+            } => {
+                let is_latest = generations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&key)
+                    .copied()
+                    == Some(generation);
+                if is_latest {
+                    run_job(&mut db, &mut warned, &open, job);
                 }
             }
             // FIFO: acking here means every prior Run has already run.
@@ -93,12 +113,63 @@ fn run(rx: Receiver<Msg>, open: impl Fn() -> anyhow::Result<Db>) {
     }
 }
 
+fn run_job(
+    db: &mut Option<Db>,
+    warned: &mut bool,
+    open: &impl Fn() -> anyhow::Result<Db>,
+    job: Job,
+) {
+    if db.is_none() {
+        match open() {
+            Ok(d) => {
+                *db = Some(d);
+                *warned = false;
+            }
+            Err(e) => {
+                if !*warned {
+                    tracing::warn!("db-writer: open failed, dropping write: {e}");
+                    *warned = true;
+                }
+                return;
+            }
+        }
+    }
+    if let Some(d) = db {
+        job(d);
+    }
+}
+
 /// Queue a best-effort DB write to run on the writer thread, in send order.
 /// Fire-and-forget: returns immediately and never blocks the caller, so it is
 /// safe to call from the event loop. Failure to enqueue (writer gone) is
 /// silently ignored — the DB is a cache.
 pub(crate) fn persist(job: impl FnOnce(&Db) + Send + 'static) {
     let _ = writer().tx.send(Msg::Run(Box::new(job))); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+}
+
+/// Queue a replaceable write. A queued write is skipped if a newer value for
+/// the same key arrived before the writer began it.
+pub(crate) fn persist_latest(key: String, job: impl FnOnce(&Db) + Send + 'static) {
+    let writer = writer();
+    enqueue_latest(&writer.tx, &writer.generations, key, Box::new(job));
+}
+
+fn enqueue_latest(
+    tx: &Sender<Msg>,
+    generations: &Mutex<HashMap<String, u64>>,
+    key: String,
+    job: Job,
+) {
+    let mut generations = generations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let generation = generations.get(&key).copied().unwrap_or(0).wrapping_add(1);
+    generations.insert(key.clone(), generation);
+    let _ = tx.send(Msg::RunLatest {
+        key,
+        generation,
+        job,
+    }); // best-effort: send: the consumer may be gone; the DB is a cache
 }
 
 /// Block until every previously-queued write has run, or `timeout` elapses
@@ -168,6 +239,75 @@ mod tests {
         assert_eq!(
             db.get_ui_state("t", "flushed").unwrap().as_deref(),
             Some("yes")
+        );
+    }
+
+    #[test]
+    fn persist_latest_coalesces_queued_values_by_key() {
+        let (tx, path) = temp_writer();
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        tx.send(Msg::Run(Box::new(move |_db| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })))
+        .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let generations = Mutex::new(HashMap::new());
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for value in ["first", "second", "third"] {
+            let value = value.to_string();
+            let ran = Arc::clone(&ran);
+            enqueue_latest(
+                &tx,
+                &generations,
+                "replaceable".to_string(),
+                Box::new(move |db| {
+                    ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    drop(Result::ok(db.set_ui_state("t", "latest", &value)));
+                }),
+            );
+        }
+        release_tx.send(()).unwrap();
+        barrier(&tx);
+
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let db = Db::open_at(&path).unwrap();
+        assert_eq!(
+            db.get_ui_state("t", "latest").unwrap().as_deref(),
+            Some("third")
+        );
+    }
+
+    #[test]
+    fn lock_contention_does_not_block_enqueue_and_recovers_after_commit() {
+        let (tx, path) = temp_writer();
+        tx.send(Msg::Run(Box::new(|db| {
+            drop(Result::ok(db.set_ui_state("t", "ready", "yes")));
+        })))
+        .unwrap();
+        barrier(&tx);
+        let lock = rusqlite::Connection::open(&path).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let started = std::time::Instant::now();
+        tx.send(Msg::Run(Box::new(|db| {
+            drop(Result::ok(db.set_ui_state("t", "locked", "written")));
+        })))
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(50));
+
+        let (ack_tx, ack_rx) = sync_channel(0);
+        tx.send(Msg::Flush(ack_tx)).unwrap();
+        assert!(ack_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        lock.execute_batch("COMMIT").unwrap();
+        barrier(&tx);
+        let db = Db::open_at(&path).unwrap();
+        assert_eq!(
+            db.get_ui_state("t", "locked").unwrap().as_deref(),
+            Some("written")
         );
     }
 
