@@ -142,19 +142,26 @@ pub(super) fn content(ctx: &SectionCtx<'_>) -> Vec<PanelRow> {
         rows.push(rule());
         rows.push(PanelRow::plain(Line::segs(vec![seg(d(), "up next")])));
         let offset = media.sources.len();
-        for (i, item) in media.queue.iter().enumerate() {
-            let current = if item.is_current {
-                crate::caps::active_glyphs().caret_open
-            } else {
-                " "
-            };
-            rows.push(
-                PanelRow::plain(Line::segs(vec![
-                    seg(g(), format!("{current} ")),
-                    seg(t(), item.label()),
-                ]))
-                .with_hit(PanelHit::Row(Section::Media, offset + i)),
-            );
+        if media.queue_error.is_some() {
+            rows.push(PanelRow::plain(Line::segs(vec![seg(
+                d(),
+                "queue unavailable",
+            )])));
+        } else {
+            for (i, item) in media.queue.iter().enumerate() {
+                let current = if item.is_current {
+                    crate::caps::active_glyphs().caret_open
+                } else {
+                    " "
+                };
+                rows.push(
+                    PanelRow::plain(Line::segs(vec![
+                        seg(g(), format!("{current} ")),
+                        seg(t(), item.label()),
+                    ]))
+                    .with_hit(PanelHit::Row(Section::Media, offset + i)),
+                );
+            }
         }
     }
     if policy.show_art && media.art_visible() {
@@ -201,10 +208,10 @@ mod tests {
         panel.set_queue(
             first_request.clone(),
             Some(&first),
-            vec![QueueItem {
+            Ok(vec![QueueItem {
                 title: "one".into(),
                 ..Default::default()
-            }],
+            }]),
         );
         assert_eq!(panel.queue.len(), 1);
         let mut changed = first.clone();
@@ -213,7 +220,11 @@ mod tests {
             .take_sources_request(Some(&first))
             .unwrap_or_else(|| panic!("source request expected"));
         panel.sync_snapshot(Some(&changed), None, 0);
-        panel.set_queue(first_request, Some(&changed), vec![QueueItem::default()]);
+        panel.set_queue(
+            first_request,
+            Some(&changed),
+            Ok(vec![QueueItem::default()]),
+        );
         assert!(panel.queue.is_empty());
         panel.set_sources(stale_request, Some(&changed), vec!["stale".into()]);
         assert!(panel.sources.is_empty());
@@ -261,11 +272,11 @@ mod tests {
         ui.media.set_queue(
             request,
             model.panel.media.as_ref(),
-            vec![QueueItem {
+            Ok(vec![QueueItem {
                 id: "next".into(),
                 title: "next track".into(),
                 ..Default::default()
-            }],
+            }]),
         );
         let mut rows = |width| {
             ui.width = width;
