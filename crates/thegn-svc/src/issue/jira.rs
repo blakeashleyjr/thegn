@@ -125,10 +125,6 @@ struct SearchResult {
     #[serde(default)]
     issues: Vec<JiraIssue>,
     #[serde(default)]
-    start_at: usize,
-    #[serde(default)]
-    max_results: usize,
-    #[serde(default)]
     total: Option<usize>,
 }
 
@@ -476,7 +472,6 @@ impl IssueBackend for JiraBackend {
                     }
                     Err(error) => return Err(error),
                 };
-                let _reported_page = (result.start_at, result.max_results);
                 total = result.total.or(total);
                 let received = result.issues.len();
                 for issue in result.issues {

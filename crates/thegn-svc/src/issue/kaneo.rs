@@ -598,10 +598,10 @@ impl KaneoBackend {
                 }
             }
         }
-        if successful_projects == 0 {
-            if let Some(error) = first_error {
-                return Err(error);
-            }
+        if successful_projects == 0
+            && let Some(error) = first_error
+        {
+            return Err(error);
         }
         // Client-side status filter (Kaneo filters by a single column slug, not
         // our status buckets) + overall limit.
@@ -965,7 +965,7 @@ mod tests {
                     route_calls.lock().unwrap().push(method_path.clone());
                     let (_, status, body) = route_responses
                         .iter()
-                        .find(|(route, _, _)| route == &format!("{} {path}", request.method()))
+                        .find(|(route, _, _)| route == &path)
                         .cloned()
                         .unwrap_or_else(|| {
                             (
