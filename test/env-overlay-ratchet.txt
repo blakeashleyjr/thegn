@@ -213,6 +213,8 @@ merge_queue.agent_timeout_secs
 merge_queue.auto_land
 merge_queue.bisect_on_red
 merge_queue.conflict_handoff
+merge_queue.diagnosis_max_gates
+merge_queue.diagnosis_timeout_secs
 merge_queue.enabled
 merge_queue.failed_folder
 merge_queue.gate_command

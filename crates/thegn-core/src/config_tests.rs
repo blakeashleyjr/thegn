@@ -831,6 +831,37 @@ fn merge_gate_deadlines_default_disabled_and_accept_config_and_env_overlays() {
 }
 
 #[test]
+fn merge_queue_diagnosis_caps_default_parse_and_overlay() {
+    let defaults = MergeQueueConfig::default();
+    assert_eq!(defaults.diagnosis_max_gates, 8);
+    assert_eq!(defaults.diagnosis_timeout_secs, 3600);
+
+    let parsed: Config =
+        toml::from_str("[merge_queue]\ndiagnosis_max_gates = 5\ndiagnosis_timeout_secs = 90\n")
+            .unwrap();
+    assert_eq!(parsed.merge_queue.diagnosis_max_gates, 5);
+    assert_eq!(parsed.merge_queue.diagnosis_timeout_secs, 90);
+
+    let mut base = MergeQueueConfig::default();
+    MergeQueueOverlay {
+        diagnosis_max_gates: Some(0),
+        diagnosis_timeout_secs: Some(0),
+        ..MergeQueueOverlay::default()
+    }
+    .apply(&mut base);
+    assert_eq!(base.diagnosis_max_gates, 0);
+    assert_eq!(base.diagnosis_timeout_secs, 0);
+    assert!(MergeQueueOverlay::default().is_empty());
+    assert!(
+        !MergeQueueOverlay {
+            diagnosis_timeout_secs: Some(1),
+            ..MergeQueueOverlay::default()
+        }
+        .is_empty()
+    );
+}
+
+#[test]
 fn sandbox_compiler_cache_is_off_by_default_and_env_authoritative() {
     assert_eq!(
         SandboxConfig::default().compiler_cache,

@@ -850,6 +850,10 @@ pub struct MergeQueueConfig {
     pub gate_target_dir: String,
     /// On a red gate, bisect to defer just the offending branch, not the batch.
     pub bisect_on_red: bool,
+    /// Maximum number of gate attempts used to localize a red batch (zero disables diagnosis).
+    pub diagnosis_max_gates: usize,
+    /// Maximum aggregate wall time in seconds for red-batch diagnosis (zero disables diagnosis).
+    pub diagnosis_timeout_secs: u64,
     /// Fold ONLY branches that were explicitly enqueued (`thegn merge add`),
     /// rather than every eligible worktree branch in the repo.
     ///
@@ -1036,6 +1040,8 @@ impl Default for MergeQueueConfig {
             gate_reuse_worktree: true,
             gate_target_dir: String::new(),
             bisect_on_red: true,
+            diagnosis_max_gates: 8,
+            diagnosis_timeout_secs: 3600,
             require_enqueue: true,
             snapshot_dirty: false,
             regenerate_paths: [
@@ -1155,6 +1161,10 @@ pub struct MergeQueueOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bisect_on_red: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnosis_max_gates: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnosis_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub require_enqueue: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_dirty: Option<bool>,
@@ -1254,6 +1264,8 @@ impl MergeQueueOverlay {
             && self.gate_reuse_worktree.is_none()
             && self.gate_target_dir.is_none()
             && self.bisect_on_red.is_none()
+            && self.diagnosis_max_gates.is_none()
+            && self.diagnosis_timeout_secs.is_none()
             && self.require_enqueue.is_none()
             && self.snapshot_dirty.is_none()
             && self.regenerate_paths.is_none()
@@ -1299,6 +1311,8 @@ impl MergeQueueOverlay {
             gate_reuse_worktree,
             gate_target_dir,
             bisect_on_red,
+            diagnosis_max_gates,
+            diagnosis_timeout_secs,
             require_enqueue,
             snapshot_dirty,
             regenerate_paths,
@@ -1360,6 +1374,12 @@ impl MergeQueueOverlay {
         }
         if let Some(v) = bisect_on_red {
             base.bisect_on_red = v;
+        }
+        if let Some(v) = diagnosis_max_gates {
+            base.diagnosis_max_gates = v;
+        }
+        if let Some(v) = diagnosis_timeout_secs {
+            base.diagnosis_timeout_secs = v;
         }
         if let Some(v) = require_enqueue {
             base.require_enqueue = v;
