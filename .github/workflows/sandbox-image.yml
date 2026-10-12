@@ -22,6 +22,9 @@ permissions:
   packages: write
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/thegn-sandbox
+concurrency:
+  group: sandbox-image-publish
+  cancel-in-progress: false
 jobs:
   build:
     strategy:
@@ -33,22 +36,36 @@ jobs:
             oci_arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: DeterminateSystems/nix-installer-action@e50d5f73bfe71c2dd0aa4218de8f4afa59f8f81d # v16
       - name: resolve tag
         id: tag
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          t="${{ github.event.inputs.tag }}"
-          [ -n "$t" ] || t="${GITHUB_REF_NAME#sandbox-image-}"
+          set -euo pipefail
+          t="$REQUESTED_TAG"
+          [ -n "$t" ] || t="${REF_NAME#sandbox-image-}"
+          [[ "$t" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || {
+            echo "::error::invalid image tag"
+            exit 1
+          }
           echo "tag=$t" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: DeterminateSystems/nix-installer-action@e50d5f73bfe71c2dd0aa4218de8f4afa59f8f81d # v16
       - name: build + load
         run: |
           nix build .#sandbox-image
           ./result | podman load
       - name: push per-arch tag
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          OCI_ARCH: ${{ matrix.oci_arch }}
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
-          ref="$IMAGE:${{ steps.tag.outputs.tag }}-${{ matrix.oci_arch }}"
+          set -euo pipefail
+          printf '%s' "$REGISTRY_TOKEN" | podman login ghcr.io -u "$ACTOR" --password-stdin
+          ref="$IMAGE:$TAG-$OCI_ARCH"
           podman tag thegn-sandbox:latest "$ref"
           podman push "$ref"
   manifest:
@@ -57,20 +74,34 @@ jobs:
     steps:
       - name: resolve tag
         id: tag
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          t="${{ github.event.inputs.tag }}"
-          [ -n "$t" ] || t="${GITHUB_REF_NAME#sandbox-image-}"
+          set -euo pipefail
+          t="$REQUESTED_TAG"
+          [ -n "$t" ] || t="${REF_NAME#sandbox-image-}"
+          [[ "$t" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || {
+            echo "::error::invalid image tag"
+            exit 1
+          }
           echo "tag=$t" >> "$GITHUB_OUTPUT"
       - name: assemble + push the manifest list
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
-          t="${{ steps.tag.outputs.tag }}"
-          podman manifest create "$IMAGE:$t" \
-            "docker://$IMAGE:$t-amd64" \
-            "docker://$IMAGE:$t-arm64"
-          podman manifest push --all "$IMAGE:$t" "docker://$IMAGE:$t"
+          set -euo pipefail
+          printf '%s' "$REGISTRY_TOKEN" | podman login ghcr.io -u "$ACTOR" --password-stdin
+          podman manifest create "$IMAGE:$TAG" \
+            "docker://$IMAGE:$TAG-amd64" \
+            "docker://$IMAGE:$TAG-arm64"
+          podman manifest push --all "$IMAGE:$TAG" "docker://$IMAGE:$TAG"
       - name: print the list digest (pin as DEFAULT_BASE_DIGEST)
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          t="${{ steps.tag.outputs.tag }}"
-          skopeo inspect --raw "docker://$IMAGE:$t" | sha256sum \
+          set -euo pipefail
+          skopeo inspect --raw "docker://$IMAGE:$TAG" | sha256sum \
             | awk '{print "DEFAULT_BASE_DIGEST = sha256:" $1}'
