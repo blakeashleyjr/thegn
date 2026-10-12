@@ -105,17 +105,29 @@ fn is_noise(name: &str) -> bool {
         || name.starts_with("GPG_")
         || name.ends_with("_PROXY")
         || name.ends_with("_proxy")
+        || name.starts_with("CARGO_TARGET_")
         || matches!(
             name,
             "RUSTC_WRAPPER"
+                | "RUSTC_WORKSPACE_WRAPPER"
                 | "RUSTC"
                 | "CARGO_HOME"
                 | "CARGO_BUILD_RUSTC_WRAPPER"
+                | "CARGO_BUILD_RUSTC"
+                | "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"
+                | "RUSTFLAGS"
+                | "CARGO_ENCODED_RUSTFLAGS"
                 | "PYTHONSTARTUP"
                 | "PYTHONPATH"
+                | "PYTHONHOME"
                 | "PERL5OPT"
+                | "PERL5LIB"
                 | "NODE_OPTIONS"
+                | "NODE_PATH"
                 | "RUBYOPT"
+                | "RUBYLIB"
+                | "JAVA_TOOL_OPTIONS"
+                | "_JAVA_OPTIONS"
                 | "BASH_ENV"
                 | "ENV"
                 | "PROMPT_COMMAND"
@@ -327,9 +339,16 @@ mod tests {
             "LD_LIBRARY_PATH",
             "DYLD_INSERT_LIBRARIES",
             "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
             "RUSTC",
             "CARGO_HOME",
             "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER",
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
             "GIT_CONFIG_GLOBAL",
             "SSH_AUTH_SOCK",
             "GPG_TTY",
@@ -337,9 +356,15 @@ mod tests {
             "https_proxy",
             "PYTHONSTARTUP",
             "PYTHONPATH",
+            "PYTHONHOME",
             "PERL5OPT",
+            "PERL5LIB",
             "NODE_OPTIONS",
+            "NODE_PATH",
             "RUBYOPT",
+            "RUBYLIB",
+            "JAVA_TOOL_OPTIONS",
+            "_JAVA_OPTIONS",
             "BASH_ENV",
             "ENV",
             "PROMPT_COMMAND",
@@ -367,6 +392,13 @@ mod tests {
             r#"{"variables":{"PATH":{"type":"exported","value":"/usr/bin:relative"}}}"#,
         );
         assert_eq!(no_store.path, None);
+
+        let oversized_path = serde_json::json!({
+            "variables": {
+                "PATH": {"type":"exported", "value":format!("/nix/store/{}", "x".repeat(64 * 1024))}
+            }
+        });
+        assert_eq!(parse_print_dev_env(&oversized_path.to_string()).path, None);
 
         let oversized = serde_json::json!({
             "variables": {
