@@ -635,24 +635,29 @@ pub fn format_submodule_conflicts(conflicts: &[crate::submodule::SubmoduleConfli
     let mut included = 0;
     for conflict in conflicts.iter().take(MAX_SUBMODULE_ITEMS) {
         let record = crate::submodule::format_submodule_conflict(conflict);
-        let line_bytes = record.len().saturating_add(1);
+        let separator_bytes = usize::from(included > 0);
+        let line_bytes = record.len().saturating_add(separator_bytes);
         if out.len().saturating_add(line_bytes) > MAX_SUBMODULE_BYTES {
             break;
         }
+        if included > 0 {
+            out.push('\n');
+        }
         out.push_str(&record);
-        out.push('\n');
         included += 1;
     }
     let omitted = conflicts.len().saturating_sub(included);
     if omitted > 0 {
-        let note = format!("... {omitted} more submodule conflict(s) omitted\n");
-        let room = MAX_SUBMODULE_BYTES.saturating_sub(out.len());
-        if note.len() <= room {
-            out.push_str(&note);
-        } else {
-            out = bound_text(&out, MAX_SUBMODULE_BYTES.saturating_sub(note.len()));
-            out.push_str(&note);
+        let note = format!("... {omitted} more submodule conflict(s) omitted");
+        let separator_bytes = usize::from(!out.is_empty());
+        let required_bytes = separator_bytes.saturating_add(note.len());
+        if out.len().saturating_add(required_bytes) > MAX_SUBMODULE_BYTES {
+            out = bound_text(&out, MAX_SUBMODULE_BYTES.saturating_sub(required_bytes));
         }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&note);
     }
     out
 }

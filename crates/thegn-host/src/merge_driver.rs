@@ -195,13 +195,12 @@ pub(crate) fn drive_queue(
             attempt: |branch: &str, location: &thegn_core::remote::GitLoc| {
                 if let thegn_core::remote::GitLoc::Local(worktree) = location {
                     let ref_name = format!("refs/heads/{branch}");
-                    let oid =
-                        util::git_out(worktree, &["rev-parse", &ref_name]).ok_or_else(|| {
-                            anyhow::anyhow!("could not resolve queued branch {ref_name}")
-                        })?;
-                    expected_oids
-                        .borrow_mut()
-                        .insert(worktree.to_string_lossy().into_owned(), oid);
+                    let key = worktree.to_string_lossy().into_owned();
+                    if let Some(oid) = util::git_out(repo_root, &["rev-parse", &ref_name]) {
+                        expected_oids.borrow_mut().insert(key, oid);
+                    } else {
+                        expected_oids.borrow_mut().remove(&key);
+                    }
                 }
                 integrate::attempt_land(cfg, repo_root, branch, location)
             },
@@ -212,9 +211,12 @@ pub(crate) fn drive_queue(
                     );
                 };
                 let expected = expected_oids.borrow().get(worktree).cloned();
-                if let Err(reason) =
-                    verify_fixer_checkout(repo_root, worktree, branch, expected.as_deref())
-                {
+                if let Err(reason) = verify_fixer_checkout_for_dispatch(
+                    repo_root,
+                    worktree,
+                    branch,
+                    expected.as_deref(),
+                ) {
                     return crate::agent_run::AgentDispatch::InfraHold(format!(
                         "worktree identity drift: {reason}"
                     ));
@@ -303,6 +305,17 @@ fn verify_fixer_checkout(
         }
     }
     Ok(())
+}
+
+fn verify_fixer_checkout_for_dispatch(
+    repo_root: &Path,
+    worktree: &str,
+    branch: &str,
+    expected_oid: Option<&str>,
+) -> Result<(), String> {
+    let expected_oid =
+        expected_oid.ok_or_else(|| "queued candidate OID unavailable".to_string())?;
+    verify_fixer_checkout(repo_root, worktree, branch, Some(expected_oid))
 }
 
 /// Private injection points exercise the actual loop without launching Git or
@@ -1127,6 +1140,11 @@ mod tests {
             let feat_oid = out(&feat_wt, &["rev-parse", "HEAD"]);
             verify_fixer_checkout(&root, feat_wt.to_str().unwrap(), "feat", Some(&feat_oid))
                 .unwrap();
+            assert_eq!(
+                verify_fixer_checkout_for_dispatch(&root, feat_wt.to_str().unwrap(), "feat", None)
+                    .unwrap_err(),
+                "queued candidate OID unavailable"
+            );
 
             let main_oid = out(&root, &["rev-parse", "HEAD"]);
             assert!(
@@ -1167,6 +1185,27 @@ mod tests {
                 !sentinel.exists(),
                 "identity drift must not launch the fixer"
             );
+            assert_eq!(db.list_merge_queue().unwrap()[0].agent_attempts, 0);
+        }
+
+        #[test]
+        fn missing_queued_branch_is_a_gate_error_not_a_branch_failure() {
+            let (_fixture, root, feat_wt) = conflicting_repo("missing-branch");
+            let db = Db::open_memory().unwrap();
+            let queued = item(&db, &feat_wt);
+            git(&root, &["update-ref", "-d", "refs/heads/feat"]);
+
+            let outcome = drive_queue(
+                &cfg(FIXER, 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+
+            assert_eq!(outcome.gate_error, ["feat"]);
+            assert!(outcome.needs_human.is_empty());
             assert_eq!(db.list_merge_queue().unwrap()[0].agent_attempts, 0);
         }
 
