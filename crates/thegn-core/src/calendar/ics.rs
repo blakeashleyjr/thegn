@@ -670,6 +670,10 @@ pub fn parse_ics_window_reported(
                     }
                     event_depth = None;
                     match cur.take() {
+                        Some(b) if b.quarantined => {
+                            report.record(IcsDiagnostic::InvalidEvent);
+                            meter.abandon_event();
+                        }
                         Some(b) if window.is_some_and(|w| !b.may_occur_in(w, default_zone)) => {
                             meter.abandon_event();
                         }
@@ -1159,6 +1163,9 @@ fn multi_time(line: &ContentLine) -> Option<Vec<EventTime>> {
     };
     let mut out = Vec::new();
     for v in line.value.split(',') {
+        if v.trim().is_empty() {
+            continue;
+        }
         one.value.clear();
         one.value.push_str(v.trim());
         out.push(parse_time(&one, "")?);

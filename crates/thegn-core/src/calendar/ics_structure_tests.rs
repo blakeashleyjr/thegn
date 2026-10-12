@@ -226,7 +226,17 @@ fn duration_parser_accepts_rfc_units_and_rejects_malformed_or_overflowing_values
         parse_duration("-PT30S"),
         Some(chrono::Duration::seconds(-30))
     );
-    for invalid in ["", "P", "P1", "P1DT", "PT", "P1D1D", "P1WD", "PT1M1H"] {
+    for invalid in [
+        "",
+        "P",
+        "P1",
+        "P1DT",
+        "PT",
+        "P1D1D",
+        "P1WD",
+        "PT1M1H",
+        "P1DT1HT1M",
+    ] {
         assert!(parse_duration(invalid).is_none(), "accepted {invalid:?}");
     }
     assert!(parse_duration("PT9223372036854775807S").is_none());
@@ -250,6 +260,21 @@ fn invalid_exdate_member_quarantines_instead_of_reappearing() {
     assert!(events.is_empty());
     assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
     assert_legacy_matches(&input, &events);
+}
+
+#[test]
+fn empty_exdate_members_are_skipped() {
+    for exdate in ["20261013T090000Z,", ",20261013T090000Z,,", ""] {
+        let input = one_event(&format!(
+            "UID:x\nDTSTART:20261012T090000Z\nRRULE:FREQ=DAILY\nEXDATE:{exdate}"
+        ));
+        let (events, report) = parse_report(&input);
+        assert_eq!(events.len(), 1, "EXDATE {exdate:?}");
+        assert!(
+            !report.diagnostics().contains(&IcsDiagnostic::InvalidEvent),
+            "EXDATE {exdate:?}"
+        );
+    }
 }
 
 #[test]
