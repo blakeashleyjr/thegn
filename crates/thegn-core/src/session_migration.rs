@@ -830,14 +830,15 @@ mod tests {
                 .unwrap()
                 .contains_key("chunk_scope")
         );
-        legacy_json["dispatches"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("chunk_scope");
         let legacy: MigrationBundle = serde_json::from_value(legacy_json).unwrap();
 
         assert_eq!(legacy.dispatches[0].chunk_scope, None);
         assert_eq!(legacy.fingerprint(), current.fingerprint());
+        assert!(
+            !serde_json::to_string(&FingerprintMaterial::from_bundle(&legacy))
+                .unwrap()
+                .contains("chunk_scope")
+        );
 
         current.dispatches[0].chunk_scope = Some(r#"{"v":1,"files":["src/**"]}"#.into());
         assert_ne!(legacy.fingerprint(), current.fingerprint());
