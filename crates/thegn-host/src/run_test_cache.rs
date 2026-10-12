@@ -17,6 +17,12 @@ impl TestCacheLoad {
         self.seq
     }
 
+    pub(crate) fn is_pending(&self, worktree: &str) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|(pending_worktree, _)| pending_worktree == worktree)
+    }
+
     pub(crate) fn accept(
         &mut self,
         worktree: &str,
@@ -42,6 +48,9 @@ impl TestCacheLoad {
     /// Claim the synchronous path used by Tests entry and explicit run start.
     /// A previously applied cache is already at least as current as SQLite.
     pub(crate) fn begin_sync(&mut self, worktree: &str) -> bool {
+        if self.is_pending(worktree) {
+            return false;
+        }
         self.pending = None;
         self.loaded_for.as_deref() != Some(worktree)
     }

@@ -206,7 +206,7 @@ fn issue_branch_tail_prefers_hint_then_slugifies() {
 }
 
 #[test]
-fn test_cache_load_fence_rejects_old_switches_and_sync_path_results() {
+fn test_cache_load_fence_rejects_old_switches_and_preserves_pending_sync() {
     let mut fence = super::run_test_cache::TestCacheLoad::default();
     let mut ui = crate::panel::PanelUi::default();
 
@@ -223,10 +223,61 @@ fn test_cache_load_fence_rejects_old_switches_and_sync_path_results() {
     assert!(fence.accept("/wt/a", a_last, "/wt/a", &mut ui, None));
 
     let late = fence.begin_switch("/wt/a");
-    assert!(fence.begin_sync("/wt/a"));
-    fence.finish_sync("/wt/a");
-    assert!(!fence.accept("/wt/a", late, "/wt/a", &mut ui, None));
     assert!(!fence.begin_sync("/wt/a"));
+    assert!(fence.accept("/wt/a", late, "/wt/a", &mut ui, None));
+    assert!(!fence.begin_sync("/wt/a"));
+}
+
+#[test]
+fn test_run_waits_for_pending_cache_then_overwrites_cached_status() {
+    use crate::testkit::model::{TestNode, TestNodeKind, TestRunRec, TestState};
+
+    let mut fence = super::run_test_cache::TestCacheLoad::default();
+    let mut ui = crate::panel::PanelUi::default();
+    let seq = fence.begin_switch("/wt/a");
+    let cached = crate::panel::TestCache {
+        nodes: vec![TestNode {
+            id: "unit::case".into(),
+            label: "case".into(),
+            depth: 0,
+            kind: TestNodeKind::Test,
+            state: TestState::Pass,
+            location: None,
+            message: None,
+            placeholder: false,
+        }],
+        history: vec![TestRunRec {
+            passed: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let run_result = TestNode {
+        id: "unit::case".into(),
+        label: "case".into(),
+        depth: 0,
+        kind: TestNodeKind::Test,
+        state: TestState::Fail,
+        location: None,
+        message: None,
+        placeholder: false,
+    };
+    let mut deferred = Vec::new();
+
+    if fence.is_pending("/wt/a") {
+        deferred.push(run_result);
+    } else {
+        ui.tests.merge_results(&[run_result]);
+    }
+    assert!(ui.tests.nodes.is_empty());
+    assert_eq!(deferred.len(), 1);
+
+    assert!(fence.accept("/wt/a", seq, "/wt/a", &mut ui, Some(cached)));
+    for result in deferred {
+        ui.tests.merge_results(&[result]);
+    }
+    assert_eq!(ui.tests.history.len(), 1);
+    assert_eq!(ui.tests.nodes[0].state, TestState::Fail);
 }
 
 #[test]

@@ -5301,13 +5301,13 @@ fn sync_tests_for_worktree(
     cache_load: &mut run_test_cache::TestCacheLoad,
 ) {
     let key = worktree.to_string_lossy();
-    if cache_load.begin_sync(&key) {
-        if let Ok(db) = thegn_core::db::Db::open() {
-            if let Some(cache) = run_test_cache::load_test_cache(&db, &key) {
-                ui.tests.apply_cache(cache);
-            }
-            cache_load.finish_sync(&key);
+    if cache_load.begin_sync(&key)
+        && let Ok(db) = thegn_core::db::Db::open()
+    {
+        if let Some(cache) = run_test_cache::load_test_cache(&db, &key) {
+            ui.tests.apply_cache(cache);
         }
+        cache_load.finish_sync(&key);
     }
     if detect && ui.tests.task.is_none() {
         ui.tests.task = crate::task::detect_test_task(worktree, cfg);
@@ -6791,6 +6791,8 @@ async fn event_loop<T: Terminal>(
     let mut named_task_generation: u64 = 0;
     let mut loaded_tests_worktree = String::new();
     let mut test_cache_load = run_test_cache::TestCacheLoad::default();
+    let mut deferred_test_discoveries = Vec::new();
+    let mut deferred_test_runs = Vec::new();
     // Bounds concurrent test/discovery jobs across worktrees so explicit runs
     // can't collectively pin the machine. thegn never auto-runs tests.
     let test_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
@@ -6812,7 +6814,7 @@ async fn event_loop<T: Terminal>(
     let mut panel_cols_pref: Option<usize> = None;
     let startup_db = thegn_core::db::Db::open().ok();
     if let Some(db) = startup_db.as_ref() {
-        sb.load(&db, SIDEBAR_SCOPE);
+        sb.load(db, SIDEBAR_SCOPE);
         // The persisted sidebar mode (full/rail/hidden) survives restart.
         want_sidebar = sb.mode != crate::layout::SidebarMode::Hidden;
         for (key, value) in db.ui_state_in_scope("panel").unwrap_or_default() {
@@ -7059,8 +7061,6 @@ async fn event_loop<T: Terminal>(
     // box for its stage columns, and as the tenth tab it was unreachable by
     // digit on a machine that showed every metric family.
     let mut board: Option<crate::pipeline_board::PipelineBoard> = None;
-    // Seeded from config + `ui_state` once `current_config` exists, below.
-    let mut monitor_prefs: crate::monitor::MonitorPrefs;
     // When the pipeline board's roster was last sampled. `None` until the
     // one-shot seed, which is what lets the (otherwise hidden) Pipeline tab
     // discover it has rows to show. See the sampler beside the stats drain.
@@ -9577,9 +9577,28 @@ async fn event_loop<T: Terminal>(
             }
             dirty = true;
         }
-        while let Ok(d) = test_discovery_rx.try_recv() {
+        while let Ok((worktree, seq, cache)) = test_cache_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            if test_cache_load.accept(&worktree, seq, &loaded_tests_worktree, &mut panel_ui, cache)
+            {
+                dirty = true;
+            }
+        }
+        let ready_discoveries = if test_cache_load.is_pending(&loaded_tests_worktree) {
+            Vec::new()
+        } else {
+            std::mem::take(&mut deferred_test_discoveries)
+        };
+        for d in ready_discoveries
+            .into_iter()
+            .chain(std::iter::from_fn(|| test_discovery_rx.try_recv().ok()))
+        {
             loop_perf.tick(crate::perf::WakeSource::Other);
             if d.generation == test_generation && d.worktree == loaded_tests_worktree {
+                if test_cache_load.is_pending(&d.worktree) {
+                    deferred_test_discoveries.push(d);
+                    continue;
+                }
                 panel_ui.tests.discovering = false;
                 panel_ui.tests.task = Some(d.task);
                 if let Some(err) = d.error {
@@ -9589,13 +9608,6 @@ async fn event_loop<T: Terminal>(
                     panel_ui.tests.summary.error = None;
                 }
                 persist_tests_for_worktree(&panel_ui, &d.worktree);
-                dirty = true;
-            }
-        }
-        while let Ok((worktree, seq, cache)) = test_cache_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Other);
-            if test_cache_load.accept(&worktree, seq, &loaded_tests_worktree, &mut panel_ui, cache)
-            {
                 dirty = true;
             }
         }
@@ -9803,9 +9815,21 @@ async fn event_loop<T: Terminal>(
         }
         // Run results: the latest run upserts each reported test's status while
         // leaving other tests' most-recent status intact.
-        while let Ok(outcome) = test_run_rx.try_recv() {
+        let ready_runs = if test_cache_load.is_pending(&loaded_tests_worktree) {
+            Vec::new()
+        } else {
+            std::mem::take(&mut deferred_test_runs)
+        };
+        for outcome in ready_runs
+            .into_iter()
+            .chain(std::iter::from_fn(|| test_run_rx.try_recv().ok()))
+        {
             loop_perf.tick(crate::perf::WakeSource::Other);
             if outcome.generation == test_generation && outcome.worktree == loaded_tests_worktree {
+                if test_cache_load.is_pending(&outcome.worktree) {
+                    deferred_test_runs.push(outcome);
+                    continue;
+                }
                 panel_ui.tests.running = false;
                 panel_ui.tests.task = Some(outcome.task.clone());
                 panel_ui
