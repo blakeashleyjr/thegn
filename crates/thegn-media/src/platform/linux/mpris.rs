@@ -453,10 +453,14 @@ impl MediaBackend for MprisZbus {
                 .map_err(|e| MediaError::Backend(e.to_string()))?;
             // A failed or unparseable read must not be turned into `false` and
             // written back as `true`.
-            let read = proxy
-                .get(iface.clone(), "Fullscreen")
-                .await
-                .map_err(|e| MediaError::Backend(format!("read Fullscreen: {e}")))?;
+            let read = proxy.get(iface.clone(), "Fullscreen").await.map_err(|e| {
+                let message = format!("read Fullscreen: {e}");
+                if is_missing_property_error(&e) {
+                    MediaError::Unsupported(message)
+                } else {
+                    MediaError::Backend(message)
+                }
+            })?;
             let cur = bool::try_from(read).ok();
             let next = toggled_fullscreen(cur)?;
             proxy
@@ -523,11 +527,16 @@ impl MediaWatch for MprisWatch {
 // === pure decoders =========================================================
 
 /// The tail after the `org.mpris.MediaPlayer2.` prefix (the player's short name).
-/// Next volume for a relative step. `None` (the read failed or the player does
-/// not expose `Volume`) is an error: never synthesize a base value and write it.
+fn tail(bus: &str) -> &str {
+    bus.strip_prefix(MPRIS_PREFIX).unwrap_or(bus)
+}
+
+/// Next volume for a relative step. A missing or non-finite read is an error:
+/// never synthesize a base value and write it.
 fn stepped_volume(current: Option<f64>, delta: f64) -> Result<f64, MediaError> {
-    let cur = current
-        .ok_or_else(|| MediaError::Unsupported("player did not report a Volume".to_string()))?;
+    let cur = current.filter(|value| value.is_finite()).ok_or_else(|| {
+        MediaError::Unsupported("player did not report a finite Volume".to_string())
+    })?;
     Ok((cur + delta).clamp(0.0, 1.0))
 }
 
@@ -539,8 +548,18 @@ fn toggled_fullscreen(current: Option<bool>) -> Result<bool, MediaError> {
         .ok_or_else(|| MediaError::Backend("Fullscreen state unreadable".to_string()))
 }
 
-fn tail(bus: &str) -> &str {
-    bus.strip_prefix(MPRIS_PREFIX).unwrap_or(bus)
+fn is_missing_property_error(error: &zbus::Error) -> bool {
+    match error {
+        zbus::Error::MethodError(name, _, _) => matches!(
+            name.as_str(),
+            "org.freedesktop.DBus.Error.UnknownProperty" | "org.freedesktop.DBus.Error.InvalidArgs"
+        ),
+        zbus::Error::FDO(error) => matches!(
+            error.as_ref(),
+            zbus::fdo::Error::UnknownProperty(_) | zbus::fdo::Error::InvalidArgs(_)
+        ),
+        _ => false,
+    }
 }
 
 /// Pick which player to show from the present `candidates` (each a sorted
@@ -747,6 +766,8 @@ mod tests {
     #[test]
     fn volume_step_requires_a_read_value() {
         assert!(stepped_volume(None, 0.1).is_err());
+        assert!(stepped_volume(Some(f64::NAN), 0.1).is_err());
+        assert!(stepped_volume(Some(f64::INFINITY), 0.1).is_err());
         assert_eq!(stepped_volume(Some(0.5), 0.1).unwrap(), 0.6);
         assert_eq!(stepped_volume(Some(0.95), 0.1).unwrap(), 1.0);
         assert_eq!(stepped_volume(Some(0.05), -0.1).unwrap(), 0.0);
@@ -755,8 +776,8 @@ mod tests {
     #[test]
     fn fullscreen_toggle_requires_a_read_value() {
         assert!(toggled_fullscreen(None).is_err());
-        assert_eq!(toggled_fullscreen(Some(false)).unwrap(), true);
-        assert_eq!(toggled_fullscreen(Some(true)).unwrap(), false);
+        assert!(toggled_fullscreen(Some(false)).unwrap());
+        assert!(!toggled_fullscreen(Some(true)).unwrap());
     }
 
     #[test]
