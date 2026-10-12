@@ -96,20 +96,27 @@ fn remember_generation_noop(
 /// build output, which is the cost this whole gate exists to remove.
 const FORCE_WALK_AFTER_SECS: i64 = 86_400;
 
-fn lazy_skip(cached_at: i64, last_walk: Option<i64>, now: i64, quiet: bool) -> bool {
+fn lazy_skip(cached_at: i64, last_walk: i64, now: i64, quiet: bool) -> bool {
     if cached_at <= 0 {
         return false;
     }
-    let last_walk = last_walk.unwrap_or(cached_at);
     quiet && now.saturating_sub(last_walk) < FORCE_WALK_AFTER_SECS
 }
 
-fn last_walk_at(path: &std::path::Path, cached_at: i64) -> Option<i64> {
+fn last_walk_at(path: &std::path::Path, cached_at: i64) -> i64 {
     let mut last_walk = LAST_WALK
         .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Some(*last_walk.entry(path.to_path_buf()).or_insert(cached_at))
+    *last_walk.entry(path.to_path_buf()).or_insert(cached_at)
+}
+
+fn forget_last_walk(path: &std::path::Path) {
+    LAST_WALK
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(path);
 }
 
 fn remember_walk(path: &std::path::Path, walked_at: i64) {
@@ -220,6 +227,7 @@ pub(crate) fn spawn_scan(
                 // Vanished since the registry row was written — drop any stale
                 // size so the badge clears instead of freezing at its last value.
                 let _ = db.delete_worktree_disk(path_s); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                forget_last_walk(path);
                 measured += 1;
                 continue;
             }
@@ -847,11 +855,11 @@ mod generation_tests {
         let now = 200_000;
         assert!(!lazy_skip(
             now - 60,
-            Some(now - FORCE_WALK_AFTER_SECS - 1),
+            now - FORCE_WALK_AFTER_SECS - 1,
             now,
             true,
         ));
-        assert!(lazy_skip(now - 60, Some(now - 60), now, true));
+        assert!(lazy_skip(now - 60, now - 60, now, true));
     }
 
     #[test]
