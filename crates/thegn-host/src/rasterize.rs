@@ -146,11 +146,6 @@ pub(crate) fn image_file_with_limits(
     decode_and_fit(&bytes, limits)
 }
 
-/// Decode encoded image `bytes` (e.g. cover art fetched over HTTP) to RGBA.
-pub fn image_bytes(bytes: &[u8]) -> Result<Raster, String> {
-    decode_and_fit(bytes, PREVIEW_LIMITS)
-}
-
 /// Decode bytes with caller-chosen limits (cover art uses the tighter budget).
 pub(crate) fn image_bytes_with_limits(
     bytes: &[u8],
