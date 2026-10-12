@@ -84,6 +84,8 @@ struct Inner {
     cv: Condvar,
     metrics_deferrals: AtomicU64,
     clipboard_retry: AtomicBool,
+    oob_retry: AtomicBool,
+    oob_pressure_logged: AtomicBool,
 }
 
 pub(crate) struct FrameWriter {
@@ -125,6 +127,8 @@ impl FrameWriter {
             cv: Condvar::new(),
             metrics_deferrals: AtomicU64::new(0),
             clipboard_retry: AtomicBool::new(false),
+            oob_retry: AtomicBool::new(false),
+            oob_pressure_logged: AtomicBool::new(false),
         });
         let handle = (!sync).then(|| {
             let inner = Arc::clone(&inner);
@@ -181,12 +185,21 @@ impl FrameWriter {
     /// message with a warning; it never makes the compositor fatal.
     pub(crate) fn submit_oob(&self, bytes: Vec<u8>) {
         if let Err(bytes) = self.try_submit_oob(bytes) {
-            tracing::warn!(
-                bytes = bytes.len(),
-                count_limit = OOB_QUEUE_COUNT,
-                byte_limit = OOB_QUEUE_BYTES,
-                "terminal OOB admission refused; dropping message"
-            );
+            if self.inner.oob_pressure_logged.swap(true, Ordering::SeqCst) {
+                tracing::debug!(
+                    bytes = bytes.len(),
+                    count_limit = OOB_QUEUE_COUNT,
+                    byte_limit = OOB_QUEUE_BYTES,
+                    "terminal OOB admission refused during existing pressure episode; dropping message"
+                );
+            } else {
+                tracing::warn!(
+                    bytes = bytes.len(),
+                    count_limit = OOB_QUEUE_COUNT,
+                    byte_limit = OOB_QUEUE_BYTES,
+                    "terminal OOB admission refused; dropping message"
+                );
+            }
         }
     }
 
@@ -205,8 +218,12 @@ impl FrameWriter {
             || q.oob_in_flight >= OOB_QUEUE_COUNT
             || bytes.len() > OOB_QUEUE_BYTES.saturating_sub(q.oob_bytes)
         {
+            self.inner.oob_retry.store(true, Ordering::SeqCst);
             return Err(bytes);
         }
+        self.inner
+            .oob_pressure_logged
+            .store(false, Ordering::SeqCst);
         q.oob_in_flight += 1;
         q.oob_bytes += bytes.len();
         q.msgs.push_back(Msg::Oob(bytes));
@@ -409,7 +426,7 @@ fn writer_main(inner: &Inner, waker: &TerminalWaker) {
             wake_loop(waker, "clipboard capacity released");
         }
         let (errored, released_oob) = write_message(inner, msg, write_and_flush);
-        if errored || released_oob {
+        if errored || oob_capacity_wake_requested(inner, released_oob) {
             wake_loop(waker, "writer state changed");
         }
     }
@@ -422,6 +439,10 @@ fn wake_loop(waker: &TerminalWaker, reason: &'static str) {
     if let Err(error) = waker.wake() {
         tracing::trace!(?error, reason, "terminal writer wake failed");
     }
+}
+
+fn oob_capacity_wake_requested(inner: &Inner, released_oob: bool) -> bool {
+    released_oob && inner.oob_retry.swap(false, Ordering::SeqCst)
 }
 
 /// One message, with the sink injected for isolated boundary tests. Queue locks
@@ -540,6 +561,8 @@ mod tests {
                 cv: Condvar::new(),
                 metrics_deferrals: AtomicU64::new(0),
                 clipboard_retry: AtomicBool::new(false),
+                oob_retry: AtomicBool::new(false),
+                oob_pressure_logged: AtomicBool::new(false),
             }),
             handle: None,
             sync: false,
@@ -623,9 +646,10 @@ mod tests {
         assert_eq!(writer.take_metrics().unwrap().completion_us.count(), 1);
         let (errored, released_oob) = write_message(&writer.inner, Msg::Oob(vec![2]), |_| Ok(()));
         assert!(!errored);
+        assert!(released_oob, "completed OOB write must release capacity");
         assert!(
-            released_oob,
-            "completed OOB write must request a capacity wake"
+            !oob_capacity_wake_requested(&writer.inner, released_oob),
+            "capacity release without a refused submission must not wake the loop"
         );
         let metrics = writer.take_metrics().unwrap();
         assert_eq!(metrics.completion_us.count(), 0);
@@ -702,17 +726,44 @@ mod tests {
         assert_eq!(refusing.take_status(), WriterStatus::Ok);
         let refused = refusing.try_submit_oob(vec![3]).unwrap_err();
         assert_eq!(refused, vec![3]);
+        assert!(refusing.inner.oob_retry.load(Ordering::SeqCst));
 
         let release_writer = test_writer();
         assert!(release_writer.try_submit_oob(vec![9]).is_ok());
         let active = pop_message(&mut release_writer.inner.q.lock().unwrap()).unwrap();
         let (errored, released) = write_message(&release_writer.inner, active, |_| Ok(()));
         assert!(!errored);
-        assert!(
-            released,
-            "completed OOB write must release capacity and wake the loop"
-        );
+        assert!(released, "completed OOB write must release capacity");
+        assert!(!oob_capacity_wake_requested(
+            &release_writer.inner,
+            released
+        ));
         assert!(release_writer.try_submit_oob(vec![4]).is_ok());
+    }
+
+    #[test]
+    fn oob_pressure_warns_once_and_refusal_wakes_on_capacity_release() {
+        let writer = test_writer();
+        for _ in 0..OOB_QUEUE_COUNT {
+            assert!(writer.try_submit_oob(vec![1]).is_ok());
+        }
+        assert_eq!(writer.try_submit_oob(vec![2]), Err(vec![2]));
+        assert!(writer.inner.oob_retry.load(Ordering::SeqCst));
+
+        writer.submit_oob(vec![3]);
+        assert!(writer.inner.oob_pressure_logged.load(Ordering::SeqCst));
+        writer.submit_oob(vec![4]);
+        assert!(writer.inner.oob_pressure_logged.load(Ordering::SeqCst));
+
+        let active = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        let (errored, released) = write_message(&writer.inner, active, |_| Ok(()));
+        assert!(!errored);
+        assert!(released);
+        assert!(oob_capacity_wake_requested(&writer.inner, released));
+        assert!(!writer.inner.oob_retry.load(Ordering::SeqCst));
+
+        assert!(writer.try_submit_oob(vec![5]).is_ok());
+        assert!(!writer.inner.oob_pressure_logged.load(Ordering::SeqCst));
     }
 
     #[test]
