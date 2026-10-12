@@ -221,7 +221,6 @@ fn bounded_sanitize(s: &str, max_bytes: usize, max_lines: usize) -> String {
     out
 }
 
-/// Prevent task and target text from imitating recovery or contract markers.
 /// Neutralize text that could imitate generated recovery or completion
 /// markers before it is interpolated into an authority-bearing prompt.
 ///
