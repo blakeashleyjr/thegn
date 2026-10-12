@@ -35,14 +35,14 @@ flag and is reported as unsafe. Every TCP request remains token-gated.
 Every token holds a scope set (csv in `pairings.scope`). The verb→scope table
 is `thegn_core::control::required_scope` — the single tested policy source.
 
-| Scope       | Grants                                                                                   |
-| ----------- | ---------------------------------------------------------------------------------------- |
-| `read`      | list sessions/leases, snapshots, `/v1/me`, event feed, git status, bounded preview fetch |
-| `write`     | open/attach/detach/kill sessions, terminal input, resize, open-worktree                  |
-| `git`       | stage + commit through the GitBackend seam (implies read, **not** write)                 |
-| `exec`      | run a trusted configured tool or launch preset (implies read, not write or git)          |
-| `merge_add` | enqueue a worktree for merge (implies read; independent of write and git)                |
-| `admin`     | pairing management, daemon shutdown (implies everything)                                 |
+| Scope       | Grants                                                                                              |
+| ----------- | --------------------------------------------------------------------------------------------------- |
+| `read`      | list sessions/leases, snapshots, `/v1/me`, event feed, git status, bounded preview fetch            |
+| `write`     | open/attach/detach/kill sessions, terminal input, resize, open-worktree (implies read)              |
+| `git`       | stage + commit through the GitBackend seam (implies read, **not** write); also allows merge enqueue |
+| `exec`      | run a trusted configured tool or launch preset (implies read, not write or git)                     |
+| `merge_add` | enqueue a worktree for merge (no read surface; independent of write and git)                        |
+| `admin`     | pairing management, daemon shutdown (implies everything)                                            |
 
 `git`, `write`, and `exec` are independent: a companion that can commit must
 not be able to type into terminals or execute configured tools. Read-only
@@ -144,19 +144,18 @@ bytes, `seq`), `Activity` (JSON), `Lease` (opened/refreshed/released/reaped),
 `Pairing` (requested/approved/revoked), `Sessions` (re-list), `SessionExit`,
 and opt-in `Lagged { missed }`.
 
-The generic event subscription parser accepts the bounded `kinds` vocabulary
-(`hello`, `snapshot`, `delta`, `activity`, `lease`, `pairing`, `sessions`,
-`exit`, `lagged`) and an optional session id. Generic HTTP/WS/SSE broadcasts do
-not carry `snapshot` or `delta` frames in v1, so those two filters currently
-match nothing there; snapshots/deltas are available only on a session attach
-stream. The accepted-but-empty generic filters are tracked contract debt, not
-a client bootstrap mechanism. Filters are applied independently after the
+The generic event subscription parser accepts only the bounded `kinds`
+vocabulary (`activity`, `lease`, `pairing`, `sessions`, `exit`) and an optional
+session id. Pane kinds such as `snapshot` and `delta` are rejected as
+`bad_request` (or gRPC `invalid_argument`); snapshots and deltas are available
+only on a session attach stream. Filters are applied independently after the
 shared broadcast and can only narrow the read-scoped feed; omitted filters
 retain the legacy full feed. Unknown or empty kinds and overlong session ids
-are rejected as `bad_request` (or gRPC `invalid_argument`). A connection that
-sets `signal_lag=1` receives a `Lagged` marker with the count skipped and then
-continues; connections that omit it retain the legacy silent skip. These are
-additive v1 fields and do not change `PROTO_VERSION`.
+are also rejected as `bad_request` (or gRPC `invalid_argument`). A connection
+that opts in with `signal_lag=1` receives a `Lagged` marker with the count
+skipped and then continues; `Lagged` is not a `kinds` value. Connections that
+omit `signal_lag` retain the legacy silent skip. These are additive v1 fields
+and do not change `PROTO_VERSION`.
 
 Warm-attach contract: the snapshot at `seq` folds all output through `seq`;
 the first live delta carries `seq + 1` — no gap, no overlap. A slow consumer
@@ -191,6 +190,7 @@ HTTP errors use the additive envelope `{ "error": "<message>", "code":
 "<code>" }`. The `error` message and HTTP status retain their existing
 behavior; `code` is a stable identifier from the closed vocabulary
 `not_found`, `no_scope`, `conflict`, `unimplemented`, `internal`,
-`unauthorized`, or `bad_request`. Clients should branch on `code` rather than
-human-readable prose. Older servers that omit `code` remain readable by
-clients, which treat it as absent.
+`unauthorized`, `bad_request`, `failed_precondition`, `resource_exhausted`,
+or `unavailable`. Clients should branch on `code` rather than human-readable
+prose. Older servers that omit `code` remain readable by clients, which treat
+it as absent.
