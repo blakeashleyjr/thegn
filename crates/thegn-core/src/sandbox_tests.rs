@@ -1702,6 +1702,79 @@ fn identify_orphans_spares_vpn_sidecar_and_profile_containers_of_live_worktrees(
 }
 
 #[test]
+fn identify_orphans_spares_compose_service_containers_of_live_worktrees() {
+    let active = vec!["/wt/feat".to_string()];
+    let containers = vec![
+        format!("{}-dev-1", container_name("/wt/feat")),
+        format!("{}_dev_1", container_name("/wt/feat")),
+        format!(
+            "{}-db-2",
+            container_name_with_profile("/wt/feat", Some("sealed"))
+        ),
+        format!("{}-dev-1", container_name("/wt/dead")),
+    ];
+    let orphans = identify_orphans(&active, &containers);
+    assert_eq!(
+        orphans,
+        vec![format!("{}-dev-1", container_name("/wt/dead"))]
+    );
+}
+
+#[test]
+fn compose_down_argv_uses_the_selected_oci_context() {
+    use crate::sandbox_compose::down_argv_for;
+
+    assert_eq!(
+        down_argv_for(Backend::Docker, None, "thegn-wt-feat").unwrap(),
+        [
+            "docker",
+            "compose",
+            "-p",
+            "thegn-wt-feat",
+            "down",
+            "--remove-orphans"
+        ]
+    );
+    assert_eq!(
+        down_argv_for(Backend::PodmanRootful, None, "proj").unwrap(),
+        [
+            "sudo",
+            "-n",
+            "podman",
+            "compose",
+            "-p",
+            "proj",
+            "down",
+            "--remove-orphans"
+        ]
+    );
+    assert_eq!(
+        down_argv_for(Backend::Podman, None, "proj").unwrap()[..2],
+        ["podman", "compose"]
+    );
+    let remote = down_argv_for(Backend::Docker, Some("ssh://user@host"), "proj").unwrap();
+    let prefix = oci_prefix_for(Backend::Docker, Some("ssh://user@host"));
+    assert_eq!(&remote[..prefix.len()], prefix.as_slice());
+    for backend in [Backend::Apple, Backend::Smol, Backend::Bwrap] {
+        assert_eq!(down_argv_for(backend, None, "proj"), None);
+    }
+}
+
+#[test]
+fn teardown_argvs_include_compose_project_down() {
+    let name = container_name("/wt/feat");
+    let commands = teardown_argvs(Backend::Docker, None, &name);
+    assert!(commands.contains(&vec![
+        "docker".into(),
+        "compose".into(),
+        "-p".into(),
+        name,
+        "down".into(),
+        "--remove-orphans".into(),
+    ]));
+}
+
+#[test]
 fn wrap_script_skips_exec_for_or_and_pipe_fallbacks() {
     // A `||` fallback (`claude --resume || claude`) must run directly, NOT
     // as `exec …` — a failed `exec` (command not found) would exit the shell
@@ -1949,7 +2022,12 @@ fn stale_env_file_sweep_removes_only_old_env_entries_without_following_links() {
         .set_modified(now - Duration::from_secs(120))
         .unwrap();
     assert_eq!(
-        sweep_stale_env_files_in(&dir, now, Duration::from_secs(60)),
+        sweep_stale_env_files_in(
+            parent.path(),
+            std::path::Path::new("sandbox-env"),
+            now,
+            Duration::from_secs(60)
+        ),
         1
     );
     assert!(!old.exists());
@@ -1971,7 +2049,12 @@ fn stale_env_file_sweep_unlinks_symlink_but_preserves_target() {
     std::fs::write(&victim, b"canary").unwrap();
     symlink(&victim, &link).unwrap();
     assert_eq!(
-        sweep_stale_env_files_in(&dir, SystemTime::now(), Duration::from_secs(1)),
+        sweep_stale_env_files_in(
+            parent.path(),
+            std::path::Path::new("sandbox-env"),
+            SystemTime::now(),
+            Duration::from_secs(1)
+        ),
         1
     );
     assert!(!link.exists());
@@ -1991,7 +2074,12 @@ fn stale_env_file_sweep_does_not_traverse_symlinked_directory() {
     std::fs::write(&old, b"keep").unwrap();
     symlink(&outside, &link).unwrap();
     assert_eq!(
-        sweep_stale_env_files_in(&link, SystemTime::now(), Duration::ZERO),
+        sweep_stale_env_files_in(
+            parent.path(),
+            std::path::Path::new("sandbox-env"),
+            SystemTime::now(),
+            Duration::ZERO
+        ),
         0
     );
     assert!(old.exists());

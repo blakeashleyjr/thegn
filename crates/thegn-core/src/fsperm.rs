@@ -312,6 +312,102 @@ pub struct PrivateDir {
 }
 
 impl PrivateDir {
+    /// Remove stale entries with the requested extension while keeping every
+    /// metadata lookup and unlink anchored to this directory's held handle.
+    /// Symlinks are always removed, directories and special files are kept,
+    /// and regular files are removed only once they reach `max_age`.
+    pub fn remove_stale_files(
+        &self,
+        extension: &str,
+        now: std::time::SystemTime,
+        max_age: std::time::Duration,
+    ) -> usize {
+        let entries = match std::fs::read_dir(&self.path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::debug!(%error, "unable to list pinned private directory entries");
+                return 0;
+            }
+        };
+        let mut removed = 0;
+        for entry in entries {
+            let name = match entry {
+                Ok(entry) => entry.file_name(),
+                Err(error) => {
+                    tracing::debug!(%error, "unable to read private directory entry name");
+                    continue;
+                }
+            };
+            if Path::new(&name)
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                != Some(extension)
+            {
+                continue;
+            }
+            #[cfg(unix)]
+            let stale = {
+                use nix::fcntl::AtFlags;
+                use nix::sys::stat::{SFlag, fstatat};
+
+                let stat = match fstatat(&self.fd, Path::new(&name), AtFlags::AT_SYMLINK_NOFOLLOW) {
+                    Ok(stat) => stat,
+                    Err(error) => {
+                        tracing::debug!(%error, "unable to inspect pinned private directory entry");
+                        continue;
+                    }
+                };
+                let kind = SFlag::from_bits_truncate(stat.st_mode);
+                if kind.contains(SFlag::S_IFLNK) {
+                    true
+                } else if !kind.contains(SFlag::S_IFREG) || stat.st_mtime < 0 {
+                    false
+                } else {
+                    let modified = std::time::SystemTime::UNIX_EPOCH.checked_add(
+                        std::time::Duration::new(stat.st_mtime as u64, stat.st_mtime_nsec as u32),
+                    );
+                    modified
+                        .and_then(|modified| now.duration_since(modified).ok())
+                        .is_some_and(|age| age >= max_age)
+                }
+            };
+            #[cfg(not(unix))]
+            let stale = {
+                let path = self.path.join(&name);
+                match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => true,
+                    Ok(metadata) if metadata.is_file() => metadata
+                        .modified()
+                        .ok()
+                        .and_then(|modified| now.duration_since(modified).ok())
+                        .is_some_and(|age| age >= max_age),
+                    Ok(_) => false,
+                    Err(error) => {
+                        tracing::debug!(%error, "unable to inspect private directory entry");
+                        false
+                    }
+                }
+            };
+            if stale {
+                #[cfg(unix)]
+                let result = {
+                    use nix::unistd::{UnlinkatFlags, unlinkat};
+                    unlinkat(&self.fd, Path::new(&name), UnlinkatFlags::NoRemoveDir)
+                        .map_err(nix_io_error)
+                };
+                #[cfg(not(unix))]
+                let result = std::fs::remove_file(self.path.join(&name));
+                match result {
+                    Ok(()) => removed += 1,
+                    Err(error) => {
+                        tracing::debug!(%error, "unable to remove stale private directory entry");
+                    }
+                }
+            }
+        }
+        removed
+    }
+
     /// Atomically publish owner-only bytes under one filename in this
     /// directory. Publication uses the held directory descriptor and never
     /// resolves an ancestor again.
@@ -791,6 +887,32 @@ mod tests {
             Some(0o600)
         );
         assert!(!outside.path().join("secret.env").exists());
+    }
+
+    #[test]
+    fn private_dir_stale_sweep_stays_anchored_after_parent_replacement() {
+        let anchor = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let dir = ensure_private_dir_beneath(anchor.path(), Path::new("secrets")).unwrap();
+        std::fs::write(anchor.path().join("secrets/old.env"), b"pinned").unwrap();
+        std::fs::write(outside.path().join("old.env"), b"outside").unwrap();
+        let moved = anchor.path().join("secrets_moved");
+        std::fs::rename(anchor.path().join("secrets"), &moved).unwrap();
+        std::os::unix::fs::symlink(outside.path(), anchor.path().join("secrets")).unwrap();
+
+        assert_eq!(
+            dir.remove_stale_files(
+                "env",
+                std::time::SystemTime::now(),
+                std::time::Duration::ZERO,
+            ),
+            1
+        );
+        assert!(!moved.join("old.env").exists());
+        assert_eq!(
+            std::fs::read(outside.path().join("old.env")).unwrap(),
+            b"outside"
+        );
     }
 
     #[test]
