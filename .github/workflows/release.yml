@@ -313,10 +313,11 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --no-tags origin "$TRUSTED_WORKFLOW_SHA"
-          mkdir -p trusted-workflow
+          rm -rf .github/actions/ci-setup
+          mkdir -p .github/actions/ci-setup
           git archive "$TRUSTED_WORKFLOW_SHA" .github/actions/ci-setup \
-            | tar -xf - -C trusted-workflow
-      - uses: ./trusted-workflow/.github/actions/ci-setup
+            | tar -xf -
+      - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           cache-lane: release-package
