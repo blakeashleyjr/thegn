@@ -71,7 +71,8 @@ fn parse_loop(s: &str) -> Option<LoopMode> {
         "" => None,
         "one" | "track" => Some(LoopMode::Track),
         "all" | "playlist" | "true" => Some(LoopMode::Playlist),
-        _ => Some(LoopMode::None), // "off" / "false" / unknown
+        "off" | "false" | "none" => Some(LoopMode::None),
+        _ => None,
     }
 }
 
@@ -115,5 +116,11 @@ mod tests {
         assert_eq!(s.length, None);
         assert_eq!(s.loop_mode, Some(LoopMode::None));
         assert_eq!(s.volume, None);
+    }
+
+    #[test]
+    fn unknown_loop_text_stays_unknown() {
+        let line = "Music\u{1f}playing\u{1f}X\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}weird\u{1f}";
+        assert_eq!(parse_line(line).loop_mode, None);
     }
 }

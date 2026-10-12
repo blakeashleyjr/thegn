@@ -12,12 +12,12 @@ use crate::helper::{self, Limits};
 use crate::model::{LoopMode, MediaKind, MediaState, PlaybackState, Playlist};
 use crate::{MediaBackend, MediaCaps, MediaError};
 
-/// Field separator for the `metadata --format` template. Since metadata may
-/// contain this byte, the parser validates the complete field count and rejects
-/// records whose framing is ambiguous.
+/// Field separator for the `metadata --format` template. `markup_escape` turns
+/// C0 control bytes other than TAB/LF/CR into character references, so metadata
+/// fields cannot contain this raw delimiter.
 const SEP: char = '\u{1f}';
 const FIELDS: usize = 13;
-const FORMAT: &str = "{{playerName}}\u{1f}{{status}}\u{1f}{{title}}\u{1f}{{artist}}\u{1f}{{album}}\u{1f}{{mpris:length}}\u{1f}{{position}}\u{1f}{{shuffle}}\u{1f}{{loopStatus}}\u{1f}{{volume}}\u{1f}{{mpris:artUrl}}\u{1f}{{xesam:url}}\u{1f}{{mpris:trackid}}";
+const FORMAT: &str = "{{markup_escape(playerName)}}\u{1f}{{markup_escape(status)}}\u{1f}{{markup_escape(title)}}\u{1f}{{markup_escape(artist)}}\u{1f}{{markup_escape(album)}}\u{1f}{{markup_escape(mpris:length)}}\u{1f}{{markup_escape(position)}}\u{1f}{{markup_escape(shuffle)}}\u{1f}{{markup_escape(loopStatus)}}\u{1f}{{markup_escape(volume)}}\u{1f}{{markup_escape(mpris:artUrl)}}\u{1f}{{markup_escape(xesam:url)}}\u{1f}{{markup_escape(mpris:trackid)}}";
 
 pub struct MprisCli {
     priority: Vec<String>,
@@ -209,16 +209,19 @@ fn classify_failure(stderr: &[u8]) -> MediaError {
     MediaError::Backend(message.trim().to_string())
 }
 
-/// Parse the `\x1f`-delimited `metadata --format` line into a [`MediaState`].
-/// Every template field must be present; ambiguous framing is rejected atomically.
+/// Parse the escaped, `\x1f`-delimited metadata line atomically.
 fn parse_line(line: &str) -> Result<MediaState, MediaError> {
-    let f: Vec<&str> = line.split(SEP).collect();
-    if f.len() != FIELDS {
+    let encoded: Vec<&str> = line.split(SEP).collect();
+    if encoded.len() != FIELDS {
         return Err(MediaError::Backend(format!(
             "malformed playerctl metadata record ({} fields)",
-            f.len()
+            encoded.len()
         )));
     }
+    let f = encoded
+        .into_iter()
+        .map(unescape_markup)
+        .collect::<Result<Vec<_>, _>>()?;
     let get = |i: usize| f[i].trim();
 
     let length = get(5)
@@ -270,11 +273,56 @@ fn parse_bool(s: &str) -> Option<bool> {
 }
 
 fn parse_loop(s: &str) -> Option<LoopMode> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(LoopMode::from_mpris(s))
+    LoopMode::parse_mpris(s)
+}
+
+fn unescape_markup(s: &str) -> Result<String, MediaError> {
+    let mut decoded = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        decoded.push_str(&rest[..amp]);
+        let entity = &rest[amp + 1..];
+        let end = entity
+            .find(';')
+            .filter(|end| *end <= 16)
+            .ok_or_else(malformed_escape)?;
+        let entity = &entity[..end];
+        let character = match entity {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "apos" => '\'',
+            "quot" => '"',
+            numeric if numeric.starts_with("#x") || numeric.starts_with("#X") => {
+                let codepoint =
+                    u32::from_str_radix(&numeric[2..], 16).map_err(|_| malformed_escape())?;
+                char::from_u32(codepoint)
+                    .filter(|ch| *ch != '\0')
+                    .ok_or_else(malformed_escape)?
+            }
+            numeric if numeric.starts_with('#') => {
+                let codepoint = numeric[1..]
+                    .parse::<u32>()
+                    .map_err(|_| malformed_escape())?;
+                char::from_u32(codepoint)
+                    .filter(|ch| *ch != '\0')
+                    .ok_or_else(malformed_escape)?
+            }
+            _ => return Err(malformed_escape()),
+        };
+        decoded.push(character);
+        rest = entity_remainder(rest, amp, end);
     }
+    decoded.push_str(rest);
+    Ok(decoded)
+}
+
+fn entity_remainder(input: &str, amp: usize, entity_end: usize) -> &str {
+    &input[amp + entity_end + 2..]
+}
+
+fn malformed_escape() -> MediaError {
+    MediaError::Backend("malformed playerctl metadata escape".into())
 }
 
 #[cfg(test)]
@@ -295,6 +343,129 @@ mod tests {
         assert_eq!(s.shuffle, Some(true));
         assert_eq!(s.loop_mode, Some(LoopMode::Playlist));
         assert_eq!(s.volume, Some(80));
+    }
+
+    fn escaped_record(fields: [&str; FIELDS]) -> String {
+        fields
+            .into_iter()
+            .map(escape_markup_fixture)
+            .collect::<Vec<_>>()
+            .join(&SEP.to_string())
+    }
+
+    fn encoded_record(fields: [&str; FIELDS]) -> String {
+        fields.join(&SEP.to_string())
+    }
+
+    fn escape_markup_fixture(value: &str) -> String {
+        let mut escaped = String::new();
+        for ch in value.chars() {
+            match ch {
+                '&' => escaped.push_str("&amp;"),
+                '<' => escaped.push_str("&lt;"),
+                '>' => escaped.push_str("&gt;"),
+                '\'' => escaped.push_str("&apos;"),
+                '"' => escaped.push_str("&quot;"),
+                '\u{1f}' => escaped.push_str("&#x1f;"),
+                control if control.is_control() && !matches!(control, '\t' | '\n' | '\r') => {
+                    escaped.push_str(&format!("&#x{:x};", control as u32));
+                }
+                other => escaped.push(other),
+            }
+        }
+        escaped
+    }
+
+    #[test]
+    fn markup_escaped_separator_round_trips_without_shifting_fields() {
+        let line = escaped_record([
+            "spotify",
+            "Playing",
+            "Title\u{1f}continued",
+            "Artist",
+            "Album",
+            "248000000",
+            "1000000",
+            "true",
+            "Playlist",
+            "0.80",
+            "art",
+            "url",
+            "track-id",
+        ]);
+        let state = parse_line(&line).unwrap();
+        assert_eq!(state.title, "Title\u{1f}continued");
+        assert_eq!(state.artist, "Artist");
+        assert_eq!(state.album, "Album");
+        assert_eq!(state.volume, Some(80));
+    }
+
+    #[test]
+    fn markup_entities_decode_once() {
+        let line = escaped_record([
+            "spotify", "Playing", "&lt;", "AC&DC", "Album", "1", "0", "false", "None", "0.5", "",
+            "", "",
+        ]);
+        let state = parse_line(&line).unwrap();
+        assert_eq!(state.title, "&lt;");
+        assert_eq!(state.artist, "AC&DC");
+    }
+
+    #[test]
+    fn rejects_malformed_markup_entities() {
+        let fields = [
+            "spotify",
+            "Playing",
+            "Title &bogus;",
+            "Artist",
+            "Album",
+            "1",
+            "0",
+            "false",
+            "None",
+            "0.5",
+            "",
+            "",
+            "",
+        ];
+        let line = encoded_record(fields);
+        assert!(
+            matches!(parse_line(&line), Err(MediaError::Backend(message)) if message == "malformed playerctl metadata escape")
+        );
+
+        let fields = [
+            "spotify",
+            "Playing",
+            "Title & no-semicolon",
+            "Artist",
+            "Album",
+            "1",
+            "0",
+            "false",
+            "None",
+            "0.5",
+            "",
+            "",
+            "",
+        ];
+        let line = encoded_record(fields);
+        assert!(
+            matches!(parse_line(&line), Err(MediaError::Backend(message)) if message == "malformed playerctl metadata escape")
+        );
+    }
+
+    #[test]
+    fn format_markup_escapes_every_field() {
+        assert_eq!(FORMAT.matches("markup_escape(").count(), FIELDS);
+    }
+
+    #[test]
+    fn unknown_loop_status_stays_unknown() {
+        let line = escaped_record([
+            "spotify", "Playing", "Title", "Artist", "Album", "1", "0", "false", "weird", "0.5",
+            "", "", "",
+        ]);
+        assert_eq!(parse_line(&line).unwrap().loop_mode, None);
     }
 
     #[test]
@@ -330,6 +501,7 @@ mod tests {
         let fourteen_fields = format!("{valid}{SEP}extra");
         assert!(parse_line(&fourteen_fields).is_err());
 
+        // A raw separator in playerctl output violates the escaped framing protocol.
         let colliding_title = valid.replacen("Title", "Title\u{1f}Injected", 1);
         assert!(parse_line(&colliding_title).is_err());
     }
