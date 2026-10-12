@@ -41,7 +41,8 @@ fn hello_example_registers_and_renders_through_the_real_path() {
 
     // Loader: the directory manifest parses, negotiates cleanly, and anchors
     // its cwd to the plugin directory.
-    let loaded = discover(&cfg, tmp.path());
+    let (loaded, problems) = discover(&cfg, tmp.path());
+    assert!(problems.is_empty(), "{problems:?}");
     assert_eq!(loaded.len(), 1, "{loaded:?}");
     let p = &loaded[0];
     assert_eq!(p.spec.manifest.id.as_str(), "hello");
