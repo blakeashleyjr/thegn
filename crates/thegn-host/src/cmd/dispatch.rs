@@ -2711,11 +2711,10 @@ mod tests {
     fn status_multiline_display_sanitizes_each_legacy_line() {
         let shown = display_multiline("report\x1b[2J\n\u{202e}verdict\u{0085}");
         assert_eq!(shown.lines().count(), 2);
-        assert!(
-            shown
-                .chars()
+        assert!(shown.lines().all(|line| {
+            line.chars()
                 .all(|c| !c.is_control() && !pipeline_report::is_format_control(c))
-        );
+        }));
     }
 
     #[test]
