@@ -51,8 +51,9 @@ performs no network access.
 
 User themes live under `$XDG_CONFIG_HOME/thegn/themes` (normally
 `~/.config/thegn/themes`). Files with invalid content are ignored by the
-catalog and reported by the popup's store status. A local file whose name
-matches a built-in cannot shadow that built-in.
+catalog and reported by the popup's store status. Each file must be named after
+the theme's slug; duplicate theme names are reported and ignored. A local file
+whose name matches a built-in cannot shadow that built-in.
 
 The shipped Gogh importer accepts `name`, optional `variant`,
 `background`, `foreground`, `cursor`, and `color_01` through `color_16`.

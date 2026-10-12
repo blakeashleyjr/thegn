@@ -34,6 +34,84 @@ fn decode_worktree_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<WorktreeRow
     })
 }
 
+pub(crate) fn delete_worktree_cache_rows(db: &Db, wt: &str) -> Result<()> {
+    let base_conn = db.conn();
+    // Keep standalone cascades atomic, while joining a caller's transaction
+    // when this helper is used during transactional cleanup.
+    let tx = if base_conn.is_autocommit() {
+        Some(base_conn.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let conn = tx.as_deref().unwrap_or(base_conn);
+    let prefix = if wt.ends_with('/') {
+        wt.to_string()
+    } else {
+        format!("{wt}/")
+    };
+    // '/' sorts immediately before '0', so this range includes descendants
+    // while excluding sibling prefixes such as `/wt/a2`.
+    let prefix_end = format!("{wt}0");
+    let has_glyph_cache = table_exists(conn, "glyph_cache")?;
+    for table in [
+        "worktree_disk",
+        "loc_cache",
+        "attention_acks",
+        "session_attention",
+        "pr_cache",
+        "pr_review_cache",
+        "ci_runs_cache",
+        "ci_log_cache",
+        "ci_autofix_dedupe",
+        "commit_cache",
+        "worktree_titles",
+        "test_cache",
+    ] {
+        let column = if matches!(table, "attention_acks" | "session_attention") {
+            "worktree_path"
+        } else {
+            "worktree"
+        };
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE {column}=?1"),
+            params![wt],
+        )?;
+    }
+    // Resolve matching entity IDs once through idx_sem_entity_file. Reuse that
+    // set for edge cleanup and entity deletion in this cascade.
+    let entity_ids = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM sem_entity
+             WHERE file=?1 OR (file>=?2 AND file<?3)",
+        )?;
+        let rows = stmt.query_map(params![wt, prefix, prefix_end], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for id in entity_ids {
+        conn.execute("DELETE FROM sem_edge WHERE src_id=?1", params![id])?;
+        conn.execute("DELETE FROM sem_edge WHERE dst_id=?1", params![id])?;
+        conn.execute("DELETE FROM sem_entity WHERE id=?1", params![id])?;
+    }
+    // glyph_cache is lazy-created and may not exist on a fresh database.
+    if has_glyph_cache {
+        conn.execute("DELETE FROM glyph_cache WHERE worktree=?1", params![wt])?;
+    }
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+fn table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        params![table],
+        |row| row.get(0),
+    )?)
+}
+
 impl WorkspaceStore for Db {
     // --- repo history (launcher recents) -----------------------------------
     fn touch_repo(&self, path: &str, name: &str) -> Result<()> {
@@ -359,28 +437,7 @@ impl WorkspaceStore for Db {
     fn del_worktree(&self, wt: &str) -> Result<()> {
         self.conn()
             .execute("DELETE FROM worktrees WHERE worktree=?1", params![wt])?;
-        // Cascade to the disk-size cache so a removed worktree can't leave an
-        // orphaned `worktree_disk` row inflating the statusbar total forever.
-        self.conn()
-            .execute("DELETE FROM worktree_disk WHERE worktree=?1", params![wt])?;
-        // Same for the LOC report cache, which had no cascade at all — a live DB
-        // was carrying ~200 `loc_cache` rows against a dozen real worktrees.
-        self.conn()
-            .execute("DELETE FROM loc_cache WHERE worktree=?1", params![wt])?;
-        // Likewise the attention acks: the hydration pass no longer garbage-
-        // collects them (a non-matching score means "not the winner right now",
-        // not "stale"), so removal is where a gone worktree's rows are reclaimed.
-        self.conn().execute(
-            "DELETE FROM attention_acks WHERE worktree_path=?1",
-            params![wt],
-        )?;
-        // And any hand still raised for it: a removed worktree must not leave
-        // live attention state behind, or a worktree recreated at the same path
-        // inherits an instant Blocked dot from a session that is long gone.
-        self.conn().execute(
-            "DELETE FROM session_attention WHERE worktree_path=?1",
-            params![wt],
-        )?;
+        delete_worktree_cache_rows(self, wt)?;
         // And the per-worktree status caches + queue row. Every delete path
         // (interactive close, the registry reap for a dir removed outside
         // thegn, the stale-group prune) funnels through here — before this,
@@ -395,21 +452,6 @@ impl WorkspaceStore for Db {
             "DELETE FROM merge_queue WHERE worktree=?1 AND NOT(status='landed' AND error_detail IS ?2)",
             params![wt, crate::merge_sweep::CleanupHold::BranchRetained.marker()],
         )?;
-        self.conn()
-            .execute("DELETE FROM pr_cache WHERE worktree=?1", params![wt])?;
-        self.conn()
-            .execute("DELETE FROM ci_runs_cache WHERE worktree=?1", params![wt])?;
-        self.conn()
-            .execute("DELETE FROM ci_log_cache WHERE worktree=?1", params![wt])?;
-        self.conn().execute(
-            "DELETE FROM ci_autofix_dedupe WHERE worktree=?1",
-            params![wt],
-        )?;
-        // best-effort: the glyph_cache table is created lazily and may not
-        // exist yet on this DB.
-        let _ = self
-            .conn()
-            .execute("DELETE FROM glyph_cache WHERE worktree=?1", params![wt]);
         Ok(())
     }
 
@@ -417,41 +459,16 @@ impl WorkspaceStore for Db {
     /// effects). Pairs with [`Self::del_workspace`] so a removed workspace's
     /// cross-workspace rows neither re-render nor resurrect on the next launch.
     fn del_worktrees_for_repo(&self, repo_path: &str) -> Result<()> {
-        // Drop the size + LOC caches for these worktrees first (joined via the
-        // `worktrees` rows we are about to delete) so none are left orphaned.
-        self.conn().execute(
-            "DELETE FROM worktree_disk WHERE worktree IN \
-             (SELECT worktree FROM worktrees WHERE repo_path=?1)",
-            params![repo_path],
-        )?;
-        self.conn().execute(
-            "DELETE FROM loc_cache WHERE worktree IN \
-             (SELECT worktree FROM worktrees WHERE repo_path=?1)",
-            params![repo_path],
-        )?;
-        // Same for any raised hands on those worktrees — live attention state
-        // for a repo we are forgetting could otherwise outlive every row that
-        // could render it.
-        self.conn().execute(
-            "DELETE FROM session_attention WHERE worktree_path IN \
-             (SELECT worktree FROM worktrees WHERE repo_path=?1)",
-            params![repo_path],
-        )?;
-        self.conn().execute(
-            "DELETE FROM ci_runs_cache WHERE worktree IN \
-             (SELECT worktree FROM worktrees WHERE repo_path=?1)",
-            params![repo_path],
-        )?;
-        self.conn().execute(
-            "DELETE FROM ci_log_cache WHERE worktree IN \
-             (SELECT worktree FROM worktrees WHERE repo_path=?1)",
-            params![repo_path],
-        )?;
-        self.conn().execute(
-            "DELETE FROM ci_autofix_dedupe WHERE worktree IN \
-             (SELECT worktree FROM worktrees WHERE repo_path=?1)",
-            params![repo_path],
-        )?;
+        let worktrees = {
+            let mut stmt = self
+                .conn()
+                .prepare("SELECT worktree FROM worktrees WHERE repo_path=?1")?;
+            let rows = stmt.query_map(params![repo_path], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for wt in &worktrees {
+            delete_worktree_cache_rows(self, wt)?;
+        }
         self.conn().execute(
             "DELETE FROM worktrees WHERE repo_path=?1",
             params![repo_path],
@@ -482,21 +499,16 @@ impl WorkspaceStore for Db {
     /// delete operations cannot be undone by a stale row whose path was moved or
     /// normalized differently than the live session group.
     fn del_worktree_for_tab(&self, repo_root: &str, tab: &str) -> Result<()> {
-        self.conn().execute(
-            "DELETE FROM ci_runs_cache WHERE worktree IN \
-             (SELECT worktree FROM worktrees WHERE repo_path=?1 AND tab_name=?2)",
-            params![repo_root, tab],
-        )?;
-        self.conn().execute(
-            "DELETE FROM ci_log_cache WHERE worktree IN \
-             (SELECT worktree FROM worktrees WHERE repo_path=?1 AND tab_name=?2)",
-            params![repo_root, tab],
-        )?;
-        self.conn().execute(
-            "DELETE FROM ci_autofix_dedupe WHERE worktree IN \
-             (SELECT worktree FROM worktrees WHERE repo_path=?1 AND tab_name=?2)",
-            params![repo_root, tab],
-        )?;
+        let worktrees = {
+            let mut stmt = self
+                .conn()
+                .prepare("SELECT worktree FROM worktrees WHERE repo_path=?1 AND tab_name=?2")?;
+            let rows = stmt.query_map(params![repo_root, tab], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for wt in &worktrees {
+            delete_worktree_cache_rows(self, wt)?;
+        }
         self.conn().execute(
             "DELETE FROM worktrees WHERE repo_path=?1 AND tab_name=?2",
             params![repo_root, tab],
@@ -1769,6 +1781,86 @@ mod tests {
         // Per-repo removal cascades for every owned worktree too.
         db.del_worktrees_for_repo("/repo").unwrap();
         assert!(db.all_worktree_disk().unwrap().is_empty());
+    }
+
+    #[test]
+    fn del_worktree_cascades_to_semantic_entities_and_path_caches() {
+        use crate::semantic::EntityKind;
+        use crate::store::SemanticStore;
+
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("tab", "/repo", "/wt/a", "feat", None, None)
+            .unwrap();
+        db.put_worktree("tab", "/repo", "/wt/a2", "sibling", None, None)
+            .unwrap();
+        let entity = |id: &str, file: &str| crate::store::SemEntityRow {
+            id: id.to_string(),
+            file: file.to_string(),
+            name: "f".to_string(),
+            kind: EntityKind::Function,
+            start_line: 1,
+            end_line: 1,
+            source_hash: "hash".to_string(),
+        };
+        db.upsert_entity(&entity("a", "/wt/a/src/a.rs")).unwrap();
+        db.upsert_entity(&entity("sibling", "/wt/a2/src/b.rs"))
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sem_edge(src_id,dst_id,kind) VALUES('sibling','a','call')",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO commit_cache(worktree,json,fetched_at) VALUES('/wt/a','[]',1);
+                 INSERT INTO worktree_titles(worktree,last_title,updated_at) VALUES('/wt/a','title',1);
+                 INSERT INTO issue_links(worktree_path,issue_id,linked_at) VALUES('/wt/a','i-1',1);
+                 INSERT INTO notifications(kind,issue_id,message,created_at_ms,read,worktree_path)
+                   VALUES('test','i-1','message',1,0,'/wt/a');",
+            )
+            .unwrap();
+        db.put_glyph_cache("/wt/a", "{}").unwrap();
+        db.put_glyph_cache("/wt/a2", "{}").unwrap();
+
+        db.del_worktree("/wt/a").unwrap();
+
+        assert_eq!(db.entities_under("/wt/a").unwrap().len(), 0);
+        assert_eq!(db.entities_under("/wt/a2").unwrap().len(), 1);
+        let edge_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM sem_edge", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(edge_count, 0, "edges to removed entities must be deleted");
+        for (table, key) in [
+            ("commit_cache", "worktree"),
+            ("worktree_titles", "worktree"),
+        ] {
+            let sql = format!("SELECT COUNT(*) FROM {table} WHERE {key}='/wt/a'");
+            let count: i64 = db.conn().query_row(&sql, [], |row| row.get(0)).unwrap();
+            assert_eq!(count, 0, "{table} retained the removed worktree");
+        }
+        for (table, key) in [
+            ("issue_links", "worktree_path"),
+            ("notifications", "worktree_path"),
+        ] {
+            let sql = format!("SELECT COUNT(*) FROM {table} WHERE {key}='/wt/a'");
+            let count: i64 = db.conn().query_row(&sql, [], |row| row.get(0)).unwrap();
+            assert_eq!(count, 1, "{table} should survive closing the worktree");
+        }
+        assert_eq!(db.all_glyph_cache().len(), 1);
+        assert_eq!(db.all_glyph_cache()[0].0, "/wt/a2");
+    }
+
+    #[test]
+    fn del_worktree_works_inside_an_existing_transaction() {
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("tab", "/repo", "/wt/a", "feat", None, None)
+            .unwrap();
+
+        db.transaction(|db| db.del_worktree("/wt/a")).unwrap();
+
+        assert!(db.worktree_record("/wt/a").unwrap().is_none());
     }
 
     /// The LOC cache had no cascade at all, which is how a live DB came to hold

@@ -265,24 +265,78 @@ fn render_dashboard(app: &ObserveApp, area: Rect, buf: &mut Buffer) {
 /// Draw one panel: its renderer when data is `Ready`, else a loading/error/empty
 /// placeholder titled with the panel name.
 fn render_panel(kind: &str, title: &str, state: &PanelState, rect: Rect, buf: &mut Buffer) {
-    let frame = match state {
+    match state {
         PanelState::Loading => {
             block_msg(rect, buf, title, "loading…", Color::DarkGray);
-            return;
         }
         PanelState::Error(e) => {
             block_msg(rect, buf, title, e, Color::Red);
-            return;
         }
-        PanelState::Ready(frames) => match frames.first() {
-            Some(f) => f,
-            None => {
-                block_msg(rect, buf, title, "no data", Color::DarkGray);
-                return;
+        PanelState::Ready(targets) => {
+            render_targets(kind, title, targets, rect, buf);
+        }
+    }
+}
+
+/// Render each target and each returned series in stable datasource order.
+fn render_targets(
+    kind: &str,
+    title: &str,
+    targets: &[gtui_app::engine::TargetUpdate],
+    rect: Rect,
+    buf: &mut Buffer,
+) {
+    let mut entries = Vec::new();
+    for target in targets {
+        match &target.result {
+            Err(message) => entries.push((
+                format!("{title} · {}", target.ref_id),
+                None,
+                Some(message.as_str()),
+            )),
+            Ok(frames) if frames.is_empty() => entries.push((
+                format!("{title} · {}", target.ref_id),
+                None,
+                Some("no data"),
+            )),
+            Ok(frames) => {
+                for (index, frame) in frames.iter().enumerate().take(32) {
+                    let label = if frames.len() == 1 {
+                        format!("{title} · {}", target.ref_id)
+                    } else {
+                        format!("{title} · {} · {}", target.ref_id, index + 1)
+                    };
+                    entries.push((label, Some(frame), None));
+                }
+                if frames.len() > 32 {
+                    entries.push((
+                        format!("{title} · {}", target.ref_id),
+                        None,
+                        Some("series limit is 32"),
+                    ));
+                }
             }
-        },
-    };
-    dispatch_renderer(kind, title, frame, rect, buf);
+        }
+    }
+    if entries.is_empty() {
+        block_msg(rect, buf, title, "no data", Color::DarkGray);
+        return;
+    }
+    for (index, (label, frame, message)) in entries.iter().enumerate() {
+        let y0 = rect.y + (u32::from(rect.height) * index as u32 / entries.len() as u32) as u16;
+        let y1 =
+            rect.y + (u32::from(rect.height) * (index + 1) as u32 / entries.len() as u32) as u16;
+        let height = y1.saturating_sub(y0);
+        if height == 0 {
+            continue;
+        }
+        let item_rect = Rect::new(rect.x, y0, rect.width, height);
+        if let Some(message) = message {
+            block_msg(item_rect, buf, label, message, Color::DarkGray);
+        } else if let Some(frame) = frame {
+            dispatch_renderer(kind, label, frame, item_rect, buf);
+        }
+    }
 }
 
 /// Panel-type → `gtui_render` widget dispatch. Unknown types draw a hint.
@@ -399,12 +453,51 @@ mod tests {
         render_panel(
             "stat",
             "CPU",
-            &PanelState::Ready(vec![f]),
+            &PanelState::Ready(vec![gtui_app::engine::TargetUpdate {
+                ref_id: "A".into(),
+                result: Ok(vec![f]),
+            }]),
             buf2.area,
             &mut buf2,
         );
         // StatRenderer drew the value "42.00".
         assert_eq!(buf2.cell((1, 1)).unwrap().symbol(), "4");
+    }
+
+    #[test]
+    fn mixed_target_results_render_identity_success_errors_and_empty_results() {
+        let frame = Frame::new(vec![Field::new("v", FieldType::Float64, vec![42.0])]);
+        let targets = vec![
+            gtui_app::engine::TargetUpdate {
+                ref_id: "A".into(),
+                result: Ok(vec![frame]),
+            },
+            gtui_app::engine::TargetUpdate {
+                ref_id: "B".into(),
+                result: Err("source failed".into()),
+            },
+            gtui_app::engine::TargetUpdate {
+                ref_id: "C".into(),
+                result: Ok(Vec::new()),
+            },
+        ];
+        for kind in ["timeseries", "stat", "table", "logs"] {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 40, 18));
+            render_targets(kind, "Panel", &targets, buf.area, &mut buf);
+            let mut rendered = String::new();
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    rendered.push_str(buf.cell((x, y)).unwrap().symbol());
+                }
+            }
+            assert!(rendered.contains("A"), "{kind} omitted successful target");
+            assert!(rendered.contains("B"), "{kind} omitted failed target");
+            assert!(rendered.contains("C"), "{kind} omitted empty target");
+            assert!(
+                rendered.contains("source failed"),
+                "{kind} omitted target error"
+            );
+        }
     }
 
     #[test]

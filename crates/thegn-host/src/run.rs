@@ -1864,10 +1864,12 @@ fn persist_share_event(ev: &crate::share::ShareEvent) {
             port,
             provider,
             url,
+            ..
         } => {
-            let _ = db.upsert_share(worktree, *port, provider, Some(url), "up"); // best-effort: cache write: the share state row feeds the UI/`share list`
+            let canonical = url.canonical();
+            let _ = db.upsert_share(worktree, *port, provider, Some(&canonical), "up"); // best-effort: cache write: the share state row feeds the UI/`share list`
         }
-        ShareEvent::Failed { worktree, port, .. } | ShareEvent::Down { worktree, port } => {
+        ShareEvent::Failed { worktree, port, .. } | ShareEvent::Down { worktree, port, .. } => {
             let _ = db.delete_share(worktree, *port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
     }
@@ -1966,7 +1968,9 @@ pub(crate) fn forget_worktree_group(
             // sidecar too).
             crate::agent::deregister_vpn(&path);
             crate::agent::deproject(&path);
-            crate::agent::deprovision_sync(&path);
+            if let Err(error) = crate::agent::deprovision_sync(&path) {
+                tracing::warn!(target: "thegn::lifecycle", worktree = %path, %error, "provider sync failed during background close");
+            }
             // Suspend-on-close: checkpoint the sandbox (8-E) before disconnecting
             // the bridge + tearing down. No-op unless the env sets auto_checkpoint.
             crate::agent::checkpoint_on_close(&path);
@@ -6772,8 +6776,8 @@ async fn event_loop<T: Terminal>(
     let mut hover_inflight = false;
     let hover_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let (logs_tx, mut logs_rx) =
-        tokio_mpsc::unbounded_channel::<Vec<thegn_core::log::parser::ParsedLog>>();
+    // Bounded drop-oldest ingress; overload is shown as a gap in the Logs panel.
+    let logs_ingress = thegn_svc::log::ingress::LogIngress::new();
 
     let mut hover_popup: Option<crate::hover::HoverPopup> = None;
     // A bar-item detail popup/modal (CPU history graph, notifications list, …),
@@ -7638,7 +7642,7 @@ async fn event_loop<T: Terminal>(
                     );
                     board = Some(crate::pipeline_board::PipelineBoard::open(
                         &model.dispatches,
-                        &current_config.pipeline.stages,
+                        &current_config,
                         &sctx,
                     ));
                 }
@@ -7679,9 +7683,19 @@ async fn event_loop<T: Terminal>(
                         && !switch_cache.get(&path).is_some_and(|s| s.is_fresh())
                         && prefetch_inflight.try_begin(&path)
                     {
+                        let prefetch_generation = prefetch_inflight
+                            .generation(&path)
+                            .expect("path was just marked in flight");
                         let hints =
                             crate::hydrate::HydrateHints::for_switch(&panel_ui, &current_config);
-                        spawn_panel_prefetch(prefetch_tx.clone(), path, hints, Some(waker.clone()));
+                        let admission = spawn_panel_prefetch(
+                            prefetch_tx.clone(),
+                            path.clone(),
+                            prefetch_generation,
+                            hints,
+                            Some(waker.clone()),
+                        );
+                        prefetch_inflight.finish_if_refused(&path, prefetch_generation, admission);
                     }
                     continue;
                 }
@@ -8163,12 +8177,17 @@ async fn event_loop<T: Terminal>(
             if !prefetch_inflight.try_begin(&path) {
                 continue;
             }
-            spawn_panel_prefetch(
+            let prefetch_generation = prefetch_inflight
+                .generation(&path)
+                .expect("path was just marked in flight");
+            let admission = spawn_panel_prefetch(
                 prefetch_tx.clone(),
-                path,
+                path.clone(),
+                prefetch_generation,
                 hints.clone(),
                 Some(waker.clone()),
             );
+            prefetch_inflight.finish_if_refused(&path, prefetch_generation, admission);
         }
         // Cross-WORKSPACE warmth: the switch cache is path-keyed and global,
         // but nothing used to feed it other workspaces' paths — so a workspace
@@ -8185,12 +8204,17 @@ async fn event_loop<T: Terminal>(
             if !prefetch_inflight.try_begin(&path) {
                 continue;
             }
-            spawn_panel_prefetch(
+            let prefetch_generation = prefetch_inflight
+                .generation(&path)
+                .expect("path was just marked in flight");
+            let admission = spawn_panel_prefetch(
                 prefetch_tx.clone(),
-                path,
+                path.clone(),
+                prefetch_generation,
                 hints.clone(),
                 Some(waker.clone()),
             );
+            prefetch_inflight.finish_if_refused(&path, prefetch_generation, admission);
         }
     }
 
@@ -8238,7 +8262,7 @@ async fn event_loop<T: Terminal>(
         let log_w = waker.clone();
         thegn_svc::log::provider::LogProvider::start_stream(
             &p,
-            logs_tx.clone(),
+            logs_ingress.clone(),
             std::sync::Arc::new(move || {
                 let _ = log_w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }),
@@ -8290,7 +8314,16 @@ async fn event_loop<T: Terminal>(
                 }
                 let boundary = std::time::Instant::now();
                 loop_perf.add_busy(active_clock.checkpoint(boundary));
-                let snap = loop_perf.rollup(boundary);
+                let log_stats = logs_ingress.stats();
+                let log_oldest_ms = log_stats
+                    .oldest_age
+                    .map_or(0, |age| age.as_millis().min(u64::MAX as u128) as u64);
+                let snap = loop_perf.rollup(
+                    boundary,
+                    log_stats.pending,
+                    log_stats.dropped_total,
+                    log_oldest_ms,
+                );
                 panel_ui.docs.loop_perf.push(&snap);
             }
         }
@@ -8621,12 +8654,17 @@ async fn event_loop<T: Terminal>(
                 {
                     continue;
                 }
-                spawn_panel_prefetch(
+                let prefetch_generation = prefetch_inflight
+                    .generation(&path)
+                    .expect("path was just marked in flight");
+                let admission = spawn_panel_prefetch(
                     prefetch_tx.clone(),
-                    path,
+                    path.clone(),
+                    prefetch_generation,
                     hints.clone(),
                     Some(waker.clone()),
                 );
+                prefetch_inflight.finish_if_refused(&path, prefetch_generation, admission);
             }
             // And the likeliest OTHER workspaces (sidebar order): cross-
             // workspace destinations were never warmed at all, making every
@@ -8644,12 +8682,17 @@ async fn event_loop<T: Terminal>(
                 {
                     continue;
                 }
-                spawn_panel_prefetch(
+                let prefetch_generation = prefetch_inflight
+                    .generation(&path)
+                    .expect("path was just marked in flight");
+                let admission = spawn_panel_prefetch(
                     prefetch_tx.clone(),
-                    path,
+                    path.clone(),
+                    prefetch_generation,
                     hints.clone(),
                     Some(waker.clone()),
                 );
+                prefetch_inflight.finish_if_refused(&path, prefetch_generation, admission);
             }
             spawn_pr_cache_refresh(
                 current_worktree.clone(),
@@ -9219,6 +9262,26 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
             playback_clock.set(ov.is_playing(), crate::replay_overlay::REPLAY_FRAME_DT_MS);
+        }
+
+        // Replay search results arrive only after the worker pulses the waker;
+        // this drain therefore adds no idle polling. Pane close drops the
+        // overlay (and cancels its worker), while recording replacement
+        // invalidates the captured generation.
+        if let Some(pane_id) = replay.as_ref().map(|ov| ov.pane_id()) {
+            if let Some(rec) = panes.table.get(&pane_id).and_then(|p| p.recording()) {
+                let ov = replay.as_mut().expect("replay pane id came from overlay");
+                if ov.invalidate_changed_config(&current_config.replay)
+                    || ov.invalidate_changed_recording(rec)
+                    || ov.drain_search_result(rec)
+                {
+                    dirty = true;
+                }
+            } else {
+                replay = None;
+                playback_clock.set(false, crate::replay_overlay::REPLAY_FRAME_DT_MS);
+                dirty = true;
+            }
         }
 
         // Hydrated models replace the whole FrameModel; re-apply the loop-owned
@@ -11481,7 +11544,18 @@ async fn event_loop<T: Terminal>(
         while let Ok((path, nw)) = watcher_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Watcher);
             if watched_worktree.as_deref() == Some(path.as_path()) {
-                diff_watcher = Some(nw);
+                if let Some(old) = diff_watcher.replace(nw) {
+                    drop(std::thread::spawn(move || {
+                        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                        drop(old);
+                    }));
+                }
+            } else {
+                // A stale registration can also hold a large inotify set.
+                drop(std::thread::spawn(move || {
+                    crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                    drop(nw);
+                }));
             }
         }
 
@@ -11761,6 +11835,9 @@ async fn event_loop<T: Terminal>(
                         &mut model,
                         &waker,
                     );
+                    if let Some(picker) = workspace_picker.as_mut() {
+                        picker.config_reloaded(new_cfg.clone(), waker.clone());
+                    }
                     current_config = new_cfg;
                     // Rebuild only the effective hydration schedule. This is
                     // intentionally after successful config admission; the
@@ -12072,7 +12149,7 @@ async fn event_loop<T: Terminal>(
                         if let Some(b) = board.as_mut() {
                             b.refresh(
                                 &model.dispatches,
-                                &current_config.pipeline.stages,
+                                &current_config,
                                 &crate::detail::StatusCtx::new(
                                     &panel_ui.docs,
                                     start.elapsed().as_secs(),
@@ -12666,8 +12743,11 @@ async fn event_loop<T: Terminal>(
             != crate::center::Grow::Tiled
             && eff_zoom != Some(crate::focus::Zone::Center);
         model.sync_panes = sync_panes;
-        model.mode_chip =
-            crate::voice::mode_chip(mode, current_config.ui.full_mode_chip, voice.is_recording());
+        model.mode_chip = crate::voice::mode_chip(
+            mode,
+            current_config.ui.full_mode_chip,
+            voice.is_recording() || voice.shutdown_pending(),
+        );
         model.keyhints = crate::keyhint::context_hints(&focus, &panel_ui, keymap.config());
         model.sidebar_hints = crate::sidebar_keytable::footer_hints(
             keymap.config(),
@@ -12807,35 +12887,48 @@ async fn event_loop<T: Terminal>(
         }
 
         // -- 23. Log streams
-        while let Ok(batch) = logs_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Other);
-            model.panel.log_lines_structured.extend(batch);
-            if model.panel.log_lines_structured.len() > 1000 {
-                let overflow = model.panel.log_lines_structured.len() - 1000;
-                model.panel.log_lines_structured.drain(0..overflow);
+        let log_backlog = {
+            let slice = logs_ingress.take(crate::loop_policy::log_apply_budget(
+                !pending_input.is_empty(),
+            ));
+            if !slice.is_empty() {
+                loop_perf.tick(crate::perf::WakeSource::Other);
+                // Avoid the render -> own-log -> tail -> render feedback loop.
+                dirty |= crate::loop_policy::apply_log_slice(
+                    &mut model.panel.log_lines_structured,
+                    slice,
+                    want_panel && panel_ui.open == crate::panel::Section::Logs,
+                );
             }
-            // Only repaint when the Logs section is actually on screen. thegn
-            // tails its OWN thegn.log; under a verbose `THEGN_LOG` every
-            // rendered frame writes a log line, so an unconditional repaint here
-            // would feed the tailer → dirty → render → another log line → a
-            // ~10Hz full-frame feedback loop (0%-idle regression). Lines still
-            // accumulate into the model so they're present when the panel opens.
-            if want_panel && panel_ui.open == crate::panel::Section::Logs {
-                dirty = true;
-            }
-        }
+            logs_ingress.has_pending()
+        };
 
         // Ingress-share state from the supervisor threads: persist the row,
         // update the supervisor, and re-sync the model so the badge + Share
         // panel repaint (a chrome change ⇒ Full frame).
         while let Ok(ev) = share_rx.try_recv() {
-            persist_share_event(&ev);
-            // Surface a failure where the user is looking — the reason was
-            // captured in the event and then thrown away before.
-            if let crate::share::ShareEvent::Failed { port, error, .. } = &ev {
-                model.status = format!("Share :{port} failed: {error}");
-            }
-            if share_supervisor.on_event(ev) {
+            if share_supervisor.on_event(ev.clone()) {
+                // Surface an accepted failure where the user is looking.
+                if let crate::share::ShareEvent::Failed { port, error, .. } = &ev {
+                    model.status = format!("Share :{port} failed: {error}");
+                }
+                let replaced_generation_is_live = match &ev {
+                    crate::share::ShareEvent::Down {
+                        worktree,
+                        port,
+                        generation,
+                    }
+                    | crate::share::ShareEvent::Failed {
+                        worktree,
+                        port,
+                        generation,
+                        ..
+                    } => share_supervisor.has_other_generation(worktree, *port, *generation),
+                    crate::share::ShareEvent::Up { .. } => false,
+                };
+                if !replaced_generation_is_live {
+                    persist_share_event(&ev);
+                }
                 model.shares = current_share_views(&share_supervisor, &session);
                 dirty = true;
             }
@@ -14170,7 +14263,7 @@ async fn event_loop<T: Terminal>(
             defer_timeout,
             dirty,
             !pending_input.is_empty(),
-            budget_exhausted,
+            budget_exhausted || log_backlog,
         );
         let polled = match pending_input.pop_front() {
             Some(ev) => Ok(Some(ev)),
@@ -15659,7 +15752,7 @@ async fn event_loop<T: Terminal>(
                         // sampling interval would read as lag.
                         b.rebuild_after_key(
                             &model.dispatches,
-                            &current_config.pipeline.stages,
+                            &current_config,
                             &crate::detail::StatusCtx::new(
                                 &panel_ui.docs,
                                 start.elapsed().as_secs(),
@@ -19198,11 +19291,11 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Share => {
-                                            // Enter copies the focused share's URL.
+                                            // Enter copies the focused endpoint as data.
                                             if let Some(url) = model
                                                 .shares
                                                 .get(panel_ui.cursor)
-                                                .and_then(|s| s.url.clone())
+                                                .and_then(crate::share::ShareView::copy_value)
                                             {
                                                 writer.submit_oob(crate::copymode::osc52(&url));
                                                 model.status = match crate::clipboard::copy(&url) {
@@ -19963,7 +20056,7 @@ async fn event_loop<T: Terminal>(
                             match model
                                 .shares
                                 .get(panel_ui.cursor)
-                                .and_then(|s| s.url.clone())
+                                .and_then(|s| s.browser_url().map(str::to_owned))
                             {
                                 Some(url) => {
                                     model.status = crate::actions::open_status(
@@ -23628,11 +23721,14 @@ async fn event_loop<T: Terminal>(
                                 // it has a recording (replay enabled + some output).
                                 match panes.table.get(&focused).and_then(|p| p.recording()) {
                                     Some(rec) if !rec.is_empty() => {
-                                        replay = Some(crate::replay_overlay::ReplayOverlay::new(
+                                        let mut overlay = crate::replay_overlay::ReplayOverlay::new(
                                             focused,
                                             rec,
                                             current_config.replay.idle_threshold_ms,
-                                        ));
+                                        );
+                                        overlay.set_search_waker(waker.clone());
+                                        overlay.set_search_config(&current_config.replay);
+                                        replay = Some(overlay);
                                     }
                                     Some(_) => toasts.info(
                                         "Replay: nothing recorded for this pane yet",

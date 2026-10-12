@@ -539,16 +539,24 @@ impl Db {
                 }
                 let verdict = crate::pipeline_chunk::verdict(&prepared.scope, &active, &done);
                 let mut reasons = Vec::new();
-                if let crate::pipeline_chunk::ScopeVerdict::Conflict { overlaps } = verdict {
-                    for (i, pairs) in overlaps {
-                        let sibling = &active[i];
-                        for (mine, theirs) in pairs {
-                            reasons.push(format!(
-                                "{} vs {}: {mine} collides with {theirs} (active row {})",
-                                prepared.path, sibling.name, sibling.row
-                            ));
+                match verdict {
+                    crate::pipeline_chunk::ScopeVerdict::Conflict { overlaps } => {
+                        for (i, pairs) in overlaps {
+                            let sibling = &active[i];
+                            for (mine, theirs) in pairs {
+                                reasons.push(format!(
+                                    "{} vs {}: {mine} collides with {theirs} (active row {})",
+                                    prepared.path, sibling.name, sibling.row
+                                ));
+                            }
                         }
                     }
+                    crate::pipeline_chunk::ScopeVerdict::Unknown(error) => {
+                        reasons.push(format!(
+                            "chunk scope overlap could not be proven within budget: {error:?}"
+                        ));
+                    }
+                    _ => {}
                 }
                 for name in crate::pipeline_chunk::after_unmet(&prepared.scope.after, &done) {
                     let holder = rows.iter().find(|r| {

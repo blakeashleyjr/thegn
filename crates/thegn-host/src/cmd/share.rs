@@ -9,7 +9,7 @@
 //! The in-process host supervisor (live respawn on restart, badge, panel) builds
 //! on the same `[share]` config + `thegn_svc::share` seam this CLI uses.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::outln;
@@ -59,7 +59,8 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
 }
 
 fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String>) -> Result<()> {
-    let wt = resolve_worktree(worktree).to_string_lossy().into_owned();
+    let wt_path = resolve_worktree(worktree);
+    let wt = wt_path.to_string_lossy().into_owned();
     let label = thegn_core::share::label_for(&wt);
     let reach = match reach.as_deref() {
         Some(s) => match thegn_core::config::ShareReach::from_str_validated(s) {
@@ -87,21 +88,26 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
 
     match launch {
         ShareLaunch::Process(plan) => {
-            let statedir = share::share_state_dir(&wt, port);
+            let generation = cli_generation()?;
+            let statedir = match share::share_state_dir(&wt_path, &kind, port, generation) {
+                Ok(path) => path,
+                Err(e) => return on_error_exit(spec.on_error, e),
+            };
             let running = match share::start(&plan, &statedir, spec.ready_timeout) {
                 Ok(r) => r,
                 Err(e) => return on_error_exit(spec.on_error, e),
             };
-            outln!("share: 127.0.0.1:{port} → {}", running.public_url);
+            let endpoint = display_endpoint(&running.public_url, &kind);
+            let display_endpoint = thegn_svc::lsp::sanitize_for_terminal(&endpoint);
+            outln!("share: 127.0.0.1:{port} → {}", display_endpoint);
             outln!("share: press Ctrl-C to stop");
             if let Some(db) = &db {
-                let _ = db.upsert_share(&wt, port, &kind, Some(&running.public_url), "up"); // best-effort: cache write: the share state row feeds the UI/`share list`; the share itself is already up
+                let url = running.public_url.canonical();
+                let _ = db.upsert_share(&wt, port, &kind, Some(&url), "up"); // best-effort: cache write: the share state row feeds the UI/`share list`; the share itself is already up
             }
             // Block until the client exits (Ctrl-C tears down the group).
-            let share::RunningShare { mut child, .. } = running;
             // CLI path: `thegn share` runs the tunnel in the foreground by design.
-            #[expect(clippy::disallowed_methods)]
-            let _ = child.wait(); // best-effort: teardown: the child may already have exited or been reaped
+            running.wait();
             if let Some(db) = &db {
                 let _ = db.delete_share(&wt, port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
@@ -120,7 +126,9 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
                 Ok(u) => u,
                 Err(e) => return on_error_exit(spec.on_error, e),
             };
-            outln!("share: 127.0.0.1:{port} → {url}");
+            let url = url.canonical();
+            let display_endpoint = thegn_svc::lsp::sanitize_for_terminal(&url);
+            outln!("share: 127.0.0.1:{port} → {display_endpoint}");
             outln!("share: serve persists in the tailnet; `share stop {port}` to remove");
             if let Some(db) = &db {
                 let _ = db.upsert_share(&wt, port, &kind, Some(&url), "up"); // best-effort: cache write: the share state row feeds the UI/`share list`; the share itself is already up
@@ -128,6 +136,25 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
         }
     }
     Ok(())
+}
+
+fn display_endpoint(endpoint: &thegn_svc::share::PublicEndpoint, provider: &str) -> String {
+    if provider == "iroh" && endpoint.kind() == thegn_svc::share::PublicEndpointKind::Ticket {
+        format!("dumbpipe connect-tcp {}", endpoint.canonical())
+    } else {
+        endpoint.canonical()
+    }
+}
+
+fn cli_generation() -> Result<u64> {
+    let nanos = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("share: system clock is before the Unix epoch")?
+            .as_nanos(),
+    )
+    .context("share: generation timestamp is out of range")?;
+    Ok(nanos ^ (u64::from(std::process::id()).rotate_left(17)))
 }
 
 /// `fail` surfaces the error (non-zero exit); `warn` notes it and exits 0.
@@ -160,7 +187,11 @@ fn list(json: bool) -> Result<()> {
             r.local_port,
             r.provider,
             r.state,
-            r.public_url.as_deref().unwrap_or("—"),
+            r.public_url
+                .as_deref()
+                .map(thegn_svc::lsp::sanitize_for_terminal)
+                .as_deref()
+                .unwrap_or("—"),
         );
     }
     Ok(())
@@ -176,4 +207,20 @@ fn stop(port: u16, worktree: Option<String>) -> Result<()> {
     outln!("share: removed record for port {port}");
     outln!("share: a foreground `share start` keeps running — interrupt it directly");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iroh_ticket_displays_as_consumer_command() {
+        let ticket =
+            thegn_svc::share::PublicEndpoint::parse_ticket("TICKET123").expect("valid ticket");
+        assert_eq!(
+            display_endpoint(&ticket, "iroh"),
+            "dumbpipe connect-tcp TICKET123"
+        );
+        assert_eq!(ticket.canonical(), "TICKET123");
+    }
 }

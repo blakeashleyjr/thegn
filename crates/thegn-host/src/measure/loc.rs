@@ -43,11 +43,8 @@ pub(crate) fn spawn_scan_with_generation(
     waker: Option<TerminalWaker>,
     generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
 ) {
-    tokio::task::spawn_blocking(move || {
+    crate::sched::spawn_bg_replaceable(move || {
         let Some(_round) = super::begin(&INFLIGHT, "loc") else {
-            return;
-        };
-        let Some(_permit) = super::permit("loc") else {
             return;
         };
         let Ok(db) = Db::open() else {

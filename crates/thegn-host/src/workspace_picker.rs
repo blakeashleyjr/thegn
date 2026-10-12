@@ -10,6 +10,8 @@
 //! `search_everywhere::PaletteSession`) so the loop only adds a one-line drain.
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::Surface;
@@ -38,7 +40,22 @@ pub(crate) enum PickerMode {
 pub(crate) struct RepoEntry {
     pub(crate) path: String,
     pub(crate) name: String,
+    haystack: String,
 }
+
+#[derive(Debug)]
+enum DiscoveryEvent {
+    Batch {
+        generation: u64,
+        paths: Vec<String>,
+    },
+    Finished {
+        generation: u64,
+        report: thegn_core::repo::DiscoveryReport,
+    },
+}
+
+static DISCOVERY_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// What a key delivered to the picker meant.
 #[derive(Debug, PartialEq, Eq)]
@@ -204,8 +221,19 @@ pub(crate) struct WorkspacePicker {
     scroll_offset: usize,
     /// True while the off-loop `discover_repos` scan is in flight.
     scanning: bool,
-    result_tx: tokio::sync::mpsc::UnboundedSender<Vec<String>>,
-    result_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<String>>,
+    truncated: bool,
+    generation: u64,
+    cancel: Option<Arc<AtomicBool>>,
+    scan_roots: Vec<String>,
+    scan_depth: usize,
+    result_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>,
+    result_rx: tokio::sync::mpsc::Receiver<DiscoveryEvent>,
+}
+
+impl Drop for WorkspacePicker {
+    fn drop(&mut self) {
+        self.cancel_discovery();
+    }
 }
 
 fn entry(path: String) -> RepoEntry {
@@ -213,12 +241,17 @@ fn entry(path: String) -> RepoEntry {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.clone());
-    RepoEntry { path, name }
+    let haystack = format!("{} {}", name, path).to_lowercase();
+    RepoEntry {
+        path,
+        name,
+        haystack,
+    }
 }
 
 impl WorkspacePicker {
     pub(crate) fn new(seed: Vec<String>, excluded: HashSet<String>) -> Self {
-        let (result_tx, result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (result_tx, result_rx) = tokio::sync::mpsc::channel(4);
         let mut p = Self {
             mode: PickerMode::Fuzzy,
             phase: Phase::Browse,
@@ -230,6 +263,11 @@ impl WorkspacePicker {
             selected: 0,
             scroll_offset: 0,
             scanning: false,
+            truncated: false,
+            generation: 0,
+            cancel: None,
+            scan_roots: Vec::new(),
+            scan_depth: 0,
             result_tx,
             result_rx,
         };
@@ -286,14 +324,58 @@ impl WorkspacePicker {
         cfg: thegn_core::config::Config,
         waker: TerminalWaker,
     ) {
+        self.cancel_discovery();
+        let generation = DISCOVERY_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        self.result_tx = tx.clone();
+        self.result_rx = rx;
+        self.generation = generation;
+        self.cancel = Some(cancel.clone());
+        self.scan_roots.clone_from(&cfg.repo_roots);
+        self.scan_depth = cfg.repo_scan_depth;
+        self.truncated = false;
         self.scanning = true;
-        let tx = self.result_tx.clone();
         tokio::task::spawn_blocking(move || {
-            let found = thegn_core::repo::discover_repos(&cfg);
-            // best-effort: the picker may already be closed
-            let _ = tx.send(found);
+            let report = thegn_core::repo::discover_repos_bounded(
+                &cfg,
+                thegn_core::repo::DiscoveryBudget::default(),
+                &cancel,
+                |paths| {
+                    if tx
+                        .blocking_send(DiscoveryEvent::Batch { generation, paths })
+                        .is_err()
+                    {
+                        return false;
+                    }
+                    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                    true
+                },
+            );
+            let _ = tx.blocking_send(DiscoveryEvent::Finished { generation, report });
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         });
+    }
+
+    fn cancel_discovery(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.scanning = false;
+    }
+
+    pub(crate) fn config_reloaded(
+        &mut self,
+        cfg: thegn_core::config::Config,
+        waker: TerminalWaker,
+    ) {
+        if self.discovery_config_changed(&cfg) {
+            self.spawn_discovery(cfg, waker);
+        }
+    }
+
+    fn discovery_config_changed(&self, cfg: &thegn_core::config::Config) -> bool {
+        cfg.repo_roots != self.scan_roots || cfg.repo_scan_depth != self.scan_depth
     }
 
     /// Merge any finished discovery results into the list (seed entries keep
@@ -301,13 +383,24 @@ impl WorkspacePicker {
     /// whether anything changed (→ the caller marks the frame dirty).
     pub(crate) fn drain_discovery(&mut self) -> bool {
         let mut changed = false;
-        while let Ok(found) = self.result_rx.try_recv() {
-            self.scanning = false;
-            changed = true;
-            for p in found {
-                if !self.excluded.contains(&p) && !self.items.iter().any(|e| e.path == p) {
-                    self.items.push(entry(p));
+        while let Ok(event) = self.result_rx.try_recv() {
+            match event {
+                DiscoveryEvent::Batch { generation, paths } if generation == self.generation => {
+                    changed = true;
+                    for p in paths {
+                        if !self.excluded.contains(&p) && !self.items.iter().any(|e| e.path == p) {
+                            self.items.push(entry(p));
+                        }
+                    }
                 }
+                DiscoveryEvent::Finished { generation, report }
+                    if generation == self.generation =>
+                {
+                    self.scanning = false;
+                    self.truncated = report.truncated || report.traversal_errors > 0;
+                    changed = true;
+                }
+                _ => {}
             }
         }
         if changed {
@@ -341,12 +434,7 @@ impl WorkspacePicker {
             self.matches = (0..self.items.len()).collect();
         } else {
             // Fuzzy over "name path" so a path fragment narrows like a basename.
-            let hay: Vec<String> = self
-                .items
-                .iter()
-                .map(|it| format!("{} {}", it.name, it.path))
-                .collect();
-            let refs: Vec<&str> = hay.iter().map(|s| s.as_str()).collect();
+            let refs: Vec<&str> = self.items.iter().map(|it| it.haystack.as_str()).collect();
             self.matches = crate::fff_backend::fuzzy_rank(self.query.as_str(), &refs)
                 .into_iter()
                 .map(|(i, _)| i)
@@ -728,7 +816,9 @@ impl WorkspacePicker {
                 let fy = inner.y + inner.rows - 2;
                 seg::draw_line(surface, inner.x, fy, inner.cols, &rule, panel);
                 let total = self.matches.len();
-                let count_str = if self.scanning {
+                let count_str = if self.truncated {
+                    format!("{total} repos (partial scan)")
+                } else if self.scanning {
                     format!("{total} · scanning repo roots…")
                 } else if total > MAX_ITEMS {
                     let end = (self.scroll_offset + MAX_ITEMS).min(total);
@@ -928,15 +1018,78 @@ mod tests {
     fn drain_discovery_merges_without_duplicating_seeds() {
         let mut p = picker(&["/code/seeded"]);
         p.scanning = true;
+        p.generation = 7;
         p.result_tx
-            .send(vec!["/code/seeded".into(), "/code/found".into()])
+            .try_send(DiscoveryEvent::Batch {
+                generation: 7,
+                paths: vec!["/code/seeded".into(), "/code/found".into()],
+            })
+            .unwrap();
+        assert!(p.drain_discovery());
+        let paths: Vec<&str> = p.matches().iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["/code/seeded", "/code/found"]);
+        p.result_tx
+            .try_send(DiscoveryEvent::Finished {
+                generation: 7,
+                report: thegn_core::repo::DiscoveryReport {
+                    truncated: true,
+                    ..thegn_core::repo::DiscoveryReport::default()
+                },
+            })
             .unwrap();
         assert!(p.drain_discovery());
         assert!(!p.scanning);
-        let paths: Vec<&str> = p.matches().iter().map(|e| e.path.as_str()).collect();
-        assert_eq!(paths, vec!["/code/seeded", "/code/found"]);
+        assert!(p.truncated, "the UI must retain partial scan state");
         // Idempotent: nothing new → no change.
         assert!(!p.drain_discovery());
+    }
+
+    #[test]
+    fn stale_discovery_generation_is_ignored() {
+        let mut p = picker(&[]);
+        p.generation = 2;
+        p.result_tx
+            .try_send(DiscoveryEvent::Batch {
+                generation: 1,
+                paths: vec!["/code/stale".into()],
+            })
+            .unwrap();
+        assert!(!p.drain_discovery());
+        assert!(p.items.is_empty());
+    }
+
+    #[test]
+    fn closing_picker_cancels_its_discovery_generation() {
+        let mut p = picker(&[]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        p.cancel = Some(cancel.clone());
+        p.scanning = true;
+        p.cancel_discovery();
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(!p.scanning);
+    }
+
+    #[test]
+    fn query_uses_precomputed_haystack() {
+        let mut p = picker(&["/code/Alpha"]);
+        let haystack = p.items[0].haystack.clone();
+        assert_eq!(haystack, "alpha /code/alpha");
+        type_str(&mut p, "alpha");
+        assert_eq!(p.items[0].haystack, haystack);
+        assert_eq!(p.matches().len(), 1);
+    }
+
+    #[test]
+    fn config_reload_restarts_discovery_only_for_scan_config_changes() {
+        let mut p = picker(&[]);
+        let cfg = thegn_core::config::Config::default();
+        p.scan_roots.clone_from(&cfg.repo_roots);
+        p.scan_depth = cfg.repo_scan_depth;
+        assert!(!p.discovery_config_changed(&cfg));
+
+        let mut changed = cfg;
+        changed.repo_scan_depth += 1;
+        assert!(p.discovery_config_changed(&changed));
     }
 
     #[test]

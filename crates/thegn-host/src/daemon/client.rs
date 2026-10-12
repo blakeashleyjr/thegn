@@ -379,7 +379,14 @@ fn adapt(session_id: String, stream: AttachStream) -> ExecSession {
                 frame = frames.recv() => match frame {
                     Some(EventFrame::PaneSnapshot { bytes, .. })
                     | Some(EventFrame::PaneDelta { bytes, .. }) => {
-                        if out_tx.send(ExecFrame::Stdout(bytes)).await.is_err() {
+                        if !forward_frame_while_servicing_control(
+                            &out_tx,
+                            ExecFrame::Stdout(bytes),
+                            &mut in_rx,
+                            &control,
+                        )
+                        .await
+                        {
                             return; // pane gone
                         }
                     }
@@ -414,6 +421,44 @@ fn adapt(session_id: String, stream: AttachStream) -> ExecSession {
         frames: out_rx,
         control: in_tx,
         session_id: sid_rx,
+    }
+}
+
+/// Forward a pane frame without preventing Close from reaching the attach
+/// stream while the pane's bounded output queue is full.
+async fn forward_frame_while_servicing_control(
+    out_tx: &tokio_mpsc::Sender<ExecFrame>,
+    frame: ExecFrame,
+    in_rx: &mut tokio_mpsc::Receiver<ExecControl>,
+    control: &tokio_mpsc::Sender<AttachControl>,
+) -> bool {
+    loop {
+        tokio::select! {
+            permit = out_tx.reserve() => match permit {
+                Ok(permit) => {
+                    permit.send(frame);
+                    return true;
+                }
+                Err(_) => return false,
+            },
+            message = in_rx.recv() => match message {
+                Some(ExecControl::Stdin(bytes)) => {
+                    if control.send(AttachControl::Input(bytes)).await.is_err() {
+                        return false;
+                    }
+                }
+                Some(ExecControl::Resize { cols, rows }) => {
+                    if control.send(AttachControl::Resize { rows, cols }).await.is_err() {
+                        return false;
+                    }
+                }
+                Some(ExecControl::Close) | None => {
+                    match control.send(AttachControl::Close).await {
+                        Ok(()) | Err(_) => return false,
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -507,6 +552,41 @@ impl ExecSource for LazyDaemonSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn attach_close_is_forwarded_when_pane_output_queue_is_full() {
+        let (frame_tx, frame_rx) = tokio_mpsc::channel(257);
+        let (attach_control_tx, mut attach_control_rx) = tokio_mpsc::channel(1);
+        let stream = AttachStream {
+            frames: frame_rx,
+            control: attach_control_tx,
+        };
+        let session = adapt("session-1".into(), stream);
+        let snapshot = || EventFrame::PaneSnapshot {
+            session: "session-1".into(),
+            seq: 0,
+            cols: 80,
+            rows: 24,
+            bytes: Vec::new(),
+        };
+        for _ in 0..257 {
+            frame_tx.send(snapshot()).await.unwrap();
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.frames.len() != 256 || frame_tx.capacity() != 257 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        session.control.send(ExecControl::Close).await.unwrap();
+
+        let close = tokio::time::timeout(Duration::from_secs(2), attach_control_rx.recv())
+            .await
+            .unwrap();
+        assert!(matches!(close, Some(AttachControl::Close)));
+    }
 
     /// The daemon reports `code: None` exactly when the exit is unreapable
     /// (killed / reaped out-of-band). That must surface as a distinct

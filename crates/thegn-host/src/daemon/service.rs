@@ -1497,7 +1497,7 @@ impl ControlApi for DaemonService {
                 let db = thegn_core::db::Db::open()?;
                 let root = crate::merge_ops::repo_root_of(std::path::Path::new(&wt))
                     .ok_or_else(|| anyhow::anyhow!("{wt}: not inside a git repository"))?;
-                Ok::<_, anyhow::Error>(crate::merge_ops::rows_for_repo(&db, &root))
+                crate::merge_ops::rows_for_repo(&db, &root)
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("merge task join: {e}")))?
@@ -1678,18 +1678,20 @@ impl ControlApi for DaemonService {
                     && thegn_svc::ci::validate_ci_id(&entry.job_id).is_ok()
             });
             if let Some(mut entry) = cached {
-                if let Some(lines) = tail_lines {
-                    let (text, truncated) = thegn_core::ci_log::bounded_tail(
-                        &entry.text,
-                        lines.min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
-                        self.config
-                            .ci
-                            .log_max_bytes
-                            .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
-                    );
-                    entry.text = text;
-                    entry.truncated |= truncated;
-                }
+                let redacted = thegn_core::ci_log::redact(&entry.text);
+                let (text, truncated) = thegn_core::ci_log::bounded_tail(
+                    &redacted,
+                    tail_lines
+                        .unwrap_or(self.config.ci.log_tail_lines)
+                        .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
+                    self.config
+                        .ci
+                        .log_max_bytes
+                        .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
+                );
+                entry.text = text;
+                entry.redacted = true;
+                entry.truncated |= truncated;
                 let fetched_at = entry.fetched_at;
                 let truncated = entry.truncated;
                 let redacted = entry.redacted;
@@ -1761,18 +1763,20 @@ impl ControlApi for DaemonService {
                     })
                     .await;
             }
-            if let Some(lines) = tail_lines {
-                let (text, truncated) = thegn_core::ci_log::bounded_tail(
-                    &entry.text,
-                    lines.min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
-                    self.config
-                        .ci
-                        .log_max_bytes
-                        .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
-                );
-                entry.text = text;
-                entry.truncated |= truncated;
-            }
+            let redacted_text = thegn_core::ci_log::redact(&entry.text);
+            let (text, truncated) = thegn_core::ci_log::bounded_tail(
+                &redacted_text,
+                tail_lines
+                    .unwrap_or(self.config.ci.log_tail_lines)
+                    .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
+                self.config
+                    .ci
+                    .log_max_bytes
+                    .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
+            );
+            entry.text = text;
+            entry.redacted = true;
+            entry.truncated |= truncated;
             let fetched_at = entry.fetched_at;
             let truncated = entry.truncated;
             let redacted = entry.redacted;

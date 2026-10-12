@@ -20,7 +20,7 @@
 //! names the offending line number, so the host's refusal can point at the
 //! exact line instead of "bad frontmatter".
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 /// The scope a chunk file declares: the paths it may touch, the siblings it
@@ -75,6 +75,14 @@ impl std::error::Error for ParseError {}
 /// - a known key appears twice (a silent overwrite would quietly re-scope a
 ///   gate — refuse instead).
 pub fn parse_frontmatter(md: &str) -> Result<ChunkScope, ParseError> {
+    let line_count = md.bytes().filter(|byte| *byte == b'\n').count()
+        + usize::from(!md.is_empty() && !md.ends_with('\n'));
+    if md.len() > 1024 * 1024 || line_count > MAX_FRONTMATTER_LINES {
+        return Err(ParseError {
+            line: 1,
+            message: "chunk frontmatter exceeds the byte or line limit".to_string(),
+        });
+    }
     let mut lines = md.lines();
     match lines.next() {
         // An empty body has no lines at all, and any other first line means
@@ -114,7 +122,18 @@ pub fn parse_frontmatter(md: &str) -> Result<ChunkScope, ParseError> {
                     Key::Overlaps => &mut scope.overlaps,
                     Key::After => &mut scope.after,
                 };
-                list.push(item.to_string());
+                if matches!(key, Key::Files) && list.len() >= MAX_PATTERNS {
+                    return Err(ParseError {
+                        line: lineno,
+                        message: format!("files scope exceeds {MAX_PATTERNS} patterns"),
+                    });
+                }
+                let item = if matches!(key, Key::Files) {
+                    canonicalize_file_pattern(item, lineno)?
+                } else {
+                    item.to_string()
+                };
+                list.push(item);
             }
             continue;
         }
@@ -166,13 +185,20 @@ pub fn parse_frontmatter(md: &str) -> Result<ChunkScope, ParseError> {
                 Some(Key::After) => &mut scope.after,
                 None => unreachable!(),
             };
-            list.extend(
-                items
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string),
-            );
+            for item in items.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if matches!(current, Some(Key::Files)) && list.len() >= MAX_PATTERNS {
+                    return Err(ParseError {
+                        line: lineno,
+                        message: format!("files scope exceeds {MAX_PATTERNS} patterns"),
+                    });
+                }
+                let item = if matches!(current, Some(Key::Files)) {
+                    canonicalize_file_pattern(item, lineno)?
+                } else {
+                    item.to_string()
+                };
+                list.push(item);
+            }
             // The inline list is complete; a later `- item` line has no key to
             // attach to.
             current = None;
@@ -184,7 +210,18 @@ pub fn parse_frontmatter(md: &str) -> Result<ChunkScope, ParseError> {
                 Some(Key::After) => &mut scope.after,
                 None => unreachable!(),
             };
-            list.push(value.to_string());
+            if matches!(current, Some(Key::Files)) && list.len() >= MAX_PATTERNS {
+                return Err(ParseError {
+                    line: lineno,
+                    message: format!("files scope exceeds {MAX_PATTERNS} patterns"),
+                });
+            }
+            let item = if matches!(current, Some(Key::Files)) {
+                canonicalize_file_pattern(value, lineno)?
+            } else {
+                value.to_string()
+            };
+            list.push(item);
             current = None;
         }
     }
@@ -194,27 +231,112 @@ pub fn parse_frontmatter(md: &str) -> Result<ChunkScope, ParseError> {
     })
 }
 
+const MAX_PATTERNS: usize = 64;
+const MAX_PATTERN_BYTES: usize = 256;
+const MAX_SEGMENTS: usize = 32;
+const MAX_FRONTMATTER_LINES: usize = 8192;
+const MAX_PAIR_MATCH_WORK: usize = 100_000;
+const MAX_TOTAL_MATCH_WORK: usize = 50_000_000;
+type StateSet = HashSet<(usize, usize)>;
+
+// `files:` is a repository-relative, slash-separated ASCII grammar. One
+// leading `./` is normalized; empty, dot, parent, drive, control, backslash,
+// wildcard-escape and Windows device-name components are refused. Matching
+// folds ASCII case for conservative conflict detection. These scopes are
+// lexical; symlink resolution of repository directories is a host concern.
+fn canonicalize_file_pattern(pattern: &str, line: usize) -> Result<String, ParseError> {
+    canonical_repo_relative_path(pattern).ok_or_else(|| ParseError {
+        line,
+        message: format!("unsupported or non-canonical file pattern `{pattern}`"),
+    })
+}
+
+/// Validate a repository-relative path or scope pattern and return its
+/// normalized spelling. One leading `./` is removed. `*` and `**` are
+/// accepted for scope patterns; callers opening a concrete file must reject
+/// wildcard characters. Windows device components are rejected
+/// ASCII-case-insensitively, including on Unix, to keep shared scopes portable.
+pub fn canonical_repo_relative_path(path: &str) -> Option<String> {
+    if path.len() > MAX_PATTERN_BYTES {
+        return None;
+    }
+    let normalized = path.strip_prefix("./").unwrap_or(path);
+    let segments: Vec<&str> = normalized.split('/').collect();
+    if normalized.is_empty()
+        || segments.len() > MAX_SEGMENTS
+        || !normalized.is_ascii()
+        || normalized.starts_with('/')
+        || normalized.contains('\\')
+        || normalized.contains(':')
+        || normalized.bytes().any(|b| b < 0x20 || b == 0x7f)
+        || segments.iter().any(|s| {
+            s.is_empty()
+                || *s == "."
+                || *s == ".."
+                || (s.contains("**") && *s != "**")
+                || s.ends_with('.')
+                || s.ends_with(' ')
+                || s.bytes()
+                    .any(|b| matches!(b, b'?' | b'<' | b'>' | b'"' | b'|'))
+                || windows_reserved_component(s)
+        })
+    {
+        return None;
+    }
+    Some(normalized.to_string())
+}
+
 /// Does `path` match `pattern`? `*` matches any run of characters within one
 /// path segment; `**` as a whole segment matches zero or more segments
 /// (across `/`); any other pattern compares literally. There is no escape
-/// syntax and no `?` — a gate should be predictable, not clever.
+/// syntax and no `?` wildcard — a gate should be predictable.
 pub fn glob_match(pattern: &str, path: &str) -> bool {
+    if pattern.len() > MAX_PATTERN_BYTES
+        || path.len() > MAX_PATTERN_BYTES * MAX_SEGMENTS
+        || !canonical_pattern(pattern)
+        || path.split('/').count() > MAX_SEGMENTS
+    {
+        return false;
+    }
     let p: Vec<&str> = pattern.split('/').collect();
     let s: Vec<&str> = path.split('/').collect();
-    match_segments(&p, &s)
+    let mut memo = HashMap::new();
+    let mut work = 0;
+    match_segments(&p, &s, &mut memo, &mut work)
 }
 
-fn match_segments(p: &[&str], s: &[&str]) -> bool {
-    match p.split_first() {
-        None => s.is_empty(),
-        // `**` across segments — including zero of them (`a/**/b` matches
-        // `a/b`), the usual glob convention.
-        Some((&"**", rest)) => (0..=s.len()).any(|skip| match_segments(rest, &s[skip..])),
-        Some((pat, rest)) => match s.split_first() {
-            None => false,
-            Some((seg, srest)) => match_segment(pat, seg) && match_segments(rest, srest),
-        },
+fn match_segments(
+    p: &[&str],
+    s: &[&str],
+    memo: &mut HashMap<(usize, usize), bool>,
+    work: &mut usize,
+) -> bool {
+    fn go(
+        p: &[&str],
+        s: &[&str],
+        i: usize,
+        j: usize,
+        memo: &mut HashMap<(usize, usize), bool>,
+        work: &mut usize,
+    ) -> bool {
+        if let Some(result) = memo.get(&(i, j)) {
+            return *result;
+        }
+        if *work >= MAX_PAIR_MATCH_WORK {
+            return false;
+        }
+        *work += 1;
+        let result = if i == p.len() {
+            j == s.len()
+        } else if p[i] == "**" {
+            go(p, s, i + 1, j, memo, work) || (j < s.len() && go(p, s, i, j + 1, memo, work))
+        } else {
+            j < s.len() && match_segment(p[i], s[j]) && go(p, s, i + 1, j + 1, memo, work)
+        };
+        memo.insert((i, j), result);
+        result
     }
+    go(p, s, 0, 0, memo, work)
 }
 
 /// One segment: literal characters plus `*` wildcards (iterative with one
@@ -248,21 +370,146 @@ fn match_segment(pat: &str, seg: &str) -> bool {
 }
 
 /// The concrete colliding `(new, sibling)` path pairs between two scopes —
-/// every pair, not the first: the refusal names everything at once. A pair
-/// collides when either side's pattern matches the other side's string, so
-/// `config_*.rs` in one scope collides with the exact `config_pipeline.rs` in
-/// another and vice versa. Empty `files` on either side yields no pairs — the
-/// opt-in rule.
-pub fn paths_overlap(a: &[String], b: &[String]) -> Vec<(String, String)> {
+/// every pair, not the first: the refusal names everything at once. Matching
+/// returns an error rather than claiming disjointness if its bounded
+/// automata product cannot complete. Empty `files` on either side yields no
+/// pairs — the opt-in rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchError {
+    OverBudget,
+    UnsupportedPattern,
+}
+
+pub fn paths_overlap(a: &[String], b: &[String]) -> Result<Vec<(String, String)>, MatchError> {
+    let mut work = 0usize;
+    paths_overlap_with_work(a, b, &mut work)
+}
+
+fn paths_overlap_with_work(
+    a: &[String],
+    b: &[String],
+    work: &mut usize,
+) -> Result<Vec<(String, String)>, MatchError> {
+    if a.len() > MAX_PATTERNS || b.len() > MAX_PATTERNS {
+        return Err(MatchError::OverBudget);
+    }
     let mut pairs = Vec::new();
     for pa in a {
         for pb in b {
-            if glob_match(pa, pb) || glob_match(pb, pa) {
+            if pa.len() > MAX_PATTERN_BYTES || pb.len() > MAX_PATTERN_BYTES {
+                return Err(MatchError::OverBudget);
+            }
+            if patterns_intersect(pa, pb, work)? {
                 pairs.push((pa.clone(), pb.clone()));
             }
         }
     }
-    pairs
+    Ok(pairs)
+}
+
+fn patterns_intersect(a: &str, b: &str, total_work: &mut usize) -> Result<bool, MatchError> {
+    if !canonical_pattern(a) || !canonical_pattern(b) {
+        return Err(MatchError::UnsupportedPattern);
+    }
+    let a: Vec<&str> = a.split('/').collect();
+    let b: Vec<&str> = b.split('/').collect();
+    let mut seen = StateSet::new();
+    let mut pending = vec![(0usize, 0usize)];
+    let mut pair_work = 0usize;
+    while let Some((i, j)) = pending.pop() {
+        if !seen.insert((i, j)) {
+            continue;
+        }
+        charge_match_work(&mut pair_work, total_work)?;
+        if i < a.len() && j < b.len() && a[i] != "**" && b[j] != "**" {
+            if segment_intersects(a[i], b[j], &mut pair_work, total_work)? {
+                pending.push((i + 1, j + 1));
+            }
+            continue;
+        }
+        if i == a.len() && j == b.len() {
+            return Ok(true);
+        }
+        if i < a.len() && a[i] == "**" {
+            pending.push((i + 1, j));
+        }
+        if j < b.len() && b[j] == "**" {
+            pending.push((i, j + 1));
+        }
+        if i < a.len() && j < b.len() {
+            if a[i] == "**" && b[j] == "**" {
+                pending.push((i, j));
+            } else if a[i] == "**" {
+                pending.push((i, j + 1));
+            } else if b[j] == "**" {
+                pending.push((i + 1, j));
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn canonical_pattern(p: &str) -> bool {
+    canonical_repo_relative_path(p).as_deref() == Some(p)
+}
+
+fn charge_match_work(pair_work: &mut usize, total_work: &mut usize) -> Result<(), MatchError> {
+    *pair_work += 1;
+    *total_work += 1;
+    if *pair_work > MAX_PAIR_MATCH_WORK || *total_work > MAX_TOTAL_MATCH_WORK {
+        return Err(MatchError::OverBudget);
+    }
+    Ok(())
+}
+
+fn windows_reserved_component(segment: &str) -> bool {
+    let base = segment.split('.').next().unwrap_or(segment);
+    ["CON", "PRN", "AUX", "NUL"]
+        .iter()
+        .any(|name| base.eq_ignore_ascii_case(name))
+        || ["COM", "LPT"].iter().any(|prefix| {
+            (1..=9).any(|digit| base.eq_ignore_ascii_case(&format!("{prefix}{digit}")))
+        })
+}
+
+// Product traversal of two epsilon NFAs. `*` has an epsilon edge to the next
+// token and a consuming self-loop; ASCII case folding is conservative for
+// repositories shared with case-insensitive filesystems.
+fn segment_intersects(
+    a: &str,
+    b: &str,
+    pair_work: &mut usize,
+    total_work: &mut usize,
+) -> Result<bool, MatchError> {
+    let a: Vec<u8> = a.bytes().map(|c| c.to_ascii_lowercase()).collect();
+    let b: Vec<u8> = b.bytes().map(|c| c.to_ascii_lowercase()).collect();
+    let mut pending = vec![(0usize, 0usize)];
+    let mut seen = StateSet::new();
+    while let Some((i, j)) = pending.pop() {
+        if !seen.insert((i, j)) {
+            continue;
+        }
+        charge_match_work(pair_work, total_work)?;
+        if i == a.len() && j == b.len() {
+            return Ok(true);
+        }
+        if i < a.len() && a[i] == b'*' {
+            pending.push((i + 1, j));
+        }
+        if j < b.len() && b[j] == b'*' {
+            pending.push((i, j + 1));
+        }
+        if i < a.len() && j < b.len() {
+            match (a[i] == b'*', b[j] == b'*') {
+                (true, true) => pending.push((i, j)),
+                (true, false) => pending.push((i, j + 1)),
+                (false, true) => pending.push((i + 1, j)),
+                (false, false) if a[i] == b[j] => pending.push((i + 1, j + 1)),
+                _ => {}
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// The `after:` entries NOT in the `done` set — the sequencing half of the
@@ -288,9 +535,8 @@ pub struct ActiveScope {
     /// The sibling's chunk name (its chunk file's basename, e.g. `chunk-2`) —
     /// what `overlaps:` blessings and `after:` entries refer to.
     pub name: String,
-    /// The sibling's parsed `files:` list (empty when its file is unreadable —
-    /// a sibling that cannot be read never conflicts, degrading to the
-    /// pre-gate behaviour rather than wedging the roster).
+    /// The sibling's parsed `files:` list. The host refuses admission if its
+    /// scope cannot be read or parsed.
     pub files: Vec<String>,
 }
 
@@ -330,6 +576,8 @@ pub enum ScopeVerdict {
     },
     /// The `after:` chunks that are not `done` yet (exhaustive, ordered).
     UnmetAfter(Vec<String>),
+    /// Matching could not be completed safely; callers must refuse admission.
+    Unknown(MatchError),
 }
 
 /// Decide whether `new` may dispatch alongside `active`, given the set of
@@ -343,11 +591,15 @@ pub enum ScopeVerdict {
 /// picture.
 pub fn verdict(new: &ChunkScope, active: &[ActiveScope], done: &HashSet<String>) -> ScopeVerdict {
     let mut overlaps = Vec::new();
+    let mut work = 0usize;
     for (i, sib) in active.iter().enumerate() {
         if new.overlaps.iter().any(|o| o == &sib.name) {
             continue;
         }
-        let pairs = paths_overlap(&new.files, &sib.files);
+        let pairs = match paths_overlap_with_work(&new.files, &sib.files, &mut work) {
+            Ok(pairs) => pairs,
+            Err(error) => return ScopeVerdict::Unknown(error),
+        };
         if !pairs.is_empty() {
             overlaps.push((i, pairs));
         }
@@ -478,9 +730,9 @@ mod tests {
     }
 
     #[test]
-    fn item_lines_with_colons_are_items_not_keys() {
+    fn unsupported_colon_in_a_file_path_is_rejected() {
         let md = "---\nfiles:\n  - crates/_a:b.rs\n---\n";
-        assert_eq!(parse_frontmatter(md).unwrap().files, s(&["crates/_a:b.rs"]));
+        assert!(parse_frontmatter(md).is_err());
     }
 
     #[test]
@@ -562,7 +814,7 @@ mod tests {
         let a = s(&["a.rs", "b.rs", "c*.rs"]);
         let b = s(&["b.rs", "c1.rs", "c2.rs"]);
         assert_eq!(
-            paths_overlap(&a, &b),
+            paths_overlap(&a, &b).unwrap(),
             vec![
                 ("b.rs".to_string(), "b.rs".to_string()),
                 ("c*.rs".to_string(), "c1.rs".to_string()),
@@ -574,20 +826,206 @@ mod tests {
     #[test]
     fn a_glob_collides_with_an_exact_path_in_either_direction() {
         assert_eq!(
-            paths_overlap(&s(&["config_*.rs"]), &s(&["config_pipeline.rs"])),
+            paths_overlap(&s(&["config_*.rs"]), &s(&["config_pipeline.rs"])).unwrap(),
             vec![("config_*.rs".to_string(), "config_pipeline.rs".to_string())]
         );
         assert_eq!(
-            paths_overlap(&s(&["config_pipeline.rs"]), &s(&["config_*.rs"])),
+            paths_overlap(&s(&["config_pipeline.rs"]), &s(&["config_*.rs"])).unwrap(),
             vec![("config_pipeline.rs".to_string(), "config_*.rs".to_string())]
         );
     }
 
     #[test]
     fn disjoint_or_empty_scopes_never_overlap() {
-        assert!(paths_overlap(&s(&["a.rs"]), &s(&["b.rs"])).is_empty());
-        assert!(paths_overlap(&[], &s(&["b.rs"])).is_empty());
-        assert!(paths_overlap(&s(&["a.rs"]), &[]).is_empty());
+        assert!(
+            paths_overlap(&s(&["a.rs"]), &s(&["b.rs"]))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(paths_overlap(&[], &s(&["b.rs"])).unwrap().is_empty());
+        assert!(paths_overlap(&s(&["a.rs"]), &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn glob_language_intersection_matrix_is_sound_and_case_conservative() {
+        let cases = [
+            ("src/*.rs", "src/lib.*", true),
+            ("src/*.rs", "src/lib.rs", true),
+            ("src/*.rs", "tests/*.rs", false),
+            ("src/a.rs", "src/b.rs", false),
+            ("src/**/lib.rs", "src/lib.rs", true),
+            ("src/**/lib.rs", "src/bin/lib.rs", true),
+            ("src/*.rs", "src/lib.py", false),
+            ("Src/Lib.rs", "src/lib.rs", true),
+        ];
+        for (a, b, intersects) in cases {
+            assert_eq!(
+                !paths_overlap(&s(&[a]), &s(&[b])).unwrap().is_empty(),
+                intersects,
+                "{a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_patterns_are_canonicalized_or_rejected_at_parse_time() {
+        assert_eq!(
+            parse_frontmatter("---\nfiles: [./src/lib.rs]\n---\n")
+                .unwrap()
+                .files,
+            s(&["src/lib.rs"])
+        );
+        for path in [
+            "../secret",
+            "/etc/passwd",
+            "src//lib.rs",
+            "src/./lib.rs",
+            "src\\lib.rs",
+            "C:/src/lib.rs",
+            "src/foo.",
+            "src/foo /bar",
+            "src/foo?.rs",
+            "src/foo\tbar",
+            "src/café.rs",
+            "src/CON.txt",
+        ] {
+            let md = format!("---\nfiles: [{path}]\n---\n");
+            assert!(parse_frontmatter(&md).is_err(), "accepted {path}");
+        }
+    }
+
+    #[test]
+    fn frontmatter_input_pattern_count_and_pattern_length_are_capped() {
+        let too_many = std::iter::repeat_n("a", MAX_PATTERNS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_frontmatter(&format!("---\nfiles: [{too_many}]\n---\n")).is_err());
+        assert!(
+            parse_frontmatter(&format!(
+                "---\nfiles: [{}]\n---\n",
+                "a".repeat(MAX_PATTERN_BYTES + 1)
+            ))
+            .is_err()
+        );
+        assert!(parse_frontmatter(&"x".repeat(1024 * 1024 + 1)).is_err());
+        assert!(parse_frontmatter(&"\n".repeat(MAX_FRONTMATTER_LINES + 1)).is_err());
+    }
+
+    #[test]
+    fn repeated_double_star_matching_is_memoized_with_a_deterministic_work_bound() {
+        let pattern = std::iter::repeat_n("**", 30).collect::<Vec<_>>().join("/");
+        let path = std::iter::repeat_n("x", 30).collect::<Vec<_>>().join("/");
+        let p: Vec<&str> = pattern.split('/').collect();
+        let s: Vec<&str> = path.split('/').collect();
+        let mut memo = HashMap::new();
+        let mut work = 0;
+        assert!(match_segments(&p, &s, &mut memo, &mut work));
+        assert!(work <= (p.len() + 1) * (s.len() + 1));
+        let repeated = std::iter::repeat_n("**", 30).collect::<Vec<_>>().join("/");
+        let mut intersection_work = 0;
+        assert!(patterns_intersect(&repeated, &repeated, &mut intersection_work).unwrap());
+        assert!(intersection_work < MAX_PAIR_MATCH_WORK);
+    }
+
+    #[test]
+    fn unsupported_and_over_budget_scope_data_is_a_typed_refusal() {
+        assert_eq!(
+            paths_overlap(&s(&["src/../secret"]), &s(&["src/*"])),
+            Err(MatchError::UnsupportedPattern)
+        );
+        assert_eq!(
+            paths_overlap(&s(&["src/a?.rs"]), &s(&["src/a.rs"])),
+            Err(MatchError::UnsupportedPattern)
+        );
+        let too_many = vec!["src/*".to_string(); MAX_PATTERNS + 1];
+        let scope = ChunkScope {
+            files: too_many,
+            ..ChunkScope::default()
+        };
+        assert_eq!(
+            verdict(&scope, &[active(1, "chunk-1", &["src/lib.rs"])], &done(&[])),
+            ScopeVerdict::Unknown(MatchError::OverBudget)
+        );
+        let mut near_aggregate_ceiling = MAX_TOTAL_MATCH_WORK - 1;
+        assert_eq!(
+            paths_overlap_with_work(
+                &s(&["same.rs"]),
+                &s(&["same.rs"]),
+                &mut near_aggregate_ceiling
+            ),
+            Err(MatchError::OverBudget)
+        );
+
+        let long_path = "a".repeat(40);
+        let siblings: Vec<ActiveScope> = (0..2500)
+            .map(|row| ActiveScope {
+                row,
+                name: format!("chunk-{row}"),
+                files: vec![format!("sibling-{row}/{long_path}")],
+            })
+            .collect();
+        let scope = ChunkScope {
+            files: vec![format!("incoming/{long_path}")],
+            ..ChunkScope::default()
+        };
+        assert_eq!(verdict(&scope, &siblings, &done(&[])), ScopeVerdict::Ok);
+    }
+
+    #[test]
+    fn realistic_roster_has_an_independent_budget_for_each_pattern_pair() {
+        let files: Vec<String> = (0..20)
+            .map(|n| format!("crates/thegn-host/src/file_{n}.rs"))
+            .collect();
+        let siblings: Vec<ActiveScope> = (0..10)
+            .map(|row| ActiveScope {
+                row,
+                name: format!("chunk-{row}"),
+                files: (0..20)
+                    .map(|n| format!("crates/thegn-host/src/other_{row}_{n}.rs"))
+                    .collect(),
+            })
+            .collect();
+        let scope = ChunkScope {
+            files,
+            ..ChunkScope::default()
+        };
+        assert_eq!(verdict(&scope, &siblings, &done(&[])), ScopeVerdict::Ok);
+    }
+
+    #[test]
+    fn invalid_file_pattern_errors_name_the_item_line_and_colon_items_still_parse() {
+        let error =
+            parse_frontmatter("---\nfiles:\n  - good.rs\n  - ../bad.rs\n---\n").unwrap_err();
+        assert_eq!(error.line, 4);
+        for (frontmatter, line) in [
+            ("---\nfiles: [../bad.rs]\n---\n", 2),
+            ("---\nfiles: ../bad.rs\n---\n", 2),
+        ] {
+            assert_eq!(parse_frontmatter(frontmatter).unwrap_err().line, line);
+        }
+        let scope =
+            parse_frontmatter("---\nafter:\n  - issue:123\noverlaps: [chunk:2]\n---\n").unwrap();
+        assert_eq!(scope.after, s(&["issue:123"]));
+        assert_eq!(scope.overlaps, s(&["chunk:2"]));
+    }
+
+    #[test]
+    fn shared_path_grammar_normalizes_one_dot_prefix_and_rejects_aliases() {
+        assert_eq!(
+            canonical_repo_relative_path("./src/*.rs").as_deref(),
+            Some("src/*.rs")
+        );
+        for path in [
+            "../outside.md",
+            "dir//scope.md",
+            "dir/./scope.md",
+            "dir\\scope.md",
+            "dir/scope:bad.md",
+            "café.md",
+            "src/aux.rs",
+        ] {
+            assert_eq!(canonical_repo_relative_path(path), None, "accepted {path}");
+        }
     }
 
     // --- after / done -------------------------------------------------------

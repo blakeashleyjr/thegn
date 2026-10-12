@@ -9,6 +9,8 @@ use crate::store::WorkspaceStore;
 use crate::util;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 const MAX_GIT_IDENTITY_OUTPUT: usize = 16 * 1024;
@@ -171,6 +173,15 @@ pub fn repo_slug(root: &Path) -> String {
         .unwrap_or(base)
 }
 
+/// Resolve a repo slug using a specific state database. This is for workers
+/// whose caller already selected an isolated database path (notably tests and
+/// alternate state profiles); it must not silently consult the default DB.
+pub fn repo_slug_at(root: &Path, db_path: &Path) -> String {
+    crate::db::Db::open_at(db_path)
+        .map(|db| repo_slug_with(&db, root))
+        .unwrap_or_else(|_| slug_base(&repo_name_from_path(root)))
+}
+
 /// Canonical slug for a repo via an existing DB handle — same contract as
 /// [`repo_slug`] but without opening a second connection or spawning git
 /// (the name is path-derived, so `root` must already be a repo root).
@@ -232,37 +243,172 @@ fn slug_base(name: &str) -> String {
 /// Discover git repos under the configured roots (parent dirs of a `.git`
 /// directory). Skips worktrees (whose `.git` is a file). Sorted + deduped.
 pub fn discover_repos(cfg: &Config) -> Vec<String> {
-    let mut found: Vec<String> = Vec::new();
-    for root in &cfg.repo_roots {
-        let root = Path::new(root);
-        if !root.is_dir() {
-            // Warn rather than skipping in silence. A typo'd or not-yet-created
-            // root produced no stdout, no stderr and exit 0 from `repo list` —
-            // which reads as "you have no repos" rather than "I looked in a
-            // directory that isn't there". Also fires for the default
-            // `repo_roots = [workspaces_dir]` when `~/code` doesn't exist.
-            crate::msg::warn(&format!(
-                "repo_roots: {} does not exist — skipping it",
-                root.display()
-            ));
-            continue;
-        }
-        for entry in WalkDir::new(root)
-            .max_depth(cfg.repo_scan_depth)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_dir()
-                && entry.file_name() == ".git"
-                && let Some(parent) = entry.path().parent()
-            {
-                found.push(parent.to_string_lossy().into_owned());
-            }
-        }
+    let cancel = AtomicBool::new(false);
+    let mut found = Vec::new();
+    let report = discover_repos_bounded(cfg, DiscoveryBudget::default(), &cancel, |batch| {
+        found.extend(batch);
+        true
+    });
+    if report.truncated {
+        crate::msg::warn(&format!(
+            "repo discovery was truncated after visiting {} entries and finding {} repositories",
+            report.visited_entries, report.repositories
+        ));
     }
     found.sort();
     found.dedup();
     found
+}
+
+/// Hard limits for a repo-root walk. The CLI and picker share these defaults;
+/// callers may lower them for deterministic bounded scans and tests.
+#[derive(Debug, Clone, Copy)]
+pub struct DiscoveryBudget {
+    pub max_entries: usize,
+    pub max_repositories: usize,
+    pub max_path_bytes: usize,
+    pub max_single_path_bytes: usize,
+    pub max_elapsed: Duration,
+    pub max_errors: usize,
+    pub batch_size: usize,
+}
+
+impl Default for DiscoveryBudget {
+    fn default() -> Self {
+        Self {
+            max_entries: 200_000,
+            max_repositories: 20_000,
+            max_path_bytes: 8 * 1024 * 1024,
+            max_single_path_bytes: 16 * 1024,
+            max_elapsed: Duration::from_secs(30),
+            max_errors: 64,
+            batch_size: 64,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveryReport {
+    pub visited_entries: usize,
+    pub repositories: usize,
+    pub path_bytes: usize,
+    pub traversal_errors: usize,
+    pub missing_roots: usize,
+    pub truncated: bool,
+    pub cancelled: bool,
+}
+
+/// Bounded, cancellable discovery. `emit` receives batches no larger than the
+/// budget and returns false when its consumer has gone away.
+pub fn discover_repos_bounded(
+    cfg: &Config,
+    budget: DiscoveryBudget,
+    cancel: &AtomicBool,
+    mut emit: impl FnMut(Vec<String>) -> bool,
+) -> DiscoveryReport {
+    fn prune(entry: &walkdir::DirEntry) -> bool {
+        if entry.depth() == 0 {
+            return false;
+        }
+        let name = entry.file_name().to_string_lossy();
+        name.starts_with('.') || matches!(name.as_ref(), "node_modules" | "target")
+    }
+    let started = Instant::now();
+    let mut report = DiscoveryReport::default();
+    let mut batch = Vec::with_capacity(budget.batch_size.min(256));
+    let mut roots = std::collections::HashSet::new();
+    for raw_root in &cfg.repo_roots {
+        if cancel.load(Ordering::Relaxed) {
+            report.cancelled = true;
+            break;
+        }
+        let raw = Path::new(raw_root);
+        if !raw.is_dir() {
+            crate::msg::warn(&format!(
+                "repo_roots: {} does not exist — skipping it",
+                raw.display()
+            ));
+            report.missing_roots += 1;
+            continue;
+        }
+        let root = match std::fs::canonicalize(raw) {
+            Ok(root) => root,
+            Err(_) => {
+                report.traversal_errors += 1;
+                if report.traversal_errors >= budget.max_errors {
+                    report.truncated = true;
+                    break;
+                }
+                continue;
+            }
+        };
+        if !roots.insert(root.clone()) {
+            continue;
+        }
+        let mut walker = WalkDir::new(raw)
+            .max_depth(cfg.repo_scan_depth)
+            .same_file_system(true)
+            .follow_links(false)
+            .into_iter();
+        while let Some(item) = walker.next() {
+            if cancel.load(Ordering::Relaxed) {
+                report.cancelled = true;
+                break;
+            }
+            if started.elapsed() >= budget.max_elapsed
+                || report.visited_entries >= budget.max_entries
+            {
+                report.truncated = true;
+                break;
+            }
+            let entry = match item {
+                Ok(entry) => entry,
+                Err(_) => {
+                    report.traversal_errors += 1;
+                    if report.traversal_errors >= budget.max_errors {
+                        report.truncated = true;
+                        break;
+                    }
+                    continue;
+                }
+            };
+            report.visited_entries += 1;
+            if entry.file_type().is_dir()
+                && entry.file_name() == ".git"
+                && let Some(parent) = entry.path().parent()
+            {
+                let path = parent.to_string_lossy().into_owned();
+                let len = path.len();
+                if len > budget.max_single_path_bytes
+                    || report.path_bytes.saturating_add(len) > budget.max_path_bytes
+                    || report.repositories >= budget.max_repositories
+                {
+                    report.truncated = true;
+                    break;
+                }
+                report.repositories += 1;
+                report.path_bytes += len;
+                batch.push(path);
+                if batch.len() >= budget.batch_size.max(1) && !emit(std::mem::take(&mut batch)) {
+                    report.cancelled = true;
+                    break;
+                }
+                // The repository has been recognized: never visit its Git object tree.
+                walker.skip_current_dir();
+                continue;
+            }
+            if entry.file_type().is_dir() && prune(&entry) {
+                walker.skip_current_dir();
+            }
+        }
+        if report.truncated || report.cancelled {
+            break;
+        }
+    }
+    if !batch.is_empty() && !report.cancelled && !cancel.load(Ordering::Relaxed) && !emit(batch) {
+        report.cancelled = true;
+    }
+    report
 }
 
 /// Discover git repos under a single `root` (e.g. `$HOME`), depth-limited and
@@ -322,6 +468,154 @@ mod tests {
                 .success(),
             "git {args:?}"
         );
+    }
+
+    #[test]
+    fn bounded_discovery_prunes_git_objects_and_reports_limits() {
+        let root = tmp("bounded-discovery");
+        std::fs::remove_dir_all(&root).unwrap_or(());
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git/objects/pack")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden/hidden-repo/.git")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/vendor/.git")).unwrap();
+        std::fs::create_dir_all(root.join("target/build/.git")).unwrap();
+        let cfg = Config {
+            repo_roots: vec![root.to_string_lossy().into_owned()],
+            ..Config::default()
+        };
+        let mut batches = Vec::new();
+        let report = discover_repos_bounded(
+            &cfg,
+            DiscoveryBudget {
+                batch_size: 1,
+                ..DiscoveryBudget::default()
+            },
+            &AtomicBool::new(false),
+            |batch| {
+                assert!(batch.len() <= 1, "batch exceeded requested bound");
+                batches.extend(batch);
+                true
+            },
+        );
+        assert_eq!(batches, vec![repo.to_string_lossy().into_owned()]);
+        assert!(
+            report.visited_entries < 8,
+            "the .git object descendants and pruned trees must not be visited: {report:?}"
+        );
+        assert!(!report.truncated);
+
+        let mut with_missing_root = cfg.clone();
+        with_missing_root.repo_roots.insert(
+            0,
+            root.with_extension("missing-root")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let errored = discover_repos_bounded(
+            &with_missing_root,
+            DiscoveryBudget::default(),
+            &AtomicBool::new(false),
+            |_| true,
+        );
+        assert_eq!(errored.traversal_errors, 0);
+        assert_eq!(errored.missing_roots, 1);
+
+        let alias = root.parent().unwrap().join("walk-alias");
+        std::fs::create_dir_all(&alias).unwrap();
+        let raw_root = alias.join("..").join(root.file_name().unwrap());
+        let mut aliased_cfg = cfg.clone();
+        aliased_cfg.repo_roots = vec![raw_root.to_string_lossy().into_owned()];
+        let mut aliased = Vec::new();
+        let alias_report = discover_repos_bounded(
+            &aliased_cfg,
+            DiscoveryBudget::default(),
+            &AtomicBool::new(false),
+            |batch| {
+                aliased.extend(batch);
+                true
+            },
+        );
+        assert_eq!(
+            aliased,
+            vec![raw_root.join("repo").to_string_lossy().into_owned()],
+            "canonical paths are dedupe keys only; results retain the configured root spelling"
+        );
+        assert!(!alias_report.truncated);
+        std::fs::remove_dir_all(alias).unwrap();
+
+        let limited = discover_repos_bounded(
+            &cfg,
+            DiscoveryBudget {
+                max_entries: 1,
+                ..DiscoveryBudget::default()
+            },
+            &AtomicBool::new(false),
+            |_| true,
+        );
+        assert!(
+            limited.truncated,
+            "the walk must stop once the entry cap is reached"
+        );
+
+        let cancelled = AtomicBool::new(true);
+        let stopped =
+            discover_repos_bounded(&cfg, DiscoveryBudget::default(), &cancelled, |_| true);
+        assert!(stopped.cancelled);
+        assert_eq!(stopped.visited_entries, 0);
+
+        for budget in [
+            DiscoveryBudget {
+                max_elapsed: Duration::ZERO,
+                ..DiscoveryBudget::default()
+            },
+            DiscoveryBudget {
+                max_repositories: 0,
+                ..DiscoveryBudget::default()
+            },
+            DiscoveryBudget {
+                max_path_bytes: 0,
+                ..DiscoveryBudget::default()
+            },
+            DiscoveryBudget {
+                max_single_path_bytes: 1,
+                ..DiscoveryBudget::default()
+            },
+        ] {
+            assert!(
+                discover_repos_bounded(&cfg, budget, &AtomicBool::new(false), |_| true).truncated
+            );
+        }
+        let consumer_gone = discover_repos_bounded(
+            &cfg,
+            DiscoveryBudget {
+                batch_size: 1,
+                ..DiscoveryBudget::default()
+            },
+            &AtomicBool::new(false),
+            |_| false,
+        );
+        assert!(consumer_gone.cancelled);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn repo_slug_at_persists_to_the_supplied_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("same-name");
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = dir.path().join("isolated/thegn.db");
+        let db = crate::db::Db::open_at(&db_path).unwrap();
+        db.slug_for_repo("/another/same-name", "same-name").unwrap();
+
+        assert_eq!(repo_slug_at(&root, &db_path), "same-name-2");
+        assert_eq!(
+            db.slug_for_repo(&root.to_string_lossy(), "same-name")
+                .unwrap(),
+            "same-name-2"
+        );
+        let bad = dir.path().join("dir-not-db");
+        std::fs::create_dir_all(&bad).unwrap();
+        assert_eq!(repo_slug_at(&root, &bad), "same-name");
     }
 
     #[test]

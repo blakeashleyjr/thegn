@@ -23,18 +23,74 @@ use thegn_core::remote::SshTarget;
 /// has **no timeouts**, so a stalled TCP handshake or a hung TLS negotiation to
 /// the provider's control plane blocks the calling request *forever* — which is
 /// exactly what strands the "Sync agent logins" provisioning step on a bad
-/// network. We bound only **connection establishment** (not the whole request),
-/// so legitimately long transfers (large binary/closure pushes) still complete,
-/// but an unreachable endpoint fails fast instead of hanging. Falls back to the
-/// plain client if the builder ever fails (it won't in practice).
+/// network. Control requests have a total deadline; individual file-transfer
+/// requests override it with their separate, longer deadline. An invalid
+/// client policy is fatal rather than falling back to an unbounded client.
+/// Redirects are rejected so authenticated requests cannot be replayed to
+/// another host.
 pub(crate) fn provider_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(CONTROL_TIMEOUT)
         // Reap idle keep-alive sockets so a half-open connection to a sprite that
         // was suspended/rotated doesn't get reused into a silent stall.
         .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("provider HTTP client policy must be supported")
+}
+
+/// Maximum decoded control-plane JSON response. File contents use their
+/// separate streaming API.
+pub(crate) const CONTROL_BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// File contents use a separate, longer policy than metadata/control calls.
+const FILE_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const FILE_TRANSFER_BODY_LIMIT: usize = 256 * 1024 * 1024;
+
+/// Read a control response in chunks so unknown-length responses cannot grow
+/// an unbounded in-memory JSON value. reqwest exposes decoded chunks here, so
+/// this cap applies after supported content decoding as well.
+pub(crate) async fn response_json(
+    response: reqwest::Response,
+    provider: &str,
+    operation: &str,
+) -> Result<serde_json::Value> {
+    let bytes = response_bytes(response, provider, operation, CONTROL_BODY_LIMIT).await?;
+    if bytes.is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("{provider}: decode {operation} response JSON"))
+}
+
+pub(crate) async fn response_text(
+    response: reqwest::Response,
+    provider: &str,
+    operation: &str,
+) -> Result<String> {
+    String::from_utf8(response_bytes(response, provider, operation, CONTROL_BODY_LIMIT).await?)
+        .with_context(|| format!("{provider}: decode {operation} response text"))
+}
+
+async fn response_bytes(
+    mut response: reqwest::Response,
+    provider: &str,
+    operation: &str,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| redacted_transport_error(provider, operation, &error))?
+    {
+        anyhow::ensure!(
+            chunk.len() <= limit.saturating_sub(bytes.len()),
+            "{provider}: {operation} response exceeded the {limit}-byte body limit"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// A stable, value-free description of a failed provider HTTP exchange.
@@ -69,11 +125,9 @@ mod sessions;
 
 /// Per-request deadline for the small JSON **control-plane** calls (create,
 /// list, destroy, fs read/list, network policy, checkpoint metadata). The shared
-/// client (above) bounds only *connection* setup so genuinely long transfers
-/// (large binary/closure pushes via `write_with_mode`) can still run; but a
-/// control call whose response the server withholds while a sprite cold-boots
-/// would otherwise hang the caller **forever** — the "hung on startup" failure.
-/// Capping each such call turns an infinite stall into a fast, retryable error.
+/// client applies this deadline by default; long file transfers override it
+/// with their separate policy. Capping control calls turns an infinite stall
+/// into a fast, retryable error.
 pub(crate) const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Control-plane retry budget for the idempotent create/list calls: a transient
@@ -200,15 +254,12 @@ impl RemoteProvider for DaytonaProvider {
                 .await
                 .context("daytona: POST /sandbox")?;
             let status = resp.status();
-            let body: serde_json::Value = resp
-                .json()
-                .await
-                .context("daytona: decode create response")?;
+            let body = response_json(resp, "daytona", "POST /sandbox").await?;
             if !status.is_success() {
-                return Err(anyhow!("daytona create failed ({status}): {body}"));
+                return Err(anyhow!("daytona create failed ({status})"));
             }
             let id = Self::parse_id(&body)
-                .ok_or_else(|| anyhow!("daytona create: no sandbox id in response: {body}"))?;
+                .ok_or_else(|| anyhow!("daytona create: response did not contain a sandbox id"))?;
             let exec = Self::exec_for(&id);
             Ok(SandboxHandle { id, exec })
         })
@@ -243,7 +294,7 @@ impl RemoteProvider for DaytonaProvider {
                 .send()
                 .await
                 .context("daytona: GET /sandbox")?;
-            let body: serde_json::Value = resp.json().await.context("daytona: decode list")?;
+            let body = response_json(resp, "daytona", "GET /sandbox").await?;
             Ok(Self::parse_list(&body))
         })
     }
@@ -398,15 +449,14 @@ impl RemoteProvider for SpritesProvider {
                 {
                     Ok(resp) => {
                         let status = resp.status();
-                        let body: serde_json::Value =
-                            resp.json().await.unwrap_or(serde_json::Value::Null);
                         if status.is_success() {
+                            let body = response_json(resp, "sprites", "POST /sprites").await?;
                             // The server echoes the name; fall back to the requested one.
                             let name = Self::parse_name(&body).unwrap_or_else(|| self.name.clone());
                             let exec = Self::exec_for(&name);
                             return Ok(SandboxHandle { id: name, exec });
                         }
-                        last = Some(format!("{status}: {body}"));
+                        last = Some(status.to_string());
                         if !transient_status(status) {
                             break;
                         }
@@ -494,8 +544,7 @@ impl RemoteProvider for SpritesProvider {
                     Ok(resp) => {
                         let status = resp.status();
                         if status.is_success() {
-                            let body: serde_json::Value =
-                                resp.json().await.context("sprites: decode list")?;
+                            let body = response_json(resp, "sprites", "GET /sprites").await?;
                             return Ok(Self::parse_list(&body));
                         }
                         last = Some(status.to_string());
@@ -617,8 +666,7 @@ impl ProviderEgress for SpritesProvider {
                 Ok(())
             } else {
                 let st = resp.status();
-                let b = resp.text().await.unwrap_or_default();
-                Err(anyhow!("sprites set network policy failed ({st}): {b}"))
+                Err(anyhow!("sprites set network policy failed ({st})"))
             }
         })
     }
@@ -633,7 +681,11 @@ impl ProviderEgress for SpritesProvider {
                 .send()
                 .await
                 .context("sprites: GET /policy/network")?;
-            let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(anyhow!("sprites GET /policy/network failed ({status})"));
+            }
+            let body = response_json(resp, "sprites", "GET /policy/network").await?;
             Ok(body
                 .get("rules")
                 .and_then(|r| r.as_array())
@@ -743,12 +795,12 @@ impl ProviderCheckpoints for SpritesProvider {
                 .await
                 .context("sprites: POST /checkpoint")?;
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
             if !status.is_success() {
-                return Err(anyhow!("sprites checkpoint failed ({status}): {text}"));
+                return Err(anyhow!("sprites checkpoint failed ({status})"));
             }
+            let text = response_text(resp, "sprites", "POST /checkpoint").await?;
             Self::parse_checkpoint_stream(&text)
-                .ok_or_else(|| anyhow!("sprites checkpoint: no id in stream: {text}"))
+                .ok_or_else(|| anyhow!("sprites checkpoint response did not contain an id"))
         })
     }
 
@@ -762,7 +814,7 @@ impl ProviderCheckpoints for SpritesProvider {
                 .send()
                 .await
                 .context("sprites: GET /checkpoints")?;
-            let v: serde_json::Value = resp.json().await.context("sprites: decode checkpoints")?;
+            let v = response_json(resp, "sprites", "GET /checkpoints").await?;
             let arr = v
                 .as_array()
                 .cloned()
@@ -797,6 +849,100 @@ pub struct FileEntry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+}
+
+const DOWNLOAD_MAX_DEPTH: usize = 64;
+const DOWNLOAD_MAX_FILES: usize = 10_000;
+const DOWNLOAD_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const DOWNLOAD_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+
+fn valid_remote_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.chars().any(|ch| matches!(ch, '/' | '\\' | '\0'))
+        && !name.chars().any(char::is_control)
+        && !(name.len() >= 2
+            && name.as_bytes()[0].is_ascii_alphabetic()
+            && name.as_bytes()[1] == b':')
+}
+
+fn ensure_download_dir(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            anyhow::bail!(
+                "download destination component is not a real directory: {}",
+                path.display()
+            )
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(path).with_context(|| format!("create {}", path.display()))?;
+            let meta = std::fs::symlink_metadata(path)?;
+            anyhow::ensure!(
+                meta.is_dir() && !meta.file_type().is_symlink(),
+                "download destination changed during directory creation: {}",
+                path.display()
+            );
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+}
+
+fn publish_download_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .context("download destination has no parent")?;
+    let metadata = std::fs::symlink_metadata(path);
+    let existing_permissions = match metadata {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
+            anyhow::bail!(
+                "download destination is not a regular file: {}",
+                path.display()
+            )
+        }
+        Ok(_) => {
+            thegn_core::fsperm::open_regular_file_nofollow(path)?;
+            Some(std::fs::symlink_metadata(path)?.permissions())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    };
+    let nonce = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = parent.join(format!(".thegn-sync-{}-{nonce}.tmp", std::process::id()));
+    let staged = (|| -> Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .with_context(|| format!("stage {}", path.display()))?;
+        if let Some(permissions) = existing_permissions {
+            file.set_permissions(permissions)?;
+        }
+        file.write_all(bytes)?;
+        Ok(())
+    })();
+    if let Err(error) = staged {
+        let cleanup = std::fs::remove_file(&temp);
+        if let Err(cleanup_error) = cleanup {
+            return Err(error)
+                .with_context(|| format!("staging failed and cleanup failed ({cleanup_error})"));
+        }
+        return Err(error);
+    }
+    if let Err(error) = thegn_core::fsperm::rename_replace(&temp, path) {
+        let cleanup = std::fs::remove_file(&temp);
+        if let Err(cleanup_error) = cleanup {
+            return Err(error).with_context(|| {
+                format!("publish failed and staging cleanup failed ({cleanup_error})")
+            });
+        }
+        return Err(error).with_context(|| format!("publish {}", path.display()));
+    }
+    Ok(())
 }
 
 /// Join a remote base dir and a relative path into a clean remote path.
@@ -898,9 +1044,59 @@ pub trait ProviderFiles: Send + Sync {
         local: &'a Path,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            anyhow::ensure!(
+                local.is_dir(),
+                "download destination is not a directory: {}",
+                local.display()
+            );
+            anyhow::ensure!(
+                !std::fs::symlink_metadata(local)?.file_type().is_symlink(),
+                "download root is a symlink: {}",
+                local.display()
+            );
             let mut stack = vec![String::new()]; // rel dirs to visit
+            let mut seen = std::collections::HashSet::new();
+            let mut file_count = 0usize;
+            let mut total_bytes = 0u64;
             while let Some(rel) = stack.pop() {
+                let depth = if rel.is_empty() {
+                    0
+                } else {
+                    rel.split('/').count()
+                };
+                anyhow::ensure!(
+                    depth <= DOWNLOAD_MAX_DEPTH,
+                    "provider listing exceeded maximum directory depth"
+                );
                 let listing = self.list_dir(id, &join_remote(remote, &rel)).await?;
+                let mut siblings = std::collections::HashSet::new();
+                for e in &listing {
+                    if e.name == ".git" {
+                        continue;
+                    }
+                    anyhow::ensure!(
+                        valid_remote_component(&e.name),
+                        "provider returned an unsafe path component"
+                    );
+                    anyhow::ensure!(
+                        siblings.insert(e.name.clone()),
+                        "provider returned a duplicate directory entry"
+                    );
+                    let child = if rel.is_empty() {
+                        e.name.clone()
+                    } else {
+                        format!("{rel}/{}", e.name)
+                    };
+                    anyhow::ensure!(
+                        seen.insert(child.clone()),
+                        "provider returned a repeated path"
+                    );
+                    let child_depth = depth + 1;
+                    anyhow::ensure!(
+                        child_depth <= DOWNLOAD_MAX_DEPTH,
+                        "provider listing exceeded maximum directory depth"
+                    );
+                }
                 for e in listing {
                     if e.name == ".git" {
                         continue;
@@ -910,16 +1106,38 @@ pub trait ProviderFiles: Send + Sync {
                     } else {
                         format!("{rel}/{}", e.name)
                     };
+                    let mut dest = local.to_path_buf();
+                    for component in child.split('/') {
+                        dest.push(component);
+                    }
                     if e.is_dir {
+                        ensure_download_dir(&dest)?;
                         stack.push(child);
                     } else {
+                        file_count += 1;
+                        anyhow::ensure!(
+                            file_count <= DOWNLOAD_MAX_FILES,
+                            "provider listing exceeded maximum file count"
+                        );
                         let data = self.read(id, &join_remote(remote, &child)).await?;
-                        let dest = local.join(&child);
-                        if let Some(p) = dest.parent() {
-                            std::fs::create_dir_all(p).ok(); // best-effort: a failure surfaces via the write below
+                        let actual_size = data.len() as u64;
+                        anyhow::ensure!(
+                            actual_size <= DOWNLOAD_MAX_FILE_BYTES,
+                            "provider file exceeded per-file size limit"
+                        );
+                        total_bytes = total_bytes
+                            .checked_add(actual_size)
+                            .context("provider transfer byte count overflow")?;
+                        anyhow::ensure!(
+                            total_bytes <= DOWNLOAD_MAX_TOTAL_BYTES,
+                            "provider transfer exceeded total byte limit"
+                        );
+                        if actual_size != e.size {
+                            tracing::warn!(target: "thegn::provider", path = %child,
+                                listed_size = e.size, actual_size, "provider file changed between listing and read; entry skipped");
+                            continue;
                         }
-                        std::fs::write(&dest, data)
-                            .with_context(|| format!("write {}", dest.display()))?;
+                        publish_download_file(&dest, &data)?;
                     }
                 }
             }
@@ -948,26 +1166,45 @@ impl SpritesProvider {
         const PROBE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
         let start = std::time::Instant::now();
         loop {
-            let err = match self.list_dir(id, "/").await {
-                Ok(_) => return Ok(()),
-                Err(e) => e,
+            let remaining = budget.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(anyhow!(
+                    "sprite {id} did not become ready within {}s",
+                    budget.as_secs()
+                ));
+            }
+            let err = match tokio::time::timeout(remaining, self.list_dir(id, "/")).await {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(error)) => error,
+                Err(_) => {
+                    return Err(anyhow!(
+                        "sprite {id} did not become ready within {}s (probe timed out)",
+                        budget.as_secs()
+                    ));
+                }
             };
-            if start.elapsed() >= budget {
+            let remaining = budget.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
                 return Err(anyhow!(
                     "sprite {id} did not become ready within {}s: {err}",
                     budget.as_secs()
                 ));
             }
-            tokio::time::sleep(PROBE_BACKOFF).await;
+            tokio::time::sleep(PROBE_BACKOFF.min(remaining)).await;
         }
     }
     /// PUT `/fs/write` with an explicit unix `mode` (octal string). `write`
     /// uses `0644`; `write_exec` uses `0755` so a pushed binary is runnable.
     async fn write_with_mode(&self, id: &str, path: &str, data: &[u8], mode: &str) -> Result<()> {
+        anyhow::ensure!(
+            data.len() <= FILE_TRANSFER_BODY_LIMIT,
+            "sprites file write exceeded the {FILE_TRANSFER_BODY_LIMIT}-byte limit"
+        );
         let resp = self
             .client
             .put(self.fs_op_url(id, "write"))
             .bearer_auth(&self.token)
+            .timeout(FILE_TRANSFER_TIMEOUT)
             .query(&[
                 ("path", path),
                 ("workingDir", "/"),
@@ -1007,7 +1244,7 @@ impl ProviderFiles for SpritesProvider {
                 .client
                 .get(self.fs_op_url(id, "read"))
                 .bearer_auth(&self.token)
-                .timeout(CONTROL_TIMEOUT)
+                .timeout(FILE_TRANSFER_TIMEOUT)
                 .query(&[("path", path), ("workingDir", "/")])
                 .send()
                 .await
@@ -1015,7 +1252,7 @@ impl ProviderFiles for SpritesProvider {
             if !resp.status().is_success() {
                 return Err(anyhow!("sprites read {path} failed ({})", resp.status()));
             }
-            Ok(resp.bytes().await.context("sprites: read body")?.to_vec())
+            response_bytes(resp, "sprites", "GET /fs/read", FILE_TRANSFER_BODY_LIMIT).await
         })
     }
 
@@ -1051,7 +1288,7 @@ impl ProviderFiles for SpritesProvider {
             if !resp.status().is_success() {
                 return Err(anyhow!("sprites list {path} failed ({})", resp.status()));
             }
-            let v: serde_json::Value = resp.json().await.context("sprites: decode listing")?;
+            let v = response_json(resp, "sprites", "GET /fs/list").await?;
             let arr = v
                 .get("entries")
                 .and_then(|e| e.as_array())
@@ -2494,5 +2731,314 @@ mod tests {
                 "--".into()
             ])
         );
+    }
+
+    #[test]
+    fn remote_download_components_reject_traversal_and_platform_prefixes() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "nested/file",
+            "nested\\file",
+            "C:escape",
+            "\\\\server\\share",
+            "bad\0name",
+            "bad\nname",
+        ] {
+            assert!(
+                !valid_remote_component(name),
+                "accepted unsafe component {name:?}"
+            );
+        }
+        assert!(valid_remote_component("nested-file.txt"));
+        assert!(valid_remote_component("λ.txt"));
+        assert!(valid_remote_component("~tilde.txt"));
+        assert!(valid_remote_component("foo:bar.txt"));
+    }
+
+    #[test]
+    fn download_publication_refuses_non_file_leaf_and_replaces_regular_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let directory = root.join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(publish_download_file(&directory, b"overwrite").is_err());
+        let file = root.join("file");
+        std::fs::write(&file, b"old").unwrap();
+        publish_download_file(&file, b"new").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+    }
+
+    #[test]
+    fn download_publication_refuses_symlink_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let target = temp.path().join("target");
+        std::fs::write(&target, b"safe").unwrap();
+        let link = root.join("leaf");
+        if let Err(error) = thegn_core::fsperm::create_symlink(&target, &link, false) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("create symlink fixture: {error}");
+        }
+        assert!(publish_download_file(&link, b"overwrite").is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"safe");
+    }
+
+    #[tokio::test]
+    async fn download_dir_refuses_symlinked_intermediate_and_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let nested_link = root.join("nested");
+        if let Err(error) = thegn_core::fsperm::create_symlink(&outside, &nested_link, true) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("create directory symlink fixture: {error}");
+        }
+        let provider = ListingProvider::new(
+            vec![FileEntry {
+                name: "nested".into(),
+                is_dir: true,
+                size: 0,
+            }],
+            vec![FileEntry {
+                name: "file".into(),
+                is_dir: false,
+                size: 4,
+            }],
+        );
+        assert!(provider.download_dir("id", "/", &root).await.is_err());
+        assert!(!outside.join("file").exists());
+
+        let leaf_root = temp.path().join("leaf-root");
+        std::fs::create_dir(&leaf_root).unwrap();
+        let leaf_target = temp.path().join("leaf-target");
+        std::fs::write(&leaf_target, b"safe").unwrap();
+        thegn_core::fsperm::create_symlink(&leaf_target, &leaf_root.join("file"), false).unwrap();
+        let leaf_provider = ListingProvider::new(
+            vec![FileEntry {
+                name: "file".into(),
+                is_dir: false,
+                size: 4,
+            }],
+            Vec::new(),
+        );
+        assert!(
+            leaf_provider
+                .download_dir("id", "/", &leaf_root)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&leaf_target).unwrap(), b"safe");
+
+        let root_link = temp.path().join("root-link");
+        thegn_core::fsperm::create_symlink(&root, &root_link, true).unwrap();
+        assert!(provider.download_dir("id", "/", &root_link).await.is_err());
+    }
+
+    struct ListingProvider {
+        root: Vec<FileEntry>,
+        nested: Vec<FileEntry>,
+    }
+
+    impl ListingProvider {
+        fn new(root: Vec<FileEntry>, nested: Vec<FileEntry>) -> Self {
+            Self { root, nested }
+        }
+    }
+
+    impl ProviderFiles for ListingProvider {
+        fn read<'a>(&'a self, _id: &'a str, _path: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
+            Box::pin(async { Ok(b"data".to_vec()) })
+        }
+
+        fn write<'a>(
+            &'a self,
+            _id: &'a str,
+            _path: &'a str,
+            _data: &'a [u8],
+        ) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn list_dir<'a>(
+            &'a self,
+            _id: &'a str,
+            path: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<FileEntry>>> {
+            let entries = if path.ends_with("/nested") {
+                self.nested.clone()
+            } else {
+                self.root.clone()
+            };
+            Box::pin(async move { Ok(entries) })
+        }
+
+        fn delete<'a>(&'a self, _id: &'a str, _path: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn download_dir_rejects_hostile_components_and_exact_duplicates() {
+        for entries in [
+            vec![FileEntry {
+                name: "..".into(),
+                is_dir: false,
+                size: 4,
+            }],
+            vec![FileEntry {
+                name: "a/b".into(),
+                is_dir: false,
+                size: 4,
+            }],
+            vec![FileEntry {
+                name: "C:x".into(),
+                is_dir: false,
+                size: 4,
+            }],
+            vec![
+                FileEntry {
+                    name: "same".into(),
+                    is_dir: false,
+                    size: 4,
+                },
+                FileEntry {
+                    name: "same".into(),
+                    is_dir: false,
+                    size: 4,
+                },
+            ],
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let provider = ListingProvider::new(entries, Vec::new());
+            assert!(provider.download_dir("id", "/", temp.path()).await.is_err());
+            assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn download_dir_accepts_case_distinct_linux_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = ListingProvider::new(
+            vec![
+                FileEntry {
+                    name: "Makefile".into(),
+                    is_dir: false,
+                    size: 4,
+                },
+                FileEntry {
+                    name: "makefile".into(),
+                    is_dir: false,
+                    size: 4,
+                },
+            ],
+            Vec::new(),
+        );
+        provider.download_dir("id", "/", temp.path()).await.unwrap();
+        assert_eq!(
+            std::fs::read(temp.path().join("Makefile")).unwrap(),
+            b"data"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("makefile")).unwrap(),
+            b"data"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_json_reader_rejects_oversized_chunked_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let n = socket.read(&mut request).await.unwrap();
+            assert!(n > 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for _ in 0..(CONTROL_BODY_LIMIT / 1024 + 2) {
+                if socket.write_all(b"400\r\n").await.is_err()
+                    || socket.write_all(&[b'x'; 1024]).await.is_err()
+                    || socket.write_all(b"\r\n").await.is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let response = provider_http_client()
+            .get(format!("http://{address}/"))
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .await
+            .unwrap();
+        let error = response_json(response, "test", "GET").await.unwrap_err();
+        assert!(error.to_string().contains("response exceeded the"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_json_reader_accepts_empty_created_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let n = socket.read(&mut request).await.unwrap();
+            assert!(n > 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let response = provider_http_client()
+            .get(format!("http://{address}/"))
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response_json(response, "test", "POST").await.unwrap(),
+            serde_json::Value::Null
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_dir_skips_size_drift_using_actual_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = ListingProvider::new(
+            vec![FileEntry {
+                name: "file".into(),
+                is_dir: false,
+                size: 0,
+            }],
+            Vec::new(),
+        );
+        provider.download_dir("id", "/", temp.path()).await.unwrap();
+        assert!(!temp.path().join("file").exists());
     }
 }

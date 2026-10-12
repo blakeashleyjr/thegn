@@ -195,6 +195,11 @@ blocking provider lane for a miss; `ci log` remains a compatibility alias.
 With `--json`, stdout is one valid JSON value with explicit `fetched_at`,
 `truncated`, and `redacted` metadata.
 
+`thegn ci runs --json` emits a JSON array on success. If provider fetching fails,
+or the provider returns a partial list containing malformed rows, it emits an
+error object (`error`, and `discarded_rows` for a partial list) and exits 0 so
+scripts can continue to consume the command's graceful-degradation result.
+
 `thegn host discover` is the inbound tailnet path: it lists the machines
 your tailscale client already knows (from `tailscale status --json`) as
 remote-host candidates, credential-free. `--promote <name|fqdn>` saves one

@@ -669,6 +669,8 @@ impl WorktreeAuxStore for Db {
                status=?2,
                blocker=COALESCE(?3, blocker),
                detail=COALESCE(?4, detail),
+               ci_rerun_head=CASE WHEN ?5 IS NOT NULL AND last_head_oid IS NOT ?5
+                                  THEN NULL ELSE ci_rerun_head END,
                last_head_oid=COALESCE(?5, last_head_oid),
                updated_at=?6
              WHERE key=?1",
@@ -683,6 +685,21 @@ impl WorktreeAuxStore for Db {
             params![key, attempts, util::now()],
         )?;
         Ok(())
+    }
+
+    fn reserve_pr_ci_rerun(
+        &self,
+        key: &str,
+        expected_head: Option<&str>,
+        head: &str,
+    ) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE pr_queue SET ci_rerun_head=?3, last_head_oid=?3, updated_at=?4
+             WHERE key=?1 AND last_head_oid IS ?2
+               AND (ci_rerun_head IS NULL OR ci_rerun_head <> ?3)",
+            params![key, expected_head, head, util::now()],
+        )?;
+        Ok(changed == 1)
     }
 
     fn remove_pr_entry(&self, key: &str) -> Result<()> {
@@ -702,7 +719,7 @@ impl WorktreeAuxStore for Db {
     fn list_pr_queue(&self) -> Result<Vec<PrQueueRow>> {
         let mut stmt = self.conn().prepare(
             r#"SELECT key,repo_root,number,worktree,branch,base_branch,forge,status,
-                      blocker,detail,agent_attempts,last_head_oid,queued_at,updated_at
+                      blocker,detail,agent_attempts,ci_rerun_head,last_head_oid,queued_at,updated_at
                FROM pr_queue ORDER BY queued_at"#,
         )?;
         let rows = stmt.query_map([], |r| {
@@ -718,9 +735,10 @@ impl WorktreeAuxStore for Db {
                 blocker: r.get(8)?,
                 detail: r.get(9)?,
                 agent_attempts: r.get::<_, Option<u32>>(10)?.unwrap_or_default(),
-                last_head_oid: r.get(11)?,
-                queued_at: r.get(12)?,
-                updated_at: r.get(13)?,
+                ci_rerun_head: r.get(11)?,
+                last_head_oid: r.get(12)?,
+                queued_at: r.get(13)?,
+                updated_at: r.get(14)?,
             })
         })?;
         let mut v = Vec::new();

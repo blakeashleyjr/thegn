@@ -15,7 +15,7 @@ use thegn_core::outln;
 use thegn_core::pipeline_resume;
 use thegn_core::pipeline_run;
 use thegn_core::store::NotificationStore;
-use thegn_core::util::git_out;
+use thegn_core::util::{git_out, git_out_allow_empty};
 use thegn_svc::control::client::{AttachControl, ControlAddr, ControlClient};
 // NOTE: stage `permissions` ride the daemon's launch command (the harness's
 // command-scoped grant, over the *effective* list — THE-440); the dispatch
@@ -1420,7 +1420,8 @@ async fn resume_work(
     let facts = gather_issue_facts(client, stage, &row.issue_id, Some(&wt)).await?;
     // 5. Finisher facts: source artifact state and bounded-at-render git facts.
     let source_vf = crate::cmd::dispatch::verify_facts(&row);
-    let git_status = git_out(Path::new(&wt), &["status", "--porcelain"]).unwrap_or_default();
+    let git_status = git_out_allow_empty(Path::new(&wt), &["status", "--porcelain"])
+        .unwrap_or_else(|| "unknown (git status probe failed)".to_string());
     let diff_stat = git_out(Path::new(&wt), &["diff", "--stat"]).unwrap_or_default();
     // 6. Reconcile the source before competing for a fresh slot. Failed rows
     //    are already terminal/free; queued, parked, and positively exited rows
