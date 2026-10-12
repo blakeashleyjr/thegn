@@ -273,6 +273,11 @@ async fn try_chain(
             continue;
         }
 
+        let Some(_permit) = state.inflight.try_acquire(&ident, backend.inflight_cap) else {
+            state.metrics.inc_fallthrough(&ident, "loadshed_inflight");
+            continue;
+        };
+
         if !state
             .limiter
             .try_acquire(&ident, backend.rate, Instant::now())
@@ -283,20 +288,12 @@ async fn try_chain(
             }
             let wait = state.limiter.reserve(&ident, backend.rate, Instant::now());
             tokio::time::sleep(wait).await;
-            // best-effort, and NOT an error: `try_acquire` returns a bool, not a
-            // Result. We already slept out the reservation this backend handed
-            // us, and it is the last one — so the request proceeds either way.
-            // The value is discarded because a lost race with a concurrent
-            // acquire changes nothing about that decision.
+            // The reservation can be lost to a concurrent acquire; as the last
+            // backend, proceed after waiting either way.
             let _ = state // best-effort: value deliberately discarded (see above)
                 .limiter
                 .try_acquire(&ident, backend.rate, Instant::now());
         }
-        let Some(_permit) = state.inflight.try_acquire(&ident, backend.inflight_cap) else {
-            state.metrics.inc_fallthrough(&ident, "loadshed_inflight");
-            continue;
-        };
-
         let backend_body = apply_transforms(backend, parsed, body);
         let attempt = state
             .upstreams
@@ -448,6 +445,11 @@ async fn try_stream_chain(
             state.metrics.inc_fallthrough(&ident, "skipped_context");
             continue;
         }
+        let Some(permit) = state.inflight.try_acquire(&ident, backend.inflight_cap) else {
+            state.metrics.inc_fallthrough(&ident, "loadshed_inflight");
+            continue;
+        };
+
         if !state
             .limiter
             .try_acquire(&ident, backend.rate, Instant::now())
@@ -458,20 +460,12 @@ async fn try_stream_chain(
             }
             let wait = state.limiter.reserve(&ident, backend.rate, Instant::now());
             tokio::time::sleep(wait).await;
-            // best-effort, and NOT an error: `try_acquire` returns a bool, not a
-            // Result. We already slept out the reservation this backend handed
-            // us, and it is the last one — so the request proceeds either way.
-            // The value is discarded because a lost race with a concurrent
-            // acquire changes nothing about that decision.
+            // The reservation can be lost to a concurrent acquire; as the last
+            // backend, proceed after waiting either way.
             let _ = state // best-effort: value deliberately discarded (see above)
                 .limiter
                 .try_acquire(&ident, backend.rate, Instant::now());
         }
-
-        let Some(permit) = state.inflight.try_acquire(&ident, backend.inflight_cap) else {
-            state.metrics.inc_fallthrough(&ident, "loadshed_inflight");
-            continue;
-        };
 
         let backend_body = apply_transforms(backend, &parsed, body);
 
@@ -518,8 +512,8 @@ async fn try_stream_chain(
                                     est_tokens as u64,
                                 )),
                             };
-                            return sse
-                                .map(|bytes| hold_inflight_permit(Body::from(bytes), permit));
+                            drop(permit);
+                            return sse.map(Body::from);
                         }
                         FailKind::Exhausted => {
                             let until = parse_reset_from_body(&resp.body, now)
@@ -545,8 +539,9 @@ async fn try_stream_chain(
         }
 
         // OpenAI-surface backend: open the stream and relay it live.
-        let opened = tokio::time::timeout(
-            cfg.first_byte,
+        let first_byte_deadline = tokio::time::Instant::now() + cfg.first_byte;
+        let opened = tokio::time::timeout_at(
+            first_byte_deadline,
             state
                 .upstreams
                 .for_backend(backend)
@@ -583,9 +578,13 @@ async fn try_stream_chain(
             }
         };
         let upstream_cost = header_cost(resp.headers());
+        let peek_cfg = relay::RelayConfig {
+            first_byte: first_byte_deadline.saturating_duration_since(tokio::time::Instant::now()),
+            ..cfg
+        };
 
         let commit = match surface {
-            Surface::OpenAi => match relay::peek(resp, OpenAiSink::default(), cfg).await {
+            Surface::OpenAi => match relay::peek(resp, OpenAiSink::default(), peek_cfg).await {
                 Peek::Commit {
                     prefix_out,
                     rest,
@@ -614,7 +613,7 @@ async fn try_stream_chain(
                     client_model,
                     est_tokens as u64,
                 );
-                match relay::peek(resp, sink, cfg).await {
+                match relay::peek(resp, sink, peek_cfg).await {
                     Peek::Commit {
                         prefix_out,
                         rest,
@@ -963,8 +962,68 @@ fn parse_usage(body: &[u8]) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use thegn_core::db::Db;
     use thegn_core::proxy::creds::{CredPool, KeyStrategy};
     use thegn_core::proxy::ratelimit::RatePolicy;
+    use tokio::io::AsyncWriteExt;
+
+    fn proxy_state(relay: crate::relay::RelayConfig) -> SharedState {
+        let config = ProxyConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            routes: Vec::new(),
+            relay,
+            aliases: Default::default(),
+            last_resort: false,
+            usage_aware: false,
+            auto_tiers: Vec::new(),
+            price_table: PriceTable::new(),
+            budget: crate::model::BudgetSettings::default(),
+        };
+        let db = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+        crate::state::AppState::new(config, db, 0)
+    }
+
+    fn streaming_route(backend: Backend) -> Route {
+        route_with(vec![backend], RoutingStrategy::Sequential)
+    }
+
+    async fn mock_stream_server(header_delay: Duration, send_event: bool) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(header_delay).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            if send_event {
+                let event = b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n";
+                socket
+                    .write_all(format!("{:x}\r\n", event.len()).as_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(event).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        format!("http://{addr}")
+    }
+
+    async fn stalled_header_server(delay: Duration) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(delay).await;
+        });
+        format!("http://{addr}")
+    }
 
     fn lane(name: &str, key_id: &str, pool: Option<Arc<CredPool>>) -> Backend {
         Backend {
@@ -1101,5 +1160,128 @@ mod tests {
         );
         assert_eq!(u.prompt_tokens, 10);
         assert_eq!(u.cache_read_tokens, 40);
+    }
+
+    #[tokio::test]
+    async fn route_streaming_rejects_a_saturated_sole_backend() {
+        let backend = lane("only", "", None);
+        let ident = backend.identity();
+        let rate = backend.rate;
+        let route = streaming_route(backend);
+        let state = proxy_state(crate::relay::RelayConfig::default());
+        let held = state.inflight.try_acquire(&ident, 1).unwrap();
+
+        let outcome = route_streaming(
+            state.clone(),
+            Identity::global(),
+            Surface::OpenAi,
+            &route,
+            "m",
+            br#"{"model":"m","stream":true}"#,
+            false,
+        )
+        .await;
+
+        assert!(matches!(outcome, StreamOutcome::Failed));
+        assert_eq!(state.inflight.get(&ident), 1);
+        assert!(state.limiter.try_acquire(&ident, rate, Instant::now()));
+        drop(held);
+        assert_eq!(state.inflight.get(&ident), 0);
+    }
+
+    #[tokio::test]
+    async fn dropped_stream_body_releases_backend_inflight_permit() {
+        let url = mock_stream_server(Duration::ZERO, true).await;
+        let mut backend = lane("stream", "", None);
+        backend.base_url = url;
+        backend.inflight_cap = 1;
+        let ident = backend.identity();
+        let route = streaming_route(backend);
+        let state = proxy_state(crate::relay::RelayConfig {
+            first_byte: Duration::from_millis(500),
+            idle: Duration::from_secs(2),
+            heartbeat: Duration::from_millis(100),
+        });
+
+        let StreamOutcome::Body(body) = route_streaming(
+            state.clone(),
+            Identity::global(),
+            Surface::OpenAi,
+            &route,
+            "m",
+            br#"{"model":"m","stream":true}"#,
+            false,
+        )
+        .await
+        else {
+            panic!("mock upstream should commit a streamed body");
+        };
+        assert_eq!(state.inflight.get(&ident), 1);
+        drop(body);
+        assert_eq!(state.inflight.get(&ident), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_without_headers_falls_through_within_first_byte_budget() {
+        let budget = Duration::from_millis(60);
+        let url = stalled_header_server(Duration::from_millis(200)).await;
+        let mut backend = lane("stalled", "", None);
+        backend.base_url = url;
+        let route = streaming_route(backend);
+        let state = proxy_state(crate::relay::RelayConfig {
+            first_byte: budget,
+            idle: Duration::from_millis(100),
+            heartbeat: Duration::from_millis(10),
+        });
+        let started = tokio::time::Instant::now();
+
+        let outcome = route_streaming(
+            state.clone(),
+            Identity::global(),
+            Surface::OpenAi,
+            &route,
+            "m",
+            br#"{"model":"m","stream":true}"#,
+            false,
+        )
+        .await;
+
+        assert!(matches!(outcome, StreamOutcome::Failed));
+        assert!(started.elapsed() < Duration::from_millis(120));
+        assert!(
+            state
+                .metrics
+                .render()
+                .contains("reason=\"first_byte_timeout\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_open_and_peek_share_first_byte_budget() {
+        let budget = Duration::from_millis(120);
+        let url = mock_stream_server(Duration::from_millis(80), false).await;
+        let mut backend = lane("stalled", "", None);
+        backend.base_url = url;
+        let route = streaming_route(backend);
+        let state = proxy_state(crate::relay::RelayConfig {
+            first_byte: budget,
+            idle: Duration::from_millis(100),
+            heartbeat: Duration::from_millis(10),
+        });
+        let started = tokio::time::Instant::now();
+
+        let outcome = route_streaming(
+            state,
+            Identity::global(),
+            Surface::OpenAi,
+            &route,
+            "m",
+            br#"{"model":"m","stream":true}"#,
+            false,
+        )
+        .await;
+
+        assert!(matches!(outcome, StreamOutcome::Failed));
+        assert!(started.elapsed() < Duration::from_millis(180));
     }
 }

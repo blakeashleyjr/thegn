@@ -313,10 +313,8 @@ impl ModelProxyConfig {
         }
         for p in &self.providers {
             if !p.rpm.is_finite()
-                || p.rpm < crate::proxy::ratelimit::MIN_RPM
-                || p.rpm > crate::proxy::ratelimit::MAX_RATE
-                || !(p.rpm / 60.0).is_finite()
-                || p.rpm / 60.0 <= 0.0
+                || !(crate::proxy::ratelimit::MIN_RPM..=crate::proxy::ratelimit::MAX_RATE)
+                    .contains(&p.rpm)
             {
                 errs.push(format!(
                     "[[model_proxy.providers]] name = {:?}: rpm must be finite and between {} and {}",
@@ -325,7 +323,7 @@ impl ModelProxyConfig {
                     crate::proxy::ratelimit::MAX_RATE
                 ));
             }
-            if !p.burst.is_finite() || p.burst < 1.0 || p.burst > crate::proxy::ratelimit::MAX_RATE
+            if !p.burst.is_finite() || !(1.0..=crate::proxy::ratelimit::MAX_RATE).contains(&p.burst)
             {
                 errs.push(format!(
                     "[[model_proxy.providers]] name = {:?}: burst must be finite and between 1 and {}",
