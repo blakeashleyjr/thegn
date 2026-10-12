@@ -108,12 +108,10 @@ fn worktree_diff_memo_key(
 }
 
 fn expanded_attributes_file(repo: &gix::Repository) -> Option<std::path::PathBuf> {
-    let value = repo.config_snapshot().string("core.attributesFile")?;
-    let value = value.to_string();
-    if let Some(rest) = value.strip_prefix("~/") {
-        return std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(rest));
+    match repo.config_snapshot().trusted_path("core.attributesFile") {
+        Some(Ok(path)) => Some(path.into_owned()),
+        Some(Err(_)) | None => None,
     }
-    Some(std::path::PathBuf::from(value))
 }
 
 fn worktree_diff_environment(
@@ -745,6 +743,22 @@ mod tests {
             .unwrap()
             .set_modified(modified)
             .unwrap();
+    }
+
+    #[test]
+    fn core_attributes_file_uses_gix_path_interpolation() {
+        let repo = TestRepo::new("memo-attributes-path-interpolation");
+        let configured = "%(prefix)/etc/gitattributes";
+        repo.out(&["config", "core.attributesFile", configured]);
+        let gr = gix::discover(&repo.dir).unwrap();
+
+        let expected = match gr.config_snapshot().trusted_path("core.attributesFile") {
+            Some(Ok(path)) => Some(path.into_owned()),
+            Some(Err(_)) | None => None,
+        };
+        assert!(expected.is_some(), "gix should resolve %(prefix) here");
+        assert_eq!(expanded_attributes_file(&gr), expected);
+        assert_ne!(expected, Some(std::path::PathBuf::from(configured)));
     }
 
     fn clean_runs(repo: &TestRepo) -> usize {
