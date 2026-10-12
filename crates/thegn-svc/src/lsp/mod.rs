@@ -18,7 +18,6 @@
 
 pub mod diagnostics_queue;
 pub mod framing;
-mod platform;
 pub mod registry;
 
 pub use diagnostics_queue::{
@@ -31,7 +30,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -58,8 +57,9 @@ pub mod limits {
     /// expand to a 3-byte `%XX` escape.
     pub const MAX_URI_BYTES: usize = 3 * MAX_IDENTITY_BYTES + 16;
     /// Outbound bodies are our own payloads (e.g. a whole file in `didOpen`),
-    /// not untrusted input: only the framing ceiling applies.
+    /// so the framing ceiling applies; the queued-byte budget is separate.
     pub const MAX_OUTBOUND_BODY_BYTES: usize = super::framing::MAX_FRAME_LEN;
+    pub const MAX_OUTBOUND_QUEUED_BYTES: usize = 64 * 1024 * 1024;
     pub const MAX_PENDING_REQUESTS: usize = 64;
     pub const MAX_OUTBOUND_MESSAGES: usize = 64;
     pub const MAX_CODE_SOURCE_BYTES: usize = 4 * 1024;
@@ -756,7 +756,10 @@ pub fn top_level_id(input: &[u8]) -> Option<i64> {
     scan_envelope(input).id
 }
 
-/// Encode an absolute filesystem path as a `file://` URI.
+/// Encode an absolute Unix filesystem path as a `file://` URI.
+///
+/// Windows drive and UNC paths are currently unsupported; workspace roots on
+/// those platforms fail closed instead of producing an invalid `rootUri`.
 pub fn path_to_uri(path: &str) -> String {
     if path.len() > limits::MAX_IDENTITY_BYTES
         || !path.starts_with('/')
@@ -962,6 +965,7 @@ fn project_symbols(
                 .or_else(|| item.get("range"))
                 .and_then(range_from_json);
             let Some(range) = range else {
+                health.invalid = true;
                 continue;
             };
             Location {
@@ -1345,6 +1349,7 @@ pub struct LspClient {
     next_id: AtomicI64,
     pending: Pending,
     closed: Arc<AtomicBool>,
+    queued_bytes: Arc<AtomicUsize>,
     root: PathBuf,
     diagnostics: DiagnosticsSender,
     /// The authority stream this connection publishes under; retired on drop
@@ -1363,17 +1368,63 @@ pub struct LspClient {
 }
 
 enum WriterCommand {
-    Message(Vec<u8>, Option<Sender<Result<(), LspError>>>),
+    Message(Vec<u8>, usize, Option<Sender<Result<(), LspError>>>),
 }
 
-fn writer_loop(mut writer: Box<dyn Write + Send>, rx: Receiver<WriterCommand>) {
+fn enqueue_body(
+    writer: &SyncSender<WriterCommand>,
+    queued_bytes: &AtomicUsize,
+    body: &str,
+    done: Option<Sender<Result<(), LspError>>>,
+) -> Result<(), LspError> {
+    if body.len() > limits::MAX_OUTBOUND_BODY_BYTES {
+        return Err(LspError::Bounded("outbound LSP body limit".into()));
+    }
+    let byte_len = format!("Content-Length: {}\r\n\r\n", body.len()).len() + body.len();
+    if queued_bytes
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |queued| {
+            queued
+                .checked_add(byte_len)
+                .filter(|total| *total <= limits::MAX_OUTBOUND_QUEUED_BYTES)
+        })
+        .is_err()
+    {
+        return Err(LspError::Bounded("LSP outbound queue byte limit".into()));
+    }
+    match writer.try_send(WriterCommand::Message(
+        framing::encode(body),
+        byte_len,
+        done,
+    )) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => {
+            queued_bytes.fetch_sub(byte_len, Ordering::SeqCst);
+            Err(LspError::Bounded("LSP outbound queue full".into()))
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            queued_bytes.fetch_sub(byte_len, Ordering::SeqCst);
+            Err(LspError::Protocol("LSP writer closed".into()))
+        }
+    }
+}
+
+fn writer_loop(
+    mut writer: Box<dyn Write + Send>,
+    rx: Receiver<WriterCommand>,
+    queued_bytes: Arc<AtomicUsize>,
+    closed: Arc<AtomicBool>,
+) {
     for command in rx {
         match command {
-            WriterCommand::Message(bytes, done) => {
+            WriterCommand::Message(bytes, byte_len, done) => {
                 let result = writer
                     .write_all(&bytes)
                     .and_then(|()| writer.flush())
                     .map_err(|error| LspError::Protocol(error.to_string()));
+                queued_bytes.fetch_sub(byte_len, Ordering::SeqCst);
+                if result.is_err() {
+                    closed.store(true, Ordering::SeqCst);
+                }
                 if let Some(done) = done
                     && done.send(result).is_err()
                 {
@@ -1556,20 +1607,23 @@ impl LspClient {
             generation,
         } = authority;
         let (writer_tx, writer_rx) = mpsc::sync_channel(limits::MAX_OUTBOUND_MESSAGES);
+        let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
         let _writer_thread = thread::Builder::new()
             .name("thegn-lsp-writer".into())
-            .spawn(move || {
-                platform::qos::set_self(platform::qos::Qos::Background);
-                writer_loop(writer, writer_rx)
+            .spawn({
+                let writer_queued_bytes = queued_bytes.clone();
+                let writer_closed = closed.clone();
+                move || writer_loop(writer, writer_rx, writer_queued_bytes, writer_closed)
             })
             .expect("LSP writer thread spawn");
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let closed = Arc::new(AtomicBool::new(false));
         let reader_thread = {
             let ctx = ReaderContext {
                 pending: pending.clone(),
                 diag_tx: diag_tx.clone(),
                 writer: writer_tx.clone(),
+                queued_bytes: queued_bytes.clone(),
                 root: root.to_path_buf(),
                 closed: closed.clone(),
                 server_identity: server_identity.clone(),
@@ -1585,6 +1639,7 @@ impl LspClient {
             next_id: AtomicI64::new(1),
             pending,
             closed,
+            queued_bytes,
             root: root.to_path_buf(),
             language_id,
             diagnostics: diag_tx,
@@ -1836,15 +1891,7 @@ impl LspClient {
 
     fn write(&self, body: &str) -> Result<(), LspError> {
         self.ensure_open()?;
-        if body.len() > limits::MAX_OUTBOUND_BODY_BYTES {
-            return Err(LspError::Bounded("outbound LSP body limit".into()));
-        }
-        self.writer
-            .try_send(WriterCommand::Message(framing::encode(body), None))
-            .map_err(|error| match error {
-                TrySendError::Full(_) => LspError::Bounded("LSP outbound queue full".into()),
-                TrySendError::Disconnected(_) => LspError::Protocol("LSP writer closed".into()),
-            })
+        enqueue_body(&self.writer, &self.queued_bytes, body, None)
     }
 
     fn write_until(
@@ -1856,16 +1903,8 @@ impl LspClient {
         if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
             return Err(LspError::Timeout);
         }
-        if body.len() > limits::MAX_OUTBOUND_BODY_BYTES {
-            return Err(LspError::Bounded("outbound LSP body limit".into()));
-        }
         let (done_tx, done_rx) = mpsc::channel();
-        self.writer
-            .try_send(WriterCommand::Message(framing::encode(body), Some(done_tx)))
-            .map_err(|error| match error {
-                TrySendError::Full(_) => LspError::Bounded("LSP outbound queue full".into()),
-                TrySendError::Disconnected(_) => LspError::Protocol("LSP writer closed".into()),
-            })?;
+        enqueue_body(&self.writer, &self.queued_bytes, body, Some(done_tx))?;
         let wait = deadline.map_or(Duration::from_secs(365 * 24 * 60 * 60), |at| {
             at.saturating_duration_since(std::time::Instant::now())
         });
@@ -1881,9 +1920,8 @@ impl LspClient {
     fn send_cancel(&self, id: i64) {
         let body =
             json!({"jsonrpc":"2.0", "method":"$/cancelRequest", "params":{"id":id}}).to_string();
-        let framed = framing::encode(&body);
-        match self.writer.try_send(WriterCommand::Message(framed, None)) {
-            Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+        if let Err(error) = enqueue_body(&self.writer, &self.queued_bytes, &body, None) {
+            tracing::debug!(target: "thegn::lsp", %error, "dropping cancel notification because outbound queue is full");
         }
     }
 }
@@ -1919,6 +1957,7 @@ struct ReaderContext {
     pending: Pending,
     diag_tx: DiagnosticsSender,
     writer: SyncSender<WriterCommand>,
+    queued_bytes: Arc<AtomicUsize>,
     root: PathBuf,
     closed: Arc<AtomicBool>,
     server_identity: String,
@@ -2042,9 +2081,8 @@ fn dispatch(msg: &Value, ctx: &ReaderContext) {
                 _ => Value::Null,
             };
             let body = json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
-            let framed = framing::encode(&body);
-            match writer.try_send(WriterCommand::Message(framed, None)) {
-                Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+            if let Err(error) = enqueue_body(writer, &ctx.queued_bytes, &body, None) {
+                tracing::debug!(target: "thegn::lsp", %error, "dropping server request reply because outbound queue is full");
             }
         }
         // Notification.
@@ -2081,23 +2119,227 @@ fn dispatch(msg: &Value, ctx: &ReaderContext) {
 mod tests {
     use super::*;
 
+    struct BlockingWriter {
+        entered: Option<Sender<()>>,
+        release: Receiver<()>,
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn blocked_client(
+        timeout: Duration,
+    ) -> (LspClient, Sender<()>, Receiver<()>, std::io::PipeWriter) {
+        let (reader, server_writer) = std::io::pipe().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = BlockingWriter {
+            entered: Some(entered_tx),
+            release: release_rx,
+        };
+        let (diag_tx, _) = diagnostics_channel();
+        let mut client = LspClient::from_io(
+            Box::new(reader),
+            Box::new(writer),
+            "fixture",
+            Path::new("/fixture"),
+            diag_tx,
+        )
+        .unwrap();
+        client.timeout = timeout;
+        (client, release_tx, entered_rx, server_writer)
+    }
+
+    fn start_blocked_request(client: &Arc<LspClient>) -> Receiver<Result<Value, LspError>> {
+        let client = client.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let _request_thread = thread::spawn(move || {
+            result_tx
+                .send(client.request("blocked", Value::Null))
+                .unwrap();
+        });
+        result_rx
+    }
+
+    #[test]
+    fn request_deadline_includes_a_blocked_write() {
+        let timeout = Duration::from_millis(60);
+        let (client, release, entered, _server_writer) = blocked_client(timeout);
+        let client = Arc::new(client);
+        let started = std::time::Instant::now();
+        let result = start_blocked_request(&client)
+            .recv_timeout(Duration::from_millis(500))
+            .expect("request deadline includes blocked write");
+        assert!(entered.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(matches!(result, Err(LspError::Timeout)));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn timed_out_request_enqueues_cancel_behind_blocked_write() {
+        let (client, release, entered, _server_writer) = blocked_client(Duration::from_millis(60));
+        let client = Arc::new(client);
+        let result = start_blocked_request(&client)
+            .recv_timeout(Duration::from_millis(500))
+            .expect("timed out request returns while writer is blocked");
+        assert!(entered.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(matches!(result, Err(LspError::Timeout)));
+        let request =
+            json!({"jsonrpc":"2.0", "id":1, "method":"blocked", "params":null}).to_string();
+        let in_flight = framing::encode(&request).len();
+        assert!(
+            client.queued_bytes.load(Ordering::SeqCst) > in_flight,
+            "timeout enqueued the cancellation frame behind the blocked request"
+        );
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn pending_request_limit_rejects_the_sixty_fifth_request() {
+        let (client, release, _entered, _server_writer) = blocked_client(Duration::from_secs(5));
+        let client = Arc::new(client);
+        let mut pending = client.pending.lock().unwrap();
+        for id in 1..=limits::MAX_PENDING_REQUESTS as i64 {
+            let (tx, _rx) = mpsc::channel();
+            pending.insert(id, tx);
+        }
+        drop(pending);
+        assert!(matches!(
+            start_blocked_request(&client)
+                .recv_timeout(Duration::from_millis(500))
+                .expect("pending admission rejects before writing"),
+            Err(LspError::Bounded(message)) if message == "too many pending LSP requests"
+        ));
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn dropping_client_does_not_wait_for_a_blocked_writer() {
+        let (client, release, entered, _server_writer) = blocked_client(Duration::from_secs(5));
+        let client = Arc::new(client);
+        let notify_client = client.clone();
+        let (notify_tx, notify_rx) = mpsc::channel();
+        let notify_thread = thread::spawn(move || {
+            notify_tx
+                .send(notify_client.notify("blocked", Value::Null))
+                .unwrap();
+        });
+        assert!(
+            notify_rx
+                .recv_timeout(Duration::from_millis(500))
+                .expect("notification enqueue does not wait for blocked writer")
+                .is_ok()
+        );
+        notify_thread.join().unwrap();
+        assert!(entered.recv_timeout(Duration::from_secs(1)).is_ok());
+        let started = std::time::Instant::now();
+        drop(client);
+        assert!(started.elapsed() < Duration::from_millis(300));
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn late_response_after_timeout_is_dropped() {
+        let (client, release, entered, mut server_writer) =
+            blocked_client(Duration::from_millis(60));
+        let client = Arc::new(client);
+        let result = start_blocked_request(&client)
+            .recv_timeout(Duration::from_millis(500))
+            .expect("timed out request returns while writer is blocked");
+        assert!(entered.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(matches!(result, Err(LspError::Timeout)));
+        let (sentinel_tx, sentinel_rx) = mpsc::channel();
+        client.pending.lock().unwrap().insert(99, sentinel_tx);
+        let mut responses = framing::encode(r#"{"jsonrpc":"2.0","id":1,"result":"late"}"#);
+        responses.extend(framing::encode(
+            r#"{"jsonrpc":"2.0","id":99,"result":"sentinel"}"#,
+        ));
+        server_writer.write_all(&responses).unwrap();
+        assert_eq!(
+            sentinel_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(json!("sentinel"))
+        );
+        assert!(client.pending.lock().unwrap().is_empty());
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn outbound_byte_cap_is_checked_before_framing_enqueue() {
+        let (writer, rx) = mpsc::sync_channel(2);
+        let queued = AtomicUsize::new(limits::MAX_OUTBOUND_QUEUED_BYTES);
+        assert!(matches!(
+            enqueue_body(&writer, &queued, "{}", None),
+            Err(LspError::Bounded(message)) if message == "LSP outbound queue byte limit"
+        ));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn writer_io_error_latches_client_closed() {
+        struct BrokenPipe;
+        impl Write for BrokenPipe {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (reader, _server_writer) = std::io::pipe().unwrap();
+        let (diag_tx, _) = diagnostics_channel();
+        let client = LspClient::from_io(
+            Box::new(reader),
+            Box::new(BrokenPipe),
+            "fixture",
+            Path::new("/fixture"),
+            diag_tx,
+        )
+        .unwrap();
+        client.notify("break", Value::Null).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !client.closed.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(client.closed.load(Ordering::SeqCst));
+        assert!(matches!(client.ensure_open(), Err(LspError::Protocol(_))));
+    }
+
     fn fixture_ctx(
         pending: Pending,
         diag_tx: DiagnosticsSender,
         stdin: Arc<Mutex<Box<dyn Write + Send>>>,
     ) -> ReaderContext {
         let (writer, reader) = mpsc::sync_channel(4);
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
         let writer_obj = match Arc::try_unwrap(stdin) {
             Ok(writer) => writer.into_inner().unwrap(),
             Err(_) => panic!("fixture writer is unique"),
         };
-        let _writer = thread::spawn(move || writer_loop(writer_obj, reader));
+        let _writer = thread::spawn({
+            let writer_queued_bytes = queued_bytes.clone();
+            let writer_closed = closed.clone();
+            move || writer_loop(writer_obj, reader, writer_queued_bytes, writer_closed)
+        });
         ReaderContext {
             pending,
             diag_tx,
             writer,
+            queued_bytes,
             root: PathBuf::from("/fixture"),
-            closed: Arc::new(AtomicBool::new(false)),
+            closed,
             server_identity: "fixture".into(),
             generation: 1,
             sequence: AtomicU64::new(0),
@@ -2157,7 +2399,8 @@ mod tests {
         let (diag_tx, diag_rx) = diagnostics_channel();
         let generation = diag_tx.register(Path::new("/fixture"), "fixture").unwrap();
         assert_eq!(generation, 1);
-        let stdin: SharedWriter = Arc::new(Mutex::new(Box::new(std::io::sink())));
+        let stdin: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(std::io::sink())));
         let mut wire = b"Content-Length: 1\r\nContent-Length: 1\r\n\r\nX".to_vec();
         wire.extend(framing::encode(r#"{"id":7,"result":"must not dispatch"}"#));
         reader_loop(
@@ -2460,7 +2703,7 @@ mod tests {
             json!({
                 "name": name,
                 "kind": 12,
-                "range": { "start": { "line": line, "character": 0 } },
+                "range": { "start": { "line": line, "character": 0 }, "end": { "line": line, "character": 0 } },
                 "children": children
             })
         };
@@ -2500,6 +2743,27 @@ mod tests {
     }
 
     #[test]
+    fn malformed_symbol_range_records_invalid_projection_health() {
+        let tree = json!([{
+            "name": "malformed",
+            "kind": 12,
+            "range": { "start": { "line": 1, "character": 0 } },
+            "children": [{
+                "name": "child",
+                "kind": 12,
+                "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 0 } }
+            }]
+        }]);
+        let mut health = ProjectionHealth::default();
+        let symbols = project_symbols(&tree, "/safe.rs", &mut health);
+        assert!(symbols.is_empty());
+        assert!(
+            health.invalid,
+            "malformed parent range records projection loss"
+        );
+    }
+
+    #[test]
     fn terminal_projection_removes_osc_and_preserves_unicode() {
         assert_eq!(
             sanitize_for_terminal("ok\u{1b}]0;evil\u{7} café\n"),
@@ -2515,7 +2779,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "method": "textDocument/publishDiagnostics",
                 "params": { "uri": uri, "diagnostics": [{
-                    "range": { "start": { "line": 0, "character": 0 } },
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
                     "message": message
                 }]}
             })
@@ -2682,7 +2946,7 @@ mod tests {
 
     #[test]
     fn exact_diagnostic_limits_are_inclusive() {
-        let one = |message: &str| json!({ "range": { "start": { "line": 0, "character": 0 } }, "message": message });
+        let one = |message: &str| json!({ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }, "message": message });
         let at_cap = json!({ "uri": "file:///a.rs", "diagnostics": (0..limits::MAX_DIAGNOSTICS).map(|_| one("m")).collect::<Vec<_>>() });
         let (pd, health) =
             parse_published_diagnostics_with_context(&at_cap, Path::new("/"), "s".into(), 1, 1);
@@ -2751,7 +3015,7 @@ mod tests {
         let body = format!(
             r#"{{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{{"uri":"file:///fixture/a.rs","diagnostics":[{}]}}}}"#,
             (0..=limits::MAX_CONTAINER_ITEMS)
-                .map(|_| r#"{"range":{"start":{"line":0,"character":0}},"message":"m"}"#)
+                .map(|_| r#"{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"message":"m"}"#)
                 .collect::<Vec<_>>()
                 .join(",")
         );
