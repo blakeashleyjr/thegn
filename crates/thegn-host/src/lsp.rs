@@ -202,10 +202,11 @@ impl LspSupervisor {
     }
 }
 
-/// Gracefully close and drop clients on a worker thread, never the render/input
-/// thread.
+/// Grace for the LSP shutdown request and for the child's exit before kill.
 const LSP_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Gracefully close and drop clients on a worker thread, never the render/input
+/// thread.
 fn teardown_off_loop(clients: Vec<Arc<LspClient>>) {
     if clients.is_empty() {
         return;
