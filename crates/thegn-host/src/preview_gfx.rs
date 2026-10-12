@@ -60,19 +60,29 @@ impl PreviewGfx {
         };
         match want {
             Some((place, raster)) if self.drawn != Some(place) => {
-                // (Re)draw: delete any stale image first, then transmit + display.
-                let mut out = Vec::new();
-                if self.drawn.is_some() {
-                    out.extend_from_slice(graphics::delete_all());
+                // (Re)draw: encode first, and commit `drawn` only once there are
+                // real bytes to emit. An invalid raster draws nothing.
+                match graphics::kitty_image(&raster.rgba, raster.w, raster.h, place) {
+                    Ok(image) => {
+                        // Delete any stale image first, then transmit + display.
+                        let mut out = Vec::new();
+                        if self.drawn.is_some() {
+                            out.extend_from_slice(graphics::delete_all());
+                        }
+                        out.extend_from_slice(&image);
+                        self.drawn = Some(place);
+                        out
+                    }
+                    Err(_) => {
+                        // Invalid raster: never claim it is drawn; clear any
+                        // stale image that is still on screen.
+                        if self.drawn.take().is_some() {
+                            graphics::delete_all().to_vec()
+                        } else {
+                            Vec::new()
+                        }
+                    }
                 }
-                out.extend_from_slice(&graphics::kitty_image(
-                    &raster.rgba,
-                    raster.w,
-                    raster.h,
-                    place,
-                ));
-                self.drawn = Some(place);
-                out
             }
             Some(_) => Vec::new(), // already drawn at this placement
             None if self.drawn.is_some() => {
@@ -138,6 +148,30 @@ mod tests {
         // Steady state: same placement → no repeated emission.
         assert!(
             g.frame(Some(panel()), Some("a.png"), false, true)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn invalid_raster_draws_nothing_and_is_not_marked_drawn() {
+        let mut g = PreviewGfx::new();
+        g.set(
+            "a.png".to_string(),
+            Raster {
+                rgba: vec![1, 2, 3], // 1x1 needs 4 bytes
+                w: 1,
+                h: 1,
+            },
+        );
+        assert!(
+            g.frame(Some(panel()), Some("a.png"), false, true)
+                .is_empty()
+        );
+        assert!(g.drawn.is_none(), "invalid raster must not set drawn");
+        // A valid raster afterwards still draws.
+        g.set("a.png".to_string(), raster());
+        assert!(
+            !g.frame(Some(panel()), Some("a.png"), false, true)
                 .is_empty()
         );
     }
