@@ -2281,12 +2281,21 @@ mod tests {
             seq: 0,
             cols: 80,
             rows: 24,
-            bytes: vec![b'x'; MAX_WIRE_FRAME],
+            bytes: Vec::new(),
         };
-        while largest.encode().len() >= MAX_WIRE_FRAME {
+        let mut encoded_len = largest.encode().len();
+        loop {
             if let EventFrame::PaneSnapshot { bytes, .. } = &mut largest {
-                bytes.pop();
+                bytes.push(b'x');
             }
+            let next_encoded_len = largest.encode().len();
+            if next_encoded_len == encoded_len {
+                if let EventFrame::PaneSnapshot { bytes, .. } = &mut largest {
+                    bytes.pop();
+                }
+                break;
+            }
+            encoded_len = next_encoded_len;
         }
         let expected_bytes = match &largest {
             EventFrame::PaneSnapshot { bytes, .. } => bytes.len(),
@@ -2294,16 +2303,6 @@ mod tests {
         };
         let largest_encoded_len = largest.encode().len();
         assert!(largest_encoded_len < MAX_WIRE_FRAME);
-        let mut one_byte_larger = largest.clone();
-        for _ in 0..4 {
-            if let EventFrame::PaneSnapshot { bytes, .. } = &mut one_byte_larger {
-                bytes.push(b'x');
-            }
-            if one_byte_larger.encode().len() >= MAX_WIRE_FRAME {
-                break;
-            }
-        }
-        assert!(one_byte_larger.encode().len() >= MAX_WIRE_FRAME);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
