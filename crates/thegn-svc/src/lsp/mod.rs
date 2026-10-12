@@ -2380,6 +2380,19 @@ mod tests {
         assert_eq!(bounded_uri_to_path("file:///a%20b"), Some("/a b".into()));
     }
 
+    #[test]
+    fn terminal_projection_neutralizes_control_families_in_combined_text() {
+        let input = "before\u{1b}]52;c;secret\u{7}x\u{1b}[31mred\u{1b}_apc\u{1b}Pdcs\u{90}c1\u{9b}31m\nnext";
+        let output = sanitize_for_terminal(input);
+        assert!(output.starts_with("beforex[31mred_apcPdcs"));
+        assert!(output.contains("\nnext"));
+        assert!(
+            !output
+                .chars()
+                .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+        );
+    }
+
     fn publish_frame(uri: &str, message: &str) -> Vec<u8> {
         framing::encode(
             &json!({
