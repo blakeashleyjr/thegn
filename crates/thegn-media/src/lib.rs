@@ -471,6 +471,13 @@ async fn mpd_client(opts: &mut ResolveOpts) -> Option<MediaClient> {
             tracing::debug!(target: "thegn::media", "media backend: native MPD");
             Some(Box::new(m))
         }
+        Err(MediaError::Backend(message))
+            if message == "mpd argument contains a forbidden control character" =>
+        {
+            // A rejected password is local configuration, not a failed dial.
+            tracing::warn!(target: "thegn::media", error = %message, "invalid [media.mpd] password; MPD disabled");
+            None
+        }
         Err(e) => {
             tracing::debug!(target: "thegn::media", error = %e, "MPD unreachable; skipping");
             None
