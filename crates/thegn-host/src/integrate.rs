@@ -1207,9 +1207,12 @@ fn bisect_offender(
     landed: &[Branch],
     cfg: &MergeQueueConfig,
     opts: &LandOpts,
-    diagnostics: &mut String,
-    budget: &mut DiagnosisBudget,
+    diagnosis: &mut DiagnosisState<'_>,
 ) -> Result<Option<String>> {
+    let DiagnosisState {
+        diagnostics,
+        budget,
+    } = diagnosis;
     // A red base says nothing about any candidate. Establish this before any
     // prefix can be blamed; retain its diagnostic alongside the union failure.
     let base_verdict = if let Some(verdict) = budget.base_verdicts.get(base).cloned() {
@@ -1261,6 +1264,11 @@ fn bisect_offender(
         }
     }
     Ok(None)
+}
+
+struct DiagnosisState<'a> {
+    diagnostics: &'a mut String,
+    budget: &'a mut DiagnosisBudget,
 }
 
 struct DiagnosisBudget {
@@ -1701,8 +1709,10 @@ fn run_fold_admitted(
                     &landed,
                     cfg,
                     &opts,
-                    &mut diagnostics,
-                    &mut diagnosis_budget,
+                    &mut DiagnosisState {
+                        diagnostics: &mut diagnostics,
+                        budget: &mut diagnosis_budget,
+                    },
                 ) {
                     Ok(o) => o,
                     // The gate stopped being runnable mid-bisect: report the
@@ -3555,8 +3565,10 @@ mod tests {
             &repo.branch_set(),
             &config,
             &land_opts(&config, "main"),
-            &mut diagnostics,
-            &mut DiagnosisBudget::new(DIAGNOSIS_GATE_LIMIT, DIAGNOSIS_TIME_LIMIT),
+            &mut DiagnosisState {
+                diagnostics: &mut diagnostics,
+                budget: &mut DiagnosisBudget::new(DIAGNOSIS_GATE_LIMIT, DIAGNOSIS_TIME_LIMIT),
+            },
         )
         .unwrap_err();
         assert!(error.downcast_ref::<BisectAborted>().is_some());
@@ -3602,8 +3614,10 @@ mod tests {
             &repo.branch_set(),
             &config,
             &land_opts(&config, "main"),
-            &mut diagnostics,
-            &mut budget,
+            &mut DiagnosisState {
+                diagnostics: &mut diagnostics,
+                budget: &mut budget,
+            },
         )
         .unwrap();
         assert_eq!(result, None, "budget exhaustion must blame no branch");
