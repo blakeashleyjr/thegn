@@ -429,7 +429,7 @@ mod tests {
         std::fs::write(&f, [7u8; 100]).unwrap();
         assert_eq!(read_regular_capped(&f, 100).unwrap().len(), 100);
         assert!(read_regular_capped(&f, 99).is_err());
-        assert!(read_regular_capped(&dir, 100).is_err(), "directory refused");
+        assert!(read_regular_capped(dir, 100).is_err(), "directory refused");
         if crate::platform::test_symlink_supported() {
             let target = dir.join("target");
             let link = dir.join("link");
