@@ -1014,6 +1014,164 @@ fn each_occurrence_keeps_the_events_wall_clock_duration() {
 }
 
 #[test]
+fn instant_daily_recurrence_stays_on_utc_across_dst_and_home_zones() {
+    let event = recurring(
+        EventTime::Instant {
+            at: utc(2026, 3, 7, 14, 30),
+        },
+        EventTime::Instant {
+            at: utc(2026, 3, 7, 15, 30),
+        },
+        "FREQ=DAILY;COUNT=4",
+    );
+    let windows = [
+        Tz::UTC,
+        Tz::America__New_York,
+        Tz::America__Los_Angeles,
+        Tz::Asia__Tokyo,
+    ];
+    let baseline = event.occurrences(d(2026, 3, 6), d(2026, 3, 12), windows[0]);
+    assert_eq!(baseline.len(), 4);
+    for home in &windows[1..] {
+        assert_eq!(
+            event.occurrences(d(2026, 3, 6), d(2026, 3, 12), *home),
+            baseline,
+            "UTC recurrence identity must not depend on display zone {home}"
+        );
+    }
+    for (index, occurrence) in baseline.iter().enumerate() {
+        let expected_start = utc(2026, 3, 7, 14, 30) + chrono::Duration::days(index as i64);
+        let expected_end = expected_start + chrono::Duration::hours(1);
+        assert_eq!(occurrence.start, EventTime::Instant { at: expected_start });
+        assert_eq!(occurrence.end, EventTime::Instant { at: expected_end });
+    }
+
+    let fall = recurring(
+        EventTime::Instant {
+            at: utc(2026, 10, 31, 5, 30),
+        },
+        EventTime::Instant {
+            at: utc(2026, 10, 31, 6, 30),
+        },
+        "FREQ=DAILY;COUNT=4",
+    );
+    let fall_baseline = fall.occurrences(d(2026, 10, 30), d(2026, 11, 5), Tz::UTC);
+    assert_eq!(fall_baseline.len(), 4);
+    for home in &windows[1..] {
+        assert_eq!(
+            fall.occurrences(d(2026, 10, 30), d(2026, 11, 5), *home),
+            fall_baseline,
+            "fall-back UTC recurrence identity must not depend on display zone {home}"
+        );
+    }
+    for (index, occurrence) in fall_baseline.iter().enumerate() {
+        let expected_start = utc(2026, 10, 31, 5, 30) + chrono::Duration::days(index as i64);
+        assert_eq!(occurrence.start, EventTime::Instant { at: expected_start });
+        assert_eq!(
+            occurrence.end,
+            EventTime::Instant {
+                at: expected_start + chrono::Duration::hours(1)
+            }
+        );
+    }
+}
+
+#[test]
+fn instant_duration_remains_elapsed_time_across_spring_and_fall_transitions() {
+    for (start, end, date) in [
+        (
+            utc(2026, 3, 8, 6, 30),
+            utc(2026, 3, 8, 7, 30),
+            d(2026, 3, 8),
+        ),
+        (
+            utc(2026, 11, 1, 5, 30),
+            utc(2026, 11, 1, 6, 30),
+            d(2026, 11, 1),
+        ),
+    ] {
+        let event = recurring(
+            EventTime::Instant { at: start },
+            EventTime::Instant { at: end },
+            "FREQ=DAILY;COUNT=1",
+        );
+        let occurrences = event.occurrences(date, date, Tz::America__New_York);
+        assert_eq!(occurrences.len(), 1);
+        assert_eq!(occurrences[0].start, EventTime::Instant { at: start });
+        assert_eq!(occurrences[0].end, EventTime::Instant { at: end });
+        assert_eq!(end - start, chrono::Duration::hours(1));
+    }
+}
+
+#[test]
+fn instant_recurrence_uses_utc_across_non_hour_dst_and_inclusive_windows() {
+    let lord_howe = recurring(
+        EventTime::Instant {
+            at: utc(2026, 10, 3, 15, 0),
+        },
+        EventTime::Instant {
+            at: utc(2026, 10, 3, 16, 0),
+        },
+        "FREQ=DAILY;COUNT=4",
+    );
+    let occurrences =
+        lord_howe.occurrences(d(2026, 10, 4), d(2026, 10, 6), Tz::Australia__Lord_Howe);
+    assert_eq!(occurrences.len(), 3);
+    for (index, occurrence) in occurrences.iter().enumerate() {
+        let start = utc(2026, 10, 3, 15, 0) + chrono::Duration::days(index as i64);
+        assert_eq!(occurrence.start, EventTime::Instant { at: start });
+        assert_eq!(
+            occurrence.end,
+            EventTime::Instant {
+                at: start + chrono::Duration::hours(1)
+            }
+        );
+    }
+
+    // This instance starts on the previous UTC date but extends into the
+    // New York spring-forward date, so the inclusive date window must retain it.
+    let crossing = recurring(
+        EventTime::Instant {
+            at: utc(2026, 3, 7, 23, 30),
+        },
+        EventTime::Instant {
+            at: utc(2026, 3, 8, 6, 30),
+        },
+        "FREQ=DAILY;COUNT=1",
+    );
+    let occurrences = crossing.occurrences(d(2026, 3, 8), d(2026, 3, 8), Tz::America__New_York);
+    assert_eq!(occurrences.len(), 1);
+    assert_eq!(
+        occurrences[0].start,
+        EventTime::Instant {
+            at: utc(2026, 3, 7, 23, 30)
+        }
+    );
+    assert_eq!(
+        occurrences[0].end,
+        EventTime::Instant {
+            at: utc(2026, 3, 8, 6, 30)
+        }
+    );
+}
+
+#[test]
+fn recurrence_rejects_mixed_time_shapes_as_an_invalid_span() {
+    let event = recurring(
+        EventTime::Instant {
+            at: utc(2026, 3, 7, 14, 30),
+        },
+        zoned(2026, 3, 7, 15, 30, "UTC"),
+        "FREQ=DAILY;COUNT=1",
+    );
+    let mut budget = ExpansionBudget::default();
+    assert_eq!(
+        event.occurrences_bounded(d(2026, 3, 7), d(2026, 3, 7), Tz::UTC, &mut budget),
+        Err(ExpansionError::InvalidSpan)
+    );
+}
+
+#[test]
 fn an_all_day_recurrence_keeps_its_day_length() {
     let mut e = CalEvent::new(
         "hol",
