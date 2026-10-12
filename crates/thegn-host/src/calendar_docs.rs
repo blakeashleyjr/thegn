@@ -170,9 +170,7 @@ impl CalendarDocs {
     /// `locale` is the environment's `LC_TIME`/`LANG`, passed in so the
     /// resolution itself stays a pure core function.
     pub fn from_config(cfg: &CalendarConfig, locale: Option<&str>) -> Self {
-        let home = cfg
-            .home_zone()
-            .unwrap_or_else(thegn_core::calendar::tz::system_zone);
+        let home = cfg.effective_home_zone();
         let twelve_hour = thegn_core::calendar::resolve_time_format(cfg.twelve_hour_pref(), locale);
         // The home row is synthesized rather than configured, so the block is
         // never empty even with no `[[calendar.clocks]]` at all.

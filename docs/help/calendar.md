@@ -253,7 +253,10 @@ Each output line is `{"method": "...", "params": {...}}`:
 
 - **`events`** — `{events: [...], deleted: [...], sync_token: "..."}`. Send it as
   many times as you like; the pages accumulate. Return the same `sync_token`
-  next time to do an incremental fetch.
+  next time to do an incremental fetch. Add `mode` to say what the run
+  produced: `snapshot` (the whole window; a `sync_token` may still come back),
+  `delta` (changes since the token you were sent), `unchanged`, or `reset`
+  (replace the cache even if empty). Omit it and thegn infers the old way.
 - **`manifest`** — declare an id, the API version you speak, and the
   capabilities you want. Optional, but it's the only way to request one.
 - **`log`** — `{level, message}`, routed to thegn's log. Diagnostics go here or
