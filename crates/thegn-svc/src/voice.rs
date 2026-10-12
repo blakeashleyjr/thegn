@@ -261,17 +261,15 @@ impl CommandVoiceProvider {
         // A command may have exited while a descendant still owns one of the
         // pipes. Close that whole process group before joining helpers so an
         // otherwise successful child cannot leave a reader or writer behind.
-        if written.is_none() || output.is_none() || error.is_none() {
-            if !terminate_child(child, &on_reaped) {
-                if !workers.discard(written, output, error) {
-                    tracing::warn!(
-                        "voice transcriber pipe workers did not settle after child exit"
-                    );
-                }
-                return Err(VoiceError::UnresolvedProcess(
-                    "transcriber process tree remained live after termination".into(),
-                ));
+        if (written.is_none() || output.is_none() || error.is_none())
+            && !terminate_child(child, &on_reaped)
+        {
+            if !workers.discard(written, output, error) {
+                tracing::warn!("voice transcriber pipe workers did not settle after child exit");
             }
+            return Err(VoiceError::UnresolvedProcess(
+                "transcriber process tree remained live after termination".into(),
+            ));
         }
         let (out, err) = workers.join(written, output, error)?;
         if !status.success() {
