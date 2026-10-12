@@ -17,7 +17,7 @@
 //! Runs from the hydration thread ([`tick`] self-throttles to [`TICK_INTERVAL`]);
 //! network work runs on its own spawned thread.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -43,17 +43,41 @@ pub fn tick(cfg: &Config) {
     if !registry::list().iter().any(|r| r.provider == "fly") {
         return;
     }
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    if IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
     {
         let mut last = LAST
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if last.is_some_and(|t| t.elapsed() < TICK_INTERVAL) {
+            IN_FLIGHT.store(false, Ordering::Release);
             return;
         }
         *last = Some(Instant::now());
     }
-    std::thread::spawn(move || reap(&envs));
+    let spawned = std::thread::Builder::new()
+        .name("thegn-fly-reaper".into())
+        .spawn(move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            struct FlightGuard;
+            impl Drop for FlightGuard {
+                fn drop(&mut self) {
+                    IN_FLIGHT.store(false, Ordering::Release);
+                }
+            }
+            let _guard = FlightGuard;
+            reap(&envs);
+        });
+    if let Err(error) = spawned {
+        IN_FLIGHT.store(false, Ordering::Release);
+        tracing::warn!(target: "thegn::lifecycle", %error, "fly reaper thread could not start");
+    }
 }
 
 /// The ledger lacks an environment/account binding. Refuse ambiguous policies

@@ -237,10 +237,20 @@ impl FlyProvider {
     }
 
     async fn get_json(&self, url: &str) -> Result<serde_json::Value> {
+        self.get_json_timeout(url, crate::provider::CONTROL_TIMEOUT)
+            .await
+    }
+
+    async fn get_json_timeout(
+        &self,
+        url: &str,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value> {
         let resp = self
             .client
             .get(url)
             .bearer_auth(&self.spec.token)
+            .timeout(timeout)
             .send()
             .await
             .map_err(|error| crate::provider::redacted_transport_error("fly", "GET", &error))?;
@@ -250,15 +260,26 @@ impl FlyProvider {
             // request values, and allocating it only to discard it is waste.
             return Err(anyhow!("fly GET request failed ({status})"));
         }
-        Ok(resp.json().await.unwrap_or(serde_json::Value::Null))
+        crate::provider::response_json(resp, "fly", "GET").await
     }
 
     async fn post_json(&self, url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.post_json_timeout(url, body, crate::provider::CONTROL_TIMEOUT)
+            .await
+    }
+
+    async fn post_json_timeout(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value> {
         let resp = self
             .client
             .post(url)
             .bearer_auth(&self.spec.token)
             .json(body)
+            .timeout(timeout)
             .send()
             .await
             .map_err(|error| crate::provider::redacted_transport_error("fly", "POST", &error))?;
@@ -266,7 +287,7 @@ impl FlyProvider {
         if !status.is_success() {
             return Err(anyhow!("fly POST request failed ({status})"));
         }
-        Ok(resp.json().await.unwrap_or(serde_json::Value::Null))
+        crate::provider::response_json(resp, "fly", "POST").await
     }
 
     /// A Fly GraphQL call (IP allocation) — bearer auth, error-surfacing.
@@ -345,8 +366,17 @@ impl FlyProvider {
         let base = self.spec.api_base();
         let start = std::time::Instant::now();
         loop {
+            let remaining = BUDGET.saturating_sub(start.elapsed());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "fly: machine {id} not started after {}s",
+                BUDGET.as_secs()
+            );
             let body = self
-                .get_json(&machines::machine_url(&base, app, id))
+                .get_json_timeout(
+                    &machines::machine_url(&base, app, id),
+                    remaining.min(crate::provider::CONTROL_TIMEOUT),
+                )
                 .await?;
             if machines::parse_machine(&body).is_some_and(|m| m.is_started()) {
                 return Ok(());
@@ -423,19 +453,29 @@ impl FlyProvider {
             .await?
             .ok_or_else(|| anyhow!("fly: machine for {name} not found"))?;
         let base = self.spec.api_base();
-        self.post_json(
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+        let start = std::time::Instant::now();
+        self.post_json_timeout(
             &machines::machine_action_url(&base, &app, &m.id, action),
             &body,
+            BUDGET.min(crate::provider::CONTROL_TIMEOUT),
         )
         .await?;
         // Transitions are async (a start 412s while still stopping) and the
         // `/wait` long-poll can return before the machine truly settles — poll
         // the real state.
-        const BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
-        let start = std::time::Instant::now();
         loop {
+            let remaining = BUDGET.saturating_sub(start.elapsed());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "fly: machine {name} not {want} after {}s",
+                BUDGET.as_secs()
+            );
             let cur = self
-                .get_json(&machines::machine_url(&base, &app, &m.id))
+                .get_json_timeout(
+                    &machines::machine_url(&base, &app, &m.id),
+                    remaining.min(crate::provider::CONTROL_TIMEOUT),
+                )
                 .await
                 .ok()
                 .and_then(|v| machines::parse_machine(&v))
@@ -535,6 +575,7 @@ impl FlyProvider {
                 .client
                 .delete(&url)
                 .bearer_auth(&self.spec.token)
+                .timeout(crate::provider::CONTROL_TIMEOUT)
                 .send()
                 .await
                 .map_err(|error| {

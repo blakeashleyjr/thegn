@@ -1966,7 +1966,9 @@ pub(crate) fn forget_worktree_group(
             // sidecar too).
             crate::agent::deregister_vpn(&path);
             crate::agent::deproject(&path);
-            crate::agent::deprovision_sync(&path);
+            if let Err(error) = crate::agent::deprovision_sync(&path) {
+                tracing::warn!(target: "thegn::lifecycle", worktree = %path, %error, "provider sync failed during background close");
+            }
             // Suspend-on-close: checkpoint the sandbox (8-E) before disconnecting
             // the bridge + tearing down. No-op unless the env sets auto_checkpoint.
             crate::agent::checkpoint_on_close(&path);
