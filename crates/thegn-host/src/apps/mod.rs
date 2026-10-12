@@ -93,6 +93,9 @@ pub struct AppSlot {
     /// The last visibility told to the tile (`None` until first told), so
     /// [`AppHost::sync_visibility`] only calls `on_visible` on a change.
     visible_told: Option<bool>,
+    /// The last focus state told to the tile. The initial hidden state is
+    /// recorded without sending a focus-loss callback.
+    focus_told: Option<bool>,
     /// The last rendered buffer, re-blitted on frames where the tile reported
     /// no change.
     // Not read yet: the run loop re-renders the focused tile every frame rather
@@ -108,6 +111,7 @@ impl AppSlot {
             label: label.into(),
             state: SlotState::Unloaded,
             visible_told: None,
+            focus_told: None,
             last_buf: None,
         }
     }
@@ -122,6 +126,22 @@ impl AppSlot {
             // room for it.
             SlotState::Failed(_) => format!("{} (failed)", self.label),
             _ => self.label.clone(),
+        }
+    }
+}
+
+impl Drop for AppSlot {
+    fn drop(&mut self) {
+        if let SlotState::Running(tile) = &mut self.state
+            && let Err(_panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tile.shutdown();
+            }))
+        {
+            tracing::warn!(
+                target: "thegn::apps",
+                app = self.id,
+                "app shutdown panicked"
+            );
         }
     }
 }
@@ -336,7 +356,8 @@ impl AppHost {
         PasteRoute::Consumed
     }
 
-    /// Tell each running tile whether it is the visible tab, on change only.
+    /// Tell each running tile whether it is the visible and focused tab,
+    /// on change only.
     /// Hidden tiles must stop periodic work (see `AppTile::on_visible`). Cheap
     /// (a flag compare per slot), so the loop calls it every iteration rather
     /// than hooking each place `active` is assigned.
@@ -345,12 +366,30 @@ impl AppHost {
         for (i, slot) in self.slots.iter_mut().enumerate() {
             let SlotState::Running(tile) = &mut slot.state else {
                 slot.visible_told = None;
+                slot.focus_told = None;
                 continue;
             };
             let visible = active == ActiveApp::Tile(i);
-            if slot.visible_told != Some(visible) {
-                slot.visible_told = Some(visible);
-                tile.on_visible(visible);
+            if visible {
+                if slot.visible_told != Some(true) {
+                    slot.visible_told = Some(true);
+                    tile.on_visible(true);
+                }
+                if slot.focus_told != Some(true) {
+                    slot.focus_told = Some(true);
+                    tile.on_focus(true);
+                }
+            } else {
+                if slot.focus_told == Some(true) {
+                    slot.focus_told = Some(false);
+                    tile.on_focus(false);
+                } else if slot.focus_told.is_none() {
+                    slot.focus_told = Some(false);
+                }
+                if slot.visible_told != Some(false) {
+                    slot.visible_told = Some(false);
+                    tile.on_visible(false);
+                }
             }
         }
     }
@@ -743,6 +782,128 @@ mod tests {
         fn on_visible(&mut self, visible: bool) {
             self.0.lock().unwrap().push(visible);
         }
+    }
+
+    struct LifecycleTile {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        panic_on_shutdown: bool,
+    }
+
+    impl AppTile for LifecycleTile {
+        fn id(&self) -> &'static str {
+            "observe"
+        }
+        fn title(&self) -> String {
+            "Observe".into()
+        }
+        fn pump(&mut self) -> bool {
+            false
+        }
+        fn wants_redraw(&self) -> bool {
+            false
+        }
+        fn handle_input(&mut self, _ev: tg_kit::InputEvent) -> tg_kit::InputResult {
+            tg_kit::InputResult::Ignored
+        }
+        fn render(&mut self, _area: tg_kit::ratatui::layout::Rect, _buf: &mut Buffer) {}
+        fn on_visible(&mut self, visible: bool) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("visible:{visible}"));
+        }
+        fn on_focus(&mut self, focused: bool) {
+            self.events.lock().unwrap().push(format!("focus:{focused}"));
+        }
+        fn shutdown(&mut self) {
+            self.events.lock().unwrap().push("shutdown".into());
+            assert!(!self.panic_on_shutdown, "injected shutdown panic");
+        }
+    }
+
+    fn lifecycle_slot(
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        panic_on_shutdown: bool,
+    ) -> AppSlot {
+        let mut slot = AppSlot::new("observe", "Observe");
+        slot.state = SlotState::Running(Box::new(LifecycleTile {
+            events,
+            panic_on_shutdown,
+        }));
+        slot
+    }
+
+    #[test]
+    fn sync_visibility_orders_focus_and_visibility_transitions_once() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut host = AppHost::new(vec![lifecycle_slot(events.clone(), false)]);
+
+        // First hidden sync reports visibility only; repeated syncs are quiet.
+        host.sync_visibility();
+        host.sync_visibility();
+        host.active = ActiveApp::Tile(0);
+        host.sync_visibility();
+        host.sync_visibility();
+        host.active = ActiveApp::Work;
+        host.sync_visibility();
+        host.sync_visibility();
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "visible:false",
+                "visible:true",
+                "focus:true",
+                "focus:false",
+                "visible:false",
+            ]
+        );
+    }
+
+    #[test]
+    fn dropping_host_shuts_down_running_tile_once() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        drop(AppHost::new(vec![lifecycle_slot(events.clone(), false)]));
+        assert_eq!(*events.lock().unwrap(), vec!["shutdown"]);
+    }
+
+    #[test]
+    fn reconcile_shuts_down_removed_tile_but_retains_reordered_tile() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.observe.enabled = true;
+        cfg.apps.tab_order = vec!["observe".into(), "work".into()];
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut host = AppHost::from_config(&cfg);
+        host.slots[0] = lifecycle_slot(events.clone(), false);
+
+        cfg.apps.tab_order = vec!["work".into(), "observe".into()];
+        host.reconcile(&cfg);
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(host.slots[0].id, "observe");
+
+        cfg.observe.enabled = false;
+        host.reconcile(&cfg);
+        assert!(host.slots.is_empty());
+        assert_eq!(*events.lock().unwrap(), vec!["shutdown"]);
+    }
+
+    #[test]
+    fn failed_slot_does_not_shutdown_and_shutdown_panic_is_contained() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut failed = AppSlot::new("observe", "Observe");
+        failed.state = SlotState::Failed("injected construction failure".into());
+        drop(failed);
+        assert!(events.lock().unwrap().is_empty());
+
+        let panic_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(AppHost::new(vec![lifecycle_slot(
+                panic_events.clone(),
+                true,
+            )]));
+        }));
+        assert!(result.is_ok(), "shutdown panic escaped AppSlot::drop");
+        assert_eq!(*panic_events.lock().unwrap(), vec!["shutdown"]);
     }
 
     #[test]
