@@ -122,6 +122,10 @@ pub struct KittyRelay {
     scanned: usize,
 }
 
+/// Child IDs are reserved when a first chunk is classified. If later transfer
+/// aggregation or payload validation rejects that transfer, its bounded slot
+/// remains reserved until the child deletes it or the relay resets. This keeps
+/// the table bounded; a later placement can still map to that rejected image.
 #[derive(Debug, Default)]
 struct CornerIds {
     child: [Option<u32>; CORNER_IDS],
@@ -319,6 +323,11 @@ impl KittyRelay {
                 } else {
                     self.transfer = Some(transfer);
                 }
+            }
+            Piece::GfxOther(bytes) if bytes.is_empty() => {
+                // A child delete-all with no live IDs still terminates any
+                // incomplete transfer, but has no outer-terminal command.
+                self.transfer = None;
             }
             Piece::GfxOther(bytes) if is_delete(&bytes) => {
                 self.transfer = None;
@@ -940,7 +949,7 @@ pub fn delete_all() -> Vec<u8> {
 }
 
 fn delete_id(host_id: u32) -> Vec<u8> {
-    format!("\x1b_Ga=d,d=I,i={host_id},q=2\x1b\\").into_bytes()
+    format!("\x1b_Ga=d,d=I,i={host_id},q=2;\x1b\\").into_bytes()
 }
 
 /// Whether the outer terminal speaks the kitty graphics protocol, from the
@@ -1066,7 +1075,7 @@ mod tests {
                 relay.feed(b"\\safe"),
                 vec![Piece::Emulator(b"safe".to_vec())]
             );
-            assert_eq!(relay.feed(&apc("Ga=d")), vec![Piece::GfxOther(Vec::new())]);
+            assert!(relay.feed(&apc("Ga=d")).is_empty());
         }
     }
 
@@ -1127,7 +1136,6 @@ mod tests {
         assert_eq!(
             pieces,
             vec![
-                Piece::GfxOther(Vec::new()),
                 Piece::Emulator(b"\x1b[2J\x1b[0;0f".to_vec()),
                 Piece::GfxDisplay({
                     let mut unit =
@@ -1272,7 +1280,18 @@ mod tests {
         assert_eq!(p1, vec![Piece::Emulator(b"hello".to_vec())]);
         // Next read completes an APC begun by that ESC.
         let p2 = r.feed(b"_Ga=d\x1b\\");
-        assert_eq!(p2, vec![Piece::GfxOther(Vec::new())]);
+        assert!(p2.is_empty());
+    }
+
+    #[test]
+    fn child_delete_cancels_an_incomplete_transfer_before_its_final_chunk() {
+        let mut relay = KittyRelay::new();
+        assert!(relay.feed(&apc("Ga=T,i=2,m=1,f=24,s=1,v=1;AQ")).is_empty());
+        assert!(matches!(
+            relay.feed(&apc("Ga=d,i=2;")).as_slice(),
+            [Piece::GfxOther(_)]
+        ));
+        assert_eq!(relay.feed(&apc("Gm=0;ID")), [Piece::Rejected]);
     }
 
     #[test]
