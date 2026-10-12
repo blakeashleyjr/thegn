@@ -189,6 +189,21 @@ fn consider_candidate_with_forge(
         forges = crate::forge_handle::get();
         forges.for_loc(&loc)
     };
+    if item.forge != provider.id() {
+        hold_identity_mismatch(
+            db,
+            &item.key,
+            item.number,
+            &format!(
+                "queued forge {} differs from resolved forge {}; re-add with `thegn pr queue add --pr {}` to verify it",
+                item.forge,
+                provider.id(),
+                item.number
+            ),
+            &notify,
+        );
+        return;
+    }
     let Some(fetched) = provider.fetch_pr(&loc, item.number).ok() else {
         notify(format!(
             "CI job {} failed for PR #{}; the current PR head could not be verified",
@@ -196,6 +211,15 @@ fn consider_candidate_with_forge(
         ));
         return;
     };
+    if let Err(detail) = thegn_core::pr_queue::attest_pr_identity(
+        item.pr_url.as_deref(),
+        item.number,
+        &fetched.pr.url,
+        fetched.pr.number,
+    ) {
+        hold_identity_mismatch(db, &item.key, item.number, &detail, &notify);
+        return;
+    }
     if !head_is_current(provider, &loc, &fetched, entry.head_sha.as_str()) {
         notify(format!(
             "CI job {} failed for PR #{}; the PR head changed, so autofix is held",
@@ -348,6 +372,25 @@ fn consider_candidate_with_forge(
     restamp_after_agent(db, &item.key, outcome);
 }
 
+fn hold_identity_mismatch(
+    db: &thegn_core::db::Db,
+    key: &str,
+    number: u64,
+    detail: &str,
+    notify: &dyn Fn(String),
+) {
+    if let Err(error) = db.update_pr_status(
+        key,
+        PrqStatus::NeedsHuman.as_str(),
+        None,
+        Some(detail),
+        None,
+    ) {
+        tracing::debug!(target: "thegn::ci_autofix", %error, "could not hold PR queue row after CI autofix identity mismatch");
+    }
+    notify(format!("CI autofix for PR #{number} held: {detail}"));
+}
+
 fn restamp_after_agent(db: &thegn_core::db::Db, key: &str, outcome: &str) {
     let rows = match db.list_pr_queue() {
         Ok(rows) => rows,
@@ -432,13 +475,93 @@ mod authorship_tests {
     }
 
     #[test]
+    fn unbound_or_mismatched_pr_identity_never_reaches_ci_dispatch() {
+        let cases = [
+            ("unbound", false, false, "identity"),
+            ("project-swap", true, false, "identity"),
+            ("forge-mismatch", true, true, "forge"),
+        ];
+        for (case, bound, forge_mismatch, expected_message) in cases {
+            for human_authorized in [false, true] {
+                let fixture = Fixture::new();
+                let path = fixture.dir.path().to_str().unwrap();
+                let db = thegn_core::db::Db::open_at(&fixture.dir.path().join("ci.db")).unwrap();
+                if bound {
+                    let url = if case == "project-swap" {
+                        "https://github.com/other/project/pull/7"
+                    } else {
+                        &fixture.pr.url
+                    };
+                    db.enqueue_bound_pr(
+                        path,
+                        7,
+                        Some(path),
+                        "fixture",
+                        "main",
+                        if forge_mismatch { "gitlab" } else { "github" },
+                        url,
+                    )
+                    .unwrap();
+                } else {
+                    db.enqueue_pr(path, 7, Some(path), "fixture", "main", "github")
+                        .unwrap();
+                }
+                let sentinel = fixture.dir.path().join("agent-must-not-run");
+                let mut cfg = Config::default();
+                cfg.ci.autofix.mode = CiAutofixMode::Auto;
+                cfg.pr_queue.enabled = true;
+                cfg.pr_queue.own_prs_only = true;
+                cfg.pr_queue.agent_command = format!("touch {}", sentinel.display());
+                let mut forge = fixture.forge(vec![fixture.proof.clone()]);
+                forge.pr.status_check_rollup = vec![
+                    serde_json::from_value(
+                        serde_json::json!({"name":"test", "conclusion":"FAILURE"}),
+                    )
+                    .unwrap(),
+                ];
+                let entry = CiLogEntry {
+                    worktree: path.into(),
+                    head_sha: fixture.pr.head_ref_oid.clone(),
+                    text: "fixture failure".into(),
+                    run_id: "run".into(),
+                    job_id: "job".into(),
+                    ..Default::default()
+                };
+
+                consider_candidate_with_forge(&cfg, &db, &entry, human_authorized, Some(&forge));
+
+                assert_eq!(forge.proof_calls.load(Ordering::SeqCst), 0, "{case}");
+                assert!(!sentinel.exists(), "{case}");
+                let row = db.list_pr_queue().unwrap().remove(0);
+                assert_eq!(row.agent_attempts, 0, "{case}");
+                assert_eq!(row.status, PrqStatus::NeedsHuman.as_str(), "{case}");
+                assert!(db.claim_ci_autofix(&entry.candidate()).unwrap(), "{case}");
+                assert!(
+                    db.get_unread_notifications().unwrap().iter().any(|n| {
+                        n.message.contains("held") && n.message.contains(expected_message)
+                    }),
+                    "missing {expected_message} hold for {case}, human={human_authorized}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn foreign_author_never_claims_or_spends_a_ci_attempt() {
         for mismatched_number in [false, true] {
             let fixture = Fixture::new();
             let path = fixture.dir.path().to_str().unwrap();
             let db = thegn_core::db::Db::open_at(&fixture.dir.path().join("ci.db")).unwrap();
-            db.enqueue_pr(path, 7, Some(path), "fixture", "main", "github")
-                .unwrap();
+            db.enqueue_bound_pr(
+                path,
+                7,
+                Some(path),
+                "fixture",
+                "main",
+                "github",
+                &fixture.pr.url,
+            )
+            .unwrap();
             let sentinel = fixture.dir.path().join("agent-must-not-run");
             let mut cfg = Config::default();
             cfg.ci.autofix.mode = CiAutofixMode::Auto;
@@ -480,12 +603,13 @@ mod authorship_tests {
                 db.claim_ci_autofix(&entry.candidate()).unwrap(),
                 "denial must not consume the candidate claim"
             );
-            assert!(
-                db.get_unread_notifications()
-                    .unwrap()
-                    .iter()
-                    .any(|n| n.message.contains("own-PR automation held"))
-            );
+            assert!(db.get_unread_notifications().unwrap().iter().any(|n| {
+                n.message.contains(if mismatched_number {
+                    "identity"
+                } else {
+                    "own-PR automation held"
+                })
+            }));
         }
     }
 
@@ -542,8 +666,16 @@ mod authorship_tests {
                     };
                     let db =
                         thegn_core::db::Db::open_at(&fixture.dir.path().join("ci.db")).unwrap();
-                    db.enqueue_pr(path, 7, Some(path), "fixture", "main", "github")
-                        .unwrap();
+                    db.enqueue_bound_pr(
+                        path,
+                        7,
+                        Some(path),
+                        "fixture",
+                        "main",
+                        "github",
+                        &fixture.pr.url,
+                    )
+                    .unwrap();
                     let row = db.list_pr_queue().unwrap().remove(0);
                     db.update_pr_status(
                         &row.key,
@@ -612,8 +744,16 @@ mod authorship_tests {
             let path = fixture.dir.path().to_str().unwrap();
             let db =
                 thegn_core::db::Db::open_at(&fixture.dir.path().join("unsupported.db")).unwrap();
-            db.enqueue_pr(path, 7, Some(path), "fixture", "main", "github")
-                .unwrap();
+            db.enqueue_bound_pr(
+                path,
+                7,
+                Some(path),
+                "fixture",
+                "main",
+                "github",
+                &fixture.pr.url,
+            )
+            .unwrap();
             let sentinel = fixture.dir.path().join("agent-must-not-run");
             let mut config = Config::default();
             config.ci.autofix.mode = CiAutofixMode::Auto;
