@@ -20,7 +20,10 @@
 //!   player teardown) the task re-resolves the backend with backoff rather than
 //!   dying permanently.
 
+use std::sync::atomic::Ordering;
+
 use tokio::sync::mpsc as tokio_mpsc;
+use tokio::time::MissedTickBehavior;
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::config::MediaConfig;
@@ -81,6 +84,77 @@ const CONFIRM_DELAY: std::time::Duration = std::time::Duration::from_millis(300)
 /// only a stream that survives this window earns a reset.
 const STREAM_STABILITY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// A last-known-good badge may survive a short provider outage, but never
+/// longer than three poll periods or ten seconds, whichever is greater.
+fn stale_grace(period: std::time::Duration) -> std::time::Duration {
+    (period * 3).max(std::time::Duration::from_secs(10))
+}
+
+#[derive(Default)]
+struct Freshness {
+    last_success: Option<tokio::time::Instant>,
+    failure_started: Option<tokio::time::Instant>,
+    stale_cleared: bool,
+}
+
+impl Freshness {
+    /// Errors are distinct from successful empty reads. A failure emits a
+    /// single clear only after the bounded last-known-good grace has elapsed.
+    fn on_failure(
+        &mut self,
+        now: tokio::time::Instant,
+        grace: std::time::Duration,
+    ) -> Option<Option<MediaSnapshot>> {
+        let since = *self.failure_started.get_or_insert(now);
+        let reference = self.last_success.unwrap_or(since);
+        if self.stale_cleared || now.duration_since(reference) < grace {
+            return None;
+        }
+        self.stale_cleared = true;
+        Some(None)
+    }
+
+    fn on_success(&mut self, now: tokio::time::Instant) {
+        self.last_success = Some(now);
+        self.failure_started = None;
+        self.stale_cleared = false;
+    }
+
+    fn until_expiry(
+        &self,
+        now: tokio::time::Instant,
+        grace: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        if self.stale_cleared {
+            return None;
+        }
+        let since = self.last_success.or(self.failure_started)?;
+        Some(grace.saturating_sub(now.duration_since(since)))
+    }
+}
+
+struct WatchState {
+    freshness: Freshness,
+    grace: std::time::Duration,
+    last_sent: Option<MediaSnapshot>,
+    last_epoch: u64,
+}
+
+fn interval(period: std::time::Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    interval
+}
+
+fn should_deliver(
+    last: &Option<MediaSnapshot>,
+    last_epoch: u64,
+    current_epoch: u64,
+    new: &Option<MediaSnapshot>,
+) -> bool {
+    last_epoch != current_epoch || last != new
+}
+
 fn backoff_after_stream(
     backoff: std::time::Duration,
     lifetime: std::time::Duration,
@@ -114,12 +188,12 @@ fn flap_action(was_showing: bool, new_active: bool) -> FlapAction {
 }
 
 /// Read one snapshot, logging read errors instead of swallowing them.
-async fn read_snapshot(client: &thegn_media::MediaClient) -> Option<MediaSnapshot> {
+async fn read_snapshot(client: &thegn_media::MediaClient) -> Result<Option<MediaSnapshot>, ()> {
     match client.snapshot_with_caps().await {
-        Ok(snap) => snap,
+        Ok(snap) => Ok(snap),
         Err(e) => {
             tracing::debug!(target: "thegn::media", error = %e, "media snapshot failed");
-            None
+            Err(())
         }
     }
 }
@@ -142,41 +216,80 @@ async fn push_snapshot(
     tx: &tokio_mpsc::UnboundedSender<MediaSnapshotDelivery>,
     waker: &TerminalWaker,
     was_showing: bool,
+    state: &mut WatchState,
 ) -> Option<bool> {
-    let mut snap = read_snapshot(client).await;
-    if flap_action(was_showing, shows_badge(&snap)) == FlapAction::Confirm {
-        tokio::time::sleep(CONFIRM_DELAY).await;
-        let confirm = read_snapshot(client).await;
-        if shows_badge(&confirm) {
-            tracing::debug!(target: "thegn::media", "media badge held (transient empty ignored)");
-        } else {
-            tracing::debug!(target: "thegn::media", "media badge cleared (empty confirmed)");
+    let read = read_snapshot(client).await;
+    let was_empty = matches!(&read, Ok(None));
+    let mut snap = match read {
+        Ok(snap) => {
+            state.freshness.on_success(tokio::time::Instant::now());
+            snap
         }
-        snap = confirm;
+        Err(()) => match state
+            .freshness
+            .on_failure(tokio::time::Instant::now(), state.grace)
+        {
+            Some(snap) => {
+                tracing::debug!(target: "thegn::media", "media provider unavailable; stale badge expired");
+                snap
+            }
+            None => return Some(was_showing),
+        },
+    };
+    if was_empty && flap_action(was_showing, shows_badge(&snap)) == FlapAction::Confirm {
+        tokio::time::sleep(CONFIRM_DELAY).await;
+        match read_snapshot(client).await {
+            Ok(confirm) => {
+                state.freshness.on_success(tokio::time::Instant::now());
+                if shows_badge(&confirm) {
+                    tracing::debug!(target: "thegn::media", "media badge held (transient empty ignored)");
+                } else {
+                    tracing::debug!(target: "thegn::media", "media badge cleared (empty confirmed)");
+                }
+                snap = confirm;
+            }
+            Err(()) => {
+                snap = state
+                    .freshness
+                    .on_failure(tokio::time::Instant::now(), state.grace)
+                    .flatten();
+                if snap.is_none() && state.freshness.stale_cleared {
+                    tracing::debug!(target: "thegn::media", "media provider unavailable; stale badge expired");
+                } else {
+                    return Some(was_showing);
+                }
+            }
+        }
     }
     let active = shows_badge(&snap);
+    let epoch = crate::media_ctl::MEDIA_DELIVERY_EPOCH.load(Ordering::Acquire);
+    if !should_deliver(&state.last_sent, state.last_epoch, epoch, &snap) {
+        return Some(active);
+    }
     if tx
         .send(MediaSnapshotDelivery {
             generation,
-            snapshot: snap,
+            snapshot: snap.clone(),
         })
         .is_err()
     {
         return None;
     }
-    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+    if let Err(error) = waker.wake() {
+        tracing::debug!(target: "thegn::media", %error, "media watcher wake failed");
+    }
+    state.last_sent = snap;
+    state.last_epoch = epoch;
     Some(active)
 }
 
-/// Log the badge-clearing transition (a track was showing, this push hides it).
-/// `Ok(None)` pushes are otherwise silent — e.g. the aggregate when every child
-/// failed, or MPD answering "daemon away" — so without this a vanishing badge
-/// leaves no trace in `THEGN_LOG=thegn::media=debug` logs.
+/// Log a badge-clearing transition without assuming the provider reported an
+/// authoritative empty snapshot; the same edge can follow the stale grace.
 fn note_cleared(prev_active: bool, now_active: bool) {
     if prev_active && !now_active {
         tracing::debug!(
             target: "thegn::media",
-            "now-playing cleared (snapshot returned none/stopped)"
+            "now-playing badge cleared"
         );
     }
 }
@@ -190,18 +303,56 @@ async fn run(
     let period = std::time::Duration::from_secs(cfg.poll_interval_secs.max(1));
     let max_backoff = std::time::Duration::from_secs(30);
     let mut backoff = std::time::Duration::from_secs(1);
+    let grace = stale_grace(period);
+    let mut state = WatchState {
+        freshness: Freshness::default(),
+        grace,
+        last_sent: None,
+        last_epoch: crate::media_ctl::MEDIA_DELIVERY_EPOCH
+            .load(Ordering::Acquire)
+            .wrapping_sub(1),
+    };
+    let mut active = false;
 
     loop {
         let Some(client) = crate::media_secret::client_for(&cfg).await else {
             // No backend yet (bus down, playerctl absent). Retry with backoff so
             // media appears once the transport comes up, rather than never.
             tracing::debug!(target: "thegn::media", "media backend unavailable; retrying");
-            tokio::time::sleep(backoff).await;
+            if let Some(snapshot) = state
+                .freshness
+                .on_failure(tokio::time::Instant::now(), state.grace)
+            {
+                active = shows_badge(&snapshot);
+                let epoch = crate::media_ctl::MEDIA_DELIVERY_EPOCH.load(Ordering::Acquire);
+                if should_deliver(&state.last_sent, state.last_epoch, epoch, &snapshot) {
+                    if tx
+                        .send(MediaSnapshotDelivery {
+                            generation,
+                            snapshot: snapshot.clone(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if let Err(error) = waker.wake() {
+                        tracing::debug!(target: "thegn::media", %error, "media watcher wake failed");
+                    }
+                    state.last_sent = snapshot;
+                    state.last_epoch = epoch;
+                }
+            }
+            let retry_after = state
+                .freshness
+                .until_expiry(tokio::time::Instant::now(), state.grace)
+                .map_or(backoff, |remaining| backoff.min(remaining));
+            tokio::time::sleep(retry_after).await;
             backoff = (backoff * 2).min(max_backoff);
             continue;
         };
-        // Initial snapshot. Nothing is shown yet, so no disappear to confirm.
-        let mut active = match push_snapshot(&client, generation, &tx, &waker, false).await {
+        // Refresh after resolution; retain `active` across failed resolutions
+        // so a prior generation's badge follows the same stale-grace policy.
+        active = match push_snapshot(&client, generation, &tx, &waker, active, &mut state).await {
             Some(a) => a,
             None => return, // receiver gone
         };
@@ -212,7 +363,7 @@ async fn run(
             // *while no track is displayed*, run a slow safety poll so a failed
             // initial read self-heals. Once a badge shows, drop back to
             // signal-only (no idle polling during playback).
-            let mut safety = tokio::time::interval(period);
+            let mut safety = interval(period);
             safety.tick().await; // consume the immediate first tick
             let stream_ended = loop {
                 let changed = if active {
@@ -226,7 +377,7 @@ async fn run(
                 if !changed {
                     break true; // signal stream ended → reconnect
                 }
-                match push_snapshot(&client, generation, &tx, &waker, active).await {
+                match push_snapshot(&client, generation, &tx, &waker, active, &mut state).await {
                     Some(a) => {
                         note_cleared(active, a);
                         active = a;
@@ -243,11 +394,11 @@ async fn run(
             }
         } else {
             // Poll path: backends without a signal stream (mpv / playerctl).
-            let mut ticker = tokio::time::interval(period);
+            let mut ticker = interval(period);
             ticker.tick().await; // consume the immediate first tick
             loop {
                 ticker.tick().await;
-                match push_snapshot(&client, generation, &tx, &waker, active).await {
+                match push_snapshot(&client, generation, &tx, &waker, active, &mut state).await {
                     Some(a) => {
                         note_cleared(active, a);
                         active = a;
@@ -283,34 +434,39 @@ pub(crate) fn drain_snapshots(
     coalesce_full: bool,
     last_full: &mut Option<std::time::Instant>,
 ) -> (bool, bool) {
-    let (mut full, mut bars) = (false, false);
+    let mut newest = None;
     while let Ok(delivery) = rx.try_recv() {
-        perf.tick(crate::perf::WakeSource::Refresh);
         if delivery.generation != generation {
             continue;
         }
-        let shown = if enabled { delivery.snapshot } else { None };
-        let shown_state = shown.as_ref().map(|snapshot| snapshot.state.clone());
-        let shown_caps = shown.as_ref().map(|snapshot| snapshot.caps);
-        if *media == shown_state && *caps == shown_caps {
-            continue;
+        newest = Some(delivery.snapshot);
+    }
+    let Some(newest) = newest else {
+        return (false, false);
+    };
+    perf.tick(crate::perf::WakeSource::Refresh);
+    let shown = if enabled { newest } else { None };
+    let shown_state = shown.as_ref().map(|snapshot| snapshot.state.clone());
+    let shown_caps = shown.as_ref().map(|snapshot| snapshot.caps);
+    if *media == shown_state && *caps == shown_caps {
+        return (false, false);
+    }
+    let badge_changed =
+        media.as_ref().and_then(|m| m.badge()) != shown_state.as_ref().and_then(|m| m.badge());
+    *media = shown_state;
+    *caps = shown_caps;
+    let (mut full, mut bars) = (false, false);
+    if coalesce_full {
+        if badge_changed
+            || last_full
+                .map(|t| t.elapsed() >= std::time::Duration::from_millis(900))
+                .unwrap_or(true)
+        {
+            full = true;
+            *last_full = Some(std::time::Instant::now());
         }
-        let badge_changed =
-            media.as_ref().and_then(|m| m.badge()) != shown_state.as_ref().and_then(|m| m.badge());
-        *media = shown_state;
-        *caps = shown_caps;
-        if coalesce_full {
-            if badge_changed
-                || last_full
-                    .map(|t| t.elapsed() >= std::time::Duration::from_millis(900))
-                    .unwrap_or(true)
-            {
-                full = true;
-                *last_full = Some(std::time::Instant::now());
-            }
-        } else if badge_changed {
-            bars = true;
-        }
+    } else if badge_changed {
+        bars = true;
     }
     (full, bars)
 }
@@ -318,10 +474,11 @@ pub(crate) fn drain_snapshots(
 #[cfg(test)]
 mod tests {
     use tokio::sync::mpsc;
+    use tokio::time::MissedTickBehavior;
 
     use super::{
-        FlapAction, MediaSnapshotDelivery, STREAM_STABILITY, abort_and_join, backoff_after_stream,
-        drain_snapshots, flap_action,
+        FlapAction, Freshness, MediaSnapshotDelivery, STREAM_STABILITY, abort_and_join,
+        backoff_after_stream, drain_snapshots, flap_action, interval, should_deliver, stale_grace,
     };
     use thegn_core::media::{MediaCaps, MediaSnapshot, MediaState};
 
@@ -353,6 +510,48 @@ mod tests {
             std::time::Duration::from_secs(1),
             "only a stream that meets the stability window resets backoff"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn freshness_keeps_last_good_during_grace_then_clears_once() {
+        let now = tokio::time::Instant::now();
+        let grace = std::time::Duration::from_secs(10);
+        let mut freshness = Freshness {
+            last_success: Some(now),
+            failure_started: None,
+            stale_cleared: false,
+        };
+        assert!(
+            freshness
+                .on_failure(now + grace - std::time::Duration::from_millis(1), grace)
+                .is_none()
+        );
+        assert_eq!(freshness.on_failure(now + grace, grace), Some(None));
+        assert!(freshness.on_failure(now + grace + grace, grace).is_none());
+        assert_eq!(stale_grace(std::time::Duration::from_secs(4)), grace);
+        assert_eq!(
+            stale_grace(std::time::Duration::from_secs(5)),
+            std::time::Duration::from_secs(15)
+        );
+    }
+
+    #[tokio::test]
+    async fn media_intervals_skip_missed_ticks() {
+        assert_eq!(
+            interval(std::time::Duration::from_secs(2)).missed_tick_behavior(),
+            MissedTickBehavior::Skip
+        );
+    }
+
+    #[test]
+    fn unchanged_snapshots_are_suppressed_unless_media_ctl_sent() {
+        let snapshot = Some(MediaSnapshot {
+            state: MediaState::default(),
+            caps: MediaCaps::default(),
+        });
+        assert!(!should_deliver(&snapshot, 4, 4, &snapshot));
+        assert!(should_deliver(&snapshot, 4, 5, &snapshot));
+        assert!(should_deliver(&snapshot, 4, 4, &None));
     }
 
     #[tokio::test]
@@ -431,5 +630,48 @@ mod tests {
         assert_eq!(media, Some(current.state));
         assert_eq!(caps, Some(current.caps));
         assert!(last_full.is_none());
+    }
+
+    #[test]
+    fn drain_applies_only_the_newest_current_generation_snapshot() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut perf = crate::perf::LoopPerf::new();
+        let mut media = Some(MediaState {
+            player: "player".into(),
+            title: "first".into(),
+            ..Default::default()
+        });
+        let mut caps = Some(MediaCaps::default());
+        let mut last_full = None;
+        let first = MediaSnapshot {
+            state: media.clone().unwrap(),
+            caps: MediaCaps::default(),
+        };
+        let middle = MediaSnapshot {
+            state: MediaState {
+                title: "middle".into(),
+                ..first.state.clone()
+            },
+            caps: MediaCaps::default(),
+        };
+        for snapshot in [first.clone(), middle, first.clone()] {
+            tx.send(MediaSnapshotDelivery {
+                generation: 7,
+                snapshot: Some(snapshot),
+            })
+            .unwrap();
+        }
+        let repaint = drain_snapshots(
+            &mut rx,
+            &mut perf,
+            true,
+            7,
+            &mut media,
+            &mut caps,
+            false,
+            &mut last_full,
+        );
+        assert_eq!(repaint, (false, false));
+        assert_eq!(media, Some(first.state));
     }
 }
