@@ -175,11 +175,9 @@ pub fn repo_slug(root: &Path) -> String {
 /// whose caller already selected an isolated database path (notably tests and
 /// alternate state profiles); it must not silently consult the default DB.
 pub fn repo_slug_at(root: &Path, db_path: &Path) -> String {
-    let base = slug_base(&repo_name_from_path(root));
     crate::db::Db::open_at(db_path)
-        .ok()
-        .and_then(|db| db.slug_for_repo(&root.to_string_lossy(), &base).ok())
-        .unwrap_or(base)
+        .map(|db| repo_slug_with(&db, root))
+        .unwrap_or_else(|_| slug_base(&repo_name_from_path(root)))
 }
 
 /// Canonical slug for a repo via an existing DB handle — same contract as
@@ -350,7 +348,9 @@ mod tests {
                 .unwrap(),
             "same-name-2"
         );
-        assert_eq!(repo_slug_at(&root, dir.path()), "same-name");
+        let bad = dir.path().join("dir-not-db");
+        std::fs::create_dir_all(&bad).unwrap();
+        assert_eq!(repo_slug_at(&root, &bad), "same-name");
     }
 
     #[test]

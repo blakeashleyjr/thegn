@@ -62,9 +62,7 @@ impl HookRunResult {
     }
 }
 
-/// Run one hook. Callers must invoke this from a worker, never from the
-/// compositor loop: the CPU wrapper probes the host and the child wait blocks.
-#[expect(clippy::disallowed_methods)]
+/// Run one hook, writing its log beneath the user's XDG state directory.
 pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult {
     run_with_log_root(
         spec,
@@ -76,6 +74,9 @@ pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult 
     )
 }
 
+/// Callers must invoke this from a worker, never from the compositor loop: the
+/// CPU wrapper probes the host and the child wait blocks.
+#[expect(clippy::disallowed_methods)]
 fn run_with_log_root(
     spec: &HookSpec,
     context: &HookContext,
