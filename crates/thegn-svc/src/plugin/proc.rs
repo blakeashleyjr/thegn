@@ -158,7 +158,7 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
     }
     set_process_group(&mut cmd);
 
-    let mut child = cmd.spawn().map_err(|e| PluginError::Spawn(e.to_string()))?;
+    let child = cmd.spawn().map_err(|e| PluginError::Spawn(e.to_string()))?;
     let pid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -197,6 +197,7 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
                         }
                         (end, newline, false)
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 };
                 if eof {
@@ -229,7 +230,7 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
             }
         }
         if stdout_tx.send((sink, truncated)).is_err() {
-            // The caller has already returned after its bounded drain deadline.
+            tracing::debug!("plugin stdout reader detached: run already gave up");
         }
     });
 
@@ -254,7 +255,7 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
             s = String::from_utf8_lossy(&buf).into_owned();
         }
         if stderr_tx.send(s).is_err() {
-            // The caller has already returned after its bounded drain deadline.
+            tracing::debug!("plugin stderr reader detached: run already gave up");
         }
     });
 
@@ -266,12 +267,14 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
     let status = 'run: loop {
         match leader_exited_nowait(pid) {
             Ok(true) => {
+                // A successful one-shot run also kills helpers left in its process group,
+                // matching gh_run; backgrounded helpers do not outlive the plugin run.
                 kill_group(pid);
                 break child.wait().ok();
             }
             Ok(false) => {}
             Err(_) => {
-                kill_group(pid);
+                hand_off_unreaped_child(child);
                 break None;
             }
         }
@@ -283,9 +286,13 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
                 match leader_exited_nowait(pid) {
                     Ok(true) => break 'run child.wait().ok(),
                     Ok(false) => {}
-                    Err(_) => break 'run None,
+                    Err(_) => {
+                        hand_off_unreaped_child(child);
+                        break 'run None;
+                    }
                 }
                 if Instant::now() >= reap_deadline {
+                    hand_off_unreaped_child(child);
                     break 'run None;
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -298,11 +305,15 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}
-            Err(_) => break None,
+            Err(_) => {
+                hand_off_unreaped_child(child);
+                break None;
+            }
         }
         if Instant::now() >= deadline {
             timed_out = true;
             kill_group(pid);
+            hand_off_unreaped_child(child);
             break None;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -339,6 +350,22 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
             stderr,
             truncated,
         }),
+    }
+}
+
+/// Preserve the bounded caller deadline while ensuring every live child is
+/// eventually waited on. `try_wait` also handles the case where another owner
+/// already reaped the child.
+fn hand_off_unreaped_child(mut child: std::process::Child) {
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(_) => {
+            std::thread::spawn(move || {
+                if let Err(error) = child.wait() {
+                    tracing::debug!(error = %error, "plugin reaper: wait failed");
+                }
+            });
+        }
     }
 }
 
