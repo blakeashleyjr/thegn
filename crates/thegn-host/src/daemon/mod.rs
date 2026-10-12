@@ -15,6 +15,7 @@
 
 pub(crate) mod agent_error_cache;
 pub(crate) mod agent_open;
+pub(crate) mod calendar_api;
 pub(crate) mod client;
 pub(crate) mod fork;
 pub(crate) mod inbox;
