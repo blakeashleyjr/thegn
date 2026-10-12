@@ -388,6 +388,47 @@ fn map_folder_assign_error(error: anyhow::Error) -> ControlError {
     }
 }
 
+#[derive(Debug)]
+enum DispatchStatusError {
+    NotFound(i64),
+    UnknownStatus,
+}
+
+impl std::fmt::Display for DispatchStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(id) => write!(f, "no dispatch with id {id}"),
+            Self::UnknownStatus => f.write_str("unknown is not a writable dispatch status"),
+        }
+    }
+}
+
+impl std::error::Error for DispatchStatusError {}
+
+fn map_dispatch_status_error(error: anyhow::Error) -> ControlError {
+    if let Some(status_error) = error.downcast_ref::<DispatchStatusError>() {
+        return match status_error {
+            DispatchStatusError::NotFound(id) => {
+                ControlError::NotFound(format!("no dispatch with id {id}"))
+            }
+            DispatchStatusError::UnknownStatus => {
+                ControlError::InvalidArgument(status_error.to_string())
+            }
+        };
+    }
+    if let Some(conflict) = error.downcast_ref::<thegn_core::db::DispatchTransitionConflict>() {
+        return match conflict {
+            thegn_core::db::DispatchTransitionConflict::Illegal { .. } => {
+                ControlError::FailedPrecondition(error.to_string())
+            }
+            thegn_core::db::DispatchTransitionConflict::Stale { .. } => {
+                ControlError::Conflict(error.to_string())
+            }
+        };
+    }
+    ControlError::Internal(error)
+}
+
 impl DaemonService {
     /// Run `f` against the shared DB on a blocking thread.
     pub(crate) async fn with_db<T, F>(&self, f: F) -> ControlResult<T>
@@ -2231,12 +2272,19 @@ impl ControlApi for DaemonService {
         Box::pin(async move {
             self.with_db(move |db| {
                 use thegn_core::store::NotificationStore;
-                if db.get_dispatch(id)?.is_none() {
-                    anyhow::bail!("no dispatch with id {id}");
+                let row = db
+                    .get_dispatch(id)?
+                    .ok_or_else(|| anyhow::Error::new(DispatchStatusError::NotFound(id)))?;
+                if status == thegn_core::issue::AgentDispatchStatus::Unknown {
+                    return Err(anyhow::Error::new(DispatchStatusError::UnknownStatus));
                 }
-                db.update_dispatch_status(id, status)
+                db.set_dispatch_status_checked(id, row.status, status, None)
             })
             .await
+            .map_err(|error| match error {
+                ControlError::Internal(error) => map_dispatch_status_error(error),
+                other => other,
+            })
         })
     }
 
@@ -3972,6 +4020,36 @@ mod tests {
             Some(".thegn/pipeline/architect/1.md")
         );
         svc.dispatch_set_status(child.id, St::Done).await.unwrap();
+        assert!(matches!(
+            svc.dispatch_set_status(child.id, St::Running).await,
+            Err(ControlError::FailedPrecondition(_))
+        ));
+        assert_eq!(
+            svc.dispatches_list()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|dispatch| dispatch.id == child.id)
+                .unwrap()
+                .status,
+            St::Done,
+            "a rejected terminal resurrection leaves the row unchanged"
+        );
+        assert!(matches!(
+            svc.dispatch_set_status(row.id, St::Unknown).await,
+            Err(ControlError::InvalidArgument(_))
+        ));
+        assert_eq!(
+            svc.dispatches_list()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|dispatch| dispatch.id == row.id)
+                .unwrap()
+                .status,
+            St::Queued,
+            "unknown is rejected without modifying the row"
+        );
         svc.dispatch_set_status(row.id, St::Running).await.unwrap();
         let rows = svc.dispatches_list().await.unwrap();
         assert_eq!(rows.len(), 2);
@@ -3980,7 +4058,33 @@ mod tests {
         assert_eq!(rows[0].status, St::Done);
         assert_eq!(rows[1].status, St::Running);
         // Advancing a non-existent row is a clean error, not a silent no-op.
-        assert!(svc.dispatch_set_status(9999, St::Done).await.is_err());
+        assert!(matches!(
+            svc.dispatch_set_status(9999, St::Done).await,
+            Err(ControlError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn dispatch_status_error_maps_checked_transition_conflicts() {
+        use thegn_core::db::DispatchTransitionConflict;
+        use thegn_core::issue::AgentDispatchStatus as St;
+
+        assert!(matches!(
+            map_dispatch_status_error(anyhow::Error::new(DispatchTransitionConflict::Stale {
+                id: 7,
+                expected: St::Queued,
+                actual: St::Running,
+            })),
+            ControlError::Conflict(_)
+        ));
+        assert!(matches!(
+            map_dispatch_status_error(anyhow::Error::new(DispatchTransitionConflict::Illegal {
+                id: 7,
+                from: St::Done,
+                to: St::Running,
+            })),
+            ControlError::FailedPrecondition(_)
+        ));
     }
 
     /// With no `[issues]` provider configured, the issue verbs answer
