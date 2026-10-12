@@ -1,5 +1,22 @@
 use super::*;
 
+#[test]
+fn submodule_scan_coalesces_refreshes_and_ignores_completion_after_reset() {
+    let mut scans = ScanCoalescer::default();
+    let first = scans.request().unwrap();
+    assert_eq!(scans.request(), None);
+    assert_eq!(scans.request(), None);
+    assert!(scans.complete(first));
+    let successor = scans.request().unwrap();
+
+    assert_eq!(scans.request(), None);
+    scans.reset();
+    let current = scans.request().unwrap();
+    assert!(!scans.complete(successor));
+    assert_eq!(scans.request(), None);
+    assert!(scans.complete(current));
+}
+
 /// Sets `XDG_STATE_HOME` for a test's lifetime and RESTORES the prior value on
 /// drop — a blind `remove_var` at test end leaked an unset into later
 /// in-process tests that read `XDG_STATE_HOME` (only visible under `cargo test`,
