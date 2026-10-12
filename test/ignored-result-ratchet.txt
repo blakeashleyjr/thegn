@@ -83,7 +83,6 @@ crates/thegn-core/src/db.rs
 crates/thegn-core/src/db_tests.rs
 crates/thegn-core/src/db_trust.rs
 crates/thegn-core/src/db_usage.rs
-crates/thegn-core/src/db_workspace.rs
 crates/thegn-core/src/db_zones.rs
 crates/thegn-core/src/devcontainer_overlay.rs
 crates/thegn-core/src/devcontainer.rs

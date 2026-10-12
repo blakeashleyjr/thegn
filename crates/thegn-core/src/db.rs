@@ -1169,30 +1169,35 @@ impl Db {
                 // the bounded-delete sweep on its own worker so opening the
                 // DB from the event loop never waits for that walk.
                 let sweep_path = path.clone();
-                if let Err(error) = std::thread::Builder::new().spawn(move || {
-                    let Ok(conn) = Db::open_connection(&sweep_path) else {
-                        return;
-                    };
-                    if conn
-                        .busy_timeout(std::time::Duration::from_millis(5000))
-                        .is_err()
-                    {
-                        return;
-                    }
-                    let sweep_db = Db {
-                        conn,
-                        schema_mismatch: None,
-                    };
-                    let mut after_rowid = 0;
-                    loop {
-                        match sweep_db.prune_missing_semantic_files(after_rowid, 512) {
-                            Ok((scanned, next_rowid)) if scanned > 0 => {
-                                after_rowid = next_rowid;
-                            }
-                            Ok(_) | Err(_) => break,
+                if let Err(error) = std::thread::Builder::new()
+                    .name("thegn-sem-prune".to_string())
+                    .spawn(move || {
+                        let Ok(conn) = Db::open_connection(&sweep_path) else {
+                            return;
+                        };
+                        if conn
+                            .busy_timeout(std::time::Duration::from_millis(5000))
+                            .is_err()
+                        {
+                            return;
                         }
-                    }
-                }) {
+                        let sweep_db = Db {
+                            conn,
+                            schema_mismatch: None,
+                        };
+                        let mut after_rowid = 0;
+                        // The sweep is idempotent; killing it mid-run is safe and
+                        // the next process can clean the remaining rows.
+                        loop {
+                            match sweep_db.prune_missing_semantic_files(after_rowid, 512) {
+                                Ok((scanned, next_rowid)) if scanned > 0 => {
+                                    after_rowid = next_rowid;
+                                }
+                                Ok(_) | Err(_) => break,
+                            }
+                        }
+                    })
+                {
                     tracing::debug!(%error, "could not start semantic entity prune worker");
                 }
             });

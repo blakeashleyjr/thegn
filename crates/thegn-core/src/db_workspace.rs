@@ -36,12 +36,16 @@ fn decode_worktree_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<WorktreeRow
 
 pub(crate) fn delete_worktree_cache_rows(db: &Db, wt: &str) -> Result<()> {
     let conn = db.conn();
-    let separator = std::path::MAIN_SEPARATOR;
-    let prefix = if wt.ends_with(separator) {
+    let prefix = if wt.ends_with('/') {
         wt.to_string()
     } else {
-        format!("{wt}{separator}")
+        format!("{wt}/")
     };
+    // '/' sorts immediately before '0', so this range includes descendants
+    // while excluding sibling prefixes such as `/wt/a2`.
+    let prefix_end = format!("{wt}0");
+    let has_glyph_cache = table_exists(conn, "glyph_cache")?;
+    let tx = conn.unchecked_transaction()?;
     for table in [
         "worktree_disk",
         "loc_cache",
@@ -55,40 +59,39 @@ pub(crate) fn delete_worktree_cache_rows(db: &Db, wt: &str) -> Result<()> {
         "commit_cache",
         "worktree_titles",
         "test_cache",
-        "issue_links",
-        "notifications",
     ] {
-        let column = if matches!(
-            table,
-            "attention_acks" | "session_attention" | "issue_links" | "notifications"
-        ) {
+        let column = if matches!(table, "attention_acks" | "session_attention") {
             "worktree_path"
         } else {
             "worktree"
         };
-        conn.execute(
+        tx.execute(
             &format!("DELETE FROM {table} WHERE {column}=?1"),
             params![wt],
         )?;
     }
-    // Entity files are keyed by absolute file path rather than worktree id.
-    // The separator boundary avoids deleting a sibling such as `/wt/a2`.
-    conn.execute(
-        "DELETE FROM sem_edge WHERE src_id IN (
-             SELECT id FROM sem_entity WHERE file=?1 OR substr(file,1,length(?2))=?2
-         ) OR dst_id IN (
-             SELECT id FROM sem_entity WHERE file=?1 OR substr(file,1,length(?2))=?2
-         )",
-        params![wt, prefix],
-    )?;
-    conn.execute(
-        "DELETE FROM sem_entity WHERE file=?1 OR substr(file,1,length(?2))=?2",
-        params![wt, prefix],
-    )?;
-    // glyph_cache is lazy-created and may not exist on a fresh database.
-    if table_exists(conn, "glyph_cache")? {
-        conn.execute("DELETE FROM glyph_cache WHERE worktree=?1", params![wt])?;
+    // Resolve matching entity IDs once through idx_sem_entity_file. Reuse that
+    // set for edge cleanup and entity deletion inside this same transaction.
+    let entity_ids = {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM sem_entity
+             WHERE file=?1 OR (file>=?2 AND file<?3)",
+        )?;
+        let rows = stmt.query_map(params![wt, prefix, prefix_end], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for id in entity_ids {
+        tx.execute("DELETE FROM sem_edge WHERE src_id=?1", params![id])?;
+        tx.execute("DELETE FROM sem_edge WHERE dst_id=?1", params![id])?;
+        tx.execute("DELETE FROM sem_entity WHERE id=?1", params![id])?;
     }
+    // glyph_cache is lazy-created and may not exist on a fresh database.
+    if has_glyph_cache {
+        tx.execute("DELETE FROM glyph_cache WHERE worktree=?1", params![wt])?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1794,6 +1797,12 @@ mod tests {
         db.upsert_entity(&entity("sibling", "/wt/a2/src/b.rs"))
             .unwrap();
         db.conn()
+            .execute(
+                "INSERT INTO sem_edge(src_id,dst_id,kind) VALUES('sibling','a','call')",
+                [],
+            )
+            .unwrap();
+        db.conn()
             .execute_batch(
                 "INSERT INTO commit_cache(worktree,json,fetched_at) VALUES('/wt/a','[]',1);
                  INSERT INTO worktree_titles(worktree,last_title,updated_at) VALUES('/wt/a','title',1);
@@ -1809,15 +1818,26 @@ mod tests {
 
         assert_eq!(db.entities_under("/wt/a").unwrap().len(), 0);
         assert_eq!(db.entities_under("/wt/a2").unwrap().len(), 1);
+        let edge_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM sem_edge", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(edge_count, 0, "edges to removed entities must be deleted");
         for (table, key) in [
             ("commit_cache", "worktree"),
             ("worktree_titles", "worktree"),
+        ] {
+            let sql = format!("SELECT COUNT(*) FROM {table} WHERE {key}='/wt/a'");
+            let count: i64 = db.conn().query_row(&sql, [], |row| row.get(0)).unwrap();
+            assert_eq!(count, 0, "{table} retained the removed worktree");
+        }
+        for (table, key) in [
             ("issue_links", "worktree_path"),
             ("notifications", "worktree_path"),
         ] {
             let sql = format!("SELECT COUNT(*) FROM {table} WHERE {key}='/wt/a'");
             let count: i64 = db.conn().query_row(&sql, [], |row| row.get(0)).unwrap();
-            assert_eq!(count, 0, "{table} retained the removed worktree");
+            assert_eq!(count, 1, "{table} should survive closing the worktree");
         }
         assert_eq!(db.all_glyph_cache().len(), 1);
         assert_eq!(db.all_glyph_cache()[0].0, "/wt/a2");

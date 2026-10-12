@@ -339,7 +339,6 @@ impl SessionMigrationStore for Db {
                     params![bundle.session_name],
                 )?;
             }
-            crate::db_workspace::delete_worktree_cache_rows(db, &bundle.worktree_path)?;
             result.counts.worktrees = db.conn().execute(
                 "DELETE FROM worktrees WHERE worktree=?1",
                 params![bundle.worktree_path],
