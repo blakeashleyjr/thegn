@@ -2320,6 +2320,36 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
     s
 }
 
+/// The extra read-only bind a bwrap sandbox needs so `/etc/resolv.conf`
+/// resolves (THE-730), or `None`. `None` for `network = none`, when the target
+/// is already reachable, or when a configured mount already covers the
+/// directory (e.g. a `/run/systemd/resolve:ro` workaround): no duplicate bind.
+fn bwrap_resolver_bind(spec: &SandboxSpec, hardcoded_parents: &[&str]) -> Option<String> {
+    let dir = crate::sandbox_mounts::resolver_bind_dir(
+        std::path::Path::new("/etc/resolv.conf"),
+        std::path::Path::new("/run"),
+        BWRAP_SUBSTRATE,
+    )?;
+    resolver_bind_filter(spec, hardcoded_parents, &dir)
+}
+
+/// Pure policy half of [`bwrap_resolver_bind`], with the resolved dir injected.
+fn resolver_bind_filter(
+    spec: &SandboxSpec,
+    hardcoded_parents: &[&str],
+    dir: &std::path::Path,
+) -> Option<String> {
+    if spec.network == Network::None {
+        return None;
+    }
+    let covered = |p: &str| dir.starts_with(p);
+    if hardcoded_parents.iter().any(|p| covered(p)) || spec.mounts.iter().any(|m| covered(&m.dest))
+    {
+        return None;
+    }
+    Some(dir.to_string_lossy().into_owned())
+}
+
 /// The backend-specific argv that runs `/bin/sh -lc <script>` in the sandbox.
 fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
     let wt = spec.worktree.to_string_lossy().into_owned();
@@ -2393,6 +2423,17 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                 && !matches!(spec.file_access, FileAccess::All | FileAccess::Host)
             {
                 v.extend(["--tmpfs".into(), home.clone()]);
+            }
+            // THE-730: `/etc` is bound but `/run` is not, so a resolv.conf that
+            // symlinks into `/run/systemd/resolve` dangles and the sandbox has no
+            // DNS. Bind the resolved target's directory read-only. Never for
+            // `network = none` (no resolver reachable by design), nor for a
+            // remote placement (the probe would read the wrong host).
+            if spec.placement.is_local()
+                && !matches!(spec.file_access, FileAccess::All | FileAccess::Host)
+                && let Some(dir) = bwrap_resolver_bind(spec, &hardcoded_parents)
+            {
+                v.extend(["--ro-bind".into(), dir.clone(), dir]);
             }
             for m in &spec.mounts {
                 // Skip mounts already covered by a hardcoded parent — bwrap
