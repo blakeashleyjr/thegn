@@ -202,7 +202,8 @@ mod db_open_memo;
 /// filed (additive nullable column).
 /// v77: `agent_dispatches.chunk_scope`, the immutable admitted file scope.
 /// v78: bounded pipeline leases and an expiry index.
-pub const SCHEMA_VERSION: i64 = 78;
+/// v79: canonical dispatch statuses and admission lookup indexes.
+pub const SCHEMA_VERSION: i64 = 79;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1503,6 +1504,7 @@ impl Db {
                     crate::db_migrate::verify_v76_schema(&conn)?;
                     crate::db_migrate::verify_v77_schema(&conn)?;
                     crate::db_migrate::verify_v78_schema(&conn)?;
+                    crate::db_migrate::verify_v79_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2165,6 +2167,7 @@ impl Db {
         crate::db_migrate::migrate_v76(&conn)?;
         crate::db_migrate::migrate_v77(&conn)?;
         crate::db_migrate::migrate_v78(&conn)?;
+        crate::db_migrate::migrate_v79(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2181,6 +2184,7 @@ impl Db {
             crate::db_migrate::verify_v76_schema(&conn)?;
             crate::db_migrate::verify_v77_schema(&conn)?;
             crate::db_migrate::verify_v78_schema(&conn)?;
+            crate::db_migrate::verify_v79_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can
