@@ -497,15 +497,30 @@ impl SessionActor {
         // detached its finalization task. Close the actor's sender, then fold
         // any completion it has queued before building the tombstone.
         drop(self.recording_done_tx.take());
-        let completion_drain = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while let Some(finished) = recording_done_rx.recv().await {
-                self.recording_completed(finished);
-            }
-        })
+        let completion_drain = tokio::time::timeout(
+            super::record::FINISH_TIMEOUT + std::time::Duration::from_millis(500),
+            async {
+                while let Some(finished) = recording_done_rx.recv().await {
+                    self.recording_completed(finished);
+                }
+            },
+        )
         .await;
         if completion_drain.is_err() {
-            self.record_truncated =
-                Some("recording completion still running at session shutdown timeout".to_string());
+            let reason = "recording completion still running at session shutdown timeout";
+            let path = self
+                .record_last_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
+            tracing::warn!(
+                target: "thegn::daemon",
+                session = %self.meta.id,
+                path = %path,
+                reason = %reason,
+                "recording could not be finalized — the .cast file is truncated"
+            );
+            self.record_truncated = Some(reason.to_string());
         }
 
         // Bury the corpse BEFORE anything observable. The ordering is the whole
@@ -1525,7 +1540,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = Config::default();
         cfg.recording.dir = tmp.path().to_string_lossy().into_owned();
-        let h = spawn_actor_cfg("sleep 0.2; printf finished; exit 0", None, "sh", cfg);
+        let mut h = spawn_actor_cfg("sleep 0.2; printf finished; exit 0", None, "sh", cfg);
 
         let (start_tx, start_rx) = oneshot::channel();
         h.msg_tx

@@ -15,7 +15,7 @@ use thegn_core::config::Config;
 
 const QUEUE_COMMANDS: usize = 64;
 const MAX_CHUNK_BYTES: usize = 16 * 1024;
-const FINISH_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const FINISH_TIMEOUT: Duration = Duration::from_secs(2);
 const GLOBAL_INFLIGHT_BYTES: usize = 8 * 1024 * 1024;
 
 static RECORDING_INFLIGHT: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
@@ -614,15 +614,19 @@ mod tests {
         struct SlowWriter {
             started: mpsc::Sender<()>,
             release: mpsc::Receiver<()>,
+            stalled: bool,
         }
         impl Write for SlowWriter {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.started
-                    .send(())
-                    .map_err(|_| io::Error::other("test observer dropped"))?;
-                self.release
-                    .recv()
-                    .map_err(|_| io::Error::other("test stall released"))?;
+                if self.stalled {
+                    self.started
+                        .send(())
+                        .map_err(|_| io::Error::other("test observer dropped"))?;
+                    self.release
+                        .recv()
+                        .map_err(|_| io::Error::other("test stall released"))?;
+                    self.stalled = false;
+                }
                 Ok(bytes.len())
             }
             fn flush(&mut self) -> io::Result<()> {
@@ -636,8 +640,15 @@ mod tests {
         ) -> Recorder {
             let mut header = Header::new(80, 24);
             header.timestamp = Some(0);
-            let writer = CastWriter::new(BufWriter::new(SlowWriter { started, release }), &header)
-                .expect("buffered header");
+            let writer = CastWriter::new(
+                BufWriter::new(SlowWriter {
+                    started,
+                    release,
+                    stalled: true,
+                }),
+                &header,
+            )
+            .expect("buffered header");
             start_with_writer_budget(writer, Arc::clone(budget), MAX_CHUNK_BYTES)
         }
 
