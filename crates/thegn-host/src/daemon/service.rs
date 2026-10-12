@@ -18,7 +18,7 @@ use thegn_core::control_wire::{EventFrame, LeaseEventKind, PairingState};
 use thegn_core::db::Db;
 use thegn_core::editor::EditorTarget;
 use thegn_core::graveyard::Graveyard;
-use thegn_core::store::{ControlStore, IntentStore, LeaseRow};
+use thegn_core::store::{ControlStore, IntentStore, LeaseRow, NotificationStore};
 use thegn_svc::control::{
     AttachKind, AttachReply, ControlApi, ControlError, ControlResult, ForkSpec, GitFileStatus,
     OpenSpec, PreviewFetchReply, PreviewFetchRequest, RecordSpec, RecordStatus,
