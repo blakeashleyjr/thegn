@@ -90,21 +90,6 @@ async fn reap_loop(svc: Arc<DaemonService>) {
     }
 }
 
-/// One reconciliation pass. Separated from the timer so the policy is readable
-/// (and so a future caller — `thegn doctor`, say — can run it directly).
-///
-/// `fresh_live` re-reads the daemon's live session ids right before a mutation
-/// (`None` = liveness unavailable). Every transition is also fenced on the
-/// (session, `run_gen`) captured with the row snapshot, so a plan built from a
-/// stale observation is a no-op, never a worker-gone verdict (THE-267).
-fn reap_pass(
-    db: &super::service::SharedDb,
-    live_ids: &[String],
-    fresh_live: &dyn Fn() -> Option<Vec<String>>,
-) {
-    reap_pass_with_in_flight(db, live_ids, &std::collections::HashSet::new(), fresh_live);
-}
-
 fn reap_pass_with_in_flight(
     db: &super::service::SharedDb,
     live_ids: &[String],
@@ -370,7 +355,9 @@ mod tests {
         let id = row(&db, &wt, ".thegn/pipeline/THE-1/code/1.md");
         let shared = Arc::new(Mutex::new(db));
 
-        reap_pass(&shared, &[], &|| Some(Vec::new()));
+        reap_pass_with_in_flight(&shared, &[], &std::collections::HashSet::new(), &|| {
+            Some(Vec::new())
+        });
         {
             let db = shared.lock().unwrap();
             assert_eq!(
@@ -379,7 +366,9 @@ mod tests {
             );
             assert_eq!(db.dispatch_notes(id, None, 0).unwrap().len(), 1);
         }
-        reap_pass(&shared, &[], &|| Some(Vec::new()));
+        reap_pass_with_in_flight(&shared, &[], &std::collections::HashSet::new(), &|| {
+            Some(Vec::new())
+        });
         assert_eq!(
             shared
                 .lock()
@@ -411,7 +400,9 @@ mod tests {
             .unwrap();
         let shared = Arc::new(Mutex::new(db));
 
-        reap_pass(&shared, &[], &|| Some(Vec::new()));
+        reap_pass_with_in_flight(&shared, &[], &std::collections::HashSet::new(), &|| {
+            Some(Vec::new())
+        });
         assert_eq!(
             shared
                 .lock()
@@ -448,7 +439,9 @@ mod tests {
 
         // After restart, the session map can be empty while this row has no
         // durable exit stamp. The daemon and CLI both leave that ambiguous row.
-        reap_pass(&shared, &[], &|| Some(Vec::new()));
+        reap_pass_with_in_flight(&shared, &[], &std::collections::HashSet::new(), &|| {
+            Some(Vec::new())
+        });
         let db = shared.lock().unwrap();
         let row = db.get_dispatch(id).unwrap().unwrap();
         assert_eq!(row.status, AgentDispatchStatus::Running);
@@ -477,9 +470,12 @@ mod tests {
             .unwrap();
         let shared = Arc::new(Mutex::new(db));
 
-        reap_pass(&shared, &["live-session".to_string()], &|| {
-            Some(vec!["live-session".to_string()])
-        });
+        reap_pass_with_in_flight(
+            &shared,
+            &["live-session".to_string()],
+            &std::collections::HashSet::new(),
+            &|| Some(vec!["live-session".to_string()]),
+        );
         assert_eq!(
             shared
                 .lock()
@@ -501,7 +497,9 @@ mod tests {
         let id = row(&db, &wt, ".thegn/pipeline/THE-1/code/1.md");
         let shared = Arc::new(Mutex::new(db));
         // Stale snapshot lacks the session; the apply-time re-read has it.
-        reap_pass(&shared, &[], &|| Some(vec!["dead-session".to_string()]));
+        reap_pass_with_in_flight(&shared, &[], &std::collections::HashSet::new(), &|| {
+            Some(vec!["dead-session".to_string()])
+        });
         assert_eq!(status_of(&shared, id), AgentDispatchStatus::Running);
     }
 
@@ -513,7 +511,7 @@ mod tests {
         std::fs::create_dir(&wt).unwrap();
         let id = row(&db, &wt, ".thegn/pipeline/THE-1/code/1.md");
         let shared = Arc::new(Mutex::new(db));
-        reap_pass(&shared, &[], &|| None);
+        reap_pass_with_in_flight(&shared, &[], &std::collections::HashSet::new(), &|| None);
         assert_eq!(status_of(&shared, id), AgentDispatchStatus::Running);
     }
 
@@ -535,7 +533,7 @@ mod tests {
                 .unwrap();
             Some(Vec::new())
         };
-        reap_pass(&shared, &[], &relaunch);
+        reap_pass_with_in_flight(&shared, &[], &std::collections::HashSet::new(), &relaunch);
         assert_eq!(status_of(&shared, id), AgentDispatchStatus::Running);
     }
 
@@ -550,7 +548,9 @@ mod tests {
         db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
             .unwrap();
         let shared = Arc::new(Mutex::new(db));
-        reap_pass(&shared, &[], &|| Some(Vec::new()));
+        reap_pass_with_in_flight(&shared, &[], &std::collections::HashSet::new(), &|| {
+            Some(Vec::new())
+        });
         assert_eq!(status_of(&shared, id), AgentDispatchStatus::Spawning);
     }
 
