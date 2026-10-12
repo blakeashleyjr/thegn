@@ -28,6 +28,7 @@ pub(crate) const MAX_DYNAMIC_INPUT_BYTES: usize = 64 * 1024;
 /// A bounded JSON HTTP reply that leaves status classification to a caller.
 pub(crate) struct JsonResponseEnvelope {
     pub(crate) status: reqwest::StatusCode,
+    pub(crate) headers: reqwest::header::HeaderMap,
     pub(crate) body: Vec<u8>,
 }
 
@@ -100,7 +101,6 @@ impl TrackerHttpClient {
         budget: Arc<TrackerHttpBudget>,
         operation_timeout: Duration,
     ) -> Result<Self, IssueError> {
-        let origin = parse_origin(origin)?;
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_gzip()
@@ -112,6 +112,25 @@ impl TrackerHttpClient {
             .timeout(operation_timeout)
             .build()
             .map_err(|_| IssueError::Policy("tracker HTTP client configuration failed"))?;
+        Self::with_client(
+            provider,
+            origin,
+            authorization,
+            budget,
+            operation_timeout,
+            client,
+        )
+    }
+
+    pub(crate) fn with_client(
+        provider: &'static str,
+        origin: &str,
+        authorization: String,
+        budget: Arc<TrackerHttpBudget>,
+        operation_timeout: Duration,
+        client: Client,
+    ) -> Result<Self, IssueError> {
+        let origin = parse_origin(origin)?;
         Ok(Self {
             client,
             origin,
@@ -280,11 +299,16 @@ impl TrackerHttpOperation<'_> {
         let response = self.send(request).await?;
         self.check_envelope_response(&response)?;
         let status = response.status();
+        let headers = response.headers().clone();
         let body = read_bounded(self.deadline, response).await?;
         self.remaining()?;
         #[cfg(test)]
         self.response_consumed_for_test();
-        Ok(JsonResponseEnvelope { status, body })
+        Ok(JsonResponseEnvelope {
+            status,
+            headers,
+            body,
+        })
     }
 
     fn check_envelope_response(&self, response: &Response) -> Result<(), IssueError> {
