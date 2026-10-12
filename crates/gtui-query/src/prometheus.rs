@@ -13,6 +13,7 @@ use crate::http::read_limited;
 use crate::prom_parser::parse_prometheus_response;
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct PrometheusSource {
@@ -24,12 +25,29 @@ pub struct PrometheusSource {
 impl PrometheusSource {
     /// `base_url` e.g. `http://localhost:9090`; `token` may be empty (no auth).
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
+        Self::with_timeouts(
+            base_url,
+            token,
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+            TOTAL_TIMEOUT,
+        )
+    }
+
+    fn with_timeouts(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        connect_timeout: std::time::Duration,
+        read_timeout: std::time::Duration,
+        total_timeout: std::time::Duration,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             token: token.into(),
             client: reqwest::Client::builder()
-                .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(TOTAL_TIMEOUT)
+                .connect_timeout(connect_timeout)
+                .read_timeout(read_timeout)
+                .timeout(total_timeout)
                 .build()
                 .expect("valid Prometheus HTTP client settings"),
         }
@@ -157,5 +175,55 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, QueryError::Other(message) if message.contains("4 MiB")));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_response_body_hits_the_read_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0, "client closed before sending its request");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let source = PrometheusSource::with_timeouts(
+            format!("http://{address}"),
+            "",
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_secs(10),
+        );
+        let now = Utc::now();
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            source.query(vec![Query {
+                ref_id: "A".into(),
+                expr: "up".into(),
+                time_range: gtui_core::datasource::TimeRange { from: now, to: now },
+            }]),
+        )
+        .await
+        .expect("read timeout did not bound the stalled body")
+        .unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "read timeout took {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(error, QueryError::Network(_)));
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 }

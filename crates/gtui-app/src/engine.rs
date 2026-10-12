@@ -16,7 +16,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tokio::time::{Duration, MissedTickBehavior, interval, timeout};
+use tokio::time::{Duration, MissedTickBehavior, interval};
 
 use gtui_core::dashboard::Dashboard;
 use gtui_core::datasource::{DataSource, Query, QueryError, TimeRange};
@@ -161,7 +161,10 @@ const MAX_CONCURRENT_PANELS: usize = 4;
 /// Bound target fan-out and the amount of per-panel state retained by a refresh.
 const MAX_TARGETS_PER_PANEL: usize = 32;
 /// A panel that does not finish cannot hold the next refresh forever.
+#[cfg(not(test))]
 const PANEL_DEADLINE: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const PANEL_DEADLINE: Duration = Duration::from_millis(300);
 type PanelQueryJob = (
     u32,
     String,
@@ -245,47 +248,80 @@ impl QueryEngine {
                 // Disabled while hidden: the branch future is not polled, so a
                 // hidden tab holds no armed timer and takes no wakes.
                 _ = ticker.tick(), if !self.hidden => {
-                    if !self.paused {
-                        self.query_all().await;
+                    if !self.paused && !self.refresh_and_coalesce(&mut cmd_rx, &mut ticker).await {
+                        break;
                     }
                 },
                 cmd = cmd_rx.recv() => match cmd {
-                    Some(EngineCmd::Requery) => {
-                        if !self.hidden {
-                            self.query_all().await;
-                        }
-                    }
-                    Some(EngineCmd::SetTimeRange(tr)) => {
-                        self.window = RelativeWindow::from_range(&tr);
-                        if !self.hidden {
-                            self.query_all().await;
-                        }
-                    }
-                    Some(EngineCmd::Pause) => self.paused = true,
-                    Some(EngineCmd::Resume) => {
-                        self.paused = false;
-                        if !self.hidden {
-                            self.query_all().await;
-                        }
-                    }
-                    Some(EngineCmd::Visible(false)) => {
-                        if !self.hidden {
-                            self.hidden = true;
-                            self.set_sources_active(false);
-                        }
-                    }
-                    Some(EngineCmd::Visible(true)) => {
-                        if self.hidden {
-                            self.hidden = false;
-                            self.set_sources_active(true);
-                            // Restart the cadence from now and refresh at once,
-                            // so a shown tab is at most one refresh period stale.
-                            ticker.reset();
-                            self.query_all().await;
+                    Some(cmd) => {
+                        if self.apply_command(cmd, &mut ticker)
+                            && !self.refresh_and_coalesce(&mut cmd_rx, &mut ticker).await
+                        {
+                            break;
                         }
                     }
                     // Every sender dropped => the view-model (and tab) is gone.
                     None => break,
+                }
+            }
+        }
+    }
+
+    /// Apply queued state changes in order and collapse all refresh requests
+    /// received during a refresh into one follow-up refresh.
+    async fn refresh_and_coalesce(
+        &mut self,
+        cmd_rx: &mut mpsc::UnboundedReceiver<EngineCmd>,
+        ticker: &mut tokio::time::Interval,
+    ) -> bool {
+        self.query_all().await;
+        loop {
+            let mut refresh = false;
+            loop {
+                match cmd_rx.try_recv() {
+                    Ok(cmd) => refresh |= self.apply_command(cmd, ticker),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => return false,
+                }
+            }
+            if !refresh || self.hidden {
+                return true;
+            }
+            self.query_all().await;
+        }
+    }
+
+    /// Apply one command; return whether it requests an immediate refresh.
+    fn apply_command(&mut self, cmd: EngineCmd, ticker: &mut tokio::time::Interval) -> bool {
+        match cmd {
+            EngineCmd::Requery => !self.hidden,
+            EngineCmd::SetTimeRange(tr) => {
+                self.window = RelativeWindow::from_range(&tr);
+                !self.hidden
+            }
+            EngineCmd::Pause => {
+                self.paused = true;
+                false
+            }
+            EngineCmd::Resume => {
+                self.paused = false;
+                !self.hidden
+            }
+            EngineCmd::Visible(false) => {
+                if !self.hidden {
+                    self.hidden = true;
+                    self.set_sources_active(false);
+                }
+                false
+            }
+            EngineCmd::Visible(true) => {
+                if self.hidden {
+                    self.hidden = false;
+                    self.set_sources_active(true);
+                    ticker.reset();
+                    true
+                } else {
+                    false
                 }
             }
         }
@@ -344,12 +380,15 @@ impl QueryEngine {
                 .collect::<Vec<_>>();
             let abort = pending.spawn(async move {
                 let mut results = Vec::with_capacity(targets.len());
+                let deadline = tokio::time::Instant::now() + PANEL_DEADLINE;
                 for (ref_id, query) in targets {
                     let result = match &source {
-                        Some(source) => timeout(PANEL_DEADLINE, source.query(vec![query]))
-                            .await
-                            .unwrap_or(Err(QueryError::Timeout))
-                            .map_err(|error| error.to_string()),
+                        Some(source) => {
+                            tokio::time::timeout_at(deadline, source.query(vec![query]))
+                                .await
+                                .unwrap_or(Err(QueryError::Timeout))
+                                .map_err(|error| error.to_string())
+                        }
                         None => Err(format!("no datasource '{datasource}'")),
                     };
                     results.push(TargetUpdate { ref_id, result });
@@ -668,6 +707,107 @@ mod tests {
         assert_eq!(
             arrived,
             (1..=MAX_CONCURRENT_PANELS as u32 * 2).collect::<Vec<_>>()
+        );
+        drop(cmd);
+    }
+
+    #[tokio::test]
+    async fn panel_deadline_covers_all_targets_instead_of_restarting_per_target() {
+        let mut panel_dashboard = dashboard(1);
+        for ref_id in ["B", "C"] {
+            panel_dashboard.panels[0].targets.push(Target {
+                ref_id: ref_id.into(),
+                expr: "hang".into(),
+            });
+        }
+        panel_dashboard.panels[0].targets[0].expr = "hang".into();
+        let sources = HashMap::from([(
+            "test".to_string(),
+            Arc::new(OneHungPanelSource) as Arc<dyn DataSource>,
+        )]);
+        let (cmd, mut updates) = QueryEngine::spawn_with_window(
+            Handle::current(),
+            panel_dashboard,
+            sources,
+            RelativeWindow::new(std::time::Duration::from_secs(60)),
+            Duration::from_secs(3600),
+            Arc::new(Utc::now),
+            Arc::new(|| {}),
+            WakeGate::new(true),
+        );
+
+        let update = tokio::time::timeout(PANEL_DEADLINE + Duration::from_secs(1), updates.recv())
+            .await
+            .expect("panel deadline restarted for each target")
+            .expect("query engine exited before deadline result");
+        assert_eq!(update.targets.len(), 3);
+        assert!(
+            update
+                .targets
+                .iter()
+                .all(|target| matches!(&target.result, Err(error) if error == "timeout"))
+        );
+        drop(cmd);
+    }
+
+    struct GatedRecordingSource {
+        queries: RecordedQueries,
+        entered: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl DataSource for GatedRecordingSource {
+        fn query(
+            &self,
+            queries: Vec<Query>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>, QueryError>> + Send>> {
+            self.queries.lock().unwrap().push(queries);
+            let entered = self.entered.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                entered.add_permits(1);
+                release.acquire().await.unwrap().forget();
+                Ok(Vec::new())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_commands_during_work_coalesce_to_one_follow_up() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let sources = HashMap::from([(
+            "test".to_string(),
+            Arc::new(GatedRecordingSource {
+                queries: queries.clone(),
+                entered: entered.clone(),
+                release: release.clone(),
+            }) as Arc<dyn DataSource>,
+        )]);
+        let (cmd, mut updates) = QueryEngine::spawn_with_window(
+            Handle::current(),
+            dashboard(2),
+            sources,
+            RelativeWindow::new(std::time::Duration::from_secs(60)),
+            Duration::from_secs(3600),
+            Arc::new(Utc::now),
+            Arc::new(|| {}),
+            WakeGate::new(true),
+        );
+        entered.acquire_many(2).await.unwrap().forget();
+        for _ in 0..5 {
+            cmd.send(EngineCmd::Requery).unwrap();
+        }
+        release.add_permits(20);
+        receive_updates(&mut updates, 4).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(updates.try_recv().is_err());
+
+        assert_eq!(
+            recorded_ranges(&queries).len(),
+            4,
+            "five queued refresh requests should produce one follow-up cycle"
         );
         drop(cmd);
     }
