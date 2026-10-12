@@ -16,7 +16,9 @@
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::future::BoxFuture;
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, LazyLock, Mutex};
 use thegn_core::remote::SshTarget;
 
 /// Build the shared reqwest client for a provider. The default `Client::new()`
@@ -43,6 +45,8 @@ pub(crate) fn provider_http_client() -> reqwest::Client {
 /// Maximum decoded control-plane JSON response. File contents use their
 /// separate streaming API.
 pub(crate) const CONTROL_BODY_LIMIT: usize = 2 * 1024 * 1024;
+pub(crate) const CONTROL_GLOBAL_CONCURRENCY: usize = 16;
+pub(crate) const CONTROL_PER_AUTHORITY_CONCURRENCY: usize = 4;
 /// File contents use a separate, longer policy than metadata/control calls.
 const FILE_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const FILE_TRANSFER_BODY_LIMIT: usize = 256 * 1024 * 1024;
@@ -130,6 +134,139 @@ mod sessions;
 /// into a fast, retryable error.
 pub(crate) const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Bounds simultaneous provider control calls across provider instances.
+pub(crate) struct ControlGate {
+    global: Arc<tokio::sync::Semaphore>,
+    per_authority: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    per_cap: usize,
+}
+
+pub(crate) struct ControlPermit {
+    _authority: tokio::sync::OwnedSemaphorePermit,
+    _global: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl ControlGate {
+    pub(crate) fn new(global: usize, per: usize) -> Self {
+        Self {
+            global: Arc::new(tokio::sync::Semaphore::new(global)),
+            per_authority: Mutex::new(HashMap::new()),
+            per_cap: per,
+        }
+    }
+
+    fn authority_gate(&self, authority: &str) -> Arc<tokio::sync::Semaphore> {
+        let mut gates = self
+            .per_authority
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        Arc::clone(
+            gates
+                .entry(authority.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.per_cap))),
+        )
+    }
+
+    pub(crate) async fn acquire(&self, authority: &str) -> Result<ControlPermit> {
+        let authority = self.authority_gate(authority);
+        let authority_permit =
+            tokio::time::timeout(CONTROL_TIMEOUT, Arc::clone(&authority).acquire_owned())
+                .await
+                .map_err(|_| anyhow!("provider concurrency cap reached"))?
+                .map_err(|_| anyhow!("provider concurrency gate closed"))?;
+        let global_permit =
+            tokio::time::timeout(CONTROL_TIMEOUT, Arc::clone(&self.global).acquire_owned())
+                .await
+                .map_err(|_| anyhow!("provider concurrency cap reached"))?
+                .map_err(|_| anyhow!("provider concurrency gate closed"))?;
+        Ok(ControlPermit {
+            _authority: authority_permit,
+            _global: global_permit,
+        })
+    }
+
+    pub(crate) fn try_acquire(&self, authority: &str) -> Result<ControlPermit> {
+        let authority = self.authority_gate(authority);
+        let authority_permit = Arc::clone(&authority)
+            .try_acquire_owned()
+            .map_err(|_| anyhow!("provider concurrency cap reached"))?;
+        let global_permit = Arc::clone(&self.global)
+            .try_acquire_owned()
+            .map_err(|_| anyhow!("provider concurrency cap reached"))?;
+        Ok(ControlPermit {
+            _authority: authority_permit,
+            _global: global_permit,
+        })
+    }
+}
+
+pub(crate) static CONTROL_GATE: LazyLock<ControlGate> = LazyLock::new(|| {
+    ControlGate::new(
+        CONTROL_GLOBAL_CONCURRENCY,
+        CONTROL_PER_AUTHORITY_CONCURRENCY,
+    )
+});
+
+/// Parse and admit a configured provider authority without allowing credentials
+/// or request modifiers to be smuggled into authenticated URLs.
+pub(crate) fn validate_api_base(raw: &str) -> Result<String> {
+    let url = reqwest::Url::parse(raw).map_err(|_| anyhow!("invalid provider api_base"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("provider api_base requires a host"))?;
+    let authority = url
+        .as_str()
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or_default()
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none() && !authority.contains('@'),
+        "api_base has embedded credentials"
+    );
+    anyhow::ensure!(
+        url.query().is_none(),
+        "provider api_base cannot have a query"
+    );
+    anyhow::ensure!(
+        url.fragment().is_none(),
+        "provider api_base cannot have a fragment"
+    );
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    anyhow::ensure!(
+        url.scheme() == "https" || (url.scheme() == "http" && loopback),
+        "provider api_base must use https (http is allowed only for loopback)"
+    );
+    let mut base = url.to_string();
+    while base.ends_with('/') {
+        base.pop();
+    }
+    Ok(base)
+}
+
+fn authority_key(base: &str) -> Result<String> {
+    let url = reqwest::Url::parse(base).map_err(|_| anyhow!("invalid provider api_base"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("provider api_base requires a host"))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("provider api_base requires a port"))?;
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    Ok(format!("{}://{host}:{port}", url.scheme()))
+}
+
 /// Control-plane retry budget for the idempotent create/list calls: a transient
 /// 5xx/429/408 or a request timeout (our [`CONTROL_TIMEOUT`] firing) can clear on
 /// a retry; other 4xx are terminal (see [`transient_status`]/[`transient_err`]).
@@ -169,6 +306,7 @@ pub trait RemoteProvider: Send + Sync {
 /// image/template to create from.
 pub struct DaytonaProvider {
     api_base: String,
+    base_error: Option<String>,
     token: String,
     snapshot: String,
     client: reqwest::Client,
@@ -178,8 +316,13 @@ impl DaytonaProvider {
     /// `api_base` like `https://app.daytona.io/api`; `token` is the API key
     /// (already resolved from `api_key_env`); `snapshot` is the image/template.
     pub fn new(api_base: &str, token: &str, snapshot: &str) -> Self {
+        let (api_base, base_error) = match validate_api_base(api_base) {
+            Ok(base) => (base, None),
+            Err(error) => (String::new(), Some(error.to_string())),
+        };
         DaytonaProvider {
-            api_base: api_base.trim_end_matches('/').to_string(),
+            api_base,
+            base_error,
             token: token.to_string(),
             snapshot: snapshot.to_string(),
             client: provider_http_client(),
@@ -188,12 +331,23 @@ impl DaytonaProvider {
 
     // --- pure request/response shaping (unit-tested) ------------------------
 
-    fn sandbox_url(&self) -> String {
-        format!("{}/sandbox", self.api_base)
+    fn base(&self) -> Result<&str> {
+        match self.base_error.as_deref() {
+            Some(error) => Err(anyhow!("{error}")),
+            None => Ok(&self.api_base),
+        }
     }
 
-    fn sandbox_id_url(&self, id: &str) -> String {
-        format!("{}/sandbox/{id}", self.api_base)
+    fn authority(&self) -> Result<String> {
+        authority_key(self.base()?)
+    }
+
+    fn sandbox_url(&self) -> Result<String> {
+        Ok(format!("{}/sandbox", self.base()?))
+    }
+
+    fn sandbox_id_url(&self, id: &str) -> Result<String> {
+        Ok(format!("{}/sandbox/{id}", self.base()?))
     }
 
     /// The create body. `snapshot` empty ⇒ the provider's default image.
@@ -239,6 +393,7 @@ impl DaytonaProvider {
 impl RemoteProvider for DaytonaProvider {
     fn create<'a>(&'a self) -> BoxFuture<'a, Result<SandboxHandle>> {
         Box::pin(async move {
+            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             // Bounded per-request deadline: the shared client only caps *connection*
             // setup, so a control plane that accepts the connection then withholds
             // the response would hang provisioning forever (the "hung on startup"
@@ -246,7 +401,7 @@ impl RemoteProvider for DaytonaProvider {
             // was skipped.
             let resp = self
                 .client
-                .post(self.sandbox_url())
+                .post(self.sandbox_url()?)
                 .bearer_auth(&self.token)
                 .timeout(CONTROL_TIMEOUT)
                 .json(&self.create_body())
@@ -267,9 +422,10 @@ impl RemoteProvider for DaytonaProvider {
 
     fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             let resp = self
                 .client
-                .delete(self.sandbox_id_url(id))
+                .delete(self.sandbox_id_url(id)?)
                 .bearer_auth(&self.token)
                 .timeout(CONTROL_TIMEOUT)
                 .send()
@@ -286,9 +442,10 @@ impl RemoteProvider for DaytonaProvider {
 
     fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
         Box::pin(async move {
+            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             let resp = self
                 .client
-                .get(self.sandbox_url())
+                .get(self.sandbox_url()?)
                 .bearer_auth(&self.token)
                 .timeout(CONTROL_TIMEOUT)
                 .send()
@@ -309,6 +466,7 @@ impl RemoteProvider for DaytonaProvider {
 /// to `https://api.sprites.dev/v1`; the token comes from `SPRITES_TOKEN`.
 pub struct SpritesProvider {
     api_base: String,
+    base_error: Option<String>,
     token: String,
     /// The sprite name to create/attach (caller-chosen; sprites are persistent).
     name: String,
@@ -342,12 +500,18 @@ impl SpritesProvider {
     /// `token` is the resolved `SPRITES_TOKEN`; `name` is the sprite to manage.
     pub fn new(api_base: &str, token: &str, name: &str) -> Self {
         let base = api_base.trim().trim_end_matches('/');
+        let configured_base = if base.is_empty() {
+            "https://api.sprites.dev/v1"
+        } else {
+            base
+        };
+        let (api_base, base_error) = match validate_api_base(configured_base) {
+            Ok(base) => (base, None),
+            Err(error) => (String::new(), Some(error.to_string())),
+        };
         SpritesProvider {
-            api_base: if base.is_empty() {
-                "https://api.sprites.dev/v1".to_string()
-            } else {
-                base.to_string()
-            },
+            api_base,
+            base_error,
             token: token.to_string(),
             name: name.trim().to_string(),
             custody_accounts: Vec::new(),
@@ -380,12 +544,23 @@ impl SpritesProvider {
 
     // --- pure request/response shaping (unit-tested) ------------------------
 
-    fn sprites_url(&self) -> String {
-        format!("{}/sprites", self.api_base)
+    fn base(&self) -> Result<&str> {
+        match self.base_error.as_deref() {
+            Some(error) => Err(anyhow!("{error}")),
+            None => Ok(&self.api_base),
+        }
     }
 
-    fn sprite_name_url(&self, name: &str) -> String {
-        format!("{}/sprites/{name}", self.api_base)
+    fn authority(&self) -> Result<String> {
+        authority_key(self.base()?)
+    }
+
+    fn sprites_url(&self) -> Result<String> {
+        Ok(format!("{}/sprites", self.base()?))
+    }
+
+    fn sprite_name_url(&self, name: &str) -> Result<String> {
+        Ok(format!("{}/sprites/{name}", self.base()?))
     }
 
     /// The create body — sprites are named by the caller.
@@ -428,6 +603,7 @@ impl SpritesProvider {
 impl RemoteProvider for SpritesProvider {
     fn create<'a>(&'a self) -> BoxFuture<'a, Result<SandboxHandle>> {
         Box::pin(async move {
+            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             if self.name.is_empty() {
                 return Err(anyhow!(
                     "sprites: set `[env.<name>.provider] id = \"<sprite-name>\"` — sprites are named"
@@ -440,7 +616,7 @@ impl RemoteProvider for SpritesProvider {
             for attempt in 0..CONTROL_ATTEMPTS {
                 match self
                     .client
-                    .post(self.sprites_url())
+                    .post(self.sprites_url()?)
                     .bearer_auth(&self.token)
                     .timeout(CONTROL_TIMEOUT)
                     .json(&Self::create_body(&self.name))
@@ -481,6 +657,7 @@ impl RemoteProvider for SpritesProvider {
 
     fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             // Validate custody before the irreversible remote delete. A corrupt
             // row may be the only evidence of an authorized key and must never
             // be collapsed into "missing" by lifecycle cleanup.
@@ -495,7 +672,7 @@ impl RemoteProvider for SpritesProvider {
             for attempt in 0..ATTEMPTS {
                 let resp = self
                     .client
-                    .delete(self.sprite_name_url(id))
+                    .delete(self.sprite_name_url(id)?)
                     .bearer_auth(&self.token)
                     .timeout(CONTROL_TIMEOUT)
                     .send()
@@ -529,13 +706,14 @@ impl RemoteProvider for SpritesProvider {
 
     fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
         Box::pin(async move {
+            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             // Bounded + retried like `create`: `ensure_exists` calls this first, so an
             // untimed list would strand provisioning on a stalled control plane.
             let mut last: Option<String> = None;
             for attempt in 0..CONTROL_ATTEMPTS {
                 match self
                     .client
-                    .get(self.sprites_url())
+                    .get(self.sprites_url()?)
                     .bearer_auth(&self.token)
                     .timeout(CONTROL_TIMEOUT)
                     .send()
@@ -639,8 +817,8 @@ pub trait ProviderEgress: Send + Sync {
 }
 
 impl SpritesProvider {
-    fn policy_network_url(&self, name: &str) -> String {
-        format!("{}/sprites/{name}/policy/network", self.api_base)
+    fn policy_network_url(&self, name: &str) -> Result<String> {
+        Ok(format!("{}/sprites/{name}/policy/network", self.base()?))
     }
 }
 
@@ -652,10 +830,11 @@ impl ProviderEgress for SpritesProvider {
         block: &'a [String],
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             let body = serde_json::json!({ "rules": rules_from(allow, block) });
             let resp = self
                 .client
-                .post(self.policy_network_url(id))
+                .post(self.policy_network_url(id)?)
                 .bearer_auth(&self.token)
                 .timeout(CONTROL_TIMEOUT)
                 .json(&body)
@@ -673,9 +852,10 @@ impl ProviderEgress for SpritesProvider {
 
     fn get_network_policy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Vec<PolicyRule>>> {
         Box::pin(async move {
+            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             let resp = self
                 .client
-                .get(self.policy_network_url(id))
+                .get(self.policy_network_url(id)?)
                 .bearer_auth(&self.token)
                 .timeout(CONTROL_TIMEOUT)
                 .send()
@@ -726,15 +906,18 @@ pub trait ProviderCheckpoints: Send + Sync {
 
 impl SpritesProvider {
     /// List endpoint (plural): `…/checkpoints`.
-    fn checkpoints_url(&self, name: &str) -> String {
-        format!("{}/sprites/{name}/checkpoints", self.api_base)
+    fn checkpoints_url(&self, name: &str) -> Result<String> {
+        Ok(format!("{}/sprites/{name}/checkpoints", self.base()?))
     }
     /// Create endpoint (SINGULAR): `…/checkpoint` — returns an NDJSON stream.
-    fn checkpoint_create_url(&self, name: &str) -> String {
-        format!("{}/sprites/{name}/checkpoint", self.api_base)
+    fn checkpoint_create_url(&self, name: &str) -> Result<String> {
+        Ok(format!("{}/sprites/{name}/checkpoint", self.base()?))
     }
-    fn restore_url(&self, name: &str, cp: &str) -> String {
-        format!("{}/sprites/{name}/checkpoints/{cp}/restore", self.api_base)
+    fn restore_url(&self, name: &str, cp: &str) -> Result<String> {
+        Ok(format!(
+            "{}/sprites/{name}/checkpoints/{cp}/restore",
+            self.base()?
+        ))
     }
     /// Parse a checkpoint list element (`{ "id", "comment"? }`).
     fn parse_checkpoint(v: &serde_json::Value) -> Option<CheckpointInfo> {
@@ -781,13 +964,14 @@ impl ProviderCheckpoints for SpritesProvider {
         label: Option<&'a str>,
     ) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
+            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             let mut body = serde_json::Map::new();
             if let Some(l) = label.map(str::trim).filter(|l| !l.is_empty()) {
                 body.insert("comment".into(), l.into());
             }
             let resp = self
                 .client
-                .post(self.checkpoint_create_url(id))
+                .post(self.checkpoint_create_url(id)?)
                 .bearer_auth(&self.token)
                 .timeout(CONTROL_TIMEOUT)
                 .json(&serde_json::Value::Object(body))
@@ -806,9 +990,10 @@ impl ProviderCheckpoints for SpritesProvider {
 
     fn list_checkpoints<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Vec<CheckpointInfo>>> {
         Box::pin(async move {
+            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             let resp = self
                 .client
-                .get(self.checkpoints_url(id))
+                .get(self.checkpoints_url(id)?)
                 .bearer_auth(&self.token)
                 .timeout(CONTROL_TIMEOUT)
                 .send()
@@ -826,9 +1011,10 @@ impl ProviderCheckpoints for SpritesProvider {
 
     fn restore<'a>(&'a self, id: &'a str, checkpoint: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             let resp = self
                 .client
-                .post(self.restore_url(id, checkpoint))
+                .post(self.restore_url(id, checkpoint)?)
                 .bearer_auth(&self.token)
                 .timeout(CONTROL_TIMEOUT)
                 .send()
@@ -1150,8 +1336,8 @@ impl SpritesProvider {
     /// The fs operation endpoint: `…/sprites/{name}/fs/{op}` (op = read|write|list
     /// |delete). The target path is a **query param** (`?path=…&workingDir=/`),
     /// not part of the URL — matching the live v1 API (and the `sprites-py` SDK).
-    fn fs_op_url(&self, name: &str, op: &str) -> String {
-        format!("{}/sprites/{name}/fs/{op}", self.api_base)
+    fn fs_op_url(&self, name: &str, op: &str) -> Result<String> {
+        Ok(format!("{}/sprites/{name}/fs/{op}", self.base()?))
     }
 
     /// Poll a cheap liveness probe until the freshly-created sprite's guest
@@ -1196,13 +1382,14 @@ impl SpritesProvider {
     /// PUT `/fs/write` with an explicit unix `mode` (octal string). `write`
     /// uses `0644`; `write_exec` uses `0755` so a pushed binary is runnable.
     async fn write_with_mode(&self, id: &str, path: &str, data: &[u8], mode: &str) -> Result<()> {
+        let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
         anyhow::ensure!(
             data.len() <= FILE_TRANSFER_BODY_LIMIT,
             "sprites file write exceeded the {FILE_TRANSFER_BODY_LIMIT}-byte limit"
         );
         let resp = self
             .client
-            .put(self.fs_op_url(id, "write"))
+            .put(self.fs_op_url(id, "write")?)
             .bearer_auth(&self.token)
             .timeout(FILE_TRANSFER_TIMEOUT)
             .query(&[
@@ -1240,9 +1427,10 @@ impl SpritesProvider {
 impl ProviderFiles for SpritesProvider {
     fn read<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move {
+            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             let resp = self
                 .client
-                .get(self.fs_op_url(id, "read"))
+                .get(self.fs_op_url(id, "read")?)
                 .bearer_auth(&self.token)
                 .timeout(FILE_TRANSFER_TIMEOUT)
                 .query(&[("path", path), ("workingDir", "/")])
@@ -1276,9 +1464,10 @@ impl ProviderFiles for SpritesProvider {
 
     fn list_dir<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<Vec<FileEntry>>> {
         Box::pin(async move {
+            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             let resp = self
                 .client
-                .get(self.fs_op_url(id, "list"))
+                .get(self.fs_op_url(id, "list")?)
                 .bearer_auth(&self.token)
                 .timeout(CONTROL_TIMEOUT)
                 .query(&[("path", path), ("workingDir", "/")])
@@ -1301,9 +1490,10 @@ impl ProviderFiles for SpritesProvider {
 
     fn delete<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
             let resp = self
                 .client
-                .delete(self.fs_op_url(id, "delete"))
+                .delete(self.fs_op_url(id, "delete")?)
                 .bearer_auth(&self.token)
                 .timeout(CONTROL_TIMEOUT)
                 .query(&[("path", path), ("workingDir", "/"), ("recursive", "true")])
@@ -1558,7 +1748,7 @@ impl SpritesProvider {
     /// CLI. The returned [`ExecSession`]'s driver task lives on the ambient tokio
     /// runtime until the socket closes or `ExecControl::Close` is sent.
     pub async fn open_exec(&self, id: &str, spec: &ExecSpec) -> Result<ExecSession> {
-        let url = exec_ws_url(&self.api_base, id, spec)?;
+        let url = exec_ws_url(self.base()?, id, spec)?;
         self.start_session(url, spec.tty).await
     }
 
@@ -1571,7 +1761,7 @@ impl SpritesProvider {
         cols: u16,
         rows: u16,
     ) -> Result<ExecSession> {
-        let url = attach_ws_url(&self.api_base, id, session, cols, rows)?;
+        let url = attach_ws_url(self.base()?, id, session, cols, rows)?;
         self.connect_exec(url, true, false).await
     }
 
@@ -1687,7 +1877,7 @@ impl SpritesProvider {
         use futures_util::SinkExt;
         use tokio_tungstenite::tungstenite::Message;
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-        let url = proxy_ws_url(&self.api_base, id)?;
+        let url = proxy_ws_url(self.base()?, id)?;
         let mut req = url
             .into_client_request()
             .context("sprites: build proxy ws request")?;
@@ -2276,14 +2466,80 @@ mod tests {
     #[test]
     fn sprites_default_base_and_urls() {
         let p = sprites();
-        assert_eq!(p.sprites_url(), "https://api.sprites.dev/v1/sprites");
         assert_eq!(
-            p.sprite_name_url("my-sprite"),
+            p.sprites_url().unwrap(),
+            "https://api.sprites.dev/v1/sprites"
+        );
+        assert_eq!(
+            p.sprite_name_url("my-sprite").unwrap(),
             "https://api.sprites.dev/v1/sprites/my-sprite"
         );
         // Empty api_base falls back to the documented default.
         let d = SpritesProvider::new("", "t", "s");
-        assert_eq!(d.sprites_url(), "https://api.sprites.dev/v1/sprites");
+        assert_eq!(
+            d.sprites_url().unwrap(),
+            "https://api.sprites.dev/v1/sprites"
+        );
+    }
+
+    #[test]
+    fn configured_api_base_requires_safe_authority() {
+        for rejected in [
+            "http://user:secret@example.com/api",
+            "http://provider.example/api",
+            "https://provider.example/api?token=x",
+            "https://provider.example/api#fragment",
+            "ftp://provider.example/api",
+            "",
+        ] {
+            assert!(
+                validate_api_base(rejected).is_err(),
+                "accepted {rejected:?}"
+            );
+        }
+        let credential_error = validate_api_base("http://u:p@127.0.0.1:1234")
+            .unwrap_err()
+            .to_string();
+        assert!(credential_error.contains("embedded credentials"));
+        assert!(!credential_error.contains("secret"));
+        assert_eq!(
+            validate_api_base("https://app.daytona.io/api/").unwrap(),
+            "https://app.daytona.io/api"
+        );
+        assert_eq!(
+            validate_api_base("http://127.0.0.1:1234").unwrap(),
+            "http://127.0.0.1:1234"
+        );
+        assert_eq!(
+            validate_api_base("http://[::1]:1234/").unwrap(),
+            "http://[::1]:1234"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_daytona_base_fails_before_connecting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = DaytonaProvider::new(&format!("http://u:p@{address}"), "token", "snapshot");
+        assert!(provider.list().await.is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "invalid base unexpectedly opened a connection"
+        );
+    }
+
+    #[test]
+    fn control_gate_enforces_authority_and_global_caps() {
+        let gate = ControlGate::new(2, 1);
+        let first = gate.try_acquire("a").unwrap();
+        assert!(gate.try_acquire("a").is_err());
+        let second = gate.try_acquire("b").unwrap();
+        assert!(gate.try_acquire("c").is_err());
+        drop(first);
+        let same_authority_again = gate.try_acquire("a").unwrap();
+        drop((second, same_authority_again));
     }
 
     #[test]
@@ -2524,7 +2780,7 @@ mod tests {
     #[test]
     fn sprites_policy_url_and_caps() {
         assert_eq!(
-            sprites().policy_network_url("dev"),
+            sprites().policy_network_url("dev").unwrap(),
             "https://api.sprites.dev/v1/sprites/dev/policy/network"
         );
         assert!(Provider::Sprites(sprites()).caps().egress);
@@ -2536,15 +2792,15 @@ mod tests {
         let p = sprites();
         // List is plural; create is SINGULAR; restore is plural/{id}/restore.
         assert_eq!(
-            p.checkpoints_url("dev"),
+            p.checkpoints_url("dev").unwrap(),
             "https://api.sprites.dev/v1/sprites/dev/checkpoints"
         );
         assert_eq!(
-            p.checkpoint_create_url("dev"),
+            p.checkpoint_create_url("dev").unwrap(),
             "https://api.sprites.dev/v1/sprites/dev/checkpoint"
         );
         assert_eq!(
-            p.restore_url("dev", "v1"),
+            p.restore_url("dev", "v1").unwrap(),
             "https://api.sprites.dev/v1/sprites/dev/checkpoints/v1/restore"
         );
         // Real list element shape: flat {id, create_time, is_auto[, comment]}.
@@ -2602,7 +2858,7 @@ mod tests {
     fn sprites_fs_url_and_entry_parse() {
         let p = sprites();
         assert_eq!(
-            p.fs_op_url("dev", "read"),
+            p.fs_op_url("dev", "read").unwrap(),
             "https://api.sprites.dev/v1/sprites/dev/fs/read"
         );
         // The live API uses camelCase `isDir` and numeric `size`.
@@ -2664,9 +2920,12 @@ mod tests {
     #[test]
     fn urls_trim_trailing_slash() {
         let p = provider();
-        assert_eq!(p.sandbox_url(), "https://app.daytona.io/api/sandbox");
         assert_eq!(
-            p.sandbox_id_url("sb-1"),
+            p.sandbox_url().unwrap(),
+            "https://app.daytona.io/api/sandbox"
+        );
+        assert_eq!(
+            p.sandbox_id_url("sb-1").unwrap(),
             "https://app.daytona.io/api/sandbox/sb-1"
         );
     }
