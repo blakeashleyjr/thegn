@@ -821,11 +821,11 @@ pub(super) fn output_bounded_with_input(
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()?;
-            if let Some(mut stdin) = child.stdin.take() {
-                if let Err(error) = stdin.write_all(input) {
-                    stop_bounded_child(&mut child);
-                    return Err(error.into());
-                }
+            if let Some(mut stdin) = child.stdin.take()
+                && let Err(error) = stdin.write_all(input)
+            {
+                stop_bounded_child(&mut child);
+                return Err(error.into());
             }
             return Ok(child.wait_with_output()?);
         }
@@ -843,11 +843,11 @@ pub(super) fn output_bounded_with_input(
     if let Some(input) = input {
         use std::io::Write;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Err(error) = stdin.write_all(input) {
-                stop_bounded_child(&mut child);
-                return Err(error.into());
-            }
+        if let Some(mut stdin) = child.stdin.take()
+            && let Err(error) = stdin.write_all(input)
+        {
+            stop_bounded_child(&mut child);
+            return Err(error.into());
         }
     }
     let mut so = child.stdout.take().expect("piped stdout");

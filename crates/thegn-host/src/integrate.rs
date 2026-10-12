@@ -352,10 +352,9 @@ fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Opt
     {
         if scratch.verify().is_ok()
             && std::fs::read_dir(&tmp).is_ok_and(|mut entries| entries.next().is_none())
+            && let Err(error) = scratch.remove_empty()
         {
-            if let Err(error) = scratch.remove_empty() {
-                tracing::warn!(target: "thegn::integrate", path = %tmp.display(), %error, "empty scratch cleanup failed");
-            }
+            tracing::warn!(target: "thegn::integrate", path = %tmp.display(), %error, "empty scratch cleanup failed");
         }
         return None;
     }
@@ -427,10 +426,9 @@ fn regenerate_merge(
     {
         if scratch.verify().is_ok()
             && std::fs::read_dir(&tmp).is_ok_and(|mut entries| entries.next().is_none())
+            && let Err(error) = scratch.remove_empty()
         {
-            if let Err(error) = scratch.remove_empty() {
-                tracing::warn!(target: "thegn::integrate", path = %tmp.display(), %error, "empty scratch cleanup failed");
-            }
+            tracing::warn!(target: "thegn::integrate", path = %tmp.display(), %error, "empty scratch cleanup failed");
         }
         return None;
     }
