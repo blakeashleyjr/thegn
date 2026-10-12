@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use thegn_core::plugin_api::RpcMessage;
@@ -19,6 +20,8 @@ pub const MAX_LINE_BYTES: usize = 1 << 20;
 pub const MAX_LINES: usize = 20_000;
 /// Bytes of stderr kept for the error message.
 pub const MAX_STDERR: usize = 8 << 10;
+/// Maximum time to wait for a killed leader and its pipe readers to finish.
+const READER_GRACE: Duration = Duration::from_millis(500);
 
 /// Why a plugin run failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,7 +165,9 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
 
     // Drain both pipes on their own threads: a child that fills the stderr pipe
     // while we read stdout would otherwise deadlock.
-    let reader = std::thread::spawn(move || {
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    std::thread::spawn(move || {
         let mut sink = sink;
         let mut truncated = false;
         let mut accepting = true;
@@ -170,43 +175,66 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
         if let Some(out) = stdout {
             let mut buf = BufReader::new(out);
             let mut line = Vec::new();
+            let mut oversized = false;
             loop {
-                line.clear();
-                // read_until, not read_line, so invalid UTF-8 is a skipped line
-                // rather than an error that ends the stream.
-                let n = match buf
-                    .by_ref()
-                    .take(MAX_LINE_BYTES as u64)
-                    .read_until(b'\n', &mut line)
-                {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
+                let (consumed, newline, eof) = match buf.fill_buf() {
+                    Ok([]) => (0, false, true),
+                    Ok(available) => {
+                        let end = available
+                            .iter()
+                            .position(|byte| *byte == b'\n')
+                            .map_or(available.len(), |idx| idx + 1);
+                        let newline = available.get(end.wrapping_sub(1)) == Some(&b'\n');
+                        let remaining = MAX_LINE_BYTES.saturating_sub(line.len());
+                        if !oversized {
+                            if end <= remaining {
+                                line.extend_from_slice(&available[..end]);
+                            } else {
+                                line.clear();
+                                oversized = true;
+                                truncated = true;
+                            }
+                        }
+                        (end, newline, false)
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 };
-                // Past the cap we KEEP READING and discard. Closing the pipe
-                // instead would hand the plugin a SIGPIPE mid-write, turning an
-                // over-chatty plugin into a "killed by signal" failure with no
-                // usable output at all — when what we want is its first N
-                // messages plus an honest `truncated`.
-                if truncated || lines >= MAX_LINES {
+                if eof {
+                    if !oversized && !line.is_empty() && accepting && lines < MAX_LINES {
+                        deliver_line(&mut sink, &line, &mut accepting, &mut lines);
+                    } else if !line.is_empty() || oversized {
+                        truncated = true;
+                    }
+                    break;
+                }
+                buf.consume(consumed);
+                if !newline {
+                    continue;
+                }
+                if oversized {
+                    // Discard the rest of this one frame, then resume at the
+                    // next frame boundary. Never reinterpret a suffix as JSON.
                     truncated = true;
+                    oversized = false;
+                    line.clear();
                     continue;
                 }
-                if !accepting {
+                if lines >= MAX_LINES {
+                    truncated = true;
+                    line.clear();
                     continue;
                 }
-                let text = String::from_utf8_lossy(&line[..n]);
-                let text = text.trim();
-                if text.is_empty() {
-                    continue;
-                }
-                lines += 1;
-                accepting = sink.line(text);
+                deliver_line(&mut sink, &line, &mut accepting, &mut lines);
+                line.clear();
             }
         }
-        (sink, truncated)
+        if stdout_tx.send((sink, truncated)).is_err() {
+            tracing::debug!("plugin stdout reader detached: run already gave up");
+        }
     });
 
-    let err_thread = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut s = String::new();
         if let Some(e) = stderr {
             // Drain to EOF, keeping only the first MAX_STDERR bytes. Stopping
@@ -226,42 +254,139 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
             }
             s = String::from_utf8_lossy(&buf).into_owned();
         }
-        s
+        if stderr_tx.send(s).is_err() {
+            tracing::debug!("plugin stderr reader detached: run already gave up");
+        }
     });
 
-    // Poll for exit rather than `wait()`, so the timeout is enforceable.
+    // Observe the leader without reaping it, so its pid still pins the process
+    // group when descendants are terminated.
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break Some(s),
-            Ok(None) => {}
-            Err(_) => break None,
+    let mut timed_out = false;
+    #[cfg(unix)]
+    let status = 'run: loop {
+        match leader_exited_nowait(pid) {
+            Ok(true) => {
+                // A successful one-shot run also kills helpers left in its process group,
+                // matching gh_run; backgrounded helpers do not outlive the plugin run.
+                kill_group(pid);
+                break child.wait().ok();
+            }
+            Ok(false) => {}
+            Err(_) => {
+                hand_off_unreaped_child(child);
+                break None;
+            }
         }
         if Instant::now() >= deadline {
+            timed_out = true;
             kill_group(pid);
-            let _ = child.wait(); // best-effort: reap-or-not is terminal here
+            let reap_deadline = Instant::now() + READER_GRACE;
+            loop {
+                match leader_exited_nowait(pid) {
+                    Ok(true) => break 'run child.wait().ok(),
+                    Ok(false) => {}
+                    Err(_) => {
+                        hand_off_unreaped_child(child);
+                        break 'run None;
+                    }
+                }
+                if Instant::now() >= reap_deadline {
+                    hand_off_unreaped_child(child);
+                    break 'run None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    #[cfg(not(unix))]
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(_) => {
+                hand_off_unreaped_child(child);
+                break None;
+            }
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            kill_group(pid);
+            hand_off_unreaped_child(child);
             break None;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
 
-    let joined = reader.join();
-    let stderr = err_thread.join().unwrap_or_default();
-    let (sink, truncated) =
-        joined.map_err(|_| PluginError::Protocol("plugin output reader failed".into()))?;
+    let drain_deadline = if timed_out || status.is_none() {
+        deadline + READER_GRACE
+    } else {
+        Instant::now() + READER_GRACE
+    };
+    let stdout_result =
+        recv_by_deadline(&stdout_rx, drain_deadline).map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => PluginError::Timeout(timeout.as_secs()),
+            mpsc::RecvTimeoutError::Disconnected => {
+                PluginError::Protocol("plugin output reader failed".into())
+            }
+        })?;
+    let stderr = recv_by_deadline(&stderr_rx, drain_deadline).map_err(|error| match error {
+        mpsc::RecvTimeoutError::Timeout => PluginError::Timeout(timeout.as_secs()),
+        mpsc::RecvTimeoutError::Disconnected => {
+            PluginError::Protocol("plugin stderr reader failed".into())
+        }
+    })?;
+    let (sink, truncated) = stdout_result;
 
-    match status {
-        None => Err(PluginError::Timeout(timeout.as_secs())),
-        Some(s) if !s.success() => Err(PluginError::Exit {
+    match (timed_out, status) {
+        (true, _) | (false, None) => Err(PluginError::Timeout(timeout.as_secs())),
+        (false, Some(s)) if !s.success() => Err(PluginError::Exit {
             code: s.code(),
             stderr,
         }),
-        Some(_) => Ok(StreamRun {
+        (false, Some(_)) => Ok(StreamRun {
             sink,
             stderr,
             truncated,
         }),
     }
+}
+
+/// Preserve the bounded caller deadline while ensuring every live child is
+/// eventually waited on. `try_wait` also handles the case where another owner
+/// already reaped the child.
+pub(super) fn hand_off_unreaped_child(mut child: std::process::Child) {
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(_) => {
+            std::thread::spawn(move || {
+                if let Err(error) = child.wait() {
+                    tracing::debug!(error = %error, "plugin reaper: wait failed");
+                }
+            });
+        }
+    }
+}
+
+fn deliver_line<S: NdjsonSink>(sink: &mut S, line: &[u8], accepting: &mut bool, lines: &mut usize) {
+    if !*accepting || *lines >= MAX_LINES {
+        return;
+    }
+    let text = String::from_utf8_lossy(line);
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    *lines += 1;
+    *accepting = sink.line(text);
+}
+
+fn recv_by_deadline<T>(
+    receiver: &mpsc::Receiver<T>,
+    deadline: Instant,
+) -> Result<T, mpsc::RecvTimeoutError> {
+    receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
 }
 
 #[cfg(unix)]
