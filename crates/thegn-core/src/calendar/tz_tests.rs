@@ -1,20 +1,16 @@
-use super::{resolve_tzid, resolve_zone};
+use super::{WINDOWS_TZ_ALIASES, resolve_tzid, resolve_zone};
 
 #[test]
 fn windows_alias_targets_are_valid_iana_zones() {
-    for target in [
-        "America/New_York",
-        "America/Chicago",
-        "America/Denver",
-        "America/Los_Angeles",
-        "Europe/Berlin",
-        "Europe/London",
-        "Asia/Tokyo",
-        "Asia/Shanghai",
-    ] {
+    for (alias, target) in WINDOWS_TZ_ALIASES {
         assert!(
             resolve_zone(target).is_some(),
             "invalid alias target: {target}"
+        );
+        assert_eq!(
+            resolve_tzid(alias).map(|zone| zone.name()),
+            Some(*target),
+            "alias does not resolve to its target: {alias}"
         );
     }
 }
