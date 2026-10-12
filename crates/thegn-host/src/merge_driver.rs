@@ -441,6 +441,28 @@ fn drive_queue_with(
 
             // A land failure. Dispatch the agent to fix it, if we still can.
             if use_agent && agent_runs < cfg.agent_max_attempts {
+                // The queue stores remote worktree identifiers as opaque host
+                // identities. Until a remote executor exists, never reinterpret
+                // one as a target-host path for sandbox resolution or `current_dir`.
+                let location = item.location.trim();
+                if (!location.is_empty() && location != "local") || branch_loc.is_remote() {
+                    let reason = format!(
+                        "cross-host fixer unsupported: {} lives on a remote host; resolve it there or `merge retry` after moving it",
+                        item.branch
+                    );
+                    thegn_core::msg::warn(&reason);
+                    let fields = set(db, MqStatus::AgentBlocked, None, Some(&reason));
+                    stop_on_write_error!();
+                    progress(&DriveStep {
+                        fields: &fields,
+                        worktree: &item.worktree,
+                        branch: &item.branch,
+                        status: MqStatus::AgentBlocked.as_str(),
+                        detail: &reason,
+                    });
+                    out.agent_blocked.push(item.branch.clone());
+                    break;
+                }
                 // Opt-in isolation floor for the handoff (default: host + slice).
                 // Gate BEFORE consuming an attempt: a fail-closed miss, or an
                 // unbuildable sandbox under a demanded floor, is an INFRASTRUCTURE
@@ -684,11 +706,12 @@ fn detail_with_log(headline: &str, log: &str) -> String {
 /// to a headline when the command produced no output at all — a bare `exit 1`
 /// gate would otherwise render as "needs a human — " with nothing after it.
 fn tail_line(log: &str) -> String {
-    log.lines()
+    let line = log
+        .lines()
         .rev()
         .find(|l| !l.trim().is_empty())
-        .unwrap_or("breaks build (gate exited non-zero, no output)")
-        .to_string()
+        .unwrap_or("breaks build (gate exited non-zero, no output)");
+    thegn_core::agent_task::bound_text(line, 2000)
 }
 
 #[cfg(test)]
@@ -819,6 +842,43 @@ mod tests {
         // show, or the status line reads "needs a human — " and stops.
         assert!(tail_line("").contains("no output"));
         assert!(tail_line("   \n\n").contains("no output"));
+    }
+
+    #[test]
+    fn gate_prompt_bounds_a_huge_single_line() {
+        let log = "x".repeat(300_000);
+        let cfg = MergeQueueConfig::default();
+        let (kind, _, prompt) = compose(
+            &cfg,
+            "/work/feature",
+            "feature",
+            "main",
+            &Failure::Gate(log),
+        )
+        .unwrap();
+        assert_eq!(kind, thegn_core::agent_task::TaskKind::GateFailure);
+        assert!(prompt.len() <= thegn_core::agent_task::MAX_RENDERED_PROMPT_BYTES);
+        assert!(prompt.contains("task data omitted"));
+    }
+
+    #[test]
+    fn conflict_prompt_caps_many_paths() {
+        let paths: Vec<String> = (0..10_000).map(|i| format!("path-{i}")).collect();
+        let cfg = MergeQueueConfig::default();
+        let (kind, vars, prompt) = compose(
+            &cfg,
+            "/work/feature",
+            "feature",
+            "main",
+            &Failure::Conflict {
+                paths,
+                submodule_conflicts: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(kind, thegn_core::agent_task::TaskKind::MergeConflict);
+        assert!(vars.get("paths").unwrap().contains("more path(s) omitted"));
+        assert!(prompt.len() <= thegn_core::agent_task::MAX_RENDERED_PROMPT_BYTES);
     }
 
     #[test]
