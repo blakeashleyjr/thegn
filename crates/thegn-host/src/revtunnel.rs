@@ -13,12 +13,13 @@
 //! be captured into the off-loop `spawn_blocking` bridge-setup task.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use thegn_svc::provider::{ExecSpec, Provider};
-use thegn_svc::revtunnel::{TcpDialer, exec_stream, run_host};
+use thegn_svc::revtunnel::{TcpDialer, clamp_permits, exec_stream, run_host_with_caps};
 use tokio::runtime::Handle;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 /// `(worktree, sandbox_port)` → its supervisor task (self-healing pump loop).
@@ -55,11 +56,18 @@ fn next_backoff(session_lasted: Duration, current: Duration) -> Duration {
 #[derive(Clone, Default)]
 pub struct ReverseTunnelSupervisor {
     tasks: Tasks,
+    global_permits: Arc<OnceLock<Arc<Semaphore>>>,
 }
 
 impl ReverseTunnelSupervisor {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn global_permits(&self, total: usize) -> Arc<Semaphore> {
+        self.global_permits
+            .get_or_init(|| Arc::new(Semaphore::new(clamp_permits(total))))
+            .clone()
     }
 
     /// Whether a tunnel is already running for `(worktree, sandbox_port)`.
@@ -87,6 +95,8 @@ impl ReverseTunnelSupervisor {
         bridge_path: String,
         sandbox_port: u16,
         host_target: String,
+        max_connections: usize,
+        global_permits: Arc<Semaphore>,
     ) {
         let key = (worktree.to_string(), sandbox_port);
         let mut tasks = match self.tasks.lock() {
@@ -121,11 +131,13 @@ impl ReverseTunnelSupervisor {
                 match provider.open_exec(&sandbox_id, &spec).await {
                     Ok(session) => {
                         let stream = exec_stream(session);
-                        if let Err(e) = run_host(
+                        if let Err(e) = run_host_with_caps(
                             stream,
                             TcpDialer {
                                 addr: host_target.clone(),
                             },
+                            max_connections,
+                            global_permits.clone(),
                         )
                         .await
                         {
@@ -196,10 +208,12 @@ impl ReverseTunnelSupervisor {
             }
             _ => return,
         };
+        let max_connections = cfg.forward.reverse_max_connections;
         for (sandbox_port, host_target) in tunnels {
             let Some(provider) = crate::provider_factory::provider_for(pc) else {
                 return;
             };
+            let global_permits = self.global_permits(cfg.forward.reverse_max_connections_total);
             self.start(
                 handle,
                 worktree,
@@ -208,6 +222,8 @@ impl ReverseTunnelSupervisor {
                 crate::bridge_sup::remote_thegn(),
                 sandbox_port,
                 host_target,
+                max_connections,
+                global_permits.clone(),
             );
         }
     }
@@ -246,6 +262,22 @@ mod tests {
         assert_eq!(reset, BACKOFF_BASE);
         let reset_longer = next_backoff(Duration::from_secs(300), b2);
         assert_eq!(reset_longer, BACKOFF_BASE);
+    }
+
+    #[test]
+    fn global_permits_are_latched_and_shared_by_supervisor_clones() {
+        let supervisor = ReverseTunnelSupervisor::new();
+        let first = supervisor.global_permits(3);
+        assert_eq!(first.available_permits(), 3);
+
+        let second = supervisor.global_permits(7);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(second.available_permits(), 3);
+
+        let cloned = supervisor.clone();
+        let from_clone = cloned.global_permits(11);
+        assert!(Arc::ptr_eq(&first, &from_clone));
+        assert_eq!(from_clone.available_permits(), 3);
     }
 
     #[test]
