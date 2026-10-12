@@ -113,12 +113,11 @@ impl AdmissionLimiter {
     fn run_worker(limiter: Arc<Self>, first: AdmissionJob) {
         let mut next = Some(first);
         loop {
-            if let Some(job) = next.take() {
-                if !job.cancel.load(Ordering::Acquire)
-                    && std::panic::catch_unwind(std::panic::AssertUnwindSafe(job.work)).is_err()
-                {
-                    tracing::error!(target: "thegn::bridge", "bridge RPC worker panicked");
-                }
+            if let Some(job) = next.take()
+                && !job.cancel.load(Ordering::Acquire)
+                && std::panic::catch_unwind(std::panic::AssertUnwindSafe(job.work)).is_err()
+            {
+                tracing::error!(target: "thegn::bridge", "bridge RPC worker panicked");
             }
             let mut queue = limiter.queue.lock().unwrap_or_else(PoisonError::into_inner);
             match queue.jobs.pop_front() {
