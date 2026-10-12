@@ -6,6 +6,7 @@
 //!   Full   (150 cols): left list + right detail panel side-by-side.
 
 use thegn_core::notification::{Notification, NotificationKind};
+use thegn_core::pipeline_report::display_cell;
 
 use crate::seg::{Line, Seg, seg, sp};
 
@@ -28,8 +29,9 @@ fn kind_hue(k: NotificationKind) -> crate::seg::Tok {
 }
 
 fn truncate(s: &str, max: usize) -> String {
+    let s = display_cell(s);
     if s.chars().count() <= max {
-        return s.to_string();
+        return s;
     }
     let cut: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{}…", cut.trim_end())
@@ -191,6 +193,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             .rsplit('/')
             .next()
             .unwrap_or(&n.worktree_path);
+        let wt_base = display_cell(wt_base);
 
         let (glyph_tok, src_tok, msg_tok) = if n.read {
             (f(), f(), f())
@@ -401,5 +404,29 @@ mod tests {
         assert_eq!(truncate("hello world", 8), "hello w…");
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("ab", 1), "…");
+        assert_eq!(truncate("ok\r\nforged\u{202e}\u{200b}", 40), "ok��forged��");
+    }
+
+    #[test]
+    fn notification_detail_replaces_hostile_message_and_source_text() {
+        let n = Notification {
+            id: 1,
+            kind: NotificationKind::AgentFailed,
+            source_ref: "THE-1\n\x1b]52;c;QQ==\x07".into(),
+            message: "agent finished in a\r\nTHE-9 ✓\u{202e}\u{200b}".into(),
+            created_at_ms: thegn_core::util::now(),
+            read: false,
+            worktree_path: String::new(),
+        };
+        let text = notification_detail_segs(&n, 40)
+            .iter()
+            .flatten()
+            .map(|part| part.text.as_str())
+            .collect::<String>();
+
+        for ch in ['\r', '\n', '\x1b', '\x07', '\u{202e}', '\u{200b}'] {
+            assert!(!text.contains(ch), "rendered text contains {ch:?}");
+        }
+        assert!(text.contains('\u{fffd}'));
     }
 }

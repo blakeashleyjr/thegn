@@ -21,6 +21,7 @@ use crate::layer::{self, Anchor, LayerSpec};
 use crate::seg::{self, Line, Tok, seg};
 use crate::telemetry::TelemetryHistory;
 use thegn_core::log_view::{LogLevel, LogLine};
+use thegn_core::pipeline_report::display_cell;
 use thegn_core::theme::Hue;
 
 /// Everything the daemon/status modal needs beyond the [`FrameModel`]: the
@@ -1250,7 +1251,7 @@ fn render_log(surface: &mut Surface, inner: Rect, lg: &LogDetail, scroll: usize,
             let left = vec![
                 cursor,
                 seg(tone, format!("{} ", line.level.glyph())),
-                seg(Tok::Slot(S::Text), line.message.clone()),
+                seg(Tok::Slot(S::Text), display_cell(&line.message)),
             ];
             let l = Line::split(
                 left,
@@ -2551,7 +2552,7 @@ fn notification_row(n: &thegn_core::notification::Notification) -> DetailRow {
     let marker = if n.read { Tok::Slot(S::Ghost) } else { marker };
     // `created_at_ms` is epoch *seconds* (legacy misnomer), so `util::age` —
     // not a millisecond clock — gives the real age.
-    let mut row = DetailRow::new(marker, glyph, n.message.clone())
+    let mut row = DetailRow::new(marker, glyph, display_cell(&n.message))
         .note(format!("{} ago", thegn_core::util::age(n.created_at_ms)));
     if !n.worktree_path.is_empty() {
         row = row.on_enter(DetailAction::FocusWorktree(n.worktree_path.clone()));
@@ -2583,7 +2584,7 @@ fn notification_row(n: &thegn_core::notification::Notification) -> DetailRow {
 fn logs_row(model: &FrameModel, notes: &[thegn_core::notification::Notification]) -> DetailRow {
     let log = notes.iter().find(|n| n.source_ref == "log:thegn");
     let text = log
-        .map(|n| n.message.clone())
+        .map(|n| display_cell(&n.message))
         .unwrap_or_else(|| "open thegn.log".into());
     let mut row = DetailRow::new(Tok::Slot(S::Dim), "\u{2261}", text)
         .on_enter(DetailAction::ShowLog(model.panel.log_tail.clone()))
