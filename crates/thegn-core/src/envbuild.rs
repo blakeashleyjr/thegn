@@ -73,7 +73,7 @@ pub fn effective_provider_id(configured: &str, worktree: &Path, repo: Option<&st
     // Invalid configured text must never become a provider name or filesystem
     // component. Keep a deterministic suffix so distinct original values map
     // to distinct canonical names within the existing short-hash contract.
-    let suffix = if valid_provider_name(&name) {
+    let suffix = if valid_provider_syntax(&name) {
         hash.clone()
     } else {
         util::short_hash(&expanded, 6)
@@ -99,6 +99,23 @@ fn valid_provider_name(name: &str) -> bool {
             let bytes = label.as_bytes();
             !bytes.is_empty()
                 && bytes.len() <= 63
+                && bytes[0].is_ascii_alphanumeric()
+                && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        })
+}
+
+/// Check DNS label syntax without applying the provider's length limits. This
+/// distinguishes a long but otherwise valid expansion (which must retain its
+/// worktree-path hash when clamped) from unsafe configured text (which gets a
+/// hash of the expanded value).
+fn valid_provider_syntax(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('.').all(|label| {
+            let bytes = label.as_bytes();
+            !bytes.is_empty()
                 && bytes[0].is_ascii_alphanumeric()
                 && bytes[bytes.len() - 1].is_ascii_alphanumeric()
                 && bytes
