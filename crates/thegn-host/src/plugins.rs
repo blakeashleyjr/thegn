@@ -217,6 +217,20 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Validate the complete plugin set before setup is allowed to start any
+/// plugin process. The CLI and runtime share `check_specs`, so a set rejected
+/// by `thegn plugin check` cannot partially execute during startup.
+fn admitted_plugins(
+    cfg: &thegn_core::config::Config,
+    config_dir: &std::path::Path,
+) -> Result<Vec<LoadedPlugin>, Vec<thegn_svc::plugin::loader::SpecProblem>> {
+    let problems = thegn_svc::plugin::loader::check_specs(cfg, config_dir);
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    Ok(thegn_svc::plugin::discover(cfg, config_dir))
+}
+
 /// Spawn one resident session whose events are tagged with the plugin id,
 /// queued on the loop channel and waker-pulsed.
 fn spawn_session(
@@ -279,7 +293,19 @@ fn setup_and_schedule(
         plugins: specs,
         ..Default::default()
     };
-    let discovered = thegn_svc::plugin::discover(&cfg, &config_dir);
+    let discovered = match admitted_plugins(&cfg, &config_dir) {
+        Ok(discovered) => discovered,
+        Err(problems) => {
+            for problem in problems {
+                tracing::warn!(target: "thegn::plugin", error = %problem, "plugin set rejected before startup");
+            }
+            // Publish an empty set for this failed admission. Crucially, this
+            // return precedes the resident and one-shot process spawn paths.
+            let _ = tx.send(PluginMsg::Loaded(Vec::new()));
+            let _ = waker.wake(); // best-effort: an input nudge must never fail this path
+            return;
+        }
+    };
     let mut loaded: Vec<LoadedState> = Vec::new();
     let mut sched: Vec<SchedEntry> = Vec::new();
     let now = Instant::now();
@@ -437,6 +463,11 @@ fn setup_and_schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::plugin_api::{PluginId, PluginSpec};
+
+    fn example_spec() -> PluginSpec {
+        toml::from_str(include_str!("../../../examples/plugins/hello/plugin.toml")).unwrap()
+    }
 
     #[test]
     fn restart_backoff_is_1_5_25_then_disabled() {
@@ -445,5 +476,45 @@ mod tests {
         assert_eq!(restart_delay(2), Some(Duration::from_secs(25)));
         assert_eq!(restart_delay(3), None);
         assert_eq!(restart_delay(17), None);
+    }
+
+    #[test]
+    fn duplicate_ids_reject_the_entire_set_before_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut first = example_spec();
+        first.manifest.id = PluginId::new("duplicate");
+        first.command = vec!["true".into()];
+        let mut second = first.clone();
+        second.command = vec!["false".into()];
+        let cfg = thegn_core::config::Config {
+            plugins: vec![first, second],
+            ..Default::default()
+        };
+
+        let problems = admitted_plugins(&cfg, tmp.path()).unwrap_err();
+
+        assert!(problems.iter().any(|problem| {
+            problem.plugin == "duplicate" && problem.problem == "duplicate plugin id"
+        }));
+    }
+
+    #[test]
+    fn invalid_enabled_spec_rejects_the_entire_set_before_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut valid = example_spec();
+        valid.command = vec!["true".into()];
+        let mut invalid = example_spec();
+        invalid.manifest.id = PluginId::new("invalid-command");
+        invalid.command.clear();
+        let cfg = thegn_core::config::Config {
+            plugins: vec![valid, invalid],
+            ..Default::default()
+        };
+
+        let problems = admitted_plugins(&cfg, tmp.path()).unwrap_err();
+
+        assert!(problems.iter().any(|problem| {
+            problem.plugin == "invalid-command" && problem.problem == "empty command"
+        }));
     }
 }
