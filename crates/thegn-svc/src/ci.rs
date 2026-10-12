@@ -312,7 +312,7 @@ fn run_cli_within(
         RunError::Exit { stderr, .. } => classify_stderr(&stderr),
         RunError::Timeout => CiError::Other("CI provider command timed out".into()),
         RunError::Truncated => CiError::Other("provider output byte budget exhausted".into()),
-        RunError::Io(_) => CiError::Other("CI provider command failed".into()),
+        RunError::Io(message) => CiError::Other(format!("CI provider command failed: {message}")),
         RunError::Cancelled => CiError::Other("CI provider command cancelled".into()),
     })
 }
@@ -1672,6 +1672,21 @@ mod tests {
         assert!(
             matches!(result, Err(CiError::Other(message)) if message == "provider output byte budget exhausted")
         );
+    }
+
+    #[test]
+    fn bounded_cli_preserves_spawn_io_error_detail() {
+        if !crate::plugin::proc::bounded_group_termination_supported() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let result = run_cli_within(
+            Command::new(temp.path()),
+            test_limits(Duration::from_secs(1), 1024),
+        );
+        assert!(matches!(result, Err(CiError::Other(message)) if message
+                .strip_prefix("CI provider command failed: ")
+                .is_some_and(|detail| !detail.is_empty())));
     }
 
     #[test]
