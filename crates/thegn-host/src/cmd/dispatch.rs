@@ -1139,10 +1139,19 @@ fn set_status_on(
     let row = db
         .get_dispatch(id)?
         .ok_or_else(|| anyhow::anyhow!("no dispatch with id {id}"))?;
+    if !thegn_core::db_dispatch::set_status_transition_allowed(row.status, parsed) {
+        return Err(anyhow::Error::new(
+            thegn_core::db_dispatch::DispatchTransitionConflict::Illegal {
+                id,
+                from: row.status,
+                to: parsed,
+            },
+        ));
+    }
     // Only `done` has artifact evidence requirements, and `--force` overrides
     // that gate. The typed transition check below still applies when forced.
     if parsed == AgentDispatchStatus::Done && !force {
-        done_gate_bound(&db, &row)?;
+        done_gate_bound(db, &row)?;
     }
     // A supplied reason is primary audit data, not cache context: commit it
     // atomically with the status so the command cannot claim success after
@@ -2239,6 +2248,31 @@ mod tests {
             db.get_dispatch(id).unwrap().unwrap().status,
             AgentDispatchStatus::Done
         );
+    }
+
+    #[test]
+    fn set_status_reports_illegal_transition_before_done_artifact_gate() {
+        let (_dir, db) = db("set-status-illegal-before-gate");
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                artifact_path: Some("missing-handoff.md"),
+                ..NewDispatch::new("linear:THE-242", "/wt/merged", "claude")
+            })
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Merged)
+            .unwrap();
+
+        let err = set_status_on(&db, id, AgentDispatchStatus::Done, false, None, true).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<thegn_core::db_dispatch::DispatchTransitionConflict>(),
+            Some(
+                thegn_core::db_dispatch::DispatchTransitionConflict::Illegal {
+                    from: AgentDispatchStatus::Merged,
+                    to: AgentDispatchStatus::Done,
+                    ..
+                }
+            )
+        ));
     }
 
     #[test]

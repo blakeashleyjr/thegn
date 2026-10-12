@@ -2679,7 +2679,8 @@ mod tests {
         let active = put_row(&db, "linear:THE-259-A", "/wt/a");
         db.conn()
             .execute(
-                "UPDATE agent_dispatches SET stage='code', status=' running ' WHERE id=?1",
+                "UPDATE agent_dispatches SET stage='code', status=char(9)||'running'||char(10)
+                 WHERE id=?1",
                 [active],
             )
             .unwrap();
@@ -2699,5 +2700,13 @@ mod tests {
             decision,
             crate::pipeline_claim::ClaimDecision::AtCapacity { .. }
         ));
+    }
+
+    #[test]
+    fn admission_active_statuses_match_pipeline_occupying_statuses() {
+        assert_eq!(
+            ADMISSION_ACTIVE_STATUSES.as_slice(),
+            crate::pipeline_claim::occupying_statuses().as_slice()
+        );
     }
 }
