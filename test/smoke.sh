@@ -19,6 +19,42 @@ SZ="$(cd "$(dirname "$SZ")" && pwd)/$(basename "$SZ")"
 }
 
 TMP="$(mktemp -d)"
+FIXTURE_DAEMON_PIDS=()
+FIXTURE_DAEMON_SOCKETS=()
+track_daemon() {
+  FIXTURE_DAEMON_PIDS+=("$1")
+  FIXTURE_DAEMON_SOCKETS+=("$2")
+}
+untrack_daemon() {
+  local wanted="$1" index
+  local -a pids=() sockets=()
+  for index in "${!FIXTURE_DAEMON_PIDS[@]}"; do
+    if [[ ${FIXTURE_DAEMON_PIDS[$index]} != "$wanted" ]]; then
+      pids+=("${FIXTURE_DAEMON_PIDS[$index]}")
+      sockets+=("${FIXTURE_DAEMON_SOCKETS[$index]}")
+    fi
+  done
+  FIXTURE_DAEMON_PIDS=("${pids[@]}")
+  FIXTURE_DAEMON_SOCKETS=("${sockets[@]}")
+}
+stop_fixture_daemon() {
+  local pid="$1" socket="$2" label="$3"
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$pid" 2>/dev/null && ! kill -KILL "$pid" 2>/dev/null; then
+    echo "smoke cleanup: could not SIGKILL daemon PID $pid" >&2
+  fi
+  wait "$pid" 2>/dev/null || true
+  untrack_daemon "$pid"
+  for _ in $(seq 1 50); do
+    [[ ! -S $socket ]] && break
+    sleep 0.1
+  done
+  check "$label" "[[ ! -S '$socket' ]]"
+}
 # Best-effort teardown that preserves the real exit status. $HOME is inside
 # $TMP, so if any check exercised a container backend, podman leaves overlay
 # storage under $TMP/.local/share/containers/storage/overlay/ that this user
@@ -27,6 +63,34 @@ TMP="$(mktemp -d)"
 # the job. Never let cleanup decide the verdict.
 cleanup() {
   local rc=$?
+  local pid index
+  for pid in "${FIXTURE_DAEMON_PIDS[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for _ in $(seq 1 50); do
+    local any_alive=0
+    for pid in "${FIXTURE_DAEMON_PIDS[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        any_alive=1
+        break
+      fi
+    done
+    [[ $any_alive -eq 1 ]] || break
+    sleep 0.1
+  done
+  for pid in "${FIXTURE_DAEMON_PIDS[@]}"; do
+    if kill -0 "$pid" 2>/dev/null && ! kill -KILL "$pid" 2>/dev/null; then
+      echo "smoke cleanup: could not SIGKILL daemon PID $pid" >&2
+    fi
+  done
+  for pid in "${FIXTURE_DAEMON_PIDS[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  for index in "${!FIXTURE_DAEMON_SOCKETS[@]}"; do
+    if [[ -S ${FIXTURE_DAEMON_SOCKETS[$index]} ]]; then
+      echo "smoke cleanup: daemon socket survived for PID ${FIXTURE_DAEMON_PIDS[$index]}: ${FIXTURE_DAEMON_SOCKETS[$index]}" >&2
+    fi
+  done
   [[ -d "$TMP/.local/share/containers" ]] && podman unshare rm -rf "$TMP/.local/share/containers" >/dev/null 2>&1 || true
   local pause_pid_file="${XDG_RUNTIME_DIR:-}/libpod/tmp/pause.pid"
   if [[ -f $pause_pid_file ]]; then
@@ -36,6 +100,9 @@ cleanup() {
   exit "$rc"
 }
 trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 export HOME="$TMP" XDG_CONFIG_HOME="$TMP/.config" XDG_STATE_HOME="$TMP/.local/state"
 # Git's config is part of the fixture boundary too. A runner may provide a
@@ -1429,6 +1496,7 @@ SQL
     KILL_SOCK="$TMP/thegn-move-kill.sock"
     move_cli "$KILL" daemon --socket "$KILL_SOCK" &
     KILL_PID=$!
+    track_daemon "$KILL_PID" "$KILL_SOCK"
     for _ in $(seq 1 40); do
       [[ -S $KILL_SOCK ]] && break
       sleep 0.1
@@ -1475,8 +1543,14 @@ SQL
     else
       bad "session move --kill fixture could not start or create a daemon session"
     fi
-    kill "$KILL_PID" 2>/dev/null || true
-    wait "$KILL_PID" 2>/dev/null || true
+    stop_fixture_daemon "$KILL_PID" "$KILL_SOCK" \
+      "session move --kill daemon exits and unlinks its socket"
+    if command -v sqlite3 >/dev/null 2>&1; then
+      kill_daemon_rows="$(sqlite3 "$KILL/state/thegn/thegn.db" \
+        'SELECT count(*) FROM daemons' 2>/dev/null || echo 1)"
+      check "session move --kill daemon registry row is removed" \
+        "[[ '$kill_daemon_rows' -eq 0 ]]"
+    fi
   fi
 
   # Collision: exercise each strict target conflict class. Every command must
@@ -1743,9 +1817,8 @@ prompt = "row={row} artifact={artifact}; run thegn dispatch report {row} --text 
 name = "smoke-chunk"
 agent = "claude"
 concurrency = 4
-# Config admission refuses a stage whose prompt never tells the worker to
-# run thegn dispatch report: the done-gate requires a report, so such a row
-# could only ever be closed by force. Same shape as smoke-live above.
+# This stage prompt includes the worker's report command, matching the
+# configured smoke-live stage above.
 # (No backticks: this heredoc is unquoted, so the shell would run them.)
 prompt = "row={row} chunk={artifact} on {branch}; run thegn dispatch report {row} --text DONE"
 EOF
@@ -2043,6 +2116,7 @@ if command -v curl >/dev/null 2>&1; then
     --set sandbox.limits.memory=off \
     --set sandbox.limits.cpu_total=off daemon --socket "$DSOCK" &
   DPID=$!
+  track_daemon "$DPID" "$DSOCK"
   for _ in $(seq 1 40); do
     [[ -S $DSOCK ]] && break
     sleep 0.1
@@ -2128,13 +2202,7 @@ if command -v curl >/dev/null 2>&1; then
     "grep -q '\"branch\":\"smoke-create\"' <<<'$wc_json' && \
      git -C '$R' worktree list --porcelain | grep -q 'smoke-create'"
 
-  kill "$DPID" 2>/dev/null || true
-  wait "$DPID" 2>/dev/null || true
-  for _ in $(seq 1 20); do
-    [[ ! -S $DSOCK ]] && break
-    sleep 0.1
-  done
-  check "daemon cleanup unlinks the socket" "[[ ! -S '$DSOCK' ]]"
+  stop_fixture_daemon "$DPID" "$DSOCK" "daemon cleanup unlinks the socket"
   if command -v sqlite3 >/dev/null 2>&1; then
     rows="$(sqlite3 "$XDG_STATE_HOME/thegn/thegn.db" 'SELECT count(*) FROM daemons' 2>/dev/null || echo 0)"
     check "daemon cleanup removes its registry row" "[[ '$rows' -eq 0 ]]"
@@ -2146,8 +2214,9 @@ fi
 # CLI verbs never spawn a daemon as a side effect — only PANE spawns lazily
 # ensure one (the default-on [daemon] routes panes, not verbs). Every verb
 # above ran daemon-less; no socket may exist on either default path.
+DEFAULT_ENDPOINT="$("$SZ" doctor --json | sed -n 's/.*"endpoint"[[:space:]]*:[[:space:]]*"\([^\"]*\)".*/\1/p' | head -n 1)"
 check "CLI verbs never spawn a daemon" \
-  "[[ ! -S \"$XDG_RUNTIME_DIR/thegn/daemon.sock\" && ! -S \"$XDG_STATE_HOME/thegn/run/daemon.sock\" ]]"
+  "[[ -n \"$DEFAULT_ENDPOINT\" && ! -S \"$DEFAULT_ENDPOINT\" && ! -S \"$XDG_RUNTIME_DIR/thegn/daemon.sock\" && ! -S \"$XDG_STATE_HOME/thegn/run/daemon.sock\" ]]"
 FALLBACK_ENDPOINT="$(env -u XDG_RUNTIME_DIR "$SZ" doctor --json | sed -n 's/.*"endpoint"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
 FALLBACK_PARENT="$(dirname "$FALLBACK_ENDPOINT")"
 FALLBACK_PARENT_BEFORE=0
@@ -2172,6 +2241,7 @@ if command -v curl >/dev/null 2>&1; then
   DSOCK2="$TMP/d2.sock"
   "$SZ" daemon --socket "$DSOCK2" &
   D2PID=$!
+  track_daemon "$D2PID" "$DSOCK2"
   for _ in $(seq 1 40); do
     [[ -S $DSOCK2 ]] && break
     sleep 0.1
@@ -2189,8 +2259,14 @@ if command -v curl >/dev/null 2>&1; then
   sleep 0.5
   "$SZ" session list --json 2>/dev/null | grep -q '"exited_at_ms"' || kill_ok=0
   check "DELETE kills the session (explicit close = kill)" "[[ $kill_ok -eq 1 ]]"
-  kill "$D2PID" 2>/dev/null || true
-  wait "$D2PID" 2>/dev/null || true
+  stop_fixture_daemon "$D2PID" "$DSOCK2" \
+    "explicit close daemon exits and unlinks its socket"
+  if command -v sqlite3 >/dev/null 2>&1; then
+    d2_daemon_rows="$(sqlite3 "$XDG_STATE_HOME/thegn/thegn.db" \
+      'SELECT count(*) FROM daemons' 2>/dev/null || echo 1)"
+    check "explicit close daemon registry row is removed" \
+      "[[ '$d2_daemon_rows' -eq 0 ]]"
+  fi
 else
   echo "  skip close-kill check (curl not on PATH)"
 fi
