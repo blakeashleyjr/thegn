@@ -7,8 +7,88 @@
 //! `populate_tracker` runs on the hydration thread and reads only the DB
 //! cache (no network).
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use termwiz::terminal::TerminalWaker;
 use thegn_core::store::{CacheStore, WorktreeAuxStore};
+
+/// A refresh request waiting behind the currently admitted pass for one repo.
+struct RefreshRequest {
+    cwd: std::path::PathBuf,
+    app_cfg: thegn_core::config::Config,
+    waker: Option<TerminalWaker>,
+}
+
+/// One active refresh per key, with only the newest overlapping request kept.
+struct RefreshCoalescer<R> {
+    pending: Mutex<HashMap<String, Option<R>>>,
+}
+
+impl<R> RefreshCoalescer<R> {
+    fn new() -> Self {
+        Self {
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn begin(&self, key: &str, req: R) -> Option<R> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(slot) = pending.get_mut(key) {
+            *slot = Some(req);
+            None
+        } else {
+            pending.insert(key.to_owned(), None);
+            Some(req)
+        }
+    }
+
+    fn next(&self, key: &str) -> Option<R> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let request = pending.get_mut(key)?.take();
+        if request.is_none() {
+            pending.remove(key);
+        }
+        request
+    }
+
+    fn abandon(&self, key: &str) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
+    }
+}
+
+fn refresh_coalescer() -> &'static RefreshCoalescer<RefreshRequest> {
+    static COALESCER: OnceLock<RefreshCoalescer<RefreshRequest>> = OnceLock::new();
+    COALESCER.get_or_init(RefreshCoalescer::new)
+}
+
+struct RefreshGuard<'a, R> {
+    coalescer: &'a RefreshCoalescer<R>,
+    key: String,
+}
+
+impl<R> Drop for RefreshGuard<'_, R> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.coalescer.abandon(&self.key);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RefreshStart {
+    Started,
+    Coalesced,
+    Busy,
+}
 
 /// Refresh the per-repo issue cache off-thread: fetch every configured
 /// provider, diff old vs new per `(repo_root, provider)` key for
@@ -25,124 +105,168 @@ pub(crate) fn spawn_issue_cache_refresh(
     app_cfg: thegn_core::config::Config,
     waker: Option<TerminalWaker>,
 ) {
-    crate::sched::spawn_bg_replaceable(move || {
-        use thegn_core::issue::IssueFilter;
-        use thegn_svc::issue::IssueRouter;
+    match request_issue_refresh(cwd, app_cfg, waker) {
+        RefreshStart::Started | RefreshStart::Coalesced => {}
+        RefreshStart::Busy => {
+            tracing::debug!(target: "thegn::tracker", "issue cache refresh admission refused");
+        }
+    }
+}
 
-        if !cwd.is_dir() {
-            return;
-        }
-        let repo_root = thegn_core::repo::main_worktree(&cwd).unwrap_or_else(|| cwd.clone());
-        let cfg = app_cfg.repo_issues(Some(&repo_root));
-        let mut router = IssueRouter::from_config_at(&cfg, Some(&cwd));
-        // Provider-as-plugin: append live plugin issue providers.
-        crate::plugin_providers::extend_issue_router(&mut router);
-        if !router.is_configured() {
-            return;
-        }
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return;
+/// Request a user-visible or background refresh. Overlapping requests for the
+/// same worktree keep only the newest config/waker and share one admission slot.
+/// If admission is refused, cleanup also drops any request coalesced between
+/// `begin` and the refusal; those callers already received `Coalesced` and
+/// have no separate notification that their queued pass was discarded.
+pub(crate) fn request_issue_refresh(
+    cwd: std::path::PathBuf,
+    app_cfg: thegn_core::config::Config,
+    waker: Option<TerminalWaker>,
+) -> RefreshStart {
+    let key = cwd.to_string_lossy().into_owned();
+    let request = RefreshRequest {
+        cwd,
+        app_cfg,
+        waker,
+    };
+    let Some(first) = refresh_coalescer().begin(&key, request) else {
+        return RefreshStart::Coalesced;
+    };
+    let worker_key = key.clone();
+    let admission = crate::sched::spawn_bg(move || {
+        let _guard = RefreshGuard {
+            coalescer: refresh_coalescer(),
+            key: worker_key.clone(),
         };
-        // Repo scope for GitHub (other providers scope by team/project and
-        // ignore `repo`). Mirrors `spawn_my_work_refresh`.
-        let loc = thegn_core::remote::GitLoc::for_worktree(&cwd);
-        let filter = IssueFilter {
-            assignee_me: cfg.filter_assignee_me,
-            limit: cfg.max_issues,
-            repo: crate::forge_handle::get()
-                .for_loc(&loc)
-                .repo_ref(&loc)
-                .map(|r| r.nwo()),
-            ..Default::default()
-        };
-        // Fetch every configured account; cache and diff each under its own
-        // `(repo_root, provider, account)` key so trackers (and multiple
-        // accounts of one provider) aggregate without clobbering.
-        let per_provider = rt.block_on(router.list_per_provider(&filter));
-        let Ok(db) = thegn_core::db::Db::open() else {
-            return;
-        };
-        let repo_key = cwd.to_string_lossy();
-        let linked: std::collections::HashSet<String> = db
-            .linked_issues(&repo_key)
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        let mut changed = false;
-        for (account, provider, result) in per_provider {
-            let issues = match result {
-                Ok(issues) => {
-                    // Reached the tracker — online evidence for the app-wide holder.
-                    thegn_core::connectivity::report_success();
-                    issues
-                }
-                Err(e) => {
-                    // The arm was silent, so a permanently-failing account (bad
-                    // token, 400) showed as an empty tracker forever with no
-                    // trace anywhere (THE-72). One warn; the ring picks it up
-                    // for crash reports/bundles even with no sink installed.
-                    tracing::warn!(account = %account, provider, error = %e, "tracker refresh failed");
-                    // Only a dropped link is offline evidence (not a bad token).
-                    if e.is_transient() {
-                        thegn_core::connectivity::report_failure();
-                    }
-                    continue; // a failing account leaves its prior cache intact
-                }
-            };
-            let Ok(json) = serde_json::to_string(&issues) else {
-                continue;
-            };
-            // Diff old vs new for this account to emit notifications first.
-            let old_issues: Vec<thegn_core::issue::Issue> = db
-                .get_issue_cache(&repo_key, provider, &account)
-                .ok()
-                .flatten()
-                .and_then(|(j, _)| serde_json::from_str::<Vec<thegn_core::issue::Issue>>(&j).ok())
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|issue| thegn_svc::issue::validate_issue_identity(issue).is_ok())
-                .collect();
-            for (kind, source_ref, msg) in tracker_diff_notifications(&old_issues, &issues, &linked)
-            {
-                let _ = crate::automation_events::emit(&db, kind, &source_ref, &msg, &repo_key); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-            }
-            // Overdue is re-derived (not diffed) each refresh; the store-side
-            // emit-once (`put_notification_once`) keeps it to one row per
-            // (issue, due date).
-            for (source_ref, msg) in
-                overdue_notifications(&issues, &linked, thegn_core::util::now())
-            {
-                let _ = crate::automation_events::emit_once(
-                    &db,
-                    "overdue",
-                    &source_ref,
-                    &msg,
-                    &repo_key,
-                ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-            }
-            let _ = db.put_issue_cache(&repo_key, provider, &account, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-            changed = true;
-            // The refresh already runs on `sched::spawn_bg`; autopilot claims
-            // here but schedules each slow agent on its own bounded background
-            // worker. It receives filter provenance rather than guessing
-            // consent from issue display fields.
-            crate::autopilot_driver::pickup(
-                &app_cfg,
-                &repo_root,
-                &cwd,
-                &account,
-                provider,
-                &issues,
-                cfg.filter_assignee_me,
-            );
-        }
-        if changed && let Some(w) = &waker {
-            let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        let mut current = Some(first);
+        while let Some(request) = current {
+            run_once(request);
+            current = refresh_coalescer().next(&worker_key);
         }
     });
+    match admission {
+        crate::sched::Admission::Admitted => RefreshStart::Started,
+        crate::sched::Admission::Saturated | crate::sched::Admission::Unavailable => {
+            refresh_coalescer().abandon(&key);
+            RefreshStart::Busy
+        }
+    }
+}
+
+fn run_once(request: RefreshRequest) {
+    let RefreshRequest {
+        cwd,
+        app_cfg,
+        waker,
+    } = request;
+    use thegn_core::issue::IssueFilter;
+    use thegn_svc::issue::IssueRouter;
+
+    if !cwd.is_dir() {
+        return;
+    }
+    let repo_root = thegn_core::repo::main_worktree(&cwd).unwrap_or_else(|| cwd.clone());
+    let cfg = app_cfg.repo_issues(Some(&repo_root));
+    let mut router = IssueRouter::from_config_at(&cfg, Some(&cwd));
+    // Provider-as-plugin: append live plugin issue providers.
+    crate::plugin_providers::extend_issue_router(&mut router);
+    if !router.is_configured() {
+        return;
+    }
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return;
+    };
+    // Repo scope for GitHub (other providers scope by team/project and
+    // ignore `repo`). Mirrors `spawn_my_work_refresh`.
+    let loc = thegn_core::remote::GitLoc::for_worktree(&cwd);
+    let filter = IssueFilter {
+        assignee_me: cfg.filter_assignee_me,
+        limit: cfg.max_issues,
+        repo: crate::forge_handle::get()
+            .for_loc(&loc)
+            .repo_ref(&loc)
+            .map(|r| r.nwo()),
+        ..Default::default()
+    };
+    // Fetch every configured account; cache and diff each under its own
+    // `(repo_root, provider, account)` key so trackers (and multiple
+    // accounts of one provider) aggregate without clobbering.
+    let per_provider = rt.block_on(router.list_per_provider(&filter));
+    let Ok(db) = thegn_core::db::Db::open() else {
+        return;
+    };
+    let repo_key = cwd.to_string_lossy();
+    let linked: std::collections::HashSet<String> = db
+        .linked_issues(&repo_key)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let mut changed = false;
+    for (account, provider, result) in per_provider {
+        let issues = match result {
+            Ok(issues) => {
+                // Reached the tracker — online evidence for the app-wide holder.
+                thegn_core::connectivity::report_success();
+                issues
+            }
+            Err(e) => {
+                // The arm was silent, so a permanently-failing account (bad
+                // token, 400) showed as an empty tracker forever with no
+                // trace anywhere (THE-72). One warn; the ring picks it up
+                // for crash reports/bundles even with no sink installed.
+                tracing::warn!(account = %account, provider, error = %e, "tracker refresh failed");
+                // Only a dropped link is offline evidence (not a bad token).
+                if e.is_transient() {
+                    thegn_core::connectivity::report_failure();
+                }
+                continue; // a failing account leaves its prior cache intact
+            }
+        };
+        let Ok(json) = serde_json::to_string(&issues) else {
+            continue;
+        };
+        // Diff old vs new for this account to emit notifications first.
+        let old_issues: Vec<thegn_core::issue::Issue> = db
+            .get_issue_cache(&repo_key, provider, &account)
+            .ok()
+            .flatten()
+            .and_then(|(j, _)| serde_json::from_str::<Vec<thegn_core::issue::Issue>>(&j).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|issue| thegn_svc::issue::validate_issue_identity(issue).is_ok())
+            .collect();
+        for (kind, source_ref, msg) in tracker_diff_notifications(&old_issues, &issues, &linked) {
+            let _ = crate::automation_events::emit(&db, kind, &source_ref, &msg, &repo_key); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        }
+        // Overdue is re-derived (not diffed) each refresh; the store-side
+        // emit-once (`put_notification_once`) keeps it to one row per
+        // (issue, due date).
+        for (source_ref, msg) in overdue_notifications(&issues, &linked, thegn_core::util::now()) {
+            let _ =
+                crate::automation_events::emit_once(&db, "overdue", &source_ref, &msg, &repo_key); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        }
+        let _ = db.put_issue_cache(&repo_key, provider, &account, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        changed = true;
+        // The refresh already runs on `sched::spawn_bg`; autopilot claims
+        // here but schedules each slow agent on its own bounded background
+        // worker. It receives filter provenance rather than guessing
+        // consent from issue display fields.
+        crate::autopilot_driver::pickup(
+            &app_cfg,
+            &repo_root,
+            &cwd,
+            &account,
+            provider,
+            &issues,
+            cfg.filter_assignee_me,
+        );
+    }
+    if changed && let Some(w) = &waker {
+        let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+    }
 }
 
 /// The pure old-vs-new cache diff behind the tracker refresh's notification
@@ -264,4 +388,72 @@ pub(crate) fn populate_tracker(
     // (explicit `[[issue_accounts]]` or a synthesized legacy provider)? Lets the
     // panel say "off" (unconfigured) vs "clear" (empty) honestly.
     panel.issues_configured = !app_cfg.issues.active_accounts().is_empty();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RefreshCoalescer, RefreshGuard};
+
+    #[test]
+    fn coalesces_to_the_latest_request_and_releases_the_key() {
+        let coalescer = RefreshCoalescer::new();
+        assert_eq!(coalescer.begin("repo", 'A'), Some('A'));
+        assert_eq!(coalescer.begin("repo", 'B'), None);
+        assert_eq!(coalescer.begin("repo", 'C'), None);
+        assert_eq!(coalescer.next("repo"), Some('C'));
+        assert_eq!(coalescer.next("repo"), None);
+        assert_eq!(coalescer.begin("repo", 'D'), Some('D'));
+    }
+
+    #[test]
+    fn distinct_keys_do_not_coalesce() {
+        let coalescer = RefreshCoalescer::new();
+        assert_eq!(coalescer.begin("repo-a", 1), Some(1));
+        assert_eq!(coalescer.begin("repo-b", 2), Some(2));
+        assert_eq!(coalescer.next("repo-a"), None);
+        assert_eq!(coalescer.next("repo-b"), None);
+    }
+
+    #[test]
+    fn abandon_frees_the_key() {
+        let coalescer = RefreshCoalescer::new();
+        assert_eq!(coalescer.begin("repo", 'A'), Some('A'));
+        assert_eq!(coalescer.begin("repo", 'B'), None);
+        coalescer.abandon("repo");
+        assert_eq!(coalescer.begin("repo", 'C'), Some('C'));
+    }
+
+    #[test]
+    fn unwinding_worker_guard_frees_the_key() {
+        let coalescer = RefreshCoalescer::new();
+        assert_eq!(coalescer.begin("repo", 'A'), Some('A'));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = RefreshGuard {
+                coalescer: &coalescer,
+                key: "repo".to_owned(),
+            };
+            panic!("simulated refresh panic");
+        }));
+        assert!(result.is_err());
+        assert_eq!(coalescer.begin("repo", 'B'), Some('B'));
+    }
+
+    #[test]
+    fn finished_worker_guard_does_not_remove_a_new_workers_key() {
+        let coalescer = RefreshCoalescer::new();
+        assert_eq!(coalescer.begin("repo", 'A'), Some('A'));
+        let guard = RefreshGuard {
+            coalescer: &coalescer,
+            key: "repo".to_owned(),
+        };
+
+        // The active worker's final next() releases its key before the
+        // closure returns and drops its guard.
+        assert_eq!(coalescer.next("repo"), None);
+        assert_eq!(coalescer.begin("repo", 'B'), Some('B'));
+        drop(guard);
+
+        // A normal guard drop must not release worker B's admission slot.
+        assert_eq!(coalescer.begin("repo", 'C'), None);
+    }
 }

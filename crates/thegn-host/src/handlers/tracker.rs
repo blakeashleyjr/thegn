@@ -163,12 +163,19 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
             true
         }
         'r' => {
-            crate::hydrate_tracker::spawn_issue_cache_refresh(
+            ctx.model.status = match crate::hydrate_tracker::request_issue_refresh(
                 active_tab_path(ctx.session),
                 ctx.live_cfg.clone(),
                 Some(ctx.waker.clone()),
-            );
-            ctx.model.status = "Refreshing issues…".into();
+            ) {
+                crate::hydrate_tracker::RefreshStart::Started => "Refreshing issues…".into(),
+                crate::hydrate_tracker::RefreshStart::Coalesced => {
+                    "Issue refresh already running; another pass queued".into()
+                }
+                crate::hydrate_tracker::RefreshStart::Busy => {
+                    "Issue refresh busy — try again shortly".into()
+                }
+            };
             true
         }
         'a' => {
@@ -204,7 +211,17 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
                         let _ = waker2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                         return;
                     }
-                    crate::hydrate_tracker::spawn_issue_cache_refresh(cwd2, full_cfg, Some(waker2));
+                    let wake_on_busy = waker2.clone();
+                    if crate::hydrate_tracker::request_issue_refresh(cwd2, full_cfg, Some(waker2))
+                        == crate::hydrate_tracker::RefreshStart::Busy
+                    {
+                        thegn_core::msg::warn(
+                            "Issue refresh busy after assignment; try again shortly",
+                        );
+                        if let Err(error) = wake_on_busy.wake() {
+                            tracing::debug!(%error, "failed to wake after busy issue refresh");
+                        }
+                    }
                 });
                 ctx.model.status = format!("Assigning {} to you…", issue.number);
             }
