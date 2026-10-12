@@ -2037,7 +2037,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
         // `docker compose -f … -p <name> up -d [service runServices…]`. The
         // project name is the sandbox name, so the pane's `compose exec` (see
         // `enter_argv`) targets the same project.
-        crate::sandbox_compose::up_and_verify(&spec.name, &compose)?;
+        crate::sandbox_compose::up_and_verify(spec, &compose)?;
         return Ok(());
     }
 
@@ -2281,15 +2281,26 @@ pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Result<Vec<String>, EnterE
     let script = wrap_script(spec, inner);
     // A compose-backed spec with a named service attaches through
     // `docker compose exec <service>` — no container-name guessing.
-    let backend_argv = spec
+    let backend_argv = if let Some(compose) = spec
         .compose_spec()
         .filter(|c| spec.backend.is_oci() && c.has_service())
-        .and_then(|c| {
-            let workdir = (spec.file_access != FileAccess::None)
-                .then(|| spec.worktree.to_string_lossy().into_owned());
-            crate::sandbox_compose::exec_argv(&spec.name, &c, workdir.as_deref(), &script, true)
-        })
-        .unwrap_or_else(|| backend_enter_argv(spec, &script));
+    {
+        let target = crate::sandbox_compose::ComposeTarget::for_spec(spec)
+            .map_err(|error| EnterError::Refused(error.to_string()))?;
+        let workdir = (spec.file_access != FileAccess::None)
+            .then(|| spec.worktree.to_string_lossy().into_owned());
+        crate::sandbox_compose::exec_argv(
+            &target,
+            &spec.name,
+            &compose,
+            workdir.as_deref(),
+            &script,
+            true,
+        )
+        .ok_or_else(|| EnterError::Refused("Compose service is missing".into()))?
+    } else {
+        backend_enter_argv(spec, &script)
+    };
     // Cap the pane's CPU on host-toolchain backends (no-op unless configured; see
     // [`crate::sandbox_cpucap`]). OCI/Systemd cap inline in their backend argv.
     let backend_argv = crate::sandbox_cpucap::wrap_pane_argv(spec, backend_argv);
@@ -2863,12 +2874,19 @@ fn write_secret_env_file(
     if secret.is_empty() {
         return None;
     }
-    let dir = util::xdg_state_home().join("thegn/sandbox-env");
-    write_secret_env_file_in(&dir, name, secret, generation)
+    let anchor = util::xdg_state_home();
+    write_secret_env_file_in(
+        &anchor,
+        std::path::Path::new("thegn/sandbox-env"),
+        name,
+        secret,
+        generation,
+    )
 }
 
 fn write_secret_env_file_in(
-    dir: &std::path::Path,
+    anchor: &std::path::Path,
+    rel: &std::path::Path,
     name: &str,
     secret: &[(&String, &String)],
     generation: bool,
@@ -2876,7 +2894,9 @@ fn write_secret_env_file_in(
     if secret.is_empty() {
         return None;
     }
-    crate::fsperm::ensure_private_dir(dir).ok()?;
+    std::fs::create_dir_all(anchor).ok()?;
+    tighten_owned_state_dir(&anchor.join("thegn"));
+    let dir = crate::fsperm::ensure_private_dir_beneath(anchor, rel).ok()?;
     let file_name = if generation {
         static NEXT_ENV_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = NEXT_ENV_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2884,10 +2904,52 @@ fn write_secret_env_file_in(
     } else {
         format!("{name}.env")
     };
-    let path = dir.join(file_name);
     let body: String = secret.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-    crate::fsperm::write_owner_only_atomic(&path, body.as_bytes()).ok()?;
-    Some(path)
+    dir.write_owner_only_atomic(&file_name, body.as_bytes())
+        .ok()
+}
+
+/// State directories created under a user-private-group umask can be 0775.
+/// Tighten thegn's own directory before the secure walk, while leaving the
+/// trusted state anchor and any foreign or symlinked directory untouched.
+fn tighten_owned_state_dir(_path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if let Ok(metadata) = std::fs::symlink_metadata(_path)
+            && metadata.file_type().is_dir()
+            && metadata.uid() == nix::unistd::geteuid().as_raw()
+            && metadata.mode() & 0o022 != 0
+        {
+            use nix::fcntl::{OFlag, open};
+            use nix::sys::stat::{Mode, SFlag, fchmod, fstat};
+
+            let tightened = (|| {
+                let directory = open(
+                    _path,
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(std::io::Error::other)?;
+                let metadata = fstat(&directory).map_err(std::io::Error::other)?;
+                if !SFlag::from_bits_truncate(metadata.st_mode).contains(SFlag::S_IFDIR)
+                    || metadata.st_uid != nix::unistd::geteuid().as_raw()
+                    || metadata.st_mode & 0o022 == 0
+                {
+                    return Ok(());
+                }
+                fchmod(
+                    &directory,
+                    Mode::from_bits_truncate(metadata.st_mode & !0o022),
+                )
+                .map_err(std::io::Error::other)
+            })();
+            if let Err(error) = tightened {
+                tracing::debug!(path = %_path.display(), %error, "could not tighten sandbox state directory permissions");
+            }
+        }
+    }
 }
 
 fn systemd_env_cleanup_prop(rm: &str, path: &std::path::Path) -> Option<String> {

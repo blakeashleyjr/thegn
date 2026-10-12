@@ -7,6 +7,7 @@
 //! terminal without graphics) never breaks the preview — it just shows text.
 //! No AI/agent dependency anywhere.
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
@@ -18,8 +19,9 @@ pub struct Raster {
     pub h: u32,
 }
 
-/// Cap the longest side so the kitty payload (and base64 of it) stays bounded —
-/// a preview pane is a few hundred pixels at most.
+/// Cap the longest visible raster side so the kitty payload (and base64 of it)
+/// stays bounded — a preview pane is a few hundred pixels at most. This display
+/// cap is separate from the source decode budget in [`PREVIEW_LIMITS`].
 const MAX_DIM: u32 = 800;
 
 /// Hard bounds on the SOURCE image, checked from the header before any pixel
@@ -39,7 +41,8 @@ pub(crate) const MEDIA_ART_LIMITS: DecodeLimits = DecodeLimits {
     max_pixels: 32 * 1024 * 1024,
     max_alloc: 192 * 1024 * 1024,
 };
-/// Bound preview source dimensions while allowing high resolution photos.
+/// Bound preview source dimensions while allowing high resolution photos. This
+/// decode budget is separate from [`MAX_DIM`], which only caps visible output.
 const MAX_PREVIEW_INPUT_DIM: u32 = 16384;
 /// Bound preview pixel count to 256 MP before decoder allocation.
 const MAX_PREVIEW_INPUT_PIXELS: u64 = 256 * 1024 * 1024;
@@ -90,7 +93,7 @@ fn decode_and_fit(bytes: &[u8], limits: DecodeLimits) -> Result<Raster, String> 
         .decode()
         .map_err(|e| format!("image decode failed: {e}"))?;
     let img = if img.width() > MAX_DIM || img.height() > MAX_DIM {
-        img.resize(MAX_DIM, MAX_DIM, image::imageops::FilterType::Triangle)
+        img.thumbnail(MAX_DIM, MAX_DIM)
     } else {
         img
     };
@@ -201,12 +204,24 @@ pub(crate) fn image_bytes_with_limits(
 /// reaped on every path. Blocking.
 pub fn pdf_page1(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
     let mut cmd = Command::new("pdftoppm");
-    cmd.args(["-png", "-f", "1", "-l", "1", "-singlefile", "-r", "96"])
-        .arg(path)
-        .arg("-"); // write PNG to stdout
+    cmd.args(pdftoppm_args(path));
     let out = crate::preview_jobs::run_renderer(&mut cmd, cancel)
         .map_err(|e| format!("pdftoppm: {}", capture_err(&e)))?;
     decode_and_fit(&out, PREVIEW_LIMITS)
+}
+
+/// Bound pdftoppm's own page bitmap allocation. The visible raster is at most
+/// [`MAX_DIM`] too, but post-render decoding cannot protect the renderer's peak.
+fn pdftoppm_args(path: &Path) -> Vec<OsString> {
+    ["-png", "-f", "1", "-l", "1", "-singlefile", "-scale-to"]
+        .into_iter()
+        .map(OsString::from)
+        .chain([
+            OsString::from(MAX_DIM.to_string()),
+            path.as_os_str().to_owned(),
+            OsString::from("-"),
+        ])
+        .collect()
 }
 
 /// Extract a PDF's text via `pdftotext` (the no-graphics fallback). Output cut
@@ -296,6 +311,40 @@ mod tests {
     }
 
     #[test]
+    fn thumbnail_preserves_extreme_non_square_aspect_ratio() {
+        let img = image::RgbaImage::from_pixel(3000, 7, image::Rgba([0, 0, 0, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        let raster = decode_and_fit(buf.get_ref(), PREVIEW_LIMITS).unwrap();
+        assert_eq!(raster.w, MAX_DIM);
+        assert!(raster.h >= 1 && raster.h <= MAX_DIM);
+    }
+
+    #[test]
+    fn pdftoppm_arguments_bound_the_renderer_bitmap() {
+        let path = Path::new("document.pdf");
+        let args = pdftoppm_args(path);
+        let args: Vec<&std::ffi::OsStr> = args.iter().map(OsString::as_os_str).collect();
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == std::ffi::OsStr::new("-scale-to") && pair[1] == std::ffi::OsStr::new("800")
+        }));
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == std::ffi::OsStr::new("-f") && pair[1] == std::ffi::OsStr::new("1")
+        }));
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == std::ffi::OsStr::new("-l") && pair[1] == std::ffi::OsStr::new("1")
+        }));
+        assert!(args.contains(&std::ffi::OsStr::new("-singlefile")));
+        assert!(!args.contains(&std::ffi::OsStr::new("-r")));
+        assert_eq!(
+            &args[args.len() - 2..],
+            [path.as_os_str(), std::ffi::OsStr::new("-")]
+        );
+    }
+
+    #[test]
     fn dimension_guard_bounds_width_height_and_pixels() {
         assert!(check_dimensions(800, 800, MEDIA_ART_LIMITS).is_ok());
         assert!(check_dimensions(MEDIA_ART_LIMITS.max_dim, 1, MEDIA_ART_LIMITS).is_ok());
@@ -312,6 +361,10 @@ mod tests {
             .is_err()
         );
         assert!(check_dimensions(MAX_PREVIEW_INPUT_DIM, 1, PREVIEW_LIMITS).is_ok());
+        for limits in [MEDIA_ART_LIMITS, PREVIEW_LIMITS] {
+            assert!(check_dimensions(u32::MAX, u32::MAX, limits).is_err());
+            assert!(check_dimensions(u32::MAX, 1, limits).is_err());
+        }
         assert!(
             check_dimensions(
                 MAX_PREVIEW_INPUT_DIM,
@@ -341,14 +394,47 @@ mod tests {
     }
 
     #[test]
+    fn truncated_png_is_rejected() {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2))
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        let mut png = buf.into_inner();
+        png.truncate(33); // complete signature and IHDR, with IDAT absent
+        assert!(decode_and_fit(&png, PREVIEW_LIMITS).is_err());
+    }
+
+    #[test]
+    fn repeated_dimension_bomb_failures_are_stable() {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1))
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        let mut png = buf.into_inner();
+        png[16..20].copy_from_slice(&60000u32.to_be_bytes());
+        png[20..24].copy_from_slice(&60000u32.to_be_bytes());
+        let crc = crc32fast::hash(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+        let first = decode_and_fit(&png, PREVIEW_LIMITS)
+            .err()
+            .expect("dimension bomb must be rejected");
+        for _ in 0..50 {
+            let error = decode_and_fit(&png, PREVIEW_LIMITS)
+                .err()
+                .expect("dimension bomb must be rejected");
+            assert_eq!(error, first);
+        }
+    }
+
+    #[test]
     fn read_regular_capped_enforces_cap_and_kind() {
-        let dir = std::env::temp_dir().join(format!("thegn-rast-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let f = dir.join("f.bin");
         std::fs::write(&f, [7u8; 100]).unwrap();
         assert_eq!(read_regular_capped(&f, 100).unwrap().len(), 100);
         assert!(read_regular_capped(&f, 99).is_err());
-        assert!(read_regular_capped(&dir, 100).is_err(), "directory refused");
+        assert!(read_regular_capped(dir, 100).is_err(), "directory refused");
         if crate::platform::test_symlink_supported() {
             let target = dir.join("target");
             let link = dir.join("link");
@@ -362,7 +448,6 @@ mod tests {
             // Must return promptly instead of blocking on the FIFO.
             assert!(read_regular_capped(&fifo, 100).is_err());
         }
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: temp cleanup
     }
 
     #[test]

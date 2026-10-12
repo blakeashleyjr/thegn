@@ -22,7 +22,7 @@
 
 use std::sync::atomic::Ordering;
 
-use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::watch as tokio_watch;
 use tokio::time::MissedTickBehavior;
 
 use termwiz::terminal::TerminalWaker;
@@ -38,12 +38,36 @@ pub(crate) struct MediaSnapshotDelivery {
     pub(crate) snapshot: Option<MediaSnapshot>,
 }
 
+pub(crate) type SnapshotSender = tokio_watch::Sender<Option<MediaSnapshotDelivery>>;
+pub(crate) type SnapshotReceiver = tokio_watch::Receiver<Option<MediaSnapshotDelivery>>;
+
+/// Store only the newest offered generation in the capacity-one mailbox.
+pub(crate) fn offer(tx: &SnapshotSender, delivery: MediaSnapshotDelivery) -> Result<bool, ()> {
+    if tx.is_closed() {
+        return Err(());
+    }
+    let mut accepted = false;
+    tx.send_if_modified(|stored| {
+        if stored
+            .as_ref()
+            .is_none_or(|current| delivery.generation >= current.generation)
+        {
+            *stored = Some(delivery);
+            accepted = true;
+            true
+        } else {
+            false
+        }
+    });
+    Ok(accepted)
+}
+
 /// Spawn the now-playing watcher for `cfg`. Returns the task handle so the caller
 /// can abort it on a config/player change; `None` when media is disabled.
 pub(crate) fn spawn(
     cfg: MediaConfig,
     generation: u64,
-    tx: tokio_mpsc::UnboundedSender<MediaSnapshotDelivery>,
+    tx: SnapshotSender,
     waker: TerminalWaker,
     previous: Option<tokio::task::JoinHandle<()>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -214,7 +238,7 @@ fn shows_badge(snap: &Option<MediaSnapshot>) -> bool {
 async fn push_snapshot(
     client: &thegn_media::MediaClient,
     generation: u64,
-    tx: &tokio_mpsc::UnboundedSender<MediaSnapshotDelivery>,
+    tx: &SnapshotSender,
     waker: &TerminalWaker,
     was_showing: bool,
     state: &mut WatchState,
@@ -266,14 +290,18 @@ async fn push_snapshot(
     if !should_deliver(&state.last_sent, state.last_epoch, epoch, &snap) {
         return Some(active);
     }
-    if tx
-        .send(MediaSnapshotDelivery {
+    let accepted = match offer(
+        tx,
+        MediaSnapshotDelivery {
             generation,
             snapshot: snap.clone(),
-        })
-        .is_err()
-    {
-        return None;
+        },
+    ) {
+        Ok(accepted) => accepted,
+        Err(()) => return None,
+    };
+    if !accepted {
+        return Some(active);
     }
     if let Err(error) = waker.wake() {
         tracing::debug!(target: "thegn::media", %error, "media watcher wake failed");
@@ -294,12 +322,7 @@ fn note_cleared(prev_active: bool, now_active: bool) {
     }
 }
 
-async fn run(
-    cfg: MediaConfig,
-    generation: u64,
-    tx: tokio_mpsc::UnboundedSender<MediaSnapshotDelivery>,
-    waker: TerminalWaker,
-) {
+async fn run(cfg: MediaConfig, generation: u64, tx: SnapshotSender, waker: TerminalWaker) {
     let period = std::time::Duration::from_secs(cfg.poll_interval_secs.max(1));
     let max_backoff = std::time::Duration::from_secs(30);
     let mut backoff = std::time::Duration::from_secs(1);
@@ -326,20 +349,23 @@ async fn run(
                 active = shows_badge(&snapshot);
                 let epoch = crate::media_ctl::MEDIA_DELIVERY_EPOCH.load(Ordering::Acquire);
                 if should_deliver(&state.last_sent, state.last_epoch, epoch, &snapshot) {
-                    if tx
-                        .send(MediaSnapshotDelivery {
+                    let accepted = match offer(
+                        &tx,
+                        MediaSnapshotDelivery {
                             generation,
                             snapshot: snapshot.clone(),
-                        })
-                        .is_err()
-                    {
-                        return;
+                        },
+                    ) {
+                        Ok(accepted) => accepted,
+                        Err(()) => return,
+                    };
+                    if accepted {
+                        if let Err(error) = waker.wake() {
+                            tracing::debug!(target: "thegn::media", %error, "media watcher wake failed");
+                        }
+                        state.last_sent = snapshot;
+                        state.last_epoch = epoch;
                     }
-                    if let Err(error) = waker.wake() {
-                        tracing::debug!(target: "thegn::media", %error, "media watcher wake failed");
-                    }
-                    state.last_sent = snapshot;
-                    state.last_epoch = epoch;
                 }
             }
             let retry_after = state
@@ -435,7 +461,7 @@ async fn run(
 /// Returns `(full, bars)` repaint intent for the loop's `dirty` / `bars_dirty`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drain_snapshots(
-    rx: &mut tokio_mpsc::UnboundedReceiver<MediaSnapshotDelivery>,
+    rx: &mut SnapshotReceiver,
     perf: &mut crate::perf::LoopPerf,
     enabled: bool,
     generation: u64,
@@ -444,16 +470,16 @@ pub(crate) fn drain_snapshots(
     coalesce_full: bool,
     last_full: &mut Option<std::time::Instant>,
 ) -> (bool, bool) {
-    let mut newest = None;
-    while let Ok(delivery) = rx.try_recv() {
-        if delivery.generation != generation {
-            continue;
-        }
-        newest = Some(delivery.snapshot);
-    }
-    let Some(newest) = newest else {
+    let Ok(true) = rx.has_changed() else {
         return (false, false);
     };
+    let Some(delivery) = rx.borrow_and_update().clone() else {
+        return (false, false);
+    };
+    if delivery.generation != generation {
+        return (false, false);
+    }
+    let newest = delivery.snapshot;
     perf.tick(crate::perf::WakeSource::Refresh);
     let shown = if enabled { newest } else { None };
     let shown_state = shown.as_ref().map(|snapshot| snapshot.state.clone());
@@ -483,12 +509,12 @@ pub(crate) fn drain_snapshots(
 
 #[cfg(test)]
 mod tests {
-    use tokio::sync::mpsc;
+    use tokio::sync::watch;
     use tokio::time::MissedTickBehavior;
 
     use super::{
         FlapAction, Freshness, MediaSnapshotDelivery, STREAM_STABILITY, abort_and_join,
-        backoff_after_stream, drain_snapshots, flap_action, interval, should_confirm_flap,
+        backoff_after_stream, drain_snapshots, flap_action, interval, offer, should_confirm_flap,
         should_deliver, stale_grace,
     };
     use thegn_core::media::{MediaCaps, MediaSnapshot, MediaState};
@@ -618,7 +644,7 @@ mod tests {
 
     #[test]
     fn stale_snapshot_after_restart_cannot_replace_current_generation() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = watch::channel(None);
         let mut perf = crate::perf::LoopPerf::new();
         let mut media = None;
         let mut caps = None;
@@ -639,15 +665,21 @@ mod tests {
             },
             caps: MediaCaps::default(),
         };
-        tx.send(MediaSnapshotDelivery {
-            generation: 1,
-            snapshot: Some(current.clone()),
-        })
+        offer(
+            &tx,
+            MediaSnapshotDelivery {
+                generation: 1,
+                snapshot: Some(current.clone()),
+            },
+        )
         .unwrap();
-        tx.send(MediaSnapshotDelivery {
-            generation: 0,
-            snapshot: Some(stale),
-        })
+        offer(
+            &tx,
+            MediaSnapshotDelivery {
+                generation: 0,
+                snapshot: Some(stale),
+            },
+        )
         .unwrap();
 
         drain_snapshots(
@@ -668,7 +700,7 @@ mod tests {
 
     #[test]
     fn drain_applies_only_the_newest_current_generation_snapshot() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = watch::channel(None);
         let mut perf = crate::perf::LoopPerf::new();
         let mut media = Some(MediaState {
             player: "player".into(),
@@ -689,10 +721,13 @@ mod tests {
             caps: MediaCaps::default(),
         };
         for snapshot in [first.clone(), middle, first.clone()] {
-            tx.send(MediaSnapshotDelivery {
-                generation: 7,
-                snapshot: Some(snapshot),
-            })
+            offer(
+                &tx,
+                MediaSnapshotDelivery {
+                    generation: 7,
+                    snapshot: Some(snapshot),
+                },
+            )
             .unwrap();
         }
         let repaint = drain_snapshots(
@@ -707,5 +742,48 @@ mod tests {
         );
         assert_eq!(repaint, (false, false));
         assert_eq!(media, Some(first.state));
+    }
+
+    #[test]
+    fn offer_keeps_newest_generation() {
+        let (tx, rx) = watch::channel(None);
+        offer(
+            &tx,
+            MediaSnapshotDelivery {
+                generation: 1,
+                snapshot: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            !offer(
+                &tx,
+                MediaSnapshotDelivery {
+                    generation: 0,
+                    snapshot: None
+                }
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            rx.borrow().as_ref().map(|delivery| delivery.generation),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn offer_reports_closed_receiver() {
+        let (tx, rx) = watch::channel(None);
+        drop(rx);
+        assert!(
+            offer(
+                &tx,
+                MediaSnapshotDelivery {
+                    generation: 1,
+                    snapshot: None
+                }
+            )
+            .is_err()
+        );
     }
 }

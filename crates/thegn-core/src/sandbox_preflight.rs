@@ -29,7 +29,7 @@ pub(crate) type PreflightRunner = dyn Fn(&[String]) -> Option<(bool, String)>;
 /// is `true` (cheap, always succeeds *if the container can exec at all*) and
 /// there is no `-it` (a capture probe has no controlling TTY). Wrapped through
 /// the placement so a remote OCI target is probed on its own host.
-pub(crate) fn preflight_exec_argv(spec: &SandboxSpec) -> Vec<String> {
+pub(crate) fn preflight_exec_argv(spec: &SandboxSpec) -> Result<Vec<String>, String> {
     // Seam: the only fs touch. `mount_sentinels` is pure over `host_exists`, and
     // returns nothing when it cannot prove a failure — in which case the body is
     // the literal `true` this probe used before.
@@ -43,18 +43,28 @@ pub(crate) fn preflight_exec_argv(spec: &SandboxSpec) -> Vec<String> {
 
 /// [`preflight_exec_argv`] with the probe body chosen by the caller — the pure
 /// half, so the argv shape is unit-tested without touching the filesystem.
-pub(crate) fn preflight_exec_argv_with(spec: &SandboxSpec, body: &str) -> Vec<String> {
+pub(crate) fn preflight_exec_argv_with(
+    spec: &SandboxSpec,
+    body: &str,
+) -> Result<Vec<String>, String> {
     if let Some(compose) = spec
         .compose_spec()
         .filter(|compose| spec.backend.is_oci() && compose.has_service())
     {
         let workdir = (spec.file_access != FileAccess::None)
             .then(|| spec.worktree.to_string_lossy().into_owned());
-        if let Some(argv) =
-            crate::sandbox_compose::exec_argv(&spec.name, &compose, workdir.as_deref(), body, false)
-        {
-            return spec.placement.control_argv(&argv);
-        }
+        let target = crate::sandbox_compose::ComposeTarget::for_spec(spec)
+            .map_err(|error| error.to_string())?;
+        let argv = crate::sandbox_compose::exec_argv(
+            &target,
+            &spec.name,
+            &compose,
+            workdir.as_deref(),
+            body,
+            false,
+        )
+        .ok_or_else(|| "Compose service is missing".to_string())?;
+        return Ok(spec.placement.control_argv(&argv));
     }
     let mut v = oci_prefix(spec);
     v.push("exec".into());
@@ -65,7 +75,7 @@ pub(crate) fn preflight_exec_argv_with(spec: &SandboxSpec, body: &str) -> Vec<St
     }
     v.push(spec.name.clone());
     v.extend(["/bin/sh".into(), "-lc".into(), body.to_string()]);
-    spec.placement.control_argv(&v)
+    Ok(spec.placement.control_argv(&v))
 }
 
 /// Verify the pane's exec path works before we spawn the (doomed) pane.
@@ -89,7 +99,7 @@ pub(crate) fn preflight_exec_with(spec: &SandboxSpec, run: &PreflightRunner) -> 
     if !spec.backend.is_oci() {
         return Ok(());
     }
-    let argv = preflight_exec_argv(spec);
+    let argv = preflight_exec_argv(spec)?;
     match run(&argv) {
         Some((true, _)) => Ok(()),
         Some((false, stderr)) => {
@@ -248,7 +258,7 @@ mod tests {
         let mut s = base_spec(Backend::Podman);
         s.worktree = std::path::PathBuf::from("/wt/feat");
         s.name = "thegn-repo-feat".into();
-        let argv = preflight_exec_argv(&s);
+        let argv = preflight_exec_argv(&s).unwrap();
         // Same shape as the pane exec, but `true` and no `-it`.
         assert_eq!(argv[0], "podman");
         assert!(argv.contains(&"exec".to_string()));
@@ -270,7 +280,7 @@ mod tests {
     fn file_access_none_drops_workdir() {
         let mut s = base_spec(Backend::Podman);
         s.file_access = FileAccess::None;
-        let argv = preflight_exec_argv(&s);
+        let argv = preflight_exec_argv(&s).unwrap();
         assert!(
             !argv.contains(&"--workdir".to_string()),
             "no worktree mount ⇒ no --workdir"
@@ -282,7 +292,7 @@ mod tests {
     fn targets_remote_daemon_connection() {
         let mut s = base_spec(Backend::Podman);
         s.oci_host = Some("ci-box".into());
-        let argv = preflight_exec_argv(&s);
+        let argv = preflight_exec_argv(&s).unwrap();
         // oci_prefix injects the connection flag right after the binary.
         assert!(argv.contains(&"--connection".to_string()));
         assert!(argv.contains(&"ci-box".to_string()));
@@ -304,18 +314,24 @@ mod tests {
         };
         let mut spec = base_spec(Backend::Docker);
         spec.compose = Some(compose.encode());
-        let routed = preflight_exec_argv_with(&spec, "true");
+        let routed = preflight_exec_argv_with(&spec, "true").unwrap();
         let workdir = spec.worktree.to_string_lossy().into_owned();
-        let pane_path =
-            crate::sandbox_compose::exec_argv(&spec.name, &compose, Some(&workdir), "true", false)
-                .unwrap();
+        let pane_path = crate::sandbox_compose::exec_argv(
+            &crate::sandbox_compose::ComposeTarget::for_spec(&spec).unwrap(),
+            &spec.name,
+            &compose,
+            Some(&workdir),
+            "true",
+            false,
+        )
+        .unwrap();
         assert_eq!(routed, spec.placement.control_argv(&pane_path));
         let exec = routed.iter().position(|arg| arg == "exec").unwrap();
         assert!(routed[exec + 1..].iter().any(|arg| arg == "worker"));
         assert!(!routed.contains(&"-it".into()));
 
         spec.backend = Backend::Bwrap;
-        let bwrap = preflight_exec_argv_with(&spec, "true");
+        let bwrap = preflight_exec_argv_with(&spec, "true").unwrap();
         assert_eq!(bwrap.first().map(String::as_str), Some("bwrap"));
         assert!(!bwrap.iter().any(|arg| arg == "compose"));
     }
@@ -352,6 +368,29 @@ mod tests {
             after_exec.get(service_index).map(String::as_str),
             Some("app")
         );
+    }
+
+    #[test]
+    fn unsupported_compose_preflight_refuses_before_runner() {
+        let compose = crate::sandbox_compose::ComposeSpec {
+            files: vec!["compose.yml".into()],
+            service: Some("app".into()),
+            run_services: Vec::new(),
+        };
+        let mut spec = base_spec(Backend::Apple);
+        spec.compose = Some(compose.encode());
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runner_called = std::sync::Arc::clone(&called);
+        let result = preflight_exec_with(&spec, &move |_| {
+            runner_called.store(true, std::sync::atomic::Ordering::Relaxed);
+            Some((true, String::new()))
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .contains("unsupported for backend 'apple'")
+        );
+        assert!(!called.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]

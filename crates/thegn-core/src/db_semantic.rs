@@ -216,6 +216,59 @@ impl SemanticStore for Db {
 }
 
 impl Db {
+    /// Remove indexed files omitted from a successful worktree listing, but
+    /// only when the file is gone and this root owns it (no nested worktree).
+    pub fn prune_unlisted_semantic_files(
+        &self,
+        root: &str,
+        listed: &HashSet<String>,
+    ) -> Result<usize> {
+        let pattern = format!("{}/%", like_escape(root));
+        let files = {
+            let mut stmt = self.conn().prepare(
+                r#"SELECT DISTINCT file FROM sem_entity
+                   WHERE file LIKE ?1 ESCAPE '\'"#,
+            )?;
+            let rows = stmt.query_map(params![pattern], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let roots = {
+            let mut stmt = self
+                .conn()
+                .prepare("SELECT worktree FROM worktrees WHERE worktree != ''")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let stale: Vec<String> = files
+            .into_iter()
+            .filter(|file| !listed.contains(file) && !Path::new(file).exists())
+            .filter(|file| {
+                roots
+                    .iter()
+                    .filter(|registered| {
+                        Path::new(file).starts_with(Path::new(registered.as_str()))
+                    })
+                    .max_by_key(|registered| registered.len())
+                    .is_none_or(|owner| owner.as_str() == root)
+            })
+            .collect();
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn().unchecked_transaction()?;
+        for file in &stale {
+            tx.execute(
+                r#"DELETE FROM sem_edge
+                   WHERE src_id IN (SELECT id FROM sem_entity WHERE file=?1)
+                      OR dst_id IN (SELECT id FROM sem_entity WHERE file=?1)"#,
+                params![file],
+            )?;
+            tx.execute("DELETE FROM sem_entity WHERE file=?1", params![file])?;
+        }
+        tx.commit()?;
+        Ok(stale.len())
+    }
+
     /// Sweep one bounded slice of semantic entities whose source files are gone.
     /// A missing file under the longest matching registered root is pruned only
     /// when that root is locally live (`.git` exists); remote or unavailable
@@ -710,6 +763,83 @@ mod tests {
         assert_eq!(db.entities_under("/wt2").unwrap().len(), 1);
         // A root with no rows yields nothing.
         assert!(db.entities_under("/nowhere").unwrap().is_empty());
+    }
+
+    #[test]
+    fn prune_unlisted_semantic_files_respects_disk_listing_and_nested_roots() {
+        use crate::store::WorkspaceStore;
+        use std::fs;
+
+        let db = Db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let nested = root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let kept = root.join("kept.rs");
+        fs::write(&kept, "pub fn kept() {}\n").unwrap();
+        let gone = root.join("gone.rs");
+        let listed_missing = root.join("listed.rs");
+        let nested_missing = nested.join("missing.rs");
+        let sibling = Path::new(&format!("{}2/x.rs", root.to_string_lossy())).to_path_buf();
+        let path = |path: &Path| path.to_string_lossy().into_owned();
+        let root_s = path(&root);
+        let kept_s = path(&kept);
+        let gone_s = path(&gone);
+        let listed_s = path(&listed_missing);
+        let nested_s = path(&nested_missing);
+        let sibling_s = path(&sibling);
+
+        db.put_worktree("root", &root_s, &root_s, "main", None, None)
+            .unwrap();
+        db.put_worktree("nested", &root_s, &path(&nested), "nested", None, None)
+            .unwrap();
+        for (id, file) in [
+            ("kept", kept_s.as_str()),
+            ("gone", gone_s.as_str()),
+            ("listed", listed_s.as_str()),
+            ("nested", nested_s.as_str()),
+            ("sibling", sibling_s.as_str()),
+        ] {
+            db.upsert_entity(&row(id, file, id, EntityKind::Function, "h1"))
+                .unwrap();
+        }
+        db.replace_edges_for_dsts(
+            &["kept".to_string()],
+            &[SemEdgeRow {
+                src_id: "gone".to_string(),
+                dst_id: "kept".to_string(),
+                kind: "call".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let listed = HashSet::from([listed_s.clone()]);
+        assert_eq!(
+            db.prune_unlisted_semantic_files(&root_s, &listed).unwrap(),
+            1
+        );
+        let remaining: HashSet<String> = db
+            .entities_under(&root_s)
+            .unwrap()
+            .into_iter()
+            .map(|entity| entity.file)
+            .collect();
+        assert!(remaining.contains(&kept_s));
+        assert!(!remaining.contains(&gone_s));
+        assert!(remaining.contains(&listed_s));
+        assert!(remaining.contains(&nested_s));
+        assert_eq!(
+            db.file_source_hash(&sibling_s).unwrap().as_deref(),
+            Some("h1"),
+            "a sibling prefix is outside the requested root"
+        );
+        let edges: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM sem_edge", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(edges, 0, "pruned file edges must be removed too");
     }
 
     #[test]

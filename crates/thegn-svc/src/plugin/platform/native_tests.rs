@@ -99,7 +99,9 @@ fn resident_native_fixture_entry() {
                 }
                 "eof-on-request" => close_standard_stream(true),
                 "invalid-output" => {
-                    std::io::stdout().write_all(b"\xff\n").unwrap();
+                    std::io::stdout()
+                        .write_all(b"\xff\n{\"method\":\"fixture_callback\",\"params\":{}}\n")
+                        .unwrap();
                     std::io::stdout().flush().unwrap();
                 }
                 "callback" => {
@@ -268,24 +270,37 @@ fn resident_native_stdout_eof_while_alive_is_bounded() {
 }
 
 #[test]
-fn resident_native_pipe_and_protocol_failures_close_owned_session() {
-    for (mode, reason) in [
-        ("closed-stdin", CloseReason::WriteFailed),
-        ("invalid-output", CloseReason::Protocol),
-    ] {
-        let fixture = Fixture::new();
-        let session = fixture.spawn(mode, mode);
-        session.writer().send_raw("trigger").unwrap();
-        let outcome = fixture.outcome(&session);
-        assert_eq!(outcome.reason, reason);
-        // WriteFailed records the actual native pipe error as a diagnostic.
-        assert!(outcome.settled(), "{outcome:?}");
-        assert_eq!(outcome.tree, TreeGuarantee::Unproven);
-        assert_eq!(
-            session.writer().send_raw("late"),
-            Err(SessionFailure::Closed)
-        );
-    }
+fn resident_native_closed_stdin_failure_closes_owned_session() {
+    let fixture = Fixture::new();
+    let session = fixture.spawn("closed-stdin", "closed-stdin");
+    session.writer().send_raw("trigger").unwrap();
+    let outcome = fixture.outcome(&session);
+    assert_eq!(outcome.reason, CloseReason::WriteFailed);
+    // WriteFailed records the actual native pipe error as a diagnostic.
+    assert!(outcome.settled(), "{outcome:?}");
+    assert_eq!(outcome.tree, TreeGuarantee::Unproven);
+    assert_eq!(
+        session.writer().send_raw("late"),
+        Err(SessionFailure::Closed)
+    );
+}
+
+#[test]
+fn resident_native_invalid_utf8_does_not_stop_later_callback() {
+    let fixture = Fixture::new();
+    let session = fixture.spawn_with_callback("invalid-output", "invalid-output", |event| {
+        if matches!(event, SessionEvent::Message(message) if message.method == "fixture_callback") {
+            panic!("valid frame after invalid UTF-8 reached callback");
+        }
+    });
+    session.writer().send_raw("trigger").unwrap();
+    let outcome = fixture.outcome(&session);
+    assert_eq!(outcome.reason, CloseReason::CallbackPanic);
+    assert_owned_settlement(&outcome);
+    assert_eq!(
+        session.writer().send_raw("late"),
+        Err(SessionFailure::Closed)
+    );
 }
 
 #[test]

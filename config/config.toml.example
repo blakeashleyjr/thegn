@@ -469,7 +469,7 @@ refresh_secs = 2           # Polling interval in seconds
 # leaves a gap between the icon and its value.
 # cpu_icon = "CPU"
 # mem_icon = "MEM"
-# net_icon = "NET"
+# net_icon = "NET"      # shipped default auto-selects Ethernet/Wi-Fi/generic from default route; any other value is fixed
 # gpu_icon = "GPU"              # shows only if a GPU is detected
 # temp_icon = "TMP"             # CPU/package temperature
 # swap_icon = "SWP"             # swap usage
@@ -3360,6 +3360,8 @@ allow_external_urls = false  # THEGN_PREVIEW_ALLOW_EXTERNAL_URLS; localhost-only
 [forward]
 auto = true            # auto-detect + forward newly-bound sandbox ports
 range = "8000-8999"    # host-port range for remaps when a port's own number is taken
+reverse_max_connections = 256 # concurrent connections per reverse tunnel run; 0 rejects all
+reverse_max_connections_total = 1024 # process-wide host cap, latched at first start; restart to change
 ignore = []            # container ports never to forward, e.g. [5432, 22]
 only = []              # if non-empty, ONLY forward these container ports
 bind = "127.0.0.1"     # host interface to bind forwards on (loopback = host-local)

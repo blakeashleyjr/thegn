@@ -498,7 +498,9 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
                 if terse {
                     GitOpResult::Err(first_line_str(&full))
                 } else {
-                    GitOpResult::HookFailed { output: full }
+                    GitOpResult::HookFailed {
+                        output: sanitize_and_redact_popup(&full),
+                    }
                 }
             }
         },
@@ -651,6 +653,13 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
     }
 }
 
+/// Make popup text safe for terminal rendering and redact secrets after
+/// sanitization, so terminal controls cannot split a secret token.
+fn sanitize_and_redact_popup(output: &str) -> String {
+    let sanitized = thegn_svc::lsp::sanitize_for_terminal(output);
+    thegn_core::ci_log::redact(&sanitized)
+}
+
 fn custom_command_result(
     outcome: (
         &'static str,
@@ -662,14 +671,15 @@ fn custom_command_result(
     capture: bool,
     redact_failure: bool,
 ) -> GitOpResult {
-    let (kind, status, mut stdout, stdout_truncated, stderr) = outcome;
+    let (kind, status, stdout, stdout_truncated, stderr) = outcome;
     match kind {
         CUSTOM_OUTCOME_EXITED if status.as_ref().is_some_and(|status| status.success()) => {
-            if capture && stdout_truncated {
-                stdout.push_str("\n… output truncated at 1 MiB");
-            }
             if capture {
-                GitOpResult::Output(stdout)
+                let mut output = sanitize_and_redact_popup(&stdout);
+                if stdout_truncated {
+                    output.push_str("\n… output truncated at 1 MiB");
+                }
+                GitOpResult::Output(output)
             } else {
                 GitOpResult::Ok(None)
             }
@@ -679,9 +689,8 @@ fn custom_command_result(
             if redact_failure {
                 GitOpResult::Err(format!("custom command failed ({status})"))
             } else {
-                let sanitized = thegn_svc::lsp::sanitize_for_terminal(&stderr);
-                let redacted = thegn_core::ci_log::redact(&sanitized);
-                let tail: Vec<String> = redacted
+                let safe_output = sanitize_and_redact_popup(&stderr);
+                let tail: Vec<String> = safe_output
                     .lines()
                     .filter(|line| !line.trim().is_empty())
                     .map(|line| line.chars().take(200).collect())
@@ -899,6 +908,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn hook_failed_popup_sanitizes_terminal_controls_and_redacts_secrets() {
+        let dir = tmp_repo("hook-popup-redaction");
+        let loc = GitLoc::Local(dir.clone());
+        let hook = dir.join(".git/hooks/pre-commit");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nprintf 'LINT FAILED\\r\\033]0;x\\007token https://u:hunter2@h.invalid\\n'; exit 1\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(dir.join("f.txt"), "two\n").unwrap();
+        assert!(matches!(
+            execute(GitOp::StageAll, &loc, false),
+            GitOpResult::Ok(_)
+        ));
+        match execute(
+            GitOp::Commit {
+                message: "blocked by hostile hook".into(),
+                no_verify: false,
+                sign: None,
+            },
+            &loc,
+            false,
+        ) {
+            GitOpResult::HookFailed { output } => {
+                assert!(output.contains("LINT FAILED"));
+                assert!(!output.contains('\r'));
+                assert!(!output.contains('\u{1b}'));
+                assert!(!output.contains("hunter2"));
+                assert!(output.contains(thegn_core::ci_log::REDACTION_MARKER));
+            }
+            other => panic!("expected sanitized HookFailed, got {other:?}"),
+        }
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::debug!(%error, "hostile hook test repo cleanup failed");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn custom_popup_marks_truncated_output() {
         let dir = tmp_repo("custom-popup-cap");
         let loc = GitLoc::Local(dir.clone());
@@ -918,6 +970,34 @@ mod tests {
         }
         if let Err(error) = std::fs::remove_dir_all(&dir) {
             tracing::debug!(%error, "custom popup test repo cleanup failed");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_popup_output_redacts_secrets_and_strips_terminal_controls() {
+        let dir = tmp_repo("custom-popup-redaction");
+        let loc = GitLoc::Local(dir.clone());
+        match execute(
+            GitOp::Custom {
+                command: "printf 'https://user:hunter2@example.invalid/r.git\\nghp_1234567890\\033]0;a b\\007ABCDEFGHIJ1234567890\\nline\\rpaint\\n'".into(),
+                capture: true,
+            },
+            &loc,
+            false,
+        ) {
+            GitOpResult::Output(output) => {
+                assert!(!output.contains("hunter2"));
+                assert!(!output.contains("ghp_1234567890"));
+                assert!(!output.contains('\u{1b}'));
+                assert!(!output.contains('\u{7}'));
+                assert!(!output.contains('\r'));
+                assert!(output.contains(thegn_core::ci_log::REDACTION_MARKER));
+            }
+            other => panic!("expected sanitized custom popup output, got {other:?}"),
+        }
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::debug!(%error, "custom popup redaction test repo cleanup failed");
         }
     }
 
