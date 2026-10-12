@@ -173,20 +173,18 @@ impl MediaBackend for Aggregate {
             let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
             let mut any = false;
             let mut tasks = Vec::new();
-            for watch in watches {
-                if let Some(mut w) = watch {
-                    any = true;
-                    let tx = tx.clone();
-                    // A notification means “refresh current state”; while one
-                    // refresh is pending, more notifications carry no information.
-                    tasks.push(tokio::spawn(async move {
-                        while w.changed().await {
-                            if !signal_refresh(&tx) {
-                                break;
-                            }
+            for mut w in watches.into_iter().flatten() {
+                any = true;
+                let tx = tx.clone();
+                // A notification means “refresh current state”; while one
+                // refresh is pending, more notifications carry no information.
+                tasks.push(tokio::spawn(async move {
+                    while w.changed().await {
+                        if !signal_refresh(&tx) {
+                            break;
                         }
-                    }));
-                }
+                    }
+                }));
             }
             any.then(|| Box::new(AggregateWatch { rx, tasks }) as Box<dyn MediaWatch + Send>)
         })
