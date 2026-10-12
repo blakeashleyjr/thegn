@@ -174,6 +174,13 @@ fn socket_usable_decision(
     let Some(parent) = socket.parent() else {
         return false;
     };
+    if parent
+        .parent()
+        .and_then(std::path::Path::file_name)
+        .is_some_and(|name| name == "thegn")
+    {
+        return runtime_socket_parent_usable(parent, probe);
+    }
     if let Some(metadata) = probe(parent) {
         return metadata.is_dir
             && !metadata.is_symlink
@@ -185,9 +192,39 @@ fn socket_usable_decision(
             metadata.is_dir && !metadata.is_symlink && metadata.mode & 0o1000 != 0
         });
     }
-    parent.parent().and_then(probe).is_some_and(|metadata| {
-        metadata.is_dir && !metadata.is_symlink && metadata.owned && metadata.mode & 0o777 == 0o700
-    })
+    false
+}
+
+#[cfg(unix)]
+fn runtime_socket_parent_usable(
+    parent: &std::path::Path,
+    probe: &dyn Fn(&std::path::Path) -> Option<DirMeta>,
+) -> bool {
+    // Runtime sockets have three directory levels below XDG_RUNTIME_DIR:
+    // `thegn/<scope-key>/daemon.sock`. Check every existing ancestor in that
+    // layout, even when the private per-scope leaf already exists.
+    let mut ancestor = Some(parent);
+    let mut found = false;
+    let mut has_private_anchor = false;
+    for depth in 0..3 {
+        let Some(path) = ancestor else { break };
+        if let Some(metadata) = probe(path) {
+            found = true;
+            if !metadata.is_dir || metadata.is_symlink || !metadata.owned {
+                return false;
+            }
+            if depth == 0 || depth == 2 {
+                if metadata.mode & 0o777 != 0o700 {
+                    return false;
+                }
+                has_private_anchor = true;
+            } else if metadata.mode & 0o022 != 0 {
+                return false;
+            }
+        }
+        ancestor = path.parent();
+    }
+    found && has_private_anchor
 }
 
 fn effective_uid() -> u32 {
@@ -262,6 +299,15 @@ pub(crate) fn legacy_socket_decision(
     }
 }
 
+#[cfg(unix)]
+fn legacy_runtime_socket_should_remove(
+    exists: bool,
+    is_socket: bool,
+    error: Option<std::io::ErrorKind>,
+) -> bool {
+    exists && is_socket && legacy_socket_decision(exists, error) == LegacySocketState::Stale
+}
+
 pub(crate) fn legacy_socket_state() -> LegacySocketState {
     let legacy = thegn_core::config_daemon::legacy_socket_path(
         &thegn_core::util::xdg_state_home().join("thegn"),
@@ -305,6 +351,9 @@ pub(crate) fn reconcile_legacy_socket(_dcfg: &thegn_core::config::DaemonConfig) 
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileTypeExt as _;
+        // The shared runtime endpoint belongs to no single state scope. Clean
+        // it independently so state-dir legacy handling cannot skip it.
+        reconcile_legacy_runtime_socket();
         let legacy = thegn_core::config_daemon::legacy_socket_path(
             &thegn_core::util::xdg_state_home().join("thegn"),
         );
@@ -326,6 +375,34 @@ pub(crate) fn reconcile_legacy_socket(_dcfg: &thegn_core::config::DaemonConfig) 
                 tracing::warn!(path = %legacy.display(), %error, "could not inspect legacy daemon endpoint");
             }
             Err(_) => {}
+        }
+    }
+}
+
+#[cfg(unix)]
+fn reconcile_legacy_runtime_socket() {
+    use std::os::unix::fs::FileTypeExt as _;
+    // A live socket may belong to another scope, so only remove it when a
+    // connect proves that it is stale; this cleanup never blocks this daemon.
+    if let Some(runtime_legacy) = thegn_core::config_daemon::legacy_runtime_socket_path(
+        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+    ) {
+        let metadata = std::fs::symlink_metadata(&runtime_legacy);
+        let exists = metadata.is_ok();
+        let is_socket = metadata.as_ref().is_ok_and(|md| md.file_type().is_socket());
+        let connect_error = if is_socket {
+            std::os::unix::net::UnixStream::connect(&runtime_legacy)
+                .err()
+                .map(|error| error.kind())
+        } else {
+            None
+        };
+        if legacy_runtime_socket_should_remove(exists, is_socket, connect_error) {
+            if let Err(error) = std::fs::remove_file(&runtime_legacy) {
+                tracing::warn!(path = %runtime_legacy.display(), %error, "could not remove stale legacy runtime daemon socket");
+            }
+        } else if exists && !is_socket {
+            tracing::warn!(path = %runtime_legacy.display(), "legacy runtime daemon endpoint is not a socket; leaving it untouched");
         }
     }
 }
@@ -1062,6 +1139,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn runtime_sockets_are_scoped_to_the_state_root() {
+        let config = thegn_core::config::DaemonConfig::default();
+        let first = socket_path_for(
+            &config,
+            Some("/run/user/1000"),
+            std::path::Path::new("/state/one"),
+            1000,
+            None,
+        );
+        let second = socket_path_for(
+            &config,
+            Some("/run/user/1000"),
+            std::path::Path::new("/state/two"),
+            1000,
+            None,
+        );
+        let legacy =
+            thegn_core::config_daemon::legacy_runtime_socket_path(Some("/run/user/1000")).unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first, legacy);
+        assert_ne!(second, legacy);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn existing_private_fallback_directory_must_have_private_mode() {
         use std::os::unix::fs::PermissionsExt as _;
         let td = tempfile::tempdir().unwrap();
@@ -1097,6 +1199,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn legacy_runtime_socket_cleanup_decision_only_removes_absent_or_stale_sockets() {
+        assert!(!legacy_runtime_socket_should_remove(
+            false,
+            false,
+            Some(std::io::ErrorKind::NotFound)
+        ));
+        assert!(legacy_runtime_socket_should_remove(
+            true,
+            true,
+            Some(std::io::ErrorKind::ConnectionRefused)
+        ));
+        assert!(!legacy_runtime_socket_should_remove(true, true, None));
+        assert!(!legacy_runtime_socket_should_remove(
+            true,
+            false,
+            Some(std::io::ErrorKind::ConnectionRefused)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn socket_usable_decision_checks_legacy_private_tmp_and_runtime_paths() {
         let legacy = std::path::Path::new("/state/thegn/run/daemon.sock");
         let state = std::path::Path::new("/home/blake/.local/state/thegn");
@@ -1109,7 +1232,9 @@ mod tests {
             .unwrap();
         assert_eq!(hash.len(), 32);
         assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        let runtime_socket = std::path::Path::new("/run/user/1000/thegn/daemon.sock");
+        let runtime_socket = std::path::Path::new(
+            "/run/user/1000/thegn/0123456789abcdef0123456789abcdef/daemon.sock",
+        );
         let absent = |_: &std::path::Path| None;
         assert!(!socket_usable_decision(
             LegacySocketState::Live,
@@ -1179,8 +1304,11 @@ mod tests {
             &foreign_probe,
         ));
 
+        let runtime_dir = std::path::Path::new("/run/user/1000");
+        let runtime_parent = runtime_socket.parent().unwrap();
+        let runtime_shared = runtime_parent.parent().unwrap();
         let runtime_probe = |path: &std::path::Path| {
-            (path == std::path::Path::new("/run/user/1000")).then_some(DirMeta {
+            (path == runtime_dir).then_some(DirMeta {
                 is_dir: true,
                 is_symlink: false,
                 owned: true,
@@ -1194,6 +1322,119 @@ mod tests {
             &tmp_socket,
             false,
             &runtime_probe,
+        ));
+
+        let secure_runtime_tree = |path: &std::path::Path| {
+            [runtime_parent, runtime_shared, runtime_dir]
+                .contains(&path)
+                .then_some(DirMeta {
+                    is_dir: true,
+                    is_symlink: false,
+                    owned: true,
+                    mode: 0o700,
+                })
+        };
+        assert!(socket_usable_decision(
+            LegacySocketState::Absent,
+            runtime_socket,
+            legacy,
+            &tmp_socket,
+            false,
+            &secure_runtime_tree,
+        ));
+        let public_but_not_writable_thegn = |path: &std::path::Path| {
+            if path == runtime_shared {
+                Some(DirMeta {
+                    is_dir: true,
+                    is_symlink: false,
+                    owned: true,
+                    mode: 0o755,
+                })
+            } else if path == runtime_dir {
+                Some(DirMeta {
+                    is_dir: true,
+                    is_symlink: false,
+                    owned: true,
+                    mode: 0o700,
+                })
+            } else {
+                None
+            }
+        };
+        assert!(socket_usable_decision(
+            LegacySocketState::Absent,
+            runtime_socket,
+            legacy,
+            &tmp_socket,
+            false,
+            &public_but_not_writable_thegn,
+        ));
+        let group_writable_thegn = |path: &std::path::Path| {
+            if path == runtime_shared {
+                Some(DirMeta {
+                    is_dir: true,
+                    is_symlink: false,
+                    owned: true,
+                    mode: 0o775,
+                })
+            } else if path == runtime_dir {
+                Some(DirMeta {
+                    is_dir: true,
+                    is_symlink: false,
+                    owned: true,
+                    mode: 0o700,
+                })
+            } else {
+                None
+            }
+        };
+        assert!(!socket_usable_decision(
+            LegacySocketState::Absent,
+            runtime_socket,
+            legacy,
+            &tmp_socket,
+            false,
+            &group_writable_thegn,
+        ));
+        let foreign_thegn = |path: &std::path::Path| {
+            if path == runtime_shared {
+                Some(DirMeta {
+                    is_dir: true,
+                    is_symlink: false,
+                    owned: false,
+                    mode: 0o700,
+                })
+            } else {
+                secure_runtime_tree(path)
+            }
+        };
+        assert!(!socket_usable_decision(
+            LegacySocketState::Absent,
+            runtime_socket,
+            legacy,
+            &tmp_socket,
+            false,
+            &foreign_thegn,
+        ));
+        let symlinked_thegn = |path: &std::path::Path| {
+            if path == runtime_shared {
+                Some(DirMeta {
+                    is_dir: true,
+                    is_symlink: true,
+                    owned: true,
+                    mode: 0o700,
+                })
+            } else {
+                secure_runtime_tree(path)
+            }
+        };
+        assert!(!socket_usable_decision(
+            LegacySocketState::Absent,
+            runtime_socket,
+            legacy,
+            &tmp_socket,
+            false,
+            &symlinked_thegn,
         ));
     }
 

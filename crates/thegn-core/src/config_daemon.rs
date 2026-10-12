@@ -144,16 +144,19 @@ impl Default for DaemonConfig {
 
 impl DaemonConfig {
     /// Resolve the control-socket path: the explicit `socket` override, else
-    /// `$XDG_RUNTIME_DIR/thegn/daemon.sock`, else the legacy
-    /// `<state_dir>/run/daemon.sock`. The host daemon relocates this fallback
-    /// into a vetted private runtime directory when one is available. Pure: env
-    /// is injected.
+    /// `$XDG_RUNTIME_DIR/thegn/<state-endpoint-key>/daemon.sock`, else the
+    /// legacy `<state_dir>/run/daemon.sock`. The host daemon relocates this
+    /// fallback into a vetted private runtime directory when one is available.
+    /// Pure: env is injected.
     pub fn socket_path(&self, runtime_dir: Option<&str>, state_dir: &std::path::Path) -> PathBuf {
         if !self.socket.is_empty() {
             return PathBuf::from(&self.socket);
         }
         match runtime_dir.filter(|d| !d.is_empty()) {
-            Some(run) => PathBuf::from(run).join("thegn").join("daemon.sock"),
+            Some(run) => PathBuf::from(run)
+                .join("thegn")
+                .join(state_endpoint_key(state_dir))
+                .join("daemon.sock"),
             None => state_dir.join("run").join("daemon.sock"),
         }
     }
@@ -163,6 +166,14 @@ impl DaemonConfig {
 /// release. New startup code must not bind this path.
 pub fn legacy_socket_path(state_dir: &std::path::Path) -> PathBuf {
     state_dir.join("run").join("daemon.sock")
+}
+
+/// Former shared runtime-dir endpoint, used only to clean up a stale socket
+/// after upgrading. New daemon startup must never bind this path.
+pub fn legacy_runtime_socket_path(runtime_dir: Option<&str>) -> Option<PathBuf> {
+    runtime_dir
+        .filter(|dir| !dir.is_empty())
+        .map(|run| PathBuf::from(run).join("thegn").join("daemon.sock"))
 }
 
 /// Longest usable unix-socket path for the platform, in bytes.
@@ -462,7 +473,9 @@ mod tests {
         let d = DaemonConfig::default();
         assert_eq!(
             d.socket_path(Some("/run/user/1000"), state),
-            PathBuf::from("/run/user/1000/thegn/daemon.sock")
+            PathBuf::from("/run/user/1000/thegn")
+                .join(state_endpoint_key(state))
+                .join("daemon.sock")
         );
         // State-dir fallback (isolated XDG_STATE_HOME ⇒ isolated daemon).
         assert_eq!(
@@ -474,6 +487,22 @@ mod tests {
             d.socket_path(Some(""), state),
             PathBuf::from("/state/thegn/run/daemon.sock")
         );
+    }
+
+    #[test]
+    fn two_state_roots_under_one_runtime_dir_get_distinct_sockets() {
+        let daemon = DaemonConfig::default();
+        let first = Path::new("/state/one");
+        let second = Path::new("/state/two");
+        let first_socket = daemon.socket_path(Some("/run/user/1000"), first);
+        let second_socket = daemon.socket_path(Some("/run/user/1000"), second);
+        let legacy = legacy_runtime_socket_path(Some("/run/user/1000")).unwrap();
+        assert_eq!(legacy, PathBuf::from("/run/user/1000/thegn/daemon.sock"));
+        assert_ne!(first_socket, second_socket);
+        assert_ne!(first_socket, legacy);
+        assert_ne!(second_socket, legacy);
+        assert_eq!(legacy_runtime_socket_path(None), None);
+        assert_eq!(legacy_runtime_socket_path(Some("")), None);
     }
 
     #[test]

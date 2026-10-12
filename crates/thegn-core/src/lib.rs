@@ -178,6 +178,7 @@ pub mod host_probe;
 pub mod i18n;
 pub mod i18n_format;
 mod i18n_locale;
+pub use i18n_locale::neutralize_bidi_controls;
 pub mod i18n_parity;
 mod i18n_pseudo;
 pub mod identity;

@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{Datelike, NaiveDate};
 use termwiz::terminal::TerminalWaker;
+use thegn_core::calendar::validate::validate_event;
 use thegn_core::calendar::{CalEvent, CalendarWindow, ExpansionError};
 use thegn_core::config_calendar::{CalendarAccount, CalendarConfig};
 use thegn_core::db::Db;
@@ -803,7 +804,8 @@ fn load_cached_window(db: &Db, window: CalendarWindow) -> Result<Cached, Calenda
     };
     for (_, json) in rows {
         match serde_json::from_str::<CalEvent>(&json) {
-            Ok(event) => cached.events.push(event),
+            Ok(event) if validate_event(&event).is_ok() => cached.events.push(event),
+            Ok(_) => cached.skipped += 1,
             Err(_) => cached.skipped += 1,
         }
     }
@@ -1205,3 +1207,7 @@ fn deliver(
 #[cfg(test)]
 #[path = "hydrate_calendar_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "hydrate_calendar_admission_tests.rs"]
+mod admission_tests;

@@ -15,6 +15,10 @@ use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, WAIT_OBJECT_0, WAIT_TIMEOU
 use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
+pub(crate) fn platform_is_executable_file(_metadata: &std::fs::Metadata) -> bool {
+    true
+}
+
 type ReadReply = oneshot::Sender<io::Result<Vec<u8>>>;
 type WriteReply = oneshot::Sender<io::Result<usize>>;
 enum Operation {

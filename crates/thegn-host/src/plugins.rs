@@ -67,6 +67,23 @@ pub(crate) fn restart_delay(restarts: u32) -> Option<Duration> {
 type Sessions = Arc<Mutex<BTreeMap<String, ResidentSession>>>;
 type Disabled = Arc<Mutex<std::collections::BTreeSet<String>>>;
 
+/// Admit a live session only while shutdown has not begun. Checking under the
+/// same lock used by shutdown makes insertion atomic with the final drain.
+fn admit_unless_stopped<T>(
+    map: &Mutex<BTreeMap<String, T>>,
+    stop: &AtomicBool,
+    id: String,
+    value: T,
+) -> Result<(), T> {
+    let mut map = lock(map);
+    if stop.load(Ordering::SeqCst) {
+        Err(value)
+    } else {
+        map.insert(id, value);
+        Ok(())
+    }
+}
+
 /// Handle to the off-loop plugin host: restart trigger + shutdown. Dropping it
 /// (or calling [`PluginsHost::shutdown`]) best-effort-deactivates and kills
 /// every resident session.
@@ -138,7 +155,10 @@ impl PluginsHost {
                 let writer = match spawn_session(&supervisor, &plugin, &tx, &waker) {
                     Ok(session) => {
                         let w = session.writer();
-                        lock(&sessions).insert(id.clone(), session);
+                        if let Err(session) = admit_unless_stopped(&sessions, &stop, id.clone(), session) {
+                            session.kill();
+                            return;
+                        }
                         Some(w)
                     }
                     Err(e) => {
@@ -396,8 +416,14 @@ fn setup_and_schedule_with_waker(
             ) {
                 Ok(session) => {
                     let w = session.writer();
-                    lock(&sessions).insert(id.clone(), session);
-                    Some(w)
+                    if let Err(session) =
+                        admit_unless_stopped(&sessions, &stop, id.clone(), session)
+                    {
+                        session.kill();
+                        None
+                    } else {
+                        Some(w)
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(target: "thegn::plugin", plugin = %id, error = %e, "resident session failed to spawn");
@@ -560,6 +586,16 @@ mod tests {
         assert_eq!(restart_delay(2), Some(Duration::from_secs(25)));
         assert_eq!(restart_delay(3), None);
         assert_eq!(restart_delay(17), None);
+    }
+
+    #[test]
+    fn stopped_host_rejects_session_admission() {
+        let sessions = Mutex::new(BTreeMap::new());
+        let stop = AtomicBool::new(true);
+        let result = admit_unless_stopped(&sessions, &stop, "p".into(), 7_u32);
+
+        assert_eq!(result, Err(7));
+        assert!(lock(&sessions).is_empty());
     }
 
     #[test]

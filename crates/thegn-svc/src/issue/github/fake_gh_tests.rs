@@ -13,27 +13,46 @@ fn make_exec(path: &std::path::Path, body: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// Fake gh: logs argv (one line per call) and answers `create` with
-/// `create_url`; `view` echoes the repo it was asked for so a wrong scope
-/// is visible in the result.
+/// Fake gh: logs argv (one line per call), tracks issue mutations, and answers
+/// `create` with `create_url`; `view` echoes the repo it was asked for so a
+/// wrong scope is visible in the result.
 fn fake_gh(dir: &std::path::Path, create_url: &str) -> std::path::PathBuf {
     let script = dir.join("gh");
     let log = dir.join("argv.log");
-    let body = format!(
-        r#"#!/bin/sh
-echo "$*" >> {log}
+    let body = r#"#!/bin/sh
+echo "$*" >> @log@
+state_file=@state@
+title_file=@title@
+fail_edit=@fail_edit@
+lie_view=@lie_view@
 case "$2" in
-  create) echo {create_url} ;;
-  view|close|reopen|edit)
+  create) echo @create_url@ ;;
+  close) printf CLOSED > "$state_file" ;;
+  reopen) printf OPEN > "$state_file" ;;
+  edit)
+    [ -f "$fail_edit" ] && exit 1
+    title="$5"
+    title="${title#"${title%%[![:space:]]*}"}"
+    title="${title%"${title##*[![:space:]]}"}"
+    printf '%s' "$title" > "$title_file" ;;
+  view)
 repo=""; num="$3"
 while [ $# -gt 0 ]; do [ "$1" = "--repo" ] && repo="$2"; shift; done
 [ -z "$repo" ] && repo="cwd/default"
-echo '{{"number":'"$num"',"title":"t","state":"OPEN","url":"https://github.com/'"$repo"'/issues/'"$num"'"}}' ;;
+state=OPEN; title=t
+[ ! -f "$state_file" ] || state=$(cat "$state_file")
+[ ! -f "$title_file" ] || title=$(cat "$title_file")
+[ ! -f "$lie_view" ] || { state=OPEN; title=unexpected; }
+echo '{"number":'"$num"',"title":"'"$title"'","state":"'"$state"'","url":"https://github.com/'"$repo"'/issues/'"$num"'"}' ;;
   *) echo '[]' ;;
 esac
-"#,
-        log = log.display()
-    );
+"#
+    .replace("@log@", &log.display().to_string())
+    .replace("@state@", &dir.join("state").display().to_string())
+    .replace("@title@", &dir.join("title").display().to_string())
+    .replace("@fail_edit@", &dir.join("fail-edit").display().to_string())
+    .replace("@lie_view@", &dir.join("lie-view").display().to_string())
+    .replace("@create_url@", create_url);
     make_exec(&script, &body);
     script
 }
@@ -130,6 +149,106 @@ async fn same_number_issues_stay_in_their_repo() {
     let u = b.update_issue("3", &p).await.unwrap();
     assert_eq!(u.id, "github:acct/default#3");
     assert!(calls(d.path()).iter().all(|c| c.contains("--repo")));
+}
+
+#[tokio::test]
+async fn compound_update_checks_github_postconditions() {
+    let d = tempfile::tempdir().unwrap();
+    let gh = fake_gh(d.path(), "");
+    let b = backend(d.path(), gh, &["--repo", "acct/default"], true);
+    let updated = b
+        .update_issue(
+            "github:acct/default#3",
+            &IssuePatch {
+                status: Some(IssueStatus::Done),
+                title: Some("Renamed".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.status, IssueStatus::Done);
+    assert_eq!(updated.title, "Renamed");
+    assert_eq!(calls(d.path()).len(), 3);
+}
+
+#[tokio::test]
+async fn title_postcondition_accepts_github_whitespace_normalization() {
+    let d = tempfile::tempdir().unwrap();
+    let gh = fake_gh(d.path(), "");
+    let b = backend(d.path(), gh, &["--repo", "acct/default"], true);
+    let updated = b
+        .update_issue(
+            "github:acct/default#3",
+            &IssuePatch {
+                title: Some(" Fix ".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.title, "Fix");
+}
+
+#[tokio::test]
+async fn title_failure_after_status_reports_partial_update() {
+    let d = tempfile::tempdir().unwrap();
+    let gh = fake_gh(d.path(), "");
+    std::fs::write(d.path().join("fail-edit"), "").unwrap();
+    let b = backend(d.path(), gh, &["--repo", "acct/default"], true);
+    let error = b
+        .update_issue(
+            "github:acct/default#3",
+            &IssuePatch {
+                status: Some(IssueStatus::Done),
+                title: Some("Renamed".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        IssueError::PartialUpdate {
+            applied,
+            unapplied,
+            unverified,
+            ..
+        } if applied == ["status"]
+            && unapplied == ["title"]
+            && unverified.is_empty()
+    ));
+    assert_eq!(calls(d.path()).len(), 2);
+}
+
+#[tokio::test]
+async fn mismatched_github_refetch_reports_unverified_fields() {
+    let d = tempfile::tempdir().unwrap();
+    let gh = fake_gh(d.path(), "");
+    std::fs::write(d.path().join("lie-view"), "").unwrap();
+    let b = backend(d.path(), gh, &["--repo", "acct/default"], true);
+    let error = b
+        .update_issue(
+            "github:acct/default#3",
+            &IssuePatch {
+                status: Some(IssueStatus::Done),
+                title: Some("Renamed".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        IssueError::PartialUpdate {
+            applied,
+            unapplied,
+            unverified,
+            ..
+        } if applied.is_empty()
+            && unapplied.is_empty()
+            && unverified == ["status", "title"]
+    ));
 }
 
 #[tokio::test]

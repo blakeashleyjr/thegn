@@ -555,8 +555,14 @@ fn edit(cfg: &Config, path: &Path) -> Result<()> {
 }
 
 fn seed_example(path: &Path) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        match std::fs::symlink_metadata(dir) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                thegn_core::fsperm::ensure_private_dir(dir)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
     thegn_core::fsperm::write_owner_only_new(path, EXAMPLE.as_bytes())?;
     Ok(())
@@ -663,13 +669,30 @@ mod tests {
     #[test]
     fn config_edit_seed_is_owner_only() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
+        let parent = dir.path().join("new");
+        let path = parent.join("config.toml");
         seed_example(&path).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), EXAMPLE.as_bytes());
         assert!(matches!(
             thegn_core::fsperm::mode_bits(&path).unwrap(),
             None | Some(0o600)
         ));
+        assert!(matches!(
+            thegn_core::fsperm::mode_bits(&parent).unwrap(),
+            None | Some(0o700)
+        ));
+    }
+
+    #[test]
+    fn config_edit_seed_preserves_existing_parent_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("existing");
+        std::fs::create_dir(&parent).unwrap();
+        let before = thegn_core::fsperm::mode_bits(&parent).unwrap();
+
+        seed_example(&parent.join("config.toml")).unwrap();
+
+        assert_eq!(thegn_core::fsperm::mode_bits(&parent).unwrap(), before);
     }
 
     #[test]

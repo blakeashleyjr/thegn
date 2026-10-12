@@ -9,12 +9,12 @@
 //! (the removed host-side devShell transfer) into a substituter covering the whole host
 //! store.
 //!
-//! Trust: paths are served UNSIGNED and the sprite nix.conf sets
-//! `require-sigs = false` (see `envplan::nix_install_script`). That's safe here —
-//! the cache is reachable ONLY over the per-sprite loopback tunnel (never network
-//! exposed), the sandbox store is single-user and owned by the sandbox user, and
-//! the narinfo `NarHash` still integrity-checks every NAR against its content. A
-//! signed-cache variant (host key + `trusted-public-keys`) is a future option.
+//! Trust: paths are served UNSIGNED. The sandbox keeps Nix signature verification
+//! enabled (see `envplan::nix_install_script`), so it ignores this cache until an
+//! authenticated signing key and scoped closure are available. A narinfo's
+//! `NarHash` can detect transfer corruption, but does not authenticate the unsigned
+//! narinfo that supplied that hash. The loopback tunnel limits reachability; it is
+//! not an authenticity boundary.
 //!
 //! Everything is async (`tokio::process` + streamed bodies) so a multi-GB NAR
 //! never blocks the event loop; concurrent dumps are bounded by a semaphore.
@@ -148,7 +148,8 @@ async fn root_file(AxumPath(file): AxumPath<String>) -> Response {
 
 /// Build the narinfo text from `nix path-info --json`. References are emitted as
 /// basenames (the narinfo format), the NAR is served uncompressed, and the
-/// content-addressed `NarHash` lets the client integrity-check the download.
+/// `NarHash` lets the client detect content corruption; it does not authenticate
+/// this unsigned narinfo or the source of its claimed hash.
 async fn narinfo_text(hash: &str, path: &std::path::Path) -> anyhow::Result<String> {
     let out = Command::new("nix")
         .args(["--extra-experimental-features", "nix-command"])

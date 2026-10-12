@@ -152,9 +152,8 @@ pub enum Action {
         /// Who is asking (a stable id for this monitor process).
         #[arg(long)]
         owner: Option<String>,
-        /// Seconds the lease stays valid; renew before it lapses. A crashed
-        /// holder's lease expires on its own.
-        #[arg(long, default_value_t = 300)]
+        /// Lease lifetime in seconds (5–86400); renew before it lapses.
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(i64).range(thegn_core::db::MIN_LEASE_TTL_SECS..=thegn_core::db::MAX_LEASE_TTL_SECS))]
         ttl: i64,
         /// The lease name — one pipeline per name.
         #[arg(long, default_value = "lead")]
@@ -424,15 +423,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
 /// an explicit `&Db`) so the insert is testable against an isolated database —
 /// `Db::open()` would hit the developer's live state.
 fn put(db: &Db, new: NewDispatch<'_>) -> Result<AgentDispatch> {
-    // A parent must exist. Nothing enforces it in SQL (the roster is a
-    // cache-side ledger, not a foreign-key graph), so a typo would otherwise
-    // produce a chunk row silently orphaned from the board.
-    if let Some(parent) = new.parent_id
-        && db.get_dispatch(parent)?.is_none()
-    {
-        anyhow::bail!("no dispatch with id {parent} to parent this row on");
-    }
-    let id = db.put_agent_dispatch(new)?;
+    let id = db.put_dispatch_with_parent_check(new)?;
     db.get_dispatch(id)?
         .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert"))
 }
@@ -730,11 +721,6 @@ fn claim_chunk_put(
     limit: u32,
     allow_scope: Option<&str>,
 ) -> Result<AgentDispatch> {
-    if let Some(parent) = new.parent_id
-        && db.get_dispatch(parent)?.is_none()
-    {
-        anyhow::bail!("no dispatch with id {parent} to parent this row on");
-    }
     let worktree = new.worktree_path.to_string();
     let issue_id = new.issue_id.to_string();
     let chunk_path = new.chunk_path.map(str::to_string);
@@ -2556,8 +2542,12 @@ mod tests {
         let (_d, db) = db("put-parent");
         let mut new = NewDispatch::new("linear:A-1", "/wt/a", "coder");
         new.parent_id = Some(4242);
-        let err = put(&db, new).unwrap_err().to_string();
-        assert!(err.contains("4242"), "{err}");
+        let err = put(&db, new).unwrap_err();
+        assert!(err.to_string().contains("4242"), "{err}");
+        assert!(
+            err.downcast_ref::<thegn_core::db::ParentDispatchConflict>()
+                .is_some()
+        );
         assert!(
             db.list_dispatches().unwrap().is_empty(),
             "a rejected parent must not leave an orphan row"

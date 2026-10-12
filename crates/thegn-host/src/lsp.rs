@@ -239,7 +239,16 @@ impl LspInner {
             // wrap is fail-safe: no published policy / unusable systemd-run ⇒
             // the server spawns unwrapped, exactly as before. Off-loop, so the
             // wrap's probe spawn is fine here.
-            let argv = thegn_core::sandbox_cpucap::wrap_background_argv(spec.argv());
+            let resolved = thegn_svc::lsp::resolve_server_command(
+                &spec.command,
+                std::env::var_os("PATH").as_deref(),
+            )?;
+            let resolved = resolved.to_str().ok_or_else(|| {
+                LspError::Spawn("resolved language server path is not valid UTF-8".into())
+            })?;
+            let mut argv = spec.argv();
+            argv[0] = resolved.to_string();
+            let argv = thegn_core::sandbox_cpucap::wrap_background_argv(argv);
             let client = LspClient::start_argv_with_identity(
                 &argv,
                 &spec.language_id,

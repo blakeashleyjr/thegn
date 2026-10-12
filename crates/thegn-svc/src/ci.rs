@@ -400,7 +400,9 @@ fn collect_log<R: Read>(mut reader: R) -> Result<(String, bool), CiError> {
     let mut kept_bytes = 0usize;
     let mut truncated = false;
     let mut discard_line = false;
+    let mut discard_line_last_marker = None;
     let mut in_pem = false;
+    let mut marker_tail = Vec::with_capacity(b"-----BEGIN ".len());
 
     loop {
         let n = reader
@@ -419,21 +421,42 @@ fn collect_log<R: Read>(mut reader: R) -> Result<(String, bool), CiError> {
             break;
         }
         for &byte in &bytes[..n] {
+            marker_tail.push(byte);
+            if marker_tail.len() > b"-----BEGIN ".len() {
+                marker_tail.remove(0);
+            }
+            if marker_tail.ends_with(b"-----BEGIN ") {
+                in_pem = true;
+                discard_line_last_marker = Some(true);
+            } else if marker_tail.ends_with(b"-----END ") {
+                in_pem = false;
+                discard_line_last_marker = Some(false);
+            }
             if discard_line {
                 if byte == b'\n' {
                     discard_line = false;
+                    if let Some(begin) = discard_line_last_marker {
+                        in_pem = begin;
+                    }
+                    discard_line_last_marker = None;
+                    marker_tail.clear();
                     truncated = true;
                 }
                 continue;
             }
             line.push(byte);
-            if line.starts_with(b"-----BEGIN ") {
-                in_pem = true;
-            }
             if line.len() > PROVIDER_LOG_MAX_BYTES {
                 line.clear();
                 discard_line = true;
                 truncated = true;
+                if byte == b'\n' {
+                    discard_line = false;
+                    if let Some(begin) = discard_line_last_marker {
+                        in_pem = begin;
+                    }
+                    discard_line_last_marker = None;
+                    marker_tail.clear();
+                }
             } else if byte == b'\n' {
                 push_log_line(
                     &mut lines,
@@ -443,6 +466,8 @@ fn collect_log<R: Read>(mut reader: R) -> Result<(String, bool), CiError> {
                     &mut in_pem,
                 );
                 line.clear();
+                discard_line_last_marker = None;
+                marker_tail.clear();
             }
         }
     }
@@ -989,7 +1014,10 @@ pub fn parse_gh_workflows(json: &str) -> Result<Vec<CiWorkflow>, String> {
 enum GitlabCredential {
     #[default]
     CliManaged,
-    Configured(String),
+    Configured {
+        token: String,
+        explicit: bool,
+    },
     Unavailable,
 }
 
@@ -997,7 +1025,7 @@ impl std::fmt::Debug for GitlabCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::CliManaged => f.write_str("CliManaged"),
-            Self::Configured(_) => f.write_str("Configured(<redacted>)"),
+            Self::Configured { .. } => f.write_str("Configured(<redacted>)"),
             Self::Unavailable => f.write_str("Unavailable"),
         }
     }
@@ -1007,7 +1035,10 @@ impl GitlabCredential {
     fn from_resolution(raw: &str, resolution: crate::secret::SecretResolution) -> Self {
         match resolution {
             crate::secret::SecretResolution::Absent => Self::CliManaged,
-            crate::secret::SecretResolution::Resolved(token) => Self::Configured(token),
+            crate::secret::SecretResolution::Resolved(token) => Self::Configured {
+                token,
+                explicit: raw != thegn_core::config::GitLabCiConfig::default().token,
+            },
             crate::secret::SecretResolution::Failed
                 if raw == thegn_core::config::GitLabCiConfig::default().token =>
             {
@@ -1023,9 +1054,10 @@ impl GitlabCredential {
 /// GitLab CI via `glab api`. The shipped `env:GITLAB_TOKEN` default remains
 /// explicitly CLI-managed when unavailable for compatibility with `glab auth
 /// login`; an absent field is also CLI-managed. Any other configured reference
-/// that fails resolution is unavailable and fails closed. A resolved token is
-/// supplied only through `GITLAB_TOKEN`. GitLab has no per-job "steps", so
-/// [`CiJob::steps`] stays empty.
+/// that fails resolution is unavailable and fails closed. Explicitly configured
+/// resolved tokens are supplied through `GITLAB_TOKEN` only for local commands;
+/// the shipped ambient default remains CLI-managed for remote commands. GitLab
+/// has no per-job "steps", so [`CiJob::steps`] stays empty.
 #[derive(Default)]
 pub struct GitlabCi {
     credential: GitlabCredential,
@@ -1069,8 +1101,19 @@ impl GitlabCi {
                 "configured [ci.gitlab] token reference could not be resolved".into(),
             ));
         }
+        if matches!(
+            &self.credential,
+            GitlabCredential::Configured { explicit: true, .. }
+        ) && loc.is_remote()
+        {
+            return Err(CiError::Other(
+                "configured GitLab token cannot be forwarded to a remote/provider worktree".into(),
+            ));
+        }
         let mut cmd = loc.cli_command("glab", args);
-        if let GitlabCredential::Configured(token) = &self.credential {
+        if let GitlabCredential::Configured { token, explicit } = &self.credential
+            && (!loc.is_remote() || *explicit)
+        {
             cmd.env("GITLAB_TOKEN", token);
         }
         cmd.env("GITLAB_HOST", &remote.host);
@@ -1531,6 +1574,49 @@ mod tests {
     }
 
     #[test]
+    fn collector_redacts_prefixed_pem_before_evicting_its_begin_line() {
+        let mut input =
+            String::from("build\tstep\t2024-01-01T00:00:00Z -----BEGIN OPENSSH PRIVATE KEY-----\n");
+        for _ in 0..PROVIDER_LOG_MAX_LINES + 1 {
+            input.push_str("ordinary line\n");
+        }
+        input.push_str(
+            "SYNTHETIC_KEY_BODY\nbuild\tstep\t2024-01-01T00:00:01Z -----END OPENSSH PRIVATE KEY-----\n",
+        );
+        for _ in 0..PROVIDER_LOG_MAX_LINES - 2 {
+            input.push_str("ordinary line\n");
+        }
+        let (tail, truncated) = collect_log(input.as_bytes()).unwrap();
+        assert!(truncated);
+        assert!(!tail.contains("SYNTHETIC_KEY_BODY"));
+        assert!(tail.contains("ordinary line"));
+    }
+
+    #[test]
+    fn oversized_prefixed_pem_begin_still_latches_redaction_state() {
+        let mut input = vec![b'x'; PROVIDER_LOG_MAX_BYTES + 32];
+        input.extend_from_slice(b"build\tstep\t2024-01-01T00:00:00Z -----BEGIN PRIVATE KEY-----\n");
+        input.extend_from_slice(b"SYNTHETIC_OVERSIZED_KEY_BODY\n");
+        input.extend_from_slice(b"-----END PRIVATE KEY-----\nafter\n");
+        let (text, truncated) = collect_log(input.as_slice()).unwrap();
+        assert!(truncated);
+        assert!(!text.contains("SYNTHETIC_OVERSIZED_KEY_BODY"));
+        assert!(text.contains("after"));
+    }
+
+    #[test]
+    fn oversized_line_keeps_the_last_pem_marker_state() {
+        let mut input = vec![b'x'; PROVIDER_LOG_MAX_BYTES + 32];
+        input.extend_from_slice(b"-----END A----- -----BEGIN B-----\n");
+        input.extend_from_slice(b"SYNTHETIC_KEY_AFTER_BEGIN\n");
+        input.extend_from_slice(b"-----END B-----\nafter\n");
+        let (text, truncated) = collect_log(input.as_slice()).unwrap();
+        assert!(truncated);
+        assert!(!text.contains("SYNTHETIC_KEY_AFTER_BEGIN"));
+        assert!(text.contains("after"));
+    }
+
+    #[test]
     fn remote_host_to_system() {
         assert_eq!(
             system_from_remote_host("git@github.com:o/r.git"),
@@ -1614,7 +1700,10 @@ mod tests {
         let endpoint =
             gitlab_pipelines_endpoint(&GitlabCi::project_seg(&remote), None, 10).unwrap();
         let client = GitlabCi {
-            credential: GitlabCredential::Configured("fixture-token".into()),
+            credential: GitlabCredential::Configured {
+                token: "fixture-token".into(),
+                explicit: true,
+            },
             host: None,
         };
         let loc = GitLoc::for_worktree(std::path::Path::new("."));
@@ -2178,6 +2267,78 @@ esac
     }
 
     #[test]
+    fn gitlab_configured_token_refuses_remote_and_provider_transports() {
+        let mut cfg = CiConfig::default();
+        cfg.gitlab.token = "fixture-secret-token".into();
+        let configured = GitlabCi::from_config(&cfg);
+        let remote = GitlabRemote {
+            host: "gitlab.example.test".into(),
+            project: "g/r".into(),
+        };
+        let provider_loc = GitLoc::Provider {
+            control_prefix: vec![
+                "sprite".into(),
+                "exec".into(),
+                "-s".into(),
+                "x".into(),
+                "--".into(),
+            ],
+            path: "/workspace".into(),
+        };
+        let error = configured
+            .command(&provider_loc, &remote, &["api", "projects/g%2Fr/pipelines"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot be forwarded"));
+        assert!(!error.contains("fixture-secret-token"));
+
+        let cli_managed = GitlabCi {
+            credential: GitlabCredential::CliManaged,
+            host: None,
+        };
+        assert!(
+            cli_managed
+                .command(&provider_loc, &remote, &["api", "projects/g%2Fr/pipelines"])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn shipped_default_resolved_token_uses_remote_cli_login() {
+        let default = thegn_core::config::GitLabCiConfig::default().token;
+        let credential = GitlabCredential::from_resolution(
+            &default,
+            crate::secret::SecretResolution::Resolved("ambient-token".into()),
+        );
+        let client = GitlabCi {
+            credential,
+            host: None,
+        };
+        let provider_loc = GitLoc::Provider {
+            control_prefix: vec![
+                "sprite".into(),
+                "exec".into(),
+                "-s".into(),
+                "x".into(),
+                "--".into(),
+            ],
+            path: "/workspace".into(),
+        };
+        let remote = GitlabRemote {
+            host: "gitlab.example.test".into(),
+            project: "g/r".into(),
+        };
+        let command = client
+            .command(&provider_loc, &remote, &["api", "projects/g%2Fr/pipelines"])
+            .unwrap();
+        assert!(
+            !command
+                .get_envs()
+                .any(|(key, _)| key == std::ffi::OsStr::new("GITLAB_TOKEN"))
+        );
+    }
+
+    #[test]
     fn explicit_gitlab_secret_resolution_failures_stop_before_command_creation() {
         assert!(std::env::var_os("THE541_SURELY_UNSET_VAR").is_none());
         let missing_file = std::env::temp_dir().join(format!(
@@ -2245,7 +2406,10 @@ esac
 
     #[test]
     fn gitlab_credential_debug_redacts_configured_token() {
-        let credential = GitlabCredential::Configured("fixture-secret-token".into());
+        let credential = GitlabCredential::Configured {
+            token: "fixture-secret-token".into(),
+            explicit: true,
+        };
         assert_eq!(format!("{credential:?}"), "Configured(<redacted>)");
     }
 
@@ -2272,6 +2436,25 @@ esac
             b"before\n-----BEGIN PRIVATE KEY-----\nsecret-body\n-----END PRIVATE KEY-----\nafter\n";
         let (text, _) = collect_log(OneByte(&input[..])).unwrap();
         assert!(!text.contains("secret-body"));
+        assert!(text.contains("before"));
+        assert!(text.contains("after"));
+        assert!(text.contains(thegn_core::ci_log::REDACTION_MARKER));
+    }
+
+    #[test]
+    fn prefixed_pem_markers_split_across_single_byte_reads_are_redacted() {
+        struct OneByte<R>(R);
+        impl<R: Read> Read for OneByte<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let len = buf.len().min(1);
+                self.0.read(&mut buf[..len])
+            }
+        }
+
+        let input = b"build\tstep\t2024-01-01T00:00:00.0000000Z -----BEGIN OPENSSH PRIVATE KEY-----\nSYNTHETICKEYBODY\nbuild\tstep\t2024-01-01T00:00:01.0000000Z -----END OPENSSH PRIVATE KEY-----\nafter\n";
+        let (text, _) = collect_log(OneByte(&input[..])).unwrap();
+        assert!(!text.contains("SYNTHETICKEYBODY"));
+        assert!(text.contains("after"));
         assert!(text.contains(thegn_core::ci_log::REDACTION_MARKER));
     }
 

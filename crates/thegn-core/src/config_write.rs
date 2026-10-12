@@ -79,7 +79,12 @@ fn write_doc(path: &Path, doc: &DocumentMut, expected: Option<&[u8]>) -> Result<
 }
 
 /// Publish an edited config document only if its source generation is unchanged.
-/// `expected` is `None` only when the destination was absent at read time.
+/// `expected` is `None` only when the destination was absent at read time. Writers
+/// using this funnel are serialized by a sidecar lock. A writer that edits the
+/// file directly can still race the final generation check and replacement.
+/// If replacement succeeds but syncing the containing directory fails, this
+/// returns success with a warning: the new bytes are visible, but may not
+/// survive a crash.
 pub fn write_document_fenced(
     path: &Path,
     doc: &DocumentMut,
@@ -110,7 +115,10 @@ fn write_document_fenced_checked(
 }
 
 fn config_lock_path(path: &Path) -> Result<std::path::PathBuf> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let name = path.file_name().context("config path has no file name")?;
     let mut lock_name = std::ffi::OsString::from(".");
     lock_name.push(name);
@@ -151,8 +159,18 @@ fn write_doc_fenced(
     expected: Option<&[u8]>,
     check: impl FnOnce(&str, &str) -> Result<()>,
 ) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match std::fs::symlink_metadata(parent) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::fsperm::ensure_private_dir(parent)
+                .with_context(|| format!("create private config directory {}", parent.display()))?;
+        }
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", parent.display())),
+    }
     let _writer_lock = lock_config_writer(path)?;
     let current = match crate::fsperm::open_regular_file_nofollow(path) {
         Ok(mut file) => {
@@ -224,7 +242,10 @@ fn write_doc_fenced(
     crate::fsperm::rename_replace(&tmp, path).context("replace config")?;
     pending.0 = None;
     if let Err(error) = crate::fsperm::sync_parent_dir(parent) {
-        tracing::warn!(error = %error, path = %parent.display(), "config was written but its directory could not be synced");
+        crate::msg::warn(&format!(
+            "config was written, but its directory could not be synced; the change may not survive a crash: {error} ({})",
+            parent.display()
+        ));
     }
     Ok(())
 }
@@ -570,10 +591,6 @@ pub fn select_env_in_repo(repo_toml: &Path, name: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn tmp(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("tg-cfgwrite-{}-{name}", std::process::id()))
-    }
-
     #[test]
     fn no_follow_config_errors_explain_symlink_refusal() {
         let error = config_path_error(
@@ -587,7 +604,8 @@ mod tests {
     #[test]
     fn read_doc_does_not_treat_an_unreadable_file_as_empty() {
         use std::os::unix::fs::PermissionsExt;
-        let p = tmp("unreadable.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("unreadable.toml");
         std::fs::write(&p, "[sandbox]\nbackend = \"bwrap\"\n").unwrap();
         // Make the existing file unreadable: a read error that is NOT NotFound.
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -606,25 +624,21 @@ mod tests {
             after.contains("bwrap"),
             "original config was clobbered: {after:?}"
         );
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn write_doc_is_atomic_and_leaves_no_tmp() {
-        let p = tmp("atomic.toml");
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("atomic.toml");
         set_key(&p, "sandbox.backend", "podman").unwrap();
         assert!(p.exists());
         assert!(!p.with_extension("toml.tmp").exists(), "tmp file leaked");
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn fenced_write_rejects_changed_generation_and_preserves_bytes() {
-        let p = tmp("generation-conflict.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("generation-conflict.toml");
         let original = b"[theme]\npreset = \"prism\"\n";
         std::fs::write(&p, original).unwrap();
         let edited = "[theme]\npreset = \"storm\"\n"
@@ -638,7 +652,6 @@ mod tests {
             std::fs::read(&p).unwrap(),
             b"[theme]\npreset = \"user-edit\"\n"
         );
-        std::fs::remove_file(&p).unwrap();
     }
 
     #[test]
@@ -662,6 +675,43 @@ mod tests {
 
         set_key(&p, "picker", "auto").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "picker = \"auto\"\n");
+    }
+
+    #[test]
+    fn first_write_creates_private_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("new");
+        let path = parent.join("config.toml");
+
+        set_key(&path, "picker", "auto").unwrap();
+
+        assert!(matches!(
+            crate::fsperm::mode_bits(&parent).unwrap(),
+            None | Some(0o700)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_write_leaves_existing_parent_permissions_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("existing");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        set_key(&parent.join("config.toml"), "picker", "auto").unwrap();
+
+        assert_eq!(crate::fsperm::mode_bits(&parent).unwrap(), Some(0o755));
+    }
+
+    #[test]
+    fn write_rejects_an_uninspectable_parent_path() {
+        let doc = "".parse::<DocumentMut>().unwrap();
+        let path = Path::new("invalid\0/config.toml");
+
+        assert!(write_document_fenced(path, &doc, None).is_err());
     }
 
     #[test]
@@ -689,7 +739,8 @@ mod tests {
 
     #[test]
     fn upsert_provider_env_round_trips_and_preserves_comments() {
-        let p = tmp("provider.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("provider.toml");
         std::fs::write(&p, "# my thegn config\n[sandbox]\nbackend = \"bwrap\"\n").unwrap();
         let spec = EnvSpec {
             name: "fly-dev".into(),
@@ -755,25 +806,21 @@ mod tests {
             doc.get("env").and_then(|e| e.get("fly-dev")).is_none(),
             "env removed"
         );
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn repo_select_writes_only_a_string() {
-        let p = tmp("repo.toml");
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("repo.toml");
         select_env_in_repo(&p, "fly-dev").unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
         assert_eq!(out.trim(), "env = \"fly-dev\"");
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn set_string_array_round_trips_and_preserves_comments() {
-        let p = tmp("array.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("array.toml");
         std::fs::write(&p, "# keep me\nworktrees_dir = \"~/wt\"\n").unwrap();
         set_string_array(&p, "repo_roots", &["~/code".into(), "~/oss".into()]).unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
@@ -789,13 +836,12 @@ mod tests {
             .parse::<DocumentMut>()
             .unwrap();
         assert_eq!(doc["repo_roots"].as_array().unwrap().len(), 1);
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn upsert_host_writes_reach_and_ssh_and_keeps_siblings() {
-        let p = tmp("host.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("host.toml");
         std::fs::write(
             &p,
             "# cfg\n[host.other]\nreach = \"ssh\"\n[host.other.ssh]\nhost = \"me@old\"\n",
@@ -825,20 +871,20 @@ mod tests {
             doc["host"]["build-box"]["ssh"]["host"].as_str(),
             Some("me@new")
         );
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn upsert_host_rejects_empty_inputs() {
-        let p = tmp("host-empty.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("host-empty.toml");
         assert!(upsert_host(&p, " ", "me@box").is_err());
         assert!(upsert_host(&p, "box", "  ").is_err());
     }
 
     #[test]
     fn upsert_issue_account_appends_updates_and_removes() {
-        let p = tmp("issue-accts.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("issue-accts.toml");
         std::fs::write(&p, "# keep\n[issues]\nprovider = \"none\"\n").unwrap();
         upsert_issue_account(&p, "work", "linear", "keyring:work", "TEAM", "", "", "", "").unwrap();
         upsert_issue_account(&p, "home", "linear", "env:LIN", "", "", "", "", "").unwrap();
@@ -882,15 +928,12 @@ mod tests {
                 .len(),
             1
         );
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn upsert_forge_writes_kind_and_host() {
-        let p = tmp("forges.toml");
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("forges.toml");
         upsert_forge(&p, "ghe", "ghe", "git.corp.example", "env:GHE").unwrap();
         let doc = std::fs::read_to_string(&p)
             .unwrap()
@@ -900,35 +943,31 @@ mod tests {
         assert_eq!(f["name"].as_str(), Some("ghe"));
         assert_eq!(f["kind"].as_str(), Some("ghe"));
         assert_eq!(f["host"].as_str(), Some("git.corp.example"));
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn upsert_issue_account_rejects_empty_name() {
-        let p = tmp("issue-empty.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("issue-empty.toml");
         assert!(upsert_issue_account(&p, " ", "linear", "", "", "", "", "", "").is_err());
     }
 
     #[test]
     fn set_key_creates_nested_tables() {
-        let p = tmp("set.toml");
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("set.toml");
         set_key(&p, "sandbox.backend", "docker").unwrap();
         let doc = std::fs::read_to_string(&p)
             .unwrap()
             .parse::<DocumentMut>()
             .unwrap();
         assert_eq!(doc["sandbox"]["backend"].as_str(), Some("docker"));
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn set_key_writes_canonical_names_for_legacy_keys() {
-        let p = tmp("set-canonical.toml");
-        let _ = std::fs::remove_file(&p);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("set-canonical.toml");
         set_key(&p, "workspaces_dir", "/projects").unwrap();
         let doc = std::fs::read_to_string(&p)
             .unwrap()
@@ -936,14 +975,12 @@ mod tests {
             .unwrap();
         assert_eq!(doc["projects_dir"].as_str(), Some("/projects"));
         assert!(doc.get("workspaces_dir").is_none());
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn set_key_writes_arrays_and_inline_tables() {
-        let p = tmp("set_array.toml");
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("set_array.toml");
         // The regression: every value was written as a TOML string, so an
         // array-typed key could not be set from the CLI at all — the write was
         // (correctly) rejected by validation and the only fix was hand-editing.
@@ -964,15 +1001,12 @@ mod tests {
         let body = std::fs::read_to_string(&p).unwrap();
         let cfg: crate::config::Config = toml::from_str(&body).unwrap();
         assert_eq!(cfg.merge_queue.regenerate_paths.len(), 2);
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn set_key_keeps_bracketed_prose_as_a_string() {
-        let p = tmp("set_prose.toml");
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("set_prose.toml");
         // Only well-formed TOML gets the array treatment; a value that merely
         // starts with a bracket must stay the string the user typed.
         set_key(&p, "base_branch", "[not valid toml").unwrap();
@@ -981,15 +1015,12 @@ mod tests {
             .parse::<DocumentMut>()
             .unwrap();
         assert_eq!(doc["base_branch"].as_str(), Some("[not valid toml"));
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn set_key_infers_scalar_types_and_config_stays_parseable() {
-        let p = tmp("set_typed.toml");
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("set_typed.toml");
         set_key(&p, "sandbox.enabled", "false").unwrap();
         set_key(&p, "pr.ttl_secs", "120").unwrap();
         set_key(&p, "sandbox.backend", "podman").unwrap();
@@ -1003,7 +1034,5 @@ mod tests {
         // caused (typed field := quoted string ⇒ load_layered discards everything).
         toml::from_str::<crate::config::Config>(&text)
             .expect("config with a bool/int set must still parse");
-        // best-effort: test cleanup: scratch removal must never fail the test
-        let _ = std::fs::remove_file(&p);
     }
 }

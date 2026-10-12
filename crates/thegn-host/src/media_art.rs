@@ -13,7 +13,10 @@
 //! bounded: http(s) only, resolved addresses vetted and the connection pinned to
 //! them, redirects re-validated per hop, body streamed under a byte cap and a
 //! total deadline, local files must be bounded regular files, and only the
-//! latest request may own the (tracked) task.
+//! latest request may own the (tracked) task. Local art is limited to files
+//! under the system temporary directory, `$XDG_RUNTIME_DIR`, `$XDG_CACHE_HOME`
+//! (or `$HOME/.cache` when unset), and `$HOME/Music`; paths are canonicalized
+//! against those roots before bounded reads.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
@@ -96,6 +99,7 @@ enum Reject {
     Redirects,
     Network,
     Decode,
+    LocalPath,
 }
 
 /// The host of an admitted URL.
@@ -312,14 +316,15 @@ async fn load_raster(art_url: &str) -> Result<crate::rasterize::Raster, Reject> 
     }
     if let Some(path) = local_path(art_url) {
         return admitted_blocking(&DECODE_SLOT, move || {
+            let path = admit_local_art(&path, &local_art_roots())?;
             crate::rasterize::image_file_with_limits(
                 &path,
                 MAX_ART_BYTES as u64,
                 crate::rasterize::MEDIA_ART_LIMITS,
             )
+            .map_err(|_| Reject::Decode)
         })
-        .await?
-        .map_err(|_| Reject::Decode);
+        .await?;
     }
     if !(art_url.starts_with("http://") || art_url.starts_with("https://")) {
         return Err(Reject::Scheme);
@@ -400,6 +405,44 @@ fn local_path(url: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Runtime allowlist for locally cached/player-library art. Non-absolute roots
+/// are ignored so malformed environment overrides cannot widen the policy.
+fn local_art_roots() -> Vec<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let mut roots = vec![std::env::temp_dir()];
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        roots.push(runtime.into());
+    }
+    if let Some(cache) = std::env::var_os("XDG_CACHE_HOME") {
+        roots.push(cache.into());
+    } else if let Some(home) = &home {
+        roots.push(home.join(".cache"));
+    }
+    if let Some(home) = home {
+        roots.push(home.join("Music"));
+    }
+    roots.retain(|root| root.is_absolute());
+    roots
+}
+
+/// Admit a local art file only when its canonical location is under one of the
+/// canonical allowlist roots. Returning the canonical path also prevents a
+/// later path-based read from following a symlink that escaped the root.
+fn admit_local_art(
+    path: &std::path::Path,
+    roots: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf, Reject> {
+    let canonical_path = path.canonicalize().map_err(|_| Reject::LocalPath)?;
+    if roots.iter().any(|root| {
+        root.canonicalize()
+            .is_ok_and(|canonical_root| canonical_path.starts_with(canonical_root))
+    }) {
+        Ok(canonical_path)
+    } else {
+        Err(Reject::LocalPath)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +480,42 @@ mod tests {
             Some(std::path::PathBuf::from("/tmp/a.png"))
         );
         assert_eq!(local_path("file://evil.example/share/a.png"), None);
+    }
+
+    #[test]
+    fn local_art_requires_a_canonical_path_under_an_allowed_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let allowed_file = sub.join("cover.png");
+        let outside_file = outside.path().join("cover.png");
+        std::fs::write(&allowed_file, b"bounded test fixture").unwrap();
+        std::fs::write(&outside_file, b"bounded test fixture").unwrap();
+        let roots = vec![root.path().to_path_buf()];
+
+        assert_eq!(
+            admit_local_art(&allowed_file, &roots).unwrap(),
+            allowed_file.canonicalize().unwrap()
+        );
+        assert_eq!(
+            admit_local_art(&outside_file, &roots),
+            Err(Reject::LocalPath)
+        );
+        let escaped_path = root
+            .path()
+            .join("sub")
+            .join("../..")
+            .join(outside.path().file_name().unwrap())
+            .join("cover.png");
+        assert_eq!(
+            admit_local_art(&escaped_path, &roots),
+            Err(Reject::LocalPath)
+        );
+        assert_eq!(
+            admit_local_art(&root.path().join("missing.png"), &roots),
+            Err(Reject::LocalPath)
+        );
     }
 
     #[test]

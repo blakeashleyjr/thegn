@@ -18,6 +18,8 @@ use thegn_core::plugin_api::RpcMessage;
 pub const MAX_LINE_BYTES: usize = 1 << 20;
 /// Most messages accepted from one run.
 pub const MAX_LINES: usize = 20_000;
+/// Total stdout bytes retained by a one-shot run, including kept junk lines.
+pub const MAX_RUN_BYTES: usize = 8 << 20;
 /// Bytes of stderr kept for the error message.
 pub const MAX_STDERR: usize = 8 << 10;
 /// Maximum time to wait for a killed leader and its pipe readers to finish.
@@ -62,7 +64,7 @@ pub struct PluginRun {
     pub junk: Vec<String>,
     /// Tail of stderr, capped.
     pub stderr: String,
-    /// Whether output was cut off by [`MAX_LINES`].
+    /// Whether output was cut off by an output limit.
     pub truncated: bool,
 }
 
@@ -70,7 +72,7 @@ pub struct PluginRun {
 ///
 /// Streaming is what bounds memory: a sink that decides per line what to keep
 /// never holds more than one line of undecided output, where collecting first
-/// would hold up to [`MAX_LINES`] × [`MAX_LINE_BYTES`].
+/// could otherwise retain [`MAX_LINES`] × [`MAX_LINE_BYTES`].
 pub trait NdjsonSink: Send + 'static {
     /// One non-empty, trimmed, lossily-decoded line of at most
     /// [`MAX_LINE_BYTES`]. Return `false` to stop receiving lines; the pipe is
@@ -84,18 +86,34 @@ pub struct StreamRun<S> {
     pub sink: S,
     /// Tail of stderr, capped.
     pub stderr: String,
-    /// Whether output was cut off by [`MAX_LINES`].
+    /// Whether output was cut off by an output limit or the sink.
     pub truncated: bool,
 }
 
 /// Collects every message — the classic [`spawn_ndjson`] behaviour.
-struct Collect(PluginRun);
+struct Collect {
+    run: PluginRun,
+    retained_bytes: usize,
+}
 
 impl NdjsonSink for Collect {
     fn line(&mut self, text: &str) -> bool {
-        match serde_json::from_str::<RpcMessage>(text) {
-            Ok(m) => self.0.messages.push(m),
-            Err(_) => self.0.junk.push(text.chars().take(200).collect()),
+        let retained_bytes = match serde_json::from_str::<RpcMessage>(text) {
+            Ok(m) => {
+                self.run.messages.push(m);
+                text.len()
+            }
+            Err(_) => {
+                let kept: String = text.chars().take(200).collect();
+                let bytes = kept.len();
+                self.run.junk.push(kept);
+                bytes
+            }
+        };
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        if self.retained_bytes > MAX_RUN_BYTES {
+            self.run.truncated = true;
+            return false;
         }
         true
     }
@@ -113,10 +131,19 @@ pub fn spawn_ndjson(
     cwd: Option<&Path>,
     timeout: Duration,
 ) -> Result<PluginRun, PluginError> {
-    let out = spawn_ndjson_stream(argv, env, cwd, timeout, Collect(PluginRun::default()))?;
-    let mut run = out.sink.0;
+    let out = spawn_ndjson_stream(
+        argv,
+        env,
+        cwd,
+        timeout,
+        Collect {
+            run: PluginRun::default(),
+            retained_bytes: 0,
+        },
+    )?;
+    let mut run = out.sink.run;
     run.stderr = out.stderr;
-    run.truncated = out.truncated;
+    run.truncated |= out.truncated;
     Ok(run)
 }
 
@@ -203,6 +230,7 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
                 if eof {
                     if !oversized && !line.is_empty() && accepting && lines < MAX_LINES {
                         deliver_line(&mut sink, &line, &mut accepting, &mut lines);
+                        truncated |= !accepting;
                     } else if !line.is_empty() || oversized {
                         truncated = true;
                     }
@@ -226,6 +254,7 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
                     continue;
                 }
                 deliver_line(&mut sink, &line, &mut accepting, &mut lines);
+                truncated |= !accepting;
                 line.clear();
             }
         }

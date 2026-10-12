@@ -102,8 +102,13 @@ pub struct Seg {
 
 /// The standard constructor: `seg(Tok::Slot(S::Dim), "text")`.
 pub fn seg(fg: Tok, text: impl Into<String>) -> Seg {
+    let text = text.into();
+    let text = match thegn_core::neutralize_bidi_controls(&text) {
+        std::borrow::Cow::Owned(clean) => clean,
+        std::borrow::Cow::Borrowed(_) => text,
+    };
     Seg {
-        text: text.into(),
+        text,
         fg,
         bg: None,
         bold: false,
@@ -654,6 +659,16 @@ mod tests {
     }
 
     const PAD: Tok = Tok::Slot(S::Bg1);
+
+    #[test]
+    fn seg_keeps_clean_input_string_allocation() {
+        let text = String::from("ordinary segment text");
+        let allocation = text.as_ptr();
+
+        let segment = seg(Tok::Slot(S::Text), text);
+
+        assert_eq!(segment.text.as_ptr(), allocation);
+    }
 
     #[test]
     fn clip_end_ascii_matches_char_count() {
