@@ -16,6 +16,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use thegn_core::config::Config;
 use thegn_core::config_model_proxy::ModelProxyConfig;
+use thegn_core::db::Db;
+use thegn_core::store::{WorkspaceStore, ZoneStore};
 
 /// Directory holding the proxy's runtime files (resolved config + pid state).
 pub fn runtime_dir() -> PathBuf {
@@ -465,13 +467,37 @@ pub fn agent_proxy_env(cfg: &Config, choice: &str, worktree: &str) -> ProxyEnvDe
             return ProxyEnvDecision::Skipped(format!("proxy secret unavailable: {error}"));
         }
     };
-    agent_proxy_env_with_secret(cfg, choice, worktree, &secret)
+    let (workspace, zone) = Db::open()
+        .map(|db| {
+            let workspace = db
+                .repo_root_for(worktree)
+                .ok()
+                .flatten()
+                .map(|repo| format!("workspace:{repo}"));
+            let zone = db
+                .zone_of_worktree(worktree)
+                .ok()
+                .flatten()
+                .map(|zone| format!("zone:{}", zone.name));
+            (workspace, zone)
+        })
+        .unwrap_or((None, None));
+    agent_proxy_env_with_secret(
+        cfg,
+        choice,
+        worktree,
+        workspace.as_deref(),
+        zone.as_deref(),
+        &secret,
+    )
 }
 
 fn agent_proxy_env_with_secret(
     cfg: &Config,
     choice: &str,
     worktree: &str,
+    workspace: Option<&str>,
+    zone: Option<&str>,
     secret: &[u8],
 ) -> ProxyEnvDecision {
     let mp = &cfg.model_proxy;
@@ -496,7 +522,7 @@ fn agent_proxy_env_with_secret(
             return ProxyEnvDecision::Skipped(format!("proxy secret unavailable: {reason}"));
         }
     }
-    let key = mint_attribution_key(worktree, choice, secret);
+    let key = mint_attribution_key(worktree, choice, workspace, zone, secret);
     let base = format!("http://{}", listen_addr(mp));
     ProxyEnvDecision::Inject(vec![
         ("ANTHROPIC_BASE_URL".to_string(), base.clone()),
@@ -509,7 +535,13 @@ fn agent_proxy_env_with_secret(
 /// Mints a per-worktree signed attribution key. HMAC authenticates its claims;
 /// the nonce is only a discriminator. The key carries the worktree and agent
 /// scopes for spend accounting and is not an upstream secret.
-fn mint_attribution_key(worktree: &str, choice: &str, secret: &[u8]) -> String {
+fn mint_attribution_key(
+    worktree: &str,
+    choice: &str,
+    workspace: Option<&str>,
+    zone: Option<&str>,
+    secret: &[u8],
+) -> String {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u128(
@@ -530,8 +562,8 @@ fn mint_attribution_key(worktree: &str, choice: &str, secret: &[u8]) -> String {
             scope: format!("worktree:{worktree}"),
             agent: Some(format!("agent:{choice}")),
             nonce,
-            workspace: None,
-            zone: None,
+            workspace: workspace.map(str::to_owned),
+            zone: zone.map(str::to_owned),
             upstream: None,
             exp_ms: None,
         },
@@ -663,7 +695,7 @@ mod tests {
             drawer_cwd: None,
         });
         assert!(matches!(
-            agent_proxy_env_with_secret(&app_cfg, "test-agent", "/tmp/wt", secret),
+            agent_proxy_env_with_secret(&app_cfg, "test-agent", "/tmp/wt", None, None, secret),
             ProxyEnvDecision::Skipped(_)
         ));
         server.join().unwrap();
@@ -755,11 +787,19 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let key = mint_attribution_key("/repo/wt", "reviewer", b"mint-test-secret");
+        let key = mint_attribution_key(
+            "/repo/wt",
+            "reviewer",
+            Some("workspace:/repo"),
+            Some("zone:c"),
+            b"mint-test-secret",
+        );
         let claims =
             thegn_core::proxy::attribution::verify(&key, b"mint-test-secret", now).unwrap();
         assert_eq!(claims.scope, "worktree:/repo/wt");
         assert_eq!(claims.agent.as_deref(), Some("agent:reviewer"));
+        assert_eq!(claims.workspace.as_deref(), Some("workspace:/repo"));
+        assert_eq!(claims.zone.as_deref(), Some("zone:c"));
         let remaining = claims.exp_ms.unwrap() - now;
         assert!((ATTRIBUTION_TTL_MS..=ATTRIBUTION_TTL_MS + 1000).contains(&remaining));
     }
