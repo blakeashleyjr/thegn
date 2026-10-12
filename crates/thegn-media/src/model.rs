@@ -83,18 +83,20 @@ impl MediaKind {
             }
         }
         if let Some(u) = url {
-            let u = u.to_ascii_lowercase();
             const VIDEO_EXT: &[&str] = &[
-                ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".flv", ".wmv", ".mpg", ".mpeg",
-                ".ts",
+                "mp4", "mkv", "webm", "mov", "avi", "m4v", "flv", "wmv", "mpg", "mpeg", "ts",
             ];
-            if VIDEO_EXT.iter().any(|e| u.contains(e)) {
+            if url_extension(u)
+                .is_some_and(|ext| VIDEO_EXT.iter().any(|e| ext.eq_ignore_ascii_case(e)))
+            {
                 return MediaKind::Video;
             }
             const AUDIO_EXT: &[&str] = &[
-                ".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".wav", ".aac", ".wma",
+                "mp3", "flac", "ogg", "oga", "opus", "m4a", "wav", "aac", "wma",
             ];
-            if AUDIO_EXT.iter().any(|e| u.contains(e)) {
+            if url_extension(u)
+                .is_some_and(|ext| AUDIO_EXT.iter().any(|e| ext.eq_ignore_ascii_case(e)))
+            {
                 return MediaKind::Audio;
             }
         }
@@ -135,6 +137,26 @@ impl MediaKind {
         }
         MediaKind::Unknown
     }
+}
+
+/// Return the final path segment's extension without consulting a URL's host,
+/// query, or fragment. Bare paths are kept intact because providers such as MPD
+/// commonly supply relative filenames rather than URLs.
+fn url_extension(value: &str) -> Option<&str> {
+    let path = if let Some((_, after_scheme)) = value.split_once("://") {
+        let slash = after_scheme.find('/')?;
+        &after_scheme[slash..]
+    } else {
+        value
+    };
+    let path = if value.contains("://") {
+        path.split(['?', '#']).next().unwrap_or(path)
+    } else {
+        path
+    };
+    let filename = path.rsplit('/').next()?;
+    let (_, extension) = filename.rsplit_once('.')?;
+    (!extension.is_empty()).then_some(extension)
 }
 
 /// Repeat mode, normalized across backends (MPRIS `LoopStatus`: None/Track/
@@ -378,6 +400,26 @@ mod tests {
         assert_eq!(
             MediaKind::from_hints("x", None, Some("file:///m/song.mp3")),
             MediaKind::Audio
+        );
+        assert_eq!(
+            MediaKind::from_hints("x", None, Some("https://h/song.mp3?redirect=.mp4")),
+            MediaKind::Audio
+        );
+        assert_eq!(
+            MediaKind::from_hints("x", None, Some("https://video.mp4.example/stream")),
+            MediaKind::Unknown
+        );
+        assert_eq!(
+            MediaKind::from_hints("x", None, Some("https://h/x.mp3#t=.mkv")),
+            MediaKind::Audio
+        );
+        assert_eq!(
+            MediaKind::from_hints("x", None, Some("music/a.flac")),
+            MediaKind::Audio
+        );
+        assert_eq!(
+            MediaKind::from_hints("x", None, Some("https://h/watch?v=abc")),
+            MediaKind::Unknown
         );
         // player-name heuristic last.
         assert_eq!(MediaKind::from_hints("mpv", None, None), MediaKind::Video);
