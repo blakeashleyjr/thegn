@@ -22,6 +22,8 @@ use crate::shared::now_unix;
 
 /// Anthropic API version pinned for the `/v1/messages` surface.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// Total deadline for buffered upstream requests, including reading the body.
+const UPSTREAM_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// A normalized backend reply in OpenAI shape. `headers` carries the upstream
 /// response headers for cost / Retry-After extraction (see [`crate::headers`]).
@@ -115,7 +117,10 @@ impl ModelUpstream for OpenAiCompatUpstream {
                 "{}/chat/completions",
                 backend.base_url.trim_end_matches('/')
             );
-            let mut req = client.post(&url).header("content-type", "application/json");
+            let mut req = client
+                .post(&url)
+                .timeout(UPSTREAM_TOTAL_TIMEOUT)
+                .header("content-type", "application/json");
             if !backend.api_key.is_empty() {
                 req = req.bearer_auth(&backend.api_key);
             }
@@ -192,6 +197,7 @@ impl ModelUpstream for AnthropicUpstream {
             let url = format!("{}/messages", backend.base_url.trim_end_matches('/'));
             let resp = client
                 .post(&url)
+                .timeout(UPSTREAM_TOTAL_TIMEOUT)
                 .header("content-type", "application/json")
                 .header("x-api-key", &backend.api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION)

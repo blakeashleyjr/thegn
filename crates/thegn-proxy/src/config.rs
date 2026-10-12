@@ -40,6 +40,12 @@ pub fn from_env() -> Result<ProxyConfig> {
 /// Builds the runtime routing model from a `[model_proxy]` section, resolving
 /// SecretRefs and expanding multi-key providers into lanes.
 pub fn build(cfg: &ModelProxyConfig) -> Result<ProxyConfig> {
+    let validation_errors = cfg.validate();
+    anyhow::ensure!(
+        validation_errors.is_empty(),
+        "invalid model-proxy config: {}",
+        validation_errors.join("; ")
+    );
     let listen: SocketAddr = cfg
         .listen
         .parse()
@@ -308,6 +314,19 @@ mod tests {
         let pc = build(&c).unwrap();
         assert_eq!(pc.routes[0].priority.len(), 1);
         assert!(pc.routes[0].priority[0].api_key.is_empty());
+    }
+
+    #[test]
+    fn build_rejects_nan_rate_before_constructing_runtime_config() {
+        let mut c = base_cfg();
+        c.providers.push(ProviderEntry {
+            name: "p".into(),
+            rpm: f64::NAN,
+            ..Default::default()
+        });
+
+        let error = build(&c).err().expect("NaN rpm must be rejected");
+        assert!(error.to_string().contains("rpm"));
     }
 
     #[test]
