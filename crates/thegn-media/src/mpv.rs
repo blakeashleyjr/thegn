@@ -28,6 +28,13 @@ const MAX_REASON: usize = 120;
 #[cfg(unix)]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// One playlist reply can be large, but a single line must remain bounded.
+#[allow(dead_code)]
+const MAX_REPLY_LINE_BYTES: usize = 2 * 1024 * 1024;
+/// Total bytes consumed while skipping events and garbage before the reply.
+#[allow(dead_code)]
+const MAX_EXCHANGE_BYTES: usize = 8 * 1024 * 1024;
+
 /// mpv error strings that mean "this optional property has no value right
 /// now" (no file loaded, no video track, ...), not a failed command.
 fn is_absent_error(reason: &str) -> bool {
@@ -134,7 +141,8 @@ impl MpvIpc {
 
     #[cfg(unix)]
     async fn exchange_inner(&self, command: Value) -> Result<Reply, MediaError> {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use crate::mpd::read_bounded_line;
+        use tokio::io::{AsyncWriteExt, BufReader};
         use tokio::net::UnixStream;
 
         let stream = UnixStream::connect(&self.socket)
@@ -150,19 +158,21 @@ impl MpvIpc {
             .map_err(|e| MediaError::Backend(e.to_string()))?;
 
         let mut reader = BufReader::new(rd);
-        let mut buf = String::new();
+        let mut total_bytes = 0usize;
         loop {
-            buf.clear();
-            let n = reader
-                .read_line(&mut buf)
+            let line = read_bounded_line(&mut reader, MAX_REPLY_LINE_BYTES)
                 .await
-                .map_err(|e| MediaError::Backend(e.to_string()))?;
-            if n == 0 {
-                return Err(MediaError::Backend("mpv closed the socket".into()));
+                .map_err(|message| MediaError::Backend(format!("mpv reply {message}")))?
+                .ok_or_else(|| MediaError::Backend("mpv closed the socket".into()))?;
+            total_bytes = total_bytes.saturating_add(line.len().saturating_add(1));
+            if total_bytes > MAX_EXCHANGE_BYTES {
+                return Err(MediaError::Backend(format!(
+                    "mpv exchange exceeds {MAX_EXCHANGE_BYTES} bytes"
+                )));
             }
-            let msg = match serde_json::from_str::<Value>(buf.trim()) {
+            let msg = match serde_json::from_str::<Value>(line.trim()) {
                 Ok(msg) => msg,
-                Err(_) if buf.contains("request_id") => {
+                Err(_) if line.contains("request_id") => {
                     return Err(MediaError::Backend(
                         "malformed mpv reply for request".into(),
                     ));
@@ -676,6 +686,31 @@ mod socket_tests {
             ])
         });
         mpv.next().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_reply_line_is_rejected_before_json_decode() {
+        let oversized = ok(json!("x".repeat(MAX_REPLY_LINE_BYTES + 1)));
+        let (_dir, mpv, _seen) = serve(move |_| Some(vec![oversized.clone()]));
+
+        assert!(
+            matches!(mpv.get("media-title").await, Err(MediaError::Backend(message)) if message.contains("exceeds"))
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_lines_share_a_bounded_exchange_budget() {
+        let event = json!({
+            "event": "playback-restart",
+            "padding": "x".repeat(1024 * 1024),
+        })
+        .to_string();
+        let lines = vec![event; 9];
+        let (_dir, mpv, _seen) = serve(move |_| Some(lines.clone()));
+
+        assert!(
+            matches!(mpv.next().await, Err(MediaError::Backend(message)) if message.contains("exceeds"))
+        );
     }
 
     #[tokio::test]
