@@ -512,6 +512,11 @@ fn build_list_page_query(
     )
 }
 
+#[cfg(test)]
+fn build_list_query(filter: &IssueFilter, team_id: Option<&str>) -> String {
+    build_list_page_query(filter, team_id, None, page_size(filter.limit))
+}
+
 fn build_search_query(query: &str, limit: usize) -> String {
     let q_escaped = escape_graphql_str(query);
     let first = page_size(limit);
