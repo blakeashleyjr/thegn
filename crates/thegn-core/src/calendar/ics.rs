@@ -283,7 +283,13 @@ pub fn parse_line(line: &str) -> Option<ContentLine> {
             .iter()
             .map(|value| decode_param_value(value.trim()))
             .collect::<Option<Vec<_>>>()?;
-        params.insert(key, decoded.join(","));
+        let value = decoded.join(",");
+        if matches!(key.as_str(), "TZID" | "VALUE")
+            && params.get(&key).is_some_and(|previous| previous != &value)
+        {
+            return None;
+        }
+        params.insert(key, value);
     }
     let value = if is_text_property(&name) {
         unescape(value)
@@ -600,6 +606,12 @@ pub fn parse_ics_window_reported(
         let Some(line) = parse_line(&text) else {
             if !components.is_empty() {
                 report.record(IcsDiagnostic::MalformedLine);
+                if let Some(builder) = cur.as_mut()
+                    && event_depth.is_some_and(|depth| components.len() == depth)
+                    && raw.name_hint().as_deref().is_some_and(is_shape_property)
+                {
+                    builder.quarantined = true;
+                }
             }
             continue;
         };
@@ -806,6 +818,14 @@ struct Builder {
     last_modified: i64,
     extra: BTreeMap<String, String>,
     seen_singletons: BTreeSet<&'static str>,
+    quarantined: bool,
+}
+
+fn is_shape_property(name: &str) -> bool {
+    matches!(
+        name,
+        "DTSTART" | "DTEND" | "DURATION" | "RRULE" | "RDATE" | "EXDATE" | "UID"
+    )
 }
 
 fn singleton_property(name: &str) -> Option<&'static str> {
@@ -893,6 +913,9 @@ impl Builder {
             && !self.seen_singletons.insert(name)
         {
             report.record(IcsDiagnostic::DuplicateProperty(name));
+            if matches!(name, "UID" | "DTSTART" | "DTEND" | "DURATION") {
+                self.quarantined = true;
+            }
         }
         match line.name.as_str() {
             "UID" => {
@@ -950,14 +973,14 @@ impl Builder {
                 meter.charge_event(tz + ENTRY_OVERHEAD, 0)?;
                 self.end = parse_time(line, "");
                 if self.end.is_none() {
-                    report.record(IcsDiagnostic::InvalidEvent);
+                    self.quarantined = true;
                 }
             }
             "DURATION" => {
                 self.duration_seen = true;
                 self.duration = parse_duration(&line.value);
                 if self.duration.is_none() {
-                    report.record(IcsDiagnostic::InvalidEvent);
+                    self.quarantined = true;
                 }
             }
             "RRULE" => {
@@ -972,7 +995,7 @@ impl Builder {
                 )?;
                 match RRule::parse(&line.value) {
                     Ok(r) => self.rrules.push(r),
-                    Err(_) => report.record(IcsDiagnostic::InvalidEvent),
+                    Err(_) => self.quarantined = true,
                 }
             }
             "RDATE" | "EXDATE" => {
@@ -985,11 +1008,10 @@ impl Builder {
                     n.saturating_mul(std::mem::size_of::<EventTime>() + tz + ENTRY_OVERHEAD),
                     n,
                 )?;
-                let times = multi_time(line);
-                if line.name == "RDATE" {
-                    self.rdates.extend(times);
-                } else {
-                    self.exdates.extend(times);
+                match multi_time(line) {
+                    Some(times) if line.name == "RDATE" => self.rdates.extend(times),
+                    Some(times) => self.exdates.extend(times),
+                    None => self.quarantined = true,
                 }
             }
             "LAST-MODIFIED" | "DTSTAMP" => {
@@ -1012,6 +1034,9 @@ impl Builder {
     }
 
     fn finish(self, default_zone: &str, report: &mut IcsReport) -> Option<CalEvent> {
+        if self.quarantined {
+            return None;
+        }
         let start = self.start?;
         if self.end.is_some() && self.duration_seen {
             return None;
@@ -1126,27 +1151,95 @@ fn stable_hash(s: &str) -> u64 {
 }
 
 /// RDATE/EXDATE may carry a comma-separated list.
-fn multi_time(line: &ContentLine) -> Vec<EventTime> {
+fn multi_time(line: &ContentLine) -> Option<Vec<EventTime>> {
     let mut one = ContentLine {
         name: line.name.clone(),
         params: line.params.clone(),
         value: String::new(),
     };
     let mut out = Vec::new();
-    for v in line.value.split(',').filter(|s| !s.trim().is_empty()) {
+    for v in line.value.split(',') {
         one.value.clear();
         one.value.push_str(v.trim());
-        if let Some(t) = parse_time(&one, "") {
-            out.push(t);
-        }
+        out.push(parse_time(&one, "")?);
     }
-    out
+    Some(out)
 }
 
 /// Parse an RFC 5545 DURATION (`PT1H30M`, `P1D`).
 pub fn parse_duration(v: &str) -> Option<chrono::Duration> {
-    let mins = parse_trigger_minutes(&format!("-{}", v.trim().trim_start_matches(['-', '+'])))?;
-    Some(chrono::Duration::minutes(mins as i64))
+    let normalized = v.trim().to_ascii_uppercase();
+    let mut chars = normalized.chars().peekable();
+    let negative = match chars.peek() {
+        Some('-') => {
+            chars.next()?;
+            true
+        }
+        Some('+') => {
+            chars.next()?;
+            false
+        }
+        _ => false,
+    };
+    if chars.next()? != 'P' {
+        return None;
+    }
+
+    let mut in_time = false;
+    let mut saw_component = false;
+    let mut saw_time_component = false;
+    let mut week_component = false;
+    let mut last_rank = None;
+    let mut total_seconds = 0i64;
+    let mut number = 0i64;
+    let mut has_number = false;
+
+    for c in chars {
+        if c.is_ascii_digit() {
+            number = number
+                .checked_mul(10)?
+                .checked_add(i64::from(c as u8 - b'0'))?;
+            has_number = true;
+            continue;
+        }
+        if c == 'T' {
+            if in_time || week_component || has_number {
+                return None;
+            }
+            in_time = true;
+            continue;
+        }
+        if !has_number {
+            return None;
+        }
+        let (rank, scale) = match (in_time, c) {
+            (false, 'W') if !saw_component && last_rank.is_none() => {
+                week_component = true;
+                (0, 604_800)
+            }
+            (false, 'D') if !week_component => (1, 86_400),
+            (true, 'H') if !week_component => (2, 3_600),
+            (true, 'M') if !week_component => (3, 60),
+            (true, 'S') if !week_component => (4, 1),
+            _ => return None,
+        };
+        if last_rank.is_some_and(|previous| rank <= previous) {
+            return None;
+        }
+        total_seconds = total_seconds.checked_add(number.checked_mul(scale)?)?;
+        last_rank = Some(rank);
+        saw_component = true;
+        saw_time_component |= in_time;
+        number = 0;
+        has_number = false;
+    }
+    if has_number || !saw_component || (in_time && !saw_time_component) {
+        return None;
+    }
+    if negative {
+        total_seconds = total_seconds.checked_neg()?;
+    }
+    chrono::Duration::try_seconds(total_seconds)
 }
 
 #[cfg(test)]

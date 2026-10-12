@@ -179,7 +179,110 @@ fn duplicate_singleton_property_is_reported() {
             .diagnostics()
             .contains(&IcsDiagnostic::DuplicateProperty("SUMMARY"))
     );
+    assert_eq!(events.len(), 1);
     assert_legacy_matches(&input, &events);
+}
+
+#[test]
+fn duplicate_shape_singletons_quarantine_the_event() {
+    let input = one_event("UID:x\nDTSTART;VALUE=DATE:20261012\nDTSTART;VALUE=DATE:20261020");
+    let (events, report) = parse_report(&input);
+    assert!(events.is_empty());
+    assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
+    assert!(
+        report
+            .diagnostics()
+            .contains(&IcsDiagnostic::DuplicateProperty("DTSTART"))
+    );
+    assert_legacy_matches(&input, &events);
+}
+
+#[test]
+fn invalid_dtend_quarantines_instead_of_defaulting() {
+    let input = one_event("UID:x\nDTSTART:20261012T090000Z\nDTEND:garbage");
+    let (events, report) = parse_report(&input);
+    assert!(events.is_empty());
+    assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
+    assert_legacy_matches(&input, &events);
+}
+
+#[test]
+fn invalid_duration_quarantines_instead_of_defaulting() {
+    let input = one_event("UID:x\nDTSTART:20261012T090000Z\nDURATION:bogus");
+    let (events, report) = parse_report(&input);
+    assert!(events.is_empty());
+    assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
+    assert_legacy_matches(&input, &events);
+}
+
+#[test]
+fn duration_parser_accepts_rfc_units_and_rejects_malformed_or_overflowing_values() {
+    assert_eq!(parse_duration("+P1W"), Some(chrono::Duration::days(7)));
+    assert_eq!(
+        parse_duration("P1DT2H3M4S"),
+        Some(chrono::Duration::seconds(93_784))
+    );
+    assert_eq!(
+        parse_duration("-PT30S"),
+        Some(chrono::Duration::seconds(-30))
+    );
+    for invalid in ["", "P", "P1", "P1DT", "PT", "P1D1D", "P1WD", "PT1M1H"] {
+        assert!(parse_duration(invalid).is_none(), "accepted {invalid:?}");
+    }
+    assert!(parse_duration("PT9223372036854775807S").is_none());
+}
+
+#[test]
+fn invalid_rrule_quarantines_instead_of_becoming_one_off() {
+    let input = one_event("UID:x\nDTSTART:20261012T090000Z\nRRULE:FREQ=DAILY;INTERVAL=0");
+    let (events, report) = parse_report(&input);
+    assert!(events.is_empty());
+    assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
+    assert_legacy_matches(&input, &events);
+}
+
+#[test]
+fn invalid_exdate_member_quarantines_instead_of_reappearing() {
+    let input = one_event(
+        "UID:x\nDTSTART:20261012T090000Z\nRRULE:FREQ=DAILY\nEXDATE:20261013T090000Z,nonsense",
+    );
+    let (events, report) = parse_report(&input);
+    assert!(events.is_empty());
+    assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
+    assert_legacy_matches(&input, &events);
+}
+
+#[test]
+fn conflicting_repeated_timezone_parameter_quarantines_event() {
+    let input =
+        one_event("UID:x\nDTSTART;TZID=America/New_York;TZID=Europe/London:20261012T090000");
+    let (events, report) = parse_report(&input);
+    assert!(events.is_empty());
+    assert!(report.diagnostics().contains(&IcsDiagnostic::MalformedLine));
+    assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
+    assert_legacy_matches(&input, &events);
+}
+
+#[test]
+fn identical_repeated_timezone_parameter_is_accepted() {
+    let line = parse_line("DTSTART;TZID=Europe/London;TZID=Europe/London:20261012T090000");
+    assert!(line.is_some());
+    assert_eq!(
+        line.and_then(|line| line.params.get("TZID").cloned()),
+        Some("Europe/London".to_string())
+    );
+}
+
+#[test]
+fn malformed_shape_property_quarantines_only_its_event() {
+    let input = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:bad\nDTSTART;VALUE=DATE:20261012\nRRULE;broken\nEND:VEVENT\nBEGIN:VEVENT\nUID:good\nDTSTART;VALUE=DATE:20261013\nEND:VEVENT\nEND:VCALENDAR";
+    let (events, report) = parse_report(input);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].uid, "good");
+    assert!(report.diagnostics().contains(&IcsDiagnostic::MalformedLine));
+    assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
+    assert!(!report.is_document_failure());
+    assert_legacy_matches(input, &events);
 }
 
 #[test]
