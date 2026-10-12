@@ -1136,7 +1136,12 @@ mod spec {
             worktree: "/repo/feat-views".into(),
             port: 3000,
             url: Some("https://abc.example.dev".into()),
+            endpoint: Some(
+                thegn_svc::share::PublicEndpoint::parse_url("https://abc.example.dev")
+                    .expect("valid endpoint"),
+            ),
             failed: false,
+            stopping: false,
             error: None,
             provider: "bore",
             public: true,

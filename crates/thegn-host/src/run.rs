@@ -1864,10 +1864,12 @@ fn persist_share_event(ev: &crate::share::ShareEvent) {
             port,
             provider,
             url,
+            ..
         } => {
-            let _ = db.upsert_share(worktree, *port, provider, Some(url), "up"); // best-effort: cache write: the share state row feeds the UI/`share list`
+            let canonical = url.canonical();
+            let _ = db.upsert_share(worktree, *port, provider, Some(&canonical), "up"); // best-effort: cache write: the share state row feeds the UI/`share list`
         }
-        ShareEvent::Failed { worktree, port, .. } | ShareEvent::Down { worktree, port } => {
+        ShareEvent::Failed { worktree, port, .. } | ShareEvent::Down { worktree, port, .. } => {
             let _ = db.delete_share(worktree, *port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
     }
@@ -12829,13 +12831,28 @@ async fn event_loop<T: Terminal>(
         // update the supervisor, and re-sync the model so the badge + Share
         // panel repaint (a chrome change ⇒ Full frame).
         while let Ok(ev) = share_rx.try_recv() {
-            persist_share_event(&ev);
-            // Surface a failure where the user is looking — the reason was
-            // captured in the event and then thrown away before.
-            if let crate::share::ShareEvent::Failed { port, error, .. } = &ev {
-                model.status = format!("Share :{port} failed: {error}");
-            }
-            if share_supervisor.on_event(ev) {
+            if share_supervisor.on_event(ev.clone()) {
+                // Surface an accepted failure where the user is looking.
+                if let crate::share::ShareEvent::Failed { port, error, .. } = &ev {
+                    model.status = format!("Share :{port} failed: {error}");
+                }
+                let replaced_generation_is_live = match &ev {
+                    crate::share::ShareEvent::Down {
+                        worktree,
+                        port,
+                        generation,
+                    }
+                    | crate::share::ShareEvent::Failed {
+                        worktree,
+                        port,
+                        generation,
+                        ..
+                    } => share_supervisor.has_other_generation(worktree, *port, *generation),
+                    crate::share::ShareEvent::Up { .. } => false,
+                };
+                if !replaced_generation_is_live {
+                    persist_share_event(&ev);
+                }
                 model.shares = current_share_views(&share_supervisor, &session);
                 dirty = true;
             }
@@ -19198,11 +19215,11 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Share => {
-                                            // Enter copies the focused share's URL.
+                                            // Enter copies the focused endpoint as data.
                                             if let Some(url) = model
                                                 .shares
                                                 .get(panel_ui.cursor)
-                                                .and_then(|s| s.url.clone())
+                                                .and_then(crate::share::ShareView::copy_value)
                                             {
                                                 writer.submit_oob(crate::copymode::osc52(&url));
                                                 model.status = match crate::clipboard::copy(&url) {
@@ -19963,7 +19980,7 @@ async fn event_loop<T: Terminal>(
                             match model
                                 .shares
                                 .get(panel_ui.cursor)
-                                .and_then(|s| s.url.clone())
+                                .and_then(|s| s.browser_url().map(str::to_owned))
                             {
                                 Some(url) => {
                                     model.status = crate::actions::open_status(
