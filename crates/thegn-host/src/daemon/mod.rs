@@ -105,6 +105,10 @@ pub(crate) fn daemon_socket_usable(dcfg: &thegn_core::config::DaemonConfig) -> b
                 legacy_socket_state(),
                 &socket,
                 &legacy,
+                &private_tmp_socket_path(
+                    &thegn_core::util::xdg_state_home().join("thegn"),
+                    effective_uid(),
+                ),
                 !dcfg.socket.is_empty(),
                 &|path| {
                     let metadata = if path == std::path::Path::new("/tmp") {
@@ -130,6 +134,7 @@ pub(crate) fn daemon_socket_usable(dcfg: &thegn_core::config::DaemonConfig) -> b
     usable
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 struct DirMeta {
     is_dir: bool,
@@ -138,10 +143,12 @@ struct DirMeta {
     mode: u32,
 }
 
+#[cfg(unix)]
 fn socket_usable_decision(
     legacy_state: LegacySocketState,
     socket: &std::path::Path,
     legacy: &std::path::Path,
+    private_tmp: &std::path::Path,
     explicit: bool,
     probe: &dyn Fn(&std::path::Path) -> Option<DirMeta>,
 ) -> bool {
@@ -160,12 +167,7 @@ fn socket_usable_decision(
             && metadata.owned
             && metadata.mode & 0o777 == 0o700;
     }
-    if parent.parent() == Some(std::path::Path::new("/tmp"))
-        && parent
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(valid_private_tmp_dir_name)
-    {
+    if socket == private_tmp {
         return probe(std::path::Path::new("/tmp")).is_some_and(|metadata| {
             metadata.is_dir && !metadata.is_symlink && metadata.mode & 0o1000 != 0
         });
@@ -173,19 +175,6 @@ fn socket_usable_decision(
     parent.parent().and_then(probe).is_some_and(|metadata| {
         metadata.is_dir && !metadata.is_symlink && metadata.owned && metadata.mode & 0o777 == 0o700
     })
-}
-
-fn valid_private_tmp_dir_name(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix("thegn-") else {
-        return false;
-    };
-    let Some((uid, hash)) = rest.split_once('-') else {
-        return false;
-    };
-    !uid.is_empty()
-        && uid.bytes().all(|byte| byte.is_ascii_digit())
-        && hash.len() == 12
-        && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn effective_uid() -> u32 {
@@ -1050,13 +1039,22 @@ mod tests {
     #[test]
     fn socket_usable_decision_checks_legacy_private_tmp_and_runtime_paths() {
         let legacy = std::path::Path::new("/state/thegn/run/daemon.sock");
-        let tmp_socket = std::path::Path::new("/tmp/thegn-1000-0123456789ab/daemon.sock");
+        let state = std::path::Path::new("/home/blake/.local/state/thegn");
+        let tmp_socket = private_tmp_socket_path(state, 1000);
+        let hash = tmp_socket
+            .parent()
+            .and_then(std::path::Path::file_name)
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(|name| name.rsplit_once('-').map(|(_, hash)| hash))
+            .unwrap();
+        assert!(hash.bytes().any(|byte| (b'g'..=b'z').contains(&byte)));
         let runtime_socket = std::path::Path::new("/run/user/1000/thegn/daemon.sock");
         let absent = |_: &std::path::Path| None;
         assert!(!socket_usable_decision(
             LegacySocketState::Live,
             std::path::Path::new("/run/user/1000/thegn/daemon.sock"),
             legacy,
+            &tmp_socket,
             false,
             &absent,
         ));
@@ -1064,6 +1062,7 @@ mod tests {
             LegacySocketState::Absent,
             legacy,
             legacy,
+            &tmp_socket,
             false,
             &absent,
         ));
@@ -1079,8 +1078,9 @@ mod tests {
         };
         assert!(socket_usable_decision(
             LegacySocketState::Absent,
-            tmp_socket,
+            &tmp_socket,
             legacy,
+            &tmp_socket,
             false,
             &tmp_probe,
         ));
@@ -1095,8 +1095,9 @@ mod tests {
         };
         assert!(!socket_usable_decision(
             LegacySocketState::Absent,
-            tmp_socket,
+            &tmp_socket,
             legacy,
+            &tmp_socket,
             false,
             &bad_mode_probe,
         ));
@@ -1110,8 +1111,9 @@ mod tests {
         };
         assert!(!socket_usable_decision(
             LegacySocketState::Absent,
-            tmp_socket,
+            &tmp_socket,
             legacy,
+            &tmp_socket,
             false,
             &foreign_probe,
         ));
@@ -1128,6 +1130,7 @@ mod tests {
             LegacySocketState::Absent,
             runtime_socket,
             legacy,
+            &tmp_socket,
             false,
             &runtime_probe,
         ));
