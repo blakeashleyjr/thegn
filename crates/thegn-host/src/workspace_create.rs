@@ -16,6 +16,14 @@ use crate::run::{
     refresh_tab_model, remap_cold_workspace_ids,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedWorkspaceUrl {
+    clone_url: String,
+    canonical_origin: String,
+    label: String,
+    destination_name: String,
+}
+
 fn looks_like_git_url(input: &str) -> bool {
     input.starts_with("http://")
         || input.starts_with("https://")
@@ -24,16 +32,181 @@ fn looks_like_git_url(input: &str) -> bool {
         || input.starts_with("git@")
 }
 
-fn workspace_repo_name_from_url(input: &str) -> String {
-    let trimmed = input.trim_end_matches('/');
-    let tail = trimmed.rsplit(['/', ':']).next().unwrap_or(trimmed);
-    let name = tail.strip_suffix(".git").unwrap_or(tail);
-    let slug = thegn_core::util::slugify(name);
-    if slug.is_empty() {
-        "workspace".into()
+fn parse_workspace_url(input: &str) -> Result<ParsedWorkspaceUrl> {
+    anyhow::ensure!(input.len() <= 2048, "git URL is too long");
+    anyhow::ensure!(
+        !input.chars().any(char::is_control) && !input.contains('\\'),
+        "git URL contains a control character or platform separator"
+    );
+    let raw_path = if input.starts_with("git@") && !input.contains("://") {
+        input
+            .split_once(':')
+            .context("invalid scp-style git URL")?
+            .1
     } else {
-        name.to_string()
+        input
+            .split_once("://")
+            .context("unsupported git URL")?
+            .1
+            .split_once('/')
+            .map(|(_, path)| path.split(['?', '#']).next().unwrap_or(""))
+            .unwrap_or("")
+    };
+    let raw_path_lower = raw_path.to_ascii_lowercase();
+    anyhow::ensure!(
+        !raw_path.starts_with('/')
+            && ![
+                "%2f", "%5c", "%2e", "%25", "%00", "%01", "%02", "%03", "%04", "%05", "%06", "%07",
+                "%08", "%09", "%0a", "%0b", "%0c", "%0d", "%0e", "%0f", "%10", "%11", "%12", "%13",
+                "%14", "%15", "%16", "%17", "%18", "%19", "%1a", "%1b", "%1c", "%1d", "%1e", "%1f",
+                "%7f"
+            ]
+            .iter()
+            .any(|part| raw_path_lower.contains(part))
+            && raw_path.trim_end_matches('/').split('/').all(|part| {
+                !part.is_empty()
+                    && part != "."
+                    && part != ".."
+                    && !part.starts_with('/')
+                    && !(part.len() == 2
+                        && part.as_bytes()[0].is_ascii_alphabetic()
+                        && part.ends_with(':'))
+            }),
+        "ambiguous or unsafe git URL path"
+    );
+    let (clone_url, canonical_origin, tail) = if input.starts_with("git@") && !input.contains("://")
+    {
+        let (authority, path) = input.split_once(':').context("invalid scp-style git URL")?;
+        let host = authority
+            .strip_prefix("git@")
+            .context("invalid scp-style git URL")?;
+        anyhow::ensure!(
+            !host.is_empty() && !host.chars().any(|c| matches!(c, '/' | '\\' | '@')),
+            "invalid git host"
+        );
+        (
+            input.to_string(),
+            format!(
+                "ssh://{}/{}",
+                host.to_lowercase(),
+                path.trim_end_matches('/')
+            ),
+            path.rsplit('/').next().unwrap_or("").to_owned(),
+        )
+    } else {
+        let parsed = url::Url::parse(input).context("unsupported git URL")?;
+        anyhow::ensure!(
+            matches!(parsed.scheme(), "http" | "https" | "ssh" | "git"),
+            "unsupported git URL scheme"
+        );
+        anyhow::ensure!(parsed.host_str().is_some(), "git URL has no host");
+        anyhow::ensure!(
+            parsed.password().is_none(),
+            "embedded URL credentials are not supported; use a git credential helper"
+        );
+        anyhow::ensure!(
+            parsed.scheme() == "ssh" || parsed.username().is_empty(),
+            "embedded URL credentials are not supported; use a git credential helper"
+        );
+        anyhow::ensure!(
+            parsed.query().is_none() && parsed.fragment().is_none(),
+            "git URL query and fragment are not supported"
+        );
+        let path = parsed.path().trim_end_matches('/');
+        let encoded = path.to_ascii_lowercase();
+        anyhow::ensure!(
+            !path.is_empty()
+                && !["%2f", "%5c", "%2e"]
+                    .iter()
+                    .any(|part| encoded.contains(part)),
+            "ambiguous git URL path"
+        );
+        let tail = path.rsplit('/').next().unwrap_or("").to_owned();
+        let clone_url = parsed.to_string();
+        let mut canonical = parsed.clone();
+        canonical
+            .set_username("")
+            .map_err(|_| anyhow::anyhow!("invalid git URL authority"))?;
+        canonical.set_path(path);
+        (clone_url, canonical.to_string(), tail)
+    };
+    let repo = tail.strip_suffix(".git").unwrap_or(tail.as_str());
+    anyhow::ensure!(
+        !repo.is_empty()
+            && repo != "."
+            && repo != ".."
+            && !repo.chars().any(|c| matches!(c, '/' | '\\' | ':'))
+            && !repo.starts_with('.')
+            && !repo.ends_with('.')
+            && repo.len() <= 128,
+        "unsafe or overlong repository name in git URL"
+    );
+    let canonical_origin = canonical_origin
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_owned();
+    let slug: String = repo
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-');
+    let slug = if slug.is_empty() { "repo" } else { slug };
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(canonical_origin.as_bytes());
+    let suffix = digest[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    Ok(ParsedWorkspaceUrl {
+        clone_url,
+        canonical_origin,
+        label: repo.to_string(),
+        destination_name: format!("{slug}-{suffix}"),
+    })
+}
+
+fn configured_origin(dest: &std::path::Path) -> Result<Option<String>> {
+    let config = std::fs::read_to_string(dest.join(".git/config"))?;
+    let mut in_origin = false;
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_origin = line[1..line.len() - 1].trim() == "remote \"origin\"";
+        } else if in_origin
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case("url")
+        {
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or(value);
+            return Ok(parse_workspace_url(value)
+                .ok()
+                .map(|parsed| parsed.canonical_origin));
+        }
     }
+    Ok(None)
+}
+
+fn existing_origin_matches(dest: &std::path::Path, expected: &str) -> bool {
+    dest.join(".git").is_dir()
+        && configured_origin(dest)
+            .ok()
+            .flatten()
+            .is_some_and(|origin| origin == expected)
+}
+
+fn workspace_repo_display(input: &str) -> String {
+    parse_workspace_url(input)
+        .map(|parsed| parsed.label)
+        .unwrap_or_else(|_| "repository".into())
 }
 
 pub(crate) enum WorkspaceResolution {
@@ -47,9 +220,9 @@ pub(crate) fn workspace_clone_dest(
     input: &str,
     cfg: &thegn_core::config::Config,
 ) -> Option<std::path::PathBuf> {
-    looks_like_git_url(input).then(|| {
+    parse_workspace_url(input).ok().map(|parsed| {
         std::path::PathBuf::from(thegn_core::util::expand_tilde(&cfg.workspaces_dir))
-            .join(workspace_repo_name_from_url(input))
+            .join(parsed.destination_name)
     })
 }
 
@@ -77,7 +250,7 @@ pub(crate) fn clone_workspace_repo(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .with_context(|| format!("git clone {url} {}", dest.display()))?;
+        .with_context(|| format!("git clone into {}", dest.display()))?;
     if let Some(stderr) = child.stderr.take() {
         stream_progress_lines(std::io::BufReader::new(stderr), on_progress);
     }
@@ -86,8 +259,8 @@ pub(crate) fn clone_workspace_repo(
     #[expect(clippy::disallowed_methods)]
     let status = child
         .wait()
-        .with_context(|| format!("git clone {url} {}", dest.display()))?;
-    anyhow::ensure!(status.success(), "git clone failed for {url}");
+        .with_context(|| format!("git clone into {}", dest.display()))?;
+    anyhow::ensure!(status.success(), "git clone failed");
     Ok(())
 }
 
@@ -162,13 +335,34 @@ pub(crate) fn plan_new_workspace_input(
     if input.is_empty() {
         return SubmitPlan::Invalid("no project path or URL given".into());
     }
-    if let Some(dest) = workspace_clone_dest(input, cfg) {
-        // An already-materialized clone dest is just a local open.
+    if looks_like_git_url(input) {
+        let parsed = match parse_workspace_url(input) {
+            Ok(parsed) => parsed,
+            Err(error) => return SubmitPlan::Invalid(error.to_string()),
+        };
+        let dest = workspace_clone_dest(input, cfg).expect("validated URL has a clone destination");
         if dest.exists() {
-            return SubmitPlan::Local(input.to_string());
+            if existing_origin_matches(&dest, &parsed.canonical_origin) {
+                return SubmitPlan::Local(input.to_string());
+            }
+            return SubmitPlan::Invalid(format!(
+                "workspace destination already exists with a different or unreadable origin: {}",
+                dest.display()
+            ));
+        }
+        let legacy = std::path::PathBuf::from(thegn_core::util::expand_tilde(&cfg.workspaces_dir))
+            .join(&parsed.label);
+        if legacy.exists() {
+            if existing_origin_matches(&legacy, &parsed.canonical_origin) {
+                return SubmitPlan::Local(input.to_string());
+            }
+            return SubmitPlan::Invalid(format!(
+                "workspace destination already exists with a different or unreadable origin: {}",
+                legacy.display()
+            ));
         }
         return SubmitPlan::Clone {
-            url: input.to_string(),
+            url: parsed.clone_url,
             dest,
         };
     }
@@ -265,7 +459,16 @@ pub(crate) fn create_workspace_from_input_with_config(
     let input = input.trim();
     anyhow::ensure!(!input.is_empty(), "no project path or URL given");
 
-    let root = if let Some(dest) = workspace_clone_dest(input, cfg) {
+    let root = if let Ok(parsed) = parse_workspace_url(input) {
+        let workspaces_dir =
+            std::path::PathBuf::from(thegn_core::util::expand_tilde(&cfg.workspaces_dir));
+        let dest = workspace_clone_dest(input, cfg).expect("parsed URL has a clone destination");
+        let legacy = workspaces_dir.join(&parsed.label);
+        let dest = if !dest.exists() && existing_origin_matches(&legacy, &parsed.canonical_origin) {
+            legacy
+        } else {
+            dest
+        };
         // URL inputs are cloned OFF the loop before this runs (NewWorkspace
         // handler → spawn_blocking → workspace_clone_rx drain); by the time
         // this is called the clone must already be on disk.
@@ -289,10 +492,13 @@ pub(crate) fn create_workspace_from_input_with_config(
     };
 
     let root_s = root.to_string_lossy().into_owned();
-    let name = root
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "workspace".into());
+    let name = parse_workspace_url(input)
+        .map(|parsed| parsed.label)
+        .unwrap_or_else(|_| {
+            root.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "workspace".into())
+        });
     let kind = if thegn_core::repo::main_worktree(&root).is_some() {
         "repo"
     } else {
@@ -495,7 +701,7 @@ pub(crate) fn handle_picker_outcome(
             SubmitPlan::Clone { url, dest } => {
                 // Keep the picker on screen in its cloning phase — apply_clone_event
                 // streams progress and closes it (or shows an error) on done.
-                model.status = format!("Cloning {url}…");
+                model.status = format!("Cloning {}…", workspace_repo_display(&url));
                 if let Some(p) = picker.as_mut() {
                     p.begin_clone(url.clone());
                 }
@@ -575,7 +781,12 @@ Receiving objects: 100% (10/10)\rdone.\n";
         match plan_new_workspace_input("https://github.com/acme/widget.git", &cfg) {
             SubmitPlan::Clone { url, dest } => {
                 assert_eq!(url, "https://github.com/acme/widget.git");
-                assert_eq!(dest.file_name().unwrap().to_string_lossy(), "widget");
+                assert!(
+                    dest.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("widget-")
+                );
             }
             other => panic!("expected Clone, got {other:?}"),
         }
@@ -584,6 +795,86 @@ Receiving objects: 100% (10/10)\rdone.\n";
             plan_new_workspace_input("git@github.com:acme/widget.git", &cfg),
             SubmitPlan::Clone { .. }
         ));
+        for url in [
+            "ssh://blake@host/repo.git",
+            "ssh://APKA123@git-codecommit.us-east-1.amazonaws.com/v1/repos/repo",
+        ] {
+            assert!(
+                matches!(
+                    plan_new_workspace_input(url, &cfg),
+                    SubmitPlan::Clone { .. }
+                ),
+                "SSH usernames are part of clone transport identity: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn destination_keys_distinguish_same_name_origins_and_reject_unsafe_urls() {
+        let cfg = thegn_core::config::Config::default();
+        let a = workspace_clone_dest("https://github.com/acme/repo.git", &cfg).unwrap();
+        let b = workspace_clone_dest("https://github.com/other/repo.git", &cfg).unwrap();
+        assert_ne!(a, b, "owner is part of the canonical origin digest");
+        for invalid in [
+            "https://github.com/acme/../repo.git",
+            "https://github.com/acme/%2e%2e/repo.git",
+            "https://user:secret@github.com/acme/repo.git",
+            "https://github.com/acme/repo.git?token=secret",
+            "https://github.com/acme/repo\\..\\escape.git",
+        ] {
+            assert!(
+                matches!(
+                    plan_new_workspace_input(invalid, &cfg),
+                    SubmitPlan::Invalid(_)
+                ),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_url_destination_is_reused_only_when_origin_matches() {
+        let mut cfg = thegn_core::config::Config::default();
+        let root = tmp("existing-url-dest");
+        std::fs::remove_dir_all(&root).unwrap_or(());
+        std::fs::create_dir_all(&root).unwrap();
+        cfg.workspaces_dir = root.to_string_lossy().into_owned();
+        let url = "https://github.com/acme/repo.git";
+        let dest = workspace_clone_dest(url, &cfg).unwrap();
+        std::fs::create_dir_all(dest.join(".git")).unwrap();
+        std::fs::write(
+            dest.join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://github.com/acme/repo.git\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            plan_new_workspace_input(url, &cfg),
+            SubmitPlan::Local(ref path) if path == url
+        ));
+
+        std::fs::write(
+            dest.join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://github.com/other/repo.git\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            plan_new_workspace_input(url, &cfg),
+            SubmitPlan::Invalid(_)
+        ));
+
+        std::fs::remove_dir_all(&dest).unwrap();
+        let legacy = root.join("repo");
+        std::fs::create_dir_all(legacy.join(".git")).unwrap();
+        std::fs::write(
+            legacy.join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://github.com/acme/repo.git\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            plan_new_workspace_input(url, &cfg),
+            SubmitPlan::Local(ref path) if path == url
+        ));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
