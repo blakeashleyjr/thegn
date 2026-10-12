@@ -1122,15 +1122,14 @@ mod tests {
     ) -> tokio::task::JoinHandle<()> {
         let listener =
             thegn_svc::ipc::IpcListener::Unix(tokio::net::UnixListener::bind(&socket).unwrap());
-        let server = tokio::spawn(async move {
+        tokio::spawn(async move {
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<thegn_svc::ipc::IpcConnectInfo>(),
             )
             .await
             .unwrap();
-        });
-        server
+        })
     }
 
     #[cfg(unix)]
