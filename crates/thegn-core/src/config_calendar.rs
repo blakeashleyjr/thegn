@@ -545,6 +545,14 @@ pub fn validate_calendar(cfg: &CalendarConfig) -> Vec<String> {
     if let Err(problem) = cfg.sync_horizon(probe) {
         out.push(problem);
     }
+    for (i, m) in cfg.reminder_default_mins.iter().enumerate() {
+        if *m > crate::calendar::reminders::MAX_LEAD_MINS {
+            out.push(format!(
+                "calendar.reminder_default_mins[{i}]: {m} minutes is beyond the supported lead of {} minutes (28 days) and could never fire",
+                crate::calendar::reminders::MAX_LEAD_MINS
+            ));
+        }
+    }
     if !cfg.home_zone.trim().is_empty() && resolve_zone(&cfg.home_zone).is_none() {
         out.push(format!(
             "calendar.home_zone: unknown IANA time zone {:?}{}",

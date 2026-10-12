@@ -842,24 +842,41 @@ pub(crate) fn due_reminders(
         });
     }
     let home = home_zone(cfg);
-    let at = chrono::DateTime::from_timestamp_millis(window.to_ms)
-        .ok_or(CalendarViewError::Expansion(ExpansionError::InvalidWindow))?;
-    let today = at.with_timezone(&home).date_naive();
-    // A day either side is plenty: no sane reminder leads by more than that,
-    // and it keeps the scan small.
-    let (from, to) = (
-        today.pred_opt().unwrap_or(today),
-        today.succ_opt().unwrap_or(today),
-    );
-    let range = CalendarWindow::new(from, to, home).ok_or(CalendarViewError::InvalidWindow)?;
+    let invalid = || CalendarViewError::Expansion(ExpansionError::InvalidWindow);
+    let to_at = chrono::DateTime::from_timestamp_millis(window.to_ms).ok_or_else(invalid)?;
+    // The core clamps catch-up to an hour, so the scan does too: a stale
+    // cursor must not widen the query.
+    let from_ms = window
+        .from_ms
+        .clamp(window.to_ms.saturating_sub(3_600_000), window.to_ms);
+    let from_at = chrono::DateTime::from_timestamp_millis(from_ms).ok_or_else(invalid)?;
+    let day = |at: chrono::DateTime<chrono::Utc>| at.with_timezone(&home).date_naive();
+    let lead = |mins: u32| chrono::TimeDelta::minutes(i64::from(mins));
+    let defaults = cfg.default_reminders();
+
+    // A reminder fires when its TRIGGER is in `(from, to]`, and the trigger is
+    // `lead` before the start, so the occurrences worth looking at start in
+    // `[from, to + lead]`. Load as far as the supported horizon (a bounded
+    // indexed read), but expand only as far as the longest lead actually
+    // present in what was loaded (THE-460) — never a fixed day.
+    let first = day(from_at).pred_opt().unwrap_or(day(from_at));
+    let widest = to_at
+        .checked_add_signed(lead(thegn_core::calendar::reminders::MAX_LEAD_MINS))
+        .ok_or_else(invalid)?;
+    let last_loaded = day(widest).succ_opt().unwrap_or(day(widest));
+    let range =
+        CalendarWindow::new(first, last_loaded, home).ok_or(CalendarViewError::InvalidWindow)?;
     let cached = load_cached_window(db, range)?;
+    let needed = thegn_core::calendar::reminders::max_lead_mins(&cached.events, &defaults);
+    let reach = to_at.checked_add_signed(lead(needed)).ok_or_else(invalid)?;
+    let (from, to) = (first, day(reach).succ_opt().unwrap_or(day(reach)));
     let expanded = thegn_core::calendar::expand_calendar(&cached.events, from, to, home)
         .map_err(CalendarViewError::Expansion)?;
     Ok(DueReminders {
         reminders: thegn_core::calendar::reminders::due_shared(
             &expanded.occurrences,
             home,
-            &cfg.default_reminders(),
+            &defaults,
             window.from_ms,
             window.to_ms,
         ),

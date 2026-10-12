@@ -859,3 +859,55 @@ fn a_reset_is_believed_even_when_empty_but_an_empty_snapshot_is_not() {
     );
     assert!(!t.db.has_calendar_events("work").unwrap());
 }
+
+#[test]
+fn a_week_long_reminder_lead_is_a_candidate_not_just_yesterday_to_tomorrow() {
+    // THE-460: the scan used to stop at tomorrow, so an event a week out with
+    // a week-long lead had its trigger due now and was never considered.
+    let t = TmpDb::new("rem-week");
+    let (from, to) = window();
+    let mut trip = event("trip"); // 2026-08-21 09:00 UTC
+    trip.reminders = vec![thegn_core::calendar::Reminder {
+        minutes_before: 7 * 24 * 60,
+    }];
+    apply_page(
+        &t.db,
+        "work",
+        "ics",
+        &page(vec![trip], vec![], ""),
+        from,
+        to,
+    );
+    let hit = reminder_window(1, utc_ms(2026, 8, 14, 8, 59), utc_ms(2026, 8, 14, 9, 1));
+    let due = due_reminders(&t.db, &reminder_cfg(), hit).unwrap();
+    assert_eq!(due.reminders.len(), 1, "{:?}", due.reminders);
+    assert_eq!(due.reminders[0].trigger_mins, 7 * 24 * 60);
+    // The tick after the trigger does not repeat it.
+    let after = reminder_window(2, utc_ms(2026, 8, 14, 9, 1), utc_ms(2026, 8, 14, 9, 3));
+    assert!(
+        due_reminders(&t.db, &reminder_cfg(), after)
+            .unwrap()
+            .reminders
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_long_configured_default_lead_reaches_events_beyond_tomorrow() {
+    let t = TmpDb::new("rem-default-week");
+    let (from, to) = window();
+    apply_page(
+        &t.db,
+        "work",
+        "ics",
+        &page(vec![event("plain")], vec![], ""),
+        from,
+        to,
+    );
+    let cfg = CalendarConfig {
+        reminder_default_mins: vec![3 * 24 * 60],
+        ..reminder_cfg()
+    };
+    let hit = reminder_window(1, utc_ms(2026, 8, 18, 8, 59), utc_ms(2026, 8, 18, 9, 1));
+    assert_eq!(due_reminders(&t.db, &cfg, hit).unwrap().reminders.len(), 1);
+}
