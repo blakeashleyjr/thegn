@@ -1717,23 +1717,41 @@ fn wait(cfg: &Config, row: Option<i64>, any: bool, timeout: Option<i64>, json: b
     let db = Db::open()?;
     let rows = db.list_dispatches()?;
     let targets = pipeline_run::wait_candidates(&rows, row).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let targets = targets
+    let targets = fence_wait_targets(&db, targets)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(wait_wake(cfg, targets, timeout, json))
+}
+
+fn fence_wait_targets(db: &Db, targets: Vec<WaitTarget>) -> Result<Vec<FencedWaitTarget>> {
+    targets
         .into_iter()
         .map(|target| {
             let run = db
-                .dispatch_run_ref(target.id)?
-                .ok_or_else(|| anyhow::anyhow!("dispatch {} disappeared before wait", target.id))?;
+                .dispatch_run_ref(target.id)
+                .map_err(|error| {
+                    anyhow::Error::new(crate::cmd::Retryable(anyhow::anyhow!(
+                        "could not fence dispatch {} before wait: {error}",
+                        target.id
+                    )))
+                })?
+                .ok_or_else(|| {
+                    anyhow::Error::new(crate::cmd::Retryable(anyhow::anyhow!(
+                        "dispatch {} disappeared before wait; retry",
+                        target.id
+                    )))
+                })?;
             if run.session_id != target.session_id {
-                anyhow::bail!("dispatch {} changed session before wait; retry", target.id);
+                return Err(anyhow::Error::new(crate::cmd::Retryable(anyhow::anyhow!(
+                    "dispatch {} changed session before wait; retry",
+                    target.id
+                ))));
             }
             Ok(FencedWaitTarget {
                 target,
                 run_gen: run.run_gen,
             })
         })
-        .collect::<Result<Vec<_>>>()?;
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(wait_wake(cfg, targets, timeout, json))
+        .collect()
 }
 
 fn validate_wait_timeout(row: Option<i64>, any: bool, timeout: Option<i64>) -> Result<()> {
@@ -1809,17 +1827,18 @@ fn is_reaped_wait_error(error: &anyhow::Error) -> bool {
         .is_some_and(|e| e.status() == 404)
 }
 
-/// Does a wake carry a handoff, whatever happened to the session?
-///
-/// A gone session is not evidence of a handoff. Verify the exact current row
-/// using the same completion facts as `dispatch verify`, then fence the result
-/// against the selected session and generation.
+/// The selected session and generation this wait candidate belongs to.
 #[derive(Debug, Clone)]
 struct FencedWaitTarget {
     target: WaitTarget,
     run_gen: i64,
 }
 
+/// Does a gone wake carry a verified handoff?
+///
+/// A gone session is not evidence of a handoff. Verify the exact current row
+/// using the same completion facts as `dispatch verify`, then fence the result
+/// against the selected session and generation.
 /// Artifactless rows retain plain-dispatch semantics: a non-empty report is
 /// their complete row handoff. This does not validate pipeline report evidence
 /// or bypass THE-241, which owns that contract.
@@ -1972,7 +1991,11 @@ async fn wait_wake(
                 v["handoff_outcome"] = serde_json::json!(handoff);
                 v["handoff_present"] = serde_json::json!(handoff.handoff_present());
             }
-            return super::emit_json(&v);
+            super::emit_json(&v)?;
+            if gone && handoff == pipeline_run::HandoffOutcome::InfrastructureUnknown {
+                std::process::exit(crate::cmd::EXIT_RETRYABLE);
+            }
+            return Ok(());
         }
         let stage = t.target.stage.as_deref().unwrap_or("-");
         match (gone, exit_code) {
@@ -2063,6 +2086,32 @@ mod tests {
         assert_eq!(artifact.as_deref(), Some("handoff.md"));
         assert_eq!(outcome, pipeline_run::HandoffOutcome::Absent);
         assert!(!outcome.handoff_present(), "assigned path is not a handoff");
+    }
+
+    #[test]
+    fn changed_session_while_selecting_wait_is_retryable() {
+        let (_dir, db) = db("wait-session-fence");
+        let (_worktree_dir, worktree) = git_repo("wait-session-worktree");
+        let id = db
+            .put_agent_dispatch(thegn_core::issue::NewDispatch::new(
+                "linear:THE-253",
+                worktree.to_str().unwrap(),
+                "coder",
+            ))
+            .unwrap();
+        db.bind_dispatch_session(id, "current-session").unwrap();
+        let error = fence_wait_targets(
+            &db,
+            vec![WaitTarget {
+                id,
+                session_id: "selected-session".into(),
+                stage: Some("code".into()),
+                issue_id: "linear:THE-253".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<crate::cmd::Retryable>().is_some());
+        assert!(error.to_string().contains("changed session"));
     }
 
     #[test]
