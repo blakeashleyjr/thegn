@@ -179,7 +179,7 @@ impl Recorder {
     }
 
     pub(crate) fn done(&self) -> bool {
-        self.state.done.load(Ordering::Acquire)
+        self.state.done()
     }
 
     pub(crate) fn capped(&self) -> bool {
