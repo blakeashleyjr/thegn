@@ -99,6 +99,46 @@ fn a_colon_inside_a_quoted_parameter_does_not_split_the_line() {
 }
 
 #[test]
+fn quoted_parameters_keep_semicolons_colons_and_commas_together() {
+    let line = parse_line(r#"ATTENDEE;CN="Doe; John, Jr.: East":mailto:jane@example.com"#).unwrap();
+    assert_eq!(
+        line.params.get("CN").map(String::as_str),
+        Some("Doe; John, Jr.: East")
+    );
+    assert_eq!(line.value, "mailto:jane@example.com");
+
+    let list = parse_line(r#"ATTENDEE;ROLE=REQ-PARTICIPANT,OPT-PARTICIPANT:mailto:a@example.com"#)
+        .unwrap();
+    assert_eq!(
+        list.params.get("ROLE").map(String::as_str),
+        Some("REQ-PARTICIPANT,OPT-PARTICIPANT")
+    );
+}
+
+#[test]
+fn parameter_values_decode_rfc_6868_and_reject_unterminated_quotes() {
+    let line =
+        parse_line(r#"ATTENDEE;CN="Doe^'s ^^ name^nSecond line":mailto:a@example.com"#).unwrap();
+    assert_eq!(
+        line.params.get("CN").map(String::as_str),
+        Some("Doe\"s ^ name\nSecond line")
+    );
+    assert!(parse_line(r#"ATTENDEE;CN="unfinished:mailto:a@example.com"#).is_none());
+}
+
+#[test]
+fn only_text_property_values_are_unescaped() {
+    let summary = parse_line(r"SUMMARY:line\nnext\,item").unwrap();
+    assert_eq!(summary.value, "line\nnext,item");
+
+    let url = parse_line(r"URL:https://example.com/a\b").unwrap();
+    assert_eq!(url.value, r"https://example.com/a\b");
+
+    let recurrence = parse_line(r"RRULE:FREQ=DAILY\;INTERVAL=2").unwrap();
+    assert_eq!(recurrence.value, r"FREQ=DAILY\;INTERVAL=2");
+}
+
+#[test]
 fn a_line_without_a_colon_is_skipped_not_fatal() {
     assert!(parse_line("GARBAGE").is_none());
     assert!(parse_line(":novalue").is_none());
