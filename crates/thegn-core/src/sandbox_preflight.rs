@@ -20,6 +20,8 @@
 use crate::config::FileAccess;
 use crate::sandbox::{PROBE_TIMEOUT, SandboxSpec, oci_prefix};
 
+pub(crate) type PreflightRunner = dyn Fn(&[String]) -> Option<(bool, String)>;
+
 /// The exec argv the preflight probe runs. It mirrors the OCI arm of
 /// `backend_enter_argv` exactly — same `oci_prefix` (so it targets the right
 /// local/remote daemon), same `--workdir <worktree>` gated on file access, same
@@ -76,11 +78,19 @@ pub(crate) fn preflight_exec_argv_with(spec: &SandboxSpec, body: &str) -> Vec<St
 /// Subprocess seam (`cov_ignore`, like the rest of the sandbox runtime); the pure
 /// argv builder above is unit-tested.
 pub fn preflight_exec(spec: &SandboxSpec) -> Result<(), String> {
+    preflight_exec_with(spec, &|argv| {
+        output_stderr_with_timeout(argv, PROBE_TIMEOUT)
+    })
+}
+
+/// [`preflight_exec`] with an injected executor, allowing route and failure
+/// behavior to be tested without a live container engine.
+pub(crate) fn preflight_exec_with(spec: &SandboxSpec, run: &PreflightRunner) -> Result<(), String> {
     if !spec.backend.is_oci() {
         return Ok(());
     }
     let argv = preflight_exec_argv(spec);
-    match output_stderr_with_timeout(&argv, PROBE_TIMEOUT) {
+    match run(&argv) {
         Some((true, _)) => Ok(()),
         Some((false, stderr)) => {
             // A verified mount failure is its own class, with its own remedy.
@@ -112,6 +122,13 @@ pub fn preflight_exec(spec: &SandboxSpec) -> Result<(), String> {
                 return Err(failure.one_line());
             }
             let msg = stderr.trim();
+            if spec
+                .compose_spec()
+                .is_some_and(|compose| compose.has_service())
+                && let Some(reason) = compose_exec_failure(msg)
+            {
+                return Err(reason);
+            }
             Err(if msg.is_empty() {
                 format!("exec probe failed for container '{}'", spec.name)
             } else {
@@ -130,6 +147,20 @@ pub fn preflight_exec(spec: &SandboxSpec) -> Result<(), String> {
     }
 }
 
+fn compose_exec_failure(stderr: &str) -> Option<String> {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("no such service") || lower.contains("no service found") {
+        Some("Compose preflight failed: service was not found".into())
+    } else if lower.contains("is not running")
+        || lower.contains("no container found for")
+        || lower.contains("service has no container")
+    {
+        Some("Compose preflight failed: service has no running container".into())
+    } else {
+        None
+    }
+}
+
 /// Like `sandbox::output_with_timeout` but captures **stderr** (where a container
 /// runtime writes its failure text) instead of stdout. Returns `(success, stderr)`
 /// or `None` on spawn failure or timeout (child killed + reaped). The probed
@@ -138,39 +169,15 @@ fn output_stderr_with_timeout(
     argv: &[String],
     timeout: std::time::Duration,
 ) -> Option<(bool, String)> {
-    use std::process::{Command, Stdio};
-    use std::time::Instant;
-    let mut child = Command::new(&argv[0])
-        .args(&argv[1..])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stderr = child
-                    .stderr
-                    .take()
-                    .and_then(|mut r| {
-                        use std::io::Read;
-                        let mut s = String::new();
-                        r.read_to_string(&mut s).ok().map(|_| s)
-                    })
-                    .unwrap_or_default();
-                return Some((status.success(), stderr));
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill(); // best-effort: probe teardown: force-kill the child at the deadline
-                let _ = child.wait(); // best-effort: probe teardown: the reaper must not block the preflight
-                return None;
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
-            Err(_) => return None,
-        }
-    }
+    crate::sandbox::proc::run_bounded(
+        argv,
+        timeout,
+        crate::sandbox::proc::Capture {
+            stdout: None,
+            stderr: Some(256 * 1024),
+        },
+    )
+    .into_stderr()
 }
 
 /// The worktree path with symlinks resolved, for the remedy's share-root guess.
@@ -311,5 +318,52 @@ mod tests {
         let bwrap = preflight_exec_argv_with(&spec, "true");
         assert_eq!(bwrap.first().map(String::as_str), Some("bwrap"));
         assert!(!bwrap.iter().any(|arg| arg == "compose"));
+    }
+
+    #[test]
+    fn compose_preflight_runner_targets_service_not_container_name() {
+        let compose = crate::sandbox_compose::ComposeSpec {
+            files: vec!["compose.yml".into()],
+            service: Some("app".into()),
+            run_services: Vec::new(),
+        };
+        let mut spec = base_spec(Backend::Docker);
+        spec.name = "thegn-x".into();
+        spec.compose = Some(compose.encode());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner_observed = std::sync::Arc::clone(&observed);
+        let result = preflight_exec_with(&spec, &move |argv| {
+            *runner_observed.lock().unwrap() = argv.to_vec();
+            Some((true, String::new()))
+        });
+        assert_eq!(result, Ok(()));
+        let observed = observed.lock().unwrap();
+        let exec = observed.iter().position(|arg| arg == "exec").unwrap();
+        assert_eq!(observed[exec - 2].as_str(), "-p");
+        assert_eq!(observed[exec - 1].as_str(), "thegn-x");
+        let after_exec = &observed[exec + 1..];
+        assert!(!after_exec.iter().any(|arg| arg == "thegn-x"));
+        let service_index = if after_exec.first().is_some_and(|arg| arg == "--workdir") {
+            2
+        } else {
+            0
+        };
+        assert_eq!(
+            after_exec.get(service_index).map(String::as_str),
+            Some("app")
+        );
+    }
+
+    #[test]
+    fn compose_service_failures_are_classified() {
+        assert_eq!(
+            compose_exec_failure("no such service: api"),
+            Some("Compose preflight failed: service was not found".into())
+        );
+        assert_eq!(
+            compose_exec_failure("service \"api\" is not running"),
+            Some("Compose preflight failed: service has no running container".into())
+        );
+        assert_eq!(compose_exec_failure("permission denied"), None);
     }
 }

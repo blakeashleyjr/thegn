@@ -118,7 +118,6 @@ crates/thegn-core/src/repo.rs
 crates/thegn-core/src/retry.rs
 crates/thegn-core/src/sandbox_mounts.rs
 crates/thegn-core/src/sandbox_prefetch.rs
-crates/thegn-core/src/sandbox_preflight.rs
 crates/thegn-core/src/sandbox.rs
 crates/thegn-core/src/sandbox_tests.rs
 crates/thegn-core/src/semantic.rs
