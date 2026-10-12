@@ -122,6 +122,21 @@ pub fn resolve_server_command(cmd: &str, path: Option<&OsStr>) -> Result<PathBuf
                 "language server command must be an absolute path or a bare name: {cmd}"
             )));
         }
+        let canonical = configured
+            .canonicalize()
+            .map_err(|_| LspError::Spawn(format!("{cmd} is not an executable file")))?;
+        let metadata = canonical
+            .metadata()
+            .map_err(|_| LspError::Spawn(format!("{cmd} is not an executable file")))?;
+        if !metadata.is_file() || !crate::plugin::platform::is_executable_file(&metadata) {
+            return Err(LspError::Spawn(format!("{cmd} is not an executable file")));
+        }
+        tracing::debug!(
+            target: "thegn::lsp",
+            command = %configured.display(),
+            canonical_path = %canonical.display(),
+            "resolved language server executable"
+        );
         return Ok(configured.to_path_buf());
     }
     let Some(path) = path else {
@@ -2453,6 +2468,30 @@ mod tests {
             resolve_server_command(executable.to_str().unwrap(), None).unwrap(),
             executable
         );
+    }
+
+    #[test]
+    fn absolute_server_paths_must_name_executable_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert!(matches!(
+            resolve_server_command(missing.to_str().unwrap(), None),
+            Err(LspError::Spawn(_))
+        ));
+        assert!(matches!(
+            resolve_server_command(dir.path().to_str().unwrap(), None),
+            Err(LspError::Spawn(_))
+        ));
+
+        let non_executable = dir.path().join("not-executable");
+        std::fs::write(&non_executable, "fixture").unwrap();
+        let metadata = non_executable.metadata().unwrap();
+        if !crate::plugin::platform::is_executable_file(&metadata) {
+            assert!(matches!(
+                resolve_server_command(non_executable.to_str().unwrap(), None),
+                Err(LspError::Spawn(_))
+            ));
+        }
     }
 
     struct CapturingWriter(Arc<Mutex<Vec<u8>>>);

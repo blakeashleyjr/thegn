@@ -52,6 +52,7 @@ enum ClientSlot {
         client: Arc<LspClient>,
         generation: u64,
         started_at: Instant,
+        last_used: Instant,
         failures: u32,
     },
     Unavailable,
@@ -202,8 +203,16 @@ impl LspSupervisor {
     }
 }
 
+impl Drop for LspSupervisor {
+    fn drop(&mut self) {
+        self.inner.shutdown_all(LSP_QUIT_BUDGET);
+    }
+}
+
 /// Grace for the LSP shutdown request and for the child's exit before kill.
 const LSP_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+/// One synchronous shutdown budget for all clients during host quit.
+const LSP_QUIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Gracefully close and drop clients on a worker thread, never the render/input
 /// thread.
@@ -226,6 +235,51 @@ fn teardown_off_loop(clients: Vec<Arc<LspClient>>) {
 }
 
 impl LspInner {
+    /// Drain live clients synchronously within one total quit budget. Startup
+    /// and negative-cache slots are intentionally left alone: a handle may
+    /// outlive the supervisor and remain usable for future starts.
+    fn shutdown_all(&self, budget: Duration) -> usize {
+        let clients = {
+            let mut state = match self.clients.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let keys = state
+                .map
+                .iter()
+                .filter_map(|(key, slot)| {
+                    matches!(slot, ClientSlot::Live { .. }).then(|| key.clone())
+                })
+                .collect::<Vec<_>>();
+            let mut clients = Vec::with_capacity(keys.len());
+            for (root, key) in keys {
+                if let Some(ClientSlot::Live {
+                    client, generation, ..
+                }) = state.map.remove(&(root.clone(), key.clone()))
+                {
+                    self.diag_tx.retire(&root, &key, generation);
+                    clients.push(client);
+                }
+            }
+            clients
+        };
+
+        let count = clients.len();
+        let deadline = Instant::now() + budget;
+        for client in clients {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                drop(client);
+                continue;
+            }
+            // LspClient::shutdown bounds protocol and process waits separately.
+            // Splitting the remaining budget keeps their combined wait within
+            // the single supervisor quit allowance.
+            client.shutdown(LSP_CLOSE_GRACE.min(remaining / 2));
+        }
+        count
+    }
+
     /// Resolve a file path to its registry key (the LSP tier), by extension.
     /// Pure; safe to call anywhere. `None` for an unregistered extension.
     pub fn resolve_key(&self, path: &str) -> Option<String> {
@@ -300,9 +354,12 @@ impl LspInner {
             let mut previous_failures = 0;
             let mut restart_backoff = false;
             let mut stale_client = None;
-            if let Some(slot) = state.map.get(&map_key) {
+            if let Some(slot) = state.map.get_mut(&map_key) {
                 match slot {
-                    ClientSlot::Live { client, .. } if !client.is_closed() => {
+                    ClientSlot::Live {
+                        client, last_used, ..
+                    } if !client.is_closed() => {
+                        *last_used = Instant::now();
                         return Ok(client.clone());
                     }
                     ClientSlot::Live { .. } => {
@@ -427,6 +484,7 @@ impl LspInner {
                                 client: client.clone(),
                                 generation,
                                 started_at: Instant::now(),
+                                last_used: Instant::now(),
                                 failures: previous_failures,
                             },
                         );
@@ -492,6 +550,40 @@ impl LspInner {
             }
             _ => {}
         }
+    }
+
+    /// Retire live clients that have not been used within `idle`. The caller
+    /// supplies `now` so the sweep can be tested without sleeping.
+    #[allow(dead_code)] // the run-loop-2 lane owns periodic sweep wiring
+    pub fn evict_idle(&self, idle: Duration, now: Instant) -> usize {
+        let mut teardown = Vec::new();
+        let mut removed_count = 0;
+        if let Ok(mut state) = self.clients.lock() {
+            let stale = state
+                .map
+                .iter()
+                .filter_map(|(key, slot)| match slot {
+                    ClientSlot::Live { last_used, .. }
+                        if now.saturating_duration_since(*last_used) >= idle =>
+                    {
+                        Some(key.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for (root, key) in stale {
+                if let Some(ClientSlot::Live {
+                    client, generation, ..
+                }) = state.map.remove(&(root.clone(), key.clone()))
+                {
+                    self.diag_tx.retire(&root, &key, generation);
+                    teardown.push(client);
+                    removed_count += 1;
+                }
+            }
+        }
+        teardown_off_loop(teardown);
+        removed_count
     }
 
     /// Retire every server (and negative-cache slot) whose worktree is no
@@ -1484,7 +1576,21 @@ fn relativize(path: &str, root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use thegn_svc::lsp::LspDiagnostic;
+
+    struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn pd(root: &str, path: &str, diags: Vec<LspDiagnostic>) -> PublishedDiagnostics {
         PublishedDiagnostics {
@@ -1758,6 +1864,86 @@ mod tests {
         let mut sup = LspSupervisor::from_config(&cfg);
         let rx = sup.take_diagnostics_rx().unwrap();
         (sup.handle(), rx)
+    }
+
+    #[test]
+    fn dropping_supervisor_shuts_down_live_clients_before_exit() {
+        let mut cfg = Config::default();
+        cfg.lsp.enabled = true;
+        let sup = LspSupervisor::from_config(&cfg);
+        let handle = sup.handle();
+        let (reader, server_writer) = std::io::pipe().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_writer = captured.clone();
+        handle
+            .client_with(
+                Path::new("/shutdown-test"),
+                "rust",
+                move |root, key, diagnostics, generation| {
+                    Ok(Arc::new(LspClient::from_io_with_identity(
+                        Box::new(reader),
+                        Box::new(CapturingWriter(captured_writer)),
+                        key,
+                        root,
+                        diagnostics,
+                        key.to_string(),
+                        generation,
+                    )))
+                },
+            )
+            .unwrap();
+
+        let started = Instant::now();
+        drop(sup);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let bytes = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        let shutdown = bytes.find("\"method\":\"shutdown\"").unwrap();
+        let exit = bytes.find("\"method\":\"exit\"").unwrap();
+        assert!(shutdown < exit, "shutdown request must precede exit");
+        drop(server_writer);
+    }
+
+    #[test]
+    fn idle_eviction_uses_injected_time_and_keeps_recent_clients() {
+        let (inner, _rx) = enabled_inner();
+        let idle_root = Path::new("/idle");
+        let active_root = Path::new("/active");
+        let idle_client = inner
+            .client_with(idle_root, "rust", live_fake_client)
+            .unwrap();
+        let active_client = inner
+            .client_with(active_root, "rust", live_fake_client)
+            .unwrap();
+        let now = Instant::now();
+        {
+            let mut state = inner.clients.lock().unwrap();
+            if let Some(ClientSlot::Live { last_used, .. }) =
+                state.map.get_mut(&(idle_root.to_path_buf(), "rust".into()))
+            {
+                *last_used = now - Duration::from_secs(10);
+            } else {
+                panic!("idle client must be live");
+            }
+        }
+
+        assert_eq!(inner.evict_idle(Duration::from_secs(5), now), 1);
+        assert!(
+            !inner
+                .clients
+                .lock()
+                .unwrap()
+                .map
+                .contains_key(&(idle_root.to_path_buf(), "rust".into()))
+        );
+        assert!(
+            inner
+                .clients
+                .lock()
+                .unwrap()
+                .map
+                .contains_key(&(active_root.to_path_buf(), "rust".into()))
+        );
+        drop((idle_client, active_client));
     }
 
     #[test]
