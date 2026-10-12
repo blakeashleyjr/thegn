@@ -33,25 +33,40 @@ use thegn_core::db::Db;
 use crate::model::ProxyConfig;
 use crate::shared::now_ms;
 use crate::state::AppState;
+use axum::{Router, extract::Query, routing::get};
+use serde::Deserialize;
+
+pub const IDENTITY_PROTOCOL: u32 = thegn_core::proxy::attribution::IDENTITY_PROTOCOL_VERSION;
 
 /// Builds the shared state and serves the proxy until the process is signalled.
 pub async fn run(config: ProxyConfig) -> Result<()> {
+    let secret_path = std::env::var_os("THEGN_MODEL_PROXY_SECRET_FILE")
+        .context("THEGN_MODEL_PROXY_SECRET_FILE is required")?;
+    let secret = read_secret(std::path::Path::new(&secret_path))?;
+    budget::install_attribution_secret(secret.clone())
+        .map_err(|_| anyhow::anyhow!("proxy attribution secret was already installed"))?;
     let db = std::sync::Arc::new(std::sync::Mutex::new(Db::open().context("open thegn.db")?));
-    serve(config, db).await
+    serve_with_secret(config, db, secret).await
 }
 
 /// Serves the proxy against an explicit DB handle (used by tests).
 pub async fn serve(config: ProxyConfig, db: shared::SharedDb) -> Result<()> {
+    serve_with_secret(config, db, Vec::new()).await
+}
+
+async fn serve_with_secret(
+    config: ProxyConfig,
+    db: shared::SharedDb,
+    secret: Vec<u8>,
+) -> Result<()> {
     let listen = config.listen;
     let state = AppState::new(config, db, now_ms());
-    let app = server::app(state);
+    let app = server::app(state)
+        .merge(Router::new().route("/thegn/identity", get(identity).with_state(secret)));
     // The listen socket IS the single-instance lock: a second bind loses.
     let listener = match tokio::net::TcpListener::bind(listen).await {
         Ok(l) => l,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            tracing::info!(%listen, "tgproxy already bound — deferring to incumbent");
-            return Ok(());
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => return Err(e).with_context(|| format!("tgproxy listen address {listen} is already occupied; verify the existing daemon identity or choose another port")),
         Err(e) => return Err(e).with_context(|| format!("bind {listen}")),
     };
     tracing::info!(%listen, "tgproxy listening");
@@ -60,6 +75,42 @@ pub async fn serve(config: ProxyConfig, db: shared::SharedDb) -> Result<()> {
         .await
         .context("axum serve")?;
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct IdentityQuery {
+    challenge: String,
+}
+
+async fn identity(
+    Query(query): Query<IdentityQuery>,
+    axum::extract::State(secret): axum::extract::State<Vec<u8>>,
+) -> axum::Json<serde_json::Value> {
+    axum::Json(
+        serde_json::json!({"protocol": IDENTITY_PROTOCOL, "proof": identity_proof(&secret, &query.challenge)}),
+    )
+}
+
+fn identity_proof(secret: &[u8], challenge: &str) -> String {
+    thegn_core::proxy::attribution::identity_proof(secret, challenge)
+}
+
+fn read_secret(path: &std::path::Path) -> Result<Vec<u8>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("read proxy secret {}", path.display()))?;
+    let bytes = raw.trim().as_bytes();
+    if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        anyhow::bail!("proxy secret file must contain 32 bytes encoded as hex");
+    }
+    let decoded = (0..bytes.len())
+        .step_by(2)
+        .map(|i| {
+            let h = (bytes[i] as char).to_digit(16).expect("validated hex");
+            let l = (bytes[i + 1] as char).to_digit(16).expect("validated hex");
+            ((h << 4) | l) as u8
+        })
+        .collect();
+    Ok(decoded)
 }
 
 async fn shutdown_signal() {

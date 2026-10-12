@@ -8,7 +8,7 @@
 //! stops it gracefully. All calls here are blocking and MUST run off the event
 //! loop (they spawn processes and probe the network).
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -28,6 +28,55 @@ fn config_path() -> PathBuf {
 
 fn pid_path() -> PathBuf {
     runtime_dir().join("tgproxy.pid")
+}
+
+fn secret_path() -> PathBuf {
+    runtime_dir().join("secret")
+}
+
+fn host_secret() -> Result<Vec<u8>> {
+    let dir = runtime_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    secret_for_path(&secret_path())
+}
+
+fn secret_for_path(path: &std::path::Path) -> Result<Vec<u8>> {
+    let mut random = [0u8; 32];
+    getrandom::fill(&mut random).context("generate model-proxy secret")?;
+    let hex: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    match thegn_core::fsperm::write_owner_only_new(&path, hex.as_bytes()) {
+        Ok(()) => Ok(random.to_vec()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut last_error = None;
+            for _ in 0..20 {
+                match read_host_secret(path) {
+                    Ok(secret) => return Ok(secret),
+                    Err(error) => last_error = Some(error),
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(last_error.expect("at least one read attempt"))
+        }
+        Err(e) => {
+            Err(e).with_context(|| format!("create owner-only proxy secret {}", path.display()))
+        }
+    }
+}
+
+fn read_host_secret(path: &std::path::Path) -> Result<Vec<u8>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("read proxy secret {}", path.display()))?;
+    let bytes = raw.trim().as_bytes();
+    if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        anyhow::bail!("invalid model-proxy secret file {}", path.display());
+    }
+    Ok((0..64)
+        .step_by(2)
+        .map(|i| {
+            (((bytes[i] as char).to_digit(16).expect("validated hex") << 4)
+                | (bytes[i + 1] as char).to_digit(16).expect("validated hex")) as u8
+        })
+        .collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,9 +166,99 @@ pub fn listen_addr(cfg: &ModelProxyConfig) -> SocketAddr {
         .unwrap_or_else(|_| "127.0.0.1:8383".parse().unwrap())
 }
 
-/// Whether the proxy answers on its listen socket right now (a quick TCP probe).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeState {
+    Down,
+    Owned,
+    Foreign(String),
+    Incompatible(u64),
+}
+
+fn verify_probe_response(secret: &[u8], challenge: &str, status: u16, body: &[u8]) -> ProbeState {
+    if status != 200 {
+        return ProbeState::Foreign(format!("identity endpoint returned HTTP {status}"));
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return ProbeState::Foreign("invalid identity response".into());
+    };
+    let Some(proof) = value.get("proof").and_then(serde_json::Value::as_str) else {
+        return ProbeState::Foreign("missing identity proof".into());
+    };
+    if thegn_core::proxy::attribution::verify_identity_proof(secret, challenge, proof) {
+        let Some(protocol) = value.get("protocol").and_then(serde_json::Value::as_u64) else {
+            return ProbeState::Foreign("missing identity protocol".into());
+        };
+        if protocol != u64::from(thegn_core::proxy::attribution::IDENTITY_PROTOCOL_VERSION) {
+            return ProbeState::Incompatible(protocol);
+        }
+        ProbeState::Owned
+    } else {
+        ProbeState::Foreign("identity proof did not match".into())
+    }
+}
+
+fn probe(cfg: &ModelProxyConfig) -> ProbeState {
+    let addr = listen_addr(cfg);
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) else {
+        return ProbeState::Down;
+    };
+    let secret = match host_secret() {
+        Ok(s) => s,
+        Err(e) => return ProbeState::Foreign(format!("cannot load daemon secret: {e}")),
+    };
+    let mut random = [0u8; 16];
+    if let Err(e) = getrandom::fill(&mut random) {
+        return ProbeState::Foreign(format!("cannot create identity challenge: {e}"));
+    }
+    let challenge: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(200))) {
+        return ProbeState::Foreign(format!("set identity timeout: {e}"));
+    }
+    if let Err(e) = stream.set_write_timeout(Some(Duration::from_millis(200))) {
+        return ProbeState::Foreign(format!("set identity timeout: {e}"));
+    }
+    if write!(stream, "GET /thegn/identity?challenge={challenge} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").is_err() { return ProbeState::Foreign("identity request failed".into()); }
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return ProbeState::Foreign("identity response timed out".into());
+        };
+        if let Err(e) = stream.set_read_timeout(Some(remaining)) {
+            return ProbeState::Foreign(format!("set identity timeout: {e}"));
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                response.extend_from_slice(&chunk[..count]);
+                if response.len() > 4096 {
+                    return ProbeState::Foreign("identity response too large".into());
+                }
+            }
+            Err(e) => return ProbeState::Foreign(format!("identity response unavailable: {e}")),
+        }
+    }
+    let Some(body_start) = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+    else {
+        return ProbeState::Foreign("malformed identity HTTP response".into());
+    };
+    let header_text = String::from_utf8_lossy(&response[..body_start]);
+    let status = header_text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    verify_probe_response(&secret, &challenge, status, &response[body_start..])
+}
+
+/// Whether the configured listener proves this daemon's authenticated identity.
 pub fn probe_up(cfg: &ModelProxyConfig) -> bool {
-    TcpStream::connect_timeout(&listen_addr(cfg), Duration::from_millis(200)).is_ok()
+    matches!(probe(cfg), ProbeState::Owned)
 }
 
 /// Writes the resolved (keys-by-reference) config to the runtime file, returning
@@ -141,6 +280,8 @@ fn write_config(cfg: &ModelProxyConfig) -> Result<PathBuf> {
 /// Returns `true` if a process was spawned (it may still lose the bind race).
 pub fn spawn(cfg: &ModelProxyConfig) -> Result<bool> {
     let config_file = write_config(cfg)?;
+    let secret_file = secret_path();
+    let _secret = host_secret()?;
     let exe = tgproxy_exe();
     // Join the shared resource ceiling (fail-safe: unwrapped if no policy).
     let argv = thegn_core::sandbox_cpucap::wrap_background_argv(vec![exe]);
@@ -148,6 +289,7 @@ pub fn spawn(cfg: &ModelProxyConfig) -> Result<bool> {
     let mut cmd = thegn_core::util::detached(program);
     cmd.args(rest);
     cmd.env("THEGN_MODEL_PROXY_CONFIG", &config_file);
+    cmd.env("THEGN_MODEL_PROXY_SECRET_FILE", &secret_file);
     let mut child = cmd.spawn().context("spawn tgproxy")?;
     let start_time = crate::platform::proxy_process_start_time(child.id());
     if crate::platform::proxy_identity_required() && start_time.is_none() {
@@ -174,9 +316,12 @@ pub fn spawn(cfg: &ModelProxyConfig) -> Result<bool> {
 #[expect(clippy::disallowed_methods)]
 pub fn serve_foreground(cfg: &ModelProxyConfig) -> Result<i32> {
     let config_file = write_config(cfg)?;
+    let secret_file = secret_path();
+    let _secret = host_secret()?;
     let exe = tgproxy_exe();
     let status = std::process::Command::new(&exe)
         .env("THEGN_MODEL_PROXY_CONFIG", &config_file)
+        .env("THEGN_MODEL_PROXY_SECRET_FILE", &secret_file)
         .status()
         .with_context(|| format!("exec {exe}"))?;
     Ok(status.code().unwrap_or(1))
@@ -185,17 +330,46 @@ pub fn serve_foreground(cfg: &ModelProxyConfig) -> Result<i32> {
 /// Ensures the proxy is running: a quick probe, then a spawn + short poll if it
 /// is down. Returns `true` when the proxy is up afterwards.
 pub fn ensure_running(cfg: &ModelProxyConfig) -> Result<bool> {
-    if probe_up(cfg) {
-        return Ok(true);
+    match probe(cfg) {
+        ProbeState::Owned => return Ok(true),
+        ProbeState::Down => {}
+        ProbeState::Foreign(reason) => anyhow::bail!(
+            "model-proxy port {} is held by a non-thegn or unauthenticated listener ({reason}); stop it or choose another [model_proxy] listen address",
+            cfg.listen
+        ),
+        ProbeState::Incompatible(version) => anyhow::bail!(
+            "model-proxy port {} is held by incompatible tgproxy protocol {version}; upgrade or stop it",
+            cfg.listen
+        ),
     }
     spawn(cfg)?;
     for _ in 0..30 {
         std::thread::sleep(Duration::from_millis(100));
-        if probe_up(cfg) {
-            return Ok(true);
+        match probe(cfg) {
+            ProbeState::Owned => return Ok(true),
+            ProbeState::Down => {}
+            ProbeState::Foreign(reason) => anyhow::bail!(
+                "model-proxy port {} is held by a non-thegn or unauthenticated listener ({reason}); stop it or choose another [model_proxy] listen address",
+                cfg.listen
+            ),
+            ProbeState::Incompatible(version) => anyhow::bail!(
+                "model-proxy port {} is held by incompatible tgproxy protocol {version}; upgrade or stop it",
+                cfg.listen
+            ),
         }
     }
-    Ok(probe_up(cfg))
+    match probe(cfg) {
+        ProbeState::Owned => Ok(true),
+        ProbeState::Down => Ok(false),
+        ProbeState::Foreign(reason) => anyhow::bail!(
+            "model-proxy port {} is held by a non-thegn or unauthenticated listener ({reason}); stop it or choose another [model_proxy] listen address",
+            cfg.listen
+        ),
+        ProbeState::Incompatible(version) => anyhow::bail!(
+            "model-proxy port {} is held by incompatible tgproxy protocol {version}; upgrade or stop it",
+            cfg.listen
+        ),
+    }
 }
 
 /// Stops the running proxy via identity-bound recorded state. Returns `true` if
@@ -241,10 +415,29 @@ pub fn agent_proxy_env(cfg: &Config, choice: &str, worktree: &str) -> ProxyEnvDe
     if !mp.enabled {
         return ProxyEnvDecision::Skipped("[model_proxy] disabled".to_string());
     }
-    if !probe_up(mp) {
-        return ProxyEnvDecision::Skipped(format!("proxy unreachable at {}", mp.listen));
+    match probe(mp) {
+        ProbeState::Owned => {}
+        ProbeState::Down => {
+            return ProxyEnvDecision::Skipped(format!("proxy unreachable at {}", mp.listen));
+        }
+        ProbeState::Foreign(reason) => {
+            return ProxyEnvDecision::Skipped(format!(
+                "untrusted listener at {}: {reason}",
+                mp.listen
+            ));
+        }
+        ProbeState::Incompatible(version) => {
+            return ProxyEnvDecision::Skipped(format!(
+                "incompatible tgproxy protocol {version} at {}",
+                mp.listen
+            ));
+        }
     }
-    let key = mint_attribution_key(worktree);
+    let secret = match host_secret() {
+        Ok(s) => s,
+        Err(e) => return ProxyEnvDecision::Skipped(format!("proxy secret unavailable: {e}")),
+    };
+    let key = mint_attribution_key(worktree, choice, &secret);
     let base = format!("http://{}", listen_addr(mp));
     ProxyEnvDecision::Inject(vec![
         ("ANTHROPIC_BASE_URL".to_string(), base.clone()),
@@ -257,7 +450,7 @@ pub fn agent_proxy_env(cfg: &Config, choice: &str, worktree: &str) -> ProxyEnvDe
 /// Mints a per-worktree virtual attribution key. Random nonce → revocable and
 /// unguessable; carries the worktree scope for spend accounting. NOT an upstream
 /// secret (leaking it leaks attribution + local spend capacity only).
-fn mint_attribution_key(worktree: &str) -> String {
+fn mint_attribution_key(worktree: &str, choice: &str, secret: &[u8]) -> String {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u128(
@@ -269,11 +462,23 @@ fn mint_attribution_key(worktree: &str) -> String {
     h.write_u32(std::process::id());
     h.write(worktree.as_bytes());
     let nonce = format!("{:016x}", h.finish());
-    thegn_core::proxy::attribution::encode(&thegn_core::proxy::attribution::AttributionScope {
-        scope: format!("worktree:{worktree}"),
-        nonce,
-        ..Default::default()
-    })
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    thegn_core::proxy::attribution::encode_signed(
+        &thegn_core::proxy::attribution::AttributionScope {
+            scope: format!("worktree:{worktree}"),
+            agent: Some(format!("agent:{choice}")),
+            nonce,
+            workspace: None,
+            zone: None,
+            upstream: None,
+            exp_ms: None,
+        },
+        secret,
+        now.saturating_add(7 * 24 * 60 * 60 * 1000),
+    )
 }
 
 /// Spawns the background supervisor thread: while `[model_proxy]` is enabled,
@@ -324,6 +529,7 @@ pub fn spawn_supervisor(cfg: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
 
     #[test]
     fn pid_state_rejects_malformed_and_extreme_values() {
@@ -347,5 +553,154 @@ mod tests {
         for raw in ["", "pid=0\nstart_time=1\n", "pid=not-a-pid\nstart_time=1\n"] {
             assert!(!stop_pid_state(raw));
         }
+    }
+
+    #[test]
+    fn fake_listener_never_passes_identity_probe() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 512];
+                stream.read(&mut request).unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .unwrap();
+            }
+        });
+        let mut cfg = ModelProxyConfig::default();
+        cfg.enabled = true;
+        cfg.listen = addr.to_string();
+        assert!(matches!(probe(&cfg), ProbeState::Foreign(_)));
+        assert!(
+            ensure_running(&cfg)
+                .unwrap_err()
+                .to_string()
+                .contains("non-thegn")
+        );
+        let mut app_cfg = Config::default();
+        app_cfg.model_proxy = cfg;
+        app_cfg.agents.push(thegn_core::config::NamedCommand {
+            name: "test-agent".into(),
+            command: "unused".into(),
+            hints: vec![],
+            provider: None,
+            harness: None,
+            model: None,
+            env: Default::default(),
+            permissions: vec![],
+            resume: false,
+            route_via_proxy: true,
+            drawer_scope: None,
+            drawer_cwd: None,
+        });
+        assert!(matches!(
+            agent_proxy_env(&app_cfg, "test-agent", "/tmp/wt"),
+            ProxyEnvDecision::Skipped(_)
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_supervisors_accept_the_same_authenticated_instance() {
+        let secret = host_secret().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_secret = secret.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 512];
+                let count = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..count]);
+                let challenge = request
+                    .split("challenge=")
+                    .nth(1)
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap();
+                let proof =
+                    thegn_core::proxy::attribution::identity_proof(&server_secret, challenge);
+                let body = format!(
+                    r#"{{"protocol":{},"proof":"{proof}"}}"#,
+                    thegn_core::proxy::attribution::IDENTITY_PROTOCOL_VERSION
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let cfg = ModelProxyConfig {
+            listen: addr.to_string(),
+            ..Default::default()
+        };
+        let left_cfg = cfg.clone();
+        let right_cfg = cfg;
+        let left = std::thread::spawn(move || ensure_running(&left_cfg).unwrap());
+        let right = std::thread::spawn(move || ensure_running(&right_cfg).unwrap());
+        assert!(left.join().unwrap());
+        assert!(right.join().unwrap());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn protocol_and_proof_are_both_required() {
+        let secret = b"secret";
+        let challenge = "00aa";
+        let proof = thegn_core::proxy::attribution::identity_proof(secret, challenge);
+        let wrong_version = format!(r#"{{"protocol":2,"proof":"{proof}"}}"#);
+        assert_eq!(
+            verify_probe_response(secret, challenge, 200, wrong_version.as_bytes()),
+            ProbeState::Incompatible(2)
+        );
+        let wrong_proof = br#"{"protocol":1,"proof":"00"}"#;
+        assert!(matches!(
+            verify_probe_response(secret, challenge, 200, wrong_proof),
+            ProbeState::Foreign(_)
+        ));
+        let valid = format!(r#"{{"protocol":1,"proof":"{proof}"}}"#);
+        assert_eq!(
+            verify_probe_response(secret, challenge, 200, valid.as_bytes()),
+            ProbeState::Owned
+        );
+    }
+
+    #[test]
+    fn minted_attribution_binds_worktree_and_agent_for_seven_days() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let key = mint_attribution_key("/repo/wt", "reviewer", b"mint-test-secret");
+        let claims =
+            thegn_core::proxy::attribution::verify(&key, b"mint-test-secret", now).unwrap();
+        assert_eq!(claims.scope, "worktree:/repo/wt");
+        assert_eq!(claims.agent.as_deref(), Some("agent:reviewer"));
+        let remaining = claims.exp_ms.unwrap() - now;
+        assert!((7 * 24 * 60 * 60 * 1000..=7 * 24 * 60 * 60 * 1000 + 1000).contains(&remaining));
+    }
+
+    #[test]
+    fn concurrent_secret_creations_read_the_single_winner() {
+        let root = std::env::temp_dir().join(format!(
+            "tgproxy-secret-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("secret");
+        let a = path.clone();
+        let b = path.clone();
+        let first = std::thread::spawn(move || secret_for_path(&a).unwrap());
+        let second = std::thread::spawn(move || secret_for_path(&b).unwrap());
+        assert_eq!(first.join().unwrap(), second.join().unwrap());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
