@@ -831,6 +831,14 @@ impl From<anyhow::Error> for ControlError {
 
 pub type ControlResult<T> = Result<T, ControlError>;
 
+/// Calendar event occurrences and cache-quality metadata.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CalendarEventsReply {
+    pub events: Vec<thegn_core::calendar::CalEvent>,
+    pub skipped_rows: u32,
+    pub incomplete: bool,
+}
+
 /// The service trait. One impl (the daemon), many thin adapters.
 ///
 /// Everything here is async-off-the-render-loop by construction: impls run on
@@ -1020,16 +1028,24 @@ pub trait ControlApi: Send + Sync + 'static {
     // wiring, following the `publish_pairing` precedent.
 
     /// The merged, recurrence-expanded calendar over `[from, to]` (inclusive
-    /// ISO dates).
+    /// ISO dates), plus cache-quality metadata. `skipped_rows` counts rows
+    /// that could not be decoded or expanded; `incomplete` is true when that
+    /// count is nonzero.
     fn calendar_events<'a>(
         &'a self,
         _from: &'a str,
         _to: &'a str,
-    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::calendar::CalEvent>>> {
+    ) -> BoxFuture<'a, ControlResult<CalendarEventsReply>> {
         Box::pin(async { Err(ControlError::Unimplemented("calendar is not configured")) })
     }
 
     /// The resolved world clocks, evaluated now.
+    ///
+    /// Returns an array of objects with `label`, `zone`, ISO-like `local`,
+    /// popup-rendered `time`, `format` (`"h12"`, `"h24"`, or the custom
+    /// strftime string), `show_date`, and timezone metadata including
+    /// `utc_offset_secs`, `is_dst`, `abbrev`, `delta_from_home_mins`,
+    /// `day_delta`, and `is_home`.
     fn calendar_clocks(&self) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
         Box::pin(async { Err(ControlError::Unimplemented("calendar is not configured")) })
     }
