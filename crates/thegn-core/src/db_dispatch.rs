@@ -82,6 +82,16 @@ pub enum DispatchAdmissionDecision {
     RetryScopeSnapshot { row: i64, path: String },
 }
 
+const DISPATCH_NOTE_COUNT_SQL: &str =
+    "SELECT COUNT(*) FROM agent_dispatch_notes WHERE dispatch_id=?1";
+const DISPATCH_NOTE_COUNT_SINCE_SQL: &str =
+    "SELECT COUNT(*) FROM agent_dispatch_notes WHERE dispatch_id=?1 AND created_at_ms > ?2";
+const NEWEST_DISPATCH_NOTES_SQL: &str = "SELECT id, dispatch_id, created_at_ms, text FROM agent_dispatch_notes \
+     WHERE dispatch_id=?1 ORDER BY created_at_ms DESC, id DESC LIMIT ?2";
+const NEWEST_DISPATCH_NOTES_SINCE_SQL: &str = "SELECT id, dispatch_id, created_at_ms, text FROM agent_dispatch_notes \
+     WHERE dispatch_id=?1 AND created_at_ms > ?2 \
+     ORDER BY created_at_ms DESC, id DESC LIMIT ?3";
+
 /// The source row's verdict changed after the resume caller read it but
 /// before the atomic claim could reconcile it. This is a contention result,
 /// rather than a database failure: the newer verdict must be preserved and a
@@ -845,7 +855,7 @@ impl Db {
             {
                 return Err(anyhow::Error::new(ParentDispatchConflict { parent_id }));
             }
-            if new.chunk_path.is_some() && allow_scope.is_none() {
+            if new.chunk_path.is_some() {
                 let Some(prepared) = prepared else {
                     return Ok(Err(DispatchAdmissionDecision::ScopeRefused(
                         "chunk scope was not prepared before admission".into(),
@@ -856,134 +866,113 @@ impl Db {
                         "prepared chunk scope does not match the claimed chunk path".into(),
                     )));
                 }
-                use crate::issue::AgentDispatchStatus as Status;
-                let mut active = Vec::new();
-                let mut snapshot_rows = std::collections::HashSet::new();
-                let mut done = std::collections::HashSet::new();
-                for row in &rows {
-                    if row.issue_id != new.issue_id || row.worktree_path != new.worktree_path {
-                        continue;
-                    }
-                    let Some(path) = row
-                        .chunk_path
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|p| !p.is_empty())
-                    else {
-                        continue;
-                    };
-                    let name = std::path::Path::new(path)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if row.status == Status::Done {
-                        done.insert(name);
-                        continue;
-                    }
-                    if !row.status.is_active() {
-                        continue;
-                    }
-                    let admitted_scope: Option<String> = conn.query_row(
-                        "SELECT chunk_scope FROM agent_dispatches WHERE id=?1",
-                        [row.id],
-                        |record| record.get(0),
-                    )?;
-                    let files = if let Some(raw) = admitted_scope {
-                        snapshot_rows.insert(row.id);
-                        decode_chunk_scope(&raw).map_err(|e| {
-                            anyhow::anyhow!(
-                                "active sibling row {} has a corrupt admitted chunk scope: {e}",
-                                row.id
-                            )
-                        })?
-                    } else {
-                        let Some(snapshot) = prepared.siblings.iter().find(|s| s.row == row.id)
-                        else {
-                            return Ok(Err(DispatchAdmissionDecision::RetryScopeSnapshot {
-                                row: row.id,
-                                path: path.to_string(),
-                            }));
-                        };
-                        if snapshot.path != path {
-                            return Ok(Err(DispatchAdmissionDecision::RetryScopeSnapshot {
-                                row: row.id,
-                                path: path.to_string(),
-                            }));
+                if allow_scope.is_none() {
+                    use crate::issue::AgentDispatchStatus as Status;
+                    let mut active = Vec::new();
+                    let mut snapshot_rows = std::collections::HashSet::new();
+                    let mut done = std::collections::HashSet::new();
+                    for row in &rows {
+                        if row.issue_id != new.issue_id || row.worktree_path != new.worktree_path {
+                            continue;
                         }
-                        let Some(Ok(scope)) = &snapshot.scope else {
-                            let reason = match &snapshot.scope {
-                                Some(Err(e)) => format!(
-                                    "legacy row without admitted snapshot: active sibling row {} has unreadable scope at {}: {e}",
-                                    row.id, snapshot.path
-                                ),
-                                _ => format!(
-                                    "legacy row without admitted snapshot: active sibling row {} scope snapshot is unavailable at {}",
-                                    row.id, snapshot.path
-                                ),
-                            };
-                            return Ok(Err(DispatchAdmissionDecision::ScopeRefused(reason)));
+                        let Some(path) = row
+                            .chunk_path
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|p| !p.is_empty())
+                        else {
+                            continue;
                         };
-                        scope.files.clone()
-                    };
-                    active.push(crate::pipeline_chunk::ActiveScope {
-                        row: row.id,
-                        name,
-                        files,
-                    });
-                }
-                let verdict = crate::pipeline_chunk::verdict(&prepared.scope, &active, &done);
-                let mut reasons = Vec::new();
-                match verdict {
-                    crate::pipeline_chunk::ScopeVerdict::Conflict { overlaps } => {
-                        for (i, pairs) in overlaps {
-                            let sibling = &active[i];
-                            for (mine, theirs) in pairs {
-                                reasons.push(format!(
-                                    "{} vs {}: {mine} collides with {theirs} (active row {}{})",
-                                    prepared.path,
-                                    sibling.name,
-                                    sibling.row,
-                                    if snapshot_rows.contains(&sibling.row) {
-                                        "; admitted scope snapshot"
-                                    } else {
-                                        ""
-                                    }
-                                ));
+                        let name = std::path::Path::new(path)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if row.status == Status::Done {
+                            done.insert(name);
+                            continue;
+                        }
+                        if !row.status.is_active() {
+                            continue;
+                        }
+                        let admitted_scope: Option<String> = conn.query_row(
+                            "SELECT chunk_scope FROM agent_dispatches WHERE id=?1",
+                            [row.id],
+                            |record| record.get(0),
+                        )?;
+                        let files = if let Some(raw) = admitted_scope {
+                            snapshot_rows.insert(row.id);
+                            decode_chunk_scope(&raw).map_err(|e| {
+                                anyhow::anyhow!(
+                                    "active sibling row {} has a corrupt admitted chunk scope: {e}",
+                                    row.id
+                                )
+                            })?
+                        } else {
+                            return Ok(Err(DispatchAdmissionDecision::ScopeRefused(format!(
+                                "active sibling row {} ({path}) has no admitted scope snapshot, so its ownership is unknown; close it with `thegn dispatch set-status {} abandoned` (or `failed`), or override with `thegn dispatch claim … --allow-scope-overlap <REASON>` / `thegn dispatch put … --force --force-reason <REASON>`",
+                                row.id, row.id
+                            ))));
+                        };
+                        active.push(crate::pipeline_chunk::ActiveScope {
+                            row: row.id,
+                            name,
+                            files,
+                        });
+                    }
+                    let verdict = crate::pipeline_chunk::verdict(&prepared.scope, &active, &done);
+                    let mut reasons = Vec::new();
+                    match verdict {
+                        crate::pipeline_chunk::ScopeVerdict::Conflict { overlaps } => {
+                            for (i, pairs) in overlaps {
+                                let sibling = &active[i];
+                                for (mine, theirs) in pairs {
+                                    reasons.push(format!(
+                                        "{} vs {}: {mine} collides with {theirs} (active row {}{})",
+                                        prepared.path,
+                                        sibling.name,
+                                        sibling.row,
+                                        if snapshot_rows.contains(&sibling.row) {
+                                            "; admitted scope snapshot"
+                                        } else {
+                                            ""
+                                        }
+                                    ));
+                                }
                             }
                         }
+                        crate::pipeline_chunk::ScopeVerdict::Unknown(error) => {
+                            reasons.push(format!(
+                                "chunk scope overlap could not be proven within budget: {error:?}"
+                            ));
+                        }
+                        _ => {}
                     }
-                    crate::pipeline_chunk::ScopeVerdict::Unknown(error) => {
-                        reasons.push(format!(
-                            "chunk scope overlap could not be proven within budget: {error:?}"
-                        ));
+                    for name in crate::pipeline_chunk::after_unmet(&prepared.scope.after, &done) {
+                        let holder = rows.iter().find(|r| {
+                            r.issue_id == new.issue_id
+                                && r.worktree_path == new.worktree_path
+                                && r.chunk_path.as_deref().is_some_and(|p| {
+                                    std::path::Path::new(p).file_stem().and_then(|s| s.to_str())
+                                        == Some(name.as_str())
+                                })
+                        });
+                        reasons.push(match holder {
+                            Some(r) => format!(
+                                "after {name} is not done (row {}: {})",
+                                r.id,
+                                r.status.as_str()
+                            ),
+                            None => format!("after {name} is not done (no dispatch row for it)"),
+                        });
                     }
-                    _ => {}
-                }
-                for name in crate::pipeline_chunk::after_unmet(&prepared.scope.after, &done) {
-                    let holder = rows.iter().find(|r| {
-                        r.issue_id == new.issue_id
-                            && r.worktree_path == new.worktree_path
-                            && r.chunk_path.as_deref().is_some_and(|p| {
-                                std::path::Path::new(p).file_stem().and_then(|s| s.to_str())
-                                    == Some(name.as_str())
-                            })
-                    });
-                    reasons.push(match holder {
-                        Some(r) => format!(
-                            "after {name} is not done (row {}: {})",
-                            r.id,
-                            r.status.as_str()
-                        ),
-                        None => format!("after {name} is not done (no dispatch row for it)"),
-                    });
-                }
-                if !reasons.is_empty() {
-                    return Ok(Err(DispatchAdmissionDecision::ScopeRefused(format!(
-                        "chunk scope gate refused {}:\n  - {}",
-                        prepared.path,
-                        reasons.join("\n  - ")
-                    ))));
+                    if !reasons.is_empty() {
+                        return Ok(Err(DispatchAdmissionDecision::ScopeRefused(format!(
+                            "chunk scope gate refused {}:\n  - {}",
+                            prepared.path,
+                            reasons.join("\n  - ")
+                        ))));
+                    }
                 }
             }
             let decision = decide_allowing_duplicate(&rows, &req, limit, allow_duplicate.is_some());
@@ -1342,16 +1331,13 @@ impl Db {
     pub fn dispatch_note_count(&self, id: i64, since_ms: Option<i64>) -> Result<usize> {
         let count: i64 = if let Some(since) = since_ms {
             self.conn().query_row(
-                "SELECT COUNT(*) FROM agent_dispatch_notes WHERE dispatch_id=?1 AND created_at_ms > ?2",
+                DISPATCH_NOTE_COUNT_SINCE_SQL,
                 rusqlite::params![id, since],
                 |row| row.get(0),
             )?
         } else {
-            self.conn().query_row(
-                "SELECT COUNT(*) FROM agent_dispatch_notes WHERE dispatch_id=?1",
-                [id],
-                |row| row.get(0),
-            )?
+            self.conn()
+                .query_row(DISPATCH_NOTE_COUNT_SQL, [id], |row| row.get(0))?
         };
         Ok(usize::try_from(count).unwrap_or(usize::MAX))
     }
@@ -1368,18 +1354,11 @@ impl Db {
         }
         let cap = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut notes = if let Some(since) = since_ms {
-            let mut stmt = self.conn().prepare(
-                "SELECT id, dispatch_id, created_at_ms, text FROM agent_dispatch_notes \
-                 WHERE dispatch_id=?1 AND created_at_ms > ?2 \
-                 ORDER BY created_at_ms DESC, id DESC LIMIT ?3",
-            )?;
+            let mut stmt = self.conn().prepare(NEWEST_DISPATCH_NOTES_SINCE_SQL)?;
             stmt.query_map(rusqlite::params![id, since, cap], map_note)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         } else {
-            let mut stmt = self.conn().prepare(
-                "SELECT id, dispatch_id, created_at_ms, text FROM agent_dispatch_notes \
-                 WHERE dispatch_id=?1 ORDER BY created_at_ms DESC, id DESC LIMIT ?2",
-            )?;
+            let mut stmt = self.conn().prepare(NEWEST_DISPATCH_NOTES_SQL)?;
             stmt.query_map(rusqlite::params![id, cap], map_note)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
@@ -1553,6 +1532,86 @@ mod tests {
             },
             siblings,
         }
+    }
+
+    #[test]
+    fn legacy_active_chunk_without_snapshot_is_refused_as_unknown() {
+        let db = Db::open_memory().unwrap();
+        let worktree = "/wt/legacy-scope";
+        let sibling = db
+            .put_agent_dispatch(crate::issue::NewDispatch {
+                chunk_path: Some("a.md"),
+                ..crate::issue::NewDispatch::new("linear:THE-214", worktree, "claude")
+            })
+            .unwrap();
+        let result = db
+            .claim_dispatch_admitted(
+                crate::issue::NewDispatch {
+                    chunk_path: Some("b.md"),
+                    ..crate::issue::NewDispatch::new("linear:THE-214", worktree, "claude")
+                },
+                10,
+                None,
+                Some(&admitted_chunk(
+                    "b.md",
+                    vec!["docs/x.md".into()],
+                    vec![crate::pipeline_chunk::PreparedSiblingScope {
+                        row: sibling,
+                        path: "a.md".into(),
+                        scope: Some(Ok(crate::pipeline_chunk::ChunkScope {
+                            files: vec!["src/other.rs".into()],
+                            ..Default::default()
+                        })),
+                    }],
+                )),
+                None,
+            )
+            .unwrap()
+            .unwrap_err();
+        let DispatchAdmissionDecision::ScopeRefused(reason) = result else {
+            panic!("expected a scope refusal, got {result:?}");
+        };
+        assert!(reason.contains(&sibling.to_string()), "{reason}");
+        assert!(reason.contains("a.md"), "{reason}");
+        assert!(reason.contains("ownership is unknown"), "{reason}");
+        assert!(reason.contains("thegn dispatch set-status"), "{reason}");
+        assert!(
+            reason.contains("--allow-scope-overlap <REASON>"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("--force --force-reason <REASON>"),
+            "{reason}"
+        );
+        assert_eq!(db.list_dispatches().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn forced_chunk_admission_requires_and_records_prepared_scope() {
+        let db = Db::open_memory().unwrap();
+        let new = || crate::issue::NewDispatch {
+            chunk_path: Some("forced.md"),
+            ..crate::issue::NewDispatch::new("linear:THE-214", "/wt/forced", "claude")
+        };
+        let without_prepared = db
+            .claim_dispatch_admitted(new(), 10, None, None, Some("reviewed"))
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            without_prepared,
+            DispatchAdmissionDecision::ScopeRefused(_)
+        ));
+        assert!(db.list_dispatches().unwrap().is_empty());
+
+        let prepared = admitted_chunk("forced.md", vec!["src/forced.rs".into()], vec![]);
+        let id = db
+            .claim_dispatch_admitted(new(), 10, None, Some(&prepared), Some("reviewed"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.dispatch_chunk_scope(id).unwrap(),
+            Some(vec!["src/forced.rs".into()])
+        );
     }
 
     #[test]
@@ -1911,6 +1970,49 @@ mod tests {
         assert_eq!(db.dispatch_note_count(id, Some(9)).unwrap(), 4);
         assert_eq!(db.dispatch_note_count(id, Some(10)).unwrap(), 0);
         assert_eq!(db.newest_dispatch_notes(id, None, 0).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn dispatch_note_queries_use_the_existing_index() {
+        fn assert_uses_index<P: rusqlite::Params>(db: &Db, sql: &str, params: P) {
+            let mut stmt = db
+                .conn()
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let details = stmt
+                .query_map(params, |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("idx_dispatch_notes_dispatch")),
+                "query plan does not use idx_dispatch_notes_dispatch: {details:?}"
+            );
+            assert!(
+                details.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+                "query plan creates a temporary b-tree: {details:?}"
+            );
+        }
+
+        let db = Db::open_memory().unwrap();
+        assert_uses_index(&db, DISPATCH_NOTE_COUNT_SQL, rusqlite::params![1_i64]);
+        assert_uses_index(
+            &db,
+            DISPATCH_NOTE_COUNT_SINCE_SQL,
+            rusqlite::params![1_i64, 0_i64],
+        );
+        assert_uses_index(
+            &db,
+            NEWEST_DISPATCH_NOTES_SQL,
+            rusqlite::params![1_i64, 20_i64],
+        );
+        assert_uses_index(
+            &db,
+            NEWEST_DISPATCH_NOTES_SINCE_SQL,
+            rusqlite::params![1_i64, 0_i64, 20_i64],
+        );
     }
 
     #[test]

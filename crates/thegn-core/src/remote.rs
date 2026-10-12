@@ -17,6 +17,12 @@ use crate::util;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Sequencer files and BISECT_LOG are tiny; cap remote/provider capture so a
+/// hostile or corrupted gitdir cannot stream unbounded data into host memory.
+const GIT_PATH_READ_LIMIT: usize = 8 * 1024 * 1024;
+static GIT_PATH_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshTarget {
@@ -688,6 +694,14 @@ impl GitLoc {
     /// reads prefix the payload with a one-byte presence tag so transport or
     /// command failures cannot be mistaken for a missing file.
     pub fn read_git_path_checked(&self, rel: &str) -> std::io::Result<Option<Vec<u8>>> {
+        self.read_git_path_checked_limited(rel, GIT_PATH_READ_LIMIT)
+    }
+
+    fn read_git_path_checked_limited(
+        &self,
+        rel: &str,
+        limit: usize,
+    ) -> std::io::Result<Option<Vec<u8>>> {
         let p = self
             .resolve_git_path(rel)
             .ok_or_else(|| std::io::Error::other(format!("cannot resolve git path {rel:?}")))?;
@@ -709,13 +723,11 @@ impl GitLoc {
             },
             GitLoc::Remote { ssh, .. } => {
                 let script = tagged_git_path_read_ssh_command(&p);
-                let out = self.ssh_command(ssh, script).output()?;
-                tagged_git_path_read_result(rel, out)
+                read_tagged_bounded(self.ssh_command(ssh, script), rel, limit)
             }
             GitLoc::Provider { control_prefix, .. } => {
                 let script = tagged_git_path_read_script(&p);
-                let out = self.provider_command(control_prefix, script).output()?;
-                tagged_git_path_read_result(rel, out)
+                read_tagged_bounded(self.provider_command(control_prefix, script), rel, limit)
             }
         }
     }
@@ -726,12 +738,39 @@ impl GitLoc {
             .resolve_git_path(rel)
             .ok_or_else(|| std::io::Error::other(format!("cannot resolve git path {rel:?}")))?;
         if let GitLoc::Local(_) = self {
-            return std::fs::write(p, bytes);
+            let path = Path::new(&p);
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(std::io::Error::other(format!(
+                        "refusing to write git path {rel:?} through a symlink"
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let nonce = GIT_PATH_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+            let temporary =
+                PathBuf::from(format!("{}.thegn-tmp.{}.{}", p, std::process::id(), nonce));
+            crate::fsperm::write_owner_only_new(&temporary, bytes)?;
+            let result = crate::fsperm::rename_replace(&temporary, path);
+            if let Err(error) = &result {
+                tracing::debug!(target: "thegn::remote", %error, "atomic git path replacement failed");
+                match std::fs::remove_file(&temporary) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::remote", %error, "could not remove temporary git path write");
+                    }
+                }
+            }
+            return result;
         }
-        use std::io::Write;
-        let script = format!("cat > {}", util::sh_quote(&p));
+        let script = atomic_git_path_write_script(&p);
         let mut cmd = match self {
-            GitLoc::Remote { ssh, .. } => self.ssh_command(ssh, script),
+            GitLoc::Remote { ssh, .. } => {
+                self.ssh_command(ssh, atomic_git_path_write_ssh_command(&p))
+            }
             GitLoc::Provider { control_prefix, .. } => {
                 self.provider_command(control_prefix, script)
             }
@@ -741,10 +780,21 @@ impl GitLoc {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         let mut child = cmd.spawn()?;
-        if let Some(mut sink) = child.stdin.take() {
-            sink.write_all(bytes)?;
+        let write_result = match child.stdin.take() {
+            Some(mut sink) => std::io::Write::write_all(&mut sink, bytes),
+            None => Err(std::io::Error::other("git path writer has no stdin pipe")),
+        };
+        if let Err(error) = write_result {
+            reap_child(&mut child);
+            return Err(error);
         }
-        let st = child.wait()?;
+        let st = match child.wait() {
+            Ok(status) => status,
+            Err(error) => {
+                reap_child(&mut child);
+                return Err(error);
+            }
+        };
         if st.success() {
             Ok(())
         } else {
@@ -866,6 +916,83 @@ fn tagged_git_path_read_ssh_command(path: &str) -> String {
     format!("sh -c {}", util::sh_quote(&script))
 }
 
+fn atomic_git_path_write_script(path: &str) -> String {
+    let quoted = util::sh_quote(path);
+    format!(
+        "set -C; umask 077; p={quoted}; t=\"$p.thegn-tmp.$$\"; \
+         [ ! -L \"$p\" ] && [ ! -d \"$p\" ] || exit 1; \
+         created=0; trap 'if [ \"$created\" = 1 ]; then rm -f -- \"$t\"; fi' 0; \
+         trap 'exit 1' HUP INT TERM; : > \"$t\" || exit 1; created=1; \
+         set +C; cat > \"$t\" && mv -f -- \"$t\" \"$p\""
+    )
+}
+
+fn atomic_git_path_write_ssh_command(path: &str) -> String {
+    let script = atomic_git_path_write_script(path);
+    format!("sh -c {}", util::sh_quote(&script))
+}
+
+/// Capture a tagged remote git-path read with a strict payload limit. On every
+/// read/limit failure the child is killed when possible and waited before the
+/// error is returned, so a stalled transport cannot leave a child behind.
+fn read_tagged_bounded(
+    mut command: Command,
+    rel: &str,
+    limit: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let capture_limit = limit
+        .checked_add(2)
+        .ok_or_else(|| std::io::Error::other("git path read limit is too large"))?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn()?;
+    let Some(stdout) = child.stdout.take() else {
+        reap_child(&mut child);
+        return Err(std::io::Error::other("git path reader has no stdout pipe"));
+    };
+    let mut bytes = Vec::new();
+    let read_result = stdout.take(capture_limit as u64).read_to_end(&mut bytes);
+    if let Err(error) = read_result {
+        reap_child(&mut child);
+        return Err(error);
+    }
+    if bytes.len() > limit.saturating_add(1) {
+        reap_child(&mut child);
+        return Err(std::io::Error::other(format!(
+            "git path {rel:?} exceeds {limit} bytes"
+        )));
+    }
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            reap_child(&mut child);
+            return Err(error);
+        }
+    };
+    tagged_git_path_read_result(
+        rel,
+        std::process::Output {
+            status,
+            stdout: bytes,
+            stderr: Vec::new(),
+        },
+    )
+}
+
+fn reap_child(child: &mut std::process::Child) {
+    if let Err(error) = child.kill() {
+        tracing::debug!(target: "thegn::remote", %error, "could not kill git path reader");
+    }
+    if let Err(error) = child.wait() {
+        tracing::debug!(target: "thegn::remote", %error, "could not reap git path reader");
+    }
+}
+
 fn tagged_git_path_read_result(
     rel: &str,
     output: std::process::Output,
@@ -953,6 +1080,134 @@ mod tests {
         let command = tagged_git_path_read_ssh_command("/work tree/marker");
         let script = "if [ -e '/work tree/marker' ] || [ -L '/work tree/marker' ]; then printf P; exec cat -- '/work tree/marker'; else printf A; fi";
         assert_eq!(command, format!("sh -c {}", util::sh_quote(script)));
+    }
+
+    #[test]
+    fn ssh_atomic_write_script_is_explicitly_run_by_posix_shell() {
+        let command = atomic_git_path_write_ssh_command("/work tree/todo");
+        let script = "set -C; umask 077; p='/work tree/todo'; t=\"$p.thegn-tmp.$$\"; [ ! -L \"$p\" ] && [ ! -d \"$p\" ] || exit 1; created=0; trap 'if [ \"$created\" = 1 ]; then rm -f -- \"$t\"; fi' 0; trap 'exit 1' HUP INT TERM; : > \"$t\" || exit 1; created=1; set +C; cat > \"$t\" && mv -f -- \"$t\" \"$p\"";
+        assert_eq!(command, format!("sh -c {}", util::sh_quote(script)));
+    }
+
+    fn provider_repo() -> (tempfile::TempDir, GitLoc) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let init = util::git_cmd(dir.path())
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let loc = GitLoc::provider(vec!["env".into()], dir.path().to_string_lossy());
+        (dir, loc)
+    }
+
+    #[test]
+    fn provider_checked_read_enforces_limit_and_accepts_exact_limit() {
+        let (dir, loc) = provider_repo();
+        let gitdir = dir.path().join(".git");
+        std::fs::write(gitdir.join("bounded"), b"1234").unwrap();
+        assert_eq!(
+            loc.read_git_path_checked_limited("bounded", 4).unwrap(),
+            Some(b"1234".to_vec())
+        );
+        std::fs::write(gitdir.join("bounded"), b"12345").unwrap();
+        let error = loc
+            .read_git_path_checked_limited("bounded", 4)
+            .expect_err("an oversized git path must be rejected");
+        assert!(error.to_string().contains("exceeds 4 bytes"), "{error}");
+    }
+
+    #[test]
+    fn oversized_tagged_reader_is_killed_and_reaped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pid_path = dir.path().join("producer.pid");
+        let script = format!(
+            "printf '%s' \"$$\" > {}; printf P; exec yes x",
+            util::sh_quote(pid_path.to_string_lossy().as_ref())
+        );
+        let mut command = Command::new("sh");
+        command.args(["-c", script.as_str()]);
+        let error =
+            read_tagged_bounded(command, "oversized", 1).expect_err("oversized producer must fail");
+        assert!(error.to_string().contains("exceeds 1 bytes"), "{error}");
+        let pid = std::fs::read_to_string(pid_path).unwrap();
+        let alive = Command::new("sh")
+            .args(["-c", "kill -0 \"$1\"", "sh", pid.trim()])
+            .status()
+            .unwrap();
+        assert!(!alive.success(), "the over-limit child is still alive");
+    }
+
+    #[test]
+    fn provider_write_atomically_replaces_and_cleans_temporary_file() {
+        let (dir, loc) = provider_repo();
+        let gitdir = dir.path().join(".git");
+        let target = gitdir.join("write-target");
+        std::fs::write(&target, b"old").unwrap();
+        let mut old_inode = std::fs::File::open(&target).unwrap();
+        loc.write_git_path("write-target", b"replacement").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+        let mut prior_contents = Vec::new();
+        std::io::Read::read_to_end(&mut old_inode, &mut prior_contents).unwrap();
+        assert_eq!(
+            prior_contents, b"old",
+            "replacement must publish a new file instead of truncating the old inode"
+        );
+        let leftovers = std::fs::read_dir(gitdir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".thegn-tmp."))
+            .count();
+        assert_eq!(leftovers, 0, "temporary git path file was left behind");
+    }
+
+    #[test]
+    fn provider_write_refuses_directory_target() {
+        let (dir, loc) = provider_repo();
+        let target = dir.path().join(".git/write-target");
+        std::fs::create_dir(&target).unwrap();
+
+        assert!(loc.write_git_path("write-target", b"replacement").is_err());
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read_dir(target).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn local_write_uses_a_fresh_temp_name_when_pid_only_name_exists() {
+        let (dir, _) = provider_repo();
+        let gitdir = dir.path().join(".git");
+        let target = gitdir.join("write-target");
+        let stale = gitdir.join(format!("write-target.thegn-tmp.{}", std::process::id()));
+        std::fs::write(&stale, b"stale temporary file").unwrap();
+        let local = GitLoc::Local(dir.path().to_path_buf());
+
+        local
+            .write_git_path("write-target", b"replacement")
+            .unwrap();
+        assert_eq!(std::fs::read(target).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(stale).unwrap(), b"stale temporary file");
+    }
+
+    #[test]
+    fn provider_and_local_writes_refuse_symlinks_without_touching_target() {
+        let (dir, loc) = provider_repo();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, b"protected").unwrap();
+        let remote_link = dir.path().join(".git/remote-link");
+        crate::fsperm::create_symlink(&outside, &remote_link, false).unwrap();
+        assert!(loc.write_git_path("remote-link", b"overwrite").is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"protected");
+
+        let local_link = dir.path().join(".git/local-link");
+        crate::fsperm::create_symlink(&outside, &local_link, false).unwrap();
+        let local = GitLoc::Local(dir.path().to_path_buf());
+        assert!(local.write_git_path("local-link", b"overwrite").is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"protected");
     }
 
     #[test]

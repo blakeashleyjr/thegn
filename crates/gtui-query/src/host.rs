@@ -16,7 +16,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gtui_core::datasource::{DataSource, Query, QueryError};
-use gtui_core::frame::{Field, FieldType, Frame};
+use gtui_core::frame::{Coverage, Field, FieldType, Frame};
 use thegn_metrics::{StatsSampler, StatsSnapshot};
 
 /// Bound host retention by time and memory: at 1 Hz, a full day is about 2.7 MiB
@@ -24,6 +24,9 @@ use thegn_metrics::{StatsSampler, StatsSnapshot};
 /// `embed.rs::adjust_window`'s maximum supported query range.
 const RING_CAP: usize = 86_400;
 const RETENTION_SECS: f64 = 86_400.0;
+/// Sampling cadence plus margin: retention eviction may trim a full window's
+/// first sample by one second without making the window meaningfully partial.
+const COVERAGE_SLACK_SECS: f64 = 2.0;
 
 #[derive(Clone, Copy)]
 struct HostSample {
@@ -163,13 +166,15 @@ impl HostSource {
     }
 
     /// Build a `(time, value)` frame for `expr` from the ring, keeping only
-    /// samples where the metric is present.
+    /// samples where the metric is present. Both UTC range endpoints are
+    /// inclusive. Coverage uses Unix seconds and marks a leading gap when the
+    /// earliest retained sample is more than two seconds after `from`.
     fn frame_for(&self, expr: &str, range: &gtui_core::datasource::TimeRange) -> Frame {
-        let extract: fn(&HostSample) -> Option<f64> = match expr {
-            "host_cpu_pct" => |s| s.cpu_pct.map(|v| v as f64),
-            "host_mem_used" => |s| s.mem_used.map(|v| v as f64),
-            "host_load1" => |s| s.load1.map(|v| v as f64),
-            _ => |_| None,
+        let (extract, recognized): (fn(&HostSample) -> Option<f64>, bool) = match expr {
+            "host_cpu_pct" => (|s| s.cpu_pct.map(|v| v as f64), true),
+            "host_mem_used" => (|s| s.mem_used.map(|v| v as f64), true),
+            "host_load1" => (|s| s.load1.map(|v| v as f64), true),
+            _ => (|_| None, false),
         };
         let mut times = Vec::new();
         let mut values = Vec::new();
@@ -177,22 +182,34 @@ impl HostSource {
             + f64::from(range.from.timestamp_subsec_nanos()) / 1_000_000_000.0;
         let to = range.to.timestamp() as f64
             + f64::from(range.to.timestamp_subsec_nanos()) / 1_000_000_000.0;
-        if let Ok(r) = self.ring.lock() {
-            // Samples are sorted; both UTC endpoints are inclusive.
-            let start = r.partition_point(|(ts, _)| *ts < from);
-            let end = r.partition_point(|(ts, _)| *ts <= to);
-            for index in start.min(end)..end {
-                let (ts, sample) = &r[index];
-                if let Some(v) = extract(sample) {
-                    times.push(*ts);
-                    values.push(v);
+        let coverage = if recognized {
+            match self.ring.lock() {
+                Ok(r) => {
+                    let coverage = coverage_for(r.front().map(|(ts, _)| *ts), from);
+                    // Samples are sorted; both UTC endpoints are inclusive.
+                    let start = r.partition_point(|(ts, _)| *ts < from);
+                    let end = r.partition_point(|(ts, _)| *ts <= to);
+                    for index in start.min(end)..end {
+                        let (ts, sample) = &r[index];
+                        if let Some(v) = extract(sample) {
+                            times.push(*ts);
+                            values.push(v);
+                        }
+                    }
+                    coverage
                 }
+                Err(_) => Coverage::Partial {
+                    retained_from: None,
+                },
             }
-        }
+        } else {
+            Coverage::Complete
+        };
         Frame::new(vec![
             Field::new("time", FieldType::Time, times),
             Field::new(expr, FieldType::Float64, values),
         ])
+        .with_coverage(coverage)
     }
 }
 
@@ -283,6 +300,18 @@ fn timestamp_secs(now: SystemTime) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn coverage_for(front: Option<f64>, from: f64) -> Coverage {
+    match front {
+        Some(retained_from) if retained_from <= from + COVERAGE_SLACK_SECS => Coverage::Complete,
+        Some(retained_from) => Coverage::Partial {
+            retained_from: Some(retained_from),
+        },
+        None => Coverage::Partial {
+            retained_from: None,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +377,81 @@ mod tests {
         let frame = source.frame_for("host_cpu_pct", &range);
         assert_eq!(frame.fields[0].floats(), &[20.0, 20.0]);
         assert_eq!(frame.fields[1].floats(), &[20.0, 21.0]);
+    }
+
+    #[test]
+    fn query_marks_a_window_starting_before_retention_as_partial() {
+        let source = HostSource::try_new().unwrap();
+        source.set_active(false);
+        wait_for("worker parked", || source.in_park.load(Ordering::Acquire));
+        let mut ring = source.ring.lock().unwrap();
+        for ts in [1000.0, 1001.0] {
+            admit(
+                &mut ring,
+                ts,
+                StatsSnapshot {
+                    cpu_pct: Some(ts as u8),
+                    ..Default::default()
+                },
+            );
+        }
+        drop(ring);
+
+        let range = |from, to| TimeRange {
+            from: chrono::DateTime::from_timestamp(from, 0).unwrap(),
+            to: chrono::DateTime::from_timestamp(to, 0).unwrap(),
+        };
+        assert_eq!(
+            source.frame_for("host_cpu_pct", &range(900, 1001)).coverage,
+            Coverage::Partial {
+                retained_from: Some(1000.0)
+            }
+        );
+        assert_eq!(
+            source
+                .frame_for("host_cpu_pct", &range(1000, 1001))
+                .coverage,
+            Coverage::Complete
+        );
+    }
+
+    #[test]
+    fn empty_ring_is_reported_as_partial_retention() {
+        let source = HostSource::try_new().unwrap();
+        source.set_active(false);
+        wait_for("worker parked", || source.in_park.load(Ordering::Acquire));
+        source.ring.lock().unwrap().clear();
+        let range = TimeRange {
+            from: chrono::DateTime::from_timestamp(900, 0).unwrap(),
+            to: chrono::DateTime::from_timestamp(1000, 0).unwrap(),
+        };
+        assert_eq!(
+            source.frame_for("host_cpu_pct", &range).coverage,
+            Coverage::Partial {
+                retained_from: None
+            }
+        );
+        assert_eq!(
+            source.frame_for("unknown", &range).coverage,
+            Coverage::Complete
+        );
+    }
+
+    #[test]
+    fn coverage_slack_boundary_is_inclusive() {
+        assert_eq!(coverage_for(Some(102.0), 100.0), Coverage::Complete);
+        assert_eq!(
+            coverage_for(Some(102.000_001), 100.0),
+            Coverage::Partial {
+                retained_from: Some(102.000_001)
+            }
+        );
+        assert_eq!(
+            coverage_for(None, 100.0),
+            Coverage::Partial {
+                retained_from: None
+            }
+        );
     }
 
     #[test]
@@ -562,6 +666,12 @@ mod tests {
         let frame = source.frame_for("host_cpu_pct", &query.time_range);
         assert_eq!(frame.fields[0].len(), 0);
         assert_eq!(frame.fields[1].len(), 0);
+        assert_eq!(
+            frame.coverage,
+            Coverage::Partial {
+                retained_from: None
+            }
+        );
     }
 
     #[test]

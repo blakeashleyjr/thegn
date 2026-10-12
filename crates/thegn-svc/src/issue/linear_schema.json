@@ -47,7 +47,7 @@
     },
     "Team": { "id": "String", "key": "String", "name": "String" },
     "IssueLabelConnection": { "nodes": "IssueLabel" },
-    "CommentConnection": { "nodes": "Comment" },
+    "CommentConnection": { "nodes": "Comment", "pageInfo": "PageInfo" },
     "IssueConnection": { "nodes": "Issue", "pageInfo": "PageInfo" },
     "PageInfo": { "hasNextPage": "Boolean", "endCursor": "String" }
   },

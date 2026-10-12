@@ -119,9 +119,58 @@ pub(crate) fn install_pane_services(
     let route_off = !daemon.enabled;
     panes.set_daemon_config(daemon);
     set_aggregate_caps(cfg);
+    reap_legacy_projection_mounts();
     if route_off {
         clear_stale_raised_hands();
     }
+}
+
+/// Reap pre-digest SSHFS projections once per process. Inspect candidate names
+/// here, but leave all filesystem metadata checks to the housekeeping thread.
+fn reap_legacy_projection_mounts() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mounts_dir = thegn_core::util::thegn_dir().join("mounts");
+        let entries = match std::fs::read_dir(&mounts_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                tracing::debug!(%error, path = %mounts_dir.display(), "could not inspect projection mounts at startup");
+                return;
+            }
+        };
+        let mut has_legacy_name = false;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::debug!(%error, path = %mounts_dir.display(), "could not inspect projection mount entry at startup");
+                    continue;
+                }
+            };
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !thegn_core::projection::is_legacy_mount_component(&name) {
+                continue;
+            }
+            has_legacy_name = true;
+            break;
+        }
+        if !has_legacy_name {
+            return;
+        }
+
+        let spawn = std::thread::Builder::new()
+            .name("projection-reap".into())
+            .spawn(move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                thegn_svc::projection::reap_legacy_mounts(&mounts_dir);
+            });
+        if let Err(error) = spawn {
+            tracing::debug!(%error, "could not start legacy projection mount reaper");
+        }
+    });
 }
 
 /// With the daemon route off, panes run in-process and this process owns an

@@ -534,22 +534,6 @@ pub fn open_lock_file(path: &std::path::Path) -> std::io::Result<std::fs::File> 
         .open(path)
 }
 
-/// Open a log for owner-only append. Hook output can contain credentials even
-/// when the hook itself was configured by a trusted user, so do not rely on
-/// the process umask for this file.
-pub fn append_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::fs::PermissionsExt;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)?;
-    // Tighten logs created by older versions too.
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    Ok(file)
-}
-
 /// Restrict a directory to owner-only access and preserve any chmod failure for
 /// callers that need to report an incomplete security boundary.
 pub fn restrict_dir_owner_only_checked(path: &std::path::Path) -> std::io::Result<()> {

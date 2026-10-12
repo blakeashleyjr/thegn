@@ -199,6 +199,7 @@ fn get_issue_comments_selection_matches_recorded_schema() {
         "comments selection drifted:\n{}",
         errors.join("\n")
     );
+    assert!(query.contains("comments(first: 250)"));
 }
 
 #[test]

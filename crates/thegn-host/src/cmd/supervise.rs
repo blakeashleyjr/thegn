@@ -290,12 +290,12 @@ fn plan(cfg: &Config, issue: Option<&str>, all: bool, json: bool) -> Result<()> 
 
 fn plan_line(lane: &Lane, action: &SuperviseAction) -> String {
     format!(
-        "row {:<5} {:<16} {:<12} {:<9} {}",
+        "row {:<5} {} {} {:<9} {}",
         lane.row.id,
-        thegn_core::pipeline_report::display_cell(&lane.row.issue_id),
-        thegn_core::pipeline_report::display_cell(&lane.facts.stage),
+        thegn_core::pipeline_report::display_fit(&lane.row.issue_id, 16),
+        thegn_core::pipeline_report::display_fit(&lane.facts.stage, 12),
         action.token(),
-        describe(lane, action)
+        thegn_core::pipeline_report::display_cell(&describe(lane, action))
     )
 }
 
@@ -443,11 +443,11 @@ fn section(title: &str, rows: &[(&Lane, &SuperviseAction)]) {
 
 fn section_line(lane: &Lane, action: &SuperviseAction) -> String {
     format!(
-        "  row {:<5} {:<16} {:<12} {}",
+        "  row {:<5} {} {} {}",
         lane.row.id,
-        thegn_core::pipeline_report::display_cell(&lane.row.issue_id),
-        thegn_core::pipeline_report::display_cell(&lane.facts.stage),
-        describe(lane, action)
+        thegn_core::pipeline_report::display_fit(&lane.row.issue_id, 16),
+        thegn_core::pipeline_report::display_fit(&lane.facts.stage, 12),
+        thegn_core::pipeline_report::display_cell(&describe(lane, action))
     )
 }
 
@@ -508,9 +508,9 @@ fn validations(row: Option<i64>, want_digest: bool, json: bool) -> Result<()> {
 
 fn validation_line(id: i64, validation: &ValidationRecord) -> String {
     format!(
-        "row {:<5} {:<12} {:<18} @ {}  (attempt {})",
+        "row {:<5} {} {:<18} @ {}  (attempt {})",
         id,
-        thegn_core::pipeline_report::display_cell(&validation.task),
+        thegn_core::pipeline_report::display_fit(&validation.task, 12),
         validation.class.as_str(),
         short(&thegn_core::pipeline_report::display_cell(
             &validation.commit_sha,
@@ -539,6 +539,7 @@ mod tests {
     use thegn_core::config_pipeline::Requirement;
     use thegn_core::issue::AgentDispatchStatus;
     use thegn_core::pipeline_approval::Approval;
+    use unicode_width::UnicodeWidthStr;
 
     const HEAD: &str = "4babb0901f2c3d4e5f60718293a4b5c6d7e8f901";
 
@@ -599,6 +600,74 @@ mod tests {
             assert!(!line.contains('\u{202e}'), "{line:?}");
             assert!(line.contains('\u{fffd}'), "{line:?}");
         }
+    }
+
+    #[test]
+    fn human_plan_and_section_lines_sanitize_describe_tail() {
+        let hostile_stage = "code\x1b]52;c;ZXZpbA==\x07\u{202e}";
+        let mut l = lane(hostile_stage);
+        l.row.stage = Some(hostile_stage.into());
+        l.facts.stage = hostile_stage.into();
+        let action = SuperviseAction::Escalate {
+            row: l.row.id,
+            why: thegn_core::pipeline_supervise::EscalationReason::AwaitingApproval {
+                stage: hostile_stage.into(),
+                commit_sha: HEAD.into(),
+            },
+        };
+
+        for line in [plan_line(&l, &action), section_line(&l, &action)] {
+            assert!(!line.contains('\x1b'), "{line:?}");
+            assert!(!line.contains('\x07'), "{line:?}");
+            assert!(!line.contains('\u{202e}'), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn human_plan_and_section_lines_sanitize_superseded_approval_tail() {
+        let mut l = lane("code");
+        l.approval = ApprovalState::Superseded {
+            approved: "1111111\x1b[2J".into(),
+            head: HEAD.into(),
+        };
+        let action = SuperviseAction::Escalate {
+            row: l.row.id,
+            why: thegn_core::pipeline_supervise::EscalationReason::AwaitingApproval {
+                stage: "code".into(),
+                commit_sha: HEAD.into(),
+            },
+        };
+
+        for line in [plan_line(&l, &action), section_line(&l, &action)] {
+            assert!(!line.contains('\x1b'), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn human_plan_identity_prefix_has_fixed_display_width() {
+        let action = SuperviseAction::Hold {
+            row: 677,
+            why: "waiting",
+        };
+        let mut benign = lane("code");
+        let mut hostile_width = lane("日本語日本語日本語");
+        hostile_width.row.issue_id = "i".repeat(200);
+        let lines = [
+            plan_line(&benign, &action),
+            plan_line(&hostile_width, &action),
+        ];
+        let token = format!(" {} ", action.token());
+        let widths: Vec<_> = lines
+            .iter()
+            .map(|line| UnicodeWidthStr::width(line.split_once(&token).unwrap().0))
+            .collect();
+        assert_eq!(widths[0], widths[1]);
+        benign.row.issue_id = "a much longer ordinary issue identifier".into();
+        let third = plan_line(&benign, &action);
+        assert_eq!(
+            widths[0],
+            UnicodeWidthStr::width(third.split_once(&token).unwrap().0)
+        );
     }
 
     #[test]
