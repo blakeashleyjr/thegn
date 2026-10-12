@@ -2812,6 +2812,19 @@ fn spawn_submodule_scan(
     });
 }
 
+fn active_submodules_enabled(
+    session: &crate::session::Session,
+    current_config: &thegn_core::config::Config,
+) -> bool {
+    let active_repo_root = session.repo_root().map(Path::to_path_buf);
+    active_repo_root
+        .as_deref()
+        .map(|root| {
+            current_config.repo_git(root).submodules != thegn_core::config::SubmoduleMode::Off
+        })
+        .unwrap_or(current_config.git.submodules != thegn_core::config::SubmoduleMode::Off)
+}
+
 // ---------------------------------------------------------------------------
 // The git mutation pipeline: every lazygit-style write flows through ONE
 // runner — `enqueue_git_op` rejects while one is in flight, runs the op on
@@ -9804,7 +9817,7 @@ async fn event_loop<T: Terminal>(
                 dirty |= before != model.panel.changes;
             }
             if refresh
-                && active_submodules_enabled
+                && active_submodules_enabled(&session, &current_config)
                 && !model.panel.changes.is_empty()
                 && let Some(next_token) = submodule_scans.request()
             {
@@ -10410,14 +10423,7 @@ async fn event_loop<T: Terminal>(
             // scan cannot make a submodule row appear clean or textual.
             // The session id IS the repo root (pure): no `git rev-parse` on the
             // loop just to pick the repo's `[git]` overlay (THE-515).
-            let active_repo_root = session.repo_root().map(Path::to_path_buf);
-            let active_submodules_enabled = active_repo_root
-                .as_deref()
-                .map(|root| {
-                    current_config.repo_git(root).submodules
-                        != thegn_core::config::SubmoduleMode::Off
-                })
-                .unwrap_or(current_config.git.submodules != thegn_core::config::SubmoduleMode::Off);
+            let active_submodules_enabled = active_submodules_enabled(&session, &current_config);
             if active_submodules_enabled {
                 for row in &mut next_model.panel.changes {
                     row.submodule = model
