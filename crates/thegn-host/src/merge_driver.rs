@@ -172,7 +172,7 @@ fn row_belongs_to_repo(
     {
         return Ok(rp == root_s);
     }
-    if !location.is_empty() && location != "local" {
+    if !location.trim().is_empty() && location.trim() != "local" {
         tracing::debug!(
             target: "thegn::merge",
             worktree,
