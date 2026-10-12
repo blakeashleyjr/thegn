@@ -129,7 +129,7 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
 
     // Cache pruning is a worker operation. Close from the highest index down so
     // earlier in-memory indices stay valid without opening SQLite on the loop.
-    crate::db_task::persist(move |db| {
+    crate::db_task::persist_critical(move |db| {
         for group in &removed_groups {
             crate::run::forget_worktree_group(db, &session_id, group, true);
         }

@@ -17,6 +17,13 @@ struct RefreshRequest {
     cwd: std::path::PathBuf,
     app_cfg: thegn_core::config::Config,
     waker: Option<TerminalWaker>,
+    report: Option<RefreshReportTarget>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RefreshReportTarget {
+    pub(crate) tx: tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    pub(crate) waker: TerminalWaker,
 }
 
 /// One active refresh per key, with only the newest overlapping request kept.
@@ -31,13 +38,22 @@ impl<R> RefreshCoalescer<R> {
         }
     }
 
+    #[cfg(test)]
     fn begin(&self, key: &str, req: R) -> Option<R> {
+        self.begin_with(key, req, |_, new| new)
+    }
+
+    fn begin_with(&self, key: &str, req: R, merge: impl FnOnce(R, R) -> R) -> Option<R> {
         let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(slot) = pending.get_mut(key) {
-            *slot = Some(req);
+            if let Some(previous) = slot.take() {
+                *slot = Some(merge(previous, req));
+            } else {
+                *slot = Some(req);
+            }
             None
         } else {
             pending.insert(key.to_owned(), None);
@@ -105,7 +121,7 @@ pub(crate) fn spawn_issue_cache_refresh(
     app_cfg: thegn_core::config::Config,
     waker: Option<TerminalWaker>,
 ) {
-    match request_issue_refresh(cwd, app_cfg, waker) {
+    match request_issue_refresh(cwd, app_cfg, waker, None) {
         RefreshStart::Started | RefreshStart::Coalesced => {}
         RefreshStart::Busy => {
             tracing::debug!(target: "thegn::tracker", "issue cache refresh admission refused");
@@ -122,14 +138,21 @@ pub(crate) fn request_issue_refresh(
     cwd: std::path::PathBuf,
     app_cfg: thegn_core::config::Config,
     waker: Option<TerminalWaker>,
+    report: Option<RefreshReportTarget>,
 ) -> RefreshStart {
     let key = cwd.to_string_lossy().into_owned();
     let request = RefreshRequest {
         cwd,
         app_cfg,
         waker,
+        report,
     };
-    let Some(first) = refresh_coalescer().begin(&key, request) else {
+    let Some(first) = refresh_coalescer().begin_with(&key, request, |previous, mut latest| {
+        if latest.report.is_none() {
+            latest.report = previous.report;
+        }
+        latest
+    }) else {
         return RefreshStart::Coalesced;
     };
     let worker_key = key.clone();
@@ -158,11 +181,20 @@ fn run_once(request: RefreshRequest) {
         cwd,
         app_cfg,
         waker,
+        report,
     } = request;
     use thegn_core::issue::IssueFilter;
     use thegn_svc::issue::IssueRouter;
 
     if !cwd.is_dir() {
+        if let Some(report) = report.as_ref() {
+            send_tracker_toast(
+                &report.tx,
+                &report.waker,
+                "Issue refresh failed — worktree is unavailable".to_owned(),
+                thegn_core::notification::Priority::Alert,
+            );
+        }
         return;
     }
     let repo_root = thegn_core::repo::main_worktree(&cwd).unwrap_or_else(|| cwd.clone());
@@ -171,12 +203,28 @@ fn run_once(request: RefreshRequest) {
     // Provider-as-plugin: append live plugin issue providers.
     crate::plugin_providers::extend_issue_router(&mut router);
     if !router.is_configured() {
+        if let Some(report) = report.as_ref() {
+            send_tracker_toast(
+                &report.tx,
+                &report.waker,
+                "No issue tracker configured".to_owned(),
+                thegn_core::notification::Priority::Info,
+            );
+        }
         return;
     }
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     else {
+        if let Some(report) = report.as_ref() {
+            send_tracker_toast(
+                &report.tx,
+                &report.waker,
+                "Issue refresh failed — could not start the tracker runtime".to_owned(),
+                thegn_core::notification::Priority::Alert,
+            );
+        }
         return;
     };
     // Repo scope for GitHub (other providers scope by team/project and
@@ -195,7 +243,12 @@ fn run_once(request: RefreshRequest) {
     // `(repo_root, provider, account)` key so trackers (and multiple
     // accounts of one provider) aggregate without clobbering.
     let per_provider = rt.block_on(router.list_per_provider(&filter));
+    let mut failures = Vec::new();
+    let mut any_success = false;
     let Ok(db) = thegn_core::db::Db::open() else {
+        if let Some(report) = report.as_ref() {
+            send_refresh_report(report, &[], Some("could not open the issue cache"), false);
+        }
         return;
     };
     let repo_key = cwd.to_string_lossy();
@@ -208,6 +261,7 @@ fn run_once(request: RefreshRequest) {
     for (account, provider, result) in per_provider {
         let issues = match result {
             Ok(issues) => {
+                any_success = true;
                 // Reached the tracker — online evidence for the app-wide holder.
                 thegn_core::connectivity::report_success();
                 issues
@@ -218,6 +272,7 @@ fn run_once(request: RefreshRequest) {
                 // trace anywhere (THE-72). One warn; the ring picks it up
                 // for crash reports/bundles even with no sink installed.
                 tracing::warn!(account = %account, provider, error = %e, "tracker refresh failed");
+                failures.push((format!("{provider}/{account}"), e.to_string()));
                 // Only a dropped link is offline evidence (not a bad token).
                 if e.is_transient() {
                     thegn_core::connectivity::report_failure();
@@ -267,6 +322,97 @@ fn run_once(request: RefreshRequest) {
     if changed && let Some(w) = &waker {
         let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     }
+    if let Some(report) = report.as_ref() {
+        send_refresh_report(report, &failures, None, any_success);
+    }
+}
+
+const MAX_REPORT_ENTRIES: usize = 3;
+const MAX_REPORT_ENTRY_CHARS: usize = 180;
+const MAX_REPORT_MESSAGE_CHARS: usize = MAX_REPORT_ENTRIES * (2 * MAX_REPORT_ENTRY_CHARS + 4) + 64;
+
+fn safe_report_text(value: &str) -> String {
+    truncate_report_text(&sanitize_and_redact(value), MAX_REPORT_ENTRY_CHARS)
+}
+
+fn sanitize_and_redact(value: &str) -> String {
+    let sanitized = thegn_svc::lsp::sanitize_for_terminal(value);
+    thegn_core::ci_log::redact(&sanitized)
+}
+
+fn truncate_report_text(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let short: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{short}…")
+    } else {
+        short
+    }
+}
+
+fn format_refresh_report(
+    failures: &[(String, String)],
+    db_error: Option<&str>,
+    any_success: bool,
+) -> Option<(String, thegn_core::notification::Priority)> {
+    let mut entries: Vec<String> = failures
+        .iter()
+        .take(MAX_REPORT_ENTRIES)
+        .map(|(account, error)| {
+            format!("{}: {}", safe_report_text(account), safe_report_text(error))
+        })
+        .collect();
+    let omitted = failures.len().saturating_sub(MAX_REPORT_ENTRIES);
+    if omitted > 0 {
+        entries.push(format!("and {omitted} more"));
+    }
+    if let Some(error) = db_error {
+        entries.clear();
+        entries.push(format!("issue cache: {}", safe_report_text(error)));
+    }
+    if !entries.is_empty() {
+        Some((
+            format!("Issue refresh failed — {}", entries.join("; ")),
+            thegn_core::notification::Priority::Alert,
+        ))
+    } else if any_success {
+        Some((
+            "Issues refreshed".to_owned(),
+            thegn_core::notification::Priority::Info,
+        ))
+    } else {
+        None
+    }
+}
+
+fn send_refresh_report(
+    report: &RefreshReportTarget,
+    failures: &[(String, String)],
+    db_error: Option<&str>,
+    any_success: bool,
+) {
+    if let Some((message, priority)) = format_refresh_report(failures, db_error, any_success) {
+        send_tracker_toast(&report.tx, &report.waker, message, priority);
+    }
+}
+
+pub(crate) fn send_tracker_toast(
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    waker: &TerminalWaker,
+    message: String,
+    priority: thegn_core::notification::Priority,
+) {
+    let message = prepare_tracker_toast_message(&message);
+    if let Err(error) = tx.send(crate::hydrate::RefreshKind::Toast { message, priority }) {
+        tracing::debug!(%error, "failed to send tracker toast");
+    }
+    if let Err(error) = waker.wake() {
+        tracing::debug!(%error, "failed to wake after tracker toast");
+    }
+}
+
+fn prepare_tracker_toast_message(message: &str) -> String {
+    truncate_report_text(&sanitize_and_redact(message), MAX_REPORT_MESSAGE_CHARS)
 }
 
 /// The pure old-vs-new cache diff behind the tracker refresh's notification
@@ -392,7 +538,10 @@ pub(crate) fn populate_tracker(
 
 #[cfg(test)]
 mod tests {
-    use super::{RefreshCoalescer, RefreshGuard};
+    use super::{
+        MAX_REPORT_ENTRY_CHARS, RefreshCoalescer, RefreshGuard, format_refresh_report,
+        prepare_tracker_toast_message, safe_report_text,
+    };
 
     #[test]
     fn coalesces_to_the_latest_request_and_releases_the_key() {
@@ -403,6 +552,75 @@ mod tests {
         assert_eq!(coalescer.next("repo"), Some('C'));
         assert_eq!(coalescer.next("repo"), None);
         assert_eq!(coalescer.begin("repo", 'D'), Some('D'));
+    }
+
+    #[test]
+    fn coalescer_merge_preserves_user_report_target_across_background_replacement() {
+        let coalescer = RefreshCoalescer::new();
+        assert_eq!(
+            coalescer.begin("repo", ("active", None)),
+            Some(("active", None))
+        );
+        assert_eq!(coalescer.begin("repo", ("user", Some("report"))), None);
+        assert_eq!(
+            coalescer.begin_with("repo", ("background", None), |previous, latest| {
+                (latest.0, latest.1.or(previous.1))
+            }),
+            None
+        );
+        assert_eq!(coalescer.next("repo"), Some(("background", Some("report"))));
+    }
+
+    #[test]
+    fn refresh_report_is_redacted_sanitized_and_bounded() {
+        let failures = vec![
+            (
+                "linear/team".into(),
+                "https://user:secret-token@host/path\r\u{1b}]0;evil\u{7} failed".into(),
+            ),
+            ("github/acct".into(), "failed".into()),
+            ("jira/site".into(), "failed".into()),
+            ("linear/extra".into(), "failed".into()),
+        ];
+        let (message, priority) = format_refresh_report(&failures, None, false).unwrap();
+        assert_eq!(priority, thegn_core::notification::Priority::Alert);
+        assert!(!message.contains("secret-token"));
+        assert!(!message.contains('\u{1b}'));
+        assert!(!message.contains('\r'));
+        assert!(message.contains("and 1 more"));
+        assert!(message.contains("linear/team:"));
+        assert!(message.contains("github/acct:"));
+        assert!(message.contains("jira/site:"));
+        assert!(!message.contains("linear/extra:"));
+
+        let (success, priority) = format_refresh_report(&[], None, true).unwrap();
+        assert_eq!(success, "Issues refreshed");
+        assert_eq!(priority, thegn_core::notification::Priority::Info);
+        let (db_failure, priority) =
+            format_refresh_report(&[], Some("cache lock held"), false).unwrap();
+        assert_eq!(priority, thegn_core::notification::Priority::Alert);
+        assert!(db_failure.contains("issue cache:"));
+        assert!(
+            safe_report_text(&"x".repeat(MAX_REPORT_ENTRY_CHARS + 10))
+                .chars()
+                .count()
+                <= MAX_REPORT_ENTRY_CHARS + 1
+        );
+    }
+
+    #[test]
+    fn sent_toast_preserves_more_suffix_for_long_multi_account_failures() {
+        let failures = (0..4)
+            .map(|index| (format!("provider/account-{index}"), "x".repeat(180)))
+            .collect::<Vec<_>>();
+        let (message, _) = format_refresh_report(&failures, None, false).unwrap();
+
+        let prepared = prepare_tracker_toast_message(&message);
+
+        assert!(prepared.contains("and 1 more"));
+        assert!(prepared.contains("provider/account-0:"));
+        assert!(prepared.contains("provider/account-2:"));
+        assert!(!prepared.contains("provider/account-3:"));
     }
 
     #[test]
