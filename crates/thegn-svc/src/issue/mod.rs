@@ -1118,15 +1118,17 @@ mod spec {
             &'a self,
             _filter: &'a IssueFilter,
         ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
-            let issue = serde_json::from_value(serde_json::json!({
-                "id": "linear:ABC-1",
-                "number": "1",
-                "provider": "linear",
-                "title": "partial row",
-                "status": "todo",
-                "priority": "low"
-            }))
-            .unwrap();
+            let issue = Issue {
+                id: "linear:ABC-1".into(),
+                number: "1".into(),
+                provider: "linear".into(),
+                title: "partial row".into(),
+                status: thegn_core::issue::IssueStatus::Todo,
+                priority: thegn_core::issue::IssuePriority::Low,
+                url: "https://linear.app/acme/issue/ABC-1".into(),
+                ..Default::default()
+            };
+            let issue = serde_json::from_value(serde_json::to_value(issue).unwrap()).unwrap();
             Box::pin(async move {
                 Err(IssueError::PartialList {
                     issues: vec![issue],
