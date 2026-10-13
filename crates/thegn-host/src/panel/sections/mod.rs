@@ -650,7 +650,7 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
         }
         Section::Keys => vec![seg(g2(), "?")],
-        Section::Help => vec![seg(g2(), "F1")],
+        Section::Help => vec![seg(g2(), model.chord("help").to_string())],
         Section::Mine => {
             let rows = &model.panel.my_work;
             if rows.is_empty() {
@@ -919,6 +919,169 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Logs => logs::content(ctx),
         Section::Media => media::content(ctx),
         Section::Usage => usage::content(ctx),
+    }
+}
+
+/// The scroll bounds and navigation ownership for hitless panel bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollExtent {
+    pub max: usize,
+    pub owns_nav: bool,
+}
+
+/// The body height shared by rendering and scroll routing.
+pub fn scroll_viewport(
+    model: &crate::chrome::FrameModel,
+    ui: &PanelUi,
+    cols: usize,
+    rows: usize,
+) -> usize {
+    let header_rows = crate::panel::frame::header_rows(model, false, cols).len();
+    if ui.width == crate::layout::PanelWidth::Full {
+        crate::panel::budget::allocate_full(
+            rows.saturating_sub(1),
+            header_rows,
+            rail_row_count(ui, cols),
+        )
+        .body_rows
+    } else {
+        rows.saturating_sub(1 + header_rows + ui.visible_section_count() + 2)
+    }
+}
+
+fn rail_row_count(ui: &PanelUi, cols: usize) -> usize {
+    let visible: Vec<_> = ui
+        .tab_sections()
+        .into_iter()
+        .map(|section| section.label())
+        .collect();
+    let mut rows = 0;
+    let mut x = 1usize;
+    for (i, label) in visible.iter().enumerate() {
+        let entry_width = (i + 1).to_string().len() + 1 + label.chars().count();
+        let separator_width = if x > 1 { 3 } else { 0 };
+        if x + separator_width + entry_width > cols.saturating_sub(1) && x > 1 {
+            rows += 1;
+            x = 1;
+        } else if separator_width > 0 {
+            x += separator_width;
+        }
+        x += entry_width;
+    }
+    if visible.is_empty() { rows } else { rows + 1 }
+}
+
+pub fn scroll_moves(ext: ScrollExtent, up: bool, scroll: usize) -> bool {
+    if up { scroll > 0 } else { scroll < ext.max }
+}
+
+/// Apply one body-scroll key, returning the clamped target when the key belongs
+/// to this scroll extent.
+pub fn scroll_step(
+    ext: ScrollExtent,
+    key: &termwiz::input::KeyCode,
+    mods: termwiz::input::Modifiers,
+    scroll: usize,
+    page: usize,
+) -> Option<usize> {
+    let amount = match *key {
+        termwiz::input::KeyCode::PageDown if mods.is_empty() => page,
+        termwiz::input::KeyCode::PageUp if mods.is_empty() => page,
+        termwiz::input::KeyCode::Char('d') if mods == termwiz::input::Modifiers::CTRL => {
+            (page / 2).max(1)
+        }
+        termwiz::input::KeyCode::Char('u') if mods == termwiz::input::Modifiers::CTRL => {
+            (page / 2).max(1)
+        }
+        termwiz::input::KeyCode::Home if mods.is_empty() && ext.owns_nav => {
+            return Some(0);
+        }
+        termwiz::input::KeyCode::End if mods.is_empty() && ext.owns_nav => {
+            return Some(ext.max);
+        }
+        termwiz::input::KeyCode::Char('g') if mods.is_empty() && ext.owns_nav => {
+            return Some(0);
+        }
+        termwiz::input::KeyCode::Char('G')
+            if !mods.contains(termwiz::input::Modifiers::CTRL)
+                && !mods.contains(termwiz::input::Modifiers::ALT)
+                && ext.owns_nav =>
+        {
+            return Some(ext.max);
+        }
+        termwiz::input::KeyCode::Char('j') if mods.is_empty() && ext.owns_nav => 1,
+        termwiz::input::KeyCode::Char('k') if mods.is_empty() && ext.owns_nav => 1,
+        _ => return None,
+    };
+    let up = matches!(
+        *key,
+        termwiz::input::KeyCode::PageUp
+            | termwiz::input::KeyCode::Char('u')
+            | termwiz::input::KeyCode::Char('k')
+    );
+    if up {
+        Some(scroll.min(ext.max).saturating_sub(amount))
+    } else {
+        Some(scroll.saturating_add(amount).min(ext.max))
+    }
+}
+
+/// Returns the viewport's maximum scroll and whether it owns j/k and g/G.
+pub fn scroll_extent(
+    section: Section,
+    model: &crate::chrome::FrameModel,
+    ui: &PanelUi,
+    cols: usize,
+    rows: usize,
+) -> Option<ScrollExtent> {
+    let ctx = SectionCtx {
+        model,
+        ui,
+        cols: cols.saturating_sub(if ui.width == crate::layout::PanelWidth::Full {
+            2
+        } else {
+            3
+        }),
+        rows,
+    };
+    let viewport = scroll_viewport(model, ui, cols, rows);
+    match section {
+        Section::Help => Some(ScrollExtent {
+            max: help::line_count(&ctx).saturating_sub(viewport.saturating_sub(2)),
+            owns_nav: true,
+        }),
+        Section::Telemetry => Some(ScrollExtent {
+            max: telemetry::row_count(&ctx).saturating_sub(viewport.saturating_sub(1)),
+            owns_nav: true,
+        }),
+        Section::Keys
+            if matches!(
+                ui.width,
+                crate::layout::PanelWidth::Half | crate::layout::PanelWidth::Full
+            ) =>
+        {
+            let lines: usize = ui
+                .docs
+                .cfg_keys
+                .iter()
+                .map(|g| g.rows.len() + 2)
+                .sum::<usize>()
+                + 8;
+            Some(ScrollExtent {
+                max: lines.div_ceil(2).saturating_sub(1),
+                owns_nav: true,
+            })
+        }
+        Section::Stash if ui.width == crate::layout::PanelWidth::Full => Some(ScrollExtent {
+            max: ui
+                .git
+                .stash_diff
+                .as_ref()
+                .map(|(_, text)| text.lines().count().saturating_sub(1))
+                .unwrap_or(0),
+            owns_nav: false,
+        }),
+        _ => None,
     }
 }
 
