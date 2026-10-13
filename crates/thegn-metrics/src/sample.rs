@@ -127,14 +127,14 @@ pub(crate) fn parse_default_route(contents: &str) -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn read_net_medium() -> NetMedium {
-    use crate::{IfaceFact, select_medium};
+pub fn probe_net_path() -> crate::MediumSelection {
+    use crate::{IfaceFact, MediumSelection, NetMedium, select_medium_explained};
     use std::collections::BTreeSet;
     use std::path::Path;
 
     let routes = match std::fs::read_to_string("/proc/net/route") {
         Ok(text) => parse_default_route(&text),
-        Err(_) => return NetMedium::Unknown,
+        Err(_) => return MediumSelection::probe_unavailable(),
     };
     let mut names = BTreeSet::new();
     if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
@@ -168,12 +168,12 @@ fn read_net_medium() -> NetMedium {
             }
         })
         .collect::<Vec<_>>();
-    select_medium(&facts)
+    select_medium_explained(&facts)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_net_medium() -> NetMedium {
-    NetMedium::Unknown
+pub fn probe_net_path() -> crate::MediumSelection {
+    crate::MediumSelection::probe_unavailable()
 }
 
 /// No `/proc/vmstat` here; the metric is reported as unobserved.
@@ -347,7 +347,7 @@ impl StatsSampler {
 
         // --- Slow tier (every SLOW_EVERY-th tick): frequency, temps, disks ---
         if slow {
-            self.last_net_medium = read_net_medium();
+            self.last_net_medium = probe_net_path().medium;
             // Apple silicon publishes no SMC components, so `Components` comes
             // back empty there and the temperature row silently vanished. Ask
             // whichever backend the probe selected; `Components` stays the
