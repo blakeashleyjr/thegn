@@ -45,8 +45,8 @@ created_at INTEGER NOT NULL, position INTEGER NOT NULL DEFAULT 0)` —
   `position` for manual sidebar ordering of program headers, same
   exact-order persistence style as `set_workspace_order`.
 - `ALTER TABLE workspaces ADD COLUMN project_id INTEGER` (nullable; NULL =
-  unprojected). One column, not a join table: membership exclusive by
-  construction, mirroring zones.
+  workspace outside any program). One column, not a join table: membership
+  exclusive by construction, mirroring zones.
 - **Additive migration, next `user_version` bump** on the ladder
   (`db_migrate.rs`), `CREATE TABLE IF NOT EXISTS` + idempotent `ALTER` so
   parallel-branch DBs tolerate it; do not pin the version number in code
@@ -122,8 +122,8 @@ No new blocking work on the loop.
 
 - Member workspaces render under a collapsible **program header row**
   (name + member count + rolled-up attention, same tier-granular bubbling
-  rules workspaces already use); unprojected workspaces render exactly as
-  today, after the projected groups. Rail mode keeps header identity.
+  rules workspaces already use); workspaces outside any program render
+  exactly as today, after the program groups. Rail mode keeps header identity.
 - Ordering: programs order by `programs.position` (keyboard reorder +
   drag, exact-order persistence); member workspaces keep their existing
   positions within the group. This sits directly on the run-partition

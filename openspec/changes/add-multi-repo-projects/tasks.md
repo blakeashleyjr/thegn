@@ -57,7 +57,7 @@ Depends on `stabilize-sidebar-internals` + `add-sidebar-folder-ordering`
 pass with the full test + e2e suite (see status note above).
 
 - [ ] 4.1 Program header rows grouping member workspaces (name, member
-      count, tier-granular attention rollup); unprojected after the groups.
+      count, tier-granular attention rollup); other workspaces after the groups.
 - [ ] 4.2 Collapse (tombstone-free `ui_state`, prefix-pruned on program
       delete) + program reorder (keyboard + drag, `set_project_order`) —
       **row-partition unit tests**. (`set_project_order` already shipped.)
