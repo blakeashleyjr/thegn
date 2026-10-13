@@ -463,12 +463,16 @@ fn pipe_to(
         }
         match child.try_wait() {
             Ok(Some(status)) => {
-                // The leader remains unreaped here, so its group identity is
-                // still owned while descendants are cleaned up.
-                group.kill();
+                // Native clipboard tools may fork the process that serves the
+                // selection and then exit successfully. Preserve that holder;
+                // on a failed detach, treat the helper as failed and clean it.
+                let detached = status.success() && group.detach();
+                if !detached {
+                    group.kill();
+                }
                 let _ = child.wait();
                 let _ = writer.join();
-                return status.success();
+                return detached;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
             Err(_) => {
@@ -552,6 +556,98 @@ mod tests {
             ),
             "unspawnable tool is a failure"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn successful_helper_keeps_its_background_clipboard_holder_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("holder.pid");
+        let helper = dir.path().join("fake-copy");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\n/bin/cat >/dev/null\n/bin/sleep 30 &\necho $! > \"$1\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+        let _env = crate::testenv::EnvVarGuard::set(&[("PATH", dir.path().to_str().unwrap())]);
+        let cancelled = AtomicBool::new(false);
+
+        assert!(pipe_to(
+            &["fake-copy", marker.to_str().unwrap()],
+            Arc::from(&b"selection"[..]),
+            &cancelled,
+            Instant::now() + OPERATION_BUDGET,
+        ));
+        let pid: i32 = std::fs::read_to_string(marker)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let running = process_is_running(pid);
+        terminate_test_process(pid);
+        assert!(running, "successful helper's holder was killed");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn timed_out_helper_kills_its_background_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("holder.pid");
+        let helper = dir.path().join("fake-copy");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\n/bin/cat >/dev/null\n/bin/sleep 30 &\necho $! > \"$1\"\nwait\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+        let _env = crate::testenv::EnvVarGuard::set(&[("PATH", dir.path().to_str().unwrap())]);
+        let cancelled = AtomicBool::new(false);
+
+        assert!(!pipe_to(
+            &["fake-copy", marker.to_str().unwrap()],
+            Arc::from(&b"selection"[..]),
+            &cancelled,
+            Instant::now() + Duration::from_millis(300),
+        ));
+        let pid: i32 = std::fs::read_to_string(marker)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let running = process_is_running(pid);
+        if running {
+            terminate_test_process(pid);
+        }
+        assert!(!running, "timeout left the holder process running");
+    }
+
+    #[cfg(unix)]
+    fn process_is_running(pid: i32) -> bool {
+        let output = Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .chars()
+            .next()
+            .is_some_and(|state| state != 'Z')
+    }
+
+    #[cfg(unix)]
+    fn terminate_test_process(pid: i32) {
+        let status = Command::new("/bin/kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]

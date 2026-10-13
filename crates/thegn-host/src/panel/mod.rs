@@ -1185,6 +1185,9 @@ impl PanelUi {
         self.row_mode = false;
         self.chg_sel = None;
         self.impact_open = false;
+        if let Some(filter) = self.git.filter.as_mut() {
+            filter.editing = false;
+        }
     }
 
     /// Adopt a config-resolved order; the open section snaps to the first
