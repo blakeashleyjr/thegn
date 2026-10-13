@@ -1147,10 +1147,10 @@ pub(crate) fn run_pr_create(
         if let Err(e) = forges.for_loc(&loc).create_pr(&loc, &opts) {
             thegn_core::msg::warn(&format!("pr create failed: {}", e.describe()));
         }
-        if tx.send(RefreshKind::Pr).is_ok() {
-            if let Err(error) = waker.wake() {
-                tracing::debug!(target: "thegn::pr", %error, "terminal wake after PR creation failed");
-            }
+        if tx.send(RefreshKind::Pr).is_ok()
+            && let Err(error) = waker.wake()
+        {
+            tracing::debug!(target: "thegn::pr", %error, "terminal wake after PR creation failed");
         }
     });
 }
