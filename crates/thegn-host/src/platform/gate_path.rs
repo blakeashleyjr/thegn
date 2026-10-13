@@ -82,8 +82,8 @@ impl ScratchDirectory {
         Ok(())
     }
 
-    /// Remove an empty scratch directory by identity. A populated worktree is
-    /// retained for Git registration repair instead of recursively deleted.
+    /// Remove an empty scratch directory by identity on the add-failure path.
+    /// Populated worktrees are removed through `remove_tree`.
     pub(crate) fn remove_empty(self) -> io::Result<()> {
         self.verify()?;
         std::fs::remove_dir(self.path())
@@ -807,6 +807,7 @@ mod tests {
         let root = private_root();
         let tree_path = root.path().join("tree");
         std::fs::create_dir(&tree_path).unwrap();
+        std::fs::set_permissions(&tree_path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let tree = Directory::open(&tree_path, Some(&tree_path)).unwrap();
         let nested = tree_path.join("nested");
         std::fs::create_dir(&nested).unwrap();
