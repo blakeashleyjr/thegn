@@ -682,7 +682,14 @@ pub(super) fn tests(ctx: &SectionCtx) -> Vec<PanelRow> {
         if ctx.ui.tests.filter_editing {
             chip.push(seg(hue(Hue::Amber), "|"));
         }
-        chip.push(seg(g2(), "  (Esc clears)"));
+        chip.push(seg(
+            g2(),
+            if ctx.ui.tests.filter_editing {
+                "  (Esc clears)"
+            } else {
+                "  (/ then Esc clears)"
+            },
+        ));
         rows.push(PanelRow::plain(Line::segs(chip)));
     }
     rows.push(PanelRow::blank());
@@ -731,7 +738,14 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
         if ts.filter_editing {
             filter.push(seg(hue(Hue::Amber), "|"));
         }
-        filter.push(seg(g2(), "  (Esc clears)"));
+        filter.push(seg(
+            g2(),
+            if ts.filter_editing {
+                "  (Esc clears)"
+            } else {
+                "  (/ then Esc clears)"
+            },
+        ));
         rows.push(PanelRow::plain(Line::segs(filter)));
     }
 

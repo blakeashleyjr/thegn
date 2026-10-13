@@ -18379,7 +18379,9 @@ async fn event_loop<T: Terminal>(
                         _ => None,
                     };
                     if let Some(edit) = edit {
-                        panel_ui.tests.edit_filter(edit);
+                        panel_ui
+                            .tests
+                            .edit_filter_with_panel_cursor(edit, &mut panel_ui.cursor);
                         dirty = true;
                         continue;
                     }
@@ -20732,29 +20734,30 @@ async fn event_loop<T: Terminal>(
                         (Section::Tests, KeyCode::Char('/')) => {
                             if panel_ui.tests.filter.is_empty() {
                                 panel_ui.tests.cursor = 0;
+                                panel_ui.cursor = 0;
                             }
                             panel_ui.tests.filter_editing = true;
                             true
                         }
                         (Section::Tests, KeyCode::Char('O')) => {
-                            let active_wt = active_tab_path(&session);
+                            let active_wt =
+                                active_tab_path(&session).to_string_lossy().into_owned();
                             match (
                                 panel_ui.tests.last_output.as_ref(),
                                 panel_ui.tests.task.as_ref(),
                             ) {
                                 (Some((worktree, output)), Some(task))
-                                    if worktree.as_str()
-                                        == active_wt.to_string_lossy().as_ref()
-                                        && !output.is_empty() =>
+                                    if worktree == &active_wt && !output.is_empty() =>
                                 {
-                                    let path = crate::handlers::task_output::task_output_dir()
-                                        .join(format!(
-                                            "{}.txt",
-                                            crate::handlers::task_output::safe_task_filename(
-                                                &format!("tests-{}", task.name)
-                                            )
-                                        ));
-                                    let write_path = path.clone();
+                                    let write_path = crate::handlers::task_output::task_output_dir(
+                                    )
+                                    .join(format!(
+                                        "{}.txt",
+                                        crate::handlers::task_output::safe_task_filename(&format!(
+                                            "tests-{}",
+                                            task.name
+                                        ))
+                                    ));
                                     let output = output.clone();
                                     let tx = job_output_tx.clone();
                                     let wake = waker.clone();

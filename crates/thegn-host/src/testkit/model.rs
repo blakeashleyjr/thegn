@@ -257,6 +257,20 @@ impl TestPanelState {
         }
     }
 
+    /// Apply a filter edit and reset both the tree and accordion cursors when
+    /// the visible set changes because text was pushed or popped.
+    pub fn edit_filter_with_panel_cursor(
+        &mut self,
+        edit: FilterEdit,
+        panel_cursor: &mut usize,
+    ) -> bool {
+        let changed = self.edit_filter(edit);
+        if changed && matches!(edit, FilterEdit::Push(_) | FilterEdit::Pop) {
+            *panel_cursor = 0;
+        }
+        changed
+    }
+
     /// Record a completed run at the head of the history (capped).
     pub fn push_history(&mut self, rec: TestRunRec) {
         self.history.insert(0, rec);
@@ -901,22 +915,46 @@ mod tests {
     fn filter_edit_narrows_visible_nodes() {
         let mut state = TestPanelState::default();
         state.merge_results(&[
-            test_node("sec::first", TestState::Pass, None, None),
-            test_node("other::second", TestState::Pass, None, None),
+            test_node("alpha::first", TestState::Pass, None, None),
+            test_node("beta::second", TestState::Pass, None, None),
         ]);
+        let before = state.visible_indices().len();
         state.cursor = 1;
         state.filter_editing = true;
 
-        assert!(state.edit_filter(FilterEdit::Push('s')));
-        assert!(state.edit_filter(FilterEdit::Push('e')));
-        assert!(state.edit_filter(FilterEdit::Push('c')));
+        for ch in "alpha".chars() {
+            assert!(state.edit_filter(FilterEdit::Push(ch)));
+        }
         assert_eq!(state.cursor, 0);
-        assert_eq!(state.visible_indices().len(), 1);
+        let after = state.visible_indices();
+        assert!(after.len() > 0 && after.len() < before);
+        assert!(after.iter().all(|&index| {
+            let node = &state.nodes[index];
+            node.id.contains("alpha") || node.label.contains("alpha")
+        }));
 
         assert!(state.edit_filter(FilterEdit::Clear));
         assert!(state.filter.is_empty());
         assert!(!state.filter_editing);
-        assert_eq!(state.visible_indices().len(), 2);
+        assert_eq!(state.visible_indices().len(), before);
+    }
+
+    #[test]
+    fn filter_edit_resets_tree_and_panel_cursors() {
+        let mut state = TestPanelState::default();
+        let mut panel_cursor = 7;
+        state.cursor = 4;
+        state.filter_editing = true;
+
+        assert!(state.edit_filter_with_panel_cursor(FilterEdit::Push('a'), &mut panel_cursor));
+        assert_eq!(state.cursor, 0);
+        assert_eq!(panel_cursor, 0);
+
+        state.cursor = 3;
+        panel_cursor = 5;
+        assert!(state.edit_filter_with_panel_cursor(FilterEdit::Pop, &mut panel_cursor));
+        assert_eq!(state.cursor, 0);
+        assert_eq!(panel_cursor, 0);
     }
 
     #[test]
