@@ -129,7 +129,7 @@ mod tests {
             Some(crate::sidebar::RowTarget::Tab(0, 2))
         );
         assert_eq!(
-            worktree_row_target("/wt/open", &[], &[wt.clone()]),
+            worktree_row_target("/wt/open", &[], std::slice::from_ref(&wt)),
             Some(crate::sidebar::RowTarget::Workspace {
                 repo_path: "/repo".into(),
                 group: Some("repo/feat".into())
