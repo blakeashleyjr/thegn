@@ -1193,13 +1193,13 @@ mod tests {
     #[test]
     fn full_self_windowed_problem_count_uses_the_complete_list() {
         let model = model_with(PanelData {
-            diagnostics: (0..40)
+            diagnostics: (0..2)
                 .map(|i| crate::panel::DiagnosticItem {
                     file: format!("src/{i}.rs"),
                     line: i,
                     col: None,
                     severity: crate::panel::Severity::Error,
-                    message: format!("diagnostic-{i}"),
+                    message: format!("{}-{i}", "long-detail".repeat(30)),
                     source: "test".into(),
                     code: None,
                 })
@@ -1213,7 +1213,7 @@ mod tests {
         };
         assert_eq!(
             section_rows(crate::panel::Section::Problems, &model, &ui, 150, 30),
-            40
+            2
         );
     }
 
@@ -1242,10 +1242,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            section_rows(crate::panel::Section::Problems, &model, &ui, 44, 50),
+            section_rows(crate::panel::Section::Problems, &model, &ui, 44, 15),
             40
         );
-        let frame = build_panel(&model, &ui, 44, 50, true);
+        let frame = build_panel(&model, &ui, 44, 15, true);
         let rendered = frame
             .rows
             .iter()
@@ -1255,6 +1255,7 @@ mod tests {
         assert!(rendered.contains("diagnostic-35"), "{rendered}");
         assert!(rendered.contains("↑"), "{rendered}");
         assert!(rendered.contains("+"), "{rendered}");
-        assert!(frame.rows.len() <= 50);
+        assert!(rendered.contains("more"), "{rendered}");
+        assert!(frame.rows.len() <= 15);
     }
 }

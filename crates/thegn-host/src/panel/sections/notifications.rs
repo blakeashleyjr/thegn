@@ -244,7 +244,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         // The cursor's secondary row wraps the complete message; other rows
         // retain the compact worktree and kind metadata.
         let secondary = if i == cursor {
-            wrap_text(&n.message, ctx.cols)
+            wrap_text(&n.message, ctx.cols.saturating_sub(2))
                 .into_iter()
                 .map(|part| Line::segs(vec![sp(2), seg(t(), part)]))
                 .collect::<Vec<_>>()

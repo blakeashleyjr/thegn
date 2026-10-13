@@ -855,7 +855,7 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
             &detail_rows,
             ts.cursor,
             list_w,
-            ctx.rows.saturating_sub(rows.len() + 1),
+            ctx.rows.saturating_sub(rows.len() + 2),
         )
         .into_iter()
         .map(|row| {

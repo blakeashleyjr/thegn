@@ -67,9 +67,6 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         return full_view(ctx);
     }
     let mut rows: Vec<PanelRow> = Vec::new();
-    if ctx.full() {
-        rows.push(PanelRow::plain(Line::segs(vec![seg(d(), "HOSTS")])));
-    }
     // Each host row carries a `Row` hit (detail rows don't), so the enumerate
     // index lines up with `ui.cursor` and with `panel.hosts` — the action keys
     // (p/r/c/x, m) target `hosts[cursor]`.
