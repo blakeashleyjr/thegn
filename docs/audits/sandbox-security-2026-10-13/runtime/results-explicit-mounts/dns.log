@@ -1,0 +1,10 @@
+exit=0
+first_allowed_rcode=0
+first_blocked_rcode=3
+second_policy_same_port=true
+second_deny_all_allowed_test_rcode=0
+alternate_dns_blocked_test_rcode=0
+direct_ip_tcp_connect=true
+event=allowed.test allowed=true
+event=blocked.test allowed=false
+event=allowed.test allowed=true

@@ -1,0 +1,24 @@
+wait_status=0
+request backend=podman profile=hardened network=none floor=off miss=degrade
+resolved backend=podman-rootless profile_home=None network=None name=thegn-audit-20261013-3566190-podman-hardened-reuse-network-none
+mounts=[{"cache":false,"dest":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-gxnstikx/home/wt","host":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-gxnstikx/home/wt","ro":false},{"cache":false,"dest":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-gxnstikx/home/repo/.git","host":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-gxnstikx/home/repo/.git","ro":false},{"cache":false,"dest":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-gxnstikx/home/repo/.git/config","host":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-gxnstikx/home/repo/.git/config","ro":true},{"cache":false,"dest":"/nix/store","host":"/nix/store","ro":true},{"cache":false,"dest":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-gxnstikx/home/.cache/pip","host":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-gxnstikx/home/.cache/pip","ro":false},{"cache":false,"dest":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-gxnstikx/home","host":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-gxnstikx/home","ro":true},{"cache":false,"dest":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-gxnstikx/home/.gnupg","host":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-gxnstikx/home/.gnupg","ro":false}]
+forwarded_env_keys=["GH_TOKEN", "TERM", "HOME", "THEGN_SANDBOX", "PREK_ALLOW_NO_CONFIG"]
+argv=["podman","--url","unix:///run/user/1000/podman/podman.sock","exec","-it","--workdir","/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-gxnstikx/home/wt","thegn-audit-20261013-3566190-podman-hardened-reuse-network-none","/bin/sh","-lc","git config --global --add safe.directory '*' >/dev/null 2>&1 || true\nunset GIT_DIR\nunset GIT_INDEX_FILE\nunset GIT_WORK_TREE\nunset GIT_COMMON_DIR\nunset GIT_NAMESPACE\nunset GIT_OBJECT_DIRECTORY\nunset GIT_ALTERNATE_OBJECT_DIRECTORIES\nexec /nix/store/jxyrvv4gbpnp3ap5iy7wxwl1sg4x2x88-python3-3.14.6/bin/python3 /home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-gxnstikx/home/wt/probe_inside.py /home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-gxnstikx 58489 33695 oci /dev/shm/thegn-audit-system-qs0z54gv/system-canary"]
+ensure=ok
+{"label": "worktree", "read": true, "write": true}
+{"label": "sibling_checkout", "read": true, "write": false, "write_errno": 30}
+{"label": "shared_git", "read": true, "write": true}
+{"label": "shared_git_config", "read": true, "write": false, "write_errno": 30}
+{"label": "home", "read": true, "write": false, "write_errno": 30}
+{"label": "credential_ssh", "read": true, "write": false, "write_errno": 30}
+{"label": "credential_gpg", "read": true, "write": true}
+{"label": "credential_gpg_default_alias", "read": false, "read_errno": 2, "write": false, "write_errno": 2}
+{"label": "cache", "read": true, "write": true}
+{"label": "custom_system_fixture", "read": false, "read_errno": 2, "write": false, "write_errno": 2}
+{"label": "host_shared_memory_fixture", "read": false, "read_errno": 2, "write": false, "write_errno": 2}
+{"label": "system_os_release", "read": true}
+{"label": "credential_forwarding", "synthetic_GH_TOKEN_present": true}
+{"label": "endpoint_address", "address": "169.254.1.2"}
+{"label": "direct_ip_tcp", "allowed": true}
+{"label": "alternate_dns_udp", "rcode": 0}
+enter_exit=exit status: 0

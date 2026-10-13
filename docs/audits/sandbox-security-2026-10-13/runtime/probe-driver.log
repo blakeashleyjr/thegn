@@ -1,0 +1,12 @@
+running bwrap-hardened
+running bwrap-hardened-deny-all
+running bwrap-network-none
+running bwrap-sealed
+running systemd-hardened
+running systemd-network-none
+running systemd-sealed
+running podman-hardened-reuse-network-none
+running podman-network-none
+running podman-sealed
+running podman-hardened-deny-all
+running missing-apple-fallback

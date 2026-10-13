@@ -1,0 +1,8 @@
+exit=0
+
+running 3 tests
+test h1_profile_names_are_distinct ... ok
+test h2_profile_overlay_sets_network_block ... ok
+test h3_profile_switch_teardown ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

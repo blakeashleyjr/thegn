@@ -1,0 +1,241 @@
+Each test executes in its own process (required by suite HOME mutation safety comments).
+case=a_legitimate_user_ro_mount_under_home_survives_the_sealed_filter exit=0
+
+running 1 test
+test a_legitimate_user_ro_mount_under_home_survives_the_sealed_filter ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=a_worktree_that_is_home_itself_or_covers_secrets_is_refused exit=0
+
+running 1 test
+test a_worktree_that_is_home_itself_or_covers_secrets_is_refused ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=allowlist_binds_benign_dotfiles_and_nothing_secret exit=0
+
+running 1 test
+test allowlist_binds_benign_dotfiles_and_nothing_secret ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=allowlist_binds_files_only_and_new_credential_names_are_denied exit=0
+
+running 1 test
+test allowlist_binds_files_only_and_new_credential_names_are_denied ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=allowlist_never_binds_git_or_zsh_dirs_wholesale exit=0
+
+running 1 test
+test allowlist_never_binds_git_or_zsh_dirs_wholesale ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=bwrap_hardened_is_unchanged_no_tmpfs_home exit=0
+
+running 1 test
+test bwrap_hardened_is_unchanged_no_tmpfs_home ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=bwrap_omits_an_allowlist_mount_retargeted_into_a_secret_after_resolution exit=0
+
+running 1 test
+test bwrap_omits_an_allowlist_mount_retargeted_into_a_secret_after_resolution ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.01s
+
+
+
+case=bwrap_sealed_hides_home_behind_a_tmpfs_before_any_bind exit=0
+
+running 1 test
+test bwrap_sealed_hides_home_behind_a_tmpfs_before_any_bind ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.01s
+
+
+
+case=default_config_mounts_never_bring_gnupg_into_a_sealed_argv exit=0
+
+running 1 test
+test default_config_mounts_never_bring_gnupg_into_a_sealed_argv ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.02s
+
+
+
+case=home_view_and_gate_per_backend exit=0
+
+running 1 test
+test home_view_and_gate_per_backend ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=identity_and_agent_mounts_added_after_resolution_never_reach_a_sealed_argv exit=0
+
+running 1 test
+test identity_and_agent_mounts_added_after_resolution_never_reach_a_sealed_argv ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.01s
+
+
+
+case=mount_deny_follows_symlinks_on_host_and_dest exit=0
+
+running 1 test
+test mount_deny_follows_symlinks_on_host_and_dest ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=oci_mount_paths_with_unsafe_syntax_are_refused exit=0
+
+running 1 test
+test oci_mount_paths_with_unsafe_syntax_are_refused ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=only_the_managed_account_dir_is_exempt_from_the_deny_list exit=0
+
+running 1 test
+test only_the_managed_account_dir_is_exempt_from_the_deny_list ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=planned_view_separates_confidentiality_from_integrity exit=0
+
+running 1 test
+test planned_view_separates_confidentiality_from_integrity ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=real_bwrap_sealed_cannot_read_canaries_but_worktree_and_git_work exit=0
+
+running 1 test
+test real_bwrap_sealed_cannot_read_canaries_but_worktree_and_git_work ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.11s
+
+
+
+case=sealed_launch_refuses_compose_backed_specs exit=0
+
+running 1 test
+test sealed_launch_refuses_compose_backed_specs ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=sealed_systemd_allowlist_survives_auto_caches_off exit=0
+
+running 1 test
+test sealed_systemd_allowlist_survives_auto_caches_off ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.01s
+
+
+
+case=symlink_outside_approved_roots_is_rejected_but_home_dotfile_repo_is_not exit=0
+
+running 1 test
+test symlink_outside_approved_roots_is_rejected_but_home_dotfile_repo_is_not ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=symlinked_dir_that_is_an_ancestor_of_a_secret_is_rejected exit=0
+
+running 1 test
+test symlinked_dir_that_is_an_ancestor_of_a_secret_is_rejected ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=symlinked_entry_into_a_secret_dir_is_rejected exit=0
+
+running 1 test
+test symlinked_entry_into_a_secret_dir_is_rejected ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=systemd_hardened_keeps_readonly_home exit=0
+
+running 1 test
+test systemd_hardened_keeps_readonly_home ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=systemd_home_view_sees_covering_mounts_and_unprotected_homes exit=0
+
+running 1 test
+test systemd_home_view_sees_covering_mounts_and_unprotected_homes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=systemd_sealed_refuses_whitespace_or_colon_in_bind_paths exit=0
+
+running 1 test
+test systemd_sealed_refuses_whitespace_or_colon_in_bind_paths ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=systemd_sealed_with_a_home_outside_protecthome_roots_is_refused exit=0
+
+running 1 test
+test systemd_sealed_with_a_home_outside_protecthome_roots_is_refused ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=systemd_sealed_without_read_only_root_fails_closed exit=0
+
+running 1 test
+test systemd_sealed_without_read_only_root_fails_closed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+
+
+case=unusable_home_and_wsl_fail_the_sealed_gate exit=0
+
+running 1 test
+test unusable_home_and_wsl_fail_the_sealed_gate ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s

@@ -1,0 +1,5 @@
+wait_status=0
+request backend=apple profile=sealed network=none floor=off miss=degrade
+[38;2;240;131;186m✦[0m [38;2;240;198;116mthegn[0m sandbox backend 'apple' unavailable on Linux; trying the chain
+[38;2;240;131;186m✦[0m [38;2;240;198;116mthegn[0m sandbox: no usable backend in chain; running on the host (no kernel boundary)
+resolved=None (local host fallback or disabled)

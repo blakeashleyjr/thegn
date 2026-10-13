@@ -1,0 +1,4 @@
+exit=0
+floor=off miss=degrade result=Ok
+floor=shared-kernel miss=degrade result=Degrade(FloorMiss { floor: SharedKernel, actual: HostProcess, best_available: HostProcess })
+floor=shared-kernel miss=fail result=Fail(FloorMiss { floor: SharedKernel, actual: HostProcess, best_available: HostProcess })
