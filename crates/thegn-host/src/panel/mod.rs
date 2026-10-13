@@ -744,8 +744,10 @@ pub struct PanelData {
     pub unread_notifications: usize,
     /// Alert-priority unread count — drives the red ⚑ attention flag.
     pub alert_notifications: usize,
-    /// Full notification list (newest first, capped at 50) for the inbox section.
+    /// Full notification list: every unread row plus the newest 50 read rows.
     pub notifications: Vec<thegn_core::notification::Notification>,
+    /// Read rows beyond the 50-row inbox read window.
+    pub notifications_hidden_read: usize,
     /// Per-kind *effective* priority (`[notifications.priority]` overrides
     /// folded over the built-in defaults), snapshotted with the list so the
     /// render layer groups and counts rows by the same priority the badge
@@ -785,6 +787,14 @@ pub struct PanelData {
     pub toolchain: Option<crate::toolchain_ui::ToolchainStatus>,
 }
 
+/// Counts unread rows in hand by effective priority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NotificationCounts {
+    pub alert: usize,
+    pub notice: usize,
+    pub info: usize,
+}
+
 impl PanelData {
     /// The effective priority of a notification kind: the hydration-time
     /// snapshot of `[notifications.priority]` when present, else the built-in
@@ -798,6 +808,19 @@ impl PanelData {
             .get(kind.as_str())
             .copied()
             .unwrap_or_else(|| kind.default_priority())
+    }
+
+    /// Count unread notifications in hand by their effective priority.
+    pub fn notification_counts(&self) -> NotificationCounts {
+        let mut counts = NotificationCounts::default();
+        for row in self.notifications.iter().filter(|row| !row.read) {
+            match self.priority_of(row.kind) {
+                thegn_core::notification::Priority::Alert => counts.alert += 1,
+                thegn_core::notification::Priority::Notice => counts.notice += 1,
+                thegn_core::notification::Priority::Info => counts.info += 1,
+            }
+        }
+        counts
     }
 
     /// Mark the rows selected by `pick` read *in the model* and recount the
@@ -822,20 +845,9 @@ impl PanelData {
     /// in hand (the hydration path computes them over the full scoped set
     /// before capping the list; after a clear the two agree).
     fn recount_unread(&mut self) {
-        use thegn_core::notification::Priority;
-        let (mut alert, mut counted) = (0, 0);
-        for n in self.notifications.iter().filter(|n| !n.read) {
-            match self.priority_of(n.kind) {
-                Priority::Alert => {
-                    alert += 1;
-                    counted += 1;
-                }
-                Priority::Notice => counted += 1,
-                Priority::Info => {}
-            }
-        }
-        self.alert_notifications = alert;
-        self.unread_notifications = counted;
+        let counts = self.notification_counts();
+        self.alert_notifications = counts.alert;
+        self.unread_notifications = counts.alert + counts.notice;
     }
 }
 
