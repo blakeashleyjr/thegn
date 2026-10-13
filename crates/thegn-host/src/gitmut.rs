@@ -374,6 +374,19 @@ fn selection_of(indices: &[(usize, usize)]) -> thegn_core::patch::Selection {
     sel
 }
 
+fn touches_index(op: &GitOp) -> bool {
+    matches!(
+        op,
+        GitOp::StageLines { .. }
+            | GitOp::StageFile { .. }
+            | GitOp::IntentToAdd { .. }
+            | GitOp::StageAll
+            | GitOp::UnstageAll
+            | GitOp::Commit { .. }
+            | GitOp::AmendHead
+    )
+}
+
 /// Host-side guard for every line-level staging entry point. The same core
 /// validator used by the patch transform rejects a mode-160000 entry before a
 /// [`GitOp`] is queued, so the mutation worker never attempts `git apply` for a
@@ -403,6 +416,9 @@ fn record_mark(loc: &GitLoc) {
 
 /// Run one op to completion on the current (blocking) thread.
 pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
+    let label = op.label();
+    let jj_note = touches_index(&op)
+        && matches!(loc, GitLoc::Local(path) if thegn_core::jj::is_colocated(path));
     let opts = RebaseOpts { override_gpg };
     if op.rewrites_history() {
         record_mark(loc);
@@ -417,7 +433,7 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
         Ok(out) => GitOpResult::Stopped(out),
         Err(e) => GitOpResult::Err(first_line(&e)),
     };
-    match op {
+    let result = match op {
         GitOp::StageLines {
             path,
             diff,
@@ -659,6 +675,13 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
                 timeout_secs,
             )
         }
+    };
+    match result {
+        GitOpResult::Ok(note) if jj_note => GitOpResult::Ok(Some(format!(
+            "{} — jj ignores the git index",
+            note.unwrap_or_else(|| format!("{label} done"))
+        ))),
+        other => other,
     }
 }
 
@@ -803,7 +826,60 @@ mod tests {
             GitOpResult::Err(msg) => assert!(!msg.contains('\n')),
             other => panic!("{other:?}"),
         }
-        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::debug!(target: "thegn::gitmut::tests", %error, "failed to remove jj mutation test repo");
+        }
+    }
+
+    #[test]
+    fn index_mutations_report_jj_colocation_note() {
+        let dir = tmp_repo("jj-note");
+        std::fs::create_dir(dir.join(".jj")).unwrap();
+        let loc = GitLoc::Local(dir.clone());
+        std::fs::write(dir.join("f.txt"), "two\n").unwrap();
+        match execute(GitOp::StageAll, &loc, false) {
+            GitOpResult::Ok(Some(note)) => assert!(note.contains("jj ignores the git index")),
+            other => panic!("{other:?}"),
+        }
+        match execute(
+            GitOp::Commit {
+                message: "m".into(),
+                no_verify: false,
+                sign: Some(false),
+            },
+            &loc,
+            false,
+        ) {
+            GitOpResult::Ok(Some(note)) => assert!(note.contains("jj ignores the git index")),
+            other => panic!("{other:?}"),
+        }
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::debug!(target: "thegn::gitmut::tests", %error, "failed to remove jj mutation test repo");
+        }
+    }
+
+    #[test]
+    fn index_mutations_only_note_a_jj_directory() {
+        let plain = tmp_repo("jj-note-plain");
+        std::fs::write(plain.join("f.txt"), "two\n").unwrap();
+        match execute(GitOp::StageAll, &GitLoc::Local(plain.clone()), false) {
+            GitOpResult::Ok(None) => {}
+            other => panic!("{other:?}"),
+        }
+
+        let jj_file = tmp_repo("jj-note-file");
+        std::fs::write(jj_file.join(".jj"), "not a directory").unwrap();
+        std::fs::write(jj_file.join("f.txt"), "two\n").unwrap();
+        match execute(GitOp::StageAll, &GitLoc::Local(jj_file.clone()), false) {
+            GitOpResult::Ok(None) => {}
+            other => panic!("{other:?}"),
+        }
+        if let Err(error) = std::fs::remove_dir_all(&plain) {
+            tracing::debug!(target: "thegn::gitmut::tests", %error, "failed to remove plain git mutation test repo");
+        }
+        if let Err(error) = std::fs::remove_dir_all(&jj_file) {
+            tracing::debug!(target: "thegn::gitmut::tests", %error, "failed to remove jj-file mutation test repo");
+        }
     }
 
     #[test]
