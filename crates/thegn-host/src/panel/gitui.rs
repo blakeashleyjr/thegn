@@ -2062,9 +2062,10 @@ mod tests {
             git,
             ..Default::default()
         };
-        assert_ne!(
-            git_key(&KeyCode::Enter, Modifiers::NONE, &ui),
-            Some(GitMsg::Drill)
+        assert!(
+            context_keys(ui.git.focus)
+                .iter()
+                .any(|entry| entry.chord == "enter" && entry.label == "files")
         );
 
         let mut git = GitUi {
