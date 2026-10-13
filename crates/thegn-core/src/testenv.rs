@@ -26,22 +26,34 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub fn ambient_state_roots() -> &'static [std::path::PathBuf] {
     static ROOTS: std::sync::OnceLock<Vec<std::path::PathBuf>> = std::sync::OnceLock::new();
     ROOTS.get_or_init(|| {
-        let mut roots = Vec::new();
-        if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-            roots.push(std::path::PathBuf::from(home).join(".local/state"));
-        }
-
-        if std::env::var_os("NEXTEST").is_none()
-            && let Some(state_home) =
-                std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty())
-        {
-            let state_home = std::path::PathBuf::from(state_home);
-            if !state_home.starts_with(std::env::temp_dir()) {
-                roots.push(state_home);
-            }
-        }
-        roots
+        ambient_roots_from(
+            std::env::var_os("HOME").as_deref(),
+            std::env::var_os("XDG_STATE_HOME").as_deref(),
+            std::env::var_os("NEXTEST").is_some(),
+            &std::env::temp_dir(),
+        )
     })
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn ambient_roots_from(
+    home: Option<&std::ffi::OsStr>,
+    state_home: Option<&std::ffi::OsStr>,
+    nextest: bool,
+    temp: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = home.filter(|value| !value.is_empty()) {
+        roots.push(std::path::PathBuf::from(home).join(".local/state"));
+    }
+
+    if !nextest && let Some(state_home) = state_home.filter(|value| !value.is_empty()) {
+        let state_home = std::path::PathBuf::from(state_home);
+        if !state_home.starts_with(temp) {
+            roots.push(state_home);
+        }
+    }
+    roots
 }
 
 /// Whether a state write would target the current HOME-derived root or one of
@@ -127,8 +139,61 @@ impl Drop for EnvGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::is_real_state_path;
+    use super::{ambient_roots_from, is_real_state_path};
+    use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn ambient_roots_include_home_state_only() {
+        assert_eq!(
+            ambient_roots_from(
+                Some(OsStr::new("/home/user")),
+                None,
+                false,
+                Path::new("/tmp")
+            ),
+            [PathBuf::from("/home/user/.local/state")]
+        );
+    }
+
+    #[test]
+    fn ambient_roots_include_inherited_non_temp_xdg_state() {
+        assert_eq!(
+            ambient_roots_from(
+                None,
+                Some(OsStr::new("/var/state")),
+                false,
+                Path::new("/tmp")
+            ),
+            [PathBuf::from("/var/state")]
+        );
+    }
+
+    #[test]
+    fn ambient_roots_exclude_xdg_state_under_temp() {
+        assert!(
+            ambient_roots_from(
+                None,
+                Some(OsStr::new("/tmp/test-state")),
+                false,
+                Path::new("/tmp")
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn ambient_roots_exclude_xdg_state_under_nextest() {
+        assert!(
+            ambient_roots_from(
+                None,
+                Some(OsStr::new("/var/state")),
+                true,
+                Path::new("/tmp")
+            )
+            .is_empty()
+        );
+    }
 
     #[test]
     fn ambient_xdg_state_path_is_real_even_with_another_home() {
