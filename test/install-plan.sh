@@ -5,6 +5,18 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+# install.sh locates the staged release binary relative to its own path. Run it
+# from a throwaway repo layout so every build artifact it reads or writes belongs
+# to this test, never to the checkout running the test.
+install_repo="$tmp/repo"
+mkdir -p "$install_repo/target/release"
+cp "$repo/install.sh" "$install_repo/install.sh"
+cp -R "$repo/config" "$install_repo/config"
+mkdir -p "$install_repo/packaging"
+cp -R "$repo/packaging/macos/." "$install_repo/packaging/macos/"
+printf '#!/usr/bin/env sh\nexit 0\n' >"$install_repo/target/release/thegn"
+chmod 0755 "$install_repo/target/release/thegn"
+
 # Launcher integration is per-platform, because the registry is: a freedesktop
 # `.desktop` entry on Linux/BSD, a generated `thegn.app` bundle on macOS, and
 # nothing on Windows. Mirror install.sh's predicates EXACTLY (keep these in
@@ -20,8 +32,8 @@ Darwin)
 MINGW* | MSYS* | CYGWIN*) freedesktop=0 ;;
 esac
 
-out="$("$repo"/install.sh --dry-run "$tmp/bin")"
-[[ $out == *"$tmp/bin/thegn <- copy of $repo/target/release/thegn"* ]] || {
+out="$("$install_repo"/install.sh --dry-run "$tmp/bin")"
+[[ $out == *"$tmp/bin/thegn <- copy of $install_repo/target/release/thegn"* ]] || {
   echo "dry-run did not plan the thegn binary copy" >&2
   echo "$out" >&2
   exit 1
@@ -31,7 +43,7 @@ out="$("$repo"/install.sh --dry-run "$tmp/bin")"
   echo "$out" >&2
   exit 1
 }
-[[ $out == *"$tmp/bin/tg wrapper -> $tmp/bin/tg-tui (current terminal); tg -s|--standalone -> alacritty --config-file $repo/config/alacritty.toml -e $tmp/bin/tg-tui"* ]] || {
+[[ $out == *"$tmp/bin/tg wrapper -> $tmp/bin/tg-tui (current terminal); tg -s|--standalone -> alacritty --config-file $install_repo/config/alacritty.toml -e $tmp/bin/tg-tui"* ]] || {
   echo "dry-run did not plan tg current-terminal + alacritty standalone wrapper" >&2
   echo "$out" >&2
   exit 1
@@ -85,27 +97,15 @@ printf '%s\n' "$@" >"${TG_ALACRITTY_LOG:?}"
 EOF
 chmod 0755 "$fakebin/alacritty"
 
-# install.sh copies the built binary, so it must actually exist. The fake cargo
-# above builds nothing — stage a stub where the real build would land. (A prior
-# revision symlinked instead, so a missing binary silently produced a dangling
-# link and the test still passed.)
-staged_release=""
-release_backup=""
-if [[ ! -f $repo/target/release/thegn ]]; then
-  mkdir -p "$repo/target/release"
-  printf '#!/usr/bin/env sh\nexit 0\n' >"$repo/target/release/thegn"
-  chmod 0755 "$repo/target/release/thegn"
-  staged_release="$repo/target/release/thegn"
-fi
+# install.sh copies the built binary, so the stub above lives at the expected
+# path in the throwaway repo. The fake cargo builds nothing.
 cleanup() {
-  [[ -n $release_backup ]] && cp "$release_backup" "$repo/target/release/thegn"
   rm -rf "$tmp"
-  [[ -n $staged_release ]] && rm -f "$staged_release"
   return 0
 }
 trap cleanup EXIT
 
-install_out="$(PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" "$repo/install.sh" "$tmp/bin")"
+install_out="$(PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" "$install_repo/install.sh" "$tmp/bin")"
 # A COPY, not a symlink: the install must survive `cargo clean` / a moved repo.
 [[ -f $tmp/bin/thegn && ! -L $tmp/bin/thegn && -x $tmp/bin/thegn ]] || {
   echo "install did not copy the release binary to bindir/thegn" >&2
@@ -134,14 +134,14 @@ config_before="$(<"$tmp/config/thegn/config.toml")"
   exit 1
 }
 # tg -s / --standalone launches the dedicated alacritty profile.
-[[ $(<"$tmp/bin/tg") == *"exec alacritty --config-file $repo/config/alacritty.toml -e $tmp/bin/tg-tui"* ]] || {
+[[ $(<"$tmp/bin/tg") == *"exec alacritty --config-file $install_repo/config/alacritty.toml -e $tmp/bin/tg-tui"* ]] || {
   echo "tg --standalone should launch the dedicated alacritty profile" >&2
   sed -n '1,120p' "$tmp/bin/tg" >&2
   exit 1
 }
 TG_ALACRITTY_LOG="$tmp/alacritty.args" PATH="$fakebin:$PATH" "$tmp/bin/tg" --standalone
 alacritty_args="$(<"$tmp/alacritty.args")"
-[[ $alacritty_args == *$'--config-file\n'"$repo/config/alacritty.toml"$'\n-e\n'"$tmp/bin/tg-tui"* ]] || {
+[[ $alacritty_args == *$'--config-file\n'"$install_repo/config/alacritty.toml"$'\n-e\n'"$tmp/bin/tg-tui"* ]] || {
   echo "tg --standalone did not invoke alacritty with the bundled config and tg-tui" >&2
   printf '%s\n' "$alacritty_args" >&2
   exit 1
@@ -225,7 +225,7 @@ mkdir -p "$foreign_bin"
 printf '#!/bin/sh\necho other\n' >"$foreign_bin/tg"
 foreign_tg_before="$(<"$foreign_bin/tg")"
 if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
-  "$repo/install.sh" "$foreign_bin" >"$tmp/foreign.out" 2>&1; then
+  "$install_repo/install.sh" "$foreign_bin" >"$tmp/foreign.out" 2>&1; then
   echo "install accepted a foreign tg collision" >&2
   exit 1
 fi
@@ -234,7 +234,7 @@ fi
   exit 1
 }
 if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
-  "$repo/install.sh" --dry-run "$foreign_bin" >"$tmp/foreign-dry.out" 2>&1; then
+  "$install_repo/install.sh" --dry-run "$foreign_bin" >"$tmp/foreign-dry.out" 2>&1; then
   echo "dry-run accepted a foreign tg collision" >&2
   exit 1
 fi
@@ -249,7 +249,7 @@ symlink_bin="$tmp/symlink-bin"
 mkdir -p "$symlink_bin"
 ln -s "$tmp/outside" "$symlink_bin/tg-tui"
 if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
-  "$repo/install.sh" "$symlink_bin" >"$tmp/symlink.out" 2>&1; then
+  "$install_repo/install.sh" "$symlink_bin" >"$tmp/symlink.out" 2>&1; then
   echo "install accepted a tg-tui symlink collision" >&2
   exit 1
 fi
@@ -262,7 +262,7 @@ foreign_binary_bin="$tmp/foreign-binary-bin"
 mkdir -p "$foreign_binary_bin"
 printf 'foreign binary bytes\n' >"$foreign_binary_bin/thegn"
 if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
-  "$repo/install.sh" "$foreign_binary_bin" >"$tmp/foreign-binary.out" 2>&1; then
+  "$install_repo/install.sh" "$foreign_binary_bin" >"$tmp/foreign-binary.out" 2>&1; then
   echo "install accepted a foreign thegn binary" >&2
   exit 1
 fi
@@ -275,7 +275,7 @@ if ((freedesktop)); then
   for unsafe_suffix in 'with space' 'with%field'; do
     unsafe_bin="$tmp/$unsafe_suffix"
     if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
-      "$repo/install.sh" --dry-run "$unsafe_bin" >"$tmp/unsafe-path.out" 2>&1; then
+      "$install_repo/install.sh" --dry-run "$unsafe_bin" >"$tmp/unsafe-path.out" 2>&1; then
       echo "dry-run accepted an unsafe freedesktop bindir: $unsafe_bin" >&2
       exit 1
     fi
@@ -291,7 +291,7 @@ if ((freedesktop)); then
   mkdir -p "$collision_bin" "$collision_data/applications"
   printf 'foreign desktop\n' >"$collision_data/applications/thegn.desktop"
   if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$collision_data" \
-    "$repo/install.sh" "$collision_bin" >"$tmp/desktop-collision.out" 2>&1; then
+    "$install_repo/install.sh" "$collision_bin" >"$tmp/desktop-collision.out" 2>&1; then
     echo "install accepted a foreign desktop entry" >&2
     exit 1
   fi
@@ -305,7 +305,7 @@ if ((freedesktop)); then
   mkdir -p "$collision_bin" "$collision_data/icons/hicolor/scalable/apps"
   printf 'foreign icon\n' >"$collision_data/icons/hicolor/scalable/apps/thegn.svg"
   if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$collision_data" \
-    "$repo/install.sh" "$collision_bin" >"$tmp/icon-collision.out" 2>&1; then
+    "$install_repo/install.sh" "$collision_bin" >"$tmp/icon-collision.out" 2>&1; then
     echo "install accepted a foreign icon" >&2
     exit 1
   fi
@@ -325,7 +325,7 @@ config_link_home="$tmp/config-link-home"
 mkdir -p "$config_link_home/thegn" "$tmp/config-link-bin"
 ln -s "$tmp/config-link-target" "$config_link_home/thegn/config.toml"
 if PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$config_link_home" XDG_DATA_HOME="$tmp/config-link-data" \
-  "$repo/install.sh" "$tmp/config-link-bin" >"$tmp/config-link.out" 2>&1; then
+  "$install_repo/install.sh" "$tmp/config-link-bin" >"$tmp/config-link.out" 2>&1; then
   echo "install accepted a config symlink collision" >&2
   exit 1
 fi
@@ -336,7 +336,7 @@ fi
 
 # The marker permits an upgrade over artifacts produced by this installer.
 PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
-  "$repo/install.sh" "$tmp/bin" >"$tmp/reinstall.out"
+  "$install_repo/install.sh" "$tmp/bin" >"$tmp/reinstall.out"
 [[ $(<"$tmp/bin/tg") == *'# generated by thegn install.sh'* && $(<"$tmp/bin/tg-tui") == *'# generated by thegn install.sh'* ]] || {
   echo "reinstall did not retain installer ownership markers" >&2
   exit 1
@@ -344,11 +344,9 @@ PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HO
 
 # Existing installation identity comes from its wrapper, not a possibly stale
 # staged release binary (which may differ after a build or target reclaim).
-release_backup="$tmp/release-before-reinstall"
-cp "$repo/target/release/thegn" "$release_backup"
-printf 'changed staged release bytes\n' >"$repo/target/release/thegn"
+printf 'changed staged release bytes\n' >"$install_repo/target/release/thegn"
 if ! PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
-  "$repo/install.sh" "$tmp/bin" >"$tmp/changed-release-reinstall.out" 2>&1; then
+  "$install_repo/install.sh" "$tmp/bin" >"$tmp/changed-release-reinstall.out" 2>&1; then
   echo "reinstall refused changed staged release bytes" >&2
   cat "$tmp/changed-release-reinstall.out" >&2
   exit 1
@@ -371,7 +369,7 @@ cat >"$mac_test_bin/thegn" <<'EOF'
 printf 'thegn 1.2.3\n'
 EOF
 chmod 0755 "$mac_test_bin/thegn"
-make_app="$repo/packaging/macos/make-app.sh"
+make_app="$install_repo/packaging/macos/make-app.sh"
 name_status=0
 PATH="$mac_test_bin:$PATH" HOME="$tmp/home" "$make_app" --bin "$mac_test_bin/thegn" --dest "$tmp/mac-apps" --name ../escaped --dry-run >"$tmp/name.out" 2>&1 || name_status=$?
 if ((name_status != 2)); then
