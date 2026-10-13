@@ -104,6 +104,7 @@ daemon.enabled
 daemon.idle_exit_secs
 daemon.lease_grace_secs
 daemon.socket
+daemon.stream_gap_window_secs
 # diagnostics.crash_sink — reserved provider-seam kind (Sentry-protocol crash
 # forwarding); not implemented, rejected at config-validate, so no runtime knob.
 diagnostics.crash_sink
