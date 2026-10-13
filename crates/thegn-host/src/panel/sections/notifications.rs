@@ -244,7 +244,8 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         // The cursor's secondary row wraps the complete message; other rows
         // retain the compact worktree and kind metadata.
         let secondary = if i == cursor {
-            wrap_text(&n.message, ctx.cols.saturating_sub(2))
+            let message = display_cell(&n.message);
+            wrap_text(&message, ctx.cols.saturating_sub(2))
                 .into_iter()
                 .map(|part| Line::segs(vec![sp(2), seg(t(), part)]))
                 .collect::<Vec<_>>()
@@ -430,7 +431,8 @@ fn notification_detail_segs(n: &Notification, w: usize) -> Vec<Vec<Seg>> {
     out.push(vec![seg(f(), n.kind.label()), seg(g(), read_tag)]);
 
     // Message
-    for chunk in wrap_text(&n.message, w) {
+    let message = display_cell(&n.message);
+    for chunk in wrap_text(&message, w) {
         out.push(vec![seg(t(), chunk)]);
     }
 
@@ -508,6 +510,39 @@ mod tests {
             assert!(!text.contains(ch), "rendered text contains {ch:?}");
         }
         assert!(text.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn notification_half_wraps_a_sanitized_cursor_message() {
+        let mut model = crate::chrome::FrameModel::default();
+        model.panel.notifications = vec![test_notification(
+            NotificationKind::AgentFailed,
+            false,
+            "first\r\nsecond\u{202e}\u{200b}",
+        )];
+        let ui = crate::panel::PanelUi {
+            open: Section::Notifications,
+            width: crate::layout::PanelWidth::Half,
+            notifications_cursor: 0,
+            ..Default::default()
+        };
+        let rows = content(&SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 75,
+            rows: 20,
+        });
+
+        for row in &rows {
+            if let Line::Segs(segs) = &row.line {
+                for part in segs {
+                    for ch in ['\r', '\n', '\u{202e}', '\u{200b}'] {
+                        assert!(!part.text.contains(ch), "rendered text contains {ch:?}");
+                    }
+                }
+            }
+        }
+        assert!(rendered_text(&rows).contains("first��second��"));
     }
 
     #[test]
