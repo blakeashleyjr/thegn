@@ -2081,7 +2081,6 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
 /// Ensure any persistent state exists (OCI: a keep-alive container we `exec`
 /// into). No-op for host-toolchain backends and `none`.
 pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
-    admit_volumes(spec)?;
     let spec = &*launchable(spec).map_err(anyhow::Error::new)?;
     if !spec.backend.is_oci() {
         return Ok(());
