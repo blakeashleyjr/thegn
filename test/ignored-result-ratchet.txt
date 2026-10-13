@@ -164,7 +164,6 @@ crates/thegn-host/src/cmd/open.rs
 crates/thegn-host/src/cmd/pr_queue.rs
 crates/thegn-host/src/cmd/pr.rs
 crates/thegn-host/src/cmd/session.rs
-crates/thegn-host/src/cmd/share.rs
 crates/thegn-host/src/cmd/wt.rs
 # THE-83 (merged to main while this gate was red): both ignores are deliberate —
 # an idempotent `OnceLock` config-source install and a discarded clamp report on

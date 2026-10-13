@@ -39,6 +39,16 @@ fn merge_queue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeQueueRow> {
     })
 }
 
+/// SQLite stores share generations as signed integers; preserve all u64 bits.
+fn encode_share_generation(generation: u64) -> i64 {
+    generation as i64
+}
+
+/// SQLite stores share generations as signed integers; this is a bit cast, not a range check.
+pub(crate) fn decode_share_generation(generation: i64) -> u64 {
+    generation as u64
+}
+
 // Caller holds a read snapshot or a write transaction for both SELECTs.
 fn merge_outcome_observation(conn: &Connection, worktree: &str) -> Result<MergeOutcomeObservation> {
     let registry = conn
@@ -220,24 +230,27 @@ impl WorktreeAuxStore for Db {
         &self,
         worktree: &str,
         local_port: u16,
+        generation: u64,
         provider: &str,
         public_url: Option<&str>,
         state: &str,
     ) -> Result<()> {
         self.conn().execute(
-            "INSERT INTO shares(worktree,local_port,provider,public_url,state,created_at)
-             VALUES(?1,?2,?3,?4,?5,?6)
+            "INSERT INTO shares(worktree,local_port,provider,public_url,state,created_at,generation)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)
              ON CONFLICT(worktree,local_port) DO UPDATE SET
                provider=excluded.provider,
                public_url=excluded.public_url,
-               state=excluded.state",
+               state=excluded.state,
+               generation=excluded.generation",
             params![
                 worktree,
                 local_port as i64,
                 provider,
                 public_url,
                 state,
-                util::now()
+                util::now(),
+                encode_share_generation(generation)
             ],
         )?;
         Ok(())
@@ -246,7 +259,7 @@ impl WorktreeAuxStore for Db {
     /// All persisted shares, newest first (restore + panel listing).
     fn list_shares(&self) -> Result<Vec<ShareRow>> {
         let mut stmt = self.conn().prepare(
-            "SELECT worktree,local_port,provider,public_url,state,created_at \
+            "SELECT worktree,local_port,provider,public_url,state,created_at,generation \
              FROM shares ORDER BY created_at DESC",
         )?;
         let rows = stmt
@@ -255,7 +268,39 @@ impl WorktreeAuxStore for Db {
         Ok(rows)
     }
 
-    /// Remove the share record for `(worktree, local_port)`.
+    fn delete_share_generation(
+        &self,
+        worktree: &str,
+        local_port: u16,
+        generation: u64,
+    ) -> Result<bool> {
+        let changed = self.conn().execute(
+            "DELETE FROM shares WHERE worktree=?1 AND local_port=?2 AND (generation=?3 OR generation=0)",
+            params![worktree, local_port as i64, encode_share_generation(generation)],
+        )?;
+        Ok(changed > 0)
+    }
+
+    fn rebind_share_generation(
+        &self,
+        worktree: &str,
+        local_port: u16,
+        from: u64,
+        to: u64,
+    ) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE shares SET generation=?4 WHERE worktree=?1 AND local_port=?2 AND generation=?3",
+            params![
+                worktree,
+                local_port as i64,
+                encode_share_generation(from),
+                encode_share_generation(to)
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Unconditionally remove the share record; reserved for explicit CLI `share stop`.
     fn delete_share(&self, worktree: &str, local_port: u16) -> Result<()> {
         self.conn().execute(
             "DELETE FROM shares WHERE worktree=?1 AND local_port=?2",
