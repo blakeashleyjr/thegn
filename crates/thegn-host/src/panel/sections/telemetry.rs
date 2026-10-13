@@ -653,8 +653,11 @@ mod tests {
             cols: 80,
             rows: 12,
         };
-        let viewport = super::super::scroll_viewport(&ui, 12);
-        assert_eq!(extent.max, row_count(&ctx).saturating_sub(viewport - 1));
+        let viewport = super::super::scroll_viewport(&model, &ui, 80, 12);
+        assert_eq!(
+            extent.max,
+            row_count(&ctx).saturating_sub(viewport.saturating_sub(1))
+        );
     }
 
     #[test]
