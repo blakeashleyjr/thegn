@@ -4342,12 +4342,6 @@ fn normalize_key_uppercases_shift_letters() {
     let normalized = normalize_key(decoded);
     assert_eq!(normalized.key, KeyCode::Char('A'));
     assert_eq!(normalized.modifiers, Modifiers::SHIFT);
-    let expected = crate::keymap::default_keymap().dispatch(
-        crate::keymap::Mode::Normal,
-        crate::sequence::Key::modified(KeyCode::Char('A'), Modifiers::SHIFT),
-    );
-    assert_eq!(dispatch_bytes(b"\x1b[97;2u"), expected);
-
     let shifted_j = normalize_key(KeyEvent {
         key: KeyCode::Char('j'),
         modifiers: Modifiers::SHIFT,

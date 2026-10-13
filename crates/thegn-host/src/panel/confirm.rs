@@ -2,6 +2,7 @@
 
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use crate::panel::Section;
 
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
@@ -30,12 +31,14 @@ impl TwoPress {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuardKind {
     TwoPress,
     Menu(&'static str),
 }
 
+#[cfg(test)]
 pub const GUARDED: &[(Section, char, GuardKind)] = &[
     (Section::PrQueue, 'c', GuardKind::TwoPress),
     (Section::MergeQueue, 'c', GuardKind::TwoPress),

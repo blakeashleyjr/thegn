@@ -37,6 +37,7 @@ pub struct SectionKey {
     /// Display chord for the hint strip.
     pub chord: &'static str,
     pub label: &'static str,
+    #[cfg_attr(not(test), allow(dead_code))] // read by the destructive_keys_are_guarded ratchet
     pub destructive: bool,
 }
 
@@ -439,7 +440,6 @@ mod tests {
             ),
             (Section::Logs, include_str!("sections/logs.rs")),
             (Section::MergeQueue, include_str!("sections/merge_queue.rs")),
-            (Section::PrQueue, include_str!("sections/pr_queue.rs")),
             (Section::Across, include_str!("sections/across.rs")),
             (Section::Ci, include_str!("sections/ci.rs")),
             (Section::Hosts, include_str!("sections/hosts.rs")),
@@ -647,6 +647,7 @@ mod tests {
             ),
             (Section::Logs, include_str!("sections/logs.rs")),
             (Section::MergeQueue, include_str!("sections/merge_queue.rs")),
+            (Section::PrQueue, include_str!("sections/pr_queue.rs")),
             (Section::Across, include_str!("sections/across.rs")),
             (Section::Ci, include_str!("sections/ci.rs")),
             (Section::Hosts, include_str!("sections/hosts.rs")),
