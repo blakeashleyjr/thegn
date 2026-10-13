@@ -646,6 +646,55 @@ pub fn confirm_menu(
     .with_body(body)
 }
 
+/// Choose a merge method after reviewing the cached blockers.
+pub fn pr_merge_menu(number: u64, blockers: &[String]) -> MenuOverlay {
+    let danger = !blockers.is_empty();
+    let mut items = vec![
+        item(
+            Some('s'),
+            "squash (default)",
+            MenuChoice::Confirm {
+                tag: "pr-merge",
+                arg: "squash".into(),
+            },
+        ),
+        item(
+            Some('m'),
+            "merge commit",
+            MenuChoice::Confirm {
+                tag: "pr-merge",
+                arg: "merge".into(),
+            },
+        ),
+        item(
+            Some('r'),
+            "rebase",
+            MenuChoice::Confirm {
+                tag: "pr-merge",
+                arg: "rebase".into(),
+            },
+        ),
+        item(Some('n'), "cancel", MenuChoice::Dismiss),
+    ];
+    if danger {
+        for choice in items.iter_mut().take(3) {
+            choice.danger = true;
+        }
+    }
+    let body = if blockers.is_empty() {
+        "no known blockers".to_string()
+    } else {
+        format!("blockers: {}", blockers.join(" · "))
+    };
+    MenuOverlay::new_with_default(
+        MenuKindTag::Confirm,
+        format!("merge PR #{number}?"),
+        items,
+        0,
+    )
+    .with_body(body)
+}
+
 /// The System ▸ Hosts action menu (opened with `m` on a host row): a
 /// discoverable list mirroring the per-key accelerators, plus remove. Every
 /// item resolves to a `Confirm { tag, arg: host_id }` routed by
@@ -2130,5 +2179,27 @@ mod tests {
                 rows: 3,
             },
         ); // open_layer refuses; must not panic
+    }
+
+    #[test]
+    fn pr_merge_menu_defaults_to_squash_and_offers_rebase() {
+        let mut menu = pr_merge_menu(7, &[]);
+        assert!(matches!(
+            menu.handle_key(&KeyCode::Enter, NONE),
+            MenuOutcome::Pick(MenuChoice::Confirm { tag: "pr-merge", arg }) if arg == "squash"
+        ));
+        let mut menu = pr_merge_menu(7, &[]);
+        assert!(matches!(
+            menu.handle_key(&KeyCode::Char('r'), NONE),
+            MenuOutcome::Pick(MenuChoice::Confirm { tag: "pr-merge", arg }) if arg == "rebase"
+        ));
+        let blocked = pr_merge_menu(7, &["unit tests failing".into()]);
+        let body = blocked.body.as_deref().unwrap_or_default();
+        assert!(body.contains("unit tests failing"));
+        assert!(
+            !body.contains('\n'),
+            "menu body must occupy one row: {body:?}"
+        );
+        assert!(blocked.items().iter().take(3).all(|item| item.danger));
     }
 }

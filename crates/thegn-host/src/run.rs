@@ -402,11 +402,9 @@ fn kick_git_docs_fetch(
         let now = thegn_core::util::now();
         let epochs = git.commit_times(&loc, WEEKS).unwrap_or_default();
         let data = GitDocs {
-            heat: thegn_core::gitviz::heat_grid(&epochs, now, WEEKS),
             weekly: thegn_core::gitviz::weekly_counts(&epochs, now, WEEKS),
             log: git.log_graph(&loc, 40).unwrap_or_default(),
             total: epochs.len() as u32,
-            head_branch: git.current_branch(&loc).unwrap_or_default(),
         };
         if tx.send((generation, DocsPayload::Git(data))).is_ok() {
             let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
@@ -17498,6 +17496,16 @@ async fn event_loop<T: Terminal>(
                                 dirty = true;
                                 continue;
                             }
+                            if crate::actions::handle_pr_menu_pick(
+                                &choice,
+                                &session,
+                                &refresh_tx,
+                                &waker,
+                                &mut model,
+                            ) {
+                                dirty = true;
+                                continue;
+                            }
                             // Sandbox-halt/ask modal `[r] retry` / `[h] run on host`.
                             {
                                 let active_wt = active_cwd(&session);
@@ -20177,10 +20185,16 @@ async fn event_loop<T: Terminal>(
                         (Section::Pr, KeyCode::Char(c @ ('M' | 'A' | 'c' | 'r' | 'o'))) => {
                             crate::actions::panel_pr_action_key(
                                 c,
-                                &mut model,
-                                &session,
-                                &refresh_tx,
-                                &waker,
+                                &mut crate::actions::PanelPrActionCtx {
+                                    model: &mut model,
+                                    session: &session,
+                                    refresh_tx: &refresh_tx,
+                                    waker: &waker,
+                                    active_menu: &mut active_menu,
+                                    pr_view: &mut pr_view,
+                                    pr_view_gen: &mut pr_view_gen,
+                                    pr_view_tx: &pr_view_tx,
+                                },
                             )
                         }
                         // -- tests: run / discover (capped, single-flight) ---

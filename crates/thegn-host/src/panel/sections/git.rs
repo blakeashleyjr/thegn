@@ -1,21 +1,18 @@
 //! The git section: PR/checks/review/log (Normal), plus issues and a
-//! velocity strip (Half), and the full-width heat calendar · velocity · log
-//! layout (Full — the former git overlay).
+//! velocity strip (Half), and a two-column PR page (Full).
 
+use crate::seg::{Line, Seg, seg, sp};
 use thegn_core::theme::Hue;
 use thegn_core::viz;
 
-use crate::panel::docs::GitDocs;
-use crate::seg::{Line, Seg, Tok, seg, sp};
-
 use super::{
     PanelHit, PanelRow, Section, SectionCtx, ac, d, f, g, g2, g3, hint_row, hue, pr_state_hue,
-    spinner_row, two_col, visible_threads,
+    visible_threads,
 };
 
 pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     if ctx.full() {
-        return full(ctx);
+        return full_pr(ctx);
     }
     list(ctx)
 }
@@ -23,7 +20,26 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
 /// Normal/Half: PR header, checks, review threads, log; Half adds issues and
 /// a 12-week velocity strip from the fetched git docs.
 fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
-    let (data, deep) = (&ctx.model.panel, ctx.deep());
+    let mut rows = header_and_checks(ctx);
+    rows.extend(threads_and_open_prs(ctx));
+    rows.extend(log_issues_velocity(ctx));
+    rows.push(PanelRow::blank());
+    rows.push(if ctx.model.panel.pr.is_some() {
+        hint_row(&[
+            ("M", "merge"),
+            ("A", "approve"),
+            ("c", "comment"),
+            ("r", "rerun"),
+            ("o", "browser"),
+        ])
+    } else {
+        hint_row(&[("c", "create PR")])
+    });
+    rows
+}
+
+fn header_and_checks(ctx: &SectionCtx) -> Vec<PanelRow> {
+    let data = &ctx.model.panel;
     let mut rows: Vec<PanelRow> = Vec::new();
     match &data.pr {
         Some(pr) => {
@@ -100,86 +116,6 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
                 }
                 rows.push(PanelRow::blank());
             }
-
-            // REVIEW — decision + unresolved threads.
-            let unresolved = data.threads.iter().filter(|t| !t.resolved).count();
-            let top_level = data.review_snapshot.as_ref().map_or(0, |snapshot| {
-                snapshot.conversation.comments.len()
-                    + snapshot
-                        .conversation
-                        .reviews
-                        .iter()
-                        .filter(|review| !review.body.trim().is_empty())
-                        .count()
-            });
-            let mut per_file: Vec<(String, usize)> = Vec::new();
-            for thread in data.threads.iter().filter(|thread| !thread.resolved) {
-                if let Some((_, count)) = per_file.iter_mut().find(|(path, _)| *path == thread.path)
-                {
-                    *count += 1;
-                } else {
-                    per_file.push((thread.path.clone(), 1));
-                }
-            }
-            if !data.threads.is_empty() || pr.review_decision.is_some() || top_level > 0 {
-                let decision = pr
-                    .review_decision
-                    .as_deref()
-                    .unwrap_or("REVIEW_REQUIRED")
-                    .to_lowercase()
-                    .replace('_', " ");
-                let mut l = vec![
-                    seg(g2(), "REVIEW").bold(),
-                    seg(g(), format!("  {decision}")),
-                ];
-                if unresolved > 0 {
-                    l.push(seg(
-                        g(),
-                        format!(" {} ", crate::caps::active_glyphs().middot),
-                    ));
-                    l.push(seg(hue(Hue::Amber), format!("⊘{unresolved} unresolved")));
-                }
-                if top_level > 0 {
-                    l.push(seg(g(), " · "));
-                    l.push(seg(g(), format!("{top_level} top-level")));
-                }
-                rows.push(PanelRow::plain(Line::segs(l)));
-                if !per_file.is_empty() {
-                    rows.push(PanelRow::plain(Line::segs(vec![
-                        seg(g2(), "files: "),
-                        seg(
-                            g(),
-                            per_file
-                                .iter()
-                                .take(6)
-                                .map(|(path, count)| format!("{path} x{count}"))
-                                .collect::<Vec<_>>()
-                                .join(&format!(" {} ", crate::caps::active_glyphs().middot)),
-                        ),
-                    ])));
-                }
-                for (i, th) in visible_threads(data, deep).enumerate() {
-                    let mark = if th.resolved {
-                        seg(hue(Hue::Green), "✓ ")
-                    } else {
-                        seg(hue(Hue::Amber), "⊘ ")
-                    };
-                    let at = match th.line {
-                        Some(l) => format!("{}:{l}", th.path),
-                        None => th.path.clone(),
-                    };
-                    rows.push(
-                        PanelRow::plain(Line::segs(vec![
-                            mark,
-                            seg(hue(Hue::Purple), th.author.clone()),
-                            seg(g(), format!(" · {at} · ")),
-                            seg(d(), format!("“{}”", th.snippet)),
-                        ]))
-                        .with_hit(PanelHit::Row(Section::Pr, i)),
-                    );
-                }
-                rows.push(PanelRow::blank());
-            }
         }
         None => {
             rows.push(PanelRow::plain(Line::segs(vec![seg(
@@ -191,61 +127,13 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
             rows.push(PanelRow::blank());
         }
     }
+    rows
+}
 
-    // OPEN PRS — the repo's other open PRs (from `gh pr list` via the
-    // repo-keyed `pr_branch_cache`), so the section answers "what's open on
-    // this repo", not only "what's open on this branch". The current branch's
-    // own PR is the detail above, so it's skipped here. ◈ marks a PR whose
-    // head branch already has a local worktree.
-    {
-        let others: Vec<&thegn_core::forge::model::PrHeader> = data
-            .open_prs
-            .iter()
-            .filter(|p| p.head_ref != data.branch)
-            .collect();
-        if !others.is_empty() {
-            let cap = if deep { 8 } else { 4 };
-            let mut header = vec![
-                seg(g2(), "OPEN PRS").bold(),
-                seg(g(), format!("  {} open on this repo", others.len())),
-            ];
-            // Age tag once the cache is meaningfully old (offline / gh
-            // failing): stale-but-shown beats blank, but it must SAY so.
-            if let Some(at) = data.open_prs_fetched_at {
-                let age = thegn_core::util::now().saturating_sub(at);
-                if age > 600 {
-                    header.push(seg(f(), format!("  ({} ago)", super::fmt_secs(age))));
-                }
-            }
-            rows.push(PanelRow::plain(Line::segs(header)));
-            for p in others.iter().take(cap) {
-                let linked = ctx
-                    .model
-                    .sidebar_db_worktrees
-                    .iter()
-                    .any(|w| w.branch == p.head_ref);
-                let mut l = vec![seg(ac(), format!("#{} ", p.number))];
-                if linked {
-                    l.push(seg(g2(), "◈ "));
-                }
-                l.push(seg(f(), p.head_ref.clone()));
-                let state_chip = if p.is_draft {
-                    Seg::chip(g(), " draft ")
-                } else {
-                    Seg::chip(pr_state_hue(&p.state, p.is_draft), format!(" {} ", p.state))
-                };
-                rows.push(PanelRow::plain(Line::split(l, vec![state_chip])));
-            }
-            if others.len() > cap {
-                rows.push(PanelRow::plain(Line::segs(vec![seg(
-                    g(),
-                    format!("… +{} more", others.len() - cap),
-                )])));
-            }
-            rows.push(PanelRow::blank());
-        }
-    }
-
+fn log_issues_velocity(ctx: &SectionCtx) -> Vec<PanelRow> {
+    let data = &ctx.model.panel;
+    let deep = ctx.deep();
+    let mut rows = Vec::new();
     // LOG — graph rows.
     if !data.log.is_empty() {
         let mut r = vec![seg(d(), "")];
@@ -313,17 +201,147 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
         }
     }
 
-    rows.push(PanelRow::blank());
-    rows.push(if data.pr.is_some() {
-        hint_row(&[
-            ("M", "merge"),
-            ("A", "approve"),
-            ("r", "rerun"),
-            ("o", "browser"),
-        ])
-    } else {
-        hint_row(&[("c", "create PR")])
-    });
+    rows
+}
+
+fn threads_and_open_prs(ctx: &SectionCtx) -> Vec<PanelRow> {
+    let (data, deep) = (&ctx.model.panel, ctx.deep());
+    let mut rows: Vec<PanelRow> = Vec::new();
+    if let Some(pr) = &data.pr {
+        // REVIEW — decision + unresolved threads.
+        let unresolved = data.threads.iter().filter(|t| !t.resolved).count();
+        let top_level = data.review_snapshot.as_ref().map_or(0, |snapshot| {
+            snapshot.conversation.comments.len()
+                + snapshot
+                    .conversation
+                    .reviews
+                    .iter()
+                    .filter(|review| !review.body.trim().is_empty())
+                    .count()
+        });
+        let mut per_file: Vec<(String, usize)> = Vec::new();
+        for thread in data.threads.iter().filter(|thread| !thread.resolved) {
+            if let Some((_, count)) = per_file.iter_mut().find(|(path, _)| *path == thread.path) {
+                *count += 1;
+            } else {
+                per_file.push((thread.path.clone(), 1));
+            }
+        }
+        if !data.threads.is_empty() || pr.review_decision.is_some() || top_level > 0 {
+            let decision = pr
+                .review_decision
+                .as_deref()
+                .unwrap_or("REVIEW_REQUIRED")
+                .to_lowercase()
+                .replace('_', " ");
+            let mut l = vec![
+                seg(g2(), "REVIEW").bold(),
+                seg(g(), format!("  {decision}")),
+            ];
+            if unresolved > 0 {
+                l.push(seg(
+                    g(),
+                    format!(" {} ", crate::caps::active_glyphs().middot),
+                ));
+                l.push(seg(hue(Hue::Amber), format!("⊘{unresolved} unresolved")));
+            }
+            if top_level > 0 {
+                l.push(seg(g(), " · "));
+                l.push(seg(g(), format!("{top_level} top-level")));
+            }
+            rows.push(PanelRow::plain(Line::segs(l)));
+            if !per_file.is_empty() {
+                rows.push(PanelRow::plain(Line::segs(vec![
+                    seg(g2(), "files: "),
+                    seg(
+                        g(),
+                        per_file
+                            .iter()
+                            .take(6)
+                            .map(|(path, count)| format!("{path} x{count}"))
+                            .collect::<Vec<_>>()
+                            .join(&format!(" {} ", crate::caps::active_glyphs().middot)),
+                    ),
+                ])));
+            }
+            for (i, th) in visible_threads(data, deep).enumerate() {
+                let mark = if th.resolved {
+                    seg(hue(Hue::Green), "✓ ")
+                } else {
+                    seg(hue(Hue::Amber), "⊘ ")
+                };
+                let at = match th.line {
+                    Some(l) => format!("{}:{l}", th.path),
+                    None => th.path.clone(),
+                };
+                rows.push(
+                    PanelRow::plain(Line::segs(vec![
+                        mark,
+                        seg(hue(Hue::Purple), th.author.clone()),
+                        seg(g(), format!(" · {at} · ")),
+                        seg(d(), format!("“{}”", th.snippet)),
+                    ]))
+                    .with_hit(PanelHit::Row(Section::Pr, i)),
+                );
+            }
+            rows.push(PanelRow::blank());
+        }
+    }
+
+    // OPEN PRS — the repo's other open PRs (from `gh pr list` via the
+    // repo-keyed `pr_branch_cache`), so the section answers "what's open on
+    // this repo", not only "what's open on this branch". The current branch's
+    // own PR is the detail above, so it's skipped here. ◈ marks a PR whose
+    // head branch already has a local worktree.
+    {
+        let others: Vec<&thegn_core::forge::model::PrHeader> = data
+            .open_prs
+            .iter()
+            .filter(|p| p.head_ref != data.branch)
+            .collect();
+        if !others.is_empty() {
+            let cap = if deep { 8 } else { 4 };
+            let mut header = vec![
+                seg(g2(), "OPEN PRS").bold(),
+                seg(g(), format!("  {} open on this repo", others.len())),
+            ];
+            // Age tag once the cache is meaningfully old (offline / gh
+            // failing): stale-but-shown beats blank, but it must SAY so.
+            if let Some(at) = data.open_prs_fetched_at {
+                let age = thegn_core::util::now().saturating_sub(at);
+                if age > 600 {
+                    header.push(seg(f(), format!("  ({} ago)", super::fmt_secs(age))));
+                }
+            }
+            rows.push(PanelRow::plain(Line::segs(header)));
+            for p in others.iter().take(cap) {
+                let linked = ctx
+                    .model
+                    .sidebar_db_worktrees
+                    .iter()
+                    .any(|w| w.branch == p.head_ref);
+                let mut l = vec![seg(ac(), format!("#{} ", p.number))];
+                if linked {
+                    l.push(seg(g2(), "◈ "));
+                }
+                l.push(seg(f(), p.head_ref.clone()));
+                let state_chip = if p.is_draft {
+                    Seg::chip(g(), " draft ")
+                } else {
+                    Seg::chip(pr_state_hue(&p.state, p.is_draft), format!(" {} ", p.state))
+                };
+                rows.push(PanelRow::plain(Line::split(l, vec![state_chip])));
+            }
+            if others.len() > cap {
+                rows.push(PanelRow::plain(Line::segs(vec![seg(
+                    g(),
+                    format!("… +{} more", others.len() - cap),
+                )])));
+            }
+            rows.push(PanelRow::blank());
+        }
+    }
+
     rows
 }
 
@@ -348,114 +366,58 @@ fn log_row(row: &thegn_svc::git::LogRow) -> PanelRow {
     ))
 }
 
-// ---- Full: heat calendar · velocity · log (the former git overlay) ---------
+// ---- Full: the PR summary and review threads, with OPEN PRS ----------------
 
-fn full(ctx: &SectionCtx) -> Vec<PanelRow> {
-    let footer = hint_row(&[("j/k", "scroll log"), ("y", "copy sha")]);
-    let Some(docs) = &ctx.ui.docs.git else {
-        return vec![
-            spinner_row(ctx.ui.docs.tick, "commit data"),
-            PanelRow::blank(),
-            footer,
-        ];
-    };
-
-    let left = calendar_column(docs);
-    let body = ctx.rows.saturating_sub(2); // blank + footer
-    let right = log_column(docs, ctx.ui.scroll, body);
-
-    // Two columns when the band is wide enough for calendar + readable log.
-    const LEFT_W: usize = 46;
-    const GAP: usize = 2;
-    let mut rows: Vec<PanelRow> = if ctx.cols >= LEFT_W + GAP + 40 {
-        two_col(&left, &right, LEFT_W, GAP)
+fn full_pr(ctx: &SectionCtx) -> Vec<PanelRow> {
+    let left = header_and_checks(ctx);
+    let right = threads_and_open_prs(ctx);
+    let left_segs = left.iter().map(row_segs).collect::<Vec<_>>();
+    let right_segs = right.iter().map(row_segs).collect::<Vec<_>>();
+    let mut out = if ctx.cols >= 100 {
+        let left_width = ctx.cols.saturating_sub(4) / 2;
+        let mut combined = super::two_col(&left_segs, &right_segs, left_width, 2)
             .into_iter()
-            .take(body)
             .map(PanelRow::plain)
-            .collect()
-    } else {
-        // Narrow fallback: stack the calendar above the log.
-        let mut stacked: Vec<Vec<Seg>> = left;
-        stacked.push(Vec::new());
-        stacked.extend(right);
-        stacked
-            .into_iter()
-            .take(body)
-            .map(|segs| {
-                if segs.is_empty() {
-                    PanelRow::blank()
-                } else {
-                    PanelRow::plain(Line::Segs(segs))
-                }
-            })
-            .collect()
-    };
-    rows.push(PanelRow::blank());
-    rows.push(footer);
-    rows
-}
-
-/// COMMITS heat calendar + legend + VELOCITY braille, as seg rows.
-fn calendar_column(docs: &GitDocs) -> Vec<Vec<Seg>> {
-    let weeks = docs.heat.len();
-    let mut left: Vec<Vec<Seg>> = Vec::new();
-    let mut head = vec![
-        seg(g2(), "COMMITS").bold(),
-        seg(g3(), format!(" · {weeks} weeks  ")),
-        seg(g3(), "less "),
-    ];
-    for l in 0..=4u8 {
-        head.push(seg(Tok::Heat(l), "■"));
-    }
-    head.push(seg(g3(), " more"));
-    left.push(head);
-    left.push(Vec::new());
-    let gutter = ["mon", "   ", "wed", "   ", "fri", "   ", "sun"];
-    for d in 0..7 {
-        let mut segs = vec![seg(g3(), format!("{} ", gutter[d]))];
-        for week in &docs.heat {
-            segs.push(seg(Tok::Heat(week[d]), "■"));
-        }
-        left.push(segs);
-    }
-    left.push(Vec::new());
-    left.push(vec![
-        seg(g2(), "VELOCITY").bold(),
-        seg(g3(), " · commits/wk  "),
-        seg(d(), docs.total.to_string()),
-        seg(g(), " commits"),
-    ]);
-    let max = docs.weekly.iter().copied().max().unwrap_or(0).max(1) as f32;
-    let vals: Vec<f32> = docs.weekly.iter().map(|&c| c as f32 / max).collect();
-    let vw = vals.len().div_ceil(2).max(1);
-    let vel = viz::braille_line(&vals, vw, 2);
-    left.push(vec![sp(1), seg(ac(), vel[0].clone())]);
-    left.push(vec![sp(1), seg(g(), vel[1].clone())]);
-    left
-}
-
-/// The LOG column: header + scrolled graph rows, as seg rows.
-fn log_column(docs: &GitDocs, scroll: usize, body: usize) -> Vec<Vec<Seg>> {
-    let mut right: Vec<Vec<Seg>> = Vec::new();
-    right.push(vec![
-        seg(g2(), "LOG").bold(),
-        sp(2),
-        seg(hue(Hue::Amber), docs.head_branch.clone()),
-    ]);
-    right.push(Vec::new());
-    let visible = body.saturating_sub(2);
-    for row in docs.log.iter().skip(scroll).take(visible) {
-        let mut segs = vec![seg(g(), row.graph.clone()), sp(1)];
-        if !row.sha.is_empty() {
-            segs.push(seg(f(), row.sha.clone()));
-            segs.push(sp(1));
-            segs.push(seg(d(), row.subject.clone()));
-            if row.is_head() {
-                segs.push(sp(1));
-                segs.push(Seg::chip(ac(), " HEAD "));
+            .collect::<Vec<_>>();
+        for (index, row) in right.iter().enumerate() {
+            if let Some(hit) = row.hit
+                && let Some(target) = combined.get_mut(index)
+            {
+                target.hit = Some(hit);
             }
         }
-        right.push(segs);
+        combined
+    } else {
+        left.iter().chain(right.iter()).cloned().collect()
+    };
+    out.push(PanelRow::blank());
+    out.push(if ctx.model.panel.pr.is_some() {
+        hint_row(&[
+            ("enter", "PR view"),
+            ("M", "merge"),
+            ("A", "approve"),
+            ("c", "comment"),
+            ("r", "rerun"),
+            ("o", "browser"),
+        ])
+    } else {
+        hint_row(&[("c", "create PR")])
+    });
+    out
+}
+
+fn row_segs(row: &PanelRow) -> Vec<Seg> {
+    match &row.line {
+        Line::Blank => Vec::new(),
+        Line::Fill { ch, .. } => vec![seg(g(), ch.to_string())],
+        Line::Segs(segs) => segs.clone(),
+        Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
+            let mut segs = l.clone();
+            if !r.is_empty() {
+                segs.push(sp(2));
+                segs.extend(r.clone());
+            }
+            segs
+        }
     }
-    right
 }
