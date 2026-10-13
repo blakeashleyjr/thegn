@@ -256,6 +256,70 @@ fn example_config_parses_as_config() {
 }
 
 #[test]
+fn plugin_example_block_round_trips() {
+    let path = example_path();
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = lines
+        .iter()
+        .position(|line| *line == "# [[plugins]]")
+        .expect("plugin example block is present");
+    let block = lines[start..]
+        .iter()
+        .take_while(|line| line.starts_with('#'))
+        .map(|line| {
+            line.strip_prefix("# ")
+                .or_else(|| line.strip_prefix('#'))
+                .unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config: thegn_core::config::Config =
+        toml::from_str(&block).expect("commented plugin example deserializes as Config");
+    assert_eq!(config.plugins.len(), 1);
+    let spec = &config.plugins[0];
+    assert_eq!(spec.manifest.contributions.len(), 1);
+
+    let minimal: thegn_core::plugin_api::PluginSpec = toml::from_str(
+        r#"
+id = "minimal"
+name = "Minimal plugin"
+version = "0.1.0"
+api = "0.3.0"
+command = ["/path/to/plugin"]
+
+[[contributions]]
+id = "minimal-status"
+extension_point = "StatusBarSegment"
+label = "Minimal status"
+"#,
+    )
+    .expect("minimal plugin spec deserializes");
+    let contribution = &spec.manifest.contributions[0];
+    let minimal_contribution = &minimal.manifest.contributions[0];
+    assert_eq!(spec.cwd, minimal.cwd, "cwd example default");
+    assert_eq!(
+        spec.timeout_secs, minimal.timeout_secs,
+        "timeout example default"
+    );
+    assert_eq!(spec.scopes, minimal.scopes, "scopes example default");
+    assert_eq!(spec.mode, minimal.mode, "mode example default");
+    assert_eq!(spec.enabled, minimal.enabled, "enabled example default");
+    assert_eq!(
+        spec.manifest.capabilities, minimal.manifest.capabilities,
+        "capabilities example default"
+    );
+    assert_eq!(contribution.cadence, minimal_contribution.cadence);
+    assert_eq!(spec.manifest.api, thegn_core::plugin_api::API_VERSION);
+
+    let encoded = serde_json::to_value(spec).expect("plugin spec serializes to JSON");
+    let decoded: thegn_core::plugin_api::PluginSpec =
+        serde_json::from_value(encoded).expect("plugin spec deserializes from JSON");
+    assert_eq!(decoded, *spec, "plugin spec JSON round trip is lossless");
+}
+
+#[test]
 fn generated_config_reference_keeps_example_schema_keys() {
     let path = example_path();
     let example = std::fs::read_to_string(&path)
