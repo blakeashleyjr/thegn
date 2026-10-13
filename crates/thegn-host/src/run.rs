@@ -6897,6 +6897,7 @@ async fn event_loop<T: Terminal>(
     // The drag-set Normal width, restored below; takes precedence over the
     // `[panel] width` config value.
     let mut panel_cols_pref: Option<usize> = None;
+    let mut help_persisted: Option<(String, usize)> = None;
     let startup_db = thegn_core::db::Db::open().ok();
     if let Some(db) = startup_db.as_ref() {
         sb.load(db, SIDEBAR_SCOPE);
@@ -6929,6 +6930,31 @@ async fn event_loop<T: Terminal>(
         // Restore collapsed directories in the Files tree.
         for (key, _) in db.ui_state_in_scope("panel.files.col").unwrap_or_default() {
             panel_ui.files_collapsed.insert(key);
+        }
+        let mut help_page = None;
+        let mut help_scroll = None;
+        for (key, value) in db.ui_state_in_scope("panel.help").unwrap_or_default() {
+            match key.as_str() {
+                "page" => help_page = Some(value),
+                "scroll" => help_scroll = value.parse::<usize>().ok(),
+                _ => {}
+            }
+        }
+        if let Some(page) = help_page {
+            panel_ui.help.page = page;
+        }
+        if panel_ui.open == crate::panel::Section::Help
+            && let Some(scroll) = help_scroll
+        {
+            panel_ui.scroll = scroll;
+            help_persisted = Some((
+                if panel_ui.help.page.is_empty() {
+                    "index".to_string()
+                } else {
+                    panel_ui.help.page.clone()
+                },
+                scroll,
+            ));
         }
         // Restore the per-section width memory; the restored global width is
         // authoritative for the restored OPEN section (it was written by the
@@ -13338,6 +13364,22 @@ async fn event_loop<T: Terminal>(
         {
             dirty = true;
         }
+        let help_page = if panel_ui.help.page.is_empty() {
+            "index"
+        } else {
+            panel_ui.help.page.as_str()
+        };
+        if crate::panel_util::help_persist_due(
+            panel_ui.open,
+            help_page,
+            panel_ui.scroll,
+            help_persisted
+                .as_ref()
+                .map(|(page, scroll)| (page.as_str(), *scroll)),
+        ) {
+            crate::panel_util::persist_help_state(help_page, panel_ui.scroll);
+            help_persisted = Some((help_page.to_string(), panel_ui.scroll));
+        }
         model.center_focused = focus.center();
         model.masthead_focused = focus.masthead();
         model.statusbar_focused = focus.statusbar();
@@ -16307,6 +16349,7 @@ async fn event_loop<T: Terminal>(
                         // section (same shape as OpenMergeQueueSection).
                         crate::help::HelpOutcome::OpenInPanel => {
                             panel_ui.help.page = h.page_id().to_string();
+                            let anchor = h.anchor();
                             help_overlay = None;
                             panel_auto_revealed = None;
                             if chrome.panel.is_none() {
@@ -16328,6 +16371,14 @@ async fn event_loop<T: Terminal>(
                                     tx: &docs_tx,
                                 },
                             );
+                            if let Some(reg) = panel_ui.help.reg.as_ref() {
+                                panel_ui.scroll = crate::panel::sections::help::scroll_for_anchor(
+                                    reg,
+                                    &panel_ui.help.page,
+                                    panel_geom(&chrome).0,
+                                    anchor,
+                                );
+                            }
                             focus.zone = crate::focus::Zone::Panel;
                         }
                         crate::help::HelpOutcome::Pending => {}
@@ -20364,6 +20415,14 @@ async fn event_loop<T: Terminal>(
                                                     }
                                                 }
                                             }
+                                        }
+                                        Section::Help => {
+                                            help_overlay = crate::help::open(
+                                                &help_registry,
+                                                keymap.config(),
+                                                &focus,
+                                                &panel_ui,
+                                            );
                                         }
                                         // Read-only / no-Enter-action sections
                                         // (MergeQueue, Logs, …).

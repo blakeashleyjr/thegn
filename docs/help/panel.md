@@ -7,6 +7,7 @@ contexts:
     zone:panel,
     panel:mine,
     panel:across,
+    panel:ci,
     panel:issues,
     panel:problems,
     panel:jobs,
