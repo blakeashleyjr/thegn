@@ -356,8 +356,8 @@ pub struct PluginSpec {
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
     /// Host-capability scopes this plugin holds for `host.call` — the same
-    /// lattice as control-API tokens (`read` / `write` / `git` / `exec` /
-    /// `admin`), so a plugin is authorised exactly like a paired client.
+    /// lattice as control-API tokens (`read` / `write` / `git` / `merge_add` /
+    /// `exec` / `admin`), so a plugin is authorised exactly like a paired client.
     /// Write, Git, and Exec are independent; Admin implies all of them.
     #[serde(default)]
     pub scopes: Vec<crate::control::Scope>,
