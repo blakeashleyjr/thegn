@@ -125,10 +125,6 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
                 seg(f(), truncate(&row.url, cols.saturating_sub(2))),
             ])));
         }
-
-        if out.len() >= ctx.rows.saturating_sub(1) {
-            break;
-        }
     }
 
     out.push(hint_row(&[

@@ -8,7 +8,7 @@
 use crate::seg::{Line, Seg, seg, sp};
 
 use super::{
-    PanelHit, PanelRow, Section, SectionCtx, d, g, g2, g3, hint_row, hue, rule, t, two_col,
+    PanelHit, PanelRow, Section, SectionCtx, d, g, g2, g3, hint_row, hue, list_detail, rule, t,
 };
 use crate::panel::Severity;
 use thegn_core::theme::Hue;
@@ -109,10 +109,6 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             row
         };
         rows.push(row);
-
-        if rows.len() >= ctx.rows.saturating_sub(1) {
-            break;
-        }
     }
 
     rows.push(hint_row(&[("↵", "open"), ("j/k", "select")]));
@@ -154,10 +150,6 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             row
         };
         rows.push(row);
-
-        if rows.len() + 1 > ctx.rows.saturating_sub(2) {
-            break;
-        }
     }
 
     rows.push(hint_row(&[("↵", "open"), ("j/k", "select")]));
@@ -195,7 +187,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
 
     let list_w = 40_usize.min(cols / 2);
 
-    let list_rows: Vec<Vec<Seg>> = diags
+    let list_rows: Vec<(Vec<Seg>, Option<usize>)> = diags
         .iter()
         .enumerate()
         .map(|(i, d_item)| {
@@ -203,12 +195,15 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             let sel = if i == cursor { "▶ " } else { "  " };
             let name_w = list_w.saturating_sub(sel.len() + glyph.len() + 1);
             let label = truncate(&d_item.message, name_w);
-            vec![
-                seg(if i == cursor { t() } else { g() }, sel),
-                seg(glyph_col, glyph),
-                seg(g3(), " "),
-                seg(if i == cursor { t() } else { d() }, label),
-            ]
+            (
+                vec![
+                    seg(if i == cursor { t() } else { g() }, sel),
+                    seg(glyph_col, glyph),
+                    seg(g3(), " "),
+                    seg(if i == cursor { t() } else { d() }, label),
+                ],
+                Some(i),
+            )
         })
         .collect();
 
@@ -218,13 +213,14 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         vec![vec![seg(g2(), "select a diagnostic")]]
     };
 
-    let combined = two_col(&list_rows, &detail_rows, list_w, 2);
-    rows.extend(
-        combined
-            .into_iter()
-            .enumerate()
-            .map(|(i, l)| PanelRow::plain(l).with_hit(PanelHit::Row(Section::Problems, i))),
-    );
+    rows.extend(list_detail(
+        Section::Problems,
+        &list_rows,
+        &detail_rows,
+        cursor,
+        list_w,
+        ctx.rows.saturating_sub(rows.len() + 2),
+    ));
 
     rows.push(rule());
     rows.push(hint_row(&[("↵", "open"), ("j/k", "select")]));

@@ -13,7 +13,7 @@ use thegn_core::theme::Hue;
 use crate::panel::{PanelHit, PanelUi, Section};
 use crate::seg::{Line, Seg, seg};
 
-use super::{PanelRow, SectionCtx, d, g, g2, g3, hint_row, hue, rule, t, two_col, wrap_text};
+use super::{PanelRow, SectionCtx, d, g, g2, g3, hint_row, hue, list_detail, rule, t, wrap_text};
 
 /// Severity rank for the structured-stream level (higher = more severe).
 fn rank(l: &ParserLogLevel) -> u8 {
@@ -202,17 +202,20 @@ fn full_view(ctx: &SectionCtx, items: &[&ParsedLog], all: bool) -> Vec<PanelRow>
 
     let cursor = ctx.ui.logs_cursor.min(items.len().saturating_sub(1));
     let list_w = 45_usize.min(cols / 2);
-    let list_rows: Vec<Vec<Seg>> = items
+    let list_rows: Vec<(Vec<Seg>, Option<usize>)> = items
         .iter()
         .enumerate()
         .map(|(i, l)| {
             let sel = if i == cursor { "▶ " } else { "  " };
             let lvl = format!("{:?}", l.level);
-            vec![
-                seg(if i == cursor { t() } else { g() }, sel),
-                seg(level_tok(&l.level), format!("{lvl:<5} ")),
-                seg(if i == cursor { t() } else { d() }, l.message.clone()),
-            ]
+            (
+                vec![
+                    seg(if i == cursor { t() } else { g() }, sel),
+                    seg(level_tok(&l.level), format!("{lvl:<5} ")),
+                    seg(if i == cursor { t() } else { d() }, l.message.clone()),
+                ],
+                Some(i),
+            )
         })
         .collect();
 
@@ -244,18 +247,14 @@ fn full_view(ctx: &SectionCtx, items: &[&ParsedLog], all: bool) -> Vec<PanelRow>
         }
     }
 
-    let combined = two_col(&list_rows, &detail, list_w, 2);
-    let n = items.len();
-    rows.extend(combined.into_iter().enumerate().map(|(i, line)| {
-        let row = PanelRow::plain(line);
-        // Only the list rows are cursor targets, indexed by the VISIBLE item
-        // index (never a row offset — the audited notifications bug).
-        if i < n {
-            row.with_hit(PanelHit::Row(Section::Logs, i))
-        } else {
-            row
-        }
-    }));
+    rows.extend(list_detail(
+        Section::Logs,
+        &list_rows,
+        &detail,
+        cursor,
+        list_w,
+        ctx.rows.saturating_sub(rows.len() + 2),
+    ));
     rows.push(rule());
     rows.push(hint_row(&[
         ("/", "filter"),
