@@ -111,10 +111,10 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
             // Block until the client exits (Ctrl-C tears down the group).
             // CLI path: `thegn share` runs the tunnel in the foreground by design.
             running.wait();
-            if let Some(db) = &db {
-                if let Err(error) = db.delete_share_generation(&wt, port, generation) {
-                    tracing::debug!(target: "thegn::db", %error, "share cache delete failed");
-                }
+            if let Some(db) = &db
+                && let Err(error) = db.delete_share_generation(&wt, port, generation)
+            {
+                tracing::debug!(target: "thegn::db", %error, "share cache delete failed");
             }
         }
         ShareLaunch::SidecarServe(serve) => {
@@ -135,11 +135,10 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
             let display_endpoint = thegn_svc::lsp::sanitize_for_terminal(&url);
             outln!("share: 127.0.0.1:{port} → {display_endpoint}");
             outln!("share: serve persists in the tailnet; `share stop {port}` to remove");
-            if let Some(db) = &db {
-                if let Err(error) = db.upsert_share(&wt, port, generation, &kind, Some(&url), "up")
-                {
-                    tracing::debug!(target: "thegn::db", %error, "share cache upsert failed");
-                }
+            if let Some(db) = &db
+                && let Err(error) = db.upsert_share(&wt, port, generation, &kind, Some(&url), "up")
+            {
+                tracing::debug!(target: "thegn::db", %error, "share cache upsert failed");
             }
         }
     }
