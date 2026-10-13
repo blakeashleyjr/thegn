@@ -1,6 +1,9 @@
 # Design
 
-## The core-model question: what IS a multi-repo project?
+## The core-model question: what IS a multi-repo program?
+
+Storage keeps the historical identifiers `ProjectStore`, `db_projects.rs`,
+`project.rs`, `projects` table, and related `project_*` names.
 
 Three shapes were considered:
 
@@ -17,33 +20,33 @@ Three shapes were considered:
    "group these repos for a feature" silently becomes "re-scope these repos'
    credentials", which a security mechanism must never let happen by
    side-effect. Also, one client zone can legitimately contain several
-   products/projects. Rejected; the _shape_ is reused, not the table.
-3. **A `projects` grouping layer above workspaces** — chosen. Same proven
+   products/programs. Rejected; the _shape_ is reused, not the table.
+3. **A program grouping layer above workspaces** — chosen. Same proven
    membership mechanics as zones: `projects` table (unique name) + nullable
    exclusive `workspaces.project_id`, explicit assignment, never
    path-inferred, per-profile for free (profiles reroot `XDG_STATE_HOME`).
-   Zero policy attached. A workspace may be in one zone and one project
-   simultaneously; the axes are orthogonal (a project MAY span zones — the
+   Zero policy attached. A workspace may be in one zone and one program
+   simultaneously; the axes are orthogonal (a program MAY span zones — the
    grouping is visual/workflow-only and mixes no credentials; a config-issue
    style warning for that case is a possible follow-up, see Open questions).
 
-Naming: the codebase already uses "project" for two other things — tracker
-projects (`[issues.*] project_key` / `project_id`, provider-side data) and
-the historical "project-level in-repo config" roadmap phrasing (roadmap 186,
-meaning per-repo config). Neither is a shipped CLI noun. THE-33's user
-language is "a single project", so the thegn noun is `project`; docs and help
-disambiguate ("tracker projects live under `[issues]`; `thegn project`
-groups repos").
+Naming follows the accepted workspace spec requirement “Multi-repository
+groups use program vocabulary.” Tracker projects remain distinct
+provider-side data under `[issues]` (`project_key` / `project_id`); the
+historical “project-level in-repo config” roadmap phrasing refers to
+per-repo config. User-facing multi-repository commands and grouping use
+`program`. Legacy `project` forms are deprecated aliases per the workspace
+spec.
 
 ## Data model and migration
 
 - `projects (project_id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
 created_at INTEGER NOT NULL, position INTEGER NOT NULL DEFAULT 0)` —
-  `position` for manual sidebar ordering of project headers, same
+  `position` for manual sidebar ordering of program headers, same
   exact-order persistence style as `set_workspace_order`.
 - `ALTER TABLE workspaces ADD COLUMN project_id INTEGER` (nullable; NULL =
-  unprojected). One column, not a join table: membership exclusive by
-  construction, mirroring zones.
+  workspace outside any program). One column, not a join table: membership
+  exclusive by construction, mirroring zones.
 - **Additive migration, next `user_version` bump** on the ladder
   (`db_migrate.rs`), `CREATE TABLE IF NOT EXISTS` + idempotent `ALTER` so
   parallel-branch DBs tolerate it; do not pin the version number in code
@@ -60,7 +63,7 @@ The cross-repo unit of work is a **feature set**: the group of worktrees, one
 per member repo, whose branches share the same name.
 
 - **Identity = exact branch-name equality.** `thegn wt new payments-retry
---project shop` resolves ONE final branch name once — the configured
+--program shop` resolves ONE final branch name once — the configured
   `branch_prefix` + slug (e.g. `tg/payments-retry`) — and creates that exact
   branch verbatim in every member repo. Per-repo `branch_prefix` overrides
   are deliberately NOT re-applied per member: identity must be literal.
@@ -92,22 +95,22 @@ forges' protected branches) share no transaction, and pretending otherwise
 would fabricate a guarantee the merge queue's whole design (fold + gate +
 CAS per repo) exists to keep honest. Semantics by phase:
 
-- **This change**: `thegn merge add --project <p> --feature <branch>`
+- **This change**: `thegn merge add --program <p> --feature <branch>`
   resolves the feature set and enqueues each member's branch in _that
   repo's_ per-repo queue as an ordinary independent row. Draining is
   unchanged — per repo, serial, oldest first. The only cross-repo artifact
   is the batch of enqueues plus per-member reporting.
 - **Follow-up (not this change)**: ordered draining — a configured
-  `[project.<name>] land_order = ["shared-lib", "api", "web"]` walked with
+  `[program.<name>] land_order = ["shared-lib", "api", "web"]` walked with
   stop-on-failure (a deferred/`needs_human` member halts later members'
-  drains and reports the halt). Same for a project-grouped PR-queue view
+  drains and reports the halt). Same for a program-grouped PR-queue view
   over `add-pr-queue`'s per-repo rows. Both are additive over this change's
   substrate and are listed as non-goals in the proposal.
 
 ## Aggregation (d)
 
 `cross-worktree-aggregation` today aggregates across every worktree of one
-workspace. Delta: the pure aggregation model accepts a **project scope** —
+workspace. Delta: the pure aggregation model accepts a **program scope** —
 excerpts collected from the feature set's worktrees across member repos —
 with labels repo-qualified (`repo · worktree`) so rows from different repos
 stay identifiable, ordering still deterministic. Population follows the
@@ -117,18 +120,18 @@ No new blocking work on the loop.
 
 ## Sidebar and rendering
 
-- Member workspaces render under a collapsible **project header row**
+- Member workspaces render under a collapsible **program header row**
   (name + member count + rolled-up attention, same tier-granular bubbling
-  rules workspaces already use); unprojected workspaces render exactly as
-  today, after the projected groups. Rail mode keeps header identity.
-- Ordering: projects order by `projects.position` (keyboard reorder +
+  rules workspaces already use); workspaces outside any program render
+  exactly as today, after the program groups. Rail mode keeps header identity.
+- Ordering: programs order by `programs.position` (keyboard reorder +
   drag, exact-order persistence); member workspaces keep their existing
   positions within the group. This sits directly on the run-partition
   machinery `add-sidebar-folder-ordering` introduces and the row-model
   cleanups in `stabilize-sidebar-internals` — this change builds on their
   post-change shape (dependency, called out in tasks).
 - Collapse state persists via `ui_state` keys and follows the
-  tombstone-free rule (delete-on-clear, prefix-prune on project delete).
+  tombstone-free rule (delete-on-clear, prefix-prune on program delete).
 - Glyphs route through the capability glyph table (`caps::active_glyphs()`);
   no literals at draw sites (ratchet).
 - **Render damage channel: `Full`** — header rows are chrome; batched
@@ -138,15 +141,15 @@ No new blocking work on the loop.
 
 ## CLI and capability catalog
 
-- `thegn project list|create|rename|rm [--force]|assign <project|none>
+- `thegn program list|create|rename|rm [--force]|assign <program|none>
 [repo]` — mirrors `thegn zone`'s grammar and reuses its
   resolve-repo-from-cwd behavior; `--json` on list via the one emitter.
-- `thegn wt new <name> --project <p> [--repos …]` extends the existing
-  headless creation; `thegn merge add --project <p> --feature <branch>`
+- `thegn wt new <name> --program <p> [--repos …]` extends the existing
+  headless creation; `thegn merge add --program <p> --feature <branch>`
   extends the merge namespace.
 - Every new verb/parameterization is a `thegn_core::capability::CATALOG`
   row projected across CLI/control/MCP surfaces and gated by
-  `required_scope(verb)`: reads (`project list`) under the read scope,
+  `required_scope(verb)`: reads (`program list`) under the read scope,
   writes (`create/rename/rm/assign`, batched `wt new`, batched
   `merge add`) under the corresponding write scopes. No second policy
   table. Note: a parallel branch is implementing write MCP tools with
@@ -155,16 +158,16 @@ No new blocking work on the loop.
 
 ## Help
 
-New action ids (project header collapse/reorder, project-scoped create,
-project assign via palette if added) are claimed by a new
+New action ids (program header collapse/reorder, program-scoped create,
+program assign via palette if added) are claimed by a new
 `docs/help/projects.md` (help ratchet + prose ratchet). Sidebar header
 interactions document under the existing `zone:sidebar` context; the
 generated keybindings page picks up new binds automatically.
 
 ## Security
 
-- **Projects are not a security boundary.** Membership carries zero policy:
-  assigning/unassigning a project never changes credential scope, egress,
+- **Programs are not a security boundary.** Membership carries zero policy:
+  assigning/unassigning a program never changes credential scope, egress,
   budget, sandbox profile, or env-bundle visibility — those remain zones'
   and the sandbox engine's exclusive job. The design keeps this true
   structurally: nothing in the launch/env/proxy resolve paths reads
@@ -189,8 +192,8 @@ generated keybindings page picks up new binds automatically.
 
 - Pure core (95% line gate): `feature_sets` derivation, batched-create
   name resolution + plan (which members, exists/skip classification),
-  `ProjectStore` SQL, project-scoped aggregation model, sidebar row
-  partition with project headers. All table-testable without I/O.
+  `ProjectStore` SQL, program-scoped aggregation model, sidebar row
+  partition with program headers. All table-testable without I/O.
 - Seam/I/O: batched `git worktree add` across fixture repos in
   `test/smoke.sh` (with `-c commit.gpgsign=false` per the fixture
   convention, isolated `XDG_STATE_HOME`); sidebar rendering via the muse
@@ -198,18 +201,18 @@ generated keybindings page picks up new binds automatically.
 
 ## Open questions
 
-1. **Member order for future `land_order`** — config list per project
+1. **Member order for future `land_order`** — config list per program
    (declarative, diffable) vs deriving from sidebar member order
    (zero-config but conflates display with landing order). Leaning config
-   (`[project.<name>] land_order`), deferred with the ordered-drain
+   (`[program.<name>] land_order`), deferred with the ordered-drain
    follow-up; no config key ships in this change.
-2. **Project spanning zones** — allowed (policy is unaffected), but should
-   `thegn doctor`/config-issues warn when a project mixes zones, since the
+2. **Program spanning zones** — allowed (policy is unaffected), but should
+   `thegn doctor`/config-issues warn when a program mixes zones, since the
    sidebar will visually interleave two clients' repos under one header?
 3. **TUI management surface** — zones shipped CLI-only (palette deferred);
-   projects likely want at least "assign to project" in the sidebar
+   programs likely want at least "assign to program" in the sidebar
    workspace context menu in phase 1. Scoped as a should-have task, cut to
    CLI-only if the sidebar in-flight changes make it churn.
-4. **`thegn project status`** — is a dedicated feature-set list view needed,
-   or does the project-scoped Across section cover it? Phase 2 ships the
+4. **`thegn program status`** — is a dedicated feature-set list view needed,
+   or does the program-scoped Across section cover it? Phase 2 ships the
    Across scope first; a dedicated section only if usage demands it.

@@ -861,9 +861,9 @@
           "project": "Proposal Retirement & Cleanup"
         }
       ],
-      "summary": "Retired package-shell-completions as superseded by openspec/changes/rework-shell-completions/.",
+      "summary": "Retired package-shell-completions as superseded by openspec/changes/archive/2026-10-12-rework-shell-completions/.",
       "successors": [
-        "openspec/changes/rework-shell-completions/"
+        "openspec/changes/archive/2026-10-12-rework-shell-completions/"
       ],
       "archive_path": "openspec/changes/archive/2026-10-12-package-shell-completions/"
     },
@@ -1081,7 +1081,7 @@
     },
     {
       "change": "rework-shell-completions",
-      "lifecycle": "active",
+      "lifecycle": "archived",
       "disposition": "residual-split",
       "owners": [
         {
@@ -1089,7 +1089,8 @@
           "project": "Cross-Platform Support & Verification"
         }
       ],
-      "summary": "The live completion engine shipped; packaging verification and cleanup remain."
+      "summary": "The dynamic completion engine shipped; the primary verifies packaged bash/zsh/fish files for both names with a nix build; the static proposal was retired 2026-10-12.",
+      "archive_path": "openspec/changes/archive/2026-10-12-rework-shell-completions/"
     },
     {
       "change": "safe-merged-worktree-cleanup",
