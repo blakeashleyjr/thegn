@@ -14,5 +14,3 @@ panel:media:f
 # Notifications: `A` shows read rows and `/` searches; neither is in its hint table.
 panel:notifications:/
 panel:notifications:A
-# PR queue: `h` invokes the configured handoff, not in its table.
-panel:prq:h
