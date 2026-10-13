@@ -239,7 +239,7 @@ pub(super) fn list_detail(
     let below = list.len().saturating_sub(end);
     let mut left: Vec<Vec<Seg>> = Vec::new();
     let mut hits = Vec::new();
-    if above > 0 && (rows >= 3 || below == 0) {
+    if rows >= 3 && above > 0 {
         left.push(vec![seg(g2(), format!("… ↑{above} above"))]);
         hits.push(None);
     }
@@ -247,7 +247,7 @@ pub(super) fn list_detail(
         left.push(row.clone());
         hits.push(*hit);
     }
-    if below > 0 && (rows >= 3 || above == 0) {
+    if rows >= 3 && below > 0 {
         left.push(vec![seg(g2(), format!("… +{below} more"))]);
         hits.push(None);
     }
@@ -278,14 +278,39 @@ pub(super) fn list_len(section: Section, ctx: &SectionCtx) -> Option<usize> {
         Section::Issues => Some(issues::sorted_issues(ctx).len()),
         Section::Ci => Some(ci::display_runs(&ctx.model.panel).len()),
         Section::Hosts => Some(ctx.model.panel.hosts.len()),
-        Section::Notifications => Some(notifications::visible_indices(&ctx.model.panel, ctx.ui).len()),
+        Section::Notifications => {
+            Some(notifications::visible_indices(&ctx.model.panel, ctx.ui).len())
+        }
         Section::Logs => Some(logs::visible_lines(&ctx.model.panel, ctx.ui).count()),
         Section::MergeQueue => Some(ctx.model.panel.merge_queue.len()),
         Section::Share => Some(ctx.model.shares.len()),
-        Section::Forward => Some(ctx.model.forwards.len() + usize::from(ctx.model.preview.is_some())),
-        Section::Across => Some(ctx.model.panel.across.rows().filter(|row| matches!(row, thegn_core::aggregate::AggRow::Excerpt(i) if ctx.model.panel.across.jump_target(*i).is_some())).count()),
+        Section::Forward => {
+            Some(ctx.model.forwards.len() + usize::from(ctx.model.preview.is_some()))
+        }
+        Section::Across => Some(
+            ctx.model
+                .panel
+                .across
+                .rows()
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        row,
+                        thegn_core::aggregate::AggRow::Excerpt(i)
+                            if ctx.model.panel.across.jump_target(*i).is_some()
+                    )
+                })
+                .count(),
+        ),
         Section::Tests => Some(ctx.ui.tests.visible_indices().len()),
-        Section::Sandbox => Some(crate::handlers::sandbox_panel::visible_containers(&ctx.model.containers, &ctx.model.active_container_name, crate::panel::scope::system_all()).len()),
+        Section::Sandbox => Some(
+            crate::handlers::sandbox_panel::visible_containers(
+                &ctx.model.containers,
+                &ctx.model.active_container_name,
+                crate::panel::scope::system_all(),
+            )
+            .len(),
+        ),
         _ => None,
     }
 }
@@ -2444,13 +2469,24 @@ mod spec {
             rendered.lines().next().unwrap().contains("detail-0"),
             "{rendered}"
         );
-        assert!(rendered.contains("↑15 above"), "{rendered}");
+        assert!(rendered.contains("↑25 above"), "{rendered}");
         assert!(rendered.contains("+5 more"), "{rendered}");
         assert!(rendered.contains("item-30"), "{rendered}");
         assert!(
             rendered.contains("+9 lines"),
             "clipped detail has a marker: {rendered}"
         );
+    }
+
+    #[test]
+    fn one_row_list_window_keeps_the_cursor_hit() {
+        let list: Vec<(Vec<Seg>, Option<usize>)> = (0..5)
+            .map(|i| (vec![seg(t(), format!("item-{i}"))], Some(i)))
+            .collect();
+        let rows = list_detail(Section::Problems, &list, &[], 4, 30, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hit, Some(PanelHit::Row(Section::Problems, 4)));
+        assert!(text(&rows).contains("item-4"));
     }
 
     #[test]
@@ -2686,11 +2722,30 @@ mod spec {
             cols: 75,
             rows: 30,
         };
-        let rendered = text(&content(Section::Notifications, &ctx));
+        let rows = content(Section::Notifications, &ctx);
+        let rendered = text(&rows);
         assert!(
             rendered.contains("TAILMARKER"),
             "the cursor row must wrap the whole message: {rendered}"
         );
+        for row in rows.iter().filter(|row| {
+            row.hit.is_none()
+                && matches!(
+                    &row.line,
+                    Line::Segs(segs) if segs
+                        .first()
+                        .is_some_and(|seg| seg.text == "  ")
+                )
+        }) {
+            if let Line::Segs(segs) = &row.line {
+                assert!(
+                    crate::seg::seg_width(segs) <= ctx.cols,
+                    "wrapped notification row exceeds {} columns: {:?}",
+                    ctx.cols,
+                    segs
+                );
+            }
+        }
     }
 
     #[test]
