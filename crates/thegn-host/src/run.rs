@@ -11115,6 +11115,7 @@ async fn event_loop<T: Terminal>(
             crate::handlers::sandbox_panel::stamp_ownership(
                 &mut model.containers,
                 &model.sidebar_db_worktrees,
+                &current_config.profile,
             );
             model.containers_listed = containers_listed;
             model.container_health =
@@ -11698,6 +11699,7 @@ async fn event_loop<T: Terminal>(
             crate::handlers::sandbox_panel::stamp_ownership(
                 &mut containers,
                 &model.sidebar_db_worktrees,
+                &current_config.profile,
             );
             // The aggregate footprint arrives only on the gated slow-cadence
             // ticks (Containers tab open); `None` means "no update", so the

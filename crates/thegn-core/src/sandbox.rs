@@ -1427,6 +1427,16 @@ pub fn container_name_with_profile(worktree: &str, profile: Option<&str>) -> Str
     }
 }
 
+/// Container name derived from the config profile used by the create site.
+///
+/// Config values are trimmed before being passed to
+/// [`container_name_with_profile`]; keeping that normalization here lets
+/// ownership checks use the same identity as container creation.
+pub fn container_name_for_config_profile(worktree: &str, profile: &str) -> String {
+    let profile = profile.trim();
+    container_name_with_profile(worktree, (!profile.is_empty()).then_some(profile))
+}
+
 /// LEGACY suffix that marked the (since-removed) embedded agent's own
 /// separately-hardened container. Kept so teardown/reconciliation still cleans
 /// up containers created by older builds. Chosen to be collision-resistant
@@ -1522,7 +1532,7 @@ impl OwnedContainers {
                         Backend::Podman | Backend::PodmanRootful | Backend::Docker
                     )
                 });
-                let base = container_name_with_profile(path, Some(profile));
+                let base = container_name_for_config_profile(path, profile);
                 [
                     (base.clone(), backend),
                     (vpn_sidecar_name(&base), backend),

@@ -12,9 +12,10 @@ use crate::menu::{self, MenuChoice, MenuOverlay};
 pub(crate) fn stamp_ownership(
     containers: &mut [ContainerInfo],
     worktrees: &[crate::sidebar::DbWorktree],
+    profile: &str,
 ) {
     OwnedContainers::new(
-        &thegn_core::profile::name(),
+        profile,
         worktrees
             .iter()
             .map(|worktree| (worktree.path.as_str(), worktree.sandbox_backend.as_deref())),
@@ -245,15 +246,14 @@ mod tests {
             env_name: None,
             env_degraded: false,
         };
-        let own = thegn_core::sandbox::container_name_with_profile(
-            "/wt/feat",
-            Some(&thegn_core::profile::name()),
-        );
+        let config_profile = "vim";
+        let own =
+            thegn_core::sandbox::container_name_for_config_profile("/wt/feat", config_profile);
         let mut containers = vec![
             container("thegn-foo", true, "podman"),
             container(&own, true, "podman"),
         ];
-        stamp_ownership(&mut containers, &[worktree]);
+        stamp_ownership(&mut containers, &[worktree], config_profile);
 
         assert!(!containers[1].ours);
         for action in ['s', 'r'] {

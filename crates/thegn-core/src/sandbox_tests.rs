@@ -1670,6 +1670,18 @@ fn container_name_with_profile_adds_slug() {
 }
 
 #[test]
+fn config_profile_container_name_matches_create_site_normalization() {
+    assert_eq!(
+        container_name_for_config_profile("/wt/feat", " vim "),
+        container_name_with_profile("/wt/feat", Some("vim"))
+    );
+    assert_eq!(
+        container_name_for_config_profile("/wt/feat", "   "),
+        container_name("/wt/feat")
+    );
+}
+
+#[test]
 fn owned_containers_need_the_exact_profile_name() {
     let worktree = OwnedContainers::new("default", [("/wt/feat", Some("podman"))]);
     let plain = container_name("/wt/feat");
@@ -1719,15 +1731,27 @@ fn stamp_only_lowers_ours() {
           {{"Names": ["registry"], "Image": "registry:2", "Status": "Up"}}
         ]"#
     ));
+    rows.push(ContainerInfo {
+        name: own.clone(),
+        image: "hand-built foreign".into(),
+        status: "Up".into(),
+        backend: "podman".into(),
+        ours: false,
+    });
     let owned = OwnedContainers::new("default", [("/wt/feat", Some("podman"))]);
     owned.stamp(&mut rows);
 
     assert_eq!(rows[0].name, own);
     assert!(rows[0].ours);
-    assert!(!rows[1].ours);
-    assert_eq!(rows[1].name, "registry");
-    assert!(!rows[2].ours);
-    assert_eq!(rows[2].name, "thegn-foo");
+    let registry = rows.iter().find(|row| row.name == "registry").unwrap();
+    assert!(!registry.ours);
+    let prefix_collision = rows.iter().find(|row| row.name == "thegn-foo").unwrap();
+    assert!(!prefix_collision.ours);
+    let preexisting_foreign = rows
+        .iter()
+        .find(|row| row.image == "hand-built foreign")
+        .unwrap();
+    assert!(!preexisting_foreign.ours);
 }
 
 #[test]
