@@ -256,16 +256,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{context} on {page_id} has no section heading"));
                 assert!(ordinal > 0, "{context} resolves to the page H1");
             } else if heading.is_none() {
-                const ACCEPTED_H1_FALLBACKS: &[&str] = &[
-                    "panel:changes",
-                    "panel:commits",
-                    "panel:branches",
-                    "panel:stash",
-                    "panel:files",
-                    "panel:sandbox",
-                    "panel:prq",
-                    "panel:keys",
-                ];
+                const ACCEPTED_H1_FALLBACKS: &[&str] = &[];
                 assert!(
                     ACCEPTED_H1_FALLBACKS.contains(&context.as_str()),
                     "{context} on {page_id} has no heading and is not an accepted H1 fallback"
