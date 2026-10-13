@@ -38,6 +38,7 @@ pub(crate) struct EnvVarGuard {
 impl EnvVarGuard {
     pub(crate) fn set(vars: &[(&str, &str)]) -> Self {
         let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ambient_roots = thegn_core::testenv::ambient_state_roots();
         let mut restore = Vec::with_capacity(vars.len());
         for (k, v) in vars {
             restore.push(((*k).to_string(), std::env::var_os(k)));
