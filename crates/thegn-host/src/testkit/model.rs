@@ -224,7 +224,8 @@ impl TestPanelState {
         self.nodes
             .iter()
             .filter(|node| node.kind == TestNodeKind::Test && node.state == TestState::Fail)
-            .filter_map(|node| seen.insert(node.id.clone()).then(|| node.id.clone()))
+            .filter(|node| seen.insert(node.id.clone()))
+            .map(|node| node.id.clone())
             .collect()
     }
 
@@ -927,7 +928,7 @@ mod tests {
         }
         assert_eq!(state.cursor, 0);
         let after = state.visible_indices();
-        assert!(after.len() > 0 && after.len() < before);
+        assert!(!after.is_empty() && after.len() < before);
         assert!(after.iter().all(|&index| {
             let node = &state.nodes[index];
             node.id.contains("alpha") || node.label.contains("alpha")
@@ -959,13 +960,15 @@ mod tests {
 
     #[test]
     fn failing_ids_lists_all_failures_once() {
-        let mut state = TestPanelState::default();
-        state.nodes = vec![
-            test_node("mod::a", TestState::Fail, None, None),
-            test_node("mod::a", TestState::Fail, None, None),
-            test_node("mod::b", TestState::Fail, None, None),
-            test_node("mod::pass", TestState::Pass, None, None),
-        ];
+        let state = TestPanelState {
+            nodes: vec![
+                test_node("mod::a", TestState::Fail, None, None),
+                test_node("mod::a", TestState::Fail, None, None),
+                test_node("mod::b", TestState::Fail, None, None),
+                test_node("mod::pass", TestState::Pass, None, None),
+            ],
+            ..TestPanelState::default()
+        };
         assert_eq!(
             state.failing_ids(),
             vec!["mod::a".to_string(), "mod::b".to_string()]
