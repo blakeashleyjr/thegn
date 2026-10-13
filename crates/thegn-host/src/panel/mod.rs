@@ -1185,6 +1185,9 @@ impl PanelUi {
         self.row_mode = false;
         self.chg_sel = None;
         self.impact_open = false;
+        if let Some(filter) = self.git.filter.as_mut() {
+            filter.editing = false;
+        }
     }
 
     /// Adopt a config-resolved order; the open section snaps to the first
@@ -2217,6 +2220,15 @@ mod tests {
             row_mode: true,
             cursor: 3,
             chg_sel: Some(1),
+            git: gitui::GitUi {
+                filter: Some(gitui::ListFilter {
+                    view: gitui::GitView::Files,
+                    query: "kept query".into(),
+                    editing: true,
+                    map: Vec::new(),
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         ui.reset_on_leave();
@@ -2228,6 +2240,9 @@ mod tests {
         assert_eq!(ui.open, Section::Pr);
         assert_eq!(ui.width, crate::layout::PanelWidth::Half);
         assert_eq!(ui.cursor, 3);
+        let filter = ui.git.filter.as_ref().unwrap();
+        assert!(!filter.editing);
+        assert_eq!(filter.query, "kept query");
     }
 
     #[test]

@@ -24628,16 +24628,24 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                if gitui::paste_filter(
+                    &mut panel_ui,
+                    want_panel && chrome.panel.is_some(),
+                    focus.panel(),
+                    &s,
+                    &model.panel,
+                ) {
+                    dirty = true;
+                    continue;
+                }
                 // A chrome text-input is collecting keystrokes (commit message /
-                // rename / new-branch overlay, the search palette, or the git
-                // filter line): a paste belongs to it, not the terminal. We
-                // don't inject into those fields yet, but we must not leak the
-                // paste into the pane sitting behind the overlay either.
+                // rename / new-branch overlay or the search palette): a paste
+                // belongs to it, not the terminal. We don't inject into those
+                // fields yet, but must not leak into the pane behind the overlay.
                 let chrome_text_input = git_input.is_some()
                     || host_input.is_some()
                     || palette.is_some()
-                    || search_replace.is_some()
-                    || panel_ui.git.filter.as_ref().is_some_and(|f| f.editing);
+                    || search_replace.is_some();
                 if chrome_text_input {
                     continue;
                 }

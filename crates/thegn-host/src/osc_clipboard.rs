@@ -101,16 +101,28 @@ impl Clipboard {
                     }
                 }
                 State::SkipString { escape } => {
-                    // DCS/APC/PM/SOS bodies may contain OSC-looking bytes or
-                    // BEL. Only ST ends these strings; their contents cannot
-                    // become top-level clipboard commands.
-                    self.state = if escape && byte == b'\\' {
-                        State::Text
+                    // CAN/SUB abort control strings. ESC followed by anything
+                    // except ST aborts the string and starts a fresh escape
+                    // sequence with the byte that followed ESC.
+                    if byte == 0x18 || byte == 0x1a || escape && byte == b'\\' {
+                        self.state = State::Text;
+                    } else if escape {
+                        // Process the byte after ESC through the same escape
+                        // transitions as a top-level sequence.
+                        self.state = match byte {
+                            b']' => {
+                                self.partial.extend_from_slice(b"\x1b]");
+                                State::Osc { escape: false }
+                            }
+                            b'P' | b'_' | b'^' | b'X' => State::SkipString { escape: false },
+                            0x1b => State::Escape,
+                            _ => State::Text,
+                        };
                     } else {
-                        State::SkipString {
+                        self.state = State::SkipString {
                             escape: byte == 0x1b,
-                        }
-                    };
+                        };
+                    }
                 }
                 State::Discard { escape } => {
                     self.state = if byte == 7 || escape && byte == b'\\' {
@@ -281,16 +293,43 @@ mod tests {
         assert!(c.has_pending());
     }
     #[test]
-    fn clipboard_sequences_inside_other_control_strings_are_not_admitted() {
+    fn control_string_bodies_without_esc_are_inert_and_esc_aborts_them() {
         for kind in b"P_^X" {
             let mut c = Clipboard::default();
             c.feed(&[0x1b, *kind]);
-            c.feed(b"payload\x1b]52;c;eA==\x07more\x1b]52;c;eQ==\x07\x1b");
+            // OSC-looking text and BEL remain inert until ST; an ESC would
+            // abort the control string and begin a new sequence.
+            c.feed(b"payload]52;c;eA==\x07more]52;c;eQ==\x07\x1b");
             assert!(!c.has_pending());
             c.feed(b"\\\x1b]52;c;eg==\x07");
             assert_eq!(
                 pending(&mut c).as_deref(),
                 Some(b"\x1b]52;c;eg==\x07".as_slice())
+            );
+        }
+
+        let mut c = Clipboard::default();
+        c.feed(b"\x1bPpayload\x1b]52;c;eA==\x07");
+        assert_eq!(
+            pending(&mut c).as_deref(),
+            Some(b"\x1b]52;c;eA==\x07".as_slice())
+        );
+    }
+
+    #[test]
+    fn aborted_apc_does_not_hide_following_osc52() {
+        for abort in [b"\x18".as_slice(), b"\x1b]".as_slice()] {
+            let mut c = Clipboard::default();
+            c.feed(b"\x1b_payload");
+            c.feed(abort);
+            if abort == b"\x1b]" {
+                c.feed(b"52;c;eA==\x07");
+            } else {
+                c.feed(b"\x1b]52;c;eA==\x07");
+            }
+            assert_eq!(
+                pending(&mut c).as_deref(),
+                Some(b"\x1b]52;c;eA==\x07".as_slice())
             );
         }
     }

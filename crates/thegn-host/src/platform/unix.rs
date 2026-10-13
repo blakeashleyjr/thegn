@@ -733,6 +733,12 @@ impl GroupHandle {
         .ok();
     }
 
+    /// Relinquish ownership without signalling the group. Unix groups have no
+    /// kill-on-drop behavior, so dropping this handle already detaches them.
+    pub fn detach(&self) -> bool {
+        true
+    }
+
     /// Whether the owned process group has no live members. This is an
     /// observation only; the handle never signals by a potentially reused ID.
     pub fn is_empty(&self) -> bool {
