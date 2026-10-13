@@ -8,9 +8,72 @@
 //! cache (no network).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use termwiz::terminal::TerminalWaker;
 use thegn_core::store::{CacheStore, WorktreeAuxStore};
+
+const BUSY_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+struct BusyRetry {
+    pending: Mutex<Option<(PathBuf, Instant)>>,
+}
+
+impl BusyRetry {
+    fn new() -> Self {
+        Self {
+            pending: Mutex::new(None),
+        }
+    }
+
+    fn record(&self, path: PathBuf, now: Instant) {
+        *self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path, now));
+    }
+
+    fn take(&self, now: Instant) -> Option<PathBuf> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.as_ref().is_some_and(|(_, recorded)| {
+            now.saturating_duration_since(*recorded) >= BUSY_RETRY_DELAY
+        }) {
+            pending.take().map(|(path, _)| path)
+        } else {
+            None
+        }
+    }
+}
+
+fn busy_retry() -> &'static BusyRetry {
+    static RETRY: OnceLock<BusyRetry> = OnceLock::new();
+    RETRY.get_or_init(BusyRetry::new)
+}
+
+pub(crate) fn take_busy_retry(now: Instant) -> Option<PathBuf> {
+    busy_retry().take(now)
+}
+
+fn tracker_failures() -> &'static Mutex<HashMap<String, String>> {
+    static FAILURES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn tracker_load(rows: Result<usize, ()>, failure: Option<&str>) -> crate::panel::gitui::DocLoad {
+    use crate::panel::gitui::DocLoad;
+
+    match rows {
+        Err(()) => DocLoad::Failed("issue cache unreadable".to_string()),
+        Ok(count) if count > 0 => DocLoad::Ready,
+        Ok(_) => failure.map_or(DocLoad::Pending, |message| {
+            DocLoad::Failed(message.to_string())
+        }),
+    }
+}
 
 /// A refresh request waiting behind the currently admitted pass for one repo.
 struct RefreshRequest {
@@ -121,9 +184,11 @@ pub(crate) fn spawn_issue_cache_refresh(
     app_cfg: thegn_core::config::Config,
     waker: Option<TerminalWaker>,
 ) {
+    let retry_path = cwd.clone();
     match request_issue_refresh(cwd, app_cfg, waker, None) {
         RefreshStart::Started | RefreshStart::Coalesced => {}
         RefreshStart::Busy => {
+            busy_retry().record(retry_path, Instant::now());
             tracing::debug!(target: "thegn::tracker", "issue cache refresh admission refused");
         }
     }
@@ -319,7 +384,26 @@ fn run_once(request: RefreshRequest) {
             cfg.filter_assignee_me,
         );
     }
-    if changed && let Some(w) = &waker {
+    let failure_only = !any_success && !failures.is_empty();
+    if failure_only {
+        if let Some((_, message)) = failures.first() {
+            tracker_failures()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    cwd.to_string_lossy().into_owned(),
+                    safe_report_text(message),
+                );
+        }
+    } else if any_success {
+        tracker_failures()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&cwd.to_string_lossy().into_owned());
+    }
+    if (changed || failure_only)
+        && let Some(w) = &waker
+    {
         let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     }
     if let Some(report) = report.as_ref() {
@@ -519,7 +603,17 @@ pub(crate) fn populate_tracker(
     app_cfg: &thegn_core::config::Config,
     panel: &mut crate::panel::PanelData,
 ) {
-    if let Ok(cached) = db.get_all_issue_cache(repo_key) {
+    let cached = db.get_all_issue_cache(repo_key);
+    let load = tracker_load(
+        cached.as_ref().map(|rows| rows.len()).map_err(|_| ()),
+        tracker_failures()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(repo_key)
+            .map(String::as_str),
+    );
+    panel.tracker_load = load;
+    if let Ok(cached) = cached {
         for (_provider, json) in cached {
             if let Ok(mut issues) = serde_json::from_str::<Vec<thegn_core::issue::Issue>>(&json) {
                 issues.retain(|issue| thegn_svc::issue::validate_issue_identity(issue).is_ok());
@@ -539,9 +633,41 @@ pub(crate) fn populate_tracker(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_REPORT_ENTRY_CHARS, RefreshCoalescer, RefreshGuard, format_refresh_report,
-        prepare_tracker_toast_message, safe_report_text,
+        BusyRetry, MAX_REPORT_ENTRY_CHARS, RefreshCoalescer, RefreshGuard, format_refresh_report,
+        prepare_tracker_toast_message, safe_report_text, tracker_load,
     };
+
+    #[test]
+    fn tracker_load_decides_pending_ready_failed() {
+        use crate::panel::gitui::DocLoad;
+
+        assert_eq!(tracker_load(Ok(0), None), DocLoad::Pending);
+        assert_eq!(
+            tracker_load(Ok(0), Some("offline")),
+            DocLoad::Failed("offline".into())
+        );
+        assert_eq!(tracker_load(Ok(1), Some("offline")), DocLoad::Ready);
+        assert_eq!(
+            tracker_load(Err(()), None),
+            DocLoad::Failed("issue cache unreadable".into())
+        );
+    }
+
+    #[test]
+    fn busy_refresh_is_retried_once_after_backoff() {
+        use std::path::PathBuf;
+        use std::time::{Duration, Instant};
+
+        let retry = BusyRetry::new();
+        let now = Instant::now();
+        retry.record(PathBuf::from("/repo"), now);
+        assert_eq!(retry.take(now + Duration::from_secs(1)), None);
+        assert_eq!(
+            retry.take(now + Duration::from_secs(2)),
+            Some(PathBuf::from("/repo"))
+        );
+        assert_eq!(retry.take(now + Duration::from_secs(3)), None);
+    }
 
     #[test]
     fn coalesces_to_the_latest_request_and_releases_the_key() {
