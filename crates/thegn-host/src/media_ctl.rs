@@ -31,6 +31,7 @@ static MEDIA_OP_OUTCOME: Mutex<Option<MediaOpOutcome>> = Mutex::new(None);
 pub(crate) enum MediaOpOutcome {
     Stale,
     Refused(&'static str),
+    Unsupported,
     Failed,
     TimedOut,
     Busy,
@@ -43,6 +44,7 @@ impl MediaOpOutcome {
             Self::Refused("shuffle") => "Media operation needs known shuffle state",
             Self::Refused("loop") => "Media operation needs known loop state",
             Self::Refused(_) => "Media operation was refused",
+            Self::Unsupported => "This player does not support that control",
             Self::Failed => "Media operation failed",
             Self::TimedOut => "Media operation timed out",
             Self::Busy => "Media controls are busy",
@@ -322,6 +324,25 @@ pub(crate) enum MediaOp {
     FullscreenToggle,
 }
 
+fn op_supported(
+    op: &MediaOp,
+    caps: &thegn_core::media::MediaCaps,
+    state: Option<&thegn_core::media::MediaState>,
+) -> bool {
+    match op {
+        MediaOp::ShuffleToggle => caps.shuffle,
+        MediaOp::LoopCycle => caps.loop_mode,
+        MediaOp::VolumeUp | MediaOp::VolumeDown => caps.volume,
+        MediaOp::SeekForward | MediaOp::SeekBack => {
+            caps.seek && state.is_none_or(|state| state.can_seek)
+        }
+        MediaOp::PlayQueueItem(_) => caps.queue,
+        MediaOp::ChapterNext | MediaOp::ChapterPrev => caps.chapters,
+        MediaOp::FullscreenToggle => caps.fullscreen,
+        MediaOp::PlayPause | MediaOp::Next | MediaOp::Previous => true,
+    }
+}
+
 /// An async result that opens a secondary media picker palette.
 pub(crate) enum MediaPick {
     Playlists(Vec<thegn_core::media::Playlist>),
@@ -425,6 +446,15 @@ pub(crate) fn spawn_media_op(
             let cur_state = cur.as_ref().map(|snapshot| &snapshot.state);
             if !generation_is_current(captured_generation, &generation_guard, &MEDIA_OP_OUTCOME) {
                 pulse(&outcome_waker);
+                return;
+            }
+            let caps = cur
+                .as_ref()
+                .map(|snapshot| snapshot.caps)
+                .unwrap_or_else(|| client.caps());
+            if !op_supported(&op, &caps, cur_state) {
+                tracing::debug!(target: "thegn::media", op = ?op, "media operation is unsupported by the selected player");
+                publish_outcome(MediaOpOutcome::Unsupported, &outcome_waker);
                 return;
             }
             let res = match op {
@@ -536,6 +566,11 @@ pub(crate) fn spawn_media_playlist(
                     pulse(&outcome_waker);
                     return;
                 }
+                if !client.caps().playlists {
+                    tracing::debug!(target: "thegn::media", playlist = %id, "playlist activation is unsupported by the selected player");
+                    publish_outcome(MediaOpOutcome::Unsupported, &outcome_waker);
+                    return;
+                }
                 if let Err(e) = client.activate_playlist(&id).await {
                     tracing::warn!(target: "thegn::media", error = %e, "playlist {id} activation failed");
                     publish_outcome(MediaOpOutcome::Failed, &outcome_waker);
@@ -638,13 +673,66 @@ pub(crate) fn spawn_media_sources(
 #[cfg(test)]
 mod tests {
     use super::{
-        MediaGeneration, MediaOpOutcome, MediaPreflightError, chain_op, chain_op_with_outcome,
-        delivery_from_read, generation_is_current, loop_target, record_refusal, replace_in_flight,
-        shuffle_target, take_outcome, within_media_budget,
+        MediaGeneration, MediaOp, MediaOpOutcome, MediaPreflightError, chain_op,
+        chain_op_with_outcome, delivery_from_read, generation_is_current, loop_target,
+        op_supported, record_refusal, replace_in_flight, shuffle_target, take_outcome,
+        within_media_budget,
     };
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
-    use thegn_core::media::{LoopMode, MediaSnapshot, MediaState};
+    use thegn_core::media::{LoopMode, MediaCaps, MediaSnapshot, MediaState};
+
+    #[test]
+    fn capability_gated_operations_follow_player_caps() {
+        let gated: [(MediaOp, fn(&mut MediaCaps)); 10] = [
+            (MediaOp::ShuffleToggle, |caps| caps.shuffle = true),
+            (MediaOp::LoopCycle, |caps| caps.loop_mode = true),
+            (MediaOp::VolumeUp, |caps| caps.volume = true),
+            (MediaOp::VolumeDown, |caps| caps.volume = true),
+            (MediaOp::SeekForward, |caps| caps.seek = true),
+            (MediaOp::SeekBack, |caps| caps.seek = true),
+            (MediaOp::PlayQueueItem("queue-id".into()), |caps| {
+                caps.queue = true
+            }),
+            (MediaOp::ChapterNext, |caps| caps.chapters = true),
+            (MediaOp::ChapterPrev, |caps| caps.chapters = true),
+            (MediaOp::FullscreenToggle, |caps| caps.fullscreen = true),
+        ];
+        let seekable = MediaState {
+            can_seek: true,
+            ..MediaState::default()
+        };
+        for (op, enable) in gated {
+            assert!(
+                !op_supported(&op, &MediaCaps::default(), Some(&seekable)),
+                "{op:?}"
+            );
+            let mut caps = MediaCaps::default();
+            enable(&mut caps);
+            assert!(op_supported(&op, &caps, Some(&seekable)), "{op:?}");
+        }
+        let seek_caps = MediaCaps {
+            seek: true,
+            ..MediaCaps::default()
+        };
+        assert!(!op_supported(
+            &MediaOp::SeekForward,
+            &seek_caps,
+            Some(&MediaState::default())
+        ));
+        for op in [MediaOp::PlayPause, MediaOp::Next, MediaOp::Previous] {
+            assert!(op_supported(&op, &MediaCaps::default(), None));
+        }
+    }
+
+    #[test]
+    fn unsupported_outcome_has_distinct_user_text() {
+        assert!(!MediaOpOutcome::Unsupported.status_text().is_empty());
+        assert_ne!(
+            MediaOpOutcome::Unsupported.status_text(),
+            MediaOpOutcome::Refused("shuffle").status_text()
+        );
+    }
 
     #[test]
     fn failed_post_operation_read_produces_no_delivery() {
