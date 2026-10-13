@@ -1733,9 +1733,25 @@ mod tests {
             &["config", "commit.gpgsign", "false"],
             &["commit", "--allow-empty", "-q", "-m", "init"],
         ] {
-            assert!(util::git_cmd(&dir).args(args).status().unwrap().success());
+            assert!(test_git_cmd(&dir).args(args).status().unwrap().success());
         }
         dir
+    }
+
+    fn test_git_cmd(dir: &Path) -> std::process::Command {
+        let mut command = util::git_cmd(dir);
+        command
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0");
+        command
+    }
+
+    fn test_git_out(dir: &Path, args: &[&str]) -> String {
+        let output = test_git_cmd(dir).args(args).output().unwrap();
+        assert!(output.status.success(), "git {:?} failed", args);
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
     /// Run the worker synchronously with the wizard decisions pre-queued
@@ -1857,23 +1873,38 @@ mod tests {
         reason = "Git fixture commands are confined to a temporary repository"
     )]
     fn exact_branch_creation_tracks_the_requested_remote_branch() {
-        let _env = crate::testenv::EnvVarGuard::set(&[("GIT_CONFIG_GLOBAL", "/dev/null")]);
+        let _env = crate::testenv::EnvVarGuard::set(&[
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+        ]);
         let repo = temp_repo("exact-branch");
+        let remote = tempfile::tempdir().unwrap();
         assert!(
-            util::git_cmd(&repo)
-                .args([
-                    "remote",
-                    "add",
-                    "origin",
-                    "https://example.invalid/acme/app.git"
-                ])
+            test_git_cmd(remote.path())
+                .args(["init", "--bare", "-q"])
                 .status()
                 .unwrap()
                 .success()
         );
         assert!(
-            util::git_cmd(&repo)
-                .args(["update-ref", "refs/remotes/origin/feature/login", "HEAD"])
+            test_git_cmd(&repo)
+                .args(["remote", "add", "origin"])
+                .arg(format!("file://{}", remote.path().display()))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let head = test_git_out(&repo, &["rev-parse", "HEAD"]);
+        assert!(
+            test_git_cmd(remote.path())
+                .args(["update-ref", "refs/heads/feature/login", &head])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            test_git_cmd(&repo)
+                .args(["update-ref", "refs/remotes/origin/feature/login", &head])
                 .status()
                 .unwrap()
                 .success()
@@ -1896,18 +1927,18 @@ mod tests {
         let created = expect_done(&events);
         assert_eq!(created.branch, "feature/login");
         assert_eq!(
-            util::git_out(
+            test_git_out(
                 Path::new(&created.path),
                 &["config", "branch.feature/login.remote"],
             ),
-            Some("origin".into())
+            "origin"
         );
         assert_eq!(
-            util::git_out(
+            test_git_out(
                 Path::new(&created.path),
                 &["config", "branch.feature/login.merge"],
             ),
-            Some("refs/heads/feature/login".into())
+            "refs/heads/feature/login"
         );
     }
 
