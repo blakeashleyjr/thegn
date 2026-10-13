@@ -1,0 +1,8 @@
+# Panel key reachability debt: <Section> <chord> <kind>.
+# Shrink-only; regenerate with THEGN_RATCHET_UPDATE=1 cargo test -p thegn-host panel_key_reachability_ratchet.
+# Pr git-key debt is owned by pr-section (L03 / THE issue for that lane).
+
+Pr A git-key
+Pr c git-key
+Pr o git-key
+Pr r git-key

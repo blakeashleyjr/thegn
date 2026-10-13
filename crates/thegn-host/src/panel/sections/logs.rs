@@ -152,7 +152,7 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         ("y", "copy"),
         ("a", "tail"),
         ("g", if all { "this repo" } else { "all" }),
-        ("E", "export"),
+        ("w", "export"),
     ]));
 
     rows
@@ -263,7 +263,7 @@ fn full_view(ctx: &SectionCtx, items: &[&ParsedLog], all: bool) -> Vec<PanelRow>
         ("y", "copy"),
         ("Y", "copy all"),
         ("a", "tail"),
-        ("E", "export"),
+        ("w", "export"),
     ]));
     rows
 }

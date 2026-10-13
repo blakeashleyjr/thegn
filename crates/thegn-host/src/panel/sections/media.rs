@@ -577,6 +577,11 @@ mod tests {
             ('p', MediaAction::Previous),
             ('s', MediaAction::Shuffle),
             ('L', MediaAction::Loop),
+            ('+', MediaAction::VolumeUp),
+            ('-', MediaAction::VolumeDown),
+            (']', MediaAction::ChapterNext),
+            ('[', MediaAction::ChapterPrev),
+            ('f', MediaAction::Fullscreen),
         ] {
             assert_eq!(
                 crate::media_panel::action_for_key(&termwiz::input::KeyCode::Char(key)),
@@ -584,5 +589,60 @@ mod tests {
             );
             assert_eq!(PanelHit::MediaAction(action), PanelHit::MediaAction(action));
         }
+        for (key, action) in [
+            (
+                termwiz::input::KeyCode::RightArrow,
+                MediaAction::SeekForward,
+            ),
+            (termwiz::input::KeyCode::LeftArrow, MediaAction::SeekBack),
+        ] {
+            assert_eq!(crate::media_panel::action_for_key(&key), Some(action));
+            assert_eq!(PanelHit::MediaAction(action), PanelHit::MediaAction(action));
+        }
+    }
+
+    #[test]
+    fn every_painted_media_key_is_a_keyboard_key() {
+        use termwiz::input::KeyCode;
+
+        let source = include_str!("media.rs");
+        let mut rest = source;
+        let mut found = 0;
+        while let Some(pos) = rest.find("action(\"") {
+            rest = &rest[pos + "action(".len()..];
+            let end = rest.find(')').expect("action call closes");
+            let call = &rest[..end];
+            let literals: Vec<&str> = call
+                .split('"')
+                .enumerate()
+                .filter(|(index, _)| index % 2 == 1)
+                .map(|(_, literal)| literal)
+                .collect();
+            let key = *literals.get(1).expect("painted action has a key label");
+            let variant = call
+                .split("MediaAction::")
+                .nth(1)
+                .expect("painted action has a MediaAction")
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .next()
+                .unwrap();
+            let code = match key {
+                "space" => KeyCode::Char(' '),
+                "right" => KeyCode::RightArrow,
+                "left" => KeyCode::LeftArrow,
+                chord => {
+                    let mut chars = chord.chars();
+                    let key = chars.next().expect("painted key is not empty");
+                    assert!(chars.next().is_none(), "unsupported painted key {chord:?}");
+                    KeyCode::Char(key)
+                }
+            };
+            let actual = crate::media_panel::action_for_key(&code)
+                .expect("every painted Media key must work on the keyboard");
+            assert_eq!(format!("{actual:?}"), variant, "{key}");
+            found += 1;
+            rest = &rest[end + 1..];
+        }
+        assert!(found > 0, "the Media renderer still paints action rows");
     }
 }
