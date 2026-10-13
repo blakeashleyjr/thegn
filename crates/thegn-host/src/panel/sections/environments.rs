@@ -99,16 +99,12 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
                 .with_hit(PanelHit::Row(Section::Environments, i)),
         );
     }
-    let selected = envs.get(ctx.ui.cursor);
-    let enter_hint = selected
-        .map(|env| if env.bound { "bound" } else { "rebind here" })
-        .unwrap_or("rebind here");
-    let mut hints = vec![("enter", enter_hint)];
-    if selected.is_some_and(|env| env.placement == "provider") {
-        hints.push(("t", "test"));
-    }
-    hints.extend([("x", "remove"), ("n", "new…")]);
-    rows.push(hint_row(&hints));
+    rows.push(hint_row(&[
+        ("enter", "bind here"),
+        ("t", "test"),
+        ("x", "remove"),
+        ("n", "new…"),
+    ]));
     if let Some(toolchain) = &ctx.model.panel.toolchain {
         rows.push(PanelRow::plain(Line::segs(vec![seg(
             d(),
@@ -116,82 +112,4 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         )])));
     }
     rows
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::chrome::FrameModel;
-    use crate::layout::PanelWidth;
-    use crate::panel::{PanelData, PanelUi};
-
-    fn row_text(row: &PanelRow) -> String {
-        match &row.line {
-            Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
-                l.iter().chain(r).map(|part| part.text.as_str()).collect()
-            }
-            Line::Segs(parts) => parts.iter().map(|part| part.text.as_str()).collect(),
-            Line::Blank | Line::Fill { .. } => String::new(),
-        }
-    }
-
-    #[test]
-    fn hints_follow_selected_environment_binding_and_provider_scope() {
-        let model = FrameModel {
-            panel: PanelData {
-                environments: vec![
-                    EnvSnapshot {
-                        name: "local".into(),
-                        kind: "local".into(),
-                        placement: "local".into(),
-                        region: String::new(),
-                        size: String::new(),
-                        bound: false,
-                        token: None,
-                    },
-                    EnvSnapshot {
-                        name: "provider".into(),
-                        kind: "provider".into(),
-                        placement: "provider".into(),
-                        region: String::new(),
-                        size: String::new(),
-                        bound: true,
-                        token: Some(true),
-                    },
-                ],
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let local_ui = PanelUi {
-            open: Section::Environments,
-            width: PanelWidth::Normal,
-            cursor: 0,
-            ..Default::default()
-        };
-        let local_rows = content(&SectionCtx {
-            model: &model,
-            ui: &local_ui,
-            cols: 80,
-            rows: 20,
-        });
-        let local_hints = row_text(local_rows.last().expect("local hints are rendered"));
-        assert!(local_hints.contains("rebind here"), "{local_hints}");
-        assert!(!local_hints.contains("test"), "{local_hints}");
-
-        let provider_ui = PanelUi {
-            cursor: 1,
-            ..local_ui
-        };
-        let provider_rows = content(&SectionCtx {
-            model: &model,
-            ui: &provider_ui,
-            cols: 80,
-            rows: 20,
-        });
-        let provider_hints = row_text(provider_rows.last().expect("provider hints are rendered"));
-        assert!(provider_hints.contains("bound"), "{provider_hints}");
-        assert!(provider_hints.contains("test"), "{provider_hints}");
-    }
 }
