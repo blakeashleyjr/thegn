@@ -1464,7 +1464,8 @@ pub fn strip_vpn_suffix(name: &str) -> &str {
 }
 
 /// One running container, as listed by the OCI runtime — feeds the panel's
-/// SANDBOXES section. `ours` marks thegn-created (prefix-named) ones.
+/// SANDBOXES section. `ours` is a prefix-based candidate until the host stamps
+/// it against this profile's known worktrees and observed backends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerInfo {
     pub name: String,
@@ -1492,6 +1493,62 @@ fn container_info(name: String, image: String, status: String, backend: &str) ->
         net: String::new(),
         containment: "worktree+caches".into(),
         mounts: String::new(),
+    }
+}
+
+/// Proven container identities for worktrees known to one thegn profile.
+///
+/// Listing parsers only mark names with the thegn prefix as candidates. The
+/// host uses this set to lower that candidate bit unless both the exact
+/// profile-aware name and the backend match a known worktree.
+#[derive(Debug, Clone, Default)]
+pub struct OwnedContainers {
+    identities: Vec<(String, Option<Backend>)>,
+}
+
+impl OwnedContainers {
+    /// Build identities from worktree paths and their last observed backends.
+    /// Backends that cannot list OCI containers do not establish ownership.
+    pub fn new<'a>(
+        profile: &str,
+        worktrees: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    ) -> Self {
+        let identities = worktrees
+            .into_iter()
+            .flat_map(|(path, observed)| {
+                let backend = observed.and_then(Backend::parse).filter(|backend| {
+                    matches!(
+                        backend,
+                        Backend::Podman | Backend::PodmanRootful | Backend::Docker
+                    )
+                });
+                let base = container_name_with_profile(path, Some(profile));
+                [
+                    (base.clone(), backend),
+                    (vpn_sidecar_name(&base), backend),
+                    (agent_container_name(&base), backend),
+                ]
+            })
+            .collect();
+        Self { identities }
+    }
+
+    /// Whether an exact container name is proven on the same parsed OCI backend.
+    pub fn owns(&self, name: &str, backend: &str) -> bool {
+        let Some(backend) = Backend::parse(backend) else {
+            return false;
+        };
+        self.identities.iter().any(|(known_name, known_backend)| {
+            known_name == name && *known_backend == Some(backend)
+        })
+    }
+
+    /// Lower prefix candidates that are not proven, then keep the listing order.
+    pub fn stamp(&self, rows: &mut [ContainerInfo]) {
+        for row in rows.iter_mut() {
+            row.ours = row.ours && self.owns(&row.name, &row.backend);
+        }
+        rows.sort_by_key(|row| (!row.ours, row.name.clone()));
     }
 }
 
