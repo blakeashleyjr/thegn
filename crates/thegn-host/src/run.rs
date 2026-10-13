@@ -8666,8 +8666,11 @@ async fn event_loop<T: Terminal>(
         if muse_ready
             && pending_ready_marker.is_pending()
             && !pending_preview_oob.is_pending()
-            && !pending_corner_oob.is_pending()
+            && !pending_corner_oob.blocks_output(corner_visible)
             && !pending_clipboard_oob.is_pending()
+            && !dirty
+            && !full_repaint
+            && dirty_panes.is_empty()
         {
             let input_pending = crate::frame_write::pty_input_pending(buf, &mut pending_input);
             pending_ready_marker.retry(input_pending, |bytes| writer.try_submit_oob(bytes));
@@ -14605,7 +14608,7 @@ async fn event_loop<T: Terminal>(
                     &mut pending_ready_marker,
                     |bytes| {
                         if pending_preview_oob.is_pending()
-                            || pending_corner_oob.is_pending()
+                            || pending_corner_oob.blocks_output(false)
                             || pending_clipboard_oob.is_pending()
                         {
                             Err(bytes)

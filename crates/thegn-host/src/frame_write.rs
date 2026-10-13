@@ -102,7 +102,7 @@ pub(crate) fn emit_muse_ready_marker<T: Terminal>(
     buf: &mut BufferedTerminal<T>,
     pending_input: &mut VecDeque<InputEvent>,
     marker: &mut crate::preview_retry::PendingReadyMarker,
-    mut submit: impl FnMut(Vec<u8>) -> Result<(), Vec<u8>>,
+    submit: impl FnMut(Vec<u8>) -> Result<(), Vec<u8>>,
 ) {
     if pty_input_pending(buf, pending_input) {
         marker.cancel();
