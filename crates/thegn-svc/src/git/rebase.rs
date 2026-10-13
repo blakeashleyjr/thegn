@@ -171,6 +171,16 @@ fn rebase_with_todo(
     todo: &[TodoEntry],
     opts: &RebaseOpts,
 ) -> Result<RebaseOutcome> {
+    if let Some(entry) = todo.iter().find(|entry| entry.action.is_commit())
+        && matches!(
+            &entry.action,
+            TodoAction::Squash | TodoAction::Fixup | TodoAction::FixupC
+        )
+    {
+        bail!(
+            "cannot squash/fixup the first commit of the range: it has no previous commit — nothing was changed"
+        );
+    }
     // Guard the todo-build → rebase-apply window: `git rebase -i <base>` operates
     // on the CURRENT `base..HEAD`, but the todo was built from an earlier snapshot
     // (possibly under a separate lock). If a commit landed on the branch in
@@ -370,8 +380,10 @@ pub trait RebaseOps: GitBackend {
         rebase_with_todo(loc, base, todo, opts)
     }
 
-    /// Once-off: retag `targets` (squash/fixup/drop/edit) and rebase. The
-    /// todo spans from the oldest target's parent to HEAD.
+    /// Once-off: retag `targets` (squash/fixup/drop/edit) and rebase. For
+    /// squash/fixup, the range includes the commit the oldest target folds
+    /// into; when `oldest_sha` is itself a target, the range starts at its
+    /// parent's parent.
     fn rebase_retag(
         &self,
         loc: &GitLoc,
@@ -380,7 +392,39 @@ pub trait RebaseOps: GitBackend {
         action: TodoAction,
         opts: &RebaseOpts,
     ) -> Result<RebaseOutcome> {
-        let base = base_for(loc, oldest_sha)?;
+        let is_fold = matches!(
+            &action,
+            TodoAction::Squash | TodoAction::Fixup | TodoAction::FixupC
+        );
+        let is_target = if is_fold {
+            let oldest_id = run_read(
+                loc,
+                &["rev-parse", "--verify", &format!("{oldest_sha}^{{commit}}")],
+            )?;
+            let mut found = false;
+            for target in targets {
+                let target_id = run_read(
+                    loc,
+                    &["rev-parse", "--verify", &format!("{target}^{{commit}}")],
+                )?;
+                if target_id.trim() == oldest_id.trim() {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        } else {
+            false
+        };
+        let base = if is_target {
+            let parent = base_for(loc, oldest_sha)?;
+            if parent == "--root" {
+                bail!("cannot squash/fixup the root commit: it has no previous commit");
+            }
+            base_for(loc, &parent)?
+        } else {
+            base_for(loc, oldest_sha)?
+        };
         let todo = todo_for(loc, &base)?;
         let todo = retag(&todo, targets, action)?;
         rebase_with_todo(loc, &base, &todo, opts)
@@ -558,10 +602,9 @@ pub trait RebaseOps: GitBackend {
         };
         let head_name = read_rebase_marker(loc, "rebase-merge/head-name")?
             .ok_or_else(|| anyhow!("rebase state is unreadable: missing head-name"))?;
-        let done = read_rebase_marker(loc, "rebase-merge/done")?
-            .ok_or_else(|| anyhow!("rebase state is unreadable: missing done todo"))?;
         let remaining = read_rebase_marker(loc, "rebase-merge/git-rebase-todo")?
             .ok_or_else(|| anyhow!("rebase state is unreadable: missing pending todo"))?;
+        let done = read_rebase_marker(loc, "rebase-merge/done")?.unwrap_or_default();
         let text = |b: Option<Vec<u8>>| {
             b.map(|b| String::from_utf8_lossy(&b).trim().to_string())
                 .unwrap_or_default()
@@ -818,6 +861,30 @@ mod tests {
     }
 
     #[test]
+    fn rebase_status_before_first_command_reports_empty_done() {
+        let r = linear("rebase-status-no-done");
+        let c2 = r.sha_of("c2");
+        let c3 = r.sha_of("c3");
+        let rel = r.out(&["rev-parse", "--git-path", "rebase-merge"]);
+        let rebase_dir = r.dir.join(rel.trim());
+        std::fs::create_dir_all(&rebase_dir).unwrap();
+        std::fs::write(rebase_dir.join("onto"), format!("{c2}\n")).unwrap();
+        std::fs::write(rebase_dir.join("head-name"), "refs/heads/main\n").unwrap();
+        std::fs::write(
+            rebase_dir.join("git-rebase-todo"),
+            format!("pick {c3} c3\n"),
+        )
+        .unwrap();
+
+        let status = CliGit
+            .rebase_status(&r.loc())
+            .unwrap()
+            .expect("rebase markers indicate an active rebase");
+        assert!(status.done.is_empty());
+        assert_eq!(status.remaining.len(), 1);
+    }
+
+    #[test]
     fn unreadable_remote_rebase_marker_is_an_error_not_absence() {
         let r = repo("unreadable-remote-rebase-marker");
         let loc = GitLoc::provider(vec!["env".into()], r.dir.to_string_lossy());
@@ -887,6 +954,106 @@ mod tests {
             files.contains("f2.txt") && files.contains("f3.txt"),
             "{files}"
         );
+    }
+
+    #[test]
+    fn fixup_of_head_folds_into_its_parent() {
+        let r = linear("fixup-head-target");
+        let c4 = r.sha_of("c4");
+        assert_eq!(
+            CliGit
+                .rebase_retag(&r.loc(), &c4, &[&c4], TodoAction::Fixup, &opts())
+                .unwrap(),
+            RebaseOutcome::Done
+        );
+        assert_eq!(r.subjects(), ["c3", "c2", "c1"]);
+        let files = touched(&r, &r.sha_of("c3"));
+        assert!(
+            files.contains("f3.txt") && files.contains("f4.txt"),
+            "{files}"
+        );
+        let rebase_dir = r.out(&["rev-parse", "--git-path", "rebase-merge"]);
+        assert!(!r.dir.join(rebase_dir.trim()).exists());
+    }
+
+    #[test]
+    fn squash_of_head_folds_into_its_parent() {
+        let r = linear("squash-head-target");
+        let c4 = r.sha_of("c4");
+        assert_eq!(
+            CliGit
+                .rebase_retag(&r.loc(), &c4, &[&c4], TodoAction::Squash, &opts())
+                .unwrap(),
+            RebaseOutcome::Done
+        );
+        assert_eq!(r.subjects(), ["c3", "c2", "c1"]);
+        let files = touched(&r, &r.sha_of("c3"));
+        assert!(
+            files.contains("f3.txt") && files.contains("f4.txt"),
+            "{files}"
+        );
+        let rebase_dir = r.out(&["rev-parse", "--git-path", "rebase-merge"]);
+        assert!(!r.dir.join(rebase_dir.trim()).exists());
+    }
+
+    #[test]
+    fn squash_of_root_commit_is_refused_without_touching_the_repo() {
+        let r = linear("squash-root-target");
+        let c1 = r.sha_of("c1");
+        let head = r.head();
+        let error = CliGit
+            .rebase_retag(&r.loc(), &c1, &[&c1], TodoAction::Squash, &opts())
+            .unwrap_err();
+        assert!(error.to_string().contains("root commit"), "{error}");
+        assert_eq!(r.head(), head);
+        let rebase_dir = r.out(&["rev-parse", "--git-path", "rebase-merge"]);
+        assert!(!r.dir.join(rebase_dir.trim()).exists());
+    }
+
+    #[test]
+    fn squash_target_with_merge_parent_is_refused_without_starting_rebase() {
+        let r = repo("squash-merge-parent");
+        r.commit_file("base.txt", "base\n", "base");
+        r.out(&["checkout", "-q", "-b", "topic"]);
+        r.commit_file("topic.txt", "topic\n", "topic");
+        r.out(&["checkout", "-q", "main"]);
+        r.commit_file("main.txt", "main\n", "main");
+        r.out(&["merge", "--no-ff", "topic", "-m", "merge"]);
+        r.commit_file("child.txt", "child\n", "child");
+        let child = r.sha_of("child");
+        let head = r.head();
+
+        let error = CliGit
+            .rebase_retag(&r.loc(), &child, &[&child], TodoAction::Squash, &opts())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("merge commits cannot be rebased here")
+        );
+        assert_eq!(r.head(), head);
+        let rebase_dir = r.out(&["rev-parse", "--git-path", "rebase-merge"]);
+        assert!(!r.dir.join(rebase_dir.trim()).exists());
+    }
+
+    #[test]
+    fn todo_starting_with_squash_is_refused_before_git_runs() {
+        let r = linear("squash-first-todo");
+        let c2 = r.sha_of("c2");
+        let c3 = r.sha_of("c3");
+        let c4 = r.sha_of("c4");
+        let base = base_for(&r.loc(), &c3).unwrap();
+        let todo = parse_todo(&format!("squash {c3} c3\npick {c4} c4\n"));
+        let head = r.head();
+
+        let error = CliGit
+            .rebase_interactive(&r.loc(), &base, &todo, &opts())
+            .unwrap_err();
+        assert!(error.to_string().contains("first commit"), "{error}");
+        assert_eq!(r.head(), head);
+        assert_eq!(r.sha_of("c2"), c2);
+        let rebase_dir = r.out(&["rev-parse", "--git-path", "rebase-merge"]);
+        assert!(!r.dir.join(rebase_dir.trim()).exists());
     }
 
     #[test]
