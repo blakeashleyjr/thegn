@@ -74,19 +74,19 @@ off banner when its feature is unavailable.
 
 **work**
 
-| Section    | Shows                                                                 |
-| ---------- | --------------------------------------------------------------------- |
-| `mine`     | one feed of everything assigned to you: issues, review requests, PRs  |
-| `across`   | failing CI for the active project (`a` widens), grouped by worktree   |
-| `pr`       | PR state, CI check rollup, review decision for this branch            |
-| `ci`       | run history and per-run state across providers                        |
-| `merge`    | the local merge queue — per-branch land/defer status                  |
-| `prq`      | the PR queue — queued pull requests on the forge and what blocks them |
-| `issues`   | tracker issues                                                        |
-| `problems` | compiler, linter, and test diagnostics                                |
-| `jobs`     | configured shell jobs (build, test, run)                              |
-| `tests`    | test results and the pass/fail rollup                                 |
-| `symbols`  | the LSP / tree-sitter outline for the selected file                   |
+| Section    | Shows                                                                |
+| ---------- | -------------------------------------------------------------------- |
+| `mine`     | one feed of everything assigned to you: issues, review requests, PRs |
+| `across`   | failing CI for the active project (`a` widens), grouped by worktree  |
+| `pr`       | PR state, CI check rollup, review decision for this branch           |
+| `ci`       | run history and per-run state across providers                       |
+| `merge`    | the local merge queue — per-branch land/defer status                 |
+| `prq`      | PR queue (hidden until `[pr_queue] enabled = true`)                  |
+| `issues`   | tracker issues                                                       |
+| `problems` | compiler, linter, and test diagnostics                               |
+| `jobs`     | configured shell jobs (build, test, run)                             |
+| `tests`    | test results and the pass/fail rollup                                |
+| `symbols`  | the LSP / tree-sitter outline for the selected file                  |
 
 **system**
 
@@ -247,8 +247,8 @@ notification when its evidence-ready message appears. The cache policy is contro
 off by default and can suggest or safely hand a verified failure to the
 existing PR-queue agent. The action rechecks PR context, head, agent policy,
 and attempt budget off-loop, and fails closed if any check no longer holds.
-In the popup, **r** reruns failed jobs, **R** reruns all jobs, and **c**
-cancels; cancellation asks for a second press.
+In the section and in its popup, **r** reruns failed jobs, **R** reruns all
+jobs, and **c** cancels after a second press.
 
 ### merge — the local merge queue
 
