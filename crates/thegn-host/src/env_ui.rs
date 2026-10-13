@@ -81,6 +81,13 @@ pub(crate) fn bind_decision(env: &EnvSnapshot, worktree: &str) -> BindDecision {
     }
 }
 
+fn already_bound_status(env: &EnvSnapshot) -> String {
+    format!(
+        "env '{}' is already this worktree's effective env",
+        env.name
+    )
+}
+
 pub(crate) fn bind_env_blocking(
     db: &thegn_core::db::Db,
     worktree: &str,
@@ -190,7 +197,7 @@ pub fn panel_key(
                     model.status = "no active worktree to bind (open one first)".into();
                 }
                 BindDecision::AlreadyBound => {
-                    model.status = format!("env '{}' is already bound to this worktree", env.name);
+                    model.status = already_bound_status(&env);
                 }
                 BindDecision::Bind => {
                     model.status = format!("binding env '{}'…", env.name);
@@ -370,6 +377,24 @@ mod tests {
         };
         assert_eq!(bind_decision(&env, "/wt"), BindDecision::AlreadyBound);
         assert_eq!(bind_decision(&env, ""), BindDecision::NoWorktree);
+    }
+
+    #[test]
+    fn already_bound_status_describes_the_effective_env() {
+        let env = EnvSnapshot {
+            name: "dev".into(),
+            kind: "local".into(),
+            placement: "local".into(),
+            region: String::new(),
+            size: String::new(),
+            bound: true,
+            token: None,
+        };
+
+        assert_eq!(
+            already_bound_status(&env),
+            "env 'dev' is already this worktree's effective env"
+        );
     }
 
     #[test]
