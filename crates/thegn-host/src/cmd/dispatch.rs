@@ -33,6 +33,9 @@ use thegn_core::pipeline_run::{self, WaitTarget};
 use thegn_core::store::NotificationStore;
 use thegn_core::util::{git_ok, git_out_allow_empty};
 
+/// Bound the active roster rows examined by the CLI reaper.
+const CLI_REAP_ROW_LIMIT: usize = 4096;
+
 #[derive(clap::Subcommand, Clone)]
 pub enum Action {
     /// List the dispatch roster (newest first).
@@ -1534,16 +1537,28 @@ pub(crate) fn reap_plan(
     Vec<pipeline_reap::Reap>,
     HashMap<i64, thegn_core::issue::DispatchRunRef>,
 )> {
-    let rows: Vec<_> = db
-        .list_dispatches()?
-        .into_iter()
-        .filter(|r| {
-            matches!(
-                r.status,
-                AgentDispatchStatus::Spawning | AgentDispatchStatus::Running
-            )
-        })
-        .collect();
+    let (plan, run_refs, truncated) = reap_plan_limited(db, live_ids, CLI_REAP_ROW_LIMIT)?;
+    if truncated {
+        thegn_core::msg::warn(&format!(
+            "dispatch reap plan covers only the oldest {CLI_REAP_ROW_LIMIT} active rows; re-run after --apply to continue"
+        ));
+    }
+    Ok((plan, run_refs))
+}
+
+fn reap_plan_limited(
+    db: &Db,
+    live_ids: Option<&[String]>,
+    limit: usize,
+) -> Result<(
+    Vec<pipeline_reap::Reap>,
+    HashMap<i64, thegn_core::issue::DispatchRunRef>,
+    bool,
+)> {
+    let (rows, truncated) = db.list_dispatches_with_status(
+        &[AgentDispatchStatus::Spawning, AgentDispatchStatus::Running],
+        limit,
+    )?;
     let run_refs = db
         .running_dispatch_run_refs()?
         .into_iter()
@@ -1556,7 +1571,7 @@ pub(crate) fn reap_plan(
         })
         .map(|run| (run.id, run))
         .collect();
-    Ok((reap_plan_rows(&rows, live_ids), run_refs))
+    Ok((reap_plan_rows(&rows, live_ids), run_refs, truncated))
 }
 
 /// Plan from a caller-owned row snapshot. The periodic daemon uses this form
@@ -1947,15 +1962,20 @@ pub(crate) fn read_status(
     all: bool,
     json: bool,
 ) -> Result<()> {
-    let mut rows = db.list_dispatches()?;
-    if let Some(id) = row {
-        rows.retain(|r| r.id == id);
-        if rows.is_empty() {
-            anyhow::bail!("no dispatch with id {id}");
+    let rows = if let Some(id) = row {
+        match db.get_dispatch(id)? {
+            Some(row) => vec![row],
+            None => {
+                anyhow::bail!("no dispatch with id {id}");
+            }
         }
-    } else if !all {
-        rows.retain(|d| d.status.is_active());
-    }
+    } else {
+        let mut rows = db.list_dispatches()?;
+        if !all {
+            rows.retain(|d| d.status.is_active());
+        }
+        rows
+    };
 
     let row_mode = row.is_some();
     let mut notes_map: HashMap<i64, Vec<DispatchNote>> = HashMap::new();
@@ -3750,6 +3770,43 @@ mod tests {
             &plan[0].verdict,
             pipeline_reap::ReapVerdict::MarkFailed { .. }
         ));
+    }
+
+    #[test]
+    fn reap_plan_is_limited_to_oldest_active_rows_and_reports_truncation() {
+        let (_dir, db) = db("reap-plan-limit");
+        let oldest = put(
+            &db,
+            NewDispatch {
+                session_id: Some("old-session"),
+                ..NewDispatch::new("linear:THE-259-old", "/unused", "worker")
+            },
+        )
+        .unwrap();
+        db.update_dispatch_status(oldest.id, AgentDispatchStatus::Running)
+            .unwrap();
+        let newer = put(
+            &db,
+            NewDispatch {
+                session_id: Some("new-session"),
+                ..NewDispatch::new("linear:THE-259-new", "/unused", "worker")
+            },
+        )
+        .unwrap();
+        db.update_dispatch_status(newer.id, AgentDispatchStatus::Running)
+            .unwrap();
+
+        let (plan, _run_refs, truncated) = reap_plan_limited(&db, None, 1).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].id, oldest.id);
+        assert!(truncated, "the second active row must set truncation");
+    }
+
+    #[test]
+    fn status_missing_row_keeps_the_exact_id_error() {
+        let (_dir, db) = db("status-missing-row-error");
+        let err = read_status(&db, Some(9876), None, false, false).unwrap_err();
+        assert_eq!(err.to_string(), "no dispatch with id 9876");
     }
 
     #[test]

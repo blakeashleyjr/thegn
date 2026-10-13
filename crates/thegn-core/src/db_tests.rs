@@ -6,6 +6,39 @@ use crate::store::{
 };
 use rusqlite::params;
 
+static BACKGROUND_WORKER_NAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn record_background_worker_name() {
+    if let Some(name) = std::thread::current().name() {
+        BACKGROUND_WORKER_NAMES
+            .lock()
+            .unwrap()
+            .push(name.to_string());
+    }
+}
+
+#[test]
+fn semantic_sweep_enters_the_installed_background_worker_hook() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("thegn.db");
+    set_background_worker_hook(record_background_worker_name);
+    let _db = Db::open_at(&path).unwrap();
+
+    spawn_semantic_sweep(path)
+        .unwrap()
+        .join()
+        .expect("semantic sweep worker joins");
+
+    assert!(
+        BACKGROUND_WORKER_NAMES
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|name| name == "thegn-sem-prune"),
+        "the host hook must run on the named semantic prune thread"
+    );
+}
+
 #[test]
 fn semantic_sweep_pages_until_all_missing_file_rows_are_removed() {
     use crate::semantic::EntityKind;

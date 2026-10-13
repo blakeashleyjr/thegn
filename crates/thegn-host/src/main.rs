@@ -931,6 +931,7 @@ fn run_main() -> anyhow::Result<()> {
     // owns the screen), writes a best-effort crash report, and prints a notice.
     // See `thegn_core::log_trace::install_panic_hook`.
     thegn_core::log_trace::install_panic_hook();
+    thegn_core::db::set_background_worker_hook(background_qos);
 
     // Parse through the grouped-help wrapper (cli_help) so top-level --help
     // renders commands under semantic headings; behavior is otherwise
@@ -1126,6 +1127,10 @@ fn run_main() -> anyhow::Result<()> {
     // down its alternate screen and maps Retryable to exit 2. Returning here
     // also lets the runtime, profile lock, and other guards unwind normally.
     result
+}
+
+fn background_qos() {
+    crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
 }
 
 /// Admit this process's configuration (see `config_startup`), mapping a
