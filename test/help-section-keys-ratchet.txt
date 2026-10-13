@@ -1,18 +1,12 @@
-# help-section-keys-ratchet — real section keys omitted from section_keys tables.
-# These entries shrink when section_keys starts advertising them.
-# Environments: `t` tests provider env tokens but is absent from ENVIRONMENTS.
+# help-section-keys-ratchet — `panel:<section>:<chord>` prose entries
+# containing real chords omitted from the subsection's section tables. Shrink only.
+# notifications A and /; logs Y; environments t; media + - [ ] f; PR queue h.
 panel:environments:t
-# Logs: `Y` copies every visible line but is absent from LOGS.
 panel:logs:Y
-# Media volume: `+` and `-` adjust volume but are absent from MEDIA.
 panel:media:+
 panel:media:-
-# Media chapters/fullscreen: `[` and `]` skip chapters; `f` toggles fullscreen.
 panel:media:[
 panel:media:]
 panel:media:f
-# Notifications: `A` shows read rows and `/` searches; neither is in its hint table.
 panel:notifications:/
 panel:notifications:A
-# PR queue: `h` invokes the configured handoff but is omitted from its hint table.
-panel:prq:h
