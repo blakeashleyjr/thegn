@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use gtui_core::datasource::QueryError;
 use gtui_core::frame::{Field, FieldType, Frame};
