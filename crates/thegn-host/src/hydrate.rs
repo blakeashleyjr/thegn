@@ -4734,6 +4734,7 @@ fn pr_search_row(
         issue_id: None,
         branch_hint: None,
         worktree_path: None,
+        repo_root: None,
     }
 }
 
@@ -4873,6 +4874,7 @@ pub(crate) fn spawn_my_work_refresh(
                         issue_id: Some(i.id),
                         branch_hint: i.branch_hint,
                         worktree_path: None,
+                        repo_root: None,
                     });
                 }
             }
@@ -4945,6 +4947,117 @@ pub(crate) fn spawn_my_work_refresh(
                     },
                     ..Default::default()
                 });
+            }
+        }
+
+        // Repo-local links and roots are display/action metadata, sampled off
+        // the event loop alongside the feed itself.
+        if let Ok(db) = thegn_core::db::Db::open() {
+            match db.issue_link_worktrees() {
+                Ok(links) => {
+                    let mut newest = std::collections::HashMap::new();
+                    for (issue_id, path) in links {
+                        newest.entry(issue_id).or_insert(path);
+                    }
+                    for row in &mut rows {
+                        if let Some(path) = row.issue_id.as_ref().and_then(|id| newest.get(id)) {
+                            row.worktree_path = Some(path.clone());
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(target: "thegn::db", %error, "issue link lookup failed")
+                }
+            }
+            match db.worktrees() {
+                Ok(worktrees) => {
+                    let roots: std::collections::HashMap<String, String> = worktrees
+                        .into_iter()
+                        .filter(|wt| Path::new(&wt.repo_root).is_dir())
+                        .map(|wt| (wt.worktree, wt.repo_root))
+                        .collect();
+                    for row in &mut rows {
+                        if let Some(root) =
+                            row.worktree_path.as_ref().and_then(|path| roots.get(path))
+                        {
+                            row.repo_root = Some(root.clone());
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(target: "thegn::db", %error, "worktree repo lookup failed")
+                }
+            }
+            if all {
+                match db.workspaces() {
+                    Ok(workspaces) => {
+                        let local: Vec<(String, thegn_core::forge::model::ForgeRepoIdentity)> =
+                            workspaces
+                                .into_iter()
+                                .filter(|ws| ws.kind == "repo" && Path::new(&ws.repo_path).is_dir())
+                                .filter_map(|ws| {
+                                    let origin = thegn_core::remote::GitLoc::for_worktree(
+                                        Path::new(&ws.repo_path),
+                                    )
+                                    .origin_url()
+                                    .unwrap_or_default();
+                                    let identity =
+                                        thegn_core::forge::model::repo_identity_from_remote_url(
+                                            &origin,
+                                        )?;
+                                    Some((ws.repo_path, identity))
+                                })
+                                .collect();
+                        let github_issue_identity = |url: &str| {
+                            let rest = url
+                                .strip_prefix("https://")
+                                .or_else(|| url.strip_prefix("http://"))?;
+                            let (host, path) = rest.split_once('/')?;
+                            let parts: Vec<&str> = path.split('/').collect();
+                            if parts.len() < 4
+                                || parts[2] != "issues"
+                                || parts[3].parse::<u64>().is_err()
+                            {
+                                return None;
+                            }
+                            thegn_core::forge::model::repo_identity_from_remote_url(&format!(
+                                "https://{host}/{}/{}",
+                                parts[0], parts[1]
+                            ))
+                        };
+                        for row in &mut rows {
+                            let expected = match row.kind {
+                                WorkKind::Pr => {
+                                    thegn_core::forge::model::repo_identity_from_pr_url(&row.url)
+                                }
+                                WorkKind::Issue if row.provider == "github" => {
+                                    github_issue_identity(&row.url)
+                                }
+                                _ => None,
+                            };
+                            if row.repo_root.is_none()
+                                && let Some(expected) = expected
+                            {
+                                let mut matches = local
+                                    .iter()
+                                    .filter(|(_, identity)| identity.matches(&expected));
+                                if let Some((path, _)) = matches.next()
+                                    && matches.next().is_none()
+                                {
+                                    row.repo_root = Some(path.clone());
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::db", %error, "workspace lookup failed")
+                    }
+                }
+            }
+        }
+        if !all {
+            for row in &mut rows {
+                row.repo_root = Some(repo_root.to_string_lossy().into_owned());
             }
         }
 

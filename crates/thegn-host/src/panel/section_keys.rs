@@ -71,7 +71,7 @@ const fn nav(chord: &'static str, label: &'static str) -> SectionKey {
 
 const MINE: &[SectionKey] = &[
     nav("j/k", "row"),
-    nav("↵", "open"),
+    nav("↵", "go"),
     k('b', "b", "branch"),
     k('o', "o", "browser"),
     k('a', "a", "all repos"),
@@ -83,12 +83,12 @@ const ACROSS: &[SectionKey] = &[
     k('a', "a", "all workspaces"),
 ];
 const PR: &[SectionKey] = &[
-    nav("j/k", "row"),
     danger('M', "M", "merge"),
     k('A', "A", "approve"),
     k('c', "c", "comment"),
     k('r', "r", "rerun"),
     k('o', "o", "browser"),
+    k('w', "w", "worktree"),
 ];
 const TESTS: &[SectionKey] = &[
     k('r', "r", "run"),
@@ -141,8 +141,8 @@ const ISSUES: &[SectionKey] = &[
     k('D', "D", "dispatch"),
 ];
 const NOTIFICATIONS: &[SectionKey] = &[
-    nav("j/k", "row"),
-    nav("↵", "expand"),
+    nav("↵", "jump"),
+    k(' ', "space", "expand"),
     // `x`, not `r` — the old hint advertised a key that did nothing. Labels
     // match the section body's own hint row: `x` marks read, `d` DELETES.
     k('x', "x", "read"),

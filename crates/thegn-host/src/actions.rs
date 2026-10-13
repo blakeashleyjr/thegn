@@ -1267,6 +1267,7 @@ pub(crate) fn spawn_pr_view_fetch(
     owner: String,
     repo: String,
     number: u64,
+    target: thegn_core::forge::PrRef,
     branch: String,
     head_oid: String,
     generation: u64,
@@ -1282,14 +1283,18 @@ pub(crate) fn spawn_pr_view_fetch(
         let wt = active_tab_path(&session);
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
         let cache_key = thegn_core::remote::GitLoc::worktree_cache_key(&wt);
-        let cached = thegn_core::db::Db::open()
-            .ok()
-            .and_then(|db| db.get_pr_review_cache(&cache_key).ok().flatten())
-            .filter(|snapshot| {
-                snapshot.branch == branch
-                    && snapshot.pr_number == number
-                    && snapshot.head_oid == head_oid
-            });
+        let cached = (target == thegn_core::forge::PrRef::Current)
+            .then(|| {
+                thegn_core::db::Db::open()
+                    .ok()
+                    .and_then(|db| db.get_pr_review_cache(&cache_key).ok().flatten())
+                    .filter(|snapshot| {
+                        snapshot.branch == branch
+                            && snapshot.pr_number == number
+                            && snapshot.head_oid == head_oid
+                    })
+            })
+            .flatten();
         let forges = crate::forge_handle::get();
         let forge = forges.for_loc(&loc);
         let repo_ref = thegn_core::forge::RepoRef { owner, repo };
@@ -1300,7 +1305,7 @@ pub(crate) fn spawn_pr_view_fetch(
                 None
             }
         };
-        let diff = match forge.pr_diff(&loc, thegn_core::forge::PrRef::Current) {
+        let diff = match forge.pr_diff(&loc, target) {
             Ok(d) => Some(d),
             Err(e) => {
                 tracing::warn!(target: "thegn::panel", error = %e, "PR diff fetch failed; the view opens without it");
@@ -1308,28 +1313,35 @@ pub(crate) fn spawn_pr_view_fetch(
             }
         };
         let live_complete = conversation.is_some() && diff.is_some();
-        let review = match (conversation, diff) {
-            (Some(conversation), Some(diff)) => {
-                let snapshot = thegn_core::review::PrReviewSnapshot {
-                    worktree_key: cache_key,
-                    branch,
-                    pr_number: number,
-                    head_oid,
-                    fetched_at: thegn_core::util::now(),
-                    conversation,
-                    diff,
-                };
-                // Branch/head are filled by the panel identity in the loop;
-                // an incomplete identity is intentionally not cached or
-                // presented as a current snapshot.
-                Some(snapshot)
+        let review = if target == thegn_core::forge::PrRef::Current {
+            match (conversation.clone(), diff.clone()) {
+                (Some(conversation), Some(diff)) => {
+                    let snapshot = thegn_core::review::PrReviewSnapshot {
+                        worktree_key: cache_key,
+                        branch,
+                        pr_number: number,
+                        head_oid,
+                        fetched_at: thegn_core::util::now(),
+                        conversation,
+                        diff,
+                    };
+                    // Branch/head are filled by the panel identity in the loop;
+                    // an incomplete identity is intentionally not cached or
+                    // presented as a current snapshot.
+                    Some(snapshot)
+                }
+                _ => cached.clone(),
             }
-            _ => cached.clone(),
+        } else {
+            None
         };
         let data = PrViewData {
             generation,
-            conversation: review.as_ref().map(|r| r.conversation.clone()),
-            diff: review.as_ref().map(|r| r.diff.clone()),
+            conversation: review
+                .as_ref()
+                .map(|r| r.conversation.clone())
+                .or(conversation),
+            diff: review.as_ref().map(|r| r.diff.clone()).or(diff),
             review,
             review_status: if live_complete {
                 None
@@ -1342,7 +1354,8 @@ pub(crate) fn spawn_pr_view_fetch(
         // A complete remote result is delivered to the modal. The identity
         // fields are stamped by the caller's current PR facts before the
         // cache write, so a transient/partial fetch leaves the old row intact.
-        if live_complete
+        if target == thegn_core::forge::PrRef::Current
+            && live_complete
             && let Some(snapshot) = data
                 .review
                 .clone()
@@ -1401,6 +1414,7 @@ pub(crate) fn open_pr_view(
             v.owner.clone(),
             v.repo.clone(),
             v.number,
+            v.target,
             v.branch.clone(),
             v.head_sha.clone(),
             *gen_ctr,
@@ -1411,6 +1425,41 @@ pub(crate) fn open_pr_view(
         );
     }
     Some(v)
+}
+
+pub(crate) struct PrViewOpenCtx<'a> {
+    pub session: &'a Session,
+    pub gen_ctr: &'a mut u64,
+    pub tx: &'a UnboundedSender<PrViewData>,
+    pub waker: &'a TerminalWaker,
+    pub refresh_tx: &'a UnboundedSender<RefreshKind>,
+}
+
+pub(crate) fn open_pr_view_number(
+    owner: String,
+    repo: String,
+    number: u64,
+    url: String,
+    wiring: PrViewOpenCtx<'_>,
+) -> PrView {
+    *wiring.gen_ctr += 1;
+    let mut view = PrView::for_number(owner, repo, number, url);
+    view.generation = *wiring.gen_ctr;
+    spawn_pr_view_fetch(
+        wiring.session.clone(),
+        view.owner.clone(),
+        view.repo.clone(),
+        view.number,
+        view.target,
+        view.branch.clone(),
+        view.head_sha.clone(),
+        *wiring.gen_ctr,
+        wiring.tx,
+        wiring.waker,
+        wiring.refresh_tx,
+        None,
+    );
+    view
 }
 
 /// Re-kick the open view's fetch (after a write) so new comments/reviews show.
@@ -1433,6 +1482,7 @@ pub(crate) fn refetch_pr_view(
             v.owner.clone(),
             v.repo.clone(),
             v.number,
+            v.target,
             v.branch.clone(),
             v.head_sha.clone(),
             *gen_ctr,
@@ -1465,11 +1515,19 @@ pub(crate) fn dispatch_pr_view_key(
         PrViewOutcome::Close => *view = None,
         PrViewOutcome::Pending => {}
         PrViewOutcome::ConfirmMerge => {
-            let blockers = pr_merge_blockers(&model.panel);
-            *active_menu = Some(crate::menu::pr_merge_menu(v.number, &blockers));
-            model.status = "confirm PR merge".into();
+            if let Some(message) = crate::pr_view::pr_view_write_refusal(v) {
+                model.status = message.into();
+            } else {
+                let blockers = pr_merge_blockers(&model.panel);
+                *active_menu = Some(crate::menu::pr_merge_menu(v.number, &blockers));
+                model.status = "confirm PR merge".into();
+            }
         }
         PrViewOutcome::Act(crate::pr_view::PrViewAction::Handoff(selection)) => {
+            if let Some(message) = crate::pr_view::pr_view_write_refusal(v) {
+                model.status = message.into();
+                return;
+            }
             if matches!(
                 crate::review_handoff::target(session, panes, cfg),
                 crate::review_handoff::PaneTarget::Headless { .. }
@@ -1483,7 +1541,15 @@ pub(crate) fn dispatch_pr_view_key(
                 );
             }
         }
-        PrViewOutcome::Act(action) => run_pr_view_action(session, refresh_tx, waker, model, action),
+        PrViewOutcome::Act(action) => {
+            if matches!(&action, crate::pr_view::PrViewAction::OpenUrl(_)) {
+                run_pr_view_action(session, refresh_tx, waker, model, action);
+            } else if let Some(message) = crate::pr_view::pr_view_write_refusal(v) {
+                model.status = message.into();
+            } else {
+                run_pr_view_action(session, refresh_tx, waker, model, action);
+            }
+        }
         PrViewOutcome::OpenInIde { path, line, note } => {
             dispatch_ide_location(
                 session,
