@@ -1084,9 +1084,9 @@ fn db_path() -> PathBuf {
 fn refuse_real_state_write(_path: &Path) {
     #[cfg(any(test, feature = "test-utils"))]
     {
-        let real_state = util::home().join(".local/state");
+        let ambient = crate::testenv::ambient_state_roots();
         assert!(
-            !_path.starts_with(&real_state),
+            !crate::testenv::is_real_state_path(_path, &util::home(), ambient),
             "THE-744: refusing test write to real state path {}",
             _path.display()
         );
