@@ -40,6 +40,14 @@ pub enum GitOp {
         indices: Vec<(usize, usize)>,
         target: StageTarget,
     },
+    /// First line-stage operation on an untracked file. Intent-to-add and
+    /// validation against the read-only synthesized diff happen atomically on
+    /// the mutation worker before selected lines enter the index.
+    StageUntrackedLines {
+        path: String,
+        synth_diff: String,
+        indices: Vec<(usize, usize)>,
+    },
     DiscardLines {
         path: String,
         diff: String,
@@ -238,6 +246,7 @@ impl GitOp {
                 ..
             } => "staging lines",
             GitOp::StageLines { .. } => "unstaging lines",
+            GitOp::StageUntrackedLines { .. } => "staging lines",
             GitOp::DiscardLines { .. } => "discarding lines",
             GitOp::StageFile { unstage: false, .. } => "staging",
             GitOp::StageFile { .. } => "unstaging",
@@ -378,6 +387,7 @@ fn touches_index(op: &GitOp) -> bool {
     matches!(
         op,
         GitOp::StageLines { .. }
+            | GitOp::StageUntrackedLines { .. }
             | GitOp::StageFile { .. }
             | GitOp::IntentToAdd { .. }
             | GitOp::StageAll
@@ -455,6 +465,34 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
                     GitOpResult::Ok(Some(format!("{verb} {n} line(s) in {path}")))
                 }
                 Err(e) => GitOpResult::Err(first_line(&e)),
+            }
+        }
+        GitOp::StageUntrackedLines {
+            path,
+            synth_diff,
+            indices,
+        } => {
+            let res = (|| -> Result<()> {
+                g.intent_to_add(loc, &path)?;
+                let current = g.unstaged_diff(loc, &path)?;
+                let body = |diff: &str| {
+                    crate::panel::staging::build(&path, diff)
+                        .lines
+                        .into_iter()
+                        .filter(|line| !line.is_header)
+                        .map(|line| (line.kind, line.text))
+                        .collect::<Vec<_>>()
+                };
+                if body(&current) != body(&synth_diff) {
+                    anyhow::bail!("file changed while staging; refetched");
+                }
+                g.stage_lines(loc, &current, &selection_of(&indices))
+            })();
+            match res {
+                Ok(()) => {
+                    GitOpResult::Ok(Some(format!("staged {} line(s) in {path}", indices.len())))
+                }
+                Err(error) => GitOpResult::Err(first_line(&error)),
             }
         }
         GitOp::DiscardLines {
@@ -860,6 +898,74 @@ mod tests {
         if let Err(error) = std::fs::remove_dir_all(&dir) {
             tracing::debug!(target: "thegn::gitmut::tests", %error, "failed to remove jj mutation test repo");
         }
+    }
+
+    #[test]
+    fn execute_stage_untracked_lines_intent_adds_then_stages_selected() {
+        use thegn_svc::git::{GitBackend, StageOps};
+
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        git_out(dir, &["init", "-q", "-b", "main"]);
+        git_out(dir, &["config", "user.name", "test"]);
+        git_out(dir, &["config", "user.email", "t@example.invalid"]);
+        std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+        git_out(dir, &["add", "base.txt"]);
+        git_out(dir, &["commit", "-q", "-m", "base"]);
+
+        std::fs::write(dir.join("new.txt"), "a\nb\nc\n").unwrap();
+        let loc = GitLoc::Local(dir.to_path_buf());
+        let synth_diff = CliGit.untracked_diff(&loc, "new.txt").unwrap();
+        assert!(git_out(dir, &["status", "--porcelain"]).contains("?? new.txt"));
+        let parsed = thegn_core::patch::parse_patch(&synth_diff);
+        let indices = parsed
+            .first()
+            .into_iter()
+            .flat_map(|file| {
+                file.hunks.iter().enumerate().flat_map(|(hunk, part)| {
+                    part.lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| {
+                            line.kind == thegn_core::patch::LineKind::Add && line.text == "b"
+                        })
+                        .map(move |(line, _)| (hunk, line))
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(indices.len(), 1, "{synth_diff}");
+        match execute(
+            GitOp::StageUntrackedLines {
+                path: "new.txt".into(),
+                synth_diff,
+                indices,
+            },
+            &loc,
+            false,
+        ) {
+            GitOpResult::Ok(_) => {}
+            other => panic!("{other:?}"),
+        }
+        let cached = git_out(dir, &["diff", "--cached", "--", "new.txt"]);
+        assert!(cached.lines().any(|line| line == "+b"), "{cached}");
+        assert!(!cached.lines().any(|line| line == "+a"), "{cached}");
+        assert!(!cached.lines().any(|line| line == "+c"), "{cached}");
+
+        std::fs::write(dir.join("changed.txt"), "before\n").unwrap();
+        let stale = CliGit.untracked_diff(&loc, "changed.txt").unwrap();
+        std::fs::write(dir.join("changed.txt"), "after\n").unwrap();
+        assert!(matches!(
+            execute(
+                GitOp::StageUntrackedLines {
+                    path: "changed.txt".into(),
+                    synth_diff: stale,
+                    indices: vec![(0, 0)],
+                },
+                &loc,
+                false,
+            ),
+            GitOpResult::Err(message) if message.contains("file changed while staging; refetched")
+        ));
     }
 
     #[test]

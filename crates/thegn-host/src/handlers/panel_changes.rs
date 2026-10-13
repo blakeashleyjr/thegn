@@ -88,7 +88,8 @@ pub(crate) struct ChangesActivateCtx<'a> {
 /// the expanded semantic breakdown (`cursor > changes.len()`) drills into its
 /// definition; the **semantic footer** (`cursor == changes.len()`) toggles the
 /// breakdown and widens a resting panel so it's readable; any other **file** row
-/// toggles its inline diff preview.
+/// toggles its summary preview. A plain file row is reserved for the git
+/// staging drill dispatched by the row-mode key handler.
 pub(crate) fn select_changes_row(ctx: ChangesActivateCtx<'_>) {
     let cursor = ctx.panel_ui.cursor;
     // Boundaries in the VISIBLE cursor space (collapsed merge-incoming rows
@@ -143,6 +144,16 @@ pub(crate) fn select_changes_row(ctx: ChangesActivateCtx<'_>) {
     }
 
     let on_footer = cursor == n;
+    if cursor < n
+        && ctx
+            .model
+            .panel
+            .changes
+            .get(cursor)
+            .is_some_and(|row| row.submodule.is_none())
+    {
+        return;
+    }
     toggle_change_selection(
         cursor,
         n,
@@ -166,6 +177,57 @@ pub(crate) fn select_changes_row(ctx: ChangesActivateCtx<'_>) {
         ctx.panel_ui.remember_width();
         *ctx.need_relayout = true;
     }
+}
+
+/// Keep the inline preview on the keyboard cursor at Half width. At the
+/// resting width the staging-first interaction has no inline preview.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn follow_change_cursor(
+    panel_ui: &mut crate::panel::PanelUi,
+    model: &FrameModel,
+    session: &Session,
+    hunk_inflight: &mut PreviewOwners,
+    hunk_tx: &tokio::sync::mpsc::UnboundedSender<crate::run::HunkMsg>,
+    submodule_inflight: &mut PreviewOwners,
+    submodule_tx: &tokio::sync::mpsc::UnboundedSender<SubmodulePreviewMsg>,
+    waker: &termwiz::terminal::TerminalWaker,
+    generation: u64,
+) {
+    match follow_change_cursor_target(panel_ui, model) {
+        Some(None) => panel_ui.chg_sel = None,
+        Some(Some(cursor)) => toggle_change_selection(
+            cursor,
+            crate::panel::visible_change_files(&model.panel, true),
+            panel_ui,
+            model,
+            session,
+            hunk_inflight,
+            hunk_tx,
+            submodule_inflight,
+            submodule_tx,
+            waker,
+            generation,
+        ),
+        None => {}
+    }
+}
+
+fn follow_change_cursor_target(
+    panel_ui: &crate::panel::PanelUi,
+    model: &FrameModel,
+) -> Option<Option<usize>> {
+    if panel_ui.open != crate::panel::Section::Changes {
+        return None;
+    }
+    if panel_ui.width == crate::layout::PanelWidth::Normal {
+        return Some(None);
+    }
+    if panel_ui.width != crate::layout::PanelWidth::Half || !panel_ui.row_mode {
+        return None;
+    }
+    let visible = crate::panel::visible_change_files(&model.panel, true);
+    (panel_ui.cursor < visible && panel_ui.chg_sel != Some(panel_ui.cursor))
+        .then_some(Some(panel_ui.cursor))
 }
 
 /// Activate row `i` of the changes section.
@@ -347,7 +409,7 @@ fn submodule_loc(
 
 #[cfg(test)]
 mod tests {
-    use super::PreviewOwners;
+    use super::{PreviewOwners, follow_change_cursor_target};
 
     #[test]
     fn duplicate_path_owner_is_refused_until_completed() {
@@ -367,5 +429,25 @@ mod tests {
         assert!(!owners.finish("src/lib.rs", stale));
         assert_eq!(owners.begin("src/lib.rs"), None);
         assert!(owners.finish("src/lib.rs", current));
+    }
+
+    #[test]
+    fn follow_change_cursor_selects_at_half_only() {
+        let mut model = FrameModel::default();
+        model.panel.changes.push(crate::panel::ChangeRow {
+            path: "f.rs".into(),
+            ..Default::default()
+        });
+        let mut ui = crate::panel::PanelUi {
+            open: crate::panel::Section::Changes,
+            width: crate::layout::PanelWidth::Half,
+            row_mode: true,
+            ..Default::default()
+        };
+        assert_eq!(follow_change_cursor_target(&ui, &model), Some(Some(0)));
+        ui.width = crate::layout::PanelWidth::Full;
+        assert_eq!(follow_change_cursor_target(&ui, &model), None);
+        ui.width = crate::layout::PanelWidth::Normal;
+        assert_eq!(follow_change_cursor_target(&ui, &model), Some(None));
     }
 }
