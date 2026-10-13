@@ -67,12 +67,13 @@ fn remove_scratch_worktree(repo_root: &Path, scratch: ScratchDirectory) {
         tracing::warn!(target: "thegn::integrate", path, %error, "scratch worktree cleanup failed; preserving it for repair");
         return;
     }
+    let admin_path = registration.path().to_path_buf();
     if let Err(error) = registration.remove() {
         gate_runner::record_external_quarantine(
-            scratch.path(),
+            &admin_path,
             "scratch worktree registration cleanup failed",
         );
-        tracing::warn!(target: "thegn::integrate", path, %error, "scratch worktree registration cleanup failed; preserving it for repair");
+        tracing::warn!(target: "thegn::integrate", path, admin_path = %admin_path.display(), %error, "scratch worktree registration cleanup failed; preserving registration for repair");
     }
 }
 

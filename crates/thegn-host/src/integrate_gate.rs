@@ -415,6 +415,10 @@ pub(super) struct ScratchRegistration {
 }
 
 impl ScratchRegistration {
+    pub(super) fn path(&self) -> &Path {
+        self.admin.path()
+    }
+
     pub(super) fn remove(self) -> Result<()> {
         self.admin.remove_tree()?;
         Ok(())
@@ -833,8 +837,8 @@ impl Workspace {
         self.checkout.verify(Some(&self.oid))
     }
 
-    // No `#[expect(clippy::disallowed_methods)]` here: the blocking child wait
-    // lives inside `gate_git_ok`, so this body only touches the filesystem.
+    // Cleanup is filesystem-only: descriptor-relative `remove_tree` calls
+    // remove the temporary checkout and registration without spawning a child.
     fn cleanup(&self) -> Result<()> {
         let Some(parent) = &self.temporary_parent else {
             return Ok(());
