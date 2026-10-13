@@ -11,7 +11,8 @@ use thegn_core::pipeline_report::display_cell;
 use crate::seg::{Line, Seg, seg, sp};
 
 use super::{
-    PanelHit, PanelRow, Section, SectionCtx, ac, d, f, g, g3, hint_row, hue, rule, t, two_col,
+    PanelHit, PanelRow, Section, SectionCtx, ac, d, f, g, g3, hint_row, hue, list_detail, rule, t,
+    wrap_text,
 };
 
 // ---- helpers -----------------------------------------------------------------
@@ -240,14 +241,21 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             seg(f(), ago),
         ]);
 
-        // Secondary metadata line (worktree · kind): `faint` words with a
-        // `ghost` separator — was `ghost3` throughout, which read as invisible.
-        let line2 = Line::segs(vec![
-            sp(2),
-            seg(f(), wt_base),
-            seg(g(), "  ·  "),
-            seg(f(), n.kind.label()),
-        ]);
+        // The cursor's secondary row wraps the complete message; other rows
+        // retain the compact worktree and kind metadata.
+        let secondary = if i == cursor {
+            wrap_text(&n.message, ctx.cols)
+                .into_iter()
+                .map(|part| Line::segs(vec![sp(2), seg(t(), part)]))
+                .collect::<Vec<_>>()
+        } else {
+            vec![Line::segs(vec![
+                sp(2),
+                seg(f(), wt_base),
+                seg(g(), "  ·  "),
+                seg(f(), n.kind.label()),
+            ])]
+        };
 
         let bg = if i == cursor {
             Some(crate::seg::Tok::SelAccent)
@@ -260,11 +268,11 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             bg,
             hit: Some(PanelHit::Row(Section::Notifications, i)),
         });
-        rows.push(PanelRow {
-            line: line2,
+        rows.extend(secondary.into_iter().map(|line| PanelRow {
+            line,
             bg: None,
             hit: None,
-        });
+        }));
         // No in-section truncation — see `normal_view`.
     }
 
@@ -352,7 +360,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let list_w = 45_usize.min(cols / 2);
 
     // Left column: compact list
-    let list_rows: Vec<Vec<Seg>> = items
+    let list_rows: Vec<(Vec<Seg>, Option<usize>)> = items
         .iter()
         .enumerate()
         .map(|(i, n)| {
@@ -365,14 +373,17 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             } else {
                 (kind_hue(n.kind), d())
             };
-            vec![
-                seg(if i == cursor { t() } else { g() }, sel_mark),
-                seg(glyph_tok, kind_gh(n.kind).0),
-                seg(g3(), " "),
-                seg(src_tok, src),
-                seg(g3(), " "),
-                seg(f(), ago),
-            ]
+            (
+                vec![
+                    seg(if i == cursor { t() } else { g() }, sel_mark),
+                    seg(glyph_tok, kind_gh(n.kind).0),
+                    seg(g3(), " "),
+                    seg(src_tok, src),
+                    seg(g3(), " "),
+                    seg(f(), ago),
+                ],
+                Some(i),
+            )
         })
         .collect();
 
@@ -383,19 +394,14 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         vec![vec![seg(f(), "select a notification")]]
     };
 
-    let combined = two_col(&list_rows, &detail_rows, list_w, 2);
-    let item_count = items.len();
-    rows.extend(combined.into_iter().enumerate().map(|(i, l)| {
-        // Only the LIST rows are cursor targets, indexed by the visible-item
-        // index — the old `header_offset + i` tagging offset every hit by the
-        // header rows, so clicks resolved to the wrong notification.
-        let row = PanelRow::plain(l);
-        if i < item_count {
-            row.with_hit(PanelHit::Row(Section::Notifications, i))
-        } else {
-            row
-        }
-    }));
+    rows.extend(list_detail(
+        Section::Notifications,
+        &list_rows,
+        &detail_rows,
+        cursor,
+        list_w,
+        ctx.rows.saturating_sub(rows.len() + 2),
+    ));
 
     rows.push(rule());
     rows.push(hint_row(&[
@@ -424,7 +430,9 @@ fn notification_detail_segs(n: &Notification, w: usize) -> Vec<Vec<Seg>> {
     out.push(vec![seg(f(), n.kind.label()), seg(g(), read_tag)]);
 
     // Message
-    out.push(vec![seg(t(), truncate(&n.message, w))]);
+    for chunk in wrap_text(&n.message, w) {
+        out.push(vec![seg(t(), chunk)]);
+    }
 
     // Worktree path
     if !n.worktree_path.is_empty() {

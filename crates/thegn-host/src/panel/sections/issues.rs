@@ -11,7 +11,7 @@ use thegn_core::theme::Hue;
 use crate::seg::{Line, Seg, seg, sp};
 
 use super::{
-    PanelHit, PanelRow, Section, SectionCtx, d, f, g, g2, g3, hint_row, hue, rule, t, two_col,
+    PanelHit, PanelRow, Section, SectionCtx, d, f, g, g2, g3, hint_row, hue, list_detail, rule, t,
 };
 
 // ---- status colour mapping --------------------------------------------------
@@ -107,7 +107,7 @@ pub(crate) fn issue_at_cursor<'a>(
     .nth(ui.cursor)
 }
 
-fn sorted_issues<'a>(ctx: &'a SectionCtx) -> Vec<&'a Issue> {
+pub(super) fn sorted_issues<'a>(ctx: &'a SectionCtx) -> Vec<&'a Issue> {
     sorted_filtered_issues(
         &ctx.model.panel,
         &ctx.ui.issues_filter,
@@ -186,10 +186,6 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             row
         };
         rows.push(row);
-
-        if rows.len() >= ctx.rows.saturating_sub(1) {
-            break;
-        }
     }
     rows.push(hint_row(&[
         ("↵", "link"),
@@ -285,10 +281,6 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             bg: None,
             hit: None,
         });
-
-        if rows.len() + 2 > ctx.rows.saturating_sub(2) {
-            break;
-        }
     }
     rows.push(hint_row(&[
         ("↵", "link"),
@@ -356,7 +348,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let detail_w = cols.saturating_sub(list_w + 2);
 
     // Build left column (issue list).
-    let list_rows: Vec<Vec<Seg>> = issues
+    let list_rows: Vec<(Vec<Seg>, Option<usize>)> = issues
         .iter()
         .enumerate()
         .map(|(i, issue)| {
@@ -365,18 +357,21 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             let link_mark = if linked { "◈" } else { " " };
             let num_w = 10.min(issue.number.len() + 1);
             let title_w = list_w.saturating_sub(2 + num_w + 1 + 1);
-            vec![
-                seg(if i == cursor { t() } else { g() }, sel_mark.to_string()),
-                seg(status_hue(issue.status), issue.status.glyph().to_string()),
-                seg(g(), " "),
-                seg(d(), issue.number.clone()),
-                seg(g(), " "),
-                seg(
-                    if i == cursor { t() } else { g2() },
-                    truncate(&issue.title, title_w),
-                ),
-                seg(g2(), format!(" {link_mark}")),
-            ]
+            (
+                vec![
+                    seg(if i == cursor { t() } else { g() }, sel_mark.to_string()),
+                    seg(status_hue(issue.status), issue.status.glyph().to_string()),
+                    seg(g(), " "),
+                    seg(d(), issue.number.clone()),
+                    seg(g(), " "),
+                    seg(
+                        if i == cursor { t() } else { g2() },
+                        truncate(&issue.title, title_w),
+                    ),
+                    seg(g2(), format!(" {link_mark}")),
+                ],
+                Some(i),
+            )
         })
         .collect();
 
@@ -387,20 +382,14 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         vec![vec![seg(g2(), "select an issue".to_string())]]
     };
 
-    let combined = two_col(&list_rows, &detail_rows, list_w, 2);
-    let combined_rows: Vec<PanelRow> = combined
-        .into_iter()
-        .enumerate()
-        .map(|(i, l)| {
-            let row = PanelRow::plain(l);
-            if i < list_rows.len() {
-                row.with_hit(PanelHit::Row(Section::Issues, i))
-            } else {
-                row
-            }
-        })
-        .collect();
-    rows.extend(combined_rows);
+    rows.extend(list_detail(
+        Section::Issues,
+        &list_rows,
+        &detail_rows,
+        cursor,
+        list_w,
+        ctx.rows.saturating_sub(rows.len() + 2),
+    ));
 
     rows.push(rule());
     rows.push(hint_row(&[

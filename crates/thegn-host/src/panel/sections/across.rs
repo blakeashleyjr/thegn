@@ -34,7 +34,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
 /// Full: excerpt list + a detail column for the cursor excerpt (worktree
 /// path, kind, source location, full text + detail, and where ↵ lands).
 fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
-    use super::{g2, rule, t, two_col, wrap_text};
+    use super::{g2, list_detail, rule, t, wrap_text};
     let agg = &ctx.model.panel.across;
     let cols = ctx.cols;
     let all = crate::panel::scope::across_all();
@@ -133,14 +133,15 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         None => vec![vec![seg(g2(), "select an excerpt")]],
     };
 
-    let combined = two_col(&list_rows, &detail, list_w, 2);
-    rows.extend(combined.into_iter().enumerate().map(|(row_i, line)| {
-        let row = PanelRow::plain(line);
-        match list_hits.get(row_i).copied().flatten() {
-            Some(i) => row.with_hit(PanelHit::Row(Section::Across, i)),
-            None => row,
-        }
-    }));
+    let entries: Vec<(Vec<Seg>, Option<usize>)> = list_rows.into_iter().zip(list_hits).collect();
+    rows.extend(list_detail(
+        Section::Across,
+        &entries,
+        &detail,
+        cursor,
+        list_w,
+        ctx.rows.saturating_sub(rows.len()),
+    ));
     rows
 }
 
