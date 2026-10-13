@@ -886,7 +886,7 @@ pub fn patch_menu() -> MenuOverlay {
                 MenuChoice::PatchRemoveFromCommit,
             )
             .danger(),
-            item(Some('x'), "reset patch", MenuChoice::PatchReset),
+            item(Some('x'), "discard patch (exit)", MenuChoice::PatchReset),
         ],
     )
 }
