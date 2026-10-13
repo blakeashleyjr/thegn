@@ -30,6 +30,7 @@ const MAX_PENDING_ALERTS_PER_PLUGIN: usize = 16;
 const MAX_ALERT_MESSAGE_BYTES: usize = 1024;
 const MAX_FEED_BRIDGES: usize = 8;
 const MAX_SUBSCRIPTIONS_PER_PLUGIN: usize = 64;
+const MAX_PLUGIN_MESSAGES_PER_DRAIN: usize = 256;
 
 /// Owns a feed worker and its cancellation signal. Dropping the owner cancels
 /// the worker even if the feed is idle and the plugin never reads another frame.
@@ -435,10 +436,13 @@ pub(crate) fn flush_alerts(state: &mut PluginsState) {
     }));
 }
 
-/// Apply every queued [`PluginMsg`]. Returns the narrowest aggregate render
-/// damage (statusbar content, structural lifecycle/contribution change, or
-/// none). The before/after comparison is deliberately made around the whole
-/// drain so coalesced updates that return to their original view stay idle.
+/// Apply up to [`MAX_PLUGIN_MESSAGES_PER_DRAIN`] queued message units, preserving
+/// FIFO order and leaving any remaining messages queued for the caller to
+/// re-poll. A one-shot run is applied whole even if it exceeds the budget.
+/// Returns the narrowest aggregate render damage (statusbar content, structural
+/// lifecycle/contribution change, or none). The before/after comparison is
+/// deliberately made around the whole drain so coalesced updates that return
+/// to their original view stay idle.
 /// `host` is the respawn/shutdown handle; `None` (tests) records restart
 /// decisions without spawning anything.
 pub(crate) fn drain(
@@ -449,7 +453,18 @@ pub(crate) fn drain(
 ) -> PluginDamage {
     let before_views = statusbar_views(state);
     let mut damage = PluginDamage::None;
-    while let Ok(msg) = rx.try_recv() {
+    let mut applied = 0;
+    while applied < MAX_PLUGIN_MESSAGES_PER_DRAIN {
+        let Ok(msg) = rx.try_recv() else {
+            break;
+        };
+        applied = applied.saturating_add(match &msg {
+            PluginMsg::OneShot { run, .. } => match run {
+                Ok(run) => run.messages.len().max(1),
+                Err(_) => 1,
+            },
+            PluginMsg::Event { .. } | PluginMsg::Loaded(_) | PluginMsg::Respawned { .. } => 1,
+        });
         match msg {
             PluginMsg::Loaded(list) => {
                 for st in list {
@@ -1363,6 +1378,79 @@ mod tests {
         }
         drop(tx);
         drain(&mut rx, state, model, None)
+    }
+
+    fn update_message(text: String) -> PluginMsg {
+        PluginMsg::Event {
+            plugin: "p".into(),
+            event: SessionEvent::Message(msg(
+                "update",
+                serde_json::json!({
+                    "surface": "p/seg",
+                    "view": {"spans": [{"text": text, "role": "Default"}]}
+                }),
+            )),
+        }
+    }
+
+    #[test]
+    fn plugin_drain_budget_preserves_fifo_backlog_for_the_next_call() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let mut model = FrameModel::default();
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        for index in 0..MAX_PLUGIN_MESSAGES_PER_DRAIN + 5 {
+            tx.send(update_message(format!("update-{index}"))).unwrap();
+        }
+
+        drain(&mut rx, &mut state, &mut model, None);
+        assert_eq!(rx.len(), 5, "the first drain stops at its message budget");
+
+        drain(&mut rx, &mut state, &mut model, None);
+        assert!(rx.is_empty());
+        assert_eq!(
+            statusbar_views(&state)[0].1.text_content(),
+            format!("update-{}", MAX_PLUGIN_MESSAGES_PER_DRAIN + 4)
+        );
+    }
+
+    #[test]
+    fn one_shot_larger_than_budget_is_applied_whole() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let mut model = FrameModel::default();
+        let run = thegn_svc::plugin::PluginRun {
+            messages: (0..MAX_PLUGIN_MESSAGES_PER_DRAIN + 5)
+                .map(|index| {
+                    msg(
+                        "update",
+                        serde_json::json!({
+                            "surface": "p/seg",
+                            "view": {"spans": [{"text": format!("shot-{index}"), "role": "Default"}]}
+                        }),
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        tx.send(PluginMsg::OneShot {
+            plugin: "p".into(),
+            run: Ok(run),
+        })
+        .unwrap();
+        tx.send(update_message("after-shot".into())).unwrap();
+        drop(tx);
+
+        drain(&mut rx, &mut state, &mut model, None);
+
+        assert_eq!(rx.len(), 1, "the oversized one-shot is one atomic unit");
+        assert_eq!(
+            statusbar_views(&state)[0].1.text_content(),
+            format!("shot-{}", MAX_PLUGIN_MESSAGES_PER_DRAIN + 4)
+        );
+
+        drain(&mut rx, &mut state, &mut model, None);
+        assert!(rx.is_empty());
+        assert_eq!(statusbar_views(&state)[0].1.text_content(), "after-shot");
     }
 
     #[test]
