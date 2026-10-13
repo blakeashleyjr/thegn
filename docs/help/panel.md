@@ -384,17 +384,6 @@ thresholds colour it with the same gauge and overlay.
 
 {{keys:usage}}
 
-### db and debug — reserved placeholders
-
-Two system-tab section names are reserved stubs, not features: **db**
-renders "no database detected" over a "db introspection not wired yet"
-line, and **debug** renders "no session", an empty `BREAKPOINTS` list and
-a "debugger integration not wired yet" line. Neither has keys or
-behaviour behind it, and neither appears in the built-in accordion — they
-stay out of the tab rotation until the database and debugger
-integrations land, at which point they become real sections and this
-page will document them as such.
-
 ## The help tab
 
 **help** shows this documentation in the docked panel. `j`/`k`, `↑`/`↓`,
