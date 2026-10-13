@@ -111,10 +111,10 @@ fn panel_doc_chords_are_section_keys() {
             .and_then(|s| s.strip_suffix("}}"))
         {
             directive_seen = true;
-            if let Some(key_section) = crate::panel::Section::from_key(key) {
-                if !sections.contains(&key_section) {
-                    sections.push(key_section);
-                }
+            if let Some(key_section) = crate::panel::Section::from_key(key)
+                && !sections.contains(&key_section)
+            {
+                sections.push(key_section);
             }
         }
         if line.contains("Keys:") {
@@ -131,12 +131,17 @@ fn panel_doc_chords_are_section_keys() {
             if sections.is_empty() {
                 continue;
             }
-            if !panel_chord_advertised(&sections, token, chord) {
-                if let Some(section) = known_unadvertised_section(&sections, chord) {
+            match (
+                panel_chord_advertised(&sections, token, chord),
+                known_unadvertised_section(&sections, chord),
+            ) {
+                (false, Some(section)) => {
                     observed.insert(format!("panel:{}:{token}", section.as_key()));
-                } else {
+                }
+                (false, None) => {
                     invalid.insert(format!("panel:{}:{token}", sections[0].as_key()));
                 }
+                (true, _) => {}
             }
         }
     }
@@ -169,8 +174,7 @@ fn help_section_keys_ratchet_update() {
         "# help-section-keys-ratchet — `panel:<section>:<chord>` prose entries".to_string(),
         "# containing real chords omitted from the subsection's section tables. Shrink only."
             .to_string(),
-        "# notifications A and /; logs Y; environments t; media + - [ ] f; prq h.".to_string(),
-        "# prq h invokes its configured handoff.".to_string(),
+        "# notifications A and /; logs Y; environments t; media + - [ ] f.".to_string(),
     ];
     let body = source
         .split_once("---\n")
@@ -187,10 +191,9 @@ fn help_section_keys_ratchet_update() {
             .strip_prefix("{{keys:")
             .and_then(|s| s.strip_suffix("}}"))
             && let Some(key_section) = crate::panel::Section::from_key(key)
+            && !sections.contains(&key_section)
         {
-            if !sections.contains(&key_section) {
-                sections.push(key_section);
-            }
+            sections.push(key_section);
         }
         if sections.is_empty() {
             continue;
