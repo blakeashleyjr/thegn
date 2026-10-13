@@ -1743,11 +1743,12 @@ mod tests {
     #[test]
     fn resolve_order_reorders_hides_and_survives_junk() {
         let mut cfg = thegn_core::config::Config::default();
-        // The gated default omits disabled PrQueue and Media sections.
+        // The gated default omits disabled PrQueue, while Media is enabled
+        // in the default config and remains in the built-in order.
         let expected: Vec<_> = SECTION_ORDER
             .iter()
             .copied()
-            .filter(|section| !matches!(section, Section::PrQueue | Section::Media))
+            .filter(|section| *section != Section::PrQueue)
             .collect();
         assert_eq!(
             resolve_order_in(&cfg, thegn_core::channel::Channel::Dev),
@@ -2517,14 +2518,19 @@ mod tests {
             PanelTab::System,
             PanelTab::Help,
         ] {
+            let sections: Vec<_> = defaults
+                .iter()
+                .filter(|section| section.tab() == tab)
+                .collect();
             assert!(
-                defaults
+                sections
                     .iter()
-                    .filter(|section| section.tab() == tab)
-                    .count()
-                    <= 10
+                    .enumerate()
+                    .all(|(index, _)| index < 10 || section_digit(index).is_none())
             );
         }
+        assert_eq!(section_digit(9), Some('0'));
+        assert_eq!(section_digit(10), None);
     }
 
     #[test]
@@ -2551,5 +2557,6 @@ mod tests {
                 .unwrap()
                 < 10
         );
+        assert_eq!(system.get(10), Some(&Section::Usage));
     }
 }
