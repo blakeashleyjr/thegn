@@ -3483,7 +3483,11 @@ fn get_unread_counts_by_worktree_groups_by_path() {
     // Read one to make it not count as unread
     let unread = db.get_unread_notifications().unwrap();
     assert_eq!(unread.len(), 3);
-    db.mark_notification_read(unread[0].id).unwrap();
+    let app_notification = unread
+        .iter()
+        .find(|notification| notification.source_ref == "ref:1")
+        .expect("the first /wt/app notification remains unread");
+    db.mark_notification_read(app_notification.id).unwrap();
 
     let cfg = crate::config::NotificationsConfig::default();
     let counts = db
