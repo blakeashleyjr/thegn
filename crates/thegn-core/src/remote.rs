@@ -1087,7 +1087,7 @@ fn cas_git_path_write_script(
     let quoted = util::sh_quote(path);
     let lock = util::sh_quote(lock_path);
     format!(
-        "set -C; umask 077; l={lock}; command -v flock >/dev/null 2>&1 || exit 44; [ ! -L \"$l\" ] || exit 44; exec 9>>\"$l\" || exit 44; flock -w {wait_secs} 9 || exit 43; p={quoted}; e=\"$p.thegn-cas.$$\"; t=\"$p.thegn-tmp.$$\"; \
+        "set -C; umask 077; l={lock}; command -v flock >/dev/null 2>&1 || exit 44; [ ! -L \"$l\" ] || exit 44; exec 9>>\"$l\" || exit 44; [ ! -L \"$l\" ] && [ \"$l\" -ef /dev/fd/9 ] || exit 44; flock -w {wait_secs} 9 || exit 43; p={quoted}; e=\"$p.thegn-cas.$$\"; t=\"$p.thegn-tmp.$$\"; \
          [ ! -L \"$p\" ] && [ ! -d \"$p\" ] && [ -e \"$p\" ] || exit 1; \
          ce=0; ct=0; trap 'if [ \"$ce\" = 1 ]; then rm -f -- \"$e\"; fi; if [ \"$ct\" = 1 ]; then rm -f -- \"$t\"; fi' 0; \
          trap 'exit 1' HUP INT TERM; : > \"$e\" || exit 1; ce=1; : > \"$t\" || exit 1; ct=1; \
@@ -1274,7 +1274,7 @@ mod tests {
             "/work tree/.git/thegn-git.lock",
             120,
         );
-        let script = "set -C; umask 077; l='/work tree/.git/thegn-git.lock'; command -v flock >/dev/null 2>&1 || exit 44; [ ! -L \"$l\" ] || exit 44; exec 9>>\"$l\" || exit 44; flock -w 120 9 || exit 43; p='/work tree/todo'; e=\"$p.thegn-cas.$$\"; t=\"$p.thegn-tmp.$$\"; [ ! -L \"$p\" ] && [ ! -d \"$p\" ] && [ -e \"$p\" ] || exit 1; ce=0; ct=0; trap 'if [ \"$ce\" = 1 ]; then rm -f -- \"$e\"; fi; if [ \"$ct\" = 1 ]; then rm -f -- \"$t\"; fi' 0; trap 'exit 1' HUP INT TERM; : > \"$e\" || exit 1; ce=1; : > \"$t\" || exit 1; ct=1; set +C; dd bs=1 count=7 2>/dev/null > \"$e\" || exit 1; [ \"$(wc -c < \"$e\")\" -eq 7 ] || exit 1; cat > \"$t\" || exit 1; cmp -s -- \"$e\" \"$p\"; cmp_status=$?; if [ \"$cmp_status\" -eq 1 ]; then exit 42; fi; [ \"$cmp_status\" -eq 0 ] || exit 1; mv -f -- \"$t\" \"$p\"";
+        let script = "set -C; umask 077; l='/work tree/.git/thegn-git.lock'; command -v flock >/dev/null 2>&1 || exit 44; [ ! -L \"$l\" ] || exit 44; exec 9>>\"$l\" || exit 44; [ ! -L \"$l\" ] && [ \"$l\" -ef /dev/fd/9 ] || exit 44; flock -w 120 9 || exit 43; p='/work tree/todo'; e=\"$p.thegn-cas.$$\"; t=\"$p.thegn-tmp.$$\"; [ ! -L \"$p\" ] && [ ! -d \"$p\" ] && [ -e \"$p\" ] || exit 1; ce=0; ct=0; trap 'if [ \"$ce\" = 1 ]; then rm -f -- \"$e\"; fi; if [ \"$ct\" = 1 ]; then rm -f -- \"$t\"; fi' 0; trap 'exit 1' HUP INT TERM; : > \"$e\" || exit 1; ce=1; : > \"$t\" || exit 1; ct=1; set +C; dd bs=1 count=7 2>/dev/null > \"$e\" || exit 1; [ \"$(wc -c < \"$e\")\" -eq 7 ] || exit 1; cat > \"$t\" || exit 1; cmp -s -- \"$e\" \"$p\"; cmp_status=$?; if [ \"$cmp_status\" -eq 1 ]; then exit 42; fi; [ \"$cmp_status\" -eq 0 ] || exit 1; mv -f -- \"$t\" \"$p\"";
         assert_eq!(command, format!("sh -c {}", util::sh_quote(script)));
     }
 
@@ -1314,6 +1314,9 @@ mod tests {
 
     #[test]
     fn provider_conditional_write_replaces_only_matching_bytes_and_cleans_temps() {
+        if !flock_available() {
+            return;
+        }
         let (dir, loc) = provider_repo();
         let gitdir = dir.path().join(".git");
         let target = gitdir.join("cas-target");
@@ -1392,6 +1395,9 @@ mod tests {
 
     #[test]
     fn provider_conditional_write_rejects_stale_bytes_without_changes_or_temps() {
+        if !flock_available() {
+            return;
+        }
         let (dir, loc) = provider_repo();
         let gitdir = dir.path().join(".git");
         let target = gitdir.join("cas-target");
@@ -1406,6 +1412,9 @@ mod tests {
 
     #[test]
     fn provider_conditional_write_rejects_absent_and_symlink_targets() {
+        if !flock_available() {
+            return;
+        }
         let (dir, loc) = provider_repo();
         let gitdir = dir.path().join(".git");
         assert!(
