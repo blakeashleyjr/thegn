@@ -4157,9 +4157,11 @@ fn drain_wheel_ticks_stops_at_cap_and_leaves_rest_queued() {
 
 #[test]
 fn panel_section_flow_stays_inside_the_active_tab() {
-    let mut ui = crate::panel::PanelUi::default();
-    ui.tab = crate::panel::PanelTab::Help;
-    ui.open = crate::panel::Section::Help;
+    let mut ui = crate::panel::PanelUi {
+        tab: crate::panel::PanelTab::Help,
+        open: crate::panel::Section::Help,
+        ..Default::default()
+    };
     assert_eq!(
         prev_section_in_order(crate::panel::Section::Help, &ui),
         None

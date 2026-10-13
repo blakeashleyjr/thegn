@@ -75,9 +75,9 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         let scroll = ctx.ui.scroll.min(lines.len().saturating_sub(1));
         let mut rows: Vec<PanelRow> = lines
             .iter()
-            .cloned()
             .skip(scroll)
             .take(body)
+            .cloned()
             .map(PanelRow::plain)
             .collect();
         rows.push(PanelRow::blank());
