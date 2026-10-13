@@ -313,12 +313,11 @@ impl Section {
         }
     }
 
-    /// The lazygit-family sections that share [`gitui::GitUi`] state and the
-    /// Full-width git frame.
+    /// The sections that share [`gitui::GitUi`] state and the Full-width git frame.
     pub fn is_git_family(self) -> bool {
         matches!(
             self,
-            Section::Changes | Section::Commits | Section::Branches | Section::Stash | Section::Pr
+            Section::Changes | Section::Commits | Section::Branches | Section::Stash
         )
     }
 
