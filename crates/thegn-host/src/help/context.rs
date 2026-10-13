@@ -53,11 +53,8 @@ pub fn vocabulary() -> Vec<String> {
     .iter()
     .map(|z| zone_key(*z).to_string())
     .collect();
-    // Every panel section, including the two outside SECTION_ORDER.
-    for s in SECTION_ORDER
-        .iter()
-        .chain([Section::Debug, Section::Db].iter())
-    {
+    // Every panel section.
+    for s in SECTION_ORDER.iter() {
         out.push(format!("panel:{}", s.as_key()));
     }
     // Full-screen modals that own the keyboard, so `resolve` can't speak for
@@ -112,10 +109,8 @@ mod tests {
         let vocab = vocabulary();
         assert!(vocab.iter().any(|k| k == "zone:sidebar"));
         assert!(vocab.iter().any(|k| k == "panel:merge"));
-        assert!(
-            vocab.iter().any(|k| k == "panel:debug"),
-            "off-order sections included"
-        );
+        assert!(!vocab.iter().any(|k| k == "panel:debug"));
+        assert!(!vocab.iter().any(|k| k == "panel:db"));
         // The monitor is a modal, not a zone — but a page must still be able to
         // claim it, so the registry validates the claim rather than rejecting it.
         assert!(vocab.iter().any(|k| k == MONITOR));

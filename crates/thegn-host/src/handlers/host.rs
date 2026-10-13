@@ -161,40 +161,68 @@ fn unix_now() -> i64 {
 /// Off-loop removal of a runtime-added host: drop the placement-capacity index,
 /// the DB row (def + cached state + inventory + events), but only when the host
 /// is DB-added and has no live placement tenants. Config-defined hosts and hosts
-/// with running sandboxes are refused (warned), never silently dropped — mirrors
+/// with running sandboxes are refused and reported, never silently dropped — mirrors
 /// `thegn host rm`'s guardrails without the interactive `--force`/drain path.
-fn remove_host_def(host: String) {
+fn host_remove_refusal(name: &str, is_db_def: bool, live_tenants: usize) -> Option<String> {
+    if !is_db_def {
+        Some(format!(
+            "host {name}: config-defined — remove it from config.toml"
+        ))
+    } else if live_tenants > 0 {
+        Some(format!(
+            "host {name}: {live_tenants} live placement(s) — drain via `thegn host rm` first"
+        ))
+    } else {
+        None
+    }
+}
+
+fn remove_host_def(
+    host: String,
+    refresh_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>>,
+    host_ui: Option<crate::host_flow::HostUiTx>,
+) {
     let job = move || {
-        let Ok(db) = thegn_core::db::Db::open() else {
-            thegn_core::msg::warn("host remove: state db unavailable");
-            return;
+        let report = |message: String, priority| {
+            if let Some(tx) = &refresh_tx
+                && let Err(error) =
+                    tx.send(crate::hydrate::RefreshKind::Toast { message, priority })
+            {
+                tracing::debug!(target: "thegn::host", %error, "host removal toast receiver is gone");
+            }
+            if let Some(ui) = &host_ui
+                && let Err(error) = ui.waker.wake()
+            {
+                tracing::debug!(target: "thegn::host", %error, "failed to wake after host removal");
+            }
         };
-        let Some(id) = thegn_core::host::HostId::parse(&host) else {
-            return;
-        };
-        let name = id.config_name().unwrap_or("").to_string();
-        let is_db = db
-            .host_defs()
-            .ok()
-            .is_some_and(|d| d.iter().any(|(n, _)| n == &name));
-        if !is_db {
-            thegn_core::msg::warn(&format!(
-                "host {name}: config-defined — remove it from config.toml"
-            ));
-            return;
-        }
-        use thegn_core::store::PlacementStore;
-        let tenants = db.tenants_of(&id).unwrap_or_default();
-        if !tenants.is_empty() {
-            thegn_core::msg::warn(&format!(
-                "host {name}: {} live placement(s) — drain via `thegn host rm` first",
-                tenants.len()
-            ));
-            return;
-        }
-        let _ = db.capacity_delete(&id); // best-effort: cache write: the capacity row is bookkeeping; the host_delete below reports the real failure
-        if let Err(e) = db.host_delete(&id) {
-            thegn_core::msg::warn(&format!("host remove: {e}"));
+        let outcome = (|| -> Result<String, String> {
+            let db = thegn_core::db::Db::open().map_err(|error| format!("host remove: {error}"))?;
+            let id = thegn_core::host::HostId::parse(&host)
+                .ok_or_else(|| format!("host remove: invalid host id {host}"))?;
+            let name = id.config_name().unwrap_or("").to_string();
+            let defs = db
+                .host_defs()
+                .map_err(|error| format!("host remove: {error}"))?;
+            use thegn_core::store::PlacementStore;
+            let tenants = db
+                .tenants_of(&id)
+                .map_err(|error| format!("host remove: {error}"))?;
+            if let Some(refusal) = host_remove_refusal(
+                &name,
+                defs.iter().any(|(defined, _)| defined == &name),
+                tenants.len(),
+            ) {
+                return Err(refusal);
+            }
+            let _ = db.capacity_delete(&id); // best-effort: cache write: the capacity row is bookkeeping; the host_delete below reports the real failure
+            db.host_delete(&id)
+                .map_err(|error| format!("host remove: {error}"))?;
+            Ok(format!("host {name} removed"))
+        })();
+        match outcome {
+            Ok(message) => report(message, thegn_core::notification::Priority::Info),
+            Err(message) => report(message, thegn_core::notification::Priority::Alert),
         }
     };
     if tokio::runtime::Handle::try_current().is_ok() {
@@ -270,6 +298,7 @@ pub(crate) fn intercept_menu_choice(
     pending: &mut Option<String>,
     cfg: &thegn_core::config::Config,
     host_ui: Option<&crate::host_flow::HostUiTx>,
+    refresh_tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>>,
 ) -> Option<String> {
     match choice {
         // Host action-menu provision / re-probe: spawn the same off-loop drive
@@ -282,39 +311,14 @@ pub(crate) fn intercept_menu_choice(
             host_ui.map(|ui| crate::host_ui::drive_host(name, *tag == "host-reprobe", cfg, ui))
         }
         // Host action-menu "remove host": drop a runtime-added `[host.*]` def.
-        // Tenant-safe + DB-only — validated in the off-loop job, which warns
-        // rather than silently no-op'ing.
+        // Tenant-safe + DB-only — validated in the off-loop job, which reports
+        // refusals and failures through a toast.
         MenuChoice::Confirm {
             tag: "host-remove",
             arg,
         } => {
             let name = arg.strip_prefix("host:").unwrap_or(arg).to_string();
-            // Pre-validate the refusal cases HERE so the user sees them in the
-            // status bar — the off-loop job's warnings only reach the Logs
-            // section, so a refused removal read as "removing…" then nothing.
-            if let (Ok(db), Some(id)) = (
-                thegn_core::db::Db::open(),
-                thegn_core::host::HostId::parse(arg),
-            ) {
-                use thegn_core::store::{HostStore, PlacementStore};
-                let is_db = db
-                    .host_defs()
-                    .ok()
-                    .is_some_and(|d| d.iter().any(|(n, _)| n == &name));
-                if !is_db {
-                    return Some(format!(
-                        "host {name}: config-defined — remove it from config.toml"
-                    ));
-                }
-                let tenants = db.tenants_of(&id).unwrap_or_default();
-                if !tenants.is_empty() {
-                    return Some(format!(
-                        "host {name}: {} live placement(s) — drain first",
-                        tenants.len()
-                    ));
-                }
-            }
-            remove_host_def(arg.clone());
+            remove_host_def(arg.clone(), refresh_tx.cloned(), host_ui.cloned());
             Some(format!("host {name}: removing…"))
         }
         MenuChoice::Confirm {
@@ -500,20 +504,21 @@ mod tests {
             &mut pending,
             &cfg,
             None,
+            None,
         )
         .expect("consumed");
         assert!(s.contains("granted"));
         assert!(pending.is_none());
 
         let mut pending = Some("host:a".to_string());
-        let s = intercept_menu_choice(&MenuChoice::Dismiss, &mut pending, &cfg, None)
+        let s = intercept_menu_choice(&MenuChoice::Dismiss, &mut pending, &cfg, None, None)
             .expect("consumed");
         assert!(s.contains("declined"));
         assert!(pending.is_none());
 
         // A dismiss with no pending consent is someone else's dismiss.
         let mut none = None;
-        assert!(intercept_menu_choice(&MenuChoice::Dismiss, &mut none, &cfg, None).is_none());
+        assert!(intercept_menu_choice(&MenuChoice::Dismiss, &mut none, &cfg, None, None).is_none());
         // Unrelated confirms pass through.
         assert!(
             intercept_menu_choice(
@@ -523,6 +528,7 @@ mod tests {
                 },
                 &mut Some("host:a".into()),
                 &cfg,
+                None,
                 None,
             )
             .is_none()
@@ -551,5 +557,20 @@ mod tests {
             rt.status_line("host:a").as_deref(),
             Some("transfer image — 412 MiB / 1.9 GiB")
         );
+    }
+
+    #[test]
+    fn host_remove_refusal_covers_config_and_live_tenants() {
+        assert!(
+            host_remove_refusal("lab", false, 0)
+                .unwrap()
+                .contains("config-defined")
+        );
+        assert!(
+            host_remove_refusal("lab", true, 2)
+                .unwrap()
+                .contains("2 live placement(s)")
+        );
+        assert_eq!(host_remove_refusal("lab", true, 0), None);
     }
 }

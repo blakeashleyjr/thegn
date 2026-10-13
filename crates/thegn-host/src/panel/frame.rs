@@ -428,11 +428,9 @@ pub fn build_panel(
             label = label.bold();
         }
         // Each accordion is numbered; the number is its open shortcut within the tab.
-        let num = seg(
-            Tok::Slot(if on { S::Accent } else { S::Ghost2 }),
-            format!("{}", i + 1),
-        )
-        .bold();
+        let number =
+            crate::panel::section_digit(i).map_or_else(String::new, |digit| digit.to_string());
+        let num = seg(Tok::Slot(if on { S::Accent } else { S::Ghost2 }), number).bold();
         let mut srow = PanelRow::plain(Line::split(
             {
                 let mut l = vec![sp(1), num, sp(1), label];
@@ -533,9 +531,10 @@ fn rail_rows_and_spans(ui: &PanelUi, cols: usize) -> (Vec<PanelRow>, Vec<RailSpa
         .collect();
     for (i, section) in visible.iter().copied().enumerate() {
         let on = section == ui.open;
-        let num = format!("{}", i + 1);
+        let num = crate::panel::section_digit(i).map(|digit| digit.to_string());
         let label = section.label();
-        let entry_w = num.chars().count() + 1 + label.chars().count();
+        let entry_w =
+            num.as_ref().map_or(0, |number| number.chars().count() + 1) + label.chars().count();
         let sep_w = if x > 1 { 3 } else { 0 };
         if x + sep_w + entry_w > cols.saturating_sub(1) && x > 1 {
             rows.push(PanelRow::plain(Line::Segs(std::mem::take(&mut cur))));
@@ -550,14 +549,10 @@ fn rail_rows_and_spans(ui: &PanelUi, cols: usize) -> (Vec<PanelRow>, Vec<RailSpa
             cols: x..x + entry_w,
             section,
         });
-        cur.push(
-            seg(
-                Tok::Slot(if on { S::Accent } else { S::Ghost2 }),
-                num.clone(),
-            )
-            .bold(),
-        );
-        cur.push(sp(1));
+        if let Some(number) = num {
+            cur.push(seg(Tok::Slot(if on { S::Accent } else { S::Ghost2 }), number).bold());
+            cur.push(sp(1));
+        }
         let mut label_seg = seg(Tok::Slot(if on { S::Accent } else { S::Dim }), label);
         if on {
             label_seg = label_seg.bold();
