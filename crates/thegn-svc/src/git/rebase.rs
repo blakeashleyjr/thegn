@@ -9,11 +9,14 @@
 //! Once-off actions (squash/fixup/drop/reword/edit/move on a single commit,
 //! amend-old-commit) compile into a generated todo over `<target>^..HEAD`.
 //! While a rebase is paused (conflict/edit/break) the live todo at
-//! `rebase-merge/git-rebase-todo` can be re-read and rewritten — safe
-//! because the host serializes mutations per worktree.
+//! `rebase-merge/git-rebase-todo` can be re-read and rewritten while holding
+//! thegn's bounded advisory git-mutation lock. That excludes other thegn
+//! writers only: git takes no lock on the todo, so an external editor or plain
+//! `git rebase --edit-todo` can still race between the check and rename.
 
 use super::{GitBackend, gpg_args, run_status, run_w};
 use anyhow::{Context, Result, anyhow, bail};
+use std::time::Duration;
 use thegn_core::git_operand as op;
 use thegn_core::rebase_todo::{
     TodoAction, TodoEntry, parse_todo, place_fixup, retag, serialize_todo, todo_from_log,
@@ -50,8 +53,9 @@ fn read_local_pending_todo(loc: &GitLoc) -> Result<Option<(std::path::PathBuf, V
 }
 
 /// Atomically publish a local todo only while its exact previously-read bytes
-/// are still present. Git does not lock this file, so the final byte check
-/// narrows the race to the rename but cannot provide a Git-honoured CAS.
+/// are still present. The caller holds thegn's bounded advisory mutation lock,
+/// excluding other thegn writers only; git takes no lock on this file, so an
+/// external editor can still race between the check and rename.
 fn replace_local_pending_todo(path: &std::path::Path, expected: &[u8], bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -584,67 +588,65 @@ pub trait RebaseOps: GitBackend {
     }
 
     /// Rewrite the PENDING entries of a paused rebase (reorder/drop/retag
-    /// mid-flight). Writes use an exact-byte check followed by atomic
-    /// replacement. Git does not lock this file, so this cannot be a true CAS;
-    /// git must not be running against this worktree.
+    /// mid-flight). The bounded advisory mutation lock excludes other thegn
+    /// writers only; git takes no lock on this file, so an external editor can
+    /// still race between the exact-byte check and atomic rename.
     fn rewrite_pending_todo(&self, loc: &GitLoc, todo: &[TodoEntry]) -> Result<()> {
-        if let GitLoc::Local(_) = loc {
-            let Some((path, disk)) = read_local_pending_todo(loc)? else {
-                bail!("no interactive rebase in progress");
-            };
-            return replace_local_pending_todo(&path, &disk, serialize_todo(todo).as_bytes())
-                .context("rewrite live rebase todo");
-        }
-        let Some(disk) = read_rebase_marker(loc, "rebase-merge/git-rebase-todo")? else {
-            bail!("no interactive rebase in progress");
-        };
-        loc.write_git_path_if_unchanged(
-            "rebase-merge/git-rebase-todo",
-            &disk,
-            serialize_todo(todo).as_bytes(),
-        )
-        .context("rewrite live rebase todo")
+        rewrite_live_todo_within(loc, todo, None, super::MUTATION_LOCK_WAIT)
     }
 
     /// [`rewrite_pending_todo`](Self::rewrite_pending_todo) with a
     /// lost-update guard: `baseline` is the pending list AS THE EDITOR READ
     /// IT, and the write is refused when the on-disk todo bytes differ from
     /// the bytes read before parsing. Local and remote writes both make an
-    /// exact-byte final check; Git does not lock this file, so a race remains
-    /// between that check and rename.
+    /// exact-byte final check under the bounded advisory mutation lock. The
+    /// lock excludes other thegn writers only; git takes no lock on the todo,
+    /// so an external editor can still race between check and rename.
     fn rewrite_pending_todo_checked(
         &self,
         loc: &GitLoc,
         todo: &[TodoEntry],
         baseline: &[TodoEntry],
     ) -> Result<()> {
-        let (local_path, disk) = if let GitLoc::Local(_) = loc {
-            let Some((path, bytes)) = read_local_pending_todo(loc)? else {
-                bail!("no interactive rebase in progress");
-            };
-            (Some(path), bytes)
-        } else {
-            let Some(bytes) = read_rebase_marker(loc, "rebase-merge/git-rebase-todo")? else {
-                bail!("no interactive rebase in progress");
-            };
-            (None, bytes)
+        rewrite_live_todo_within(loc, todo, Some(baseline), super::MUTATION_LOCK_WAIT)
+    }
+}
+
+fn rewrite_live_todo_within(
+    loc: &GitLoc,
+    todo: &[TodoEntry],
+    baseline: Option<&[TodoEntry]>,
+    wait: Duration,
+) -> Result<()> {
+    let bytes = serialize_todo(todo);
+    if let GitLoc::Local(worktree) = loc {
+        let _lock =
+            super::require_mutation_lock_within(worktree, &["rebase-todo", "rewrite"], wait)?;
+        let Some((path, disk)) = read_local_pending_todo(loc)? else {
+            bail!("no interactive rebase in progress");
         };
+        if let Some(baseline) = baseline {
+            let text = String::from_utf8(disk.clone())
+                .map_err(|_| anyhow!("rebase todo is not valid UTF-8; refusing a lossy rewrite"))?;
+            if parse_todo(&text) != baseline {
+                bail!("rebase todo changed on disk — reload the editor before rewriting");
+            }
+        }
+        return replace_local_pending_todo(&path, &disk, bytes.as_bytes())
+            .context("rewrite live rebase todo");
+    }
+    let Some(disk) = read_rebase_marker(loc, "rebase-merge/git-rebase-todo")? else {
+        bail!("no interactive rebase in progress");
+    };
+    if let Some(baseline) = baseline {
         let text = String::from_utf8(disk.clone())
             .map_err(|_| anyhow!("rebase todo is not valid UTF-8; refusing a lossy rewrite"))?;
         if parse_todo(&text) != baseline {
             bail!("rebase todo changed on disk — reload the editor before rewriting");
         }
-        if let Some(path) = local_path {
-            return replace_local_pending_todo(&path, &disk, serialize_todo(todo).as_bytes())
-                .context("rewrite live rebase todo");
-        }
-        loc.write_git_path_if_unchanged(
-            "rebase-merge/git-rebase-todo",
-            &disk,
-            serialize_todo(todo).as_bytes(),
-        )
-        .context("rewrite live rebase todo")
     }
+    loc.write_git_path_if_unchanged("rebase-merge/git-rebase-todo", &disk, bytes.as_bytes())
+        .context("rewrite live rebase todo")
 }
 
 impl<T: GitBackend + ?Sized> RebaseOps for T {}
@@ -1140,6 +1142,59 @@ mod tests {
             r.subjects(),
             ["c2", "c1"],
             "c3 dropped + c4 dropped externally"
+        );
+    }
+
+    #[test]
+    fn checked_rewrite_requires_mutation_lock_and_releases_it_after_publish() {
+        let r = linear("edit-lock");
+        let c2 = r.sha_of("c2");
+        let out = CliGit
+            .rebase_retag(&r.loc(), &c2, &[&c2], TodoAction::Edit, &opts())
+            .unwrap();
+        assert_eq!(out, RebaseOutcome::Paused);
+        let status = CliGit
+            .rebase_status(&r.loc())
+            .unwrap()
+            .expect("paused status");
+        let baseline = status.remaining;
+        let kept: Vec<TodoEntry> = baseline
+            .iter()
+            .filter(|entry| entry.subject != "c3")
+            .cloned()
+            .collect();
+        let todo_path = r.dir.join(".git/rebase-merge/git-rebase-todo");
+        let before = std::fs::read(&todo_path).unwrap();
+        let held = thegn_core::util::try_lock_git_mutations(&r.dir).unwrap();
+        let loc = r.loc();
+        let baseline_for_worker = baseline.clone();
+        let kept_for_worker = kept.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = rewrite_live_todo_within(
+                &loc,
+                &kept_for_worker,
+                Some(&baseline_for_worker),
+                Duration::from_millis(200),
+            )
+            .map_err(|error| error.to_string());
+            sender.send(result).unwrap();
+        });
+        let error = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bounded mutation-lock wait must return promptly")
+            .expect_err("rewrite must refuse while another thegn writer holds the lock");
+        assert!(error.contains("mutation lock"), "{error}");
+        worker.join().unwrap();
+        assert_eq!(std::fs::read(&todo_path).unwrap(), before);
+        drop(held);
+
+        rewrite_live_todo_within(&r.loc(), &kept, Some(&baseline), Duration::from_millis(200))
+            .unwrap();
+        assert_ne!(std::fs::read(&todo_path).unwrap(), before);
+        assert_eq!(
+            CliGit.rebase_continue(&r.loc()).unwrap(),
+            RebaseOutcome::Done
         );
     }
 
