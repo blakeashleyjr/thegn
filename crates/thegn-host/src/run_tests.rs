@@ -4154,3 +4154,31 @@ fn drain_wheel_ticks_stops_at_cap_and_leaves_rest_queued() {
     assert!(leftover.is_none());
     assert_eq!(q.len(), 6, "ticks past the cap stay queued");
 }
+
+#[test]
+fn panel_section_flow_stays_inside_the_active_tab() {
+    let mut ui = crate::panel::PanelUi::default();
+    ui.tab = crate::panel::PanelTab::Help;
+    ui.open = crate::panel::Section::Help;
+    assert_eq!(
+        prev_section_in_order(crate::panel::Section::Help, &ui),
+        None
+    );
+
+    ui.tab = crate::panel::PanelTab::Git;
+    let git_sections = ui.tab_sections();
+    let first_git = git_sections[0];
+    let last_git = *git_sections.last().expect("Git tab has sections");
+    assert_eq!(prev_section_in_order(first_git, &ui), None);
+    assert_eq!(next_section_in_order(last_git, &ui), None);
+}
+
+#[test]
+fn switching_panel_tabs_resets_scroll_to_the_top() {
+    let mut ui = crate::panel::PanelUi {
+        scroll: 7,
+        ..Default::default()
+    };
+    ui.switch_tab(crate::panel::PanelTab::Help);
+    assert_eq!(ui.scroll, 0);
+}

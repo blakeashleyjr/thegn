@@ -12,6 +12,15 @@ use crate::seg::{Line, Tok, seg, sp};
 use super::{PanelRow, SectionCtx, ac, bar_segs, d, g, g2, g3, hue, t};
 
 pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
+    let rows = all_rows(ctx);
+    rows.into_iter().skip(ctx.ui.scroll).collect()
+}
+
+pub(super) fn row_count(ctx: &SectionCtx) -> usize {
+    all_rows(ctx).len()
+}
+
+fn all_rows(ctx: &SectionCtx) -> Vec<PanelRow> {
     let s = &ctx.model.stats;
     if s.cpu_pct.is_none() && s.mem_gib.is_none() && s.net_bps.is_none() {
         return vec![PanelRow::plain(Line::segs(vec![seg(
@@ -406,7 +415,7 @@ fn temps_line(ctx: &SectionCtx) -> Vec<PanelRow> {
     vec![PanelRow::plain(Line::Segs(segs))]
 }
 
-/// One row per physical disk: mount, free-% bar, medium, IO rate. Capped so a
+/// One row per physical disk: mount, used-% bar, medium, IO rate. Capped so a
 /// machine with many mounts doesn't flood the section.
 fn disk_rows(ctx: &SectionCtx, meter_w: usize) -> Vec<PanelRow> {
     let disks = &ctx.model.stats.disks;
@@ -414,7 +423,14 @@ fn disk_rows(ctx: &SectionCtx, meter_w: usize) -> Vec<PanelRow> {
         return Vec::new();
     }
     let mut rows = vec![PanelRow::plain(Line::segs(vec![seg(g2(), "DISK").bold()]))];
-    for disk in disks.iter().take(4) {
+    let mut by_mount = disks.iter().collect::<Vec<_>>();
+    by_mount.sort_by_key(|disk| disk.mount.len());
+    let mut names = std::collections::HashSet::new();
+    for disk in by_mount
+        .into_iter()
+        .filter(|disk| names.insert(disk.name.as_str()))
+        .take(4)
+    {
         let kind = match disk.kind {
             thegn_metrics::DiskKind::Ssd => "ssd",
             thegn_metrics::DiskKind::Hdd => "hdd",
@@ -427,12 +443,13 @@ fn disk_rows(ctx: &SectionCtx, meter_w: usize) -> Vec<PanelRow> {
         } else {
             hue(Hue::Teal)
         };
+        let used_pct = 100 - disk.free_pct;
         let mut l = vec![
             sp(1),
             seg(d(), format!("{} ", trunc_pad(&disk.mount, 10))),
-            seg(t(), format!("{:>3}% ", disk.free_pct)),
+            seg(t(), format!("{:>3}% ", used_pct)),
         ];
-        l.extend(bar_segs(disk.free_pct as f32 / 100.0, meter_w, tone));
+        l.extend(bar_segs(used_pct as f32 / 100.0, meter_w, tone));
         let io = disk.read_bps + disk.write_bps;
         rows.push(PanelRow::plain(Line::split(
             l,
@@ -522,7 +539,122 @@ fn trunc_pad(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chrome::FrameModel;
+    use crate::layout::PanelWidth;
+    use crate::panel::{PanelUi, Section};
     use unicode_width::UnicodeWidthStr;
+
+    fn fixture(scroll: usize) -> (FrameModel, PanelUi) {
+        let mut model = FrameModel::default();
+        model.stats.cpu_pct = Some(30);
+        let ui = PanelUi {
+            open: Section::Telemetry,
+            width: PanelWidth::Full,
+            scroll,
+            ..Default::default()
+        };
+        (model, ui)
+    }
+
+    fn text(rows: &[PanelRow]) -> String {
+        rows.iter()
+            .map(|row| match &row.line {
+                Line::Blank => String::new(),
+                Line::Segs(segs) => segs
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(""),
+                Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => l
+                    .iter()
+                    .chain(r)
+                    .map(|s| s.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(""),
+                Line::Fill { ch, .. } => ch.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn disk_rows_dedupe_device_names_and_show_used_percent() {
+        let (mut model, ui) = fixture(0);
+        model.stats.disks = vec![
+            thegn_metrics::DiskInfo {
+                name: "device-a".into(),
+                mount: "/".into(),
+                free_pct: 15,
+                read_bps: 0,
+                write_bps: 0,
+                kind: thegn_metrics::DiskKind::Ssd,
+            },
+            thegn_metrics::DiskInfo {
+                name: "device-a".into(),
+                mount: "/nix".into(),
+                free_pct: 15,
+                read_bps: 0,
+                write_bps: 0,
+                kind: thegn_metrics::DiskKind::Ssd,
+            },
+        ];
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 80,
+            rows: 30,
+        };
+        let rendered = text(&content(&ctx));
+        assert_eq!(rendered.matches("85%").count(), 1, "{rendered}");
+        assert!(
+            rendered.contains("/          "),
+            "shortest mount retained: {rendered}"
+        );
+        assert!(
+            !rendered.contains("/nix"),
+            "duplicate mount omitted: {rendered}"
+        );
+    }
+
+    #[test]
+    fn telemetry_scroll_drops_the_first_three_rows() {
+        let (model, ui) = fixture(0);
+        let all = content(&SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 80,
+            rows: 30,
+        });
+        let scrolled_ui = PanelUi { scroll: 3, ..ui };
+        let scrolled = content(&SectionCtx {
+            model: &model,
+            ui: &scrolled_ui,
+            cols: 80,
+            rows: 30,
+        });
+        let scrolled_lines = scrolled.into_iter().map(|row| row.line).collect::<Vec<_>>();
+        let expected = all
+            .into_iter()
+            .skip(3)
+            .map(|row| row.line)
+            .collect::<Vec<_>>();
+        assert_eq!(scrolled_lines, expected);
+    }
+
+    #[test]
+    fn scroll_extent_marks_telemetry_as_nav_owner() {
+        let (model, ui) = fixture(0);
+        let extent = super::super::scroll_extent(Section::Telemetry, &model, &ui, 80, 12)
+            .expect("Telemetry is scrollable");
+        assert!(extent.owns_nav);
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 80,
+            rows: 12,
+        };
+        assert_eq!(extent.max, row_count(&ctx).saturating_sub(12));
+    }
 
     #[test]
     fn trunc_pad_ascii_fits_and_pads_to_width() {
