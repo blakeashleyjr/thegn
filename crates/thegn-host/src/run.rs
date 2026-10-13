@@ -17382,6 +17382,16 @@ async fn event_loop<T: Terminal>(
                                 dirty = true;
                                 continue;
                             }
+                            if crate::actions::handle_pr_menu_pick(
+                                &choice,
+                                &session,
+                                &refresh_tx,
+                                &waker,
+                                &mut model,
+                            ) {
+                                dirty = true;
+                                continue;
+                            }
                             // Sandbox-halt/ask modal `[r] retry` / `[h] run on host`.
                             {
                                 let active_wt = active_cwd(&session);
@@ -20046,10 +20056,16 @@ async fn event_loop<T: Terminal>(
                         (Section::Pr, KeyCode::Char(c @ ('M' | 'A' | 'c' | 'r' | 'o'))) => {
                             crate::actions::panel_pr_action_key(
                                 c,
-                                &mut model,
-                                &session,
-                                &refresh_tx,
-                                &waker,
+                                &mut crate::actions::PanelPrActionCtx {
+                                    model: &mut model,
+                                    session: &session,
+                                    refresh_tx: &refresh_tx,
+                                    waker: &waker,
+                                    active_menu: &mut active_menu,
+                                    pr_view: &mut pr_view,
+                                    pr_view_gen: &mut pr_view_gen,
+                                    pr_view_tx: &pr_view_tx,
+                                },
                             )
                         }
                         // -- tests: run / discover (capped, single-flight) ---

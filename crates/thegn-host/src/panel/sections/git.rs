@@ -1,21 +1,17 @@
 //! The git section: PR/checks/review/log (Normal), plus issues and a
-//! velocity strip (Half), and the full-width heat calendar · velocity · log
-//! layout (Full — the former git overlay).
+//! velocity strip (Half), and a two-column PR page (Full).
 
+use crate::seg::{Line, Seg, seg, sp};
 use thegn_core::theme::Hue;
-use thegn_core::viz;
-
-use crate::panel::docs::GitDocs;
-use crate::seg::{Line, Seg, Tok, seg, sp};
 
 use super::{
     PanelHit, PanelRow, Section, SectionCtx, ac, d, f, g, g2, g3, hint_row, hue, pr_state_hue,
-    spinner_row, two_col, visible_threads,
+    visible_threads,
 };
 
 pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     if ctx.full() {
-        return full(ctx);
+        return full_pr(ctx);
     }
     list(ctx)
 }
@@ -318,6 +314,7 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
         hint_row(&[
             ("M", "merge"),
             ("A", "approve"),
+            ("c", "comment"),
             ("r", "rerun"),
             ("o", "browser"),
         ])
@@ -348,114 +345,79 @@ fn log_row(row: &thegn_svc::git::LogRow) -> PanelRow {
     ))
 }
 
-// ---- Full: heat calendar · velocity · log (the former git overlay) ---------
+// ---- Full: the PR summary and review threads, with OPEN PRS ----------------
 
-fn full(ctx: &SectionCtx) -> Vec<PanelRow> {
-    let footer = hint_row(&[("j/k", "scroll log"), ("y", "copy sha")]);
-    let Some(docs) = &ctx.ui.docs.git else {
-        return vec![
-            spinner_row(ctx.ui.docs.tick, "commit data"),
-            PanelRow::blank(),
-            footer,
-        ];
-    };
-
-    let left = calendar_column(docs);
-    let body = ctx.rows.saturating_sub(2); // blank + footer
-    let right = log_column(docs, ctx.ui.scroll, body);
-
-    // Two columns when the band is wide enough for calendar + readable log.
-    const LEFT_W: usize = 46;
-    const GAP: usize = 2;
-    let mut rows: Vec<PanelRow> = if ctx.cols >= LEFT_W + GAP + 40 {
-        two_col(&left, &right, LEFT_W, GAP)
+fn full_pr(ctx: &SectionCtx) -> Vec<PanelRow> {
+    let rows = list(ctx);
+    let review = rows
+        .iter()
+        .position(|row| row_text(row).starts_with("REVIEW"));
+    let open_prs = rows
+        .iter()
+        .position(|row| row_text(row).starts_with("OPEN PRS"));
+    let tail = ["LOG", "ISSUES", "VELOCITY"]
+        .iter()
+        .filter_map(|heading| {
+            rows.iter()
+                .position(|row| row_text(row).starts_with(heading))
+        })
+        .min();
+    let left_end = review.or(open_prs).or(tail).unwrap_or(rows.len());
+    let right_start = review.or(open_prs).unwrap_or(left_end);
+    let right_end = tail.unwrap_or_else(|| rows.len().saturating_sub(2));
+    let left = &rows[..left_end];
+    let right = &rows[right_start..right_end];
+    let left_segs = left.iter().map(row_segs).collect::<Vec<_>>();
+    let right_segs = right.iter().map(row_segs).collect::<Vec<_>>();
+    let mut out = if ctx.cols >= 100 {
+        let left_width = ctx.cols.saturating_sub(4) / 2;
+        let mut combined = super::two_col(&left_segs, &right_segs, left_width, 2)
             .into_iter()
-            .take(body)
             .map(PanelRow::plain)
-            .collect()
-    } else {
-        // Narrow fallback: stack the calendar above the log.
-        let mut stacked: Vec<Vec<Seg>> = left;
-        stacked.push(Vec::new());
-        stacked.extend(right);
-        stacked
-            .into_iter()
-            .take(body)
-            .map(|segs| {
-                if segs.is_empty() {
-                    PanelRow::blank()
-                } else {
-                    PanelRow::plain(Line::Segs(segs))
+            .collect::<Vec<_>>();
+        for (index, row) in right.iter().enumerate() {
+            if let Some(hit) = row.hit.clone() {
+                if let Some(target) = combined.get_mut(index) {
+                    target.hit = Some(hit);
                 }
-            })
-            .collect()
-    };
-    rows.push(PanelRow::blank());
-    rows.push(footer);
-    rows
-}
-
-/// COMMITS heat calendar + legend + VELOCITY braille, as seg rows.
-fn calendar_column(docs: &GitDocs) -> Vec<Vec<Seg>> {
-    let weeks = docs.heat.len();
-    let mut left: Vec<Vec<Seg>> = Vec::new();
-    let mut head = vec![
-        seg(g2(), "COMMITS").bold(),
-        seg(g3(), format!(" · {weeks} weeks  ")),
-        seg(g3(), "less "),
-    ];
-    for l in 0..=4u8 {
-        head.push(seg(Tok::Heat(l), "■"));
-    }
-    head.push(seg(g3(), " more"));
-    left.push(head);
-    left.push(Vec::new());
-    let gutter = ["mon", "   ", "wed", "   ", "fri", "   ", "sun"];
-    for d in 0..7 {
-        let mut segs = vec![seg(g3(), format!("{} ", gutter[d]))];
-        for week in &docs.heat {
-            segs.push(seg(Tok::Heat(week[d]), "■"));
-        }
-        left.push(segs);
-    }
-    left.push(Vec::new());
-    left.push(vec![
-        seg(g2(), "VELOCITY").bold(),
-        seg(g3(), " · commits/wk  "),
-        seg(d(), docs.total.to_string()),
-        seg(g(), " commits"),
-    ]);
-    let max = docs.weekly.iter().copied().max().unwrap_or(0).max(1) as f32;
-    let vals: Vec<f32> = docs.weekly.iter().map(|&c| c as f32 / max).collect();
-    let vw = vals.len().div_ceil(2).max(1);
-    let vel = viz::braille_line(&vals, vw, 2);
-    left.push(vec![sp(1), seg(ac(), vel[0].clone())]);
-    left.push(vec![sp(1), seg(g(), vel[1].clone())]);
-    left
-}
-
-/// The LOG column: header + scrolled graph rows, as seg rows.
-fn log_column(docs: &GitDocs, scroll: usize, body: usize) -> Vec<Vec<Seg>> {
-    let mut right: Vec<Vec<Seg>> = Vec::new();
-    right.push(vec![
-        seg(g2(), "LOG").bold(),
-        sp(2),
-        seg(hue(Hue::Amber), docs.head_branch.clone()),
-    ]);
-    right.push(Vec::new());
-    let visible = body.saturating_sub(2);
-    for row in docs.log.iter().skip(scroll).take(visible) {
-        let mut segs = vec![seg(g(), row.graph.clone()), sp(1)];
-        if !row.sha.is_empty() {
-            segs.push(seg(f(), row.sha.clone()));
-            segs.push(sp(1));
-            segs.push(seg(d(), row.subject.clone()));
-            if row.is_head() {
-                segs.push(sp(1));
-                segs.push(Seg::chip(ac(), " HEAD "));
             }
         }
-        right.push(segs);
+        combined
+    } else {
+        left.iter().chain(right.iter()).cloned().collect()
+    };
+    out.push(PanelRow::blank());
+    out.push(if ctx.model.panel.pr.is_some() {
+        hint_row(&[
+            ("enter", "PR view"),
+            ("M", "merge"),
+            ("A", "approve"),
+            ("c", "comment"),
+            ("r", "rerun"),
+            ("o", "browser"),
+        ])
+    } else {
+        hint_row(&[("c", "create PR")])
+    });
+    out
+}
+
+fn row_segs(row: &PanelRow) -> Vec<Seg> {
+    match &row.line {
+        Line::Blank => Vec::new(),
+        Line::Fill { ch, .. } => vec![seg(g(), ch.to_string())],
+        Line::Segs(segs) => segs.clone(),
+        Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
+            let mut segs = l.clone();
+            if !r.is_empty() {
+                segs.push(sp(2));
+                segs.extend(r.clone());
+            }
+            segs
+        }
     }
-    right
+}
+
+fn row_text(row: &PanelRow) -> String {
+    row_segs(row).into_iter().map(|part| part.text).collect()
 }

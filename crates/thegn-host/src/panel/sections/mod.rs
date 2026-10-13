@@ -1903,12 +1903,43 @@ mod spec {
             "{f}"
         );
         assert!(f.contains("c0") && f.contains("c1"), "core sparkrow: {f}");
-        let f = render(Section::Pr, PanelWidth::Full);
-        assert!(
-            f.contains("COMMITS") && f.contains("VELOCITY") && f.contains("LOG"),
-            "{f}"
-        );
-        assert!(f.contains("abc1234"), "{f}");
+        let mut pr_model = model();
+        pr_model.panel.pr = Some(crate::panel::PrSummary {
+            number: 7,
+            title: "Views page".into(),
+            state: "OPEN".into(),
+            url: "https://github.com/o/r/pull/7".into(),
+            is_draft: false,
+            review_decision: None,
+        });
+        pr_model.panel.checks.push(crate::panel::CheckLine {
+            name: "build".into(),
+            state: crate::panel::CheckState::Pass,
+            duration_secs: None,
+            details_url: None,
+        });
+        pr_model
+            .panel
+            .open_prs
+            .push(thegn_core::forge::model::PrHeader {
+                number: 8,
+                head_ref: "other-topic".into(),
+                state: "OPEN".into(),
+                url: "https://github.com/o/r/pull/8".into(),
+                is_draft: false,
+            });
+        let mut pr_ui = ui(PanelWidth::Full, Section::Pr);
+        pr_ui.docs.git = None;
+        let pr_ctx = SectionCtx {
+            model: &pr_model,
+            ui: &pr_ui,
+            cols: 150,
+            rows: 38,
+        };
+        let f = text(&content(Section::Pr, &pr_ctx));
+        assert!(f.contains("CHECKS") && f.contains("OPEN PRS"), "{f}");
+        assert!(f.contains("Views page"), "{f}");
+        assert!(!f.contains("VELOCITY") && !f.contains("LOG"), "{f}");
         // (Changes at Full is rendered by the git-family frame, not this
         // module — its old side-by-side body was removed.)
         let f = render(Section::Keys, PanelWidth::Full);
@@ -1930,7 +1961,12 @@ mod spec {
             cols: 150,
             rows: 38,
         };
-        assert!(text(&content(Section::Pr, &ctx)).contains("loading"));
+        let rendered = text(&content(Section::Pr, &ctx));
+        assert!(!rendered.contains("loading"), "{rendered}");
+        assert!(
+            !rendered.contains("VELOCITY") && !rendered.contains("LOG"),
+            "{rendered}"
+        );
         // (Changes-at-Full no longer has a doc-backed body here — the
         // git-family frame owns that width.)
     }
