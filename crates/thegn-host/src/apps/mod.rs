@@ -720,6 +720,7 @@ mod tests {
             active: ActiveApp::Work,
             tab_order: vec![ActiveApp::Work, ActiveApp::Tile(0), ActiveApp::Tile(1)],
             default_tab: "work".into(),
+            observe_config_snapshot: thegn_core::config_observe::ObserveConfig::default(),
         };
         let delta = |k: char| match tab_chord(Modifiers::ALT, &KeyCode::Char(k), host.tab_count()) {
             Some(TabChord::Cycle(d)) => d,
