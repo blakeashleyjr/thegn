@@ -682,9 +682,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use thegn_core::media::{LoopMode, MediaCaps, MediaSnapshot, MediaState};
 
+    type GatedOperation = (MediaOp, fn(&mut MediaCaps));
+
     #[test]
     fn capability_gated_operations_follow_player_caps() {
-        let gated: [(MediaOp, fn(&mut MediaCaps)); 10] = [
+        let gated: [GatedOperation; 10] = [
             (MediaOp::ShuffleToggle, |caps| caps.shuffle = true),
             (MediaOp::LoopCycle, |caps| caps.loop_mode = true),
             (MediaOp::VolumeUp, |caps| caps.volume = true),
