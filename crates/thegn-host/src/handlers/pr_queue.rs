@@ -6,6 +6,7 @@
 //! waker pulse, so the compositor loop never touches the network or the DB.
 
 use std::path::PathBuf;
+use std::time::Instant;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use termwiz::terminal::TerminalWaker;
@@ -661,6 +662,29 @@ pub(crate) struct PrqKeyCtx<'a> {
     pub tx: &'a PrqTx,
     pub inflight: &'a mut bool,
     pub toasts: &'a mut Toasts,
+    pub guard: &'a mut crate::panel::confirm::TwoPress,
+    pub now: Instant,
+}
+
+fn clear_gate(
+    rows: &[PrQueueRow],
+    guard: &mut crate::panel::confirm::TwoPress,
+    key: &str,
+    now: Instant,
+) -> Result<(), String> {
+    let running = rows
+        .iter()
+        .filter(|row| row.status == "agent_running")
+        .count();
+    let what = format!(
+        "clear {} PR-queue row(s) ({running} with an agent running)",
+        rows.len()
+    );
+    if guard.confirm(key, now) {
+        Ok(())
+    } else {
+        Err(crate::panel::confirm::arm_prompt('c', &what))
+    }
 }
 
 /// Handle one of the section's action keys on the row under the cursor. Returns
@@ -698,7 +722,19 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: PrqKeyCtx) -> bool {
             *ctx.inflight = true;
             spawn_drive(ctx.tx, ctx.waker, ctx.cfg.clone(), ctx.active_wt.clone());
         }
-        PrqAction::Clear => spawn_mutate(ctx.tx, ctx.waker, ctx.active_wt.clone(), Mutation::Clear),
+        PrqAction::Clear => {
+            let rows = &ctx.model.panel.pr_queue;
+            if rows.is_empty() {
+                ctx.model.status = "PR queue: nothing to clear".into();
+                return true;
+            }
+            let key = format!("prq-clear:{}", ctx.active_wt.display());
+            if let Err(prompt) = clear_gate(rows, ctx.guard, &key, ctx.now) {
+                ctx.model.status = prompt;
+                return true;
+            }
+            spawn_mutate(ctx.tx, ctx.waker, ctx.active_wt.clone(), Mutation::Clear)
+        }
         PrqAction::Remove => {
             if let Some(r) = row {
                 spawn_mutate(
@@ -1027,6 +1063,52 @@ mod tests {
             queued_at: 0,
             updated_at: 0,
         }
+    }
+
+    #[test]
+    fn clear_needs_two_presses() {
+        let panel = crate::panel::PanelData {
+            pr_queue: vec![
+                row("/repo#1", 1, "queued"),
+                row("/repo#2", 2, "agent_running"),
+                row("/repo#3", 3, "needs_human"),
+            ],
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let mut guard = crate::panel::confirm::TwoPress::default();
+        let prompt = clear_gate(&panel.pr_queue, &mut guard, "repo", t0).unwrap_err();
+        assert!(prompt.contains("3"));
+        assert!(prompt.contains("1 with an agent running"));
+        assert!(
+            clear_gate(
+                &panel.pr_queue,
+                &mut guard,
+                "repo",
+                t0 + std::time::Duration::from_secs(1),
+            )
+            .is_ok()
+        );
+
+        assert!(clear_gate(&panel.pr_queue, &mut guard, "repo", t0).is_err());
+        assert!(
+            clear_gate(
+                &panel.pr_queue,
+                &mut guard,
+                "other",
+                t0 + std::time::Duration::from_secs(1)
+            )
+            .is_err()
+        );
+        assert!(
+            clear_gate(
+                &panel.pr_queue,
+                &mut guard,
+                "other",
+                t0 + std::time::Duration::from_secs(5)
+            )
+            .is_err()
+        );
     }
 
     #[test]
