@@ -33,7 +33,7 @@ fn with_lines<R>(ctx: &SectionCtx, f: impl FnOnce(&[Line]) -> R) -> R {
     let Some(page) = reg.page(page_id).or_else(|| reg.page("index")) else {
         return f(&[]);
     };
-    let width = ctx.cols.saturating_sub(1).max(8);
+    let width: usize = ctx.cols.saturating_sub(1).max(8);
     let id = page.meta.id.clone();
     let cached = PAGE_MEMO.with(|memo| {
         let memo = memo.borrow();
@@ -100,7 +100,7 @@ pub(super) fn line_count(ctx: &SectionCtx) -> usize {
     with_lines(ctx, <[Line]>::len)
 }
 
-pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
+pub(crate) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     if ctx.ui.help.reg.is_none() {
         return vec![PanelRow::plain(Line::segs(vec![seg(
             d(),
@@ -312,7 +312,10 @@ mod tests {
             width: PanelWidth::Half,
             ..stash
         };
-        assert!(super::super::scroll_extent(Section::Stash, &model, &stash_half, 80, 12).is_none());
+        let half_extent = super::super::scroll_extent(Section::Stash, &model, &stash_half, 80, 12)
+            .expect("Half Stash detail is scrollable");
+        assert_eq!(half_extent.max, 2);
+        assert!(!half_extent.owns_nav);
         let keys_normal = PanelUi {
             open: Section::Keys,
             width: PanelWidth::Normal,

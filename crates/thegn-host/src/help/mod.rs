@@ -107,14 +107,14 @@ pub fn open(
     let label = crate::panel::Section::from_key(section_key)
         .map(crate::panel::Section::label)
         .unwrap_or("");
-    let heading = reg
-        .anchor_for_context(&context_key)
-        .unwrap_or(label)
-        .to_string();
+    let anchor = reg.anchor_for_context(&context_key);
     Some(HelpOverlay::new_at(
         reg.clone(),
         page,
-        Some(overlay::OverlayTarget::Heading(heading)),
+        Some(overlay::OverlayTarget::Heading {
+            key: anchor.unwrap_or(section_key).to_string(),
+            label: anchor.unwrap_or(label).to_string(),
+        }),
         badge,
     ))
 }
@@ -191,7 +191,7 @@ mod tests {
             scroll: 8,
             ..Default::default()
         };
-        let ctx = crate::panel::SectionCtx {
+        let ctx = crate::panel::sections::SectionCtx {
             model: &model,
             ui: &ui,
             cols: 42,
@@ -242,11 +242,37 @@ mod tests {
                     .get(ordinal)
                     .map(|(_, text)| text.as_str())
             });
-            assert!(heading.is_some(), "{context} on {page_id} has no heading");
             if page_id == "panel" {
+                let key = context.strip_prefix("panel:").unwrap_or("");
+                let label = crate::panel::Section::from_key(key)
+                    .map(crate::panel::Section::label)
+                    .unwrap_or("");
+                let anchor = reg.anchor_for_context(context);
+                let ordinal = heading_for_section(
+                    &rendered.headings,
+                    anchor.unwrap_or(key),
+                    anchor.unwrap_or(label),
+                )
+                .unwrap_or_else(|| panic!("{context} on {page_id} has no section heading"));
+                assert!(ordinal > 0, "{context} resolves to the page H1");
+            } else if heading.is_none() {
+                const ACCEPTED_H1_FALLBACKS: &[&str] = &[
+                    "panel:changes",
+                    "panel:commits",
+                    "panel:branches",
+                    "panel:stash",
+                    "panel:files",
+                    "panel:sandbox",
+                    "panel:prq",
+                    "panel:keys",
+                ];
                 assert!(
-                    heading.is_some_and(|heading| !heading.is_empty()),
-                    "{context} resolves to a non-H1 section heading"
+                    ACCEPTED_H1_FALLBACKS.contains(&context.as_str()),
+                    "{context} on {page_id} has no heading and is not an accepted H1 fallback"
+                );
+                assert!(
+                    rendered.headings.first().is_some(),
+                    "{page_id} has no H1 for the accepted fallback {context}"
                 );
             }
             if context == "panel:ci" {

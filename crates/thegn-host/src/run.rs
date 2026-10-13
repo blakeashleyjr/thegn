@@ -16372,10 +16372,15 @@ async fn event_loop<T: Terminal>(
                                 },
                             );
                             if let Some(reg) = panel_ui.help.reg.as_ref() {
+                                let indent = if panel_ui.width == crate::layout::PanelWidth::Full {
+                                    2
+                                } else {
+                                    3
+                                };
                                 panel_ui.scroll = crate::panel::sections::help::scroll_for_anchor(
                                     reg,
                                     &panel_ui.help.page,
-                                    panel_geom(&chrome).0,
+                                    panel_geom(&chrome).0.saturating_sub(indent),
                                     anchor,
                                 );
                             }
