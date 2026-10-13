@@ -1,0 +1,8 @@
+{
+  "source_commit": "38e09ded78652c6cf56b0e3a7b6a7c16d18dcd95",
+  "platform": "Linux 7.2.9",
+  "tcp_port": 35807,
+  "dns_port": 38044,
+  "oci_host": "unix:///run/user/1000/podman/podman.sock",
+  "cached_image": "84be7cfa538b9f8180f268e20329f0123b781d471fb490c162294e631b07f9e1"
+}

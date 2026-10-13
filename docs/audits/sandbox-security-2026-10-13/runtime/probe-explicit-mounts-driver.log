@@ -1,0 +1,7 @@
+running bwrap-hardened
+running bwrap-hardened-deny-all
+running bwrap-network-none
+running bwrap-sealed
+running systemd-hardened
+running systemd-network-none
+running systemd-sealed

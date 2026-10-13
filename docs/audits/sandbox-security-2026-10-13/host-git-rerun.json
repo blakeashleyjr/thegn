@@ -1,0 +1,11 @@
+{
+  "commit_no_verify": {
+    "post_commit_canary_written": true,
+    "returncode": 0
+  },
+  "scope": "Direct Git primitive test; production local status argv; synthetic HOME/config; owned temporary markers; no network or Thegn UI invocation",
+  "status": {
+    "fsmonitor_canary_written": true,
+    "returncode": 0
+  }
+}

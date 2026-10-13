@@ -1,0 +1,4 @@
+running bwrap-hardened
+running systemd-hardened
+running podman-hardened-reuse-network-none
+running podman-hardened-deny-all

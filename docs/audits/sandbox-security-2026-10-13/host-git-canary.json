@@ -1,0 +1,11 @@
+{
+  "status": {
+    "returncode": 0,
+    "fsmonitor_canary_written": true
+  },
+  "commit_no_verify": {
+    "returncode": 0,
+    "post_commit_canary_written": true
+  },
+  "scope": "Synthetic Git CLI argv/environment matching local util::git_cmd; no Thegn binary invocation; all writes confined to /tmp/thegn-hostgit-canary-a9yfsq0l"
+}

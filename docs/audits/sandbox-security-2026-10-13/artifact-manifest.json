@@ -1,0 +1,587 @@
+{
+  "artifact_hash_exclusion": "artifact-manifest.json itself",
+  "artifacts": {
+    "README.md": {
+      "bytes": 16935,
+      "sha256": "57d936c52ee5abc9f19840d8287d9cd2647f8051910641c4c302c8149f550951"
+    },
+    "backend-evidence.md": {
+      "bytes": 28060,
+      "sha256": "905e36df06536c15a917f5bc9d32c22716a19b0746ba1932c7b9472056beb875"
+    },
+    "backend-probe-output.txt": {
+      "bytes": 282,
+      "sha256": "46bf9a843a3f61d5bad09a52f64a9182c7cdc91724b4e7ec3fa20beca1c3e3d4"
+    },
+    "backend-probe.py": {
+      "bytes": 3297,
+      "sha256": "a70f0dfa00aeb8af5643c8fa86b956d81ddab9018b24b54fdcf895176ed929b0"
+    },
+    "design.md": {
+      "bytes": 24479,
+      "sha256": "c6e3ea0e59099cb0a61984dfef29e28aa0f78bf11b5a1d6ee789fc063dd588fd"
+    },
+    "external-runtime-fit.md": {
+      "bytes": 9712,
+      "sha256": "29bae138319e5147a8d7445a04709dead3187bba8bb42e0650197729efc26958"
+    },
+    "host-git-canary.json": {
+      "bytes": 334,
+      "sha256": "a411db6453d6e903d0d3e2ea555ecbd3a3487c406be487f8d05895e8f0d4e81b"
+    },
+    "host-git-experiments.py": {
+      "bytes": 2494,
+      "sha256": "ac6122159f51a5ab09e667f640755b85ab43b95edbfe0f6e789348f1a1e795c0"
+    },
+    "host-git-rerun.json": {
+      "bytes": 322,
+      "sha256": "5a4c1fbd0281b18824936ca10d7eeca1f82e968a5f66ed5a688c1fd2af5834ad"
+    },
+    "launcher-evidence.md": {
+      "bytes": 34230,
+      "sha256": "4d8dd7cbe4a91fe4d5849ef8fc27c58ff3dfb9811ccbf914c9db4ed44c898932"
+    },
+    "private-copy-experiments.py": {
+      "bytes": 8603,
+      "sha256": "42725f9a151d57e594f9e6d46810fb363abc590b855d8477d4dc00ca925af4dd"
+    },
+    "private-copy-results.json": {
+      "bytes": 2167,
+      "sha256": "71e8d6db79f88305342bd15f9b6ea572f861900ce76b2c8152331ea023b7c4ae"
+    },
+    "runtime-evidence.md": {
+      "bytes": 12233,
+      "sha256": "215e45e9f2811ceb25dd93830cf7ea6a588568a5e1602880c64f3d560c54a241"
+    },
+    "runtime/Cargo.lock": {
+      "bytes": 70348,
+      "sha256": "64e20bbda7144ee505d8311cd41d1c4df1a514841000d87c69c5d84a701de5e2"
+    },
+    "runtime/Cargo.toml": {
+      "bytes": 211,
+      "sha256": "5228b8062a2057b16710c29fa89eeb83974694c7e0352aadecd0abe332679b09"
+    },
+    "runtime/helper-build.log": {
+      "bytes": 7969,
+      "sha256": "bae6578afcdb90582e01655de1001dbeec8cb8fe9a5dd6d01f63e7c0091bfd88"
+    },
+    "runtime/helper-rebuild.log": {
+      "bytes": 214,
+      "sha256": "1918bb33e49930c8c05e23c29c1bd6a4b291b9dc3c4fc1b03ec8beb8c9df6398"
+    },
+    "runtime/offline-build.log": {
+      "bytes": 8608,
+      "sha256": "3fffb45d6781984a7e3f1a520e4db08423c584f2ae98e789a4238fcc47943e28"
+    },
+    "runtime/podman-capture.py": {
+      "bytes": 771,
+      "sha256": "69cabefce21d9b90c79bda84ba3489fa258dc278ccc4c2f5ff0390b2a2ae7a19"
+    },
+    "runtime/probe-container-restart-driver.log": {
+      "bytes": 43,
+      "sha256": "22d42983d69b9dde8c3882f54b52264d73e8ee3182a83b079295ed7ba24adaf6"
+    },
+    "runtime/probe-corrected-driver.log": {
+      "bytes": 337,
+      "sha256": "4beac21b3b04986bca9c4a221080eb727a9fe9e9003c3ead18a5b8f6be63607f"
+    },
+    "runtime/probe-default-confirmed-driver.log": {
+      "bytes": 124,
+      "sha256": "0936930ca1c2dacd26ca56f0a15468243ced8f106f68fbb95df9f7327b190103"
+    },
+    "runtime/probe-driver.log": {
+      "bytes": 337,
+      "sha256": "4beac21b3b04986bca9c4a221080eb727a9fe9e9003c3ead18a5b8f6be63607f"
+    },
+    "runtime/probe-explicit-mounts-driver.log": {
+      "bytes": 180,
+      "sha256": "e5ed3cee96c7b2e83bf2e1aa503f9e9085e560fc270c4ee48ad5652197a81055"
+    },
+    "runtime/probe-final-control-driver.log": {
+      "bytes": 208,
+      "sha256": "6615bb84e145146825410669adb97797610850dfd267ff824a1a8ab1fcaf3811"
+    },
+    "runtime/probe-oci-minimal-driver.log": {
+      "bytes": 126,
+      "sha256": "e075b8aa307a373b5ce48133a00d21b1c22d5954db66ed932f727038f1531089"
+    },
+    "runtime/probe_inside.py": {
+      "bytes": 2903,
+      "sha256": "30ad8bd3a327d696c4ff99f6d84926b8820a01b6c7150ba5bea877323965b23d"
+    },
+    "runtime/results-container-restart/dns.log": {
+      "bytes": 276,
+      "sha256": "dd01fe458eb3fda6760e066b71de12788cc6d88b77561d073a246b569d03cfb8"
+    },
+    "runtime/results-container-restart/env-selection.log": {
+      "bytes": 169,
+      "sha256": "29d0185a4fc6b3a6218a843a05775bb99549d360b095f6e9db8067382a79f317"
+    },
+    "runtime/results-container-restart/floor.log": {
+      "bytes": 300,
+      "sha256": "327b5861acf20b06b7e68e205fd3e7652de30402bb5b643ed17d4a3c5f90639a"
+    },
+    "runtime/results-container-restart/inventory.json": {
+      "bytes": 281,
+      "sha256": "73d302f797a62186b467d7d46afc203d9bcf6ac51a61bef40ab1825224fcb6f2"
+    },
+    "runtime/results-container-restart/podman-cli.jsonl": {
+      "bytes": 5801,
+      "sha256": "fe352f892ab5ac91fe278ce5e15160be4aa178262c716c6cd328d6e3c8b5dfdc"
+    },
+    "runtime/results-container-restart/podman-hardened-reuse-network-none-after-container-restart.log": {
+      "bytes": 3575,
+      "sha256": "8c73368b913545053acbec1faf3b4677dfc94a9a10992baded153c677f8ad063"
+    },
+    "runtime/results-container-restart/podman-hardened-reuse-network-none-after-process-exit.log": {
+      "bytes": 77,
+      "sha256": "41617d7e823a94cf23bafb95a48811c1e254c111c37424ce0504e49a5cce6239"
+    },
+    "runtime/results-container-restart/podman-hardened-reuse-network-none-cleanup.log": {
+      "bytes": 71,
+      "sha256": "578e3b78a3d192eaf65dd2aaa4a055a9bc78b472d77ea60891f1823dc33e9495"
+    },
+    "runtime/results-container-restart/podman-hardened-reuse-network-none-container-restart.log": {
+      "bytes": 71,
+      "sha256": "578e3b78a3d192eaf65dd2aaa4a055a9bc78b472d77ea60891f1823dc33e9495"
+    },
+    "runtime/results-container-restart/podman-hardened-reuse-network-none-process-restart.log": {
+      "bytes": 3575,
+      "sha256": "8c73368b913545053acbec1faf3b4677dfc94a9a10992baded153c677f8ad063"
+    },
+    "runtime/results-container-restart/podman-hardened-reuse-network-none.log": {
+      "bytes": 5640,
+      "sha256": "e3a5a6e2381fdc902b86f82cd8020e85cf4baca3618fa62c0fc8429091ad64b2"
+    },
+    "runtime/results-container-restart/policy-overlay.log": {
+      "bytes": 359,
+      "sha256": "de8a55cdafafd6965c8585b1bacc157c3f39e102eb539acedfbaca060ee20ee7"
+    },
+    "runtime/results-corrected-mounts/bwrap-hardened-deny-all.log": {
+      "bytes": 6091,
+      "sha256": "9ee251908dbf8613ef5f564df58c6c48a0155af7257823e962bb54d0d809d0e6"
+    },
+    "runtime/results-corrected-mounts/bwrap-hardened.log": {
+      "bytes": 6082,
+      "sha256": "a45542f18df500835c016ac6b40eb56bad20cfd97605fc87e9f7a28ba63c5dfc"
+    },
+    "runtime/results-corrected-mounts/bwrap-network-none.log": {
+      "bytes": 6100,
+      "sha256": "387e76bb9060e4569e5f5b12ffade8def852cd937f6d3d2a017dcca90906acf8"
+    },
+    "runtime/results-corrected-mounts/bwrap-sealed.log": {
+      "bytes": 5812,
+      "sha256": "89c8697db24000ec682d92b39b186f8beb83e073dad02404afff5e617f5046ec"
+    },
+    "runtime/results-corrected-mounts/dns.log": {
+      "bytes": 276,
+      "sha256": "dd01fe458eb3fda6760e066b71de12788cc6d88b77561d073a246b569d03cfb8"
+    },
+    "runtime/results-corrected-mounts/env-selection.log": {
+      "bytes": 169,
+      "sha256": "29d0185a4fc6b3a6218a843a05775bb99549d360b095f6e9db8067382a79f317"
+    },
+    "runtime/results-corrected-mounts/floor.log": {
+      "bytes": 300,
+      "sha256": "327b5861acf20b06b7e68e205fd3e7652de30402bb5b643ed17d4a3c5f90639a"
+    },
+    "runtime/results-corrected-mounts/inventory.json": {
+      "bytes": 281,
+      "sha256": "3b4fcfc41763b4776bfe4cac9a55834e66eb2b7f828bf1be67530942f28a4d40"
+    },
+    "runtime/results-corrected-mounts/missing-apple-fallback.log": {
+      "bytes": 3369,
+      "sha256": "8eee311b8011304d0531c5f4b22a5a052865e7e09f4d0ef81b5795427e9174a4"
+    },
+    "runtime/results-corrected-mounts/podman-cli.jsonl": {
+      "bytes": 27227,
+      "sha256": "95d86db41d25c694f6f824cb45927f5bdab6b3f006570175ee79661c7c70f10c"
+    },
+    "runtime/results-corrected-mounts/podman-hardened-deny-all-cleanup.log": {
+      "bytes": 7,
+      "sha256": "19eaf43821a7660ec323a87c8457bf74823beb296c39f5e01aa8a683aa50f061"
+    },
+    "runtime/results-corrected-mounts/podman-hardened-deny-all.log": {
+      "bytes": 3256,
+      "sha256": "57375069774cfd96ac2e3cad3f394281c5dcd02c865b70d8938a11957c7a2434"
+    },
+    "runtime/results-corrected-mounts/podman-hardened-reuse-network-none-cleanup.log": {
+      "bytes": 71,
+      "sha256": "0822cfad9b96c707371bc6ce5e2e064e9d13767c37e417dfe15d81442bf523f2"
+    },
+    "runtime/results-corrected-mounts/podman-hardened-reuse-network-none.log": {
+      "bytes": 3286,
+      "sha256": "438babdce40d6cad88e02b3bad81093bbd0dd79a64ab8ae4084992209178ceaf"
+    },
+    "runtime/results-corrected-mounts/podman-network-none-cleanup.log": {
+      "bytes": 56,
+      "sha256": "540199e600e1059eb6941c4e10b73f18bae2efae983271d937c07b0b79a012a1"
+    },
+    "runtime/results-corrected-mounts/podman-network-none.log": {
+      "bytes": 3243,
+      "sha256": "fc7b0298f47ad3b8fa49fe373220d5238a206d0365e49061a6d23dc578bc9b5c"
+    },
+    "runtime/results-corrected-mounts/podman-sealed-cleanup.log": {
+      "bytes": 50,
+      "sha256": "fd56ca7c03995f0e2bf4ac85d4a3b570046d9e4e6a0712ea02f0cc7ad76778d8"
+    },
+    "runtime/results-corrected-mounts/podman-sealed.log": {
+      "bytes": 3322,
+      "sha256": "fb23cdfa5ba134d276ab7e37e9b4f88c5f9a8c3c7c75e9a6e1a1dd50549ecf4c"
+    },
+    "runtime/results-corrected-mounts/systemd-hardened.log": {
+      "bytes": 5093,
+      "sha256": "fa22b9ec8e917b4341ab26bccabaf9438277a07fc24f5e89c9f91d9ee2e18edb"
+    },
+    "runtime/results-corrected-mounts/systemd-network-none.log": {
+      "bytes": 5187,
+      "sha256": "eff6dcb8f4f5ab74232f94a011997e93f673a602e7844d820116cf972e098928"
+    },
+    "runtime/results-corrected-mounts/systemd-sealed.log": {
+      "bytes": 6082,
+      "sha256": "dcfc42fe3f00a7aba3195f93fbc01e660beebc8b4982c455d5d360bdd48fe91a"
+    },
+    "runtime/results-default-confirmed/bwrap-hardened.log": {
+      "bytes": 6381,
+      "sha256": "08f687f4d5e2f81529f48c77d4b8a8e18f9dd23bcc6d91615f208a391ccc0655"
+    },
+    "runtime/results-default-confirmed/dns.log": {
+      "bytes": 276,
+      "sha256": "dd01fe458eb3fda6760e066b71de12788cc6d88b77561d073a246b569d03cfb8"
+    },
+    "runtime/results-default-confirmed/env-selection.log": {
+      "bytes": 169,
+      "sha256": "29d0185a4fc6b3a6218a843a05775bb99549d360b095f6e9db8067382a79f317"
+    },
+    "runtime/results-default-confirmed/floor.log": {
+      "bytes": 300,
+      "sha256": "327b5861acf20b06b7e68e205fd3e7652de30402bb5b643ed17d4a3c5f90639a"
+    },
+    "runtime/results-default-confirmed/inventory.json": {
+      "bytes": 281,
+      "sha256": "ddeb22fe9763950d9c1ca139b4596d5bfbc6f14ee17fbbbb84c77dff65126555"
+    },
+    "runtime/results-default-confirmed/podman-cli.jsonl": {
+      "bytes": 14064,
+      "sha256": "d376b2e7f54db228fd704d2e542cde431e772d532dd58b7342b8e03fe22436a0"
+    },
+    "runtime/results-default-confirmed/podman-hardened-deny-all-cleanup.log": {
+      "bytes": 7,
+      "sha256": "19eaf43821a7660ec323a87c8457bf74823beb296c39f5e01aa8a683aa50f061"
+    },
+    "runtime/results-default-confirmed/podman-hardened-deny-all.log": {
+      "bytes": 3386,
+      "sha256": "4a8591156c2140405ed06fb3ef6c804102ace6252c343820642be2f8d02d19f7"
+    },
+    "runtime/results-default-confirmed/podman-hardened-reuse-network-none-cleanup.log": {
+      "bytes": 7,
+      "sha256": "19eaf43821a7660ec323a87c8457bf74823beb296c39f5e01aa8a683aa50f061"
+    },
+    "runtime/results-default-confirmed/podman-hardened-reuse-network-none.log": {
+      "bytes": 3416,
+      "sha256": "b3de292b774fce19601335b984e466d96907b746c2d2833d9024d7a8ea0b015e"
+    },
+    "runtime/results-default-confirmed/systemd-hardened.log": {
+      "bytes": 1827,
+      "sha256": "61ef6abb02dcb0458eb0bb07e83877d6d76dd28888d2f1785ab1fca78bb74fb5"
+    },
+    "runtime/results-explicit-mounts/bwrap-hardened-deny-all.log": {
+      "bytes": 6565,
+      "sha256": "40ef55bee84db488fd16e9dda6a2cc307691d1bbf2264e96cfe8324dcb3235d5"
+    },
+    "runtime/results-explicit-mounts/bwrap-hardened.log": {
+      "bytes": 6556,
+      "sha256": "720ab0312ce87ae737bf32321226ec2534b346fc6774b5c1d6d8fcc28b4d2229"
+    },
+    "runtime/results-explicit-mounts/bwrap-network-none.log": {
+      "bytes": 6574,
+      "sha256": "dd51f4d4b83185c25117bec8e70573598daeaf60beafd66811a27415a5d3b12c"
+    },
+    "runtime/results-explicit-mounts/bwrap-sealed.log": {
+      "bytes": 5920,
+      "sha256": "1719adba77e67472be85c19a133807de1da8d0824a9bcebb7f8ccb96f00a1526"
+    },
+    "runtime/results-explicit-mounts/dns.log": {
+      "bytes": 276,
+      "sha256": "dd01fe458eb3fda6760e066b71de12788cc6d88b77561d073a246b569d03cfb8"
+    },
+    "runtime/results-explicit-mounts/env-selection.log": {
+      "bytes": 169,
+      "sha256": "29d0185a4fc6b3a6218a843a05775bb99549d360b095f6e9db8067382a79f317"
+    },
+    "runtime/results-explicit-mounts/floor.log": {
+      "bytes": 300,
+      "sha256": "327b5861acf20b06b7e68e205fd3e7652de30402bb5b643ed17d4a3c5f90639a"
+    },
+    "runtime/results-explicit-mounts/inventory.json": {
+      "bytes": 281,
+      "sha256": "3cc76f83c01c11d01fac04ae525875725d74745fa01b5ffbf19c4c2dbf0acde3"
+    },
+    "runtime/results-explicit-mounts/systemd-hardened.log": {
+      "bytes": 5494,
+      "sha256": "f25726259e462b091c8f372209d91851def5e0a34fa0bdb38d5ad6cef386985d"
+    },
+    "runtime/results-explicit-mounts/systemd-network-none.log": {
+      "bytes": 5588,
+      "sha256": "419491895d161d56efd980f2aa6f7362bd4d6477a4517c4d6ea01bc3ef38b832"
+    },
+    "runtime/results-explicit-mounts/systemd-sealed.log": {
+      "bytes": 6190,
+      "sha256": "b5337d60607f01d30408c74d26c435d272cb1159bdc3ef2648f1a9187694ef1c"
+    },
+    "runtime/results-final-control/bwrap-custom-mount.log": {
+      "bytes": 7060,
+      "sha256": "b2ece94f585f6f07503a1111dfd62e565d0feb5b6ca04f15cebfaa07945b6044"
+    },
+    "runtime/results-final-control/bwrap-hardened.log": {
+      "bytes": 6713,
+      "sha256": "e10a777aad728e94496f2f5d1f4e0fbf41cfc8e2a98e85300c52a93cc95a5a6c"
+    },
+    "runtime/results-final-control/dns.log": {
+      "bytes": 276,
+      "sha256": "dd01fe458eb3fda6760e066b71de12788cc6d88b77561d073a246b569d03cfb8"
+    },
+    "runtime/results-final-control/env-selection.log": {
+      "bytes": 169,
+      "sha256": "29d0185a4fc6b3a6218a843a05775bb99549d360b095f6e9db8067382a79f317"
+    },
+    "runtime/results-final-control/floor.log": {
+      "bytes": 300,
+      "sha256": "327b5861acf20b06b7e68e205fd3e7652de30402bb5b643ed17d4a3c5f90639a"
+    },
+    "runtime/results-final-control/inventory.json": {
+      "bytes": 281,
+      "sha256": "f9e40458547578dd6988076c11b61e531c1999b2af032b2d199fd3221bfb0148"
+    },
+    "runtime/results-final-control/missing-backend-empty-chain-fallback.log": {
+      "bytes": 388,
+      "sha256": "b3c0b27fb3c9c2fedc4f8cf6c5ace16b3c5f99433c643935429f5104699701ec"
+    },
+    "runtime/results-final-control/podman-cli.jsonl": {
+      "bytes": 7849,
+      "sha256": "f62d91be01648dbaada6cb2061a88422818fcb5f7bf9696be39b2eacc59f2fc7"
+    },
+    "runtime/results-final-control/podman-hardened-reuse-network-none-after-process-exit.log": {
+      "bytes": 77,
+      "sha256": "b94209c0a8a1c6524209f55adbe6a1b4baf361df28900d9541622241ae33b896"
+    },
+    "runtime/results-final-control/podman-hardened-reuse-network-none-cleanup.log": {
+      "bytes": 71,
+      "sha256": "b0a5fbf99b9eafac26d7a1a286f39125f92c815473ff7c5d92fa2778e08d89aa"
+    },
+    "runtime/results-final-control/podman-hardened-reuse-network-none-process-restart.log": {
+      "bytes": 3575,
+      "sha256": "d61336d964302936cd4e22f262013ea80cbaec3092105f2ae9ab77f58a887a02"
+    },
+    "runtime/results-final-control/podman-hardened-reuse-network-none.log": {
+      "bytes": 5640,
+      "sha256": "9b0db96fec94c71f00029841f3c6a21cbc5f46ab48d55f074b1a619cd424e01d"
+    },
+    "runtime/results-final-control/podman-sealed-after-process-exit.log": {
+      "bytes": 77,
+      "sha256": "9dd5a19256c5b50980a5820302f43760e2d30ca4ad1419b5e60f94b592eb60ab"
+    },
+    "runtime/results-final-control/podman-sealed-cleanup.log": {
+      "bytes": 50,
+      "sha256": "97c4ce2e1addf91ecae178d1fd85bb6e745a4821ae4e12ca3ec273a142df67c3"
+    },
+    "runtime/results-final-control/podman-sealed.log": {
+      "bytes": 3380,
+      "sha256": "2178f99379df09d0bbe98cff148949d3521438a6b7dc4d98947f640d9c0fdcaa"
+    },
+    "runtime/results-final-control/policy-overlay.log": {
+      "bytes": 359,
+      "sha256": "de8a55cdafafd6965c8585b1bacc157c3f39e102eb539acedfbaca060ee20ee7"
+    },
+    "runtime/results-final-control/systemd-hardened.log": {
+      "bytes": 5614,
+      "sha256": "eea9b58e708879a12d57b2d4955a7598658b241b557a411abd724a49c25c72a8"
+    },
+    "runtime/results-final-control/systemd-sealed.log": {
+      "bytes": 6310,
+      "sha256": "2f396bb31be12ead88878d9b055d22ca7fd20a838f6175805d04efa513233f95"
+    },
+    "runtime/results-oci-minimal/dns.log": {
+      "bytes": 276,
+      "sha256": "dd01fe458eb3fda6760e066b71de12788cc6d88b77561d073a246b569d03cfb8"
+    },
+    "runtime/results-oci-minimal/env-selection.log": {
+      "bytes": 169,
+      "sha256": "29d0185a4fc6b3a6218a843a05775bb99549d360b095f6e9db8067382a79f317"
+    },
+    "runtime/results-oci-minimal/floor.log": {
+      "bytes": 300,
+      "sha256": "327b5861acf20b06b7e68e205fd3e7652de30402bb5b643ed17d4a3c5f90639a"
+    },
+    "runtime/results-oci-minimal/inventory.json": {
+      "bytes": 281,
+      "sha256": "e4a3c218fa9a60b3ad4fea0e8e7d3a47b2c920dc6b96bcb0c96374ecc588c145"
+    },
+    "runtime/results-oci-minimal/podman-cli.jsonl": {
+      "bytes": 15570,
+      "sha256": "056968aa14d47fdecb35ae3558d336dba0af60a36d2b2999a4fa974ea173e417"
+    },
+    "runtime/results-oci-minimal/podman-hardened-deny-all-cleanup.log": {
+      "bytes": 7,
+      "sha256": "19eaf43821a7660ec323a87c8457bf74823beb296c39f5e01aa8a683aa50f061"
+    },
+    "runtime/results-oci-minimal/podman-hardened-deny-all.log": {
+      "bytes": 2482,
+      "sha256": "8c68189a8cbd0665d5cf354265ac41ee5df5d925ec98b5f0dd72179b94f4a2a9"
+    },
+    "runtime/results-oci-minimal/podman-hardened-reuse-network-none-cleanup.log": {
+      "bytes": 71,
+      "sha256": "abf7417db2481c01ec4ce29c254600d47ec7ce02e0bbec29ba77865b188fe099"
+    },
+    "runtime/results-oci-minimal/podman-hardened-reuse-network-none.log": {
+      "bytes": 5326,
+      "sha256": "7b6dce4e849e8378ef7f55bea2b654332c258b3d6a6828e08c47a8fb58970c3d"
+    },
+    "runtime/results-oci-minimal/podman-network-none-cleanup.log": {
+      "bytes": 56,
+      "sha256": "cea009734775a91ea8661cd07625613f3a0432f522e3895d0794e7f089f05634"
+    },
+    "runtime/results-oci-minimal/podman-network-none.log": {
+      "bytes": 3474,
+      "sha256": "416ca46f870485c70363b85d24b0b4965601ac5a966277fbc99c983bd41243af"
+    },
+    "runtime/results-oci-minimal/podman-sealed-cleanup.log": {
+      "bytes": 50,
+      "sha256": "376c686b9c7c3bd92484c46ac618c88245710cffcd674dbd411482a5874ce297"
+    },
+    "runtime/results-oci-minimal/podman-sealed.log": {
+      "bytes": 3223,
+      "sha256": "ed4479a0ffff55a63a10ee13f4a81f3aee1f471f66e6f38361f2e10c50d0daf5"
+    },
+    "runtime/results/bwrap-hardened-deny-all.log": {
+      "bytes": 6311,
+      "sha256": "4dac539344edabd94cd7b6ced6768131d80b39c298f73a95a422d9d9a255409a"
+    },
+    "runtime/results/bwrap-hardened.log": {
+      "bytes": 6302,
+      "sha256": "93414523f47d2456f78dedc0e0a20a01c25a2e891cecc549345f2a9568bd023d"
+    },
+    "runtime/results/bwrap-network-none.log": {
+      "bytes": 6320,
+      "sha256": "76b039afd767f62a8e8b3c666a766a3d49c7e5de0dc4ecb13a15aede39d287f8"
+    },
+    "runtime/results/bwrap-sealed.log": {
+      "bytes": 5804,
+      "sha256": "aba2f6b7200203393bc6021404914fb25b7f7a656a058e573c0f04bf56d51cc2"
+    },
+    "runtime/results/dns.log": {
+      "bytes": 276,
+      "sha256": "dd01fe458eb3fda6760e066b71de12788cc6d88b77561d073a246b569d03cfb8"
+    },
+    "runtime/results/env-selection.log": {
+      "bytes": 169,
+      "sha256": "29d0185a4fc6b3a6218a843a05775bb99549d360b095f6e9db8067382a79f317"
+    },
+    "runtime/results/floor.log": {
+      "bytes": 300,
+      "sha256": "327b5861acf20b06b7e68e205fd3e7652de30402bb5b643ed17d4a3c5f90639a"
+    },
+    "runtime/results/inventory.json": {
+      "bytes": 281,
+      "sha256": "142ed9f44d8385d4ab81741b29f02b1b32583b66ddd3d3fd1c9608beed639b4a"
+    },
+    "runtime/results/missing-apple-fallback.log": {
+      "bytes": 3361,
+      "sha256": "35e4e37c66b403f7e4f1d7b2754e2663f7ba80c9c5dbd4781e709aa7be464c8c"
+    },
+    "runtime/results/podman-hardened-deny-all-cleanup.log": {
+      "bytes": 7,
+      "sha256": "19eaf43821a7660ec323a87c8457bf74823beb296c39f5e01aa8a683aa50f061"
+    },
+    "runtime/results/podman-hardened-deny-all.log": {
+      "bytes": 3378,
+      "sha256": "3808b8821a24a4e61c97407a7357569ff67cc89aafc74108cd90acd9c64fdfbf"
+    },
+    "runtime/results/podman-hardened-reuse-network-none-cleanup.log": {
+      "bytes": 7,
+      "sha256": "19eaf43821a7660ec323a87c8457bf74823beb296c39f5e01aa8a683aa50f061"
+    },
+    "runtime/results/podman-hardened-reuse-network-none.log": {
+      "bytes": 3408,
+      "sha256": "cadb4dca426d8e1cbb831406681857e6432cc53baece1d27a616e7e1bf0426de"
+    },
+    "runtime/results/podman-network-none-cleanup.log": {
+      "bytes": 7,
+      "sha256": "19eaf43821a7660ec323a87c8457bf74823beb296c39f5e01aa8a683aa50f061"
+    },
+    "runtime/results/podman-network-none.log": {
+      "bytes": 3365,
+      "sha256": "cc6805bc9f8fd18f6d0500e2dee702fa89117404ebb3f0c2473e86e5ea5fe6c0"
+    },
+    "runtime/results/podman-sealed-cleanup.log": {
+      "bytes": 50,
+      "sha256": "3d6c65639f5eddde97ccf6e93d260898e6da9ac2f2ef740f823c384c6c0d2a8d"
+    },
+    "runtime/results/podman-sealed.log": {
+      "bytes": 3314,
+      "sha256": "481f79fe43a4849be03bbd0120bb0b430a5d19093b03187c1d5a8ce63ed0e731"
+    },
+    "runtime/results/systemd-hardened.log": {
+      "bytes": 2083,
+      "sha256": "eb2da96ea7b4d5532ac91f83925df8562c58c0e35bcd24ecbd40e688f010da78"
+    },
+    "runtime/results/systemd-network-none.log": {
+      "bytes": 2089,
+      "sha256": "071bb1ec197c9a2d2a8c00efb0d696b8864755a5b655178e12ca54600b923ea5"
+    },
+    "runtime/results/systemd-sealed.log": {
+      "bytes": 5822,
+      "sha256": "fc6e4a3e9faa631e8d66ec985ff916f0d318d2db765ab1ba1893ddd7679092fb"
+    },
+    "runtime/run-probes.py": {
+      "bytes": 10678,
+      "sha256": "25819fc64c6d0e4295ce96a5f373abb257c276441936acaaffb1354d7b2a2cdf"
+    },
+    "runtime/sandbox_profile-tests.log": {
+      "bytes": 250,
+      "sha256": "6aaadc8d48819e069650082d01ac2ff9eba505ed44b08c4bf8b6b78baa357a34"
+    },
+    "runtime/sandbox_readonly_home-tests.log": {
+      "bytes": 335,
+      "sha256": "758a0fba8699555a81d94d19544ce21d2465489e54bbd6f699be4edee53e3d2d"
+    },
+    "runtime/sandbox_sealed_home-process-isolated-tests.log": {
+      "bytes": 6785,
+      "sha256": "73c335fcb91096df0cb674a8f98699638c5f7183b75f4e3d09d62a0eddb66c0d"
+    },
+    "runtime/sandbox_sealed_home-supported-home-tests.log": {
+      "bytes": 2292,
+      "sha256": "3599754c0d947da8e485674d4c70b6b06a51a5a88901771bb27afd3badd65f08"
+    },
+    "runtime/sandbox_sealed_home-tests.log": {
+      "bytes": 2292,
+      "sha256": "b1baf62af6fed596059e2182b23f3edc55afc2da4312c99b805f7b4c5eb17822"
+    },
+    "runtime/src/main.rs": {
+      "bytes": 10713,
+      "sha256": "1863913ce8664b0a1651d02b0e71c00450d7e0df068f25e6f4da2e5444218068"
+    },
+    "validation.md": {
+      "bytes": 9260,
+      "sha256": "095bf237091f4f444700bcc62164e387f3afd36ec8ebef0e25d3af7d450b83a4"
+    },
+    "verification.json": {
+      "bytes": 319,
+      "sha256": "8754a3909f421823620b0562ba36c78864041b72e4a1145248f260c49a9b99bc"
+    }
+  },
+  "audited_source_hashes": {
+    "crates/thegn-core/src/config.rs": "6f044e3521a88ac2afe5201904e970cc686b4dda9c3ec0bd4347755b0468914c",
+    "crates/thegn-core/src/config_resolve.rs": "43211bf8ce5e592bc49063763585a62a81bd9eb5d7f8a2e8273ea6b1f69a979a",
+    "crates/thegn-core/src/dns_filter.rs": "dd5b3900349dbf5ed7b5f203672578ce18e8c116d1a050c287393cae885a6382",
+    "crates/thegn-core/src/sandbox.rs": "62b374a9fabd62236129bf800696bb3c08125edc4c0cd8df462119e33a718899",
+    "crates/thegn-core/src/sandbox_floor.rs": "6b9721ae7346bf2f3978364ed5982e35fc746ae3a893614124619bd5ebb78460",
+    "crates/thegn-core/src/sandbox_mounts.rs": "52c6823e9448d88975939e9110cf0ce60459a9c5c655c42dfd8a695130ee21ef",
+    "crates/thegn-host/src/agent.rs": "97329fe1f6cf7eb954743eb08b268cee7cbe7a2dbee7120800c4e18b1598d8f1",
+    "crates/thegn-host/src/agent_run.rs": "5ce92e11171905871c46d189cdbed32811b53add47ba8302686a42fbe784814b",
+    "crates/thegn-host/src/panes.rs": "b54ad86e6a6b06793f9f07dba6db8af34ff0453d12cafb3afba45a8d69195af1"
+  },
+  "date": "2026-10-13",
+  "scope": "Audit/design only; no product code/API changes",
+  "source_commit": "38e09ded78652c6cf56b0e3a7b6a7c16d18dcd95"
+}

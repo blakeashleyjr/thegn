@@ -1,0 +1,4 @@
+reuse: NAT->none and rw->ro share same inspected input, reusable=true
+nonsealed removed mount: extra old bind accepted=true
+singleton: second deny-all policy uses first port and forwards allowed.test, rcode=0
+block-only case mismatch: blocked.test denied, BLOCKED.TEST allowed=true

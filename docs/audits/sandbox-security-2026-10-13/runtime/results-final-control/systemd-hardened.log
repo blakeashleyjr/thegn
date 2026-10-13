@@ -1,0 +1,31 @@
+wait_status=0
+request backend=systemd profile=hardened network=nat floor=off miss=degrade
+resolved backend=systemd profile_home=None network=Nat name=thegn-audit-20261013-3556055-systemd-hardened
+mounts=[{"cache":false,"dest":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/wt","host":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/wt","ro":false},{"cache":false,"dest":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/repo/.git","host":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/repo/.git","ro":false},{"cache":false,"dest":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/repo/.git/config","host":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/repo/.git/config","ro":true},{"cache":true,"dest":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/.cargo/registry","host":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/.cargo/registry","ro":false},{"cache":true,"dest":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/.cache/pip","host":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/.cache/pip","ro":false},{"cache":false,"dest":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/.gitconfig","host":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/.gitconfig","ro":true},{"cache":false,"dest":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/.gnupg","host":"/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/.gnupg","ro":false}]
+forwarded_env_keys=["GH_TOKEN", "TERM", "HOME", "THEGN_SANDBOX", "PREK_ALLOW_NO_CONFIG"]
+argv=["systemd-run","--user","--pty","--quiet","--collect","--working-directory=/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/wt","-p","PrivateTmp=yes","--slice=thegn.slice","-p","ProtectSystem=yes","-p","ProtectHome=read-only","-p","InaccessiblePaths=-/run/user/1000/thegn","-p","ReadWritePaths=/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/wt","-p","ReadWritePaths=/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/repo/.git","-p","ReadWritePaths=/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/.cargo/registry","-p","ReadWritePaths=/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/.cache/pip","-p","ReadWritePaths=/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/.gnupg","-p","ReadOnlyPaths=/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/repo/.git/config","-p","NoNewPrivileges=yes","-p","TasksMax=512","-p","EnvironmentFile=/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/.local/state/thegn/sandbox-env/thegn-audit-20261013-3556055-systemd-hardened-3556120-1.env","-p","ExecStopPost=-+/nix/store/cp7wjv1pl4wapfk48svvizxd089v9h0a-coreutils-9.11/bin/rm -f -- /home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/.local/state/thegn/sandbox-env/thegn-audit-20261013-3556055-systemd-hardened-3556120-1.env","--setenv","THEGN_SANDBOX=1","--setenv","PREK_ALLOW_NO_CONFIG=1","/bin/sh","-lc","unset GIT_DIR\nunset GIT_INDEX_FILE\nunset GIT_WORK_TREE\nunset GIT_COMMON_DIR\nunset GIT_NAMESPACE\nunset GIT_OBJECT_DIRECTORY\nunset GIT_ALTERNATE_OBJECT_DIRECTORIES\nexec /nix/store/jxyrvv4gbpnp3ap5iy7wxwl1sg4x2x88-python3-3.14.6/bin/python3 /home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/wt/probe_inside.py /home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k 35807 38044 host /dev/shm/thegn-audit-system-voqc9jt4/system-canary"]
+ensure=ok
+[22;2t]2;🟡 /bin/sh -lc unset GIT_DIR
+unset GIT_INDEX_FILE
+unset GIT_WORK_TREE
+unset GIT_COMM…-audit-system-voqc9jt4/system-canary on ws-3\install: cannot create directory '/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/.config/containers'
+install: cannot create directory '/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/.config/containers'
+mkdir: cannot create directory '/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/.docker': Read-only file system
+ln: failed to create symbolic link '/home/blake/code/thegn-audit-runtime-20261013/.audit-fixture-_e1n1z5k/home/.docker/docker.sock': No such file or directory
+{"label": "worktree", "read": true, "write": true}
+{"label": "sibling_checkout", "read": true, "write": false, "write_errno": 30}
+{"label": "shared_git", "read": true, "write": true}
+{"label": "shared_git_config", "read": true, "write": false, "write_errno": 30}
+{"label": "home", "read": true, "write": false, "write_errno": 30}
+{"label": "credential_ssh", "read": true, "write": false, "write_errno": 30}
+{"label": "credential_gpg", "read": true, "write": true}
+{"label": "credential_gpg_default_alias", "read": false, "read_errno": 2, "write": false, "write_errno": 2}
+{"label": "cache", "read": true, "write": true}
+{"label": "custom_system_fixture", "read": true, "write": false, "write_errno": 30}
+{"label": "host_shared_memory_fixture", "read": true, "write": true}
+{"label": "system_os_release", "read": true}
+{"label": "credential_forwarding", "synthetic_GH_TOKEN_present": true}
+{"label": "endpoint_address", "address": "127.0.0.1"}
+{"label": "direct_ip_tcp", "allowed": true}
+{"label": "alternate_dns_udp", "rcode": 0}
+[23;2t[!p]104\[0m[?7h[1G[0Jenter_exit=exit status: 0

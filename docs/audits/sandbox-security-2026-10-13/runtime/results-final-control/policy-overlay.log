@@ -1,0 +1,5 @@
+exit=0
+case=restricted_repo_adds_destination allow=["allowed.test"] block=["globalblocked.test", "*"]
+case=restricted_repo_empty_allow allow=["allowed.test"] block=["globalblocked.test", "*"]
+case=restricted_repo_adds_block allow=["allowed.test"] block=["globalblocked.test", "repoblocked.test"]
+case=unrestricted_repo_narrows allow=["allowed.test"] block=[]
