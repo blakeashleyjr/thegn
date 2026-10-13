@@ -684,6 +684,41 @@ pub fn display_map(ui: &GitUi, view: GitView, data: &crate::panel::PanelData) ->
     (0..len).collect()
 }
 
+/// Paste into the active git filter only while its panel input owns focus.
+/// Returns false when the paste belongs to the terminal pane instead.
+pub fn paste_filter(
+    ui: &mut crate::panel::PanelUi,
+    panel_visible: bool,
+    panel_focused: bool,
+    text: &str,
+    data: &crate::panel::PanelData,
+) -> bool {
+    let view = {
+        let Some(filter) = ui
+            .git
+            .filter
+            .as_mut()
+            .filter(|filter| panel_visible && panel_focused && filter.editing)
+        else {
+            return false;
+        };
+        filter
+            .query
+            .extend(text.chars().filter(|character| !character.is_control()));
+        filter.view
+    };
+    let map = display_map(&ui.git, view, data);
+    let max_cursor = map.len().saturating_sub(1);
+    if let Some(filter) = ui.git.filter.as_mut() {
+        filter.map = map;
+    }
+    let cursor = ui.git.cur.get(view).min(max_cursor);
+    ui.git.cur.set(view, cursor);
+    ui.cursor = cursor;
+    ui.git.sel_anchor = None;
+    true
+}
+
 /// Translate the focused list's display cursor to its source index.
 pub fn source_at(ui: &GitUi, view: GitView, data: &crate::panel::PanelData) -> Option<usize> {
     display_map(ui, view, data).get(ui.cur.get(view)).copied()
@@ -1159,6 +1194,31 @@ mod tests {
         };
         ui.git.focus = view;
         ui
+    }
+
+    #[test]
+    fn filter_paste_requires_visible_panel_focus_and_editing() {
+        let data = crate::panel::PanelData::default();
+        let mut ui = ui_at(GitView::Files, PanelWidth::Full);
+        ui.git.filter = Some(ListFilter {
+            view: GitView::Files,
+            query: "old".into(),
+            editing: true,
+            map: Vec::new(),
+        });
+        ui.git.cur.set(GitView::Files, 4);
+        ui.cursor = 4;
+        ui.git.sel_anchor = Some(2);
+        assert!(!paste_filter(&mut ui, false, true, "paste", &data));
+        assert!(!paste_filter(&mut ui, true, false, "paste", &data));
+        assert_eq!(ui.git.filter.as_ref().unwrap().query, "old");
+        assert!(paste_filter(&mut ui, true, true, " paste", &data));
+        assert_eq!(ui.git.filter.as_ref().unwrap().query, "old paste");
+        assert_eq!(ui.cursor, 0);
+        assert_eq!(ui.git.cur.get(GitView::Files), 0);
+        assert_eq!(ui.git.sel_anchor, None);
+        assert!(paste_filter(&mut ui, true, true, "a\nb\x1b", &data));
+        assert_eq!(ui.git.filter.as_ref().unwrap().query, "old pasteab");
     }
 
     #[test]

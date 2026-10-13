@@ -463,12 +463,16 @@ fn pipe_to(
         }
         match child.try_wait() {
             Ok(Some(status)) => {
-                // The leader remains unreaped here, so its group identity is
-                // still owned while descendants are cleaned up.
-                group.kill();
+                // Native clipboard tools may fork the process that serves the
+                // selection and then exit successfully. Preserve that holder;
+                // on a failed detach, treat the helper as failed and clean it.
+                let detached = status.success() && group.detach();
+                if !detached {
+                    group.kill();
+                }
                 let _ = child.wait();
                 let _ = writer.join();
-                return status.success();
+                return detached;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
             Err(_) => {
@@ -552,6 +556,74 @@ mod tests {
             ),
             "unspawnable tool is a failure"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn successful_helper_keeps_its_background_clipboard_holder_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("holder.pid");
+        let helper = dir.path().join("fake-copy");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\ncat >/dev/null\nsleep 30 &\necho $$ > \"$1\"\n",
+        )
+        .unwrap();
+        crate::platform::set_owner_executable(&helper).unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        assert!(pipe_to(
+            &[helper.to_str().unwrap(), marker.to_str().unwrap()],
+            Arc::from(&b"selection"[..]),
+            &cancelled,
+            Instant::now() + OPERATION_BUDGET,
+        ));
+        let pid: i32 = std::fs::read_to_string(marker)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let group = crate::platform::GroupHandle::from_pid(pid);
+        let alive = !group.is_empty();
+        group.kill();
+        assert!(alive, "successful helper's holder was killed");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn timed_out_helper_kills_its_background_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("holder.pid");
+        let helper = dir.path().join("fake-copy");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\necho $$ > \"$1\"\ncat >/dev/null\nsleep 30 &\nwait\n",
+        )
+        .unwrap();
+        crate::platform::set_owner_executable(&helper).unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        assert!(!pipe_to(
+            &[helper.to_str().unwrap(), marker.to_str().unwrap()],
+            Arc::from(&b"selection"[..]),
+            &cancelled,
+            Instant::now() + Duration::from_secs(2),
+        ));
+        let pid: i32 = std::fs::read_to_string(marker)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let group = crate::platform::GroupHandle::from_pid(pid);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !group.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let empty = group.is_empty();
+        if !empty {
+            group.kill();
+        }
+        assert!(empty, "timeout left the holder process group alive");
     }
 
     #[test]
