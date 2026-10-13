@@ -1,3 +1,5 @@
+> Retired (THE-130): accepted as delivered by THE-68 (openspec/changes/archive/2026-09-09-fix-attention-signal-noise/ and the activity-signals "live state" requirement); the targeted notify verb (task 3.1) was not built and is not carried forward.
+
 # Add OSC attention signaling (agents raise their hand)
 
 ## Summary

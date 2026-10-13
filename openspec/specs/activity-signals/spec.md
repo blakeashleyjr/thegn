@@ -155,8 +155,8 @@ enabled MUST hold at most one current row per session rather than one per signal
 #### Scenario: A deliberate push still records an inbox row
 
 - **WHEN** an `agent_attention` notification is pushed deliberately
-  (`thegn notify push --urgency alert`, `notify.push` over the control API, or
-  the MCP tool)
+  (`thegn notify push --kind agent_attention`, or `notify.push` over the control
+  API with `urgency` `alert` or `critical`)
 - **THEN** it is recorded in the inbox and scores as it always has: this
   requirement changes the ambient OSC path only
 
