@@ -34,11 +34,13 @@ pub fn run_command_bounded(
 
 pub use battery::{read_battery, read_battery_power};
 pub use coverage::{AbsentReason, Coverage, FamilyReport, MetricFamily, coverage};
-pub use net_medium::{IfaceFact, NetMedium, select_medium};
+pub use net_medium::{
+    IfaceFact, MediumReason, MediumSelection, NetMedium, select_medium, select_medium_explained,
+};
 pub use procs::{
     MIN_INTERVAL as PROC_MIN_INTERVAL, ProcOwner, ProcSample, ProcSampler, ProcSnapshot,
 };
-pub use sample::{StatsSampler, SystemInfo, TrackedSpec};
+pub use sample::{StatsSampler, SystemInfo, TrackedSpec, probe_net_path};
 
 /// One sampled reading; `None`/empty fields render as absent widgets, so a
 /// platform that cannot supply a metric (e.g. temperatures on Windows) simply
