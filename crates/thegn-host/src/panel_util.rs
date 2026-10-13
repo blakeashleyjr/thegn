@@ -60,6 +60,8 @@ pub(crate) fn open_editor(
             false
         }
         thegn_core::editor::Placement::Pane => {
+            let prior_focus = session.active_tab().map(|tab| tab.focused_pane);
+            let prior_count = panes.table.len();
             match in_pane {
                 Some(focused) => crate::actions::open_command_pane(
                     session,
@@ -73,7 +75,17 @@ pub(crate) fn open_editor(
                     crate::actions::open_command_tab(session, panes, &launch.command, cwd, center)
                 }
             }
-            true
+            let focused = session.active_tab().map(|tab| tab.focused_pane);
+            let opened = focused != prior_focus || panes.table.len() > prior_count;
+            if opened {
+                let focused = focused.unwrap_or(0);
+                let path = cwd.map_or_else(
+                    || std::path::PathBuf::from(path),
+                    |directory| directory.join(path),
+                );
+                panes.note_editor_file(focused, path.to_string_lossy().into_owned());
+            }
+            opened
         }
     }
 }
