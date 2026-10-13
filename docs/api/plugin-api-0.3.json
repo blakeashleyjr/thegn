@@ -461,7 +461,7 @@
         },
         "scopes": {
           "default": [],
-          "description": "Host-capability scopes this plugin holds for `host.call` — the same lattice as control-API tokens (`read` / `write` / `git` / `exec` / `admin`), so a plugin is authorised exactly like a paired client. Write, Git, and Exec are independent; Admin implies all of them.",
+          "description": "Host-capability scopes this plugin holds for `host.call` — the same lattice as control-API tokens (`read` / `write` / `git` / `merge_add` / `exec` / `admin`), so a plugin is authorised exactly like a paired client. Write, Git, and Exec are independent; Admin implies all of them.",
           "items": {
             "$ref": "#/definitions/Scope"
           },

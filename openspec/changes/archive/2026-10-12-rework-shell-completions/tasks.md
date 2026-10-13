@@ -91,7 +91,7 @@ State below is as of this branch's tip (`tg/the-36-completions`).
       action ids or keybinds are claimed, so the help ratchets are unaffected.
 - [x] 3.4 `docs/extending/completion-source.md` + the `docs/extending/README.md`
       index row: the recipe for adding a value source, ending in its gates.
-- [ ] 3.5 On completion of the implementation, `/opsx:sync` this delta into
+- [x] 3.5 On completion of the implementation, `/opsx:sync` this delta into
       `openspec/specs/cli/spec.md` and archive both this change **and the
       superseded `package-shell-completions`**. Do not hand-edit the main spec.
 

@@ -1,5 +1,5 @@
 use gtui_core::frame::Frame;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Row, Table};
 use std::borrow::Cow;
 
@@ -9,7 +9,13 @@ impl TableRenderer {
     /// Build the table for a panel `rows` tall and `width` wide. Only the first
     /// `rows` data rows can be visible (no scroll state), so only those are
     /// built; text cells borrow from `frame` and are clipped to the width budget.
-    pub fn render<'a>(frame: &'a Frame, title: &str, rows: usize, width: usize) -> Table<'a> {
+    pub fn render<'a>(
+        frame: &'a Frame,
+        title: &str,
+        rows: usize,
+        width: usize,
+        colors: &crate::RenderColors,
+    ) -> Table<'a> {
         let headers: Vec<&str> = frame.fields.iter().map(|f| f.name.as_str()).collect();
 
         let mut out_rows = Vec::new();
@@ -38,10 +44,12 @@ impl TableRenderer {
             .collect();
 
         Table::new(out_rows, widths)
-            .header(Row::new(headers).style(Style::default().fg(Color::Yellow)))
+            .header(Row::new(headers).style(Style::default().fg(colors.header)))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_style(Style::default().fg(colors.border))
+                    .title_style(Style::default().fg(colors.title))
                     .title(title.to_string()),
             )
     }
@@ -60,7 +68,7 @@ mod tests {
         let field = Field::new("val", FieldType::Float64, vec![1.0, 5.0]);
         let frame = Frame::new(vec![field]);
 
-        let t = TableRenderer::render(&frame, "Table", 10, 40);
+        let t = TableRenderer::render(&frame, "Table", 10, 40, &crate::RenderColors::default());
         let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 10));
         t.render(buffer.area, &mut buffer);
 
@@ -82,7 +90,9 @@ mod tests {
             .map(|_| ratatui::layout::Constraint::Ratio(1, headers.len() as u32))
             .collect();
         let t = Table::new(rows, widths)
-            .header(Row::new(headers).style(Style::default().fg(Color::Yellow)))
+            .header(
+                Row::new(headers).style(Style::default().fg(crate::RenderColors::default().header)),
+            )
             .block(Block::default().borders(Borders::ALL).title("T"));
         let mut b = Buffer::empty(area);
         t.render(area, &mut b);
@@ -105,8 +115,28 @@ mod tests {
         for (w, h) in [(60u16, 12u16), (9, 4), (120, 30), (3, 3)] {
             let area = Rect::new(0, 0, w, h);
             let mut got = Buffer::empty(area);
-            TableRenderer::render(&frame, "T", h as usize, w as usize).render(area, &mut got);
+            TableRenderer::render(
+                &frame,
+                "T",
+                h as usize,
+                w as usize,
+                &crate::RenderColors::default(),
+            )
+            .render(area, &mut got);
             assert_eq!(got, reference(&frame, area), "{w}x{h}");
         }
+    }
+
+    #[test]
+    fn supplied_header_color_reaches_the_buffer() {
+        let frame = Frame::new(vec![Field::new("val", FieldType::Float64, vec![1.0])]);
+        let colors = crate::RenderColors {
+            header: ratatui::style::Color::Rgb(1, 2, 3),
+            ..crate::RenderColors::default()
+        };
+        let area = Rect::new(0, 0, 12, 5);
+        let mut buffer = Buffer::empty(area);
+        TableRenderer::render(&frame, "T", 2, 12, &colors).render(area, &mut buffer);
+        assert_eq!(buffer.cell((1, 1)).unwrap().fg, colors.header);
     }
 }

@@ -541,9 +541,10 @@ pub struct Resolved {
     pub gh_config: Option<String>,
     /// `GNUPGHOME` target.
     pub gpg_home: Option<String>,
-    /// Commit-signing binding: `(gpg.format, user.signingKey)`. `None` when the
-    /// identity sets no signing key (falls through the scope chain / repo git
-    /// config). The key is `~`-expanded only for the ssh format (a path);
+    /// Parsed commit-signing binding: `(gpg.format, user.signingKey)`. `None`
+    /// when the identity sets no signing key (falls through the scope chain / repo
+    /// git config). This is not yet applied to panes or git commands; runtime
+    /// binding is tracked by THE-149. The key is `~`-expanded only for ssh paths;
     /// openpgp key ids are left verbatim.
     pub git_signing: Option<(String, String)>,
 }
@@ -558,11 +559,10 @@ impl Resolved {
             .map(|k| format!("ssh -i {k} -o IdentitiesOnly=yes"))
     }
 
-    /// The `git -c …` overrides that bind this identity's signing key, if set:
-    /// `["-c", "gpg.format=<fmt>", "-c", "user.signingKey=<key>"]`. Empty when
-    /// the identity sets no signing key, so a caller can unconditionally splice
-    /// the result into a git argv. The per-operation controls (the commit
-    /// overlay's `^S` cycle, `[git] override_gpg`) still layer above this.
+    /// Build the `git -c …` overrides that would bind this identity's signing
+    /// key, if set: `["-c", "gpg.format=<fmt>", "-c", "user.signingKey=<key>"]`.
+    /// Empty when the identity sets no signing key. No runtime caller applies
+    /// these arguments yet; runtime binding is tracked by THE-149.
     pub fn git_signing_args(&self) -> Vec<String> {
         match &self.git_signing {
             Some((fmt, key)) => vec![

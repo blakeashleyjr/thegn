@@ -70,6 +70,7 @@ impl Fixture {
             .env("XDG_STATE_HOME", self.path("state"))
             .env("XDG_CACHE_HOME", self.path("cache"))
             .env("XDG_RUNTIME_DIR", self.path("runtime"))
+            .env("TMPDIR", self.root.path())
             .env("APPDATA", self.path("config"))
             .env("LOCALAPPDATA", self.path("local"))
             .env("PATH", self.path("empty-path"));

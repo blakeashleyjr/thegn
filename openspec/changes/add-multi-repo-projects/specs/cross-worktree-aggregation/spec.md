@@ -2,11 +2,11 @@
 
 ## ADDED Requirements
 
-### Requirement: The aggregation model accepts a project scope
+### Requirement: The aggregation model accepts a program scope
 
-The pure aggregation model SHALL accept a project scope: excerpts collected
-from the worktrees of a project feature set across the project's member
-repos, not just from one workspace's worktrees. In project scope each
+The pure aggregation model SHALL accept a program scope: excerpts collected
+from the worktrees of a program feature set across the program's member
+repos, not just from one workspace's worktrees. In program scope each
 excerpt's display label MUST be repo-qualified so rows from different repos
 remain identifiable, ordering MUST remain deterministic, and jump targets
 MUST resolve to the owning worktree regardless of which member repo it

@@ -12,6 +12,7 @@ start recording from the focused pane, press it again to stop and transcribe,
 or press `Esc`/`Alt V` to cancel and discard the utterance. The transcript is
 inserted into the same pane only while it is still focused. It is pasted
 without a newline and is never auto-submitted.
+Line breaks and control characters in a transcript are inserted as spaces.
 
 thegn ships no microphone integration, audio library, speech-to-text engine,
 or model. Configure two argv arrays under `[voice]`:

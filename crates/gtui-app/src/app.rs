@@ -36,6 +36,7 @@ pub struct ObserveApp {
     /// Which panel is focused (index into `dashboard.panels`), for input nav.
     pub selected_panel: usize,
     panels: HashMap<u32, PanelState>,
+    windows: HashMap<u32, TimeRange>,
     frames_rx: mpsc::Receiver<PanelUpdate>,
     cmd_tx: mpsc::UnboundedSender<EngineCmd>,
     gate: Arc<WakeGate>,
@@ -73,6 +74,7 @@ impl ObserveApp {
             time_range,
             selected_panel: 0,
             panels,
+            windows: HashMap::new(),
             frames_rx,
             cmd_tx,
             gate,
@@ -101,6 +103,7 @@ impl ObserveApp {
         while let Ok(update) = self.frames_rx.try_recv() {
             let state = PanelState::Ready(update.targets);
             self.panels.insert(update.panel_id, state);
+            self.windows.insert(update.panel_id, update.window);
             changed = true;
         }
         changed
@@ -109,6 +112,11 @@ impl ObserveApp {
     /// Latest state for a panel (`Loading` until its first result lands).
     pub fn panel_state(&self, panel_id: u32) -> &PanelState {
         self.panels.get(&panel_id).unwrap_or(&PanelState::Loading)
+    }
+
+    /// Latest resolved query window for a panel, if a refresh has completed.
+    pub fn panel_window(&self, panel_id: u32) -> Option<&TimeRange> {
+        self.windows.get(&panel_id)
     }
 
     /// Ask the engine to re-run every panel now. Non-blocking best-effort.
@@ -169,5 +177,9 @@ mod tests {
         assert!(
             matches!(app.panel_state(1), PanelState::Ready(targets) if targets.iter().all(|target| target.result.is_err()))
         );
+        let window = app
+            .panel_window(1)
+            .expect("drained update carries its query window");
+        assert_eq!(window.to - window.from, chrono::Duration::minutes(15));
     }
 }
