@@ -592,20 +592,46 @@ impl std::fmt::Display for VolumeAdmissionError {
 
 impl std::error::Error for VolumeAdmissionError {}
 
+/// Policy category for a sandbox launch refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalClass {
+    ComposePolicy,
+    SealedHome,
+    UnsafeMountPath,
+    SystemdMountPath,
+    ComposeTarget,
+    ComposeServiceMissing,
+}
+
+/// Structured, safe context for a refused sandbox launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub class: RefusalClass,
+    pub backend: String,
+    pub path: Option<String>,
+    pub message: String,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Why [`enter_argv`] refused to build a launch command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnterError {
     /// A named volume failed admission.
     Volume(VolumeAdmissionError),
-    /// A sealed or OCI launch was refused (message names paths, never contents).
-    Refused(String),
+    /// A policy or backend-specific launch refusal.
+    Refused(Refusal),
 }
 
 impl std::fmt::Display for EnterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EnterError::Volume(e) => e.fmt(f),
-            EnterError::Refused(m) => f.write_str(m),
+            EnterError::Refused(refusal) => refusal.fmt(f),
         }
     }
 }
@@ -616,6 +642,20 @@ impl From<VolumeAdmissionError> for EnterError {
     fn from(e: VolumeAdmissionError) -> Self {
         EnterError::Volume(e)
     }
+}
+
+fn refusal(
+    spec: &SandboxSpec,
+    class: RefusalClass,
+    path: Option<String>,
+    message: String,
+) -> EnterError {
+    EnterError::Refused(Refusal {
+        class,
+        backend: spec.backend.label().to_string(),
+        path,
+        message,
+    })
 }
 
 /// The spec as it will actually be launched. For a sealed spec this drops every
@@ -659,7 +699,7 @@ pub fn sealed_view(spec: &SandboxSpec) -> std::borrow::Cow<'_, SandboxSpec> {
 fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, EnterError> {
     admit_volumes(spec)?;
     if let Some(message) = compose_policy_refusal(spec) {
-        return Err(EnterError::Refused(message));
+        return Err(refusal(spec, RefusalClass::ComposePolicy, None, message));
     }
     let mut view = if !spec.backend.is_oci() && spec.compose.is_some() {
         let mut owned = spec.clone();
@@ -680,7 +720,12 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
     }
     view = std::borrow::Cow::Owned(canonical_view);
     if let Some(m) = crate::sandbox_floor::home_gate(&view) {
-        return Err(EnterError::Refused(m));
+        return Err(refusal(
+            spec,
+            RefusalClass::SealedHome,
+            sealed_home_offending_path(&view),
+            m,
+        ));
     }
     if view.backend.profile().family == BackendFamily::Oci
         && let Some(m) = view.mounts.iter().find(|m| {
@@ -688,14 +733,26 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
                 || crate::sandbox_mounts::mount_path_unsafe(&m.dest)
         })
     {
-        return Err(EnterError::Refused(format!(
-            "OCI mount `{}` contains whitespace, a quote, a backslash or ':' which a `-v` \
-             spec cannot express safely",
-            m.dest
-        )));
+        return Err(refusal(
+            spec,
+            RefusalClass::UnsafeMountPath,
+            Some(m.dest.clone()),
+            format!(
+                "OCI mount `{}` contains whitespace, a quote, a backslash or ':' which a `-v` \
+                 spec cannot express safely",
+                m.dest
+            ),
+        ));
     }
     if view.backend.profile().family == BackendFamily::Systemd {
-        systemd_mount_props(&view).map_err(EnterError::Refused)?;
+        systemd_mount_props(&view).map_err(|message| {
+            refusal(
+                spec,
+                RefusalClass::SystemdMountPath,
+                systemd_unsafe_mount_path(&view),
+                message,
+            )
+        })?;
     }
     Ok(view)
 }
@@ -2025,10 +2082,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
 /// into). No-op for host-toolchain backends and `none`.
 pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     admit_volumes(spec)?;
-    let spec = &*launchable(spec).map_err(|e| match e {
-        EnterError::Volume(v) => anyhow::Error::new(v),
-        EnterError::Refused(m) => anyhow::anyhow!(m),
-    })?;
+    let spec = &*launchable(spec).map_err(anyhow::Error::new)?;
     if !spec.backend.is_oci() {
         return Ok(());
     }
@@ -2296,7 +2350,7 @@ pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Result<Vec<String>, EnterE
         .filter(|c| spec.backend.is_oci() && c.has_service())
     {
         let target = crate::sandbox_compose::ComposeTarget::for_spec(spec)
-            .map_err(|error| EnterError::Refused(error.to_string()))?;
+            .map_err(|error| refusal(spec, RefusalClass::ComposeTarget, None, error.to_string()))?;
         let workdir = (spec.file_access != FileAccess::None)
             .then(|| spec.worktree.to_string_lossy().into_owned());
         crate::sandbox_compose::exec_argv(
@@ -2307,9 +2361,16 @@ pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Result<Vec<String>, EnterE
             &script,
             true,
         )
-        .ok_or_else(|| EnterError::Refused("Compose service is missing".into()))?
+        .ok_or_else(|| {
+            refusal(
+                spec,
+                RefusalClass::ComposeServiceMissing,
+                None,
+                "Compose service is missing".into(),
+            )
+        })?
     } else {
-        backend_enter_argv(spec, &script)
+        backend_enter_argv(spec, &script)?
     };
     // Cap the pane's CPU on host-toolchain backends (no-op unless configured; see
     // [`crate::sandbox_cpucap`]). OCI/Systemd cap inline in their backend argv.
@@ -2419,6 +2480,29 @@ fn systemd_mount_props(spec: &SandboxSpec) -> Result<Vec<String>, String> {
     systemd_mount_props_with_carveouts(spec, &carveouts)
 }
 
+fn systemd_unsafe_mount_path(spec: &SandboxSpec) -> Option<String> {
+    spec.mounts.iter().find_map(|mount| {
+        [mount.host.as_str(), mount.dest.as_str()]
+            .into_iter()
+            .find(|path| crate::sandbox_mounts::systemd_path_refusal(path).is_some())
+            .map(str::to_owned)
+    })
+}
+
+fn sealed_home_offending_path(spec: &SandboxSpec) -> Option<String> {
+    let home = std::path::Path::new(spec.seal_home.as_deref()?);
+    spec.mounts
+        .iter()
+        .find(|mount| {
+            crate::sandbox_mounts::sealed_mount_covers_deny(mount, home)
+                || (spec.backend.profile().family == BackendFamily::Systemd
+                    && std::path::Path::new(&mount.dest).starts_with(home)
+                    && (crate::sandbox_mounts::systemd_path_refusal(&mount.host).is_some()
+                        || crate::sandbox_mounts::systemd_path_refusal(&mount.dest).is_some()))
+        })
+        .map(|mount| mount.dest.clone())
+}
+
 fn systemd_mount_props_with_carveouts(
     spec: &SandboxSpec,
     carveouts: &[Mount],
@@ -2476,7 +2560,7 @@ fn bwrap_mount_covered(mount: &Mount, hardcoded_parents: &[&str]) -> bool {
 }
 
 /// The backend-specific argv that runs `/bin/sh -lc <script>` in the sandbox.
-fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
+fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Result<Vec<String>, EnterError> {
     backend_enter_argv_with_env(
         spec,
         script,
@@ -2501,7 +2585,7 @@ fn backend_enter_argv_with_resolver_dir(
     spec: &SandboxSpec,
     script: &str,
     resolved_resolver_dir: Option<&std::path::Path>,
-) -> Vec<String> {
+) -> Result<Vec<String>, EnterError> {
     backend_enter_argv_with_env(
         spec,
         script,
@@ -2522,11 +2606,11 @@ fn backend_enter_argv_with_env(
     spec: &SandboxSpec,
     script: &str,
     env: SandboxArgvEnv,
-) -> Vec<String> {
+) -> Result<Vec<String>, EnterError> {
     let wt = spec.worktree.to_string_lossy().into_owned();
     // Keyed on the backend *family* (one arm per way of driving a sandbox),
     // so a new OCI runtime is a profile row, not a new arm here.
-    match spec.backend.profile().family {
+    Ok(match spec.backend.profile().family {
         BackendFamily::Oci => {
             let mut v = oci_prefix(spec);
             v.extend(["exec".into(), "-it".into()]);
@@ -2731,9 +2815,14 @@ fn backend_enter_argv_with_env(
                     ]);
                 }
             }
-            for property in systemd_mount_props(spec)
-                .unwrap_or_else(|_| vec!["ThegnRefusedUnsafeMountPath=yes".into()])
-            {
+            for property in systemd_mount_props(spec).map_err(|message| {
+                refusal(
+                    spec,
+                    RefusalClass::SystemdMountPath,
+                    systemd_unsafe_mount_path(spec),
+                    message,
+                )
+            })? {
                 v.extend(["-p".into(), property]);
             }
             if spec.no_new_privileges {
@@ -2806,7 +2895,7 @@ fn backend_enter_argv_with_env(
             };
             vec!["/bin/sh".into(), "-lc".into(), body]
         }
-    }
+    })
 }
 
 /// Borrowed `(key, value)` env pairs from a spec's `env` map.
