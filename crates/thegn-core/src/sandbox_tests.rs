@@ -1732,11 +1732,9 @@ fn stamp_only_lowers_ours() {
         ]"#
     ));
     rows.push(ContainerInfo {
-        name: own.clone(),
         image: "hand-built foreign".into(),
-        status: "Up".into(),
-        backend: "podman".into(),
         ours: false,
+        ..container_info(own.clone(), "alpine".into(), "Up".into(), "podman")
     });
     let owned = OwnedContainers::new("default", [("/wt/feat", Some("podman"))]);
     owned.stamp(&mut rows);
