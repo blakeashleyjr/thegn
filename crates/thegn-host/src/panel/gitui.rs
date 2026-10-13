@@ -1837,7 +1837,10 @@ mod tests {
     #[test]
     fn commit_precheck_refuses_with_nothing_staged() {
         let mut data = crate::panel::PanelData {
-            changes: vec![change("f", crate::panel::Stage::Unstaged)],
+            changes: vec![
+                change("new-a", crate::panel::Stage::Untracked),
+                change("new-b", crate::panel::Stage::Untracked),
+            ],
             ..Default::default()
         };
         assert_eq!(
@@ -1846,8 +1849,30 @@ mod tests {
         );
         data.changes[0].stage = crate::panel::Stage::Staged;
         assert_eq!(commit_precheck(&data), None);
-        data.changes[0].stage = crate::panel::Stage::Unstaged;
-        assert_eq!(commit_precheck(&data), None, "partially staged MM row");
+        let mut partially_staged = crate::panel::PanelData {
+            changes: vec![
+                crate::panel::ChangeRow {
+                    status: "MM".into(),
+                    ..change("modified", crate::panel::Stage::Unstaged)
+                },
+                crate::panel::ChangeRow {
+                    status: "AM".into(),
+                    ..change("added", crate::panel::Stage::Unstaged)
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            commit_precheck(&partially_staged),
+            None,
+            "partially staged MM/AM rows are allowed"
+        );
+        partially_staged.changes.clear();
+        assert_eq!(
+            commit_precheck(&partially_staged),
+            Some("nothing staged: space stages the file, a stages all"),
+            "empty changes list"
+        );
         let merge_data = crate::panel::PanelData {
             merge: Some(crate::panel::MergeBanner {
                 label: "MERGING".into(),
