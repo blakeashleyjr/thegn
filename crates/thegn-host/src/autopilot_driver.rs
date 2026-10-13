@@ -66,11 +66,13 @@ pub(crate) fn pickup(
                     return;
                 }
             };
-            let claim = match db.claim_autopilot(
+            let queue_enabled = cfg.repo_pr_queue(&repo_root).enabled;
+            let claim = match db.claim_autopilot_slots(
                 &key,
                 &repo_root_s,
                 policy.max_concurrent,
                 policy.max_attempts,
+                queue_enabled,
                 thegn_core::util::now_ms(),
             ) {
                 Ok(thegn_core::store::ClaimOutcome::Claimed(run)) => run,

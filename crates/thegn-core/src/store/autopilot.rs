@@ -12,14 +12,29 @@ pub enum ClaimOutcome {
 }
 
 pub trait AutopilotStore {
-    /// Atomically claim an issue, enforcing the unique issue identity and the
-    /// repository's active-run and attempt budgets.
+    /// Atomically claim an issue, keeping a PR-opened run in the repository's
+    /// active-run budget for compatibility with callers that shepherd every PR.
     fn claim_autopilot(
         &self,
         key: &AutopilotIssueKey,
         repo_root: &str,
         max_concurrent: u32,
         max_attempts: u32,
+        now: i64,
+    ) -> Result<ClaimOutcome> {
+        self.claim_autopilot_slots(key, repo_root, max_concurrent, max_attempts, true, now)
+    }
+
+    /// Atomically claim an issue, enforcing the unique issue identity and the
+    /// repository's active-run and attempt budgets. `pr_opened_holds_slot`
+    /// controls whether a PR-opened run remains in the active-run count.
+    fn claim_autopilot_slots(
+        &self,
+        key: &AutopilotIssueKey,
+        repo_root: &str,
+        max_concurrent: u32,
+        max_attempts: u32,
+        pr_opened_holds_slot: bool,
         now: i64,
     ) -> Result<ClaimOutcome>;
 
