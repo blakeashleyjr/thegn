@@ -19,8 +19,9 @@ the full tool.
 
 `↵` on a file opens its inline hunks; binary and mode-only changes say so
 instead of showing a diff. `space` stages; `e` widens to the full-screen
-git frame, where `↵` opens line-level staging. At Half and Full width, the
-detail region follows the cursor and shows the selected change read-only.
+git frame, where `↵` opens line-level staging. In changes and the commit-files
+drill, `b` opens blame when available; untracked and added files are refused,
+and other unavailable blame states are reported.
 
 ### commits — branch history
 
@@ -51,9 +52,7 @@ at both Half and Full widths.
 
 The worktree's file tree; `/` filters it (directories stay while any
 descendant matches; Esc clears), `↵` previews a file inline, `o` pages it
-in bat, `O` opens your editor, `y` reveals it in yazi. `b` opens blame
-when available; untracked and added files are refused, and other unavailable
-blame states are reported.
+in bat, `O` opens your editor, `y` reveals it in yazi.
 
 Inside the git-family sections (changes/commits/branches/stash — not
 files), `?` shows that section's own key cheatsheet only after entering row
