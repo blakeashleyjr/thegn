@@ -1,0 +1,3 @@
+# Panel key reachability debt: <Section> <chord> <kind>.
+# Shrink-only; regenerate with THEGN_RATCHET_UPDATE=1 cargo test -p thegn-host panel_key_reachability_ratchet.
+# RATCHET-EMPTY
