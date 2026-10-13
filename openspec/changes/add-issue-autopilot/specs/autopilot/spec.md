@@ -110,7 +110,8 @@ request itself, and MUST NOT widen any PR-queue safety default.
 
 - **WHEN** `[pr_queue] enabled` is false and an implement run succeeds
 - **THEN** the pull request is opened, the run reports that shepherding is
-  disabled, and nothing polls it
+  disabled, nothing polls it, and the run no longer occupies a concurrency
+  slot
 
 ### Requirement: The tracker reflects the run's outcome
 
