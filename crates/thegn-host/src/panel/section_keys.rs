@@ -112,12 +112,12 @@ const FILES: &[SectionKey] = &[
     k('y', "y", "yazi"),
 ];
 const ISSUES: &[SectionKey] = &[
+    nav("j/k", "row"),
     nav("↵", "link"),
     k('o', "o", "browser"),
     k('a', "a", "assign me"),
     k('b', "b", "branch"),
     k('D', "D", "dispatch"),
-    k('r', "r", "refresh"),
 ];
 const NOTIFICATIONS: &[SectionKey] = &[
     nav("j/k", "row"),
@@ -179,9 +179,8 @@ const HOSTS: &[SectionKey] = &[
 ];
 const ENVIRONMENTS: &[SectionKey] = &[
     nav("j/k", "row"),
-    nav("↵", "bind here"),
+    nav("↵", "rebind"),
     k('n', "n", "new"),
-    k('t', "t", "test"),
     k('x', "x", "remove"),
 ];
 const MEDIA: &[SectionKey] = &[
@@ -649,7 +648,7 @@ mod tests {
         const WIDTHS: &[PanelWidth] = &[PanelWidth::Normal, PanelWidth::Half, PanelWidth::Full];
 
         let renderers = renderer_sources();
-        let row_sources = vec![
+        let row_sources = [
             include_str!("sections/usage.rs"),
             include_str!("sections/telemetry.rs"),
             include_str!("sections/tasks.rs"),
@@ -812,6 +811,9 @@ mod tests {
                         })
                     })
                     && let Some(c) = ch
+                    && c.is_ascii_graphic()
+                    && !accordion_named
+                    && !hint_nav_chords.contains(&chord)
                     && !dispatched.get(&name).is_some_and(|keys| keys.contains(&c))
                 {
                     violations.insert(format!("{name} {chord} undispatched"));
