@@ -19687,12 +19687,26 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Tests => {
-                                            let target = model
-                                                .panel
-                                                .tests
-                                                .as_ref()
-                                                .and_then(|t| t.failures.get(panel_ui.cursor))
-                                                .and_then(|(_, at)| parse_file_line(at));
+                                            let target = if panel_ui.width
+                                                == crate::layout::PanelWidth::Full
+                                            {
+                                                panel_ui.tests.selected_node().and_then(|node| {
+                                                    node.location.as_ref().map(|loc| {
+                                                        let worktree = active_tab_path(&session);
+                                                        (
+                                                            resolve_loc_path(&worktree, &loc.path),
+                                                            loc.line,
+                                                        )
+                                                    })
+                                                })
+                                            } else {
+                                                model
+                                                    .panel
+                                                    .tests
+                                                    .as_ref()
+                                                    .and_then(|t| t.failures.get(panel_ui.cursor))
+                                                    .and_then(|(_, at)| parse_file_line(at))
+                                            };
                                             if let Some((path, line)) = target {
                                                 let cwd = active_cwd(&session);
                                                 if open_editor(
@@ -19711,7 +19725,7 @@ async fn event_loop<T: Terminal>(
                                                 need_relayout = true;
                                             } else {
                                                 model.status =
-                                                    "No source location for this failure".into();
+                                                    "No source location for this test".into();
                                             }
                                         }
                                         Section::Files => {
