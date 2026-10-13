@@ -133,6 +133,8 @@ pub enum EngineCmd {
 pub struct PanelUpdate {
     pub panel_id: u32,
     pub targets: Vec<TargetUpdate>,
+    /// The resolved timestamp window used by this refresh, shared by all panels.
+    pub window: TimeRange,
 }
 
 /// One target's independently queryable result, retaining its dashboard identity.
@@ -441,7 +443,11 @@ impl QueryEngine {
                     let update = match joined {
                         Ok((id, (panel_id, targets))) => {
                             drop(job_ids.remove(&id));
-                            Some(PanelUpdate { panel_id, targets })
+                            Some(PanelUpdate {
+                                panel_id,
+                                targets,
+                                window: time_range.clone(),
+                            })
                         }
                         Err(join_error) => job_ids.remove(&join_error.id()).map(|(panel_id, target_ids)| {
                             let message = format!("panel query panicked: {join_error}");
@@ -452,7 +458,11 @@ impl QueryEngine {
                                     result: Err(message.clone()),
                                 })
                                 .collect();
-                            PanelUpdate { panel_id, targets }
+                            PanelUpdate {
+                                panel_id,
+                                targets,
+                                window: time_range.clone(),
+                            }
                         }),
                     };
                     if let Some(update) = update {
@@ -1221,7 +1231,13 @@ mod tests {
             Duration::from_secs(3600),
         );
 
-        receive_updates(&mut frames_rx, 2).await;
+        let update = tokio::time::timeout(std::time::Duration::from_secs(1), frames_rx.recv())
+            .await
+            .expect("timed out waiting for the real refresh path")
+            .expect("query engine exited before delivering a panel update");
+        assert_eq!(update.window.to, first);
+        assert_eq!(update.window.from, first - ChronoDuration::seconds(60));
+        receive_updates(&mut frames_rx, 1).await;
         cmd_tx.send(EngineCmd::Pause).unwrap();
         cmd_tx.send(EngineCmd::Requery).unwrap();
         receive_updates(&mut frames_rx, 2).await;

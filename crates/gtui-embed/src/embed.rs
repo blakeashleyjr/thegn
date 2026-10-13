@@ -17,7 +17,7 @@ use chrono::Utc;
 use gtui_app::app::{ObserveApp, PanelState};
 use gtui_core::dashboard::{Dashboard, builtin_host_dashboard};
 use gtui_core::datasource::{DataSource, TimeRange};
-use gtui_core::frame::{Coverage, Frame};
+use gtui_core::frame::{Coverage, FieldType, Frame};
 use gtui_query::host::HostSource;
 use gtui_query::loki::LokiSource;
 use gtui_query::prometheus::PrometheusSource;
@@ -478,6 +478,14 @@ fn render_dashboard(app: &ObserveApp, area: Rect, buf: &mut Buffer, theme: &Them
             rect,
             buf,
             theme,
+            app.panel_window(panel.id).map(|window| {
+                [
+                    window.from.timestamp() as f64
+                        + f64::from(window.from.timestamp_subsec_nanos()) / 1_000_000_000.0,
+                    window.to.timestamp() as f64
+                        + f64::from(window.to.timestamp_subsec_nanos()) / 1_000_000_000.0,
+                ]
+            }),
         );
     }
 }
@@ -491,6 +499,7 @@ fn render_panel(
     rect: Rect,
     buf: &mut Buffer,
     theme: &Theme,
+    window: Option<[f64; 2]>,
 ) {
     match state {
         PanelState::Loading => {
@@ -500,7 +509,7 @@ fn render_panel(
             block_msg(rect, buf, title, e, Tok::Red, theme);
         }
         PanelState::Ready(targets) => {
-            render_targets(kind, title, targets, rect, buf, theme);
+            render_targets(kind, title, targets, rect, buf, theme, window);
         }
     }
 }
@@ -513,6 +522,7 @@ fn render_targets(
     rect: Rect,
     buf: &mut Buffer,
     theme: &Theme,
+    window: Option<[f64; 2]>,
 ) {
     let mut entries = Vec::new();
     for target in targets {
@@ -532,7 +542,15 @@ fn render_targets(
                     let mut label = if frames.len() == 1 {
                         format!("{title} · {}", target.ref_id)
                     } else {
-                        format!("{title} · {} · {}", target.ref_id, index + 1)
+                        let series = frame
+                            .fields
+                            .iter()
+                            .find(|field| field.ty != FieldType::Time)
+                            .map(|field| field.name.as_str())
+                            .filter(|name| !name.is_empty())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| (index + 1).to_string());
+                        format!("{title} · {} · {series}", target.ref_id)
                     };
                     if let Coverage::Partial { .. } = frame.coverage {
                         label.push_str(" · partial");
@@ -574,7 +592,7 @@ fn render_targets(
         if let Some(message) = message {
             block_msg(item_rect, buf, label, message, Tok::Faint, theme);
         } else if let Some(frame) = frame {
-            dispatch_renderer(kind, label, frame, item_rect, buf, theme);
+            dispatch_renderer(kind, label, frame, item_rect, buf, theme, window);
         }
     }
 }
@@ -587,25 +605,37 @@ fn dispatch_renderer(
     rect: Rect,
     buf: &mut Buffer,
     theme: &Theme,
+    window: Option<[f64; 2]>,
 ) {
     use gtui_render::{logs, stat, table, timeseries};
+    let colors = render_colors(theme);
     match kind {
-        "timeseries" => timeseries::TimeseriesRenderer::render(
+        "timeseries" => timeseries::TimeseriesRenderer::render_in_window(
             frame,
             title,
             bounds_for(frame),
+            window,
             rect.width as usize,
+            &colors,
         )
         .render(rect, buf),
-        "stat" => stat::StatRenderer::render(frame, title).render(rect, buf),
-        "table" => {
-            table::TableRenderer::render(frame, title, rect.height as usize, rect.width as usize)
-                .render(rect, buf)
-        }
-        "logs" => {
-            logs::LogsRenderer::render(frame, title, rect.height as usize, rect.width as usize)
-                .render(rect, buf)
-        }
+        "stat" => stat::StatRenderer::render(frame, title, &colors).render(rect, buf),
+        "table" => table::TableRenderer::render(
+            frame,
+            title,
+            rect.height as usize,
+            rect.width as usize,
+            &colors,
+        )
+        .render(rect, buf),
+        "logs" => logs::LogsRenderer::render(
+            frame,
+            title,
+            rect.height as usize,
+            rect.width as usize,
+            &colors,
+        )
+        .render(rect, buf),
         other => block_msg(
             rect,
             buf,
@@ -617,9 +647,24 @@ fn dispatch_renderer(
     }
 }
 
-/// Compute `[x_min, x_max, y_min, y_max]` bounds for a timeseries frame: X is the
-/// sample index, Y is the value field's range with 10% padding. Falls back to a
-/// unit box for empty/flat data so the canvas never divides by zero.
+fn render_colors(theme: &Theme) -> gtui_render::RenderColors {
+    use gtui_render::RenderColors;
+    RenderColors {
+        value: theme.color(Tok::Accent),
+        header: theme.color(Tok::Amber),
+        // Logs use the host's normal text token so readable log content keeps
+        // the same contrast as other panel values.
+        text: theme.color(Tok::Text),
+        series: theme.color(Tok::Green),
+        border: theme.color(Tok::Border),
+        title: theme.color(Tok::Text),
+    }
+}
+
+/// Compute fallback `[x_min, x_max, y_min, y_max]` bounds: X uses sample indices
+/// when no matching time field exists, and Y uses the value range with 10%
+/// padding. Empty/flat data falls back to a unit box so the canvas never divides
+/// by zero.
 fn bounds_for(frame: &Frame) -> [f64; 4] {
     let values: &[f64] = frame
         .fields
@@ -650,6 +695,8 @@ fn block_msg(rect: Rect, buf: &mut Buffer, title: &str, msg: &str, token: Tok, t
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.color(Tok::Border)))
+                .title_style(Style::default().fg(theme.color(Tok::Text)))
                 .title(title.to_string()),
         );
     w.render(rect, buf);
@@ -859,6 +906,8 @@ mod tests {
     fn error_placeholder_uses_the_supplied_semantic_red() {
         let mut theme = Theme::prism();
         theme.red = (1, 2, 3);
+        theme.border = (4, 5, 6);
+        theme.text = (7, 8, 9);
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
         render_panel(
             "stat",
@@ -867,12 +916,15 @@ mod tests {
             buf.area,
             &mut buf,
             &theme,
+            None,
         );
         assert!(
             buf.content
                 .iter()
                 .any(|cell| cell.fg == theme.color(Tok::Red))
         );
+        assert_eq!(buf.cell((0, 0)).unwrap().fg, theme.color(Tok::Border));
+        assert_eq!(buf.cell((2, 0)).unwrap().fg, theme.color(Tok::Text));
     }
 
     #[test]
@@ -901,7 +953,7 @@ mod tests {
     fn dispatch_unknown_type_does_not_panic() {
         let f = Frame::new(vec![Field::new("v", FieldType::Float64, vec![1.0])]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
-        dispatch_renderer("nope", "P", &f, buf.area, &mut buf, &Theme::prism());
+        dispatch_renderer("nope", "P", &f, buf.area, &mut buf, &Theme::prism(), None);
         // A hint was drawn (top-left border of the block).
         assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "┌");
     }
@@ -916,6 +968,7 @@ mod tests {
             buf.area,
             &mut buf,
             &Theme::prism(),
+            None,
         );
         assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "┌");
 
@@ -931,6 +984,7 @@ mod tests {
             buf2.area,
             &mut buf2,
             &Theme::prism(),
+            None,
         );
         // StatRenderer drew the value "42.00".
         assert_eq!(buf2.cell((1, 1)).unwrap().symbol(), "4");
@@ -955,7 +1009,15 @@ mod tests {
         ];
         for kind in ["timeseries", "stat", "table", "logs"] {
             let mut buf = Buffer::empty(Rect::new(0, 0, 40, 18));
-            render_targets(kind, "Panel", &targets, buf.area, &mut buf, &Theme::prism());
+            render_targets(
+                kind,
+                "Panel",
+                &targets,
+                buf.area,
+                &mut buf,
+                &Theme::prism(),
+                None,
+            );
             let mut rendered = String::new();
             for y in 0..buf.area.height {
                 for x in 0..buf.area.width {
@@ -968,6 +1030,134 @@ mod tests {
             assert!(
                 rendered.contains("source failed"),
                 "{kind} omitted target error"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_series_target_titles_use_derived_series_names() {
+        let frames = ["up{job=\"a\"}", "up{job=\"b\"}"]
+            .into_iter()
+            .map(|name| {
+                Frame::new(vec![
+                    Field::new("time", FieldType::Time, vec![1.0]),
+                    Field::new(name, FieldType::Float64, vec![42.0]),
+                ])
+            })
+            .collect();
+        let targets = vec![gtui_app::engine::TargetUpdate {
+            ref_id: "A".into(),
+            result: Ok(frames),
+        }];
+        let area = Rect::new(0, 0, 70, 12);
+        let mut buf = Buffer::empty(area);
+        render_targets(
+            "stat",
+            "Panel",
+            &targets,
+            area,
+            &mut buf,
+            &Theme::prism(),
+            None,
+        );
+        let rendered = buf
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(rendered.contains("A · up{job=\"a\"}"));
+        assert!(rendered.contains("A · up{job=\"b\"}"));
+    }
+
+    #[test]
+    fn requested_window_keeps_early_samples_in_the_left_half() {
+        let frame = Frame::new(vec![
+            Field::new("time", FieldType::Time, vec![0.0, 1.0]),
+            Field::new("v", FieldType::Float64, vec![0.0, 1.0]),
+        ]);
+        let targets = vec![gtui_app::engine::TargetUpdate {
+            ref_id: "A".into(),
+            result: Ok(vec![frame]),
+        }];
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 10));
+        let theme = Theme::prism();
+        render_targets(
+            "timeseries",
+            "Panel",
+            &targets,
+            buf.area,
+            &mut buf,
+            &theme,
+            Some([0.0, 2.0]),
+        );
+        let series = theme.color(Tok::Green);
+        assert!(buf.content.iter().any(|cell| cell.fg == series));
+        assert!(!buf.content.iter().enumerate().any(|(index, cell)| {
+            let x = index as u16 % buf.area.width;
+            x >= 20 && cell.fg == series
+        }));
+    }
+
+    #[test]
+    fn each_renderer_uses_host_content_and_border_tokens() {
+        let mut theme = Theme::prism();
+        theme.accent = (12, 34, 56);
+        theme.amber = (23, 45, 67);
+        theme.green = (34, 56, 78);
+        theme.text = (45, 67, 89);
+        theme.border = (56, 78, 90);
+        let cases = [
+            (
+                "stat",
+                Field::new("v", FieldType::Float64, vec![1.0, 2.0]),
+                Tok::Accent,
+            ),
+            (
+                "table",
+                Field::new("v", FieldType::Float64, vec![1.0]),
+                Tok::Amber,
+            ),
+            (
+                "logs",
+                Field::new_str("line", vec!["log line".into()]),
+                Tok::Text,
+            ),
+            (
+                "timeseries",
+                Field::new("time", FieldType::Time, vec![0.0, 1.0]),
+                Tok::Green,
+            ),
+        ];
+        for (kind, field, token) in cases {
+            let mut fields = vec![field];
+            if kind == "timeseries" {
+                fields.push(Field::new("v", FieldType::Float64, vec![0.0, 1.0]));
+            }
+            let frame = Frame::new(fields);
+            let area = Rect::new(0, 0, 40, 10);
+            let mut buf = Buffer::empty(area);
+            render_targets(
+                kind,
+                "Panel",
+                &[gtui_app::engine::TargetUpdate {
+                    ref_id: "A".into(),
+                    result: Ok(vec![frame]),
+                }],
+                area,
+                &mut buf,
+                &theme,
+                None,
+            );
+            assert!(
+                buf.content.iter().any(|cell| cell.fg == theme.color(token)),
+                "{kind} omitted {token:?}"
+            );
+            assert!(
+                buf.content
+                    .iter()
+                    .any(|cell| cell.fg == theme.color(Tok::Border)),
+                "{kind} omitted border token"
             );
         }
     }
@@ -1008,6 +1198,7 @@ mod tests {
             buf.area,
             &mut buf,
             &Theme::prism(),
+            None,
         );
         let mut rendered = String::new();
         for y in 0..buf.area.height {
