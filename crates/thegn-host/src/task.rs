@@ -811,7 +811,22 @@ pub fn run_job(
     limits: &LimitsConfig,
 ) -> TaskOutcome {
     let slot = job_slot(&worktree, &task.name);
-    run_task_in(worktree, loc, generation, task, limits, slot, None)
+    run_task_in(
+        worktree,
+        loc,
+        generation,
+        task,
+        limits,
+        slot,
+        secs_to_timeout(limits.test_timeout_secs),
+    )
+}
+
+pub(crate) fn job_outcome_is_stale(
+    latest_generation: Option<u64>,
+    outcome_generation: u64,
+) -> bool {
+    latest_generation.is_some_and(|latest| outcome_generation < latest)
 }
 
 fn run_task_in(
@@ -2050,6 +2065,13 @@ mod tests {
         );
         assert!(slot_active(&wt));
         registry().lock().unwrap().remove(&key);
+        let sibling_key = job_slot(&sibling, "x");
+        registry().lock().unwrap().insert(
+            sibling_key.clone(),
+            (1, crate::platform::GroupHandle::from_pid(4242)),
+        );
+        assert!(!slot_active(&wt));
+        registry().lock().unwrap().remove(&sibling_key);
         let key = format!("{}:disc", wt.display());
         registry().lock().unwrap().insert(
             key.clone(),
@@ -2077,6 +2099,13 @@ mod tests {
         assert!(!arm.confirm("b", t0 + Duration::from_secs(3)));
         assert!(!arm.confirm("a", t0 + Duration::from_secs(4)));
         assert!(!arm.confirm("a", t0 + Duration::from_secs(8)));
+    }
+
+    #[test]
+    fn older_job_outcome_is_stale_after_restart() {
+        assert!(job_outcome_is_stale(Some(2), 1));
+        assert!(!job_outcome_is_stale(Some(2), 2));
+        assert!(!job_outcome_is_stale(None, 1));
     }
 
     #[test]
@@ -2127,6 +2156,26 @@ mod tests {
         );
         assert!(out.timed_out, "the deadline should mark the run timed out");
         let _ = std::fs::remove_dir_all(wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn jobs_inherit_the_test_timeout_limit() {
+        let dir = private_temp_dir();
+        let wt = dir.path().to_path_buf();
+        let limits = LimitsConfig {
+            test_timeout_secs: 1,
+            ..uncapped()
+        };
+        let outcome = run_job(
+            wt.clone(),
+            &GitLoc::Local(wt),
+            1,
+            TestTask::new("slow", "sleep 2", "generic"),
+            &limits,
+        );
+
+        assert_eq!(outcome.exit_code, Some(124));
+        assert!(outcome.stdout_stderr.starts_with("test run exceeded 1s"));
     }
 
     /// Metadata-based cargo discovery parses targets without compiling.

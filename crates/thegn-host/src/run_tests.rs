@@ -316,7 +316,7 @@ fn test_outcome_disposition_checks_worktree_generation_then_cache_fence() {
 }
 
 #[test]
-fn discovery_and_run_generations_are_independent() {
+fn stale_generation_is_dropped() {
     use super::run_test_cache::OutcomeDisposition as D;
 
     assert_eq!(
