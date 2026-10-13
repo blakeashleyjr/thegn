@@ -10,6 +10,34 @@ use super::{
     visible_threads,
 };
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PrRow<'a> {
+    Thread(usize),
+    OpenPr(&'a thegn_core::forge::model::PrHeader),
+}
+
+pub(crate) fn pr_row_at(
+    data: &crate::panel::PanelData,
+    deep: bool,
+    cursor: usize,
+) -> Option<PrRow<'_>> {
+    let thread_count = if data.pr.is_some() {
+        visible_threads(data, deep).count()
+    } else {
+        0
+    };
+    if cursor < thread_count {
+        return Some(PrRow::Thread(cursor));
+    }
+    let cap = if deep { 8 } else { 4 };
+    data.open_prs
+        .iter()
+        .filter(|p| p.head_ref != data.branch)
+        .take(cap)
+        .nth(cursor - thread_count)
+        .map(PrRow::OpenPr)
+}
+
 pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     if ctx.full() {
         return full_pr(ctx);
@@ -31,6 +59,7 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
             ("c", "comment"),
             ("r", "rerun"),
             ("o", "browser"),
+            ("w", "worktree"),
         ])
     } else {
         hint_row(&[("c", "create PR")])
@@ -314,12 +343,22 @@ fn threads_and_open_prs(ctx: &SectionCtx) -> Vec<PanelRow> {
                 }
             }
             rows.push(PanelRow::plain(Line::segs(header)));
-            for p in others.iter().take(cap) {
-                let linked = ctx
-                    .model
-                    .sidebar_db_worktrees
-                    .iter()
-                    .any(|w| w.branch == p.head_ref);
+            let thread_count = if data.pr.is_some() {
+                visible_threads(data, deep).count()
+            } else {
+                0
+            };
+            let active_repo = ctx
+                .model
+                .sidebar_db_worktrees
+                .iter()
+                .find(|w| w.tab_name == ctx.model.worktree)
+                .map(|w| w.repo_path.as_str());
+            for (j, p) in others.iter().take(cap).enumerate() {
+                let linked =
+                    ctx.model.sidebar_db_worktrees.iter().any(|w| {
+                        w.branch == p.head_ref && Some(w.repo_path.as_str()) == active_repo
+                    });
                 let mut l = vec![seg(ac(), format!("#{} ", p.number))];
                 if linked {
                     l.push(seg(g2(), "◈ "));
@@ -330,7 +369,11 @@ fn threads_and_open_prs(ctx: &SectionCtx) -> Vec<PanelRow> {
                 } else {
                     Seg::chip(pr_state_hue(&p.state, p.is_draft), format!(" {} ", p.state))
                 };
-                rows.push(PanelRow::plain(Line::split(l, vec![state_chip])));
+                let row_index = thread_count + j;
+                rows.push(
+                    PanelRow::plain(Line::split(l, vec![state_chip]))
+                        .with_hit(PanelHit::Row(Section::Pr, row_index)),
+                );
             }
             if others.len() > cap {
                 rows.push(PanelRow::plain(Line::segs(vec![seg(
@@ -399,6 +442,7 @@ fn full_pr(ctx: &SectionCtx) -> Vec<PanelRow> {
             ("c", "comment"),
             ("r", "rerun"),
             ("o", "browser"),
+            ("w", "worktree"),
         ])
     } else {
         hint_row(&[("c", "create PR")])
@@ -419,5 +463,92 @@ fn row_segs(row: &PanelRow) -> Vec<Seg> {
             }
             segs
         }
+    }
+}
+
+#[cfg(test)]
+mod pr_row_tests {
+    use super::*;
+
+    #[test]
+    fn open_prs_rows_carry_row_hits_after_threads() {
+        let mut model = crate::chrome::FrameModel::default();
+        model.panel.pr = Some(crate::panel::PrSummary {
+            number: 9,
+            title: "Current".into(),
+            state: "OPEN".into(),
+            url: "https://github.com/a/b/pull/9".into(),
+            is_draft: false,
+            review_decision: None,
+        });
+        model
+            .panel
+            .threads
+            .push(thegn_core::forge::model::ReviewThreadRow {
+                author: "reviewer".into(),
+                path: "src/lib.rs".into(),
+                line: Some(1),
+                snippet: "note".into(),
+                resolved: false,
+                created_at: String::new(),
+            });
+        model.panel.open_prs = vec![
+            thegn_core::forge::model::PrHeader {
+                number: 1,
+                head_ref: "one".into(),
+                state: "OPEN".into(),
+                url: "https://github.com/a/b/pull/1".into(),
+                is_draft: false,
+            },
+            thegn_core::forge::model::PrHeader {
+                number: 2,
+                head_ref: "two".into(),
+                state: "OPEN".into(),
+                url: "https://github.com/a/b/pull/2".into(),
+                is_draft: false,
+            },
+        ];
+        let rows = content(&SectionCtx {
+            model: &model,
+            ui: &crate::panel::PanelUi {
+                open: Section::Pr,
+                ..Default::default()
+            },
+            cols: 80,
+            rows: 30,
+        });
+        let hits = rows
+            .iter()
+            .filter_map(|row| match row.hit {
+                Some(PanelHit::Row(Section::Pr, index)) => Some(index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(hits, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn pr_row_at_resolves_an_open_pr() {
+        let mut model = crate::chrome::FrameModel::default();
+        model
+            .panel
+            .open_prs
+            .push(thegn_core::forge::model::PrHeader {
+                number: 42,
+                head_ref: "feature".into(),
+                state: "OPEN".into(),
+                url: "https://github.com/a/b/pull/42".into(),
+                is_draft: false,
+            });
+        model
+            .panel
+            .threads
+            .push(thegn_core::forge::model::ReviewThreadRow {
+                resolved: false,
+                ..Default::default()
+            });
+        assert!(
+            matches!(pr_row_at(&model.panel, false, 1), Some(PrRow::OpenPr(pr)) if pr.number == 42)
+        );
     }
 }

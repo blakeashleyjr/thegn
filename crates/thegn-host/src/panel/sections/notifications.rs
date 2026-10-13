@@ -1,8 +1,8 @@
 //! Notifications section — program-wide inbox for all event kinds.
 //!
 //! Three view widths:
-//!   Normal (39 cols): compact one-liners, kind glyph + source ref + message + age.
-//!   Half   (75 cols): two-line rows with worktree basename and kind label.
+//!   Normal (39 cols): compact rows; Space expands the selected message and refs.
+//!   Half   (75 cols): wrapped message, with Space adding the source and worktree refs.
 //!   Full   (150 cols): left list + right detail panel side-by-side.
 
 use thegn_core::notification::{Notification, NotificationKind};
@@ -141,6 +141,7 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         let msg_budget = ctx
             .cols
             .saturating_sub(1 + 1 + 12 + 1 + 1 + ago.len().max(2));
+        let expanded = ctx.ui.notifications_expanded == Some(n.id);
         let msg = truncate(&n.message, msg_budget.max(4));
         let src = truncate(&n.source_ref, 12);
 
@@ -169,12 +170,39 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             row
         };
         rows.push(row);
+        if expanded {
+            for part in wrap_text(&display_cell(&n.message), ctx.cols.saturating_sub(2)) {
+                rows.push(PanelRow {
+                    line: Line::segs(vec![sp(2), seg(t(), part)]),
+                    bg: None,
+                    hit: None,
+                });
+            }
+            for (label, value) in [
+                ("source  ", n.source_ref.as_str()),
+                ("worktree  ", n.worktree_path.as_str()),
+            ] {
+                if !value.is_empty() {
+                    rows.push(PanelRow {
+                        line: Line::segs(vec![
+                            sp(2),
+                            seg(f(), label),
+                            seg(g(), display_cell(value)),
+                        ]),
+                        bg: None,
+                        hit: None,
+                    });
+                }
+            }
+        }
         // No in-section truncation: the frame's cursor-following window keeps
         // the highlighted row on screen, so every row stays reachable.
     }
 
     rows.push(hint_row(&[
-        ("↵", "expand"),
+        ("↵", "jump"),
+        ("space", "expand"),
+        ("o", "source"),
         ("/ ", "search"),
         ("x", "read"),
         ("d", "delete"),
@@ -243,12 +271,30 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
 
         // The cursor's secondary row wraps the complete message; other rows
         // retain the compact worktree and kind metadata.
-        let secondary = if i == cursor {
+        let expanded = ctx.ui.notifications_expanded == Some(n.id);
+        let secondary = if i == cursor || expanded {
             let message = display_cell(&n.message);
-            wrap_text(&message, ctx.cols.saturating_sub(2))
+            let mut lines = wrap_text(&message, ctx.cols.saturating_sub(2))
                 .into_iter()
                 .map(|part| Line::segs(vec![sp(2), seg(t(), part)]))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            if expanded {
+                if !n.source_ref.is_empty() {
+                    lines.push(Line::segs(vec![
+                        sp(2),
+                        seg(f(), "source  "),
+                        seg(g(), display_cell(&n.source_ref)),
+                    ]));
+                }
+                if !n.worktree_path.is_empty() {
+                    lines.push(Line::segs(vec![
+                        sp(2),
+                        seg(f(), "worktree  "),
+                        seg(g(), display_cell(&n.worktree_path)),
+                    ]));
+                }
+            }
+            lines
         } else {
             vec![Line::segs(vec![
                 sp(2),
@@ -278,7 +324,9 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
 
     rows.push(hint_row(&[
-        ("↵", "expand"),
+        ("↵", "jump"),
+        ("space", "expand"),
+        ("o", "source"),
         ("/ ", "search"),
         ("x", "read"),
         ("d", "delete"),
@@ -406,7 +454,9 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
 
     rows.push(rule());
     rows.push(hint_row(&[
-        ("↵", "expand"),
+        ("↵", "jump"),
+        ("space", "expand"),
+        ("o", "source"),
         ("/ ", "search"),
         ("x", "read"),
         ("d", "delete"),
@@ -543,6 +593,56 @@ mod tests {
             }
         }
         assert!(rendered_text(&rows).contains("first��second��"));
+    }
+
+    #[test]
+    fn space_expands_a_normal_row() {
+        let message = (0..40)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut model = crate::chrome::FrameModel::default();
+        let mut notification = test_notification(NotificationKind::Mentioned, false, &message);
+        notification.worktree_path = "/repo/worktrees/feature".into();
+        model.panel.notifications.push(notification);
+        let expanded = crate::panel::PanelUi {
+            open: Section::Notifications,
+            notifications_expanded: Some(1),
+            ..Default::default()
+        };
+        let rows = content(&SectionCtx {
+            model: &model,
+            ui: &expanded,
+            cols: 39,
+            rows: 30,
+        });
+        let text = rendered_text(&rows);
+        for word in message.split_whitespace() {
+            assert!(text.contains(word), "expanded row omitted {word}");
+        }
+        assert!(text.contains("/repo/worktrees/feature"));
+        assert!(
+            rows.iter()
+                .skip(1)
+                .take(rows.len().saturating_sub(2))
+                .all(|row| row.hit.is_none())
+        );
+
+        let compact = crate::panel::PanelUi {
+            open: Section::Notifications,
+            ..Default::default()
+        };
+        let compact_rows = content(&SectionCtx {
+            model: &model,
+            ui: &compact,
+            cols: 39,
+            rows: 30,
+        });
+        assert_eq!(
+            compact_rows.iter().filter(|row| row.hit.is_some()).count(),
+            1
+        );
+        assert!(!rendered_text(&compact_rows).contains("word39"));
     }
 
     #[test]
