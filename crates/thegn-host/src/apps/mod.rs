@@ -186,7 +186,7 @@ impl AppHost {
     pub fn reconcile(&mut self, cfg: &thegn_core::config::Config) {
         if self.observe_config_snapshot != cfg.observe {
             if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == "observe") {
-                *slot = AppSlot::new(slot.id, slot.label);
+                *slot = AppSlot::new(slot.id, slot.label.clone());
             }
             self.observe_config_snapshot = cfg.observe.clone();
         }
