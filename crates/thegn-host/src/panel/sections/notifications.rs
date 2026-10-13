@@ -7,6 +7,7 @@
 
 use thegn_core::notification::{Notification, NotificationKind};
 use thegn_core::pipeline_report::display_cell;
+use unicode_width::UnicodeWidthStr;
 
 use crate::seg::{Line, Seg, seg, sp};
 
@@ -36,6 +37,45 @@ fn truncate(s: &str, max: usize) -> String {
     }
     let cut: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{}…", cut.trim_end())
+}
+
+/// Wrap a sanitized notification message without splitting ordinary words or
+/// dropping its tail. A single word wider than the panel is split by cells.
+fn wrap_message(s: &str, width: usize) -> Vec<String> {
+    let width = width.max(4);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+
+    for word in s.split_whitespace() {
+        let candidate = if line.is_empty() {
+            word.to_owned()
+        } else {
+            format!("{line} {word}")
+        };
+        if UnicodeWidthStr::width(candidate.as_str()) <= width {
+            line = candidate;
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+
+        let mut rest = word;
+        while UnicodeWidthStr::width(rest) > width {
+            let chunk = crate::seg::take_cols(rest, width);
+            if chunk.is_empty() {
+                break;
+            }
+            lines.push(chunk.to_owned());
+            rest = &rest[chunk.len()..];
+        }
+        line.push_str(rest);
+    }
+
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// Indices (into `panel.notifications`) visible under the current show-read
@@ -171,7 +211,7 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         };
         rows.push(row);
         if expanded {
-            for part in wrap_text(&display_cell(&n.message), ctx.cols.saturating_sub(2)) {
+            for part in wrap_message(&display_cell(&n.message), ctx.cols.saturating_sub(2)) {
                 rows.push(PanelRow {
                     line: Line::segs(vec![sp(2), seg(t(), part)]),
                     bg: None,
@@ -274,7 +314,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         let expanded = ctx.ui.notifications_expanded == Some(n.id);
         let secondary = if i == cursor || expanded {
             let message = display_cell(&n.message);
-            let mut lines = wrap_text(&message, ctx.cols.saturating_sub(2))
+            let mut lines = wrap_message(&message, ctx.cols.saturating_sub(2))
                 .into_iter()
                 .map(|part| Line::segs(vec![sp(2), seg(t(), part)]))
                 .collect::<Vec<_>>();
@@ -597,7 +637,7 @@ mod tests {
 
     #[test]
     fn space_expands_a_normal_row() {
-        let message = (0..40)
+        let message = (0..100)
             .map(|i| format!("word{i}"))
             .collect::<Vec<_>>()
             .join(" ");
