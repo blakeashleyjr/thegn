@@ -11,7 +11,7 @@ use thegn_core::config::TaskKind;
 use crate::seg::{Line, Seg, seg, sp};
 
 use super::{
-    PanelHit, PanelRow, Section, SectionCtx, d, g, g2, g3, hint_row, hue, rule, t, two_col,
+    PanelHit, PanelRow, Section, SectionCtx, d, g, g2, g3, hint_row, hue, list_detail, rule, t,
 };
 use thegn_core::theme::Hue;
 
@@ -116,10 +116,6 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             row
         };
         rows.push(row);
-
-        if rows.len() >= ctx.rows.saturating_sub(1) {
-            break;
-        }
     }
 
     rows.push(hint_row(&[
@@ -187,10 +183,6 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             bg: None,
             hit: None,
         });
-
-        if rows.len() + 2 > ctx.rows.saturating_sub(2) {
-            break;
-        }
     }
 
     rows.push(hint_row(&[
@@ -247,7 +239,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
 
     let list_w = 40_usize.min(cols / 2);
 
-    let list_rows: Vec<Vec<Seg>> = specs
+    let list_rows: Vec<(Vec<Seg>, Option<usize>)> = specs
         .iter()
         .enumerate()
         .map(|(i, task)| {
@@ -267,7 +259,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
                 seg(g3(), " "),
             ];
             s.extend(status_segs(run));
-            s
+            (s, Some(i))
         })
         .collect();
 
@@ -278,13 +270,14 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         vec![vec![seg(g2(), "select a task")]]
     };
 
-    let combined = two_col(&list_rows, &detail_rows, list_w, 2);
-    rows.extend(
-        combined
-            .into_iter()
-            .enumerate()
-            .map(|(i, l)| PanelRow::plain(l).with_hit(PanelHit::Row(Section::Jobs, i))),
-    );
+    rows.extend(list_detail(
+        Section::Jobs,
+        &list_rows,
+        &detail_rows,
+        cursor,
+        list_w,
+        ctx.rows.saturating_sub(rows.len() + 2),
+    ));
 
     rows.push(rule());
     rows.push(hint_row(&[

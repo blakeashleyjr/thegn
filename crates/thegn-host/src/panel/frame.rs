@@ -727,6 +727,14 @@ pub fn section_rows(
     {
         return super::gitui::display_map(&ui.git, view, &model.panel).len();
     }
+    if ui.width == crate::layout::PanelWidth::Full
+        && let Some(count) = sections::list_len(
+            section,
+            &section_ctx(model, ui, cols, rows.saturating_sub(1), 4),
+        )
+    {
+        return count;
+    }
     // Subtract 1 for the tab bar row in the row estimate.
     let ctx = section_ctx(model, ui, cols, rows.saturating_sub(1), 4);
     sections::content(section, &ctx)
@@ -1196,5 +1204,76 @@ mod tests {
             .find(|r| r.hit == Some(PanelHit::Row(Section::Changes, model.panel.changes.len())))
             .expect("impact footer row present");
         assert_eq!(footer.bg, Some(Tok::SelAccent));
+    }
+
+    #[test]
+    fn full_self_windowed_problem_count_uses_the_complete_list() {
+        let model = model_with(PanelData {
+            diagnostics: (0..2)
+                .map(|i| crate::panel::DiagnosticItem {
+                    file: format!("src/{i}.rs"),
+                    line: i,
+                    col: None,
+                    severity: crate::panel::Severity::Error,
+                    message: format!("{}-{i}", "long-detail".repeat(30)),
+                    source: "test".into(),
+                    code: None,
+                })
+                .collect(),
+            ..Default::default()
+        });
+        let ui = PanelUi {
+            width: crate::layout::PanelWidth::Full,
+            open: crate::panel::Section::Problems,
+            ..Default::default()
+        };
+        assert_eq!(
+            section_rows(crate::panel::Section::Problems, &model, &ui, 150, 30),
+            2
+        );
+    }
+
+    #[test]
+    fn normal_long_list_is_reachable_and_windowed() {
+        let model = model_with(PanelData {
+            diagnostics: (0..40)
+                .map(|i| crate::panel::DiagnosticItem {
+                    file: format!("src/{i}.rs"),
+                    line: i,
+                    col: None,
+                    severity: crate::panel::Severity::Error,
+                    message: format!("diagnostic-{i}"),
+                    source: "test".into(),
+                    code: None,
+                })
+                .collect(),
+            ..Default::default()
+        });
+        let ui = PanelUi {
+            width: crate::layout::PanelWidth::Normal,
+            tab: crate::panel::PanelTab::Work,
+            open: crate::panel::Section::Problems,
+            problems_cursor: 35,
+            cursor: 35,
+            row_mode: true,
+            order: vec![crate::panel::Section::Problems],
+            ..Default::default()
+        };
+        assert_eq!(
+            section_rows(crate::panel::Section::Problems, &model, &ui, 44, 15),
+            40
+        );
+        let frame = build_panel(&model, &ui, 44, 15, true);
+        let rendered = frame
+            .rows
+            .iter()
+            .map(|row| text_of(&row.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("diagnostic-35"), "{rendered}");
+        assert!(rendered.contains("↑"), "{rendered}");
+        assert!(rendered.contains("+"), "{rendered}");
+        assert!(rendered.contains("more"), "{rendered}");
+        assert!(frame.rows.len() <= 15);
     }
 }

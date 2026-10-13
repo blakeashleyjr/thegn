@@ -329,7 +329,7 @@ pub(super) fn forward(ctx: &SectionCtx) -> Vec<PanelRow> {
 /// Full: share list + detail — the full URL / consumer command (untruncated),
 /// provider, reach, and worktree for the cursor row.
 fn share_full(ctx: &SectionCtx) -> Vec<PanelRow> {
-    use super::{rule, t, two_col, wrap_text};
+    use super::{list_detail, rule, t, wrap_text};
     let shares = &ctx.model.shares;
     let cols = ctx.cols;
     let mut rows: Vec<PanelRow> = Vec::new();
@@ -341,7 +341,7 @@ fn share_full(ctx: &SectionCtx) -> Vec<PanelRow> {
 
     let cursor = ctx.ui.cursor.min(shares.len().saturating_sub(1));
     let list_w = 45_usize.min(cols / 2);
-    let list_rows: Vec<Vec<crate::seg::Seg>> = shares
+    let list_rows: Vec<(Vec<crate::seg::Seg>, Option<usize>)> = shares
         .iter()
         .enumerate()
         .map(|(i, s)| {
@@ -353,15 +353,18 @@ fn share_full(ctx: &SectionCtx) -> Vec<PanelRow> {
             } else {
                 seg(g2(), "…")
             };
-            vec![
-                seg(if sel { t() } else { g() }, if sel { "▶ " } else { "  " }),
-                seg(g(), format!("{} ", s.reach_glyph())),
-                state,
-                seg(
-                    if sel { t() } else { d() },
-                    format!(" ⇅ {} · {}", s.port, s.provider),
-                ),
-            ]
+            (
+                vec![
+                    seg(if sel { t() } else { g() }, if sel { "▶ " } else { "  " }),
+                    seg(g(), format!("{} ", s.reach_glyph())),
+                    state,
+                    seg(
+                        if sel { t() } else { d() },
+                        format!(" ⇅ {} · {}", s.port, s.provider),
+                    ),
+                ],
+                Some(i),
+            )
         })
         .collect();
 
@@ -416,16 +419,14 @@ fn share_full(ctx: &SectionCtx) -> Vec<PanelRow> {
         None => detail.push(vec![seg(g2(), "starting…".to_string())]),
     }
 
-    let combined = two_col(&list_rows, &detail, list_w, 2);
-    let n = shares.len();
-    rows.extend(combined.into_iter().enumerate().map(|(i, line)| {
-        let row = PanelRow::plain(line);
-        if i < n {
-            row.with_hit(PanelHit::Row(Section::Share, i))
-        } else {
-            row
-        }
-    }));
+    rows.extend(list_detail(
+        Section::Share,
+        &list_rows,
+        &detail,
+        cursor,
+        list_w,
+        ctx.rows.saturating_sub(rows.len() + 1),
+    ));
     rows.push(hint_row(&[
         ("↵", "copy endpoint"),
         ("o", "browser"),
@@ -437,7 +438,7 @@ fn share_full(ctx: &SectionCtx) -> Vec<PanelRow> {
 /// Full: forward list + detail — the container→host mapping, remap note, and
 /// full preview URL for the cursor row.
 fn forward_full(ctx: &SectionCtx) -> Vec<PanelRow> {
-    use super::{rule, t, two_col, wrap_text};
+    use super::{list_detail, rule, t, wrap_text};
     let forwards = &ctx.model.forwards;
     let preview = ctx.model.preview.as_ref();
     let cols = ctx.cols;
@@ -451,7 +452,7 @@ fn forward_full(ctx: &SectionCtx) -> Vec<PanelRow> {
 
     let cursor = ctx.ui.cursor.min(total.saturating_sub(1));
     let list_w = 45_usize.min(cols / 2);
-    let mut list_rows: Vec<Vec<crate::seg::Seg>> = Vec::new();
+    let mut list_rows: Vec<(Vec<crate::seg::Seg>, Option<usize>)> = Vec::new();
     if let Some(p) = preview {
         let gl = crate::caps::active_glyphs();
         let tone = match p.status {
@@ -459,21 +460,24 @@ fn forward_full(ctx: &SectionCtx) -> Vec<PanelRow> {
             thegn_core::preview::PreviewStatus::Down => hue(Hue::Red),
             thegn_core::preview::PreviewStatus::Unknown => hue(Hue::Amber),
         };
-        list_rows.push(vec![
-            seg(
-                if cursor == 0 { t() } else { g() },
-                if cursor == 0 {
-                    format!("{} ", gl.chevron)
-                } else {
-                    "  ".to_string()
-                },
-            ),
-            seg(tone, format!("{} :{}", p.status, p.port)),
-            seg(
-                if cursor == 0 { t() } else { d() },
-                format!(" · {}", p.source),
-            ),
-        ]);
+        list_rows.push((
+            vec![
+                seg(
+                    if cursor == 0 { t() } else { g() },
+                    if cursor == 0 {
+                        format!("{} ", gl.chevron)
+                    } else {
+                        "  ".to_string()
+                    },
+                ),
+                seg(tone, format!("{} :{}", p.status, p.port)),
+                seg(
+                    if cursor == 0 { t() } else { d() },
+                    format!(" · {}", p.source),
+                ),
+            ],
+            Some(0),
+        ));
     }
     list_rows.extend(forwards.iter().enumerate().map(|(i, fw)| {
         let row_index = i + usize::from(preview.is_some());
@@ -483,14 +487,17 @@ fn forward_full(ctx: &SectionCtx) -> Vec<PanelRow> {
         } else {
             hue(Hue::Teal)
         };
-        vec![
-            seg(if sel { t() } else { g() }, if sel { "▶ " } else { "  " }),
-            seg(tone, format!("⇅ {}", fw.container_port)),
-            seg(
-                if sel { t() } else { d() },
-                format!(" → localhost:{}", fw.host_port),
-            ),
-        ]
+        (
+            vec![
+                seg(if sel { t() } else { g() }, if sel { "▶ " } else { "  " }),
+                seg(tone, format!("⇅ {}", fw.container_port)),
+                seg(
+                    if sel { t() } else { d() },
+                    format!(" → localhost:{}", fw.host_port),
+                ),
+            ],
+            Some(row_index),
+        )
     }));
 
     let detail_w = cols.saturating_sub(list_w + 2);
@@ -563,16 +570,14 @@ fn forward_full(ctx: &SectionCtx) -> Vec<PanelRow> {
         }
     }
 
-    let combined = two_col(&list_rows, &detail, list_w, 2);
-    let n = total;
-    rows.extend(combined.into_iter().enumerate().map(|(i, line)| {
-        let row = PanelRow::plain(line);
-        if i < n {
-            row.with_hit(PanelHit::Row(Section::Forward, i))
-        } else {
-            row
-        }
-    }));
+    rows.extend(list_detail(
+        Section::Forward,
+        &list_rows,
+        &detail,
+        cursor,
+        list_w,
+        ctx.rows.saturating_sub(rows.len() + 1),
+    ));
     rows.push(hint_row(&[("↵", "copy url"), ("o", "browser")]));
     rows
 }
@@ -837,22 +842,30 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
         vec![vec![seg(g2(), "select a test")]]
     };
 
-    // Merge list + detail into two-column rows.
-    let combined = super::two_col(&list_rows, &detail_rows, list_w, 2);
-    rows.extend(combined.into_iter().enumerate().map(|(i, l)| {
-        let selected = i < visible.len() && i == ts.cursor;
-        let row = PanelRow::plain(l);
-        let row = if i < visible.len() {
-            row.with_hit(PanelHit::Row(Section::Tests, i))
-        } else {
-            row
-        };
-        if selected {
-            row.with_bg(Tok::SelAccent)
-        } else {
-            row
-        }
-    }));
+    // Merge list + detail while keeping detail pinned beside the cursor.
+    let list_entries: Vec<(Vec<crate::seg::Seg>, Option<usize>)> = list_rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| (row, (i < visible.len()).then_some(i)))
+        .collect();
+    rows.extend(
+        super::list_detail(
+            Section::Tests,
+            &list_entries,
+            &detail_rows,
+            ts.cursor,
+            list_w,
+            ctx.rows.saturating_sub(rows.len() + 2),
+        )
+        .into_iter()
+        .map(|row| {
+            if matches!(row.hit, Some(PanelHit::Row(Section::Tests, i)) if i == ts.cursor) {
+                row.with_bg(Tok::SelAccent)
+            } else {
+                row
+            }
+        }),
+    );
 
     rows.push(super::hint_row(&[
         ("r", "run"),
@@ -1122,7 +1135,7 @@ fn sandbox_with(ctx: &SectionCtx, show_all: bool) -> Vec<PanelRow> {
 /// Container rows are cursor targets so the container action keys act on the
 /// highlighted row.
 fn sandbox_full_with(ctx: &SectionCtx, show_all: bool) -> Vec<PanelRow> {
-    use super::{rule, t, two_col};
+    use super::{list_detail, rule, t};
     let model = ctx.model;
     let cols = ctx.cols;
     let mut rows: Vec<PanelRow> = Vec::new();
@@ -1232,23 +1245,32 @@ fn sandbox_full_with(ctx: &SectionCtx, show_all: bool) -> Vec<PanelRow> {
         ]);
     }
 
-    let combined = two_col(&list_rows, &detail, list_w, 2);
-    let n = visible.len();
-    rows.extend(combined.into_iter().enumerate().map(|(row_i, line)| {
-        let row = PanelRow::plain(line);
-        // Row 0 is the column title; container j sits at row j+1.
-        if row_i >= 1 && row_i <= n {
-            let selected = row_i - 1 == cursor;
-            let row = row.with_hit(PanelHit::Row(Section::Sandbox, row_i - 1));
-            if selected {
+    let list_entries: Vec<(Vec<crate::seg::Seg>, Option<usize>)> = list_rows
+        .into_iter()
+        .enumerate()
+        .map(|(row_i, row)| {
+            let hit = (row_i >= 1 && row_i <= visible.len()).then_some(row_i.saturating_sub(1));
+            (row, hit)
+        })
+        .collect();
+    rows.extend(
+        list_detail(
+            Section::Sandbox,
+            &list_entries,
+            &detail,
+            cursor,
+            list_w,
+            ctx.rows.saturating_sub(rows.len() + 1),
+        )
+        .into_iter()
+        .map(|row| {
+            if matches!(row.hit, Some(PanelHit::Row(Section::Sandbox, i)) if i == cursor) {
                 row.with_bg(crate::seg::Tok::SelAccent)
             } else {
                 row
             }
-        } else {
-            row
-        }
-    }));
+        }),
+    );
     if let Some(row) = sandbox_hint(ctx, show_all) {
         rows.push(row);
     }
