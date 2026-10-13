@@ -840,8 +840,9 @@ pub struct MergeQueueConfig {
     /// Maximum time allowed for `gate_setup_command`; zero disables the deadline.
     /// Filesystem calls and uninterruptible process I/O cannot be preempted.
     pub gate_setup_timeout_secs: u64,
-    /// Maximum time allowed for `gate_command`; zero disables the deadline.
-    /// The default is disabled so a legitimate long build is never blamed.
+    /// Maximum time allowed for `gate_command`; defaults to 3600 seconds.
+    /// Zero disables the deadline. A timeout is an infrastructure hold
+    /// (`gate_error`), never a red build attributed to the branch.
     /// Filesystem calls and uninterruptible process I/O cannot be preempted.
     pub gate_timeout_secs: u64,
     /// Whether to run `gate_command` at all.
@@ -1037,7 +1038,7 @@ impl Default for MergeQueueConfig {
             gate_command: String::new(),
             gate_setup_command: String::new(),
             gate_setup_timeout_secs: 0,
-            gate_timeout_secs: 0,
+            gate_timeout_secs: 3600,
             gate_on: true,
             gate_reuse_worktree: true,
             gate_target_dir: String::new(),
@@ -5642,6 +5643,7 @@ pub struct ConfigOverlay {
     pub loc_watch_invalidate_secs: Option<u64>,
     pub weather_enabled: Option<bool>,
     pub notifications_agent_attention_inbox: Option<bool>,
+    pub notifications_merge_queue_hold_desktop: Option<bool>,
     pub skills_enabled: Option<bool>,
     pub skills_user_dirs: Option<Vec<String>>,
     pub skills_exclude: Option<Vec<String>>,
@@ -5756,6 +5758,10 @@ impl ConfigOverlay {
         set!(
             base.notifications.agent_attention_inbox,
             self.notifications_agent_attention_inbox
+        );
+        set!(
+            base.notifications.merge_queue_hold_desktop,
+            self.notifications_merge_queue_hold_desktop
         );
         set!(base.skills.enabled, self.skills_enabled);
         set!(base.skills.user_dirs, self.skills_user_dirs);
@@ -6078,6 +6084,10 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX") {
         o.notifications_agent_attention_inbox =
             parse_bool(&v, "THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX");
+    }
+    if let Some(v) = env.get("THEGN_NOTIFICATIONS_MERGE_QUEUE_HOLD_DESKTOP") {
+        o.notifications_merge_queue_hold_desktop =
+            parse_bool(&v, "THEGN_NOTIFICATIONS_MERGE_QUEUE_HOLD_DESKTOP");
     }
 
     // [skills] — all three values are shallow, useful for isolated launches,

@@ -807,13 +807,13 @@ fn sandbox_profile_defaults_and_env_overlay() {
 }
 
 #[test]
-fn merge_gate_deadlines_default_disabled_and_accept_config_and_env_overlays() {
+fn merge_gate_deadlines_default_and_accept_config_and_env_overlays() {
     let defaults = MergeQueueConfig::default();
     assert_eq!(
         defaults.gate_setup_timeout_secs, 0,
         "zero disables setup deadline"
     );
-    assert_eq!(defaults.gate_timeout_secs, 0, "zero disables gate deadline");
+    assert_eq!(defaults.gate_timeout_secs, 3600, "one hour gate deadline");
 
     let mut base = MergeQueueConfig {
         gate_timeout_secs: 45,
@@ -1784,6 +1784,7 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_DISK_SHARED_TARGET_DIR", "/tgt"),
         ("THEGN_WEATHER_ENABLED", "yes"),
         ("THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX", "true"),
+        ("THEGN_NOTIFICATIONS_MERGE_QUEUE_HOLD_DESKTOP", "yes"),
         ("THEGN_SKILLS_ENABLED", "false"),
         ("THEGN_SKILLS_USER_DIRS", "/one, ~/.skills"),
         ("THEGN_SKILLS_EXCLUDE", "mq, pipeline"),
@@ -1884,6 +1885,7 @@ fn env_overlay_covers_every_knob() {
     assert_eq!(c.disk.shared_target_dir, "/tgt");
     assert!(c.weather.enabled);
     assert!(c.notifications.agent_attention_inbox);
+    assert!(c.notifications.merge_queue_hold_desktop);
     assert!(!c.skills.enabled);
     assert_eq!(c.skills.user_dirs, vec!["/one", "~/.skills"]);
     assert_eq!(c.skills.exclude, vec!["mq", "pipeline"]);
@@ -3021,6 +3023,24 @@ fn agent_attention_inbox_defaults_off_and_env_flips_it() {
     // And a config that sets it survives `thegn config validate --strict`.
     assert!(
         crate::config_validate::validate_str("[notifications]\nagent_attention_inbox = true\n")
+            .is_empty()
+    );
+}
+
+#[test]
+fn merge_queue_hold_desktop_defaults_off_and_env_flips_it() {
+    assert!(!NotificationsConfig::default().merge_queue_hold_desktop);
+    let env = map_env(&[("THEGN_NOTIFICATIONS_MERGE_QUEUE_HOLD_DESKTOP", "yes")]);
+    let c = Config::load_layered(&env, &[], None);
+    assert!(c.notifications.merge_queue_hold_desktop);
+    let bad = map_env(&[("THEGN_NOTIFICATIONS_MERGE_QUEUE_HOLD_DESKTOP", "sometimes")]);
+    assert_eq!(
+        env_overlay(&bad).notifications_merge_queue_hold_desktop,
+        None,
+        "a garbage bool must not flip the knob"
+    );
+    assert!(
+        crate::config_validate::validate_str("[notifications]\nmerge_queue_hold_desktop = true\n")
             .is_empty()
     );
 }
