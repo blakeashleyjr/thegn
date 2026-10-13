@@ -17697,6 +17697,27 @@ async fn event_loop<T: Terminal>(
                                 dirty = true;
                                 continue;
                             }
+                            if let Some(outcome) = crate::handlers::sandbox_panel::resolve_choice(
+                                &choice,
+                                &model.containers,
+                            ) {
+                                match outcome {
+                                    Ok(req) => {
+                                        model.status =
+                                            crate::handlers::sandbox_panel::control_status(&req);
+                                        crate::handlers::sandbox_panel::spawn_control(
+                                            keymap.config().sandbox.clone(),
+                                            active_tab_path(&session),
+                                            req,
+                                            refresh_tx.clone(),
+                                            waker.clone(),
+                                        );
+                                    }
+                                    Err(status) => model.status = status,
+                                }
+                                dirty = true;
+                                continue;
+                            }
                             // Reach picker → port entry carrying the chosen reach.
                             // Not a git op, so handle before the git dispatch.
                             if let menu::MenuChoice::ShareReach(reach) = choice {
@@ -20809,95 +20830,47 @@ async fn event_loop<T: Terminal>(
                             );
                             true
                         }
-                        // Container actions: `s` stop / `r` restart the
-                        // highlighted container (Full view cursor; the active
-                        // worktree's own container at the narrow widths),
-                        // `l` tails its logs in a center pane. Stop/restart
-                        // run off-loop; the outcome lands as a toast + a
-                        // model refresh.
+                        // Sandbox actions resolve against the renderer's shared
+                        // width and scope model; destructive actions confirm.
                         (Section::Sandbox, KeyCode::Char(c @ ('s' | 'r' | 'l'))) => {
-                            let sel = if panel_ui.width == crate::layout::PanelWidth::Full {
-                                model
-                                    .containers
-                                    .get(
-                                        panel_ui
-                                            .cursor
-                                            .min(model.containers.len().saturating_sub(1)),
-                                    )
-                                    .cloned()
-                            } else {
-                                model
-                                    .containers
-                                    .iter()
-                                    .find(|k| k.ours && k.name == model.active_container_name)
-                                    .cloned()
-                            };
-                            match sel {
-                                None => {
-                                    model.status =
-                                        "no container to act on (OCI sandboxes only)".into();
+                            let show_all = crate::panel::scope::system_all();
+                            match crate::handlers::sandbox_panel::key(
+                                c,
+                                &model.containers,
+                                &model.active_container_name,
+                                show_all,
+                                panel_ui.width,
+                                panel_ui.cursor,
+                            ) {
+                                crate::handlers::sandbox_panel::SandboxKey::NoTarget(status)
+                                | crate::handlers::sandbox_panel::SandboxKey::Refused(status) => {
+                                    model.status = status;
                                 }
-                                Some(cont) => {
+                                crate::handlers::sandbox_panel::SandboxKey::Confirm(menu) => {
+                                    active_menu = Some(menu);
+                                }
+                                crate::handlers::sandbox_panel::SandboxKey::Logs(cont) => {
                                     let backend =
                                         thegn_core::sandbox::Backend::parse(&cont.backend)
                                             .unwrap_or(thegn_core::sandbox::Backend::Podman);
-                                    if c == 'l' {
-                                        let argv = thegn_core::sandbox::container_logs_argv(
-                                            &keymap.config().sandbox,
-                                            backend,
-                                            &cont.name,
-                                        );
-                                        let cmd = argv.join(" ");
-                                        let cwd_o = active_cwd(&session);
-                                        open_command_pane(
-                                            &mut session,
-                                            &mut panes,
-                                            focused,
-                                            &cmd,
-                                            cwd_o.as_deref(),
-                                            chrome.center,
-                                        );
-                                        focus.zone = crate::focus::Zone::Center;
-                                        refresh_tab_model(&mut model, &session, &mut sb);
-                                        need_relayout = true;
-                                    } else {
-                                        let action = if c == 's' { "stop" } else { "restart" };
-                                        model.status = format!("{action}ing {}…", cont.name);
-                                        let cfg_sb = keymap.config().sandbox.clone();
-                                        // Best-effort placement: the active
-                                        // worktree's host. A foreign-host row
-                                        // (all-scope) may miss; the toast says so.
-                                        let wt = active_tab_path(&session);
-                                        let refresh = refresh_tx.clone();
-                                        let wk = waker.clone();
-                                        let name = cont.name.clone();
-                                        let action = action.to_string();
-                                        tokio::task::spawn_blocking(move || {
-                                            let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-                                            let ok = thegn_core::sandbox::container_control(
-                                                &cfg_sb, &loc, backend, &name, &action,
-                                            );
-                                            let message = if ok {
-                                                format!("{name}: {action} ✓")
-                                            } else {
-                                                format!("{name}: {action} failed")
-                                            };
-                                            let priority = if ok {
-                                                thegn_core::notification::Priority::Info
-                                            } else {
-                                                thegn_core::notification::Priority::Alert
-                                            };
-                                            // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                                            let _ =
-                                                refresh.send(crate::hydrate::RefreshKind::Toast {
-                                                    message,
-                                                    priority,
-                                                });
-                                            let _ =
-                                                refresh.send(crate::hydrate::RefreshKind::Model); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                                            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                                        });
-                                    }
+                                    let argv = thegn_core::sandbox::container_logs_argv(
+                                        &keymap.config().sandbox,
+                                        backend,
+                                        &cont.name,
+                                    );
+                                    let cmd = argv.join(" ");
+                                    let cwd_o = active_cwd(&session);
+                                    open_command_pane(
+                                        &mut session,
+                                        &mut panes,
+                                        focused,
+                                        &cmd,
+                                        cwd_o.as_deref(),
+                                        chrome.center,
+                                    );
+                                    focus.zone = crate::focus::Zone::Center;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
                                 }
                             }
                             true
