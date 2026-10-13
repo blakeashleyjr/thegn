@@ -144,6 +144,10 @@ fn template_for(kind: NotificationKind) -> BuiltinTemplate {
             title: "Merge queue needs you",
             prefix: "Merge queue needs you",
         },
+        NotificationKind::QueueHeld => BuiltinTemplate {
+            title: "Merge queue hold",
+            prefix: "Merge queue hold",
+        },
         NotificationKind::PrQueueMerged => BuiltinTemplate {
             title: "Pull request merged",
             prefix: "Pull request merged",
