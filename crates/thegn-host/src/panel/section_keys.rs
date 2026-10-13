@@ -37,6 +37,7 @@ pub struct SectionKey {
     /// Display chord for the hint strip.
     pub chord: &'static str,
     pub label: &'static str,
+    pub destructive: bool,
 }
 
 const fn k(key: char, chord: &'static str, label: &'static str) -> SectionKey {
@@ -44,6 +45,16 @@ const fn k(key: char, chord: &'static str, label: &'static str) -> SectionKey {
         key: Some(key),
         chord,
         label,
+        destructive: false,
+    }
+}
+
+const fn danger(key: char, chord: &'static str, label: &'static str) -> SectionKey {
+    SectionKey {
+        key: Some(key),
+        chord,
+        label,
+        destructive: true,
     }
 }
 
@@ -53,6 +64,7 @@ const fn nav(chord: &'static str, label: &'static str) -> SectionKey {
         key: None,
         chord,
         label,
+        destructive: false,
     }
 }
 
@@ -71,7 +83,7 @@ const ACROSS: &[SectionKey] = &[
 ];
 const PR: &[SectionKey] = &[
     nav("j/k", "row"),
-    k('M', "M", "merge"),
+    danger('M', "M", "merge"),
     k('A', "A", "approve"),
     k('c', "c", "comment"),
     k('r', "r", "rerun"),
@@ -88,8 +100,8 @@ const TESTS: &[SectionKey] = &[
 const CI: &[SectionKey] = &[
     nav("j/k", "row"),
     k('v', "v", "view"),
-    k('r', "r", "rerun"),
-    k('c', "c", "cancel"),
+    k('r', "r", "rerun failed"),
+    danger('c', "c", "cancel"),
     k('g', "g", "refresh"),
     k('o', "o", "browser"),
 ];
@@ -98,8 +110,16 @@ const MERGE_QUEUE: &[SectionKey] = &[
     k('x', "x", "remove"),
     k('l', "l", "land"),
     k('r', "r", "retry"),
-    k('D', "D", "drain"),
+    danger('c', "c", "sweep ✓"),
     k('g', "g", "scope"),
+];
+const PR_QUEUE: &[SectionKey] = &[
+    k('a', "a", "add"),
+    k('x', "x", "rm"),
+    k('r', "r", "re-watch"),
+    danger('c', "c", "clear"),
+    k('h', "h", "handle"),
+    k('o', "o", "browser"),
 ];
 // Labels match what the keys actually do (`o` opens bat, the EDITOR is `O`;
 // the old strip claimed `o` = editor and `b` = blame, neither true here —
@@ -134,7 +154,7 @@ const NOTIFICATIONS: &[SectionKey] = &[
     // invisible. The strip fits ~6, so they displace `A` (show-read) and `/`
     // (search) — both still work, and both are conventions carried by other
     // sections' strips.
-    k('a', "a", "clear all"),
+    danger('a', "a", "clear all"),
     k('g', "g", "scope"),
 ];
 const JOBS: &[SectionKey] = &[
@@ -175,13 +195,13 @@ const HOSTS: &[SectionKey] = &[
     k('c', "c", "grant"),
     // `x` forgets the cached host state (confirmed) — actual host REMOVAL
     // lives behind `m`; labelling this "remove" made users expect deletion.
-    k('x', "x", "forget cache"),
+    danger('x', "x", "forget cache"),
 ];
 const ENVIRONMENTS: &[SectionKey] = &[
     nav("j/k", "row"),
     nav("↵", "rebind"),
     k('n', "n", "new"),
-    k('x', "x", "remove"),
+    danger('x', "x", "remove"),
 ];
 const MEDIA: &[SectionKey] = &[
     k(' ', "space", "play/pause"),
@@ -193,8 +213,8 @@ const MEDIA: &[SectionKey] = &[
 ];
 const USAGE: &[SectionKey] = &[k('r', "r", "refresh"), nav("\u{21b5}", "open")];
 const SANDBOX: &[SectionKey] = &[
-    k('s', "s", "stop"),
-    k('r', "r", "restart"),
+    danger('s', "s", "stop"),
+    danger('r', "r", "restart"),
     k('l', "l", "logs"),
     k('g', "g", "scope"),
 ];
@@ -219,6 +239,7 @@ pub fn section_keys(section: Section) -> &'static [SectionKey] {
         Section::Tests => TESTS,
         Section::Ci => CI,
         Section::MergeQueue => MERGE_QUEUE,
+        Section::PrQueue => PR_QUEUE,
         Section::Files => FILES,
         Section::Issues => ISSUES,
         Section::Notifications => NOTIFICATIONS,
@@ -418,6 +439,7 @@ mod tests {
             ),
             (Section::Logs, include_str!("sections/logs.rs")),
             (Section::MergeQueue, include_str!("sections/merge_queue.rs")),
+            (Section::PrQueue, include_str!("sections/pr_queue.rs")),
             (Section::Across, include_str!("sections/across.rs")),
             (Section::Ci, include_str!("sections/ci.rs")),
             (Section::Hosts, include_str!("sections/hosts.rs")),
@@ -529,6 +551,59 @@ mod tests {
         for section in SECTION_ORDER {
             let n = section_keys(section).len();
             assert!(n <= 6, "{section:?} advertises {n} keys; the strip fits ~6");
+        }
+    }
+
+    #[test]
+    fn destructive_keys_are_guarded() {
+        use crate::panel::confirm::{GUARDED, GuardKind};
+
+        for section in SECTION_ORDER {
+            for key in section_keys(section).iter().filter(|key| key.destructive) {
+                let ch = key.key.expect("destructive keys are action keys");
+                assert!(
+                    GUARDED.iter().any(|(guarded_section, guarded_key, _)| {
+                        *guarded_section == section && *guarded_key == ch
+                    }),
+                    "{section:?} {ch} is destructive but absent from GUARDED"
+                );
+            }
+        }
+        for (section, ch, kind) in GUARDED {
+            assert!(
+                section_keys(*section)
+                    .iter()
+                    .any(|key| key.key == Some(*ch) && key.destructive),
+                "{section:?} {ch} is in GUARDED but not destructive in its table"
+            );
+            match kind {
+                GuardKind::Menu(tag) => {
+                    let sources = [
+                        include_str!("../run.rs"),
+                        include_str!("../menu.rs"),
+                        include_str!("../handlers/attention.rs"),
+                        include_str!("../handlers/sandbox_panel.rs"),
+                        include_str!("../env_ui.rs"),
+                        include_str!("../host_ui.rs"),
+                    ];
+                    assert!(
+                        sources.iter().any(|src| src.contains(tag)),
+                        "missing menu tag {tag}"
+                    );
+                }
+                GuardKind::TwoPress => {
+                    let source = match section {
+                        Section::PrQueue => include_str!("../handlers/pr_queue.rs"),
+                        Section::MergeQueue => include_str!("../handlers/merge_queue.rs"),
+                        Section::Ci => include_str!("../actions.rs"),
+                        _ => panic!("unexpected TwoPress section {section:?}"),
+                    };
+                    assert!(
+                        source.contains("confirm::"),
+                        "{section:?} {ch} does not call confirm::"
+                    );
+                }
+            }
         }
     }
 

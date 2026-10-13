@@ -4308,3 +4308,57 @@ fn section_scroll_falls_through_at_both_scroll_boundaries() {
     assert!(can_move(ext, true, 1));
     assert!(can_move(ext, false, ext.max - 1));
 }
+
+#[test]
+fn normalize_key_uppercases_shift_letters() {
+    use termwiz::input::KeyEvent;
+
+    let shifted = normalize_key(KeyEvent {
+        key: KeyCode::Char('a'),
+        modifiers: Modifiers::SHIFT,
+    });
+    assert_eq!(shifted.key, KeyCode::Char('A'));
+    assert_eq!(shifted.modifiers, Modifiers::SHIFT);
+
+    for (key, modifiers) in [
+        (KeyCode::Char('a'), Modifiers::CTRL | Modifiers::SHIFT),
+        (KeyCode::Char('1'), Modifiers::SHIFT),
+        (KeyCode::Char('A'), Modifiers::SHIFT),
+    ] {
+        let normalized = normalize_key(KeyEvent { key, modifiers });
+        assert_eq!(normalized.key, key);
+        assert_eq!(normalized.modifiers, modifiers);
+    }
+
+    let mut parser = termwiz::input::InputParser::new();
+    let decoded = parser.parse_as_vec(b"\x1b[97;2u", false);
+    let decoded = decoded
+        .into_iter()
+        .find_map(|event| match event {
+            InputEvent::Key(key) => Some(key),
+            _ => None,
+        })
+        .expect("CSI-u Shift+a decodes as a key");
+    let normalized = normalize_key(decoded);
+    assert_eq!(normalized.key, KeyCode::Char('A'));
+    assert_eq!(normalized.modifiers, Modifiers::SHIFT);
+    let expected = crate::keymap::default_keymap().dispatch(
+        crate::keymap::Mode::Normal,
+        crate::sequence::Key::modified(KeyCode::Char('A'), Modifiers::SHIFT),
+    );
+    assert_eq!(dispatch_bytes(b"\x1b[97;2u"), expected);
+
+    let shifted_j = normalize_key(KeyEvent {
+        key: KeyCode::Char('j'),
+        modifiers: Modifiers::SHIFT,
+    });
+    assert_eq!(shifted_j.key, KeyCode::Char('J'));
+    assert_eq!(
+        crate::panel::accordion_key(
+            &shifted_j.key,
+            shifted_j.modifiers,
+            &crate::panel::PanelUi::default(),
+        ),
+        Some(crate::panel::PanelMsg::NextSection)
+    );
+}
