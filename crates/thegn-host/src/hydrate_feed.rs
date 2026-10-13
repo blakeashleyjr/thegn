@@ -232,34 +232,15 @@ mod tests {
     #[test]
     fn populate_notifications_reaches_old_unread_rows() {
         let db = Db::open_memory().unwrap();
-        let mut ids = Vec::new();
         for index in 0..3 {
-            ids.push(
-                db.put_notification("assigned", &format!("U-{index}"), "unread", "")
-                    .unwrap(),
-            );
+            db.put_notification("assigned", &format!("U-{index}"), "unread", "")
+                .unwrap();
         }
         for index in 0..55 {
-            ids.push(
-                db.put_notification("assigned", &format!("R-{index}"), "read", "")
-                    .unwrap(),
-            );
-        }
-        for (index, id) in ids.iter().enumerate() {
-            db.conn()
-                .execute(
-                    "UPDATE notifications SET created_at_ms=?1, read=?2 WHERE id=?3",
-                    rusqlite::params![
-                        if index < 3 {
-                            index as i64 + 1
-                        } else {
-                            index as i64 + 97
-                        },
-                        if index >= 3 { 1i64 } else { 0i64 },
-                        id
-                    ],
-                )
+            let id = db
+                .put_notification("assigned", &format!("R-{index}"), "read", "")
                 .unwrap();
+            db.mark_notification_read(id).unwrap();
         }
 
         let mut panel = crate::panel::PanelData::default();

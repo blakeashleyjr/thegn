@@ -1377,22 +1377,39 @@ mod spec {
     fn notifications_summary_flags_alerts_not_info() {
         let seg_text = |segs: &[Seg]| segs.iter().map(|s| s.text.clone()).collect::<String>();
         let mut m = FrameModel::default();
+        let notification = |id, kind| thegn_core::notification::Notification {
+            id,
+            kind,
+            source_ref: format!("ref:{id}"),
+            message: "notification".into(),
+            created_at_ms: id,
+            read: false,
+            worktree_path: String::new(),
+        };
 
         // Info-only inbox (worktree created / process exited never count): no flag.
-        m.panel.alert_notifications = 0;
-        m.panel.unread_notifications = 0;
+        m.panel.notifications = vec![notification(
+            1,
+            thegn_core::notification::NotificationKind::WorktreeCreated,
+        )];
         let s = seg_text(&summary(Section::Notifications, &m));
         assert_eq!(s, "inbox zero");
         assert!(!s.contains('⚑'));
 
         // Notice-priority unread: a neutral count, still no red flag.
-        m.panel.unread_notifications = 2;
+        m.panel.notifications = vec![
+            notification(2, thegn_core::notification::NotificationKind::Assigned),
+            notification(3, thegn_core::notification::NotificationKind::Assigned),
+        ];
         let s = seg_text(&summary(Section::Notifications, &m));
         assert_eq!(s, "2 unread");
         assert!(!s.contains('⚑'));
 
         // An Alert raises the red flag and wins precedence over the unread count.
-        m.panel.alert_notifications = 1;
+        m.panel.notifications.push(notification(
+            4,
+            thegn_core::notification::NotificationKind::TestFailed,
+        ));
         let s = seg_text(&summary(Section::Notifications, &m));
         assert_eq!(s, "⚑ 1");
     }

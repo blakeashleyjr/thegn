@@ -788,6 +788,7 @@ pub struct PanelData {
     pub toolchain: Option<crate::toolchain_ui::ToolchainStatus>,
 }
 
+/// Counts unread rows in hand by effective priority.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NotificationCounts {
     pub alert: usize,
