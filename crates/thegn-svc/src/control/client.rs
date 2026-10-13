@@ -33,6 +33,35 @@ use super::{
 /// Heartbeats older than this mark a daemon row stale for discovery.
 pub const DAEMON_HEARTBEAT_TTL_MS: i64 = 60_000;
 
+/// A permanent failure while validating the control WebSocket greeting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapError {
+    VersionSkew {
+        server: String,
+        daemon_proto: u32,
+        client_proto: u32,
+    },
+    Protocol(String),
+}
+
+impl std::fmt::Display for BootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VersionSkew {
+                server,
+                daemon_proto,
+                client_proto,
+            } => write!(
+                f,
+                "pane daemon ({server}) speaks control protocol v{daemon_proto}, this thegn speaks v{client_proto} — restart the daemon (`thegn daemon`) or quit stale daemons"
+            ),
+            Self::Protocol(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for BootstrapError {}
+
 /// Where the daemon is and how to authenticate to it.
 #[derive(Clone)]
 pub enum ControlAddr {
@@ -1594,16 +1623,16 @@ where
         match msg {
             Some(Ok(Message::Binary(bytes))) => {
                 let frame = EventDecoder::decode_message(&bytes).map_err(|e| {
-                    anyhow!(
+                    anyhow::Error::new(BootstrapError::Protocol(format!(
                         "undecodable greeting from the pane daemon ({e}) — likely a \
                          protocol-incompatible daemon; restart it (`thegn daemon`) or \
                          quit stale daemons"
-                    )
+                    )))
                 })?;
                 let EventFrame::Hello(hello) = frame else {
-                    return Err(anyhow!(
-                        "expected Hello as the first control frame from the pane daemon"
-                    ));
+                    return Err(anyhow::Error::new(BootstrapError::Protocol(
+                        "expected Hello as the first control frame from the pane daemon".into(),
+                    )));
                 };
                 break hello;
             }
@@ -1621,12 +1650,11 @@ where
         }
     };
     if hello.proto != PROTO_VERSION {
-        return Err(anyhow!(
-            "pane daemon ({}) speaks control protocol v{}, this thegn speaks v{PROTO_VERSION} — \
-             restart the daemon (`thegn daemon`) or quit stale daemons",
-            hello.server,
-            hello.proto,
-        ));
+        return Err(anyhow::Error::new(BootstrapError::VersionSkew {
+            server: hello.server,
+            daemon_proto: hello.proto,
+            client_proto: PROTO_VERSION,
+        }));
     }
     // Queue the greeting before starting the data pump: Hello is the first
     // client-visible attach frame, even if the daemon has already sent a
@@ -2393,6 +2421,22 @@ mod tests {
             events.admit(&snapshot),
             Err(StreamEnd::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn events_stream_rejects_a_hello_after_bootstrap_without_reconnecting() {
+        let mut events = StreamGuard::new(StreamMode::Events {
+            filter: FeedFilter::default(),
+        });
+        let end = events
+            .admit(&EventFrame::Hello(Hello {
+                proto: PROTO_VERSION,
+                server: "test daemon".into(),
+                scopes: vec![],
+            }))
+            .unwrap_err();
+        assert!(matches!(end, StreamEnd::Protocol(_)));
+        assert!(!end.reconnects());
     }
 
     #[test]
@@ -3684,6 +3728,30 @@ mod tests {
         assert!(discover(&db, "/scope/a", now).is_none());
     }
 
+    async fn reject_first_frame(payload: Vec<u8>, events: bool) -> anyhow::Error {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            ws.send(Message::Binary(payload.into())).await.unwrap();
+        });
+
+        let client = ControlClient::new(ControlAddr::Tcp {
+            addr,
+            token: "t".into(),
+        });
+        let result = if events {
+            client.subscribe_events().await.map(|_| ())
+        } else {
+            client.attach("s1", "c1", 24, 80, false).await.map(|_| ())
+        };
+        server.await.unwrap();
+        result.expect_err("a non-Hello first frame must fail bootstrap")
+    }
+
     /// The version-skew guard: a daemon greeting with an incompatible
     /// `Hello.proto` must fail the attach with an actionable error instead of
     /// handing the caller a stream it will misdecode.
@@ -3719,6 +3787,49 @@ mod tests {
             msg.contains("restart the daemon"),
             "error must be actionable: {msg}"
         );
+        assert!(matches!(
+            err.downcast_ref::<BootstrapError>(),
+            Some(BootstrapError::VersionSkew {
+                daemon_proto,
+                client_proto,
+                ..
+            }) if *daemon_proto == PROTO_VERSION + 1 && *client_proto == PROTO_VERSION
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn event_and_attach_streams_reject_invalid_first_frames() {
+        let invalid_frames = [
+            EventFrame::PaneSnapshot {
+                session: "s1".into(),
+                seq: 0,
+                cols: 80,
+                rows: 24,
+                bytes: vec![],
+            }
+            .encode(),
+            EventFrame::PaneDelta {
+                session: "s1".into(),
+                seq: 0,
+                bytes: vec![],
+            }
+            .encode(),
+            EventFrame::Activity { json: "{}".into() }.encode(),
+            Vec::new(),
+            vec![0xff, 0x00, 0x7f],
+        ];
+        for events in [false, true] {
+            for payload in &invalid_frames {
+                let error = reject_first_frame(payload.clone(), events).await;
+                assert!(
+                    matches!(
+                        error.downcast_ref::<BootstrapError>(),
+                        Some(BootstrapError::Protocol(_))
+                    ),
+                    "invalid first frame should be a typed protocol error, got: {error:#}"
+                );
+            }
+        }
     }
 
     #[test]
