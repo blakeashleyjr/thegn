@@ -1235,10 +1235,12 @@ mod tests {
         });
         let ui = PanelUi {
             width: crate::layout::PanelWidth::Normal,
+            tab: crate::panel::PanelTab::Work,
             open: crate::panel::Section::Problems,
             problems_cursor: 35,
             cursor: 35,
             row_mode: true,
+            order: vec![crate::panel::Section::Problems],
             ..Default::default()
         };
         assert_eq!(
