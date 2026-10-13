@@ -1,5 +1,16 @@
 # Add a help page
 
+The `{{keys:<section>}}` line in `docs/help/panel.md` expands from the panel's
+section key tables when the help registry is built. Use it for a section's
+key list instead of maintaining a second chord list. Git-family sections use
+their `gitui::context_keys` table; other sections use `section_keys`.
+
+`panel_doc_chords_are_section_keys` checks any remaining authored `Keys:`
+lines against those tables. Its shrink-only debt list is
+`test/help-section-keys-ratchet.txt`; `just help-ratchet-update` regenerates
+it after prose changes. The generated Keybindings page folds the git context
+tables as well as the ordinary section tables.
+
 1. Create `docs/help/<slug>.md` with frontmatter: `id`, `title`, `order`,
    optional `parent`, `contexts: [zone:*, panel:*]` (which F1 contexts open
    it), `actions: [...]` (the action ids it documents). Unknown frontmatter

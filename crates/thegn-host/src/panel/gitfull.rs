@@ -168,19 +168,6 @@ fn short7(sha: &str) -> String {
     sha.chars().take(7).collect()
 }
 
-/// The commits mark gutter (mirrors `graph::mark`, which is private).
-fn commit_mark(sha: &str, ui: &PanelUi) -> Seg {
-    if ui.git.clipboard.iter().any(|s| s == sha) {
-        seg(hue(Hue::Teal), "❐")
-    } else if ui.git.mark_base.as_deref() == Some(sha) {
-        seg(hue(Hue::Magenta), "▶")
-    } else if ui.git.diff_mark.as_deref() == Some(sha) {
-        seg(hue(Hue::Blue), "◈")
-    } else {
-        sp(1)
-    }
-}
-
 // ---- status region ----------------------------------------------------------
 
 /// Flow chips for the status row: `REBASING`, `MERGING`, `CHERRY-PICK`,
@@ -342,31 +329,37 @@ fn item_segs(data: &PanelData, view: GitView, src: usize) -> (Vec<Seg>, usize) {
     }
 }
 
-/// The commits list item: the mark gutter + short sha prefix, then the subject;
-/// the hanging indent aligns wrapped subject lines under the subject.
-fn commit_segs(data: &PanelData, ui: &PanelUi, src: usize) -> (Vec<Seg>, usize) {
-    let c = &data.commits[src];
-    let prefix = vec![
-        sp(1),
-        commit_mark(&c.sha, ui),
-        sp(1),
-        seg(ac(), c.short.clone()),
-        sp(1),
-    ];
-    let indent = seg::seg_width(&prefix);
-    let mut segs = prefix;
-    segs.push(seg(d(), c.subject.clone()));
-    (segs, indent)
-}
-
-/// The wrapped physical height (line count) of one side-list item at `side_w`.
-fn item_height(data: &PanelData, ui: &PanelUi, view: GitView, src: usize, side_w: usize) -> usize {
-    let (segs, ind) = if view == GitView::Commits {
-        commit_segs(data, ui, src)
-    } else {
-        item_segs(data, view, src)
+/// Pre-render the commits list with its lane graph and marks.
+fn commit_graph_items(data: &PanelData, ui: &PanelUi, side_w: usize) -> Vec<(Vec<Seg>, usize)> {
+    let layout = graph::layout(&data.commits);
+    let marks = graph::GraphMarks {
+        copied: &ui.git.clipboard,
+        base: ui.git.mark_base.as_deref(),
+        diff_mark: ui.git.diff_mark.as_deref(),
     };
-    seg::wrap(&segs, side_w, ind).len()
+    let selected = list_indices(ui, data, GitView::Commits)
+        .get(ui.git.cur.commits)
+        .copied();
+    let gutter = layout
+        .iter()
+        .map(|row| row.cells.len().min(graph::MAX_LANES))
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let indent = (1 + 1 + gutter + 1 + 7 + 1).min(side_w);
+    // `graph::rows` normally cuts its left column to the terminal width. The
+    // side list wraps items itself, so retain the full subject here and let
+    // `item_block` apply the actual side-column width.
+    graph::rows(&data.commits, &layout, &marks, selected, usize::MAX)
+        .into_iter()
+        .map(|line| {
+            let segs = match line {
+                Line::Split { l, .. } | Line::SplitMinLeft { l, .. } | Line::Segs(l) => l,
+                Line::Blank | Line::Fill { .. } => Vec::new(),
+            };
+            (segs, indent)
+        })
+        .collect()
 }
 
 /// Wrap one item's seg run into a block of `PanelRow`s, every row carrying the
@@ -461,6 +454,7 @@ fn side_rows(
         .iter()
         .map(|(v, _, _)| list_indices(ui, data, *v))
         .collect();
+    let commit_items = commit_graph_items(data, ui, side_w);
     // Breathing room between lists when the column is tall enough.
     let gaps = if body >= 20 { 3 } else { 0 };
     let avail = body.saturating_sub(gaps);
@@ -472,7 +466,12 @@ fn side_rows(
         let (view, _, _) = lists[i];
         let mut n = 1usize; // header
         for &src in &indices[i] {
-            n += item_height(data, ui, view, src, side_w);
+            let (segs, indent) = if view == GitView::Commits {
+                commit_items.get(src).cloned().unwrap_or_default()
+            } else {
+                item_segs(data, view, src)
+            };
+            n += seg::wrap(&segs, side_w, indent).len();
             if n >= avail {
                 break;
             }
@@ -513,7 +512,7 @@ fn side_rows(
         // height. Items wrap (rather than truncate) to fit `side_w`.
         let item = |di: usize| -> (Vec<Seg>, usize) {
             if *view == GitView::Commits {
-                commit_segs(data, ui, ix[di])
+                commit_items.get(ix[di]).cloned().unwrap_or_default()
             } else {
                 item_segs(data, *view, ix[di])
             }
@@ -633,7 +632,13 @@ fn staging_region(
             };
             let (rows, cur) = staging::rows(&state.doc, &opts);
             let win = window(rows.len(), avail.saturating_sub(out.len()), cur);
-            out.extend(rows[win].iter().cloned());
+            out.extend(
+                rows[win.clone()]
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(i, row)| row.with_hit(PanelHit::GitDrill(win.start + i))),
+            );
             out
         }
         (Some(st), _) => vec![
@@ -662,58 +667,114 @@ fn staging_region(
                         file_line.push(sp(1));
                         file_line.push(seg(hue(Hue::Red), format!("−{}", c.deleted)));
                     }
-                    vec![
+                    let mut rows = vec![
                         PanelRow::plain(Line::segs(file_line)),
                         PanelRow::blank(),
-                        PanelRow::plain(Line::segs(vec![seg(g2(), "enter to stage lines")])),
-                    ]
-                }
-                // A clean tree has nothing to stage — the commit graph is a
-                // far better use of the main region than one dim line.
-                None => {
-                    let mut out = vec![
-                        PanelRow::plain(Line::segs(vec![seg(g2(), "working tree clean")])),
-                        PanelRow::blank(),
+                        PanelRow::plain(Line::segs(vec![seg(g2(), "selected file diff")])),
                     ];
-                    out.extend(commits_region(data, ui, w, avail.saturating_sub(out.len())));
-                    out
+                    if let Some(hunks) = ui.hunks.get(&c.path) {
+                        for hunk in hunks {
+                            rows.push(PanelRow::plain(Line::segs(vec![seg(
+                                hue(Hue::Blue),
+                                hunk.header.clone(),
+                            )])));
+                            for (origin, text) in &hunk.lines {
+                                let token = match origin {
+                                    '+' => hue(Hue::Green),
+                                    '-' => hue(Hue::Red),
+                                    _ => f(),
+                                };
+                                rows.push(PanelRow::plain(Line::segs(vec![seg(
+                                    token,
+                                    format!("{origin}{text}"),
+                                )])));
+                            }
+                        }
+                    } else {
+                        rows.push(spinner(ui.docs.tick, "file diff"));
+                    }
+                    rows.push(PanelRow::plain(Line::segs(vec![seg(
+                        g2(),
+                        "enter to stage lines",
+                    )])));
+                    rows
+                }
+                // A clean tree has no Files detail; the commit selection stays
+                // available in the side list.
+                None => {
+                    vec![
+                        PanelRow::plain(Line::segs(vec![seg(
+                            g2(),
+                            "working tree clean · select a commit for its diff",
+                        )])),
+                        PanelRow::blank(),
+                    ]
                 }
             }
         }
     }
 }
 
-/// The commits main region: the lane graph with marks, the selected commit
-/// tinted, and a `DIFF vs <ref>` banner while diffing.
-fn commits_region(data: &PanelData, ui: &PanelUi, w: usize, avail: usize) -> Vec<PanelRow> {
+/// The selected commit's read-only metadata and patch; the graph lives in the side list.
+fn commits_region(data: &PanelData, ui: &PanelUi, _w: usize, avail: usize) -> Vec<PanelRow> {
     let mut out: Vec<PanelRow> = Vec::new();
-    if let GitFlow::Diffing(r) = &ui.git.flow {
+    let base = match &ui.git.flow {
+        GitFlow::Diffing(r) => Some(r.as_str()),
+        _ => None,
+    };
+    if let Some(r) = base {
         out.push(PanelRow::plain(Line::segs(vec![Seg::chip(
             hue(Hue::Blue),
             format!(" DIFF vs {r} "),
         )])));
     }
-    let ix = list_indices(ui, data, GitView::Commits);
-    let cur = ui
-        .git
-        .cur
-        .get(GitView::Commits)
-        .min(ix.len().saturating_sub(1));
-    let sel_src = ix.get(cur).copied();
-    let layout = graph::layout(&data.commits);
-    let marks = graph::GraphMarks {
-        copied: &ui.git.clipboard,
-        base: ui.git.mark_base.as_deref(),
-        diff_mark: ui.git.diff_mark.as_deref(),
-    };
-    let lines = graph::rows(&data.commits, &layout, &marks, sel_src, w);
-    let win = window(
-        lines.len(),
-        avail.saturating_sub(out.len()),
-        sel_src.unwrap_or(0),
-    );
-    out.extend(lines[win].iter().cloned().map(PanelRow::plain));
+    let selected = list_indices(ui, data, GitView::Commits)
+        .get(ui.git.cur.commits)
+        .and_then(|&index| data.commits.get(index));
+    if let Some(commit) = selected {
+        let key = ui.git.selected_commit_detail_key(&commit.sha);
+        match ui.git.commit_show.as_ref().filter(|entry| entry.0.eq(&key)) {
+            Some((_, Ok(text))) => out.extend(diff_text_rows(
+                text,
+                ui.scroll,
+                avail.saturating_sub(out.len()),
+            )),
+            Some((_, Err(error))) => out.push(PanelRow::plain(Line::segs(vec![seg(
+                hue(Hue::Red),
+                format!("commit detail unavailable: {error}"),
+            )]))),
+            None => out.push(spinner(ui.docs.tick, "commit detail")),
+        }
+    } else {
+        out.push(PanelRow::plain(Line::segs(vec![seg(g2(), "no commits")])));
+    }
     out
+}
+
+fn diff_text_rows(text: &str, scroll: usize, body: usize) -> Vec<PanelRow> {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = scroll.min(lines.len().saturating_sub(1));
+    lines
+        .iter()
+        .skip(start)
+        .take(body)
+        .map(|line| {
+            let tok = if line.starts_with("+++") || line.starts_with("---") {
+                d()
+            } else if line.starts_with('+') {
+                hue(Hue::Green)
+            } else if line.starts_with('-') {
+                hue(Hue::Red)
+            } else if line.starts_with("@@") {
+                hue(Hue::Blue)
+            } else if line.starts_with("diff ") || line.starts_with("index ") {
+                g2()
+            } else {
+                f()
+            };
+            PanelRow::plain(Line::segs(vec![seg(tok, (*line).to_string())]))
+        })
+        .collect()
 }
 
 /// The selected stash's `stash@{N}` index (filter-aware) — the loop's
@@ -808,30 +869,8 @@ fn stash_region(data: &PanelData, ui: &PanelUi, avail: usize) -> Vec<PanelRow> {
     ];
     match ui.git.stash_diff.as_ref().filter(|(i, _)| *i == s.index) {
         Some((_, text)) => {
-            // Unified-diff lines colored by prefix, scrolled by `ui.scroll`
-            // and windowed to the region height.
-            let lines: Vec<&str> = text.lines().collect();
             let body = avail.saturating_sub(out.len()).max(1);
-            let start = ui.scroll.min(lines.len().saturating_sub(1));
-            for line in lines.iter().skip(start).take(body) {
-                let tok = if line.starts_with("+++") || line.starts_with("---") {
-                    d()
-                } else if line.starts_with('+') {
-                    hue(Hue::Green)
-                } else if line.starts_with('-') {
-                    hue(Hue::Red)
-                } else if line.starts_with("@@") {
-                    hue(Hue::Blue)
-                } else if line.starts_with("diff ") || line.starts_with("index ") {
-                    g2()
-                } else {
-                    f()
-                };
-                out.push(PanelRow::plain(Line::segs(vec![seg(
-                    tok,
-                    (*line).to_string(),
-                )])));
-            }
+            out.extend(diff_text_rows(text, ui.scroll, body));
         }
         None => out.push(spinner(ui.docs.tick, "stash diff")),
     }
@@ -846,11 +885,27 @@ fn commit_files_region(ui: &PanelUi, focused: bool, avail: usize) -> Vec<PanelRo
         out.push(PanelRow::plain(Line::segs(vec![
             seg(ac(), short7(sha)).bold(),
             seg(g2(), format!(" — {} file(s)", ui.git.commit_files.len())),
-            seg(g3(), " · enter to build a patch"),
+            seg(g3(), " · enter view diff"),
         ])));
     }
     if ui.git.commit_files.is_empty() {
-        out.push(spinner(ui.docs.tick, "commit files"));
+        match &ui.git.commit_files_load {
+            crate::panel::gitui::DocLoad::Pending => {
+                out.push(spinner(ui.docs.tick, "commit files"))
+            }
+            crate::panel::gitui::DocLoad::Ready => {
+                out.push(PanelRow::plain(Line::segs(vec![seg(
+                    g2(),
+                    "no files changed",
+                )])))
+            }
+            crate::panel::gitui::DocLoad::Failed(error) => {
+                out.push(PanelRow::plain(Line::segs(vec![seg(
+                    hue(Hue::Red),
+                    format!("commit files unavailable: {error}"),
+                )])))
+            }
+        }
         return out;
     }
     let cursor = ui
@@ -858,11 +913,8 @@ fn commit_files_region(ui: &PanelUi, focused: bool, avail: usize) -> Vec<PanelRo
         .cur
         .get(GitView::CommitFiles)
         .min(ui.git.commit_files.len().saturating_sub(1));
-    let win = window(
-        ui.git.commit_files.len(),
-        avail.saturating_sub(out.len()),
-        cursor,
-    );
+    let list_rows = (avail / 3).max(3).min(avail.saturating_sub(out.len()));
+    let win = window(ui.git.commit_files.len(), list_rows, cursor);
     for i in win {
         let (path, added, deleted) = &ui.git.commit_files[i];
         let mut row = PanelRow::plain(Line::split(
@@ -881,7 +933,29 @@ fn commit_files_region(ui: &PanelUi, focused: bool, avail: usize) -> Vec<PanelRo
                 range_tint()
             });
         }
+        row = row.with_hit(PanelHit::GitDrill(i));
         out.push(row);
+    }
+    if let Some((path, _, _)) = ui.git.commit_files.get(cursor) {
+        match ui.git.patch_docs.get(path) {
+            Some(state) => out.extend(diff_text_rows(
+                &state.diff,
+                ui.scroll,
+                avail.saturating_sub(out.len()),
+            )),
+            None => match ui
+                .git
+                .drilled_commit
+                .as_ref()
+                .and_then(|sha| ui.git.patch_failed.get(&(sha.clone(), path.clone())))
+            {
+                Some(error) => out.push(PanelRow::plain(Line::segs(vec![seg(
+                    hue(Hue::Red),
+                    format!("commit diff unavailable: {error}"),
+                )]))),
+                None => out.push(spinner(ui.docs.tick, "commit diff")),
+            },
+        }
     }
     out
 }
@@ -897,9 +971,24 @@ fn patch_region(ui: &PanelUi, focused: bool, w: usize, avail: usize) -> Vec<Pane
         };
         out.push(PanelRow::plain(Line::segs(vec![
             seg(ac(), short7(sha)).bold(),
-            seg(g2(), " — mark lines for the patch"),
-            seg(hue(Hue::Purple), format!(" ◆{marked}")),
-            seg(g3(), " · C-p patch menu"),
+            seg(
+                g2(),
+                if matches!(&ui.git.flow, GitFlow::Patch(_)) {
+                    " — mark lines for the patch"
+                } else {
+                    " — read-only diff"
+                },
+            ),
+            if matches!(&ui.git.flow, GitFlow::Patch(_)) {
+                seg(hue(Hue::Purple), format!(" ◆{marked}"))
+            } else {
+                seg(g3(), " · space add to patch")
+            },
+            if matches!(&ui.git.flow, GitFlow::Patch(_)) {
+                seg(g3(), " · C-p patch menu")
+            } else {
+                seg(g3(), "")
+            },
         ])));
     }
     match stage_doc(ui) {
@@ -918,9 +1007,27 @@ fn patch_region(ui: &PanelUi, focused: bool, w: usize, avail: usize) -> Vec<Pane
             };
             let (rows, cur) = staging::rows(&state.doc, &opts);
             let win = window(rows.len(), avail.saturating_sub(out.len()), cur);
-            out.extend(rows[win].iter().cloned());
+            out.extend(
+                rows[win.clone()]
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(i, row)| row.with_hit(PanelHit::GitDrill(win.start + i))),
+            );
         }
-        None => out.push(spinner(ui.docs.tick, "patch")),
+        None => match ui
+            .git
+            .drilled_commit
+            .as_ref()
+            .zip(ui.git.staging.as_ref().map(|st| &st.path))
+            .and_then(|(sha, path)| ui.git.patch_failed.get(&(sha.clone(), path.clone())))
+        {
+            Some(error) => out.push(PanelRow::plain(Line::segs(vec![seg(
+                hue(Hue::Red),
+                format!("commit diff unavailable: {error}"),
+            )]))),
+            None => out.push(spinner(ui.docs.tick, "patch")),
+        },
     }
     out
 }
@@ -1033,13 +1140,20 @@ fn main_rows(
 /// SHA prefix on the left. The cursor row gets the accent tint.
 fn blame_region(ui: &PanelUi, focused: bool, avail: usize) -> Vec<PanelRow> {
     if ui.git.blame_rows.is_empty() {
-        return if ui.git.blame_path.is_some() {
-            vec![spinner(0, "blame")]
-        } else {
-            vec![PanelRow::plain(Line::segs(vec![seg(
+        return match &ui.git.blame_load {
+            crate::panel::gitui::DocLoad::Failed(error) => {
+                vec![PanelRow::plain(Line::segs(vec![seg(
+                    hue(Hue::Red),
+                    format!("blame unavailable: {error}"),
+                )]))]
+            }
+            crate::panel::gitui::DocLoad::Pending if ui.git.blame_path.is_some() => {
+                vec![spinner(ui.docs.tick, "blame")]
+            }
+            _ => vec![PanelRow::plain(Line::segs(vec![seg(
                 g2(),
                 "no file selected",
-            )]))]
+            )]))],
         };
     }
     let rows = &ui.git.blame_rows;
@@ -1088,7 +1202,7 @@ fn blame_region(ui: &PanelUi, focused: bool, avail: usize) -> Vec<PanelRow> {
                     range_tint()
                 });
             }
-            row
+            row.with_hit(PanelHit::GitDrill(src_i))
         })
         .collect()
 }
@@ -1211,7 +1325,13 @@ pub(super) fn build_git_full(
         let view = match ui.git.focus {
             GitView::Staging => "staging",
             GitView::CommitFiles => "commit files",
-            GitView::PatchBuilding => "patch building",
+            GitView::PatchBuilding => {
+                if matches!(&ui.git.flow, GitFlow::Patch(_)) {
+                    "patch building"
+                } else {
+                    "diff"
+                }
+            }
             GitView::Blame => "blame",
             GitView::RebaseTodo => "rebase todo",
             _ => "",
@@ -1236,6 +1356,24 @@ pub(super) fn build_git_full(
     }
     let body = rows.saturating_sub(out.len() + 1);
     if body > 0 {
+        if ui.width == crate::layout::PanelWidth::Half && cols < SIDE_W + 40 {
+            let side_rows_count = (body / 3).max(4).min(body.saturating_sub(1));
+            out.extend(side_rows(model, ui, focused, side_rows_count, cols));
+            out.extend(main_rows(
+                model,
+                ui,
+                focused,
+                cols,
+                body.saturating_sub(side_rows_count),
+            ));
+            out.push(help_row(ui.git.focus));
+            out.truncate(rows);
+            return PanelFrame {
+                rows: out,
+                rail: Vec::new(),
+                tab_spans: Vec::new(),
+            };
+        }
         let side_w = SIDE_W.saturating_sub(1).min(cols.saturating_sub(2));
         let main_w = cols.saturating_sub(side_w + 1);
         let side = side_rows(model, ui, focused, body, side_w);
@@ -1374,18 +1512,163 @@ mod tests {
     }
 
     #[test]
-    fn clean_tree_files_focus_falls_back_to_the_commit_graph() {
+    fn clean_tree_files_focus_shows_a_resolved_clean_state() {
         let mut m = model();
         m.panel.changes.clear();
         let u = ui(GitView::Files);
         let frame = build_git_full(&m, &u, 120, 40, true);
         let all = all_text(&frame);
         assert!(all.contains("working tree clean"), "{all}");
-        // The main region carries the commit graph instead of dead space.
-        assert!(all.contains("feat: change 7"), "graph rendered: {all}");
-        // And the side column still shows every list with its count badge.
+        assert!(all.contains("select a commit for its diff"), "{all}");
+        assert!(!all.contains("loading commit detail"), "{all}");
+        // The side column still shows every list with its count badge.
         assert!(all.contains("COMMITS 8"), "{all}");
         assert!(all.contains("BRANCHES 2"), "{all}");
+        assert!(all.contains('●'), "commit lane graph missing: {all}");
+    }
+
+    #[test]
+    fn commits_region_shows_the_selected_commit_detail_not_the_graph() {
+        let m = model();
+        let mut u = ui(GitView::Commits);
+        let key = u.git.selected_commit_detail_key(&m.panel.commits[0].sha);
+        u.git.commit_show_key = Some(key.clone());
+        u.git.commit_show = Some((
+            key,
+            Ok("commit detail header\nAuthor: Blake\n+change".into()),
+        ));
+        let main = commits_region(&m.panel, &u, 120, 30);
+        let main_text = main
+            .iter()
+            .filter_map(|row| match &row.line {
+                Line::Segs(segments) => Some(
+                    segments
+                        .iter()
+                        .map(|segment| segment.text.as_str())
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(main_text.contains("commit detail header"), "{main_text}");
+        assert!(
+            !main_text.contains("feat: change 7"),
+            "graph duplicated in main region: {main_text}"
+        );
+    }
+
+    #[test]
+    fn commit_detail_for_another_sha_renders_a_spinner() {
+        let m = model();
+        let mut u = ui(GitView::Commits);
+        u.git.commit_show = Some((
+            crate::panel::gitui::CommitDetailKey {
+                base: None,
+                sha: "another".into(),
+            },
+            Ok("wrong commit detail".into()),
+        ));
+        let all = all_text(&build_git_full(&m, &u, 120, 40, true));
+        assert!(all.contains("loading commit detail"), "{all}");
+        assert!(!all.contains("wrong commit detail"), "{all}");
+    }
+
+    #[test]
+    fn empty_commit_renders_no_files_changed() {
+        let m = model();
+        let mut u = ui(GitView::CommitFiles);
+        u.git.drilled_commit = Some(m.panel.commits[0].sha.clone());
+        u.git.commit_files_load = crate::panel::gitui::DocLoad::Ready;
+        let all = all_text(&build_git_full(&m, &u, 120, 40, true));
+        assert!(all.contains("no files changed"), "{all}");
+        assert!(!all.contains("loading commit files"), "{all}");
+    }
+
+    #[test]
+    fn failed_commit_files_renders_the_error() {
+        let m = model();
+        let mut u = ui(GitView::CommitFiles);
+        u.git.drilled_commit = Some(m.panel.commits[0].sha.clone());
+        u.git.commit_files_load = crate::panel::gitui::DocLoad::Failed("git show failed".into());
+        let all = all_text(&build_git_full(&m, &u, 120, 40, true));
+        assert!(
+            all.contains("commit files unavailable: git show failed"),
+            "{all}"
+        );
+    }
+
+    #[test]
+    fn failed_commit_file_diff_renders_for_the_selected_path() {
+        let m = model();
+        let sha = m.panel.commits[0].sha.clone();
+        let mut u = ui(GitView::CommitFiles);
+        u.git.drilled_commit = Some(sha.clone());
+        u.git.commit_files_load = crate::panel::gitui::DocLoad::Ready;
+        u.git.commit_files = vec![("src/a.rs".into(), 2, 1)];
+        u.git
+            .patch_failed
+            .insert((sha, "src/a.rs".into()), "git show failed".into());
+        let all = all_text(&build_git_full(&m, &u, 120, 40, true));
+        assert!(
+            all.contains("commit diff unavailable: git show failed"),
+            "{all}"
+        );
+        assert!(!all.contains("loading commit diff"), "{all}");
+    }
+
+    #[test]
+    fn failed_blame_renders_unavailable() {
+        let m = model();
+        let mut u = ui(GitView::Blame);
+        u.git.blame_path = Some("new.rs".into());
+        u.git.blame_load = crate::panel::gitui::DocLoad::Failed("not tracked".into());
+        let all = all_text(&build_git_full(&m, &u, 120, 40, true));
+        assert!(all.contains("blame unavailable: not tracked"), "{all}");
+        assert!(!all.contains("loading blame"), "{all}");
+    }
+
+    #[test]
+    fn read_only_diff_has_no_patch_chip() {
+        let m = model();
+        let mut u = ui(GitView::PatchBuilding);
+        u.git.drilled_commit = Some(m.panel.commits[0].sha.clone());
+        let all = all_text(&build_git_full(&m, &u, 120, 40, true));
+        assert!(!all.contains("PATCH"), "unexpected patch chip: {all}");
+        assert!(
+            !all.contains('◆'),
+            "read-only diff showed patch marks: {all}"
+        );
+    }
+
+    #[test]
+    fn drill_rows_carry_gitdrill_hits() {
+        let m = model();
+        let mut u = ui(GitView::CommitFiles);
+        u.width = PanelWidth::Half;
+        u.git.drilled_commit = Some(m.panel.commits[0].sha.clone());
+        u.git.commit_files_load = crate::panel::gitui::DocLoad::Ready;
+        u.git.commit_files = vec![("src/a.rs".into(), 2, 1)];
+        let frame = build_git_full(&m, &u, 60, 40, true);
+        assert!(
+            frame
+                .rows
+                .iter()
+                .any(|row| row.hit == Some(PanelHit::GitDrill(0)))
+        );
+    }
+
+    #[test]
+    fn half_commits_routes_to_the_git_frame() {
+        let m = model();
+        let mut u = ui(GitView::Commits);
+        u.width = PanelWidth::Half;
+        u.git.focus = GitView::Commits;
+        let key = u.git.selected_commit_detail_key(&m.panel.commits[0].sha);
+        u.git.commit_show_key = Some(key.clone());
+        u.git.commit_show = Some((key, Ok("half width commit detail".into())));
+        let frame = crate::panel::frame::build_panel(&m, &u, 60, 30, true);
+        let all = all_text(&frame);
+        assert!(all.contains("half width commit detail"), "{all}");
     }
 
     // Regression: with both the hydrated header banner and the UI merge flow

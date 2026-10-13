@@ -9,12 +9,13 @@ order: 0
 A terminal-native git-worktree IDE that is its own terminal multiplexer.
 One process, one session: each git repo is a **project**, each git
 **worktree** is a **tab**, and the chrome — the [[sidebar]] tree, the
-[[panel|diff/PR panel]], the tab bar, the status bar, and the pin strip —
+[[panel|right panel]], the tab bar, the status bar, and the pin strip —
 is rendered in-process.
 
-Press `F1` anywhere to open this help at the page for whatever has focus.
-Press `/` here to search every page; `Tab` switches between the contents
-list and the page; `↵` follows a link; `[` goes back.
+In the `F1` overlay, press `/` to search every page; `Tab` switches between
+the contents list and the page; `↵` follows a link; `[` goes back. The
+docked panel tab scrolls its help body. Press `F1` anywhere to open this help at
+the page for whatever has focus.
 
 ## Start here
 

@@ -225,6 +225,20 @@ pub struct StageDocState {
     pub diff: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DocLoad {
+    #[default]
+    Pending,
+    Ready,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitDetailKey {
+    pub base: Option<String>,
+    pub sha: String,
+}
+
 /// Per-view cursors + scrolls, so drilling around never loses your place.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ViewCursors {
@@ -290,12 +304,21 @@ pub struct GitUi {
     pub stage_doc: Option<StageDocState>,
     /// The drilled commit's files: `(path, added, deleted)` numstat rows.
     pub commit_files: Vec<(String, u32, u32)>,
+    pub commit_files_load: DocLoad,
     /// The patch-building view's fetched document (the drilled commit's diff
     /// limited to the drilled path).
     pub patch_doc: Option<StageDocState>,
+    pub patch_load: DocLoad,
     /// Every patch doc fetched this flow, by path — custom-patch rendering
     /// needs the diff of EVERY marked file, not just the one on screen.
     pub patch_docs: std::collections::HashMap<String, StageDocState>,
+    /// Failed per-file commit diffs, keyed by commit sha and path.
+    pub patch_failed: std::collections::HashMap<(String, String), String>,
+    pub patch_selected_path: Option<String>,
+    pub commit_show: Option<(CommitDetailKey, std::result::Result<String, String>)>,
+    pub commit_show_key: Option<CommitDetailKey>,
+    /// Selection used solely to reset the cursor-follow detail scroll.
+    pub commit_scroll_key: Option<CommitDetailKey>,
     /// Acceptance cutoff for arriving git-op results (same idiom as
     /// `hunks_gen`).
     pub op_gen: u64,
@@ -307,6 +330,7 @@ pub struct GitUi {
     pub blame_path: Option<String>,
     /// Fetched blame rows (empty while the async fetch is in-flight).
     pub blame_rows: Vec<crate::panel::BlameRow>,
+    pub blame_load: DocLoad,
     /// Cursor into `blame_rows`.
     pub blame_cursor: usize,
     /// Vertical scroll offset for the blame region.
@@ -351,9 +375,18 @@ impl GitUi {
         self.stage_doc = None;
         self.drilled_commit = None;
         self.commit_files.clear();
+        self.commit_files_load = DocLoad::Pending;
+        self.patch_docs.clear();
+        self.patch_failed.clear();
+        self.patch_selected_path = None;
         self.patch_doc = None;
+        self.patch_load = DocLoad::Pending;
+        self.commit_show = None;
+        self.commit_show_key = None;
+        self.commit_scroll_key = None;
         self.blame_path = None;
         self.blame_rows.clear();
+        self.blame_load = DocLoad::Pending;
         self.blame_cursor = 0;
         self.blame_scroll = 0;
         self.sel_anchor = None;
@@ -402,7 +435,9 @@ impl GitUi {
             GitView::CommitFiles => {
                 self.drilled_commit = None;
                 self.commit_files.clear();
+                self.commit_files_load = DocLoad::Pending;
                 self.patch_doc = None;
+                self.patch_load = DocLoad::Pending;
                 if matches!(&self.flow, GitFlow::Patch(p) if p.marked() == 0) {
                     self.flow = GitFlow::None;
                     self.patch_docs.clear();
@@ -416,6 +451,7 @@ impl GitUi {
             GitView::Blame => {
                 self.blame_path = None;
                 self.blame_rows.clear();
+                self.blame_load = DocLoad::Pending;
                 self.blame_cursor = 0;
                 self.blame_scroll = 0;
             }
@@ -469,6 +505,180 @@ impl GitUi {
         };
     }
 
+    pub fn selected_commit_detail_key(&self, sha: &str) -> CommitDetailKey {
+        CommitDetailKey {
+            base: match &self.flow {
+                GitFlow::Diffing(base) => Some(base.clone()),
+                _ => None,
+            },
+            sha: sha.to_string(),
+        }
+    }
+
+    pub fn accept_commit_files(
+        &mut self,
+        sha: &str,
+        result: std::result::Result<Vec<(String, u32, u32)>, String>,
+    ) -> bool {
+        if self.drilled_commit.as_deref() != Some(sha) {
+            return false;
+        }
+        match result {
+            Ok(files) => {
+                self.commit_files = files;
+                self.commit_files_load = DocLoad::Ready;
+            }
+            Err(error) => {
+                self.commit_files.clear();
+                self.commit_files_load = DocLoad::Failed(error);
+            }
+        }
+        self.cur.commit_files = self
+            .cur
+            .commit_files
+            .min(self.commit_files.len().saturating_sub(1));
+        true
+    }
+
+    pub fn accept_patch_doc(
+        &mut self,
+        sha: &str,
+        path: &str,
+        result: std::result::Result<StageDocState, String>,
+    ) -> bool {
+        if self.drilled_commit.as_deref() != Some(sha) {
+            return false;
+        }
+        let state = match result {
+            Ok(state) => {
+                if state.path != path {
+                    return false;
+                }
+                self.patch_failed
+                    .remove(&(sha.to_string(), path.to_string()));
+                self.patch_load = DocLoad::Ready;
+                state
+            }
+            Err(error) => {
+                self.patch_failed
+                    .insert((sha.to_string(), path.to_string()), error.clone());
+                self.patch_doc = None;
+                self.patch_load = DocLoad::Failed(error);
+                return true;
+            }
+        };
+        self.patch_docs.insert(state.path.clone(), state.clone());
+        if self.staging.as_ref().is_some_and(|s| s.path == state.path) {
+            self.patch_doc = Some(state);
+        }
+        true
+    }
+
+    pub fn accept_blame(
+        &mut self,
+        path: &str,
+        result: std::result::Result<Vec<crate::panel::BlameRow>, String>,
+    ) -> bool {
+        if self.blame_path.as_deref() != Some(path) {
+            return false;
+        }
+        match result {
+            Ok(rows) => {
+                self.blame_rows = rows;
+                self.blame_load = DocLoad::Ready;
+            }
+            Err(error) => {
+                self.blame_rows.clear();
+                self.blame_load = DocLoad::Failed(error);
+            }
+        }
+        self.blame_cursor = self
+            .blame_cursor
+            .min(self.blame_rows.len().saturating_sub(1));
+        true
+    }
+
+    pub fn accept_commit_show(
+        &mut self,
+        key: CommitDetailKey,
+        result: std::result::Result<String, String>,
+    ) -> bool {
+        if self.commit_show_key.as_ref() != Some(&key) {
+            return false;
+        }
+        self.commit_show = Some((key, result));
+        true
+    }
+
+    pub fn open_commit_file(&mut self, sha: &str, path: &str) -> Result<(), usize> {
+        if let Some(marked) = self.patch_conflicts_with(sha) {
+            if marked > 0 {
+                return Err(marked);
+            }
+            self.flow = GitFlow::None;
+            self.patch_docs.clear();
+        }
+        self.drilled_commit = Some(sha.to_string());
+        self.staging = Some(StagingUi::new(path));
+        self.patch_doc = self.patch_docs.get(path).cloned();
+        self.patch_load = if self.patch_doc.is_some() {
+            DocLoad::Ready
+        } else {
+            DocLoad::Pending
+        };
+        if let GitFlow::Patch(patch) = &mut self.flow {
+            patch.path = path.to_string();
+        }
+        self.drill(GitView::PatchBuilding);
+        Ok(())
+    }
+
+    pub fn mark_patch_lines(&mut self, path: &str, toggles: &[usize]) {
+        if !matches!(&self.flow, GitFlow::Patch(_)) {
+            let Some(commit) = self.drilled_commit.clone() else {
+                return;
+            };
+            self.flow = GitFlow::Patch(PatchUi {
+                commit,
+                path: path.to_string(),
+                marks: Default::default(),
+            });
+        }
+        if let GitFlow::Patch(patch) = &mut self.flow {
+            patch.path = path.to_string();
+            let marks = patch.marks.entry(path.to_string()).or_default();
+            for index in toggles {
+                if !marks.remove(index) {
+                    marks.insert(*index);
+                }
+            }
+        }
+    }
+
+    pub fn click_drill_row(&mut self, index: usize) {
+        match self.focus {
+            GitView::CommitFiles => {
+                self.cur.commit_files = index.min(self.commit_files.len().saturating_sub(1));
+            }
+            GitView::Blame => {
+                self.blame_cursor = index.min(self.blame_rows.len().saturating_sub(1));
+            }
+            GitView::Staging | GitView::PatchBuilding => {
+                if let Some(staging) = self.staging.as_mut() {
+                    let doc = match self.focus {
+                        GitView::Staging => self.stage_doc.as_ref(),
+                        _ => self.patch_doc.as_ref(),
+                    };
+                    staging.cursor = doc
+                        .map(|state| staging::clamp_cursor(&state.doc, index))
+                        .unwrap_or(0);
+                    staging.anchor = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Step the focused view's own cursor up/down. The flow-through list views
     /// (files/branches/commits/stash) are driven by the accordion; the
     /// line-cursor and drill-list views own their cursor and step it here.
@@ -505,11 +715,15 @@ impl GitUi {
             }
             GitView::CommitFiles => {
                 let max = self.commit_files.len().saturating_sub(1);
+                let previous = self.cur.commit_files;
                 self.cur.commit_files = if down {
                     (self.cur.commit_files + 1).min(max)
                 } else {
                     self.cur.commit_files.saturating_sub(1)
                 };
+                if self.cur.commit_files != previous {
+                    self.patch_doc = None;
+                }
             }
             _ => {}
         }
@@ -650,7 +864,7 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("?", "keys", GitMsg::Cheatsheet),
         ],
         GitView::Commits => vec![
-            k("enter", "files", GitMsg::Drill),
+            k("enter", "diff", GitMsg::Drill),
             k("s", "squash", GitMsg::Squash),
             k("f", "fixup", GitMsg::Fixup),
             k("d", "drop", GitMsg::Drop),
@@ -711,7 +925,7 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("?", "keys", GitMsg::Cheatsheet),
         ],
         GitView::CommitFiles => vec![
-            k("enter", "patch lines", GitMsg::Drill),
+            k("enter", "view diff", GitMsg::Drill),
             k("o", "open in editor", GitMsg::OpenFile),
             k("b", "blame", GitMsg::BlameFile),
             k("z", "undo", GitMsg::Undo),
@@ -724,7 +938,7 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("?", "keys", GitMsg::Cheatsheet),
         ],
         GitView::PatchBuilding => vec![
-            k("space", "mark line", GitMsg::StageLines),
+            k("space", "add to patch", GitMsg::StageLines),
             k("a", "hunk", GitMsg::SelectHunk),
             k("v", "range", GitMsg::ToggleRangeMode),
             k("C-p", "patch menu", GitMsg::OpenMenu(MenuKind::Patch)),
@@ -1513,6 +1727,23 @@ mod tests {
     }
 
     #[test]
+    fn click_drill_row_clamps_list_and_diff_cursors() {
+        let mut git = GitUi {
+            focus: GitView::CommitFiles,
+            commit_files: vec![("a.rs".into(), 1, 0)],
+            ..Default::default()
+        };
+        git.click_drill_row(99);
+        assert_eq!(git.cur.commit_files, 0);
+
+        git.focus = GitView::PatchBuilding;
+        git.staging = Some(StagingUi::new("a.rs"));
+        git.patch_doc = Some(StageDocState::default());
+        git.click_drill_row(99);
+        assert_eq!(git.staging.as_ref().map(|st| st.cursor), Some(0));
+    }
+
+    #[test]
     fn shifted_letters_are_distinct_from_plain() {
         let shift = Modifiers::SHIFT;
         let none = Modifiers::NONE;
@@ -2039,7 +2270,7 @@ mod tests {
         assert!(
             context_keys(ui.git.focus)
                 .iter()
-                .any(|entry| entry.chord == "enter" && entry.label == "files")
+                .any(|entry| entry.chord == "enter" && entry.label == "diff")
         );
 
         let mut git = GitUi {
@@ -2048,6 +2279,115 @@ mod tests {
         };
         assert!(!git.normalize(Some(GitView::Commits), PanelWidth::Half));
         assert_eq!(git.focus, GitView::CommitFiles);
+    }
+
+    #[test]
+    fn enter_enter_never_creates_a_patch_flow() {
+        let mut git = GitUi {
+            focus: GitView::CommitFiles,
+            drilled_commit: Some("abc123".into()),
+            commit_files: vec![("src/lib.rs".into(), 2, 1)],
+            ..Default::default()
+        };
+        git.cur.commit_files = 0;
+        git.open_commit_file("abc123", "src/lib.rs").unwrap();
+        assert_eq!(git.focus, GitView::PatchBuilding);
+        assert_eq!(git.flow, GitFlow::None);
+    }
+
+    #[test]
+    fn first_mark_creates_the_patch_flow() {
+        let mut git = GitUi {
+            focus: GitView::PatchBuilding,
+            drilled_commit: Some("abc123".into()),
+            ..Default::default()
+        };
+        git.mark_patch_lines("src/lib.rs", &[2, 4]);
+        assert!(matches!(&git.flow, GitFlow::Patch(p) if p.commit == "abc123" && p.marked() == 2));
+    }
+
+    #[test]
+    fn stale_commit_files_result_is_dropped() {
+        let mut git = GitUi {
+            drilled_commit: Some("B".into()),
+            commit_files: vec![("keep.rs".into(), 1, 0)],
+            ..Default::default()
+        };
+        assert!(!git.accept_commit_files("A", Ok(vec![("stale.rs".into(), 9, 9)])));
+        assert_eq!(git.commit_files[0].0, "keep.rs");
+    }
+
+    #[test]
+    fn stale_patch_doc_is_dropped() {
+        let mut git = GitUi {
+            drilled_commit: Some("B".into()),
+            ..Default::default()
+        };
+        let state = StageDocState {
+            path: "stale.rs".into(),
+            ..Default::default()
+        };
+        assert!(!git.accept_patch_doc("A", "new.rs", Ok(state)));
+        assert!(git.patch_docs.is_empty());
+    }
+
+    #[test]
+    fn patch_failure_is_retained_for_its_commit_and_path() {
+        let mut git = GitUi {
+            drilled_commit: Some("A".into()),
+            ..Default::default()
+        };
+        assert!(git.accept_patch_doc("A", "a.rs", Err("git show failed".into())));
+        assert_eq!(
+            git.patch_failed
+                .get(&("A".into(), "a.rs".into()))
+                .map(String::as_str),
+            Some("git show failed")
+        );
+        assert!(!git.patch_failed.contains_key(&("B".into(), "a.rs".into())));
+    }
+
+    #[test]
+    fn stale_blame_is_dropped() {
+        let mut git = GitUi {
+            blame_path: Some("current.rs".into()),
+            ..Default::default()
+        };
+        assert!(!git.accept_blame("old.rs", Ok(Vec::new())));
+        assert!(git.blame_rows.is_empty());
+    }
+
+    #[test]
+    fn commit_show_keyed_by_mark_and_sha() {
+        let mut git = GitUi {
+            flow: GitFlow::Diffing("base".into()),
+            commit_show_key: Some(CommitDetailKey {
+                base: Some("base".into()),
+                sha: "selected".into(),
+            }),
+            ..Default::default()
+        };
+        let stale = CommitDetailKey {
+            base: None,
+            sha: "selected".into(),
+        };
+        assert!(!git.accept_commit_show(stale, Ok("stale".into())));
+        let current = git.commit_show_key.clone().unwrap();
+        assert!(git.accept_commit_show(current, Ok("range".into())));
+        assert!(
+            matches!(git.commit_show, Some((CommitDetailKey { base: Some(base), sha }, Ok(text))) if base == "base" && sha == "selected" && text == "range")
+        );
+    }
+
+    #[test]
+    fn branches_and_stash_enter_dispatches_drill_at_normal() {
+        for view in [GitView::Branches, GitView::Stash] {
+            let ui = ui_at(view, PanelWidth::Normal);
+            assert_eq!(
+                git_key(&KeyCode::Enter, Modifiers::NONE, &ui),
+                Some(GitMsg::Drill)
+            );
+        }
     }
 
     #[test]

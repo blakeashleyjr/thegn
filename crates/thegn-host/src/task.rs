@@ -154,30 +154,7 @@ pub fn job_slot(worktree: &Path, name: &str) -> String {
     format!("{}:job:{name}", worktree.display())
 }
 
-const RESTART_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
-
-#[derive(Debug, Default)]
-pub struct RestartArm {
-    armed: Option<(String, Instant)>,
-}
-
-impl RestartArm {
-    pub fn confirm(&mut self, name: &str, now: Instant) -> bool {
-        let confirmed = self.armed.as_ref().is_some_and(|(armed_name, armed_at)| {
-            armed_name == name && now.saturating_duration_since(*armed_at) < RESTART_CONFIRM_WINDOW
-        });
-        if confirmed {
-            self.armed = None;
-            return true;
-        }
-        self.armed = Some((name.to_owned(), now));
-        false
-    }
-
-    pub fn clear(&mut self) {
-        self.armed = None;
-    }
-}
+pub(crate) use crate::panel::confirm::TwoPress as RestartArm;
 
 pub fn cancel_job(worktree: &Path, name: &str) {
     cancel_slot(&job_slot(worktree, name));

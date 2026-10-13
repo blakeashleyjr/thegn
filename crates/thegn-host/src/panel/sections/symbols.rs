@@ -89,10 +89,6 @@ fn list_view(ctx: &SectionCtx, half: bool) -> Vec<PanelRow> {
             row
         };
         rows.push(row);
-
-        if rows.len() >= ctx.rows.saturating_sub(1) {
-            break;
-        }
     }
 
     rows.push(hint_row(&[

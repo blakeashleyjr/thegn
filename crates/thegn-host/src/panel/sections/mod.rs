@@ -17,7 +17,7 @@ pub(crate) mod ci;
 pub(crate) mod commits;
 mod environments;
 mod git;
-mod help;
+pub(crate) mod help;
 mod hosts;
 pub(crate) mod issues;
 mod keys;
@@ -208,6 +208,111 @@ fn two_col(left: &[Vec<Seg>], right: &[Vec<Seg>], left_w: usize, gap: usize) -> 
             Line::Segs(segs)
         })
         .collect()
+}
+
+/// Render a cursor-windowed list beside detail that remains pinned to row zero.
+pub(super) fn list_detail(
+    section: Section,
+    list: &[(Vec<Seg>, Option<usize>)],
+    detail: &[Vec<Seg>],
+    cursor: usize,
+    list_w: usize,
+    rows: usize,
+) -> Vec<PanelRow> {
+    if rows == 0 {
+        return Vec::new();
+    }
+    let hit_pos = list
+        .iter()
+        .position(|(_, hit)| *hit == Some(cursor))
+        .unwrap_or(0);
+    let overflow = list.len() > rows;
+    let mut start = 0;
+    let mut end = list.len().min(rows);
+    if overflow {
+        let capacity = if rows >= 3 { rows - 2 } else { 1 };
+        start = hit_pos.saturating_sub(capacity / 2);
+        start = start.min(list.len().saturating_sub(capacity));
+        end = (start + capacity).min(list.len());
+    }
+    let above = start;
+    let below = list.len().saturating_sub(end);
+    let mut left: Vec<Vec<Seg>> = Vec::new();
+    let mut hits = Vec::new();
+    if rows >= 3 && above > 0 {
+        left.push(vec![seg(g2(), format!("… ↑{above} above"))]);
+        hits.push(None);
+    }
+    for (row, hit) in &list[start..end] {
+        left.push(row.clone());
+        hits.push(*hit);
+    }
+    if rows >= 3 && below > 0 {
+        left.push(vec![seg(g2(), format!("… +{below} more"))]);
+        hits.push(None);
+    }
+    let mut right = detail.to_vec();
+    if right.len() > rows {
+        right.truncate(rows);
+        right[rows - 1] = vec![seg(g2(), format!("… +{} lines", detail.len() - rows + 1))];
+    }
+    two_col(&left, &right, list_w, 2)
+        .into_iter()
+        .enumerate()
+        .take(rows)
+        .map(|(i, line)| {
+            let row = PanelRow::plain(line);
+            match hits.get(i).copied().flatten() {
+                Some(index) => row.with_hit(PanelHit::Row(section, index)),
+                None => row,
+            }
+        })
+        .collect()
+}
+
+/// Full visible cursor-list length for sections that window inside their body.
+pub(super) fn list_len(section: Section, ctx: &SectionCtx) -> Option<usize> {
+    match section {
+        Section::Problems => Some(ctx.model.panel.diagnostics.len()),
+        Section::Jobs => Some(ctx.model.panel.task_specs.len()),
+        Section::Issues => Some(issues::sorted_issues(ctx).len()),
+        Section::Ci => Some(ci::display_runs(&ctx.model.panel).len()),
+        Section::Hosts => Some(ctx.model.panel.hosts.len()),
+        Section::Notifications => {
+            Some(notifications::visible_indices(&ctx.model.panel, ctx.ui).len())
+        }
+        Section::Logs => Some(logs::visible_lines(&ctx.model.panel, ctx.ui).count()),
+        Section::MergeQueue => Some(ctx.model.panel.merge_queue.len()),
+        Section::Share => Some(ctx.model.shares.len()),
+        Section::Forward => {
+            Some(ctx.model.forwards.len() + usize::from(ctx.model.preview.is_some()))
+        }
+        Section::Across => Some(
+            ctx.model
+                .panel
+                .across
+                .rows()
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        row,
+                        thegn_core::aggregate::AggRow::Excerpt(i)
+                            if ctx.model.panel.across.jump_target(*i).is_some()
+                    )
+                })
+                .count(),
+        ),
+        Section::Tests => Some(ctx.ui.tests.visible_indices().len()),
+        Section::Sandbox => Some(
+            crate::handlers::sandbox_panel::visible_containers(
+                &ctx.model.containers,
+                &ctx.model.active_container_name,
+                crate::panel::scope::system_all(),
+            )
+            .len(),
+        ),
+        _ => None,
+    }
 }
 
 /// Wrap plain text into `w`-col chunks by display width — the detail-column
@@ -608,7 +713,6 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
             _ => vec![seg(g(), "not run")],
         },
-        Section::Debug => vec![seg(g2(), "○ idle")],
         Section::Sandbox => {
             // Summarise the ACTIVE worktree's sandbox — the same match the
             // body uses. The old "any of our containers anywhere" check lit
@@ -635,7 +739,6 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 }
             }
         }
-        Section::Db => vec![seg(g2(), "—")],
         Section::Hosts => hosts::summary(model),
         Section::Environments => environments::summary(model),
         Section::Telemetry => {
@@ -888,6 +991,12 @@ fn compact_count(n: u64) -> String {
 
 /// A section's content rows for the current view.
 pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
+    if let Some(reason) = ctx.ui.off_reason(section) {
+        return vec![PanelRow::plain(Line::segs(vec![seg(
+            g2(),
+            format!("{} is off: {reason}", section.label()),
+        )]))];
+    }
     match section {
         Section::Changes => changes::content(ctx),
         Section::Commits => commits::content(ctx),
@@ -902,13 +1011,11 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Jobs => tasks::content(ctx),
         Section::Tests => misc::tests(ctx),
         Section::Symbols => symbols::content(ctx),
-        Section::Debug => misc::debug(),
         Section::Sandbox => misc::sandbox(ctx),
         Section::Hosts => hosts::content(ctx),
         Section::Environments => environments::content(ctx),
         Section::Share => misc::share(ctx),
         Section::Forward => misc::forward(ctx),
-        Section::Db => misc::db(),
         Section::Telemetry => telemetry::content(ctx),
         Section::Keys => keys::content(ctx),
         Section::Help => help::content(ctx),
@@ -958,7 +1065,7 @@ fn rail_row_count(ui: &PanelUi, cols: usize) -> usize {
     let mut rows = 0;
     let mut x = 1usize;
     for (i, label) in visible.iter().enumerate() {
-        let entry_width = (i + 1).to_string().len() + 1 + label.chars().count();
+        let entry_width = crate::panel::section_digit(i).map_or(0, |_| 2) + label.chars().count();
         let separator_width = if x > 1 { 3 } else { 0 };
         if x + separator_width + entry_width > cols.saturating_sub(1) && x > 1 {
             rows += 1;
@@ -1072,15 +1179,42 @@ pub fn scroll_extent(
                 owns_nav: true,
             })
         }
-        Section::Stash if ui.width == crate::layout::PanelWidth::Full => Some(ScrollExtent {
-            max: ui
-                .git
-                .stash_diff
-                .as_ref()
-                .map(|(_, text)| text.lines().count().saturating_sub(1))
-                .unwrap_or(0),
-            owns_nav: false,
-        }),
+        Section::Stash | Section::Commits
+            if matches!(
+                ui.width,
+                crate::layout::PanelWidth::Half | crate::layout::PanelWidth::Full
+            ) =>
+        {
+            let max = if section == Section::Stash {
+                ui.git
+                    .stash_diff
+                    .as_ref()
+                    .map(|(_, text)| text.lines().count().saturating_sub(1))
+                    .unwrap_or(0)
+            } else if matches!(
+                ui.git.focus,
+                super::gitui::GitView::CommitFiles | super::gitui::GitView::PatchBuilding
+            ) {
+                ui.git
+                    .commit_files
+                    .get(ui.git.cur.commit_files)
+                    .and_then(|(path, _, _)| ui.git.patch_docs.get(path))
+                    .map(|doc| doc.diff.lines().count().saturating_sub(1))
+                    .unwrap_or(0)
+            } else {
+                ui.git
+                    .commit_show
+                    .as_ref()
+                    .filter(|(key, _)| ui.git.commit_show_key.as_ref() == Some(key))
+                    .and_then(|(_, result)| result.as_ref().ok())
+                    .map(|text| text.lines().count().saturating_sub(1))
+                    .unwrap_or(0)
+            };
+            Some(ScrollExtent {
+                max,
+                owns_nav: false,
+            })
+        }
         _ => None,
     }
 }
@@ -1998,6 +2132,31 @@ mod spec {
     }
 
     #[test]
+    fn off_section_renders_banner_only() {
+        let m = model();
+        let reason = "set [pr_queue] enabled = true";
+        let u = PanelUi {
+            off: vec![(Section::PrQueue, reason)],
+            ..ui(PanelWidth::Normal, Section::PrQueue)
+        };
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 39,
+            rows: 28,
+        };
+        let rows = content(Section::PrQueue, &ctx);
+        assert_eq!(rows.len(), 1);
+        let rendered = text(&rows);
+        assert!(rendered.contains("prq is off: set [pr_queue] enabled = true"));
+        assert!(!rendered.contains("off: off"));
+        assert!(
+            rows.iter()
+                .all(|row| !matches!(row.hit, Some(PanelHit::Row(_, _))))
+        );
+    }
+
+    #[test]
     fn every_section_renders_three_distinct_views() {
         for section in crate::panel::SECTION_ORDER {
             let n = render(section, PanelWidth::Normal);
@@ -2006,18 +2165,14 @@ mod spec {
             assert!(!n.is_empty(), "{section:?} normal");
             assert!(!h.is_empty(), "{section:?} half");
             assert!(!f.is_empty(), "{section:?} full");
-            // Debug/Db are dead-code placeholder sections — distinctness is
-            // waived, as is PrQueue (a flat list whose empty/default render has
-            // no width-specific full view). Changes' accordion body is
+            // PrQueue is a flat list whose empty/default render has no
+            // width-specific full view. Changes' accordion body is
             // Half == Full by design: the production Full view is the
             // git-family frame (`gitfull`), not this renderer. Everything else
             // — including the once-waived logs/share/forward/merge-queue/across
             // /sandbox — now renders a real list+detail Full body over the
             // populated fixture.
-            if matches!(
-                section,
-                Section::Debug | Section::Db | Section::Changes | Section::PrQueue
-            ) {
+            if matches!(section, Section::Changes | Section::PrQueue) {
                 continue;
             }
             assert_ne!(n, f, "{section:?}: normal vs full");
@@ -2339,6 +2494,308 @@ mod spec {
         // The long left row clips with an ellipsis and the right stays put.
         assert!(segs(&lines[1]).starts_with("a-very-"));
         assert!(segs(&lines[1]).contains('…'));
+    }
+
+    #[test]
+    fn list_detail_windows_list_and_pins_detail() {
+        let list: Vec<(Vec<Seg>, Option<usize>)> = (0..40)
+            .map(|i| (vec![seg(t(), format!("item-{i}"))], Some(i)))
+            .collect();
+        let detail: Vec<Vec<Seg>> = (0..20)
+            .map(|i| vec![seg(t(), format!("detail-{i}"))])
+            .collect();
+        let rows = list_detail(Section::Problems, &list, &detail, 30, 30, 12);
+        assert_eq!(rows.len(), 12);
+        let hits: Vec<usize> = rows
+            .iter()
+            .filter_map(|row| match row.hit {
+                Some(PanelHit::Row(Section::Problems, i)) => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hits, (25..35).collect::<Vec<_>>());
+        let rendered = text(&rows);
+        assert!(
+            rendered.lines().next().unwrap().contains("detail-0"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("↑25 above"), "{rendered}");
+        assert!(rendered.contains("+5 more"), "{rendered}");
+        assert!(rendered.contains("item-30"), "{rendered}");
+        assert!(
+            rendered.contains("+9 lines"),
+            "clipped detail has a marker: {rendered}"
+        );
+    }
+
+    #[test]
+    fn one_row_list_window_keeps_the_cursor_hit() {
+        let list: Vec<(Vec<Seg>, Option<usize>)> = (0..5)
+            .map(|i| (vec![seg(t(), format!("item-{i}"))], Some(i)))
+            .collect();
+        let rows = list_detail(Section::Problems, &list, &[], 4, 30, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hit, Some(PanelHit::Row(Section::Problems, 4)));
+        assert!(text(&rows).contains("item-4"));
+    }
+
+    #[test]
+    fn long_problem_job_symbol_and_ci_lists_keep_all_cursor_hits() {
+        let mut m = model();
+        m.panel.diagnostics = (0..40)
+            .map(|i| crate::panel::DiagnosticItem {
+                file: format!("src/{i}.rs"),
+                line: i,
+                col: None,
+                severity: crate::panel::Severity::Error,
+                message: format!("diagnostic-{i}"),
+                source: "test".into(),
+                code: None,
+            })
+            .collect();
+        let task = m.panel.task_specs[0].clone();
+        m.panel.task_specs = (0..40)
+            .map(|i| {
+                let mut value = task.clone();
+                value.name = format!("job-{i}");
+                value
+            })
+            .collect();
+        let symbol = m.panel.symbols[0].clone();
+        m.panel.symbols = (0..40)
+            .map(|i| {
+                let mut value = symbol.clone();
+                value.name = format!("symbol-{i}");
+                value
+            })
+            .collect();
+        m.panel.my_work = (0..40)
+            .map(|i| thegn_core::work::WorkRow {
+                number: format!("work-{i}"),
+                title: format!("work item {i}"),
+                ..Default::default()
+            })
+            .collect();
+        m.panel.tracker_issues = (0..40)
+            .map(|i| thegn_core::issue::Issue {
+                id: format!("linear:issue-{i}"),
+                number: format!("ISSUE-{i}"),
+                provider: "linear".into(),
+                title: format!("issue {i}"),
+                ..Default::default()
+            })
+            .collect();
+        m.panel.issues_configured = true;
+        m.panel.ci_runs = (0..40)
+            .map(|i| thegn_core::ci::CiRun {
+                id: format!("run-{i}"),
+                name: format!("workflow-{i}"),
+                ..Default::default()
+            })
+            .collect();
+
+        for width in [PanelWidth::Normal, PanelWidth::Half] {
+            for section in [
+                Section::Problems,
+                Section::Jobs,
+                Section::Symbols,
+                Section::Mine,
+                Section::Issues,
+            ] {
+                let mut u = ui(width, section);
+                u.problems_cursor = 39;
+                u.tasks_cursor = 39;
+                u.symbols_cursor = 39;
+                u.cursor = 39;
+                let ctx = SectionCtx {
+                    model: &m,
+                    ui: &u,
+                    cols: if width == PanelWidth::Normal { 39 } else { 75 },
+                    rows: 10,
+                };
+                let hits = content(section, &ctx)
+                    .iter()
+                    .filter(|row| matches!(row.hit, Some(PanelHit::Row(s, _)) if s == section))
+                    .count();
+                assert_eq!(hits, 40, "{section:?} {width:?}");
+            }
+        }
+        let u = ui(PanelWidth::Normal, Section::Ci);
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 39,
+            rows: 10,
+        };
+        let hits = content(Section::Ci, &ctx)
+            .iter()
+            .filter(|row| matches!(row.hit, Some(PanelHit::Row(Section::Ci, _))))
+            .count();
+        assert_eq!(hits, 40, "CI Normal");
+    }
+
+    #[test]
+    fn full_problem_and_job_details_follow_cursor_and_hits_are_only_list_rows() {
+        let mut m = model();
+        m.panel.diagnostics = (0..40)
+            .map(|i| crate::panel::DiagnosticItem {
+                file: format!("src/{i}.rs"),
+                line: i,
+                col: None,
+                severity: crate::panel::Severity::Error,
+                message: format!("diagnostic-{i}"),
+                source: "test".into(),
+                code: None,
+            })
+            .collect();
+        let mut u = ui(PanelWidth::Full, Section::Problems);
+        u.problems_cursor = 30;
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 150,
+            rows: 22,
+        };
+        assert_eq!(
+            crate::panel::frame::section_rows(Section::Problems, &m, &u, 150, 22),
+            40
+        );
+        let rows = content(Section::Problems, &ctx);
+        assert!(rows.len() <= ctx.rows);
+        assert!(text(&rows).contains("diagnostic-30"));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row.hit, Some(PanelHit::Row(Section::Problems, _))))
+                .count(),
+            16
+        );
+
+        let mut m = model();
+        let template = m.panel.task_specs[0].clone();
+        m.panel.task_specs = (0..40)
+            .map(|i| {
+                let mut task = template.clone();
+                task.name = format!("job-{i}");
+                task
+            })
+            .collect();
+        let mut u = ui(PanelWidth::Full, Section::Jobs);
+        u.tasks_cursor = 30;
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 150,
+            rows: 22,
+        };
+        assert_eq!(
+            crate::panel::frame::section_rows(Section::Jobs, &m, &u, 150, 22),
+            40
+        );
+        let rows = content(Section::Jobs, &ctx);
+        assert!(rows.len() <= ctx.rows);
+        assert!(text(&rows).contains("job-30"));
+        assert!(
+            rows.iter()
+                .filter(|row| matches!(row.hit, Some(PanelHit::Row(Section::Jobs, _))))
+                .count()
+                < rows.len()
+        );
+    }
+
+    #[test]
+    fn ci_detail_tracks_the_cursor_run_at_half_and_full() {
+        let mut m = model();
+        let mut second = m.panel.ci_runs[0].clone();
+        second.id = "200".into();
+        second.name = "deploy".into();
+        second.jobs[0].name = "deploy-job".into();
+        m.panel.ci_runs.push(second);
+        for width in [PanelWidth::Half, PanelWidth::Full] {
+            let mut u = ui(width, Section::Ci);
+            u.cursor = 1;
+            let ctx = SectionCtx {
+                model: &m,
+                ui: &u,
+                cols: if width == PanelWidth::Full { 150 } else { 75 },
+                rows: 30,
+            };
+            let rendered = text(&content(Section::Ci, &ctx));
+            assert!(rendered.contains("deploy-job"), "{width:?}: {rendered}");
+            if width == PanelWidth::Full {
+                assert!(rendered.contains("RUN JOBS"), "{rendered}");
+            }
+            assert!(
+                !rendered.contains("LATEST RUN JOBS"),
+                "{width:?}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_hosts_show_cursor_target_and_detail_beside_list() {
+        let mut m = model();
+        m.panel.hosts[1].target = "flaky.example".into();
+        let mut u = ui(PanelWidth::Full, Section::Hosts);
+        u.cursor = 1;
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 150,
+            rows: 30,
+        };
+        let rows = content(Section::Hosts, &ctx);
+        let rendered = text(&rows);
+        assert!(rendered.contains("host connect: timeout"), "{rendered}");
+        assert!(rendered.contains("ghcr.io/x/base:v1"), "{rendered}");
+        assert!(
+            rendered.contains("reach target  flaky.example"),
+            "{rendered}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row.hit, Some(PanelHit::Row(Section::Hosts, _))))
+                .count(),
+            2
+        );
+        assert!(rows.len() <= ctx.rows);
+    }
+
+    #[test]
+    fn notification_half_wraps_the_cursor_message() {
+        let mut m = model();
+        m.panel.notifications[0].message = format!("{}TAILMARKER", "message-word ".repeat(35));
+        let mut u = ui(PanelWidth::Half, Section::Notifications);
+        u.notifications_cursor = 0;
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 75,
+            rows: 30,
+        };
+        let rows = content(Section::Notifications, &ctx);
+        let rendered = text(&rows);
+        assert!(
+            rendered.contains("TAILMARKER"),
+            "the cursor row must wrap the whole message: {rendered}"
+        );
+        for row in rows.iter().filter(|row| {
+            row.hit.is_none()
+                && matches!(
+                    &row.line,
+                    Line::Segs(segs) if segs
+                        .first()
+                        .is_some_and(|seg| seg.text == "  ")
+                )
+        }) {
+            if let Line::Segs(segs) = &row.line {
+                assert!(
+                    crate::seg::seg_width(segs) <= ctx.cols,
+                    "wrapped notification row exceeds {} columns: {:?}",
+                    ctx.cols,
+                    segs
+                );
+            }
+        }
     }
 
     #[test]

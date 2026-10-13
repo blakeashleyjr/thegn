@@ -17,6 +17,7 @@
 //! legitimately owns them.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::attention::MqStatus;
@@ -501,6 +502,7 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                 }
             }
             DriveMsg::Note(msg) => {
+                ctx.model.status = msg.clone();
                 ctx.toasts.info(msg, now);
                 *ctx.want_model_refresh = true;
             }
@@ -854,6 +856,28 @@ pub(crate) struct MqKeyCtx<'a> {
     pub drive_tx: &'a DriveTx,
     pub fold_inflight: &'a mut bool,
     pub toasts: &'a mut Toasts,
+    pub guard: &'a mut crate::panel::confirm::TwoPress,
+    pub now: Instant,
+}
+
+fn clear_gate(
+    rows: &[MergeQueueRow],
+    guard: &mut crate::panel::confirm::TwoPress,
+    key: &str,
+    now: Instant,
+    may_sweep: bool,
+) -> Result<(), String> {
+    let count = rows.iter().filter(|row| row.status == "landed").count();
+    let what = if may_sweep {
+        format!("clear {count} landed row(s) and may sweep their worktrees")
+    } else {
+        format!("clear {count} landed row(s)")
+    };
+    if guard.confirm(key, now) {
+        Ok(())
+    } else {
+        Err(crate::panel::confirm::arm_prompt('c', &what))
+    }
 }
 
 /// Handle one of the section's action keys (`a/A/x/l/r/c/D`) on the queue row
@@ -969,6 +993,12 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
                 .collect();
             if landed.is_empty() {
                 ctx.model.status = "Merge queue: nothing landed to clear".into();
+                return true;
+            }
+            let key = format!("mq-clear:{}", ctx.active_wt.display());
+            let may_sweep = ctx.cfg.merge_queue.on_landed == thegn_core::config::OnLanded::Expire;
+            if let Err(prompt) = clear_gate(&landed, ctx.guard, &key, ctx.now, may_sweep) {
+                ctx.model.status = prompt;
                 return true;
             }
             // Do not optimistically erase retry rows before collection succeeds.
@@ -1836,6 +1866,68 @@ mod tests {
             location: String::new(),
             agent_attempts: 0,
         }
+    }
+
+    #[test]
+    fn clear_landed_needs_two_presses() {
+        let rows = vec![row("/wt/a", "landed"), row("/wt/b", "landed")];
+        let t0 = Instant::now();
+        let mut guard = crate::panel::confirm::TwoPress::default();
+        let prompt = clear_gate(&rows, &mut guard, "repo", t0, true).unwrap_err();
+        assert!(prompt.contains("2 landed row(s)"));
+        assert!(prompt.contains("sweep their worktrees"));
+        assert!(
+            clear_gate(
+                &rows,
+                &mut guard,
+                "repo",
+                t0 + std::time::Duration::from_secs(1),
+                true
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn note_resolves_the_status() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let cfg = Config::default();
+        let notify = crate::notify::NotifyState::new(
+            cfg.notifications.clone(),
+            String::new(),
+            waker.clone(),
+        );
+        let event_bus = thegn_core::event_bus::EventBus::new();
+        let session = crate::session::Session::default();
+        let mut model = crate::chrome::FrameModel::default();
+        let mut toasts = Toasts::default();
+        let mut fold_inflight = false;
+        let mut want_model_refresh = false;
+        let mut dirty = false;
+        let mut loop_perf = crate::perf::LoopPerf::new();
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let note = "Skipped main — that's the target branch".to_string();
+        tx.send(DriveMsg::Note(note.clone())).unwrap();
+        drain_drive_msgs(
+            &mut rx,
+            &mut DrainCtx {
+                model: &mut model,
+                toasts: &mut toasts,
+                notify_state: &notify,
+                event_bus: &event_bus,
+                fold_inflight: &mut fold_inflight,
+                want_model_refresh: &mut want_model_refresh,
+                dirty: &mut dirty,
+                loop_perf: &mut loop_perf,
+                session: &session,
+                waker: &waker,
+            },
+        );
+        assert_eq!(model.status, note);
     }
 
     #[test]

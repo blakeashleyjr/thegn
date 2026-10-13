@@ -576,6 +576,7 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
             "--no-color",
             "--no-ext-diff",
             "--no-renames",
+            "--diff-merges=first-parent",
             "-U3",
             "--format=",
             sha,
@@ -584,6 +585,41 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
             args.extend(["--", p]);
         }
         run(loc, &args)
+    }
+
+    /// Full commit metadata and first-parent diff for the read-only detail region.
+    fn commit_show(&self, loc: &GitLoc, sha: &str) -> Result<String> {
+        run(
+            loc,
+            &[
+                "-c",
+                "diff.noprefix=false",
+                "show",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-renames",
+                "--diff-merges=first-parent",
+                "-U3",
+                "--format=fuller",
+                sha,
+            ],
+        )
+    }
+
+    /// Diff two refs for the `W` marked-range detail view.
+    fn range_patch(&self, loc: &GitLoc, from: &str, to: &str) -> Result<String> {
+        run(
+            loc,
+            &[
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-renames",
+                "-U3",
+                from,
+                to,
+            ],
+        )
     }
 
     /// Stage one path (`git add -- <path>`). Routed through the write runner
@@ -3847,6 +3883,61 @@ mod tests {
         let solo_loc = GitLoc::for_worktree(&solo);
         assert_eq!(gix.ahead_behind(&solo_loc).unwrap(), None);
         assert_eq!(cli.ahead_behind(&solo_loc).unwrap(), None);
+    }
+
+    #[test]
+    fn commit_diff_of_a_merge_matches_first_parent() {
+        use super::GitBackend;
+        let repo = tempfile::tempdir().unwrap();
+        testutil::git_in(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+        testutil::git_in(repo.path(), &["add", "--", "base.txt"]);
+        testutil::git_in(repo.path(), &["commit", "-q", "-m", "base"]);
+        testutil::git_in(repo.path(), &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
+        testutil::git_in(repo.path(), &["add", "--", "feature.txt"]);
+        testutil::git_in(repo.path(), &["commit", "-q", "-m", "feature"]);
+        testutil::git_in(repo.path(), &["checkout", "-q", "main"]);
+        std::fs::write(repo.path().join("main.txt"), "main\n").unwrap();
+        testutil::git_in(repo.path(), &["add", "--", "main.txt"]);
+        testutil::git_in(repo.path(), &["commit", "-q", "-m", "main change"]);
+        testutil::git_in(
+            repo.path(),
+            &["merge", "--no-ff", "-q", "feature", "-m", "merge feature"],
+        );
+        let loc = GitLoc::for_worktree(repo.path());
+        let sha = String::from_utf8_lossy(
+            &thegn_core::util::git_cmd(repo.path())
+                .args(["rev-parse", "HEAD"])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let listed: Vec<String> = super::CliGit
+            .diff_refs(&loc, &format!("{sha}^"), &sha)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect();
+        let patch = super::CliGit
+            .commit_diff(&loc, &sha, Some("feature.txt"))
+            .unwrap();
+        assert!(
+            !patch.is_empty(),
+            "first-parent merge diff must include the merged file"
+        );
+        let patch_paths: Vec<String> = thegn_core::patch::parse_patch(&patch)
+            .into_iter()
+            .map(|file| file.new_path)
+            .collect();
+        assert_eq!(listed, vec!["feature.txt"]);
+        assert_eq!(
+            patch_paths, listed,
+            "per-file diff paths must agree with first-parent file list"
+        );
     }
 }
 

@@ -14,6 +14,7 @@ type PageMemo = (
     String,
     usize,
     Vec<Line>,
+    Vec<(usize, String)>,
 );
 
 thread_local! {
@@ -32,25 +33,64 @@ fn with_lines<R>(ctx: &SectionCtx, f: impl FnOnce(&[Line]) -> R) -> R {
     let Some(page) = reg.page(page_id).or_else(|| reg.page("index")) else {
         return f(&[]);
     };
-    let width = ctx.cols.saturating_sub(1).max(8);
+    let width: usize = ctx.cols.saturating_sub(1).max(8);
     let id = page.meta.id.clone();
     let cached = PAGE_MEMO.with(|memo| {
         let memo = memo.borrow();
         memo.as_ref()
-            .filter(|(cached_reg, cached_id, cached_width, _)| {
+            .filter(|(cached_reg, cached_id, cached_width, _, _)| {
                 Arc::ptr_eq(cached_reg, reg) && *cached_id == id && *cached_width == width
             })
             .is_some()
     });
     if !cached {
         let blocks = crate::help::render::page_blocks(reg, &id);
-        let lines = crate::help::render::render_page(&blocks, width, None).lines;
-        PAGE_MEMO.with(|memo| *memo.borrow_mut() = Some((Arc::clone(reg), id, width, lines)));
+        let rendered = crate::help::render::render_page(&blocks, width, None);
+        PAGE_MEMO.with(|memo| {
+            *memo.borrow_mut() = Some((
+                Arc::clone(reg),
+                id,
+                width,
+                rendered.lines,
+                rendered.headings,
+            ))
+        });
     }
     PAGE_MEMO.with(|memo| {
         let memo = memo.borrow();
         f(&memo.as_ref().expect("page memo was just populated").3)
     })
+}
+
+pub(crate) fn anchor_at(ui: &crate::panel::PanelUi) -> Option<crate::help::HelpAnchor> {
+    let page_id = if ui.help.page.is_empty() {
+        "index"
+    } else {
+        &ui.help.page
+    };
+    PAGE_MEMO.with(|memo| {
+        let memo = memo.borrow();
+        let (cached_reg, cached_id, _, _, headings) = memo.as_ref()?;
+        let reg = ui.help.reg.as_ref()?;
+        (Arc::ptr_eq(cached_reg, reg) && cached_id == page_id)
+            .then(|| crate::help::anchor_at(headings, ui.scroll))?
+    })
+}
+
+pub(crate) fn scroll_for_anchor(
+    reg: &thegn_core::help::HelpRegistry,
+    page_id: &str,
+    cols: usize,
+    anchor: Option<crate::help::HelpAnchor>,
+) -> usize {
+    let Some(anchor) = anchor else { return 0 };
+    let Some(page) = reg.page(page_id).or_else(|| reg.page("index")) else {
+        return 0;
+    };
+    let width = cols.saturating_sub(1).max(8);
+    let blocks = crate::help::render::page_blocks(reg, &page.meta.id);
+    let rendered = crate::help::render::render_page(&blocks, width, None);
+    crate::help::scroll_for(&rendered.headings, anchor, rendered.lines.len())
 }
 
 pub(super) fn line_count(ctx: &SectionCtx) -> usize {
@@ -60,7 +100,7 @@ pub(super) fn line_count(ctx: &SectionCtx) -> usize {
     with_lines(ctx, <[Line]>::len)
 }
 
-pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
+pub(crate) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     if ctx.ui.help.reg.is_none() {
         return vec![PanelRow::plain(Line::segs(vec![seg(
             d(),
@@ -83,6 +123,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         rows.push(PanelRow::blank());
         rows.push(hint_row(&[
             ("j/k", "scroll"),
+            ("↵", "full help"),
             (ctx.model.chord("help"), "full help"),
             ("esc", "back"),
         ]));
@@ -271,7 +312,10 @@ mod tests {
             width: PanelWidth::Half,
             ..stash
         };
-        assert!(super::super::scroll_extent(Section::Stash, &model, &stash_half, 80, 12).is_none());
+        let half_extent = super::super::scroll_extent(Section::Stash, &model, &stash_half, 80, 12)
+            .expect("Half Stash detail is scrollable");
+        assert_eq!(half_extent.max, 2);
+        assert!(!half_extent.owns_nav);
         let keys_normal = PanelUi {
             open: Section::Keys,
             width: PanelWidth::Normal,
@@ -300,5 +344,33 @@ mod tests {
             ..Default::default()
         };
         assert!(super::super::scroll_extent(Section::Pr, &model, &pr, 80, 12).is_none());
+    }
+
+    #[test]
+    fn scroll_for_anchor_round_trips_at_two_panel_widths() {
+        let reg = crate::help::pages::build_registry(&Config::default()).0;
+        let page = "panel";
+        for cols in [28usize, 64] {
+            let width = cols.saturating_sub(1).max(8);
+            let rendered = crate::help::render::render_page(
+                &crate::help::render::page_blocks(&reg, page),
+                width,
+                None,
+            );
+            let heading =
+                crate::help::heading_for_section(&rendered.headings, "merge", "merge").unwrap();
+            let scroll = rendered.headings[heading].0 + 1;
+            let anchor = crate::help::anchor_at(&rendered.headings, scroll).unwrap();
+            let resolved = scroll_for_anchor(&reg, page, cols, Some(anchor));
+            let rerendered = crate::help::render::render_page(
+                &crate::help::render::page_blocks(&reg, page),
+                width,
+                None,
+            );
+            assert_eq!(
+                crate::help::anchor_at(&rerendered.headings, resolved),
+                Some(anchor)
+            );
+        }
     }
 }

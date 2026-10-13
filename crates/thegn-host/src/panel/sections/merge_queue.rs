@@ -14,7 +14,7 @@ use thegn_core::theme::Hue;
 use crate::seg::{Line, Seg, seg};
 
 use super::{
-    PanelHit, PanelRow, Section, SectionCtx, d, g, g2, hint_row, hue, t, two_col, wrap_text,
+    PanelHit, PanelRow, Section, SectionCtx, d, g, g2, hint_row, hue, list_detail, t, wrap_text,
 };
 
 /// A short host label for a queue row whose branch lives off this host, or
@@ -157,7 +157,7 @@ fn full_view(ctx: &SectionCtx, rows: &[thegn_core::db::MergeQueueRow]) -> Vec<Pa
 
     let cursor = ctx.ui.cursor.min(rows.len().saturating_sub(1));
     let list_w = 45_usize.min(cols / 2);
-    let list_rows: Vec<Vec<Seg>> = rows
+    let list_rows: Vec<(Vec<Seg>, Option<usize>)> = rows
         .iter()
         .enumerate()
         .map(|(i, r)| {
@@ -173,7 +173,7 @@ fn full_view(ctx: &SectionCtx, rows: &[thegn_core::db::MergeQueueRow]) -> Vec<Pa
             if let Some(host) = host_label(&r.location) {
                 l.push(seg(hue(Hue::Blue), format!(" @{host}")));
             }
-            l
+            (l, Some(i))
         })
         .collect();
 
@@ -222,17 +222,14 @@ fn full_view(ctx: &SectionCtx, rows: &[thegn_core::db::MergeQueueRow]) -> Vec<Pa
         }
     }
 
-    let combined = two_col(&list_rows, &detail, list_w, 2);
-    let n = rows.len();
-    out.extend(combined.into_iter().enumerate().map(|(i, line)| {
-        let row = PanelRow::plain(line);
-        // Hits index the queue rows only, by visible index.
-        if i < n {
-            row.with_hit(PanelHit::Row(Section::MergeQueue, i))
-        } else {
-            row
-        }
-    }));
+    out.extend(list_detail(
+        Section::MergeQueue,
+        &list_rows,
+        &detail,
+        cursor,
+        list_w,
+        ctx.rows.saturating_sub(out.len() + 1),
+    ));
     out.push(mq_hint_row());
     out
 }
