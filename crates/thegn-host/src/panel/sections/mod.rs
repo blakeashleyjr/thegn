@@ -2002,7 +2002,7 @@ mod spec {
     #[test]
     fn off_section_renders_banner_only() {
         let m = model();
-        let reason = "off — set [pr_queue] enabled = true";
+        let reason = "set [pr_queue] enabled = true";
         let u = PanelUi {
             off: vec![(Section::PrQueue, reason)],
             ..ui(PanelWidth::Normal, Section::PrQueue)
@@ -2015,7 +2015,9 @@ mod spec {
         };
         let rows = content(Section::PrQueue, &ctx);
         assert_eq!(rows.len(), 1);
-        assert!(text(&rows).contains(reason));
+        let rendered = text(&rows);
+        assert!(rendered.contains("prq is off: set [pr_queue] enabled = true"));
+        assert!(!rendered.contains("off: off"));
         assert!(
             rows.iter()
                 .all(|row| !matches!(row.hit, Some(PanelHit::Row(_, _))))

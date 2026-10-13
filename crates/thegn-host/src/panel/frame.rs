@@ -428,8 +428,8 @@ pub fn build_panel(
             label = label.bold();
         }
         // Each accordion is numbered; the number is its open shortcut within the tab.
-        let number =
-            crate::panel::section_digit(i).map_or_else(String::new, |digit| digit.to_string());
+        let number = crate::panel::section_digit(i)
+            .map_or_else(|| " ".to_string(), |digit| digit.to_string());
         let num = seg(Tok::Slot(if on { S::Accent } else { S::Ghost2 }), number).bold();
         let mut srow = PanelRow::plain(Line::split(
             {
@@ -1175,5 +1175,22 @@ mod tests {
             .find(|r| r.hit == Some(PanelHit::Row(Section::Changes, model.panel.changes.len())))
             .expect("impact footer row present");
         assert_eq!(footer.bg, Some(Tok::SelAccent));
+    }
+
+    #[test]
+    fn unnumbered_accordion_headers_keep_the_label_column_aligned() {
+        let model = model_with(PanelData::default());
+        let ui = PanelUi {
+            tab: crate::panel::PanelTab::Work,
+            open: Section::Symbols,
+            ..Default::default()
+        };
+        let frame = build_panel(&model, &ui, 44, 50, true);
+        let symbols = frame
+            .rows
+            .iter()
+            .find(|row| row.hit == Some(PanelHit::OpenSection(Section::Symbols)))
+            .expect("Symbols accordion header is rendered");
+        assert!(text_of(&symbols.line).starts_with("  symbols"));
     }
 }

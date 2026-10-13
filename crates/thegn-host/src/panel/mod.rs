@@ -369,17 +369,13 @@ pub fn section_gate(
     use thegn_core::channel::Feature;
     match section {
         Section::PrQueue if !cfg.pr_queue.enabled => {
-            SectionGate::Off("off — set [pr_queue] enabled = true")
+            SectionGate::Off("set [pr_queue] enabled = true")
         }
         Section::Hosts | Section::Environments if !Feature::Providers.allowed_in(channel) => {
             SectionGate::Off("dev-channel only — run with THEGN_CHANNEL=dev")
         }
-        Section::Media if !cfg.media.enabled => {
-            SectionGate::Off("off — set [media] enabled = true")
-        }
-        Section::Usage if !cfg.usage.enabled => {
-            SectionGate::Off("off — set [usage] enabled = true")
-        }
+        Section::Media if !cfg.media.enabled => SectionGate::Off("set [media] enabled = true"),
+        Section::Usage if !cfg.usage.enabled => SectionGate::Off("set [usage] enabled = true"),
         _ => SectionGate::On,
     }
 }
@@ -401,7 +397,11 @@ pub fn resolve_order_in(
     }
     out.retain(|section| {
         section_gate(*section, cfg, channel) == SectionGate::On
-            || cfg.panel.sections.iter().any(|key| key == section.as_key())
+            || cfg
+                .panel
+                .sections
+                .iter()
+                .any(|key| Section::from_key(key) == Some(*section))
     });
     out
 }
@@ -2458,7 +2458,7 @@ mod tests {
         );
         assert_eq!(
             off_sections(&cfg, Channel::Dev),
-            vec![(Section::PrQueue, "off — set [pr_queue] enabled = true",)]
+            vec![(Section::PrQueue, "set [pr_queue] enabled = true")]
         );
     }
 
