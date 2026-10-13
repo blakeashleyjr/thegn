@@ -409,7 +409,7 @@ fn submodule_loc(
 
 #[cfg(test)]
 mod tests {
-    use super::{PreviewOwners, follow_change_cursor_target};
+    use super::{FrameModel, PreviewOwners, follow_change_cursor_target};
 
     #[test]
     fn duplicate_path_owner_is_refused_until_completed() {

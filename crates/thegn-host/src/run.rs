@@ -4099,13 +4099,17 @@ fn handle_git_msg(
                     .zip(panel_ui.git.stage_doc.as_ref())
                     .map(|(s, d)| {
                         let indices = gitui::sel_pairs(&d.doc, s.selection());
-                        (indices, d.path.clone(), d.diff.clone(), s.clone())
+                        (indices, d.path.clone(), d.diff.clone(), s.clone(), d.pane)
                     });
                 match op {
-                    Some((indices, _, _, _)) if indices.is_empty() => {
+                    Some((indices, _, _, _, _)) if indices.is_empty() => {
                         model.status = "nothing stageable selected".into();
                     }
-                    Some((indices, path, diff, staging)) => {
+                    Some((indices, path, diff, staging, doc_pane)) => {
+                        if staging.pane != doc_pane {
+                            model.status = "loading…".into();
+                            return GitAfter::None;
+                        }
                         if let Some(s) = panel_ui.git.staging.as_mut() {
                             s.anchor = None;
                         }
@@ -4114,7 +4118,7 @@ fn handle_git_msg(
                             model.status = reason;
                             return GitAfter::None;
                         }
-                        let op = gitui::plan_stage_lines(&staging, path, diff, indices);
+                        let op = gitui::plan_stage_lines(&staging, doc_pane, path, diff, indices);
                         enqueue(panel_ui, model, op);
                     }
                     None => {}
@@ -4332,7 +4336,7 @@ fn handle_git_msg(
         }
         // ---- commits ---------------------------------------------------------
         GitMsg::Commit => {
-            if let Some(reason) = gitui::commit_precheck(&model.panel.changes) {
+            if let Some(reason) = gitui::commit_precheck(&model.panel) {
                 model.status = reason.into();
                 return GitAfter::None;
             }
@@ -4749,7 +4753,10 @@ fn handle_git_msg(
         GitMsg::StashPush => {
             *ov.input = Some((
                 menu::InputOverlay::new(
-                    format!("stash message (empty = WIP on {})", model.panel.branch),
+                    format!(
+                        "stash message (empty = {})",
+                        gitui::stash_message_or_default("", &model.panel.branch)
+                    ),
                     "",
                 ),
                 GitInputKind::StashPush,
@@ -10436,19 +10443,16 @@ async fn event_loop<T: Terminal>(
                     }
                     // A landed stage/discard moves lines between panes:
                     // refetch the staging doc the cursor is parked on.
-                    if let Some(s) = &panel_ui.git.staging {
-                        let untracked = model
-                            .panel
-                            .changes
-                            .iter()
-                            .find(|row| row.path == s.path)
-                            .is_some_and(|row| row.stage == crate::panel::Stage::Untracked);
+                    if let Some(s) = panel_ui.git.staging.as_mut() {
+                        if s.untracked {
+                            s.untracked = false;
+                        }
                         spawn_stage_doc_fetch(
                             panel_ui.git.op_gen,
                             &session,
                             s.path.clone(),
                             s.pane,
-                            untracked,
+                            false,
                             &gitdoc_tx,
                             &waker,
                         );
