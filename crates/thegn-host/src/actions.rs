@@ -2124,7 +2124,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ci_r_reruns_failed_and_R_all() {
+    fn ci_lower_r_reruns_failed_upper_r_reruns_all() {
         assert!(matches!(
             ci_key_action('r', Some("run".into())),
             Some(DetailAction::CiRerun { failed: true, .. })
