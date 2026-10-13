@@ -12,6 +12,7 @@
 //! engine; this module only supplies the clock + runtime state and performs the
 //! I/O the decision authorizes.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -28,6 +29,8 @@ pub struct NotifyState {
     /// Burst suppression for repeat process-failure alerts (a crash-respawning
     /// remote pane must not storm the inbox) — see `record`.
     debounce: Mutex<thegn_core::notify_debounce::NotifyDebounce>,
+    /// Per-row settled merge-queue holds already notified during this process.
+    queue_holds: Mutex<HashMap<String, String>>,
     /// Manual DND override: `None` defers to the schedule.
     dnd_forced: Mutex<Option<bool>>,
     /// Active routing mode (`""` = the default/no-mode rule set).
@@ -88,6 +91,7 @@ impl NotifyState {
         let state = Arc::new(NotifyState {
             cfg: Mutex::new(cfg),
             debounce: Mutex::new(thegn_core::notify_debounce::NotifyDebounce::default()),
+            queue_holds: Mutex::new(HashMap::new()),
             dnd_forced: Mutex::new(None),
             active_mode: Mutex::new(active_mode),
             active_profile,
@@ -111,6 +115,35 @@ impl NotifyState {
 
     pub(crate) fn shutdown_sound(&self) {
         self.sound_runtime.shutdown();
+    }
+
+    pub(crate) fn merge_queue_hold_desktop(&self) -> bool {
+        self.cfg.lock().unwrap().merge_queue_hold_desktop
+    }
+
+    /// Latch a settled hold state by row. Transient transitions leave the latch
+    /// alone; a settled non-hold clears it by passing `None`.
+    pub(crate) fn latch_queue_hold(&self, row: &str, state: Option<&str>) -> bool {
+        let mut holds = self.queue_holds.lock().unwrap();
+        match state {
+            Some(state) => {
+                if holds
+                    .get(row)
+                    .is_some_and(|previous| previous.as_str() == state)
+                {
+                    return false;
+                }
+                if !holds.contains_key(row) && holds.len() >= 512 {
+                    holds.clear();
+                }
+                holds.insert(row.to_string(), state.to_string());
+                true
+            }
+            None => {
+                holds.remove(row);
+                false
+            }
+        }
     }
 
     /// Atomically publish a reloaded notification config and its matching push
@@ -372,6 +405,26 @@ pub(crate) fn route(
     decision
 }
 
+/// Decide using the normal rules and DND state, but restrict delivery to the
+/// inbox. Queue holds only interrupt the desktop when explicitly enabled.
+pub(crate) fn route_inbox_only(
+    state: &NotifyState,
+    kind: &str,
+    source_ref: &str,
+    message: &str,
+    worktree: &str,
+) -> RouteDecision {
+    inbox_only(state.decide(kind, source_ref, message, worktree))
+}
+
+fn inbox_only(mut decision: RouteDecision) -> RouteDecision {
+    decision.desktop = false;
+    decision.toast = false;
+    decision.sound = None;
+    decision.push_sinks.clear();
+    decision
+}
+
 /// Decide + conditionally persist a notification. Returns the decision and the
 /// new inbox row id (`None` when a rule dropped it). The dispatch sites use the
 /// returned decision to gate the desktop toast + sound.
@@ -524,6 +577,50 @@ mod tests {
             Some(NotificationKind::TestFailed)
         );
         assert_eq!(parse_kind("bogus"), None);
+    }
+
+    #[test]
+    fn inbox_only_masks_transient_sinks_and_preserves_inbox_decision() {
+        let decision = RouteDecision {
+            record: true,
+            effective_priority: thegn_core::notification::Priority::Alert,
+            desktop: true,
+            toast: true,
+            push_sinks: vec!["push-target".into()],
+            sound: Some(thegn_core::notification_route::SoundEmit::Bell),
+        };
+        let masked = inbox_only(decision);
+        assert!(masked.record);
+        assert_eq!(
+            masked.effective_priority,
+            thegn_core::notification::Priority::Alert
+        );
+        assert!(!masked.desktop);
+        assert!(!masked.toast);
+        assert!(masked.push_sinks.is_empty());
+        assert!(masked.sound.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queue_hold_latch_tracks_state_and_clears_on_settled_progress() {
+        let (state, _master, _terminal) = test_state(NotificationsConfig::default());
+        assert!(state.latch_queue_hold("row", Some("deferred")));
+        assert!(!state.latch_queue_hold("row", Some("deferred")));
+        assert!(state.latch_queue_hold("row", Some("gate_failed")));
+        assert!(!state.latch_queue_hold("row", None));
+        assert!(state.latch_queue_hold("row", Some("gate_failed")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_queue_hold_desktop_reads_effective_config() {
+        let cfg = NotificationsConfig {
+            merge_queue_hold_desktop: true,
+            ..NotificationsConfig::default()
+        };
+        let (state, _master, _terminal) = test_state(cfg);
+        assert!(state.merge_queue_hold_desktop());
     }
 
     #[cfg(unix)]

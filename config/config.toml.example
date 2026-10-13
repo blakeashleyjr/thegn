@@ -2153,6 +2153,9 @@ github_mentions = true
 # every other notification. On, you get one CURRENT row per session (not one per
 # turn) as an audit trail. Env: THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX.
 agent_attention_inbox = false
+# Show deferred and red-gate merge-queue holds as desktop notifications. Off by
+# default; the hold remains in the inbox. Env: THEGN_NOTIFICATIONS_MERGE_QUEUE_HOLD_DESKTOP.
+merge_queue_hold_desktop = false
 # Case-insensitive substrings in completed agent-output lines that identify a
 # harness failure. Set to [] to disable text-based agent error detection.
 # agent_error_signatures = ["weekly limit", "rate limit", "usage limit", "limit reached", "quota exceeded", "out of credits", "insufficient credits", "credit balance", "billing", "payment required", "connection error.", "connection refused", "connection timed out", "network error", "network request failed"]
@@ -2176,7 +2179,7 @@ active_mode = ""
 #              calendar_changed, pr_queue_merged, pr_review_thread_resolved
 #   "notice" — assigned, mentioned, status_changed, blocker_resolved,
 #              pr_linked, overdue, pr_state_changed, agent_done, queue_ready,
-#              pr_queue_ready, pr_review_task_queued, calendar_reminder,
+#              queue_held, pr_queue_ready, pr_review_task_queued, calendar_reminder,
 #              upstream_behind, automation
 # Override any kind below (keys are the snake_case kind names). Unknown
 # keys/values are ignored. The queue_* kinds are the merge queue's settled
@@ -4267,8 +4270,8 @@ gate_setup_command = ""       # run in the gate worktree BEFORE gate_command, to
                               # reused worktree), so keep it idempotent and cheap when warm.
 gate_setup_timeout_secs = 0   # maximum setup duration; 0 disables the deadline. A timeout is
                               # an infrastructure hold, never a red result attributed to a branch.
-gate_timeout_secs = 0         # maximum gate duration; 0 disables the deadline. Defaults stay
-                              # disabled so long-running builds are not silently rejected.
+gate_timeout_secs = 3600      # maximum gate duration; defaults to one hour. 0 disables the
+                              # deadline. A timeout is an infrastructure hold, never a red build.
 gate_on = true                # run gate_command before advancing main
 gate_reuse_worktree = true    # reuse a stable per-repo gate worktree + target dir between folds
                               # (warm incremental rebuild instead of a cold from-scratch compile).

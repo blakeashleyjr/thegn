@@ -255,9 +255,9 @@ gate_setup_timeout_secs = 1800
 gate_timeout_secs = 3600
 ```
 
-Both deadlines default to `0`, which explicitly disables that deadline. Set
-`gate_setup_timeout_secs` and `gate_timeout_secs` separately when setup and the
-actual test command need different limits. A timeout is an infrastructure hold
+`gate_setup_timeout_secs` defaults to `0` (unbounded), while
+`gate_timeout_secs` defaults to `3600` seconds. Set either to `0` to disable its
+deadline, or tune setup and gate separately. A timeout is an infrastructure hold
 (`gate_error`), never a red result attributed to the candidate branch. Filesystem
 operations around workspace preparation cannot be interrupted by these command
 deadlines, and a process stuck in uninterruptible OS I/O can delay reaping and
