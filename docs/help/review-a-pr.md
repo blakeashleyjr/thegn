@@ -3,7 +3,7 @@ id: review-a-pr
 title: Review a PR
 parent: workflows
 order: 1
-contexts: [panel:pr, panel:ci]
+contexts: [panel:pr]
 actions: [pr-open, pr-create]
 ---
 

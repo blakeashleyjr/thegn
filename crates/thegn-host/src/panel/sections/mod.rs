@@ -17,7 +17,7 @@ pub(crate) mod ci;
 pub(crate) mod commits;
 mod environments;
 mod git;
-mod help;
+pub(crate) mod help;
 mod hosts;
 pub(crate) mod issues;
 mod keys;
