@@ -854,7 +854,6 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
         }
     }));
 
-    // `cursor_visible_pos` is used for scroll tracking in a future change.
     rows.push(super::hint_row(&[
         ("r", "run"),
         ("F", "file"),

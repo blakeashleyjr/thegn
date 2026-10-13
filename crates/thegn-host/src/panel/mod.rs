@@ -1528,11 +1528,11 @@ impl PanelUi {
     /// Mirror the accordion cursor into the per-section cursors that dispatch
     /// reads: the git view cursor (`git.cur`) plus the notifications / logs /
     /// jobs / symbols / problems / issues / tests cursors. EVERY write to
-    /// `self.cursor` must be
-    /// followed by this call — a highlight that moves without it leaves the
-    /// action keys pointing at a different row than the one on screen (the
-    /// audit's "clicked file 7, staged file 0 / deleted the wrong branch"
-    /// class). Centralised so a new cursor-write site can't forget a mirror.
+    /// `self.cursor` must be followed by this call; otherwise a moved
+    /// highlight leaves the action keys pointing at a different row than the
+    /// one on screen (the audit's "clicked file 7, staged file 0 / deleted the
+    /// wrong branch" class). Centralised so a new cursor-write site can't
+    /// forget a mirror.
     pub fn sync_section_cursors(&mut self) {
         if let Some(v) = self.open.home_view() {
             self.git.cur.set(v, self.cursor);
@@ -2024,6 +2024,7 @@ mod tests {
 
         ui.tests.filter = "second".into();
         ui.cursor = 0;
+        ui.sync_section_cursors();
         let model = crate::chrome::FrameModel {
             panel: PanelData::default(),
             ..Default::default()
