@@ -51,7 +51,7 @@ fn none_backend_skips_cd_for_unretargeted_remote_worktree() {
         TransportKind::Ssh,
     ));
     s.mounts.clear();
-    let body = backend_enter_argv(&s, "exec sh").pop().unwrap();
+    let body = backend_enter_argv(&s, "exec sh").unwrap().pop().unwrap();
     assert!(!body.contains("cd "), "no local cd shipped remote: {body}");
     assert!(body.contains("exec sh"));
 
@@ -62,7 +62,7 @@ fn none_backend_skips_cd_for_unretargeted_remote_worktree() {
         ro: false,
         cache: false,
     }];
-    let retargeted = backend_enter_argv(&s, "exec sh").pop().unwrap();
+    let retargeted = backend_enter_argv(&s, "exec sh").unwrap().pop().unwrap();
     assert!(
         retargeted.starts_with("cd "),
         "retargeted remote cds: {retargeted}"
@@ -71,7 +71,10 @@ fn none_backend_skips_cd_for_unretargeted_remote_worktree() {
     // A local `none` still cds into the worktree.
     let mut local = spec(Backend::None);
     local.placement = Placement::Local;
-    let body_local = backend_enter_argv(&local, "exec sh").pop().unwrap();
+    let body_local = backend_enter_argv(&local, "exec sh")
+        .unwrap()
+        .pop()
+        .unwrap();
     assert!(
         body_local.starts_with("cd "),
         "local none cds: {body_local}"
@@ -410,10 +413,65 @@ fn compose_enter_refuses_unsupported_apple_backend() {
         .encode(),
     );
     match enter_argv(&s, "true") {
-        Err(EnterError::Refused(message)) => {
-            assert!(message.contains("unsupported for backend 'apple'"));
+        Err(EnterError::Refused(refusal)) => {
+            assert_eq!(refusal.class, RefusalClass::ComposePolicy);
+            assert_eq!(refusal.backend, "apple");
+            assert!(refusal.path.is_none());
+            assert!(refusal.message.contains("unsupported for backend 'apple'"));
+            assert!(
+                enter_argv(&s, "true")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unsupported for backend 'apple'")
+            );
         }
         other => panic!("expected unsupported Compose refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn sealed_home_refusal_is_structured_and_keeps_its_display() {
+    let mut s = spec(Backend::Bwrap);
+    s.seal_home = Some("relative-home".into());
+    let error = enter_argv(&s, "true").expect_err("relative sealed HOME cannot be hidden");
+    match &error {
+        EnterError::Refused(refusal) => {
+            assert_eq!(refusal.class, RefusalClass::SealedHome);
+            assert_eq!(refusal.backend, "bwrap");
+            assert!(refusal.path.is_none());
+            assert_eq!(error.to_string(), refusal.message);
+        }
+        other => panic!("expected sealed-home refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn refusal_constructor_preserves_each_class_and_field() {
+    let spec = spec(Backend::Docker);
+    for class in [
+        RefusalClass::ComposePolicy,
+        RefusalClass::SealedHome,
+        RefusalClass::UnsafeMountPath,
+        RefusalClass::SystemdMountPath,
+        RefusalClass::ComposeTarget,
+        RefusalClass::ComposeServiceMissing,
+    ] {
+        let error = refusal(
+            &spec,
+            class,
+            Some("/safe/path".into()),
+            "safe message".into(),
+        );
+        match &error {
+            EnterError::Refused(refusal) => {
+                assert_eq!(refusal.class, class);
+                assert_eq!(refusal.backend, "docker");
+                assert_eq!(refusal.path.as_deref(), Some("/safe/path"));
+                assert_eq!(refusal.message, "safe message");
+                assert_eq!(error.to_string(), "safe message");
+            }
+            other => panic!("expected structured refusal, got {other:?}"),
+        }
     }
 }
 
@@ -865,7 +923,7 @@ fn sealed_systemd_argv_uses_protecthome_tmpfs_and_binds_back_only_the_allowlist(
             cache: false,
         },
     ];
-    let j = backend_enter_argv(&s, "true").join(" ");
+    let j = backend_enter_argv(&s, "true").unwrap().join(" ");
     assert!(j.contains("ProtectHome=tmpfs"), "{j}");
     assert!(
         j.contains("BindReadOnlyPaths=/nix/store/x-zshrc:/home/synthetic-user/.zshrc"),
@@ -902,8 +960,32 @@ fn named_volume_admission_precedes_oci_ensure_without_side_effects() {
     let mut s = spec(Backend::Podman);
     s.volumes = vec![("/tmp/state".into(), "/mnt/state".into())];
     let error = ensure(&s).expect_err("invalid volume must stop before OCI ensure");
-    assert!(error.downcast_ref::<VolumeAdmissionError>().is_some());
+    assert!(matches!(
+        error.downcast_ref::<EnterError>(),
+        Some(EnterError::Volume(_))
+    ));
     assert!(!error.to_string().contains("/tmp/state"));
+}
+
+#[test]
+fn ensure_preserves_typed_refusal_before_oci_side_effects() {
+    let mut s = spec(Backend::Podman);
+    s.mounts.push(Mount {
+        host: "/tmp/source".into(),
+        dest: "/mnt/bad path".into(),
+        ro: false,
+        cache: false,
+    });
+    let error = ensure(&s).expect_err("unsafe OCI mount must refuse before ensure");
+    assert!(matches!(
+        error.downcast_ref::<EnterError>(),
+        Some(EnterError::Refused(Refusal {
+            class: RefusalClass::UnsafeMountPath,
+            backend,
+            path: Some(path),
+            ..
+        })) if backend == "podman-rootless" && path == "/mnt/bad path"
+    ));
 }
 
 #[test]
@@ -1012,7 +1094,7 @@ fn compose_refusal_tracks_only_unenforced_restrictions() {
     assert!(!argv.iter().any(|arg| arg == "compose" || arg == "exec"));
     let mut isolated = spec(Backend::Bwrap);
     isolated.read_only_root = true;
-    let bwrap_argv = backend_enter_argv(&isolated, "true");
+    let bwrap_argv = backend_enter_argv(&isolated, "true").unwrap();
     assert!(
         bwrap_argv
             .windows(2)
@@ -1037,7 +1119,8 @@ fn compose_refusal_tracks_only_unenforced_restrictions() {
             resolver_dir: None,
             runtime_dir: Some("/run/user/42".into()),
         },
-    );
+    )
+    .unwrap();
     assert!(
         runtime_argv
             .windows(2)
@@ -1935,8 +2018,8 @@ fn systemd_local_secrets_go_to_environment_file_not_argv() {
         ("API_KEY".into(), "sk_secret".into()), // secret
         ("THEGN_SANDBOX".into(), "1".into()),   // synthetic
     ];
-    let argv = backend_enter_argv(&s, "exec true");
-    let argv_again = backend_enter_argv(&s, "exec true");
+    let argv = backend_enter_argv(&s, "exec true").unwrap();
+    let argv_again = backend_enter_argv(&s, "exec true").unwrap();
     let j = argv.join(" ");
     assert!(
         !j.contains("sk_secret"),
@@ -2857,7 +2940,7 @@ fn bwrap_network_none_argv_has_no_resolver_bind() {
 
     let mut nat = spec(Backend::Bwrap);
     nat.network = Network::Nat;
-    let nat_argv = backend_enter_argv_with_resolver_dir(&nat, "true", Some(resolver_dir));
+    let nat_argv = backend_enter_argv_with_resolver_dir(&nat, "true", Some(resolver_dir)).unwrap();
     assert!(
         nat_argv
             .windows(3)
@@ -2866,7 +2949,7 @@ fn bwrap_network_none_argv_has_no_resolver_bind() {
 
     let mut none = spec(Backend::Bwrap);
     none.network = Network::None;
-    let argv = backend_enter_argv_with_resolver_dir(&none, "true", Some(resolver_dir));
+    let argv = backend_enter_argv_with_resolver_dir(&none, "true", Some(resolver_dir)).unwrap();
     assert!(
         !contains_resolver_dir(&argv),
         "unexpected resolver bind in argv: {}",
@@ -2904,7 +2987,11 @@ fn systemd_launch_refuses_mount_paths_systemd_would_misparse() {
     git_config.mounts.last_mut().unwrap().dest = "/repo/My Code/config".into();
     assert!(matches!(
         enter_argv(&git_config, "true"),
-        Err(EnterError::Refused(_))
+        Err(EnterError::Refused(Refusal {
+            class: RefusalClass::SystemdMountPath,
+            path: Some(_),
+            ..
+        }))
     ));
 
     // Hardened with no sealed HOME emits no property for a read-only mount.
@@ -2935,7 +3022,24 @@ fn systemd_launch_refuses_mount_paths_systemd_would_misparse() {
     });
     assert!(matches!(
         enter_argv(&emitted, "true"),
-        Err(EnterError::Refused(_))
+        Err(EnterError::Refused(Refusal {
+            class: RefusalClass::SystemdMountPath,
+            path: Some(_),
+            ..
+        }))
+    ));
+    let direct = backend_enter_argv(&emitted, "true");
+    assert!(matches!(
+        &direct,
+        Err(EnterError::Refused(Refusal {
+            class: RefusalClass::SystemdMountPath,
+            path: Some(_),
+            ..
+        }))
+    ));
+    assert!(!matches!(
+        direct,
+        Ok(argv) if argv.iter().any(|arg| arg.contains("ThegnRefused"))
     ));
 
     // A host path is emitted only for binds beneath a sealed HOME.
@@ -2977,7 +3081,8 @@ fn systemd_launch_refuses_mount_paths_systemd_would_misparse() {
             resolver_dir: None,
             runtime_dir: Some("/run/user/9".into()),
         },
-    );
+    )
+    .unwrap();
     assert!(
         protected_argv
             .windows(2)
@@ -2995,7 +3100,8 @@ fn systemd_launch_refuses_mount_paths_systemd_would_misparse() {
             resolver_dir: None,
             runtime_dir: Some("/run/user/9".into()),
         },
-    );
+    )
+    .unwrap();
     assert!(
         !open_argv
             .iter()
