@@ -1,6 +1,5 @@
 //! Shared sandbox-panel target resolution and guarded container actions.
 
-use termwiz::input::{KeyCode, Modifiers};
 use termwiz::terminal::TerminalWaker;
 use thegn_core::config::SandboxConfig;
 use thegn_core::remote::GitLoc;
@@ -8,7 +7,7 @@ use thegn_core::sandbox::{Backend, ContainerInfo};
 
 use crate::hydrate::RefreshKind;
 use crate::layout::PanelWidth;
-use crate::menu::{self, MenuChoice, MenuOutcome, MenuOverlay};
+use crate::menu::{self, MenuChoice, MenuOverlay};
 
 pub(crate) fn visible_containers(
     containers: &[ContainerInfo],
@@ -93,7 +92,7 @@ pub(crate) fn key(
         } else {
             "sandbox-restart"
         },
-        container.name.clone(),
+        format!("{}\u{1f}{}", container.backend, container.name),
         true,
     ))
 }
@@ -113,7 +112,7 @@ pub(crate) fn resolve_choice(
     choice: &MenuChoice,
     containers: &[ContainerInfo],
 ) -> Option<Result<ControlRequest, String>> {
-    let (tag, action) = match choice {
+    let (arg, action) = match choice {
         MenuChoice::Confirm {
             tag: "sandbox-stop",
             arg,
@@ -124,11 +123,16 @@ pub(crate) fn resolve_choice(
         } => (arg, "restart"),
         _ => return None,
     };
+    let Some((backend_name, name)) = arg.split_once('\u{1f}') else {
+        return Some(Err("container confirmation is malformed".into()));
+    };
     let Some(container) = containers
         .iter()
-        .find(|container| container.name.as_str() == tag.as_str())
+        .find(|container| container.name == name && container.backend == backend_name)
     else {
-        return Some(Err(format!("container {tag} is no longer available")));
+        return Some(Err(format!(
+            "container {name} ({backend_name}) is no longer available"
+        )));
     };
     if !container.ours {
         return Some(Err(format!(
@@ -136,16 +140,22 @@ pub(crate) fn resolve_choice(
             container.name, container.backend
         )));
     }
+    let Some(backend) = Backend::parse(&container.backend) else {
+        return Some(Err(format!(
+            "{}: unknown container backend {}",
+            container.name, container.backend
+        )));
+    };
     Some(Ok(ControlRequest {
         name: container.name.clone(),
-        backend: Backend::parse(&container.backend).unwrap_or(Backend::Podman),
+        backend,
         action,
     }))
 }
 
 pub(crate) fn spawn_control(
     cfg_sb: SandboxConfig,
-    wt: String,
+    wt: std::path::PathBuf,
     req: ControlRequest,
     refresh_tx: tokio::sync::mpsc::UnboundedSender<RefreshKind>,
     waker: TerminalWaker,
@@ -184,6 +194,8 @@ pub(crate) fn spawn_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::menu::MenuOutcome;
+    use termwiz::input::{KeyCode, Modifiers};
 
     fn container(name: &str, ours: bool, backend: &str) -> ContainerInfo {
         ContainerInfo {
@@ -253,7 +265,7 @@ mod tests {
             menu.handle_key(&KeyCode::Char('y'), Modifiers::NONE),
             MenuOutcome::Pick(MenuChoice::Confirm {
                 tag: "sandbox-stop",
-                arg: "thegn-repo-home".into(),
+                arg: "podman\u{1f}thegn-repo-home".into(),
             })
         );
     }
@@ -284,18 +296,49 @@ mod tests {
     fn resolve_choice_rechecks_ownership_at_pick_time() {
         let vanished = MenuChoice::Confirm {
             tag: "sandbox-restart",
-            arg: "x".into(),
+            arg: "podman\u{1f}x".into(),
         };
         assert!(resolve_choice(&vanished, &[]).is_some_and(|result| result.is_err()));
         let changed_owner = MenuChoice::Confirm {
             tag: "sandbox-restart",
-            arg: "postgres-dev".into(),
+            arg: "docker\u{1f}postgres-dev".into(),
         };
         assert!(resolve_choice(&changed_owner, &fixtures()).is_some_and(|result| result.is_err()));
         let unrelated = MenuChoice::Confirm {
             tag: "env-remove",
-            arg: "x".into(),
+            arg: "podman\u{1f}x".into(),
         };
         assert!(resolve_choice(&unrelated, &fixtures()).is_none());
+    }
+
+    #[test]
+    fn resolve_choice_matches_the_confirmed_backend_and_fails_closed() {
+        let containers = vec![
+            container("thegn-shared", true, "podman"),
+            container("thegn-shared", true, "docker"),
+        ];
+        let choice = MenuChoice::Confirm {
+            tag: "sandbox-stop",
+            arg: "docker\u{1f}thegn-shared".into(),
+        };
+        assert_eq!(
+            resolve_choice(&choice, &containers),
+            Some(Ok(ControlRequest {
+                name: "thegn-shared".into(),
+                backend: Backend::Docker,
+                action: "stop",
+            }))
+        );
+
+        let unknown_backend = MenuChoice::Confirm {
+            tag: "sandbox-stop",
+            arg: "future-runtime\u{1f}thegn-shared".into(),
+        };
+        let unknown = vec![container("thegn-shared", true, "future-runtime")];
+        assert!(
+            resolve_choice(&unknown_backend, &unknown).is_some_and(
+                |result| result.is_err_and(|error| error.contains("unknown container backend"))
+            )
+        );
     }
 }
