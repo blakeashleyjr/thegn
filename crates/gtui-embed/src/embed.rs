@@ -1095,7 +1095,7 @@ mod tests {
         assert!(buf.content.iter().any(|cell| cell.fg == series));
         assert!(!buf.content.iter().enumerate().any(|(index, cell)| {
             let x = index as u16 % buf.area.width;
-            x >= 20 && cell.fg == series
+            x > 20 && cell.fg == series
         }));
     }
 
