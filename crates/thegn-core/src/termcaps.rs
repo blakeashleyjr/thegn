@@ -360,6 +360,7 @@ pub struct GlyphSet {
     pub arrow_right: &'static str,    // → flows-into / next-stage marker
     pub net_wired: &'static str,      // Ethernet path
     pub net_generic: &'static str,    // unknown or ambiguous network path
+    pub net_wifi: &'static str,       // Wi-Fi path
     pub diamond_filled: &'static str, // ◆ generic emphasis marker
     pub diamond_hollow: &'static str, // ◇ pending step
     pub role_server: &'static str,    // ▲ daemon serving remote thin clients
@@ -438,6 +439,7 @@ pub const UNICODE: GlyphSet = GlyphSet {
     arrow_right: "\u{2192}",    // →
     net_wired: "\u{f0e8}",      // nf-fa-sitemap
     net_generic: "\u{f0ac}",    // nf-fa-globe
+    net_wifi: "\u{f1eb}",       // nf-fa-wifi
     diamond_filled: "\u{25c6}", // ◆
     diamond_hollow: "\u{25c7}", // ◇
     role_server: "\u{25b2}",    // ▲
@@ -506,6 +508,7 @@ pub const ASCII: GlyphSet = GlyphSet {
     arrow_right: ">",
     net_wired: "#",
     net_generic: "@",
+    net_wifi: "w",
     diamond_filled: "*",
     diamond_hollow: "o",
     role_server: "^",
@@ -1358,6 +1361,7 @@ mod tests {
             g.arrow_right,
             g.net_wired,
             g.net_generic,
+            g.net_wifi,
             g.diamond_filled,
             g.diamond_hollow,
             g.role_server,
@@ -1438,6 +1442,7 @@ mod tests {
             g.arrow_right,
             g.net_wired,
             g.net_generic,
+            g.net_wifi,
             g.diamond_filled,
             g.diamond_hollow,
             g.role_server,

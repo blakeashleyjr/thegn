@@ -316,10 +316,14 @@ static LAST_LOG_INDEX: OnceLock<Mutex<std::collections::HashMap<(PathBuf, String
 pub(crate) fn log_root() -> PathBuf {
     let state_home = thegn_core::util::xdg_state_home();
     #[cfg(test)]
-    assert_ne!(
-        state_home,
-        thegn_core::util::home().join(".local/state"),
-        "THE-744: hook test resolved the real XDG state home"
+    assert!(
+        !thegn_core::testenv::is_real_state_path(
+            &state_home,
+            &thegn_core::util::home(),
+            thegn_core::testenv::ambient_state_roots()
+        ),
+        "THE-744: hook test resolved the real XDG state home {}",
+        state_home.display()
     );
     state_home.join("thegn").join("hooks")
 }

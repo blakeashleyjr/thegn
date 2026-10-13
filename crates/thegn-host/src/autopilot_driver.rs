@@ -211,8 +211,8 @@ fn drive_claim(
         }
     }
 
-    // This edge is best-effort and never releases the durable claim.  A
-    // provider outage must leave the run visible for a human to inspect.
+    // This edge is best-effort and never releases the durable claim. A
+    // provider outage is carried forward as a note on the worker-start edge.
     let tracker_cfg = tracker_config_for_account(cfg, repo_root, account);
     let router = autopilot_issue_router(
         &tracker_cfg,
@@ -220,52 +220,14 @@ fn drive_claim(
         account,
         crate::plugin_providers::issue_backends(),
     );
-    if !router.is_configured() {
-        mark_needs_human(
-            db,
-            run_id,
-            AutopilotState::Claimed,
-            Some(dispatch_id),
-            &format!("no tracker route for autopilot account {account}"),
-        );
-        return;
-    }
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(error) => {
-            mark_needs_human(
-                db,
-                run_id,
-                AutopilotState::Claimed,
-                Some(dispatch_id),
-                &format!("issue runtime build failed: {error}"),
-            );
-            return;
-        }
-    };
-    let patch = IssuePatch {
-        status: Some(thegn_core::issue::IssueStatus::InProgress),
-        ..Default::default()
-    };
-    if let Err(e) = rt.block_on(router.update_issue(&issue.id, &patch)) {
-        mark_needs_human(
-            db,
-            run_id,
-            AutopilotState::Claimed,
-            Some(dispatch_id),
-            &format!("issue status update failed: {e}"),
-        );
-        return;
-    }
+    let tracker_note = tracker_in_progress_note(&router, &issue.id, account);
+    let worker_reason = worker_start_reason(tracker_note.as_deref());
 
     match db.transition_autopilot(
         run_id,
         AutopilotState::Claimed,
         AutopilotState::Working,
-        Some("worker started"),
+        Some(&worker_reason),
         None,
         thegn_core::util::now_ms(),
     ) {
@@ -477,11 +439,12 @@ fn drive_claim(
             return;
         }
     }
+    let queue_enabled = cfg.repo_pr_queue(repo_root).enabled;
     match db.transition_autopilot(
         run_id,
         AutopilotState::Working,
         AutopilotState::PrOpened,
-        Some("pull request opened"),
+        Some(pr_opened_reason(queue_enabled)),
         Some(pr.number),
         thegn_core::util::now_ms(),
     ) {
@@ -515,7 +478,7 @@ fn drive_claim(
         );
         return;
     }
-    if cfg.repo_pr_queue(repo_root).enabled {
+    if queue_enabled {
         if let Err(e) = db.enqueue_bound_pr(
             &root_s,
             pr.number,
@@ -621,6 +584,58 @@ fn autopilot_issue_router(
         }
     }
     router
+}
+
+fn tracker_in_progress_note(
+    router: &thegn_svc::issue::IssueRouter,
+    issue_id: &str,
+    account: &str,
+) -> Option<String> {
+    let note = if !router.is_configured() {
+        Some(format!("no tracker route for autopilot account {account}"))
+    } else {
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => {
+                let patch = IssuePatch {
+                    status: Some(thegn_core::issue::IssueStatus::InProgress),
+                    ..Default::default()
+                };
+                match runtime.block_on(router.update_issue(issue_id, &patch)) {
+                    Ok(_) => None,
+                    Err(error) => Some(format!("tracker in-progress update failed: {error}")),
+                }
+            }
+            Err(error) => Some(format!("issue runtime build failed: {error}")),
+        }
+    };
+    if let Some(note) = &note {
+        tracing::warn!(
+            target: "thegn::autopilot",
+            account,
+            issue_id,
+            note,
+            "autopilot tracker in-progress update was not recorded"
+        );
+    }
+    note
+}
+
+fn worker_start_reason(tracker_note: Option<&str>) -> String {
+    match tracker_note {
+        Some(note) => format!("worker started; {note}"),
+        None => "worker started".to_owned(),
+    }
+}
+
+fn pr_opened_reason(queue_enabled: bool) -> &'static str {
+    if queue_enabled {
+        "pull request opened"
+    } else {
+        "pull request opened; PR queue disabled, shepherding is off"
+    }
 }
 
 /// Resolve the issue worker's isolation boundary independently of the normal
@@ -861,8 +876,8 @@ pub(crate) fn on_pr_merged(cfg: &Config, repo_root: &Path, number: u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        autopilot_backend_is_isolated, autopilot_issue_router, issue_prompt,
-        tracker_config_for_account, worker_failure,
+        autopilot_backend_is_isolated, autopilot_issue_router, issue_prompt, pr_opened_reason,
+        tracker_config_for_account, tracker_in_progress_note, worker_failure, worker_start_reason,
     };
     use thegn_core::issue::IssueFilter;
     use thegn_core::sandbox::Backend;
@@ -873,6 +888,22 @@ mod tests {
         let text = worker_failure("HEAD", "feat", false, 0);
         assert!(text.contains("expected"));
         assert!(text.contains("commits_ahead=0"));
+    }
+
+    #[test]
+    fn worker_start_reason_carries_tracker_failure_note() {
+        assert_eq!(worker_start_reason(None), "worker started");
+
+        let note = "tracker in-progress update failed: boom";
+        let reason = worker_start_reason(Some(note));
+        assert!(reason.contains("worker started"));
+        assert!(reason.contains(note));
+    }
+
+    #[test]
+    fn pr_opened_reason_reports_queue_disabled_state() {
+        assert!(pr_opened_reason(false).contains("shepherding is off"));
+        assert_eq!(pr_opened_reason(true), "pull request opened");
     }
 
     #[test]
@@ -968,6 +999,35 @@ mod tests {
             .expect("demo provider route");
 
         assert_eq!(detail.issue.title, "demo");
+    }
+
+    #[test]
+    fn tracker_update_failure_returns_a_run_note() {
+        let cfg = thegn_core::config::IssuesConfig::default();
+        let repo_root = tempfile::tempdir().expect("temporary repo root");
+        let router = autopilot_issue_router(
+            &cfg,
+            repo_root.path(),
+            "demo",
+            vec![
+                (
+                    "other".into(),
+                    Box::new(PluginIssueBackend { account: "other" }) as Box<dyn IssueBackend>,
+                ),
+                (
+                    "demo".into(),
+                    Box::new(PluginIssueBackend { account: "demo" }) as Box<dyn IssueBackend>,
+                ),
+            ],
+        );
+
+        let note = tracker_in_progress_note(&router, "plugin:demo:1", "demo");
+
+        assert!(note.is_some());
+        assert!(
+            note.expect("plugin update failure becomes a note")
+                .contains("tracker in-progress update failed")
+        );
     }
 
     struct PluginIssueBackend {

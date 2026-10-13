@@ -1178,6 +1178,34 @@ fn system_metrics_json(cfg: &Config) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
+fn medium_word(medium: thegn_metrics::NetMedium) -> &'static str {
+    match medium {
+        thegn_metrics::NetMedium::Ethernet => "ethernet",
+        thegn_metrics::NetMedium::Wifi => "wifi",
+        thegn_metrics::NetMedium::Unknown => "generic",
+    }
+}
+
+fn network_path_json(selection: &thegn_metrics::MediumSelection) -> serde_json::Value {
+    serde_json::json!({
+        "medium": medium_word(selection.medium),
+        "interface": selection.iface.as_deref(),
+        "reason": selection.reason.word(),
+    })
+}
+
+fn network_path_report(selection: &thegn_metrics::MediumSelection) {
+    let medium = medium_word(selection.medium);
+    if let Some(iface) = &selection.iface {
+        outln!(
+            "  net path      {medium} via {iface} ({})",
+            selection.reason.word()
+        );
+    } else {
+        outln!("  net path      {medium} ({})", selection.reason.word());
+    }
+}
+
 /// Human report: one line per metric family with `available`, or `absent
 /// (<reason>)`. Matches exactly what the masthead widgets and monitor tabs show,
 /// so a puzzling missing widget has an authoritative explanation here.
@@ -1190,6 +1218,7 @@ fn system_metrics_report(cfg: &Config) {
         };
         outln!("  {:<13} {}", r.family.key(), status);
     }
+    network_path_report(&thegn_metrics::probe_net_path());
 }
 
 /// One harness's probe: binary on PATH, credential home present, logged-in
@@ -1730,6 +1759,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
         "mobile_access": mobile_access_json(cfg),
         "lsp": lsp_json(cfg),
         "system_metrics": system_metrics_json(cfg),
+        "network_path": network_path_json(&thegn_metrics::probe_net_path()),
         "source_control": source_control_json(cfg),
         "harnesses": harness_json(),
         "agents": agents_json(cfg),
@@ -3985,6 +4015,44 @@ fn summary(c: &TermCaps) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn medium_word_maps_each_network_medium() {
+        assert_eq!(medium_word(thegn_metrics::NetMedium::Ethernet), "ethernet");
+        assert_eq!(medium_word(thegn_metrics::NetMedium::Wifi), "wifi");
+        assert_eq!(medium_word(thegn_metrics::NetMedium::Unknown), "generic");
+    }
+
+    #[test]
+    fn network_path_json_explains_selected_interface_and_fallback() {
+        let selected = thegn_metrics::MediumSelection {
+            medium: thegn_metrics::NetMedium::Ethernet,
+            iface: Some("eth0".into()),
+            reason: thegn_metrics::MediumReason::DefaultRoute,
+        };
+        assert_eq!(
+            network_path_json(&selected),
+            serde_json::json!({
+                "medium": "ethernet",
+                "interface": "eth0",
+                "reason": "default route",
+            })
+        );
+
+        let ambiguous = thegn_metrics::MediumSelection {
+            medium: thegn_metrics::NetMedium::Unknown,
+            iface: None,
+            reason: thegn_metrics::MediumReason::AmbiguousDefaultRoutes,
+        };
+        assert_eq!(
+            network_path_json(&ambiguous),
+            serde_json::json!({
+                "medium": "generic",
+                "interface": null,
+                "reason": "ambiguous default routes",
+            })
+        );
+    }
 
     #[test]
     fn run_does_not_panic_on_default_config() {

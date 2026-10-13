@@ -762,6 +762,12 @@ tab_order = ["work", "observe"]
 enabled = false               # show the Observe tab in the app strip
 refresh_interval_secs = 15    # panel auto-refresh cadence
 dashboard_path = ""           # "" = built-in host dashboard; else a dashboard TOML path (~ ok)
+# Dashboard loading limits: 1 MiB total, 64 panels, 16 query targets per
+# panel, 4096 bytes per target expression, 256 bytes per label/description/ref
+# id, and 10,000 rows. Refresh cadence is clamped to 1 second–1 hour.
+# If a custom dashboard fails to load, the Observe tab is marked failed; there
+# is no fallback to the built-in dashboard. Changing [observe] and reloading
+# config rebuilds the tab.
 [observe.prometheus]
 # base_url = "http://localhost:9090"   # empty ⇒ Prometheus panels report "not configured"
 # token = "env:PROMETHEUS_TOKEN"       # bearer token; env:VAR / file:PATH / literal
@@ -1115,9 +1121,9 @@ crash_sink = ""           # RESERVED: external Sentry-protocol forwarding is not
 # format  = "ssh"                        # "openpgp" (default) or "ssh" → gpg.format
 # key     = "~/.ssh/id_washu.pub"        # → user.signingKey (ssh key path, or a
 #                                        #   GPG key id for format = "openpgp")
-# # A worktree bound to `washu` signs with this key; siblings follow the repo/
-# # global git config. The commit overlay's ^S inherit→sign→no-sign cycle and
-# # [git] override_gpg still layer ABOVE this identity default.
+# # This block is parsed and validated, but is not yet applied to panes or git
+# # commands (runtime binding is tracked by THE-149). Commits follow the
+# # repository/global git signing config today.
 #
 # Reference an identity from a profile (its firewall base) or a bundle (soft,
 # per-scope; overrides the profile base, and the bundle's own env/config_dirs
@@ -4092,9 +4098,11 @@ enabled = false
 # copy is killed (best-effort) rather than left running invisibly forever.
 enabled = true
 # Control-socket override. Empty (default) resolves to
-# $XDG_RUNTIME_DIR/thegn/daemon.sock, falling back to
-# $XDG_STATE_HOME/thegn/run/daemon.sock (so isolated state dirs — `just
-# start`, smoke tests — get isolated daemons).
+# $XDG_RUNTIME_DIR/thegn/<state-hash>/daemon.sock, one socket per state dir so
+# `just start` and smoke tests get isolated daemons. Without XDG_RUNTIME_DIR,
+# the host uses a vetted private runtime dir, else
+# /tmp/thegn-<uid>-<state-hash>/daemon.sock. If neither can be secured, panes
+# run in-process.
 #
 # LENGTH LIMIT: a unix socket path cannot exceed 107 bytes on Linux or 103 on
 # macOS/BSD (the kernel's sun_path buffer). Over that, the daemon cannot bind:
@@ -4905,7 +4913,7 @@ heartbeat_secs = 10
 # id = "example-plugin"                # Stable plugin identifier (required).
 # name = "Example plugin"              # Human-readable plugin name (required).
 # version = "0.1.0"                     # Plugin version string (required).
-# api = "0.1.0"                         # Plugin API version (required).
+# api = "0.3.0"                         # Plugin API version (required).
 # capabilities = []                     # Requested capability grants; default is empty.
 # command = ["/path/to/reviewed-plugin"] # Executable argv; required, never a shell string.
 # cwd = ""                              # Working directory; default is empty (plugin directory or host cwd).
@@ -4913,7 +4921,7 @@ heartbeat_secs = 10
 #                                         # No env:/file: expansion is performed; do not put secrets here.
 #                                         # The plugin also inherits thegn's own environment.
 # timeout_secs = 30                     # Per-call wall-clock limit in seconds; default is 30.
-# scopes = []                           # host.call scopes; default is empty (read/write/git/exec/admin).
+# scopes = []                           # host.call scope ceiling; default empty (read/write/git/merge_add/exec/admin).
 # mode = "one_shot"                     # Process mode; default is one_shot (or resident).
 # enabled = true                        # Whether the plugin may run; default is true.
 # [[plugins.contributions]]
@@ -4923,5 +4931,5 @@ heartbeat_secs = 10
 # surface = "statusbar"                 # Optional surface identifier; omitted by default.
 # cadence = { kind = "on_demand" }      # Update cadence; default is on_demand.
 # metadata = { source = "example" }     # Optional string metadata map; default is empty.
-# caps = {}                             # Optional provider capability data; omit for the null default.
+# caps = {}                             # Optional capability object; {} is empty; omit for null.
 # chord = "Ctrl+Alt+x"                  # Optional default key chord; omitted by default.

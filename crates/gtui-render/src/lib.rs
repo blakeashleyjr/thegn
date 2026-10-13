@@ -4,6 +4,33 @@ pub mod stat;
 pub mod table;
 pub mod timeseries;
 
+use ratatui::style::Color;
+
+/// Semantic colors used by the renderers. The default preserves standalone
+/// gtui's historical palette; embedders can pass their host palette explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderColors {
+    pub value: Color,
+    pub header: Color,
+    pub text: Color,
+    pub series: Color,
+    pub border: Color,
+    pub title: Color,
+}
+
+impl Default for RenderColors {
+    fn default() -> Self {
+        Self {
+            value: Color::Cyan,
+            header: Color::Yellow,
+            text: Color::Gray,
+            series: Color::Green,
+            border: Color::Reset,
+            title: Color::Reset,
+        }
+    }
+}
+
 /// Longest prefix of `s` holding at most `max_chars` chars (char-boundary safe).
 ///
 /// Renderers clip every cell/line with this before handing it to a widget, so

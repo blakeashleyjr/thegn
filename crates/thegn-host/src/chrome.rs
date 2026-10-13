@@ -1544,7 +1544,7 @@ pub(crate) fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWi
             let glyphs = crate::caps::active_glyphs();
             let icon = if ic.net_icon.as_str() == DEFAULT_NET_ICON.as_str() {
                 match s.net_medium {
-                    thegn_metrics::NetMedium::Wifi => ic.net_icon.as_str(),
+                    thegn_metrics::NetMedium::Wifi => glyphs.net_wifi,
                     thegn_metrics::NetMedium::Ethernet => glyphs.net_wired,
                     thegn_metrics::NetMedium::Unknown => glyphs.net_generic,
                 }
