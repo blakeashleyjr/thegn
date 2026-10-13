@@ -2047,14 +2047,14 @@ fn badge_detail(
                             'r',
                             DetailAction::CiRerun {
                                 run_id: r.id.clone(),
-                                failed: false,
+                                failed: true,
                             },
                         )
                         .action(
                             'R',
                             DetailAction::CiRerun {
                                 run_id: r.id.clone(),
-                                failed: true,
+                                failed: false,
                             },
                         )
                         .action('g', DetailAction::CiRefresh);
@@ -2076,7 +2076,7 @@ fn badge_detail(
                 })
                 .collect();
             let mut ov = list("CI runs", rows, "no CI runs", 60, 14);
-            ov.hint = Some("↵ view · o open · r/R rerun · c cancel · g refresh".into());
+            ov.hint = Some("↵ view · o open · r/R rerun failed/all · c cancel · g refresh".into());
             Some(ov)
         }
         BarBadge::Ingress => {

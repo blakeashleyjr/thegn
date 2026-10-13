@@ -5129,6 +5129,15 @@ fn normalize_key(k: termwiz::input::KeyEvent) -> termwiz::input::KeyEvent {
             modifiers: k.modifiers | Modifiers::CTRL,
         };
     }
+    if let KeyCode::Char(c) = k.key
+        && c.is_ascii_lowercase()
+        && k.modifiers == Modifiers::SHIFT
+    {
+        return termwiz::input::KeyEvent {
+            key: KeyCode::Char(c.to_ascii_uppercase()),
+            modifiers: k.modifiers,
+        };
+    }
     // Enhanced-keyboard modes (xterm `modifyOtherKeys`, which termwiz enables,
     // or a kitty-protocol terminal) report modified ASCII control keys in CSI-u
     // form (`ESC [ 9 ; 2 u` = Shift+Tab), which termwiz decodes to
@@ -6836,6 +6845,7 @@ async fn event_loop<T: Terminal>(
     let (job_output_tx, mut job_output_rx) =
         tokio_mpsc::unbounded_channel::<std::result::Result<PathBuf, String>>();
     let mut restart_arm = crate::task::RestartArm::default();
+    let mut confirm_guard = crate::panel::confirm::TwoPress::default();
     // Off-loop worktree-rename completions (audit run.rs:12131/12147): the git
     // subprocesses + dir move run on spawn_blocking and land here to re-key the
     // session group by identity.
@@ -8393,6 +8403,8 @@ async fn event_loop<T: Terminal>(
                             drive_tx: &drive_tx,
                             fold_inflight: &mut fold_inflight,
                             toasts: &mut toasts,
+                            guard: &mut confirm_guard,
+                            now: std::time::Instant::now(),
                         },
                     );
                     dirty = true;
@@ -16694,6 +16706,8 @@ async fn event_loop<T: Terminal>(
                                     drive_tx: &drive_tx,
                                     fold_inflight: &mut fold_inflight,
                                     toasts: &mut toasts,
+                                    guard: &mut confirm_guard,
+                                    now: std::time::Instant::now(),
                                 },
                             );
                         }
@@ -16709,6 +16723,48 @@ async fn event_loop<T: Terminal>(
                                 kick_model_hydration!();
                             }
                             sb.focus_active_row(&mut model);
+                        }
+                        crate::detail::DetailOutcome::Act(
+                            crate::detail::DetailAction::AckAllAttention,
+                        ) => {
+                            bar_detail = None;
+                            active_menu = crate::handlers::attention::clear_all_confirm(
+                                &model,
+                                crate::panel::scope::system_all(),
+                                false,
+                            );
+                            if active_menu.is_none() {
+                                model.status = "inbox already clear".into();
+                            }
+                        }
+                        crate::detail::DetailOutcome::Act(
+                            crate::detail::DetailAction::CiCancel { run_id },
+                        ) => {
+                            match crate::actions::ci_cancel_gate(
+                                &mut confirm_guard,
+                                &run_id,
+                                std::time::Instant::now(),
+                            ) {
+                                Ok(()) => {
+                                    bar_detail = CiActionCtx {
+                                        session: &mut session,
+                                        panes: &mut panes,
+                                        model: &mut model,
+                                        focus: &mut focus,
+                                        sb: &mut sb,
+                                        need_relayout: &mut need_relayout,
+                                        center: chrome.center,
+                                        cfg: &current_config,
+                                        refresh_tx: &refresh_tx,
+                                        waker: &waker,
+                                    }
+                                    .run_detail_action(
+                                        crate::detail::DetailAction::CiCancel { run_id },
+                                        bar_detail.take(),
+                                    );
+                                }
+                                Err(prompt) => model.status = prompt,
+                            }
                         }
                         // A row action normally closes the overlay; the CI drill
                         // keeps it open (returns the overlay) to fill in place.
@@ -21511,8 +21567,8 @@ async fn event_loop<T: Terminal>(
                             panel_ui.cursor = 0;
                             true
                         }
-                        // -- ci (AV group): drill in (v), open (o), re-run (r/R),
-                        // cancel (c), refresh (g). Provider is authority; bad
+                        // -- ci (AV group): drill in (v), open (o), re-run failed/all (r/R),
+                        // cancel (c, confirmed), refresh (g). Provider is authority; bad
                         // ops decline off-loop.
                         (Section::Ci, key)
                             if matches!(key, KeyCode::Char('v' | 'o' | 'r' | 'R' | 'c' | 'g')) =>
@@ -21533,6 +21589,8 @@ async fn event_loop<T: Terminal>(
                                 key,
                                 panel_ui.cursor,
                                 &mut bar_detail,
+                                &mut confirm_guard,
+                                std::time::Instant::now(),
                             )
                         }
                         // -- merge queue: add (a/A), remove (x), land (l),
@@ -21553,6 +21611,8 @@ async fn event_loop<T: Terminal>(
                                 drive_tx: &drive_tx,
                                 fold_inflight: &mut fold_inflight,
                                 toasts: &mut toasts,
+                                guard: &mut confirm_guard,
+                                now: std::time::Instant::now(),
                             },
                         ),
                         // -- PR queue: add (a), remove (x), re-watch (r), clear
@@ -21574,6 +21634,8 @@ async fn event_loop<T: Terminal>(
                                 tx: &prq_tx,
                                 inflight: &mut prq_inflight,
                                 toasts: &mut toasts,
+                                guard: &mut confirm_guard,
+                                now: std::time::Instant::now(),
                             },
                         ),
                         // Merge queue scope: this workspace (default) ↔ every

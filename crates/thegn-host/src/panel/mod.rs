@@ -19,6 +19,7 @@
 //! `budget` owns the pure vertical-allocation math.
 
 pub mod budget;
+pub mod confirm;
 pub mod docs;
 pub mod frame;
 pub mod gitfull;

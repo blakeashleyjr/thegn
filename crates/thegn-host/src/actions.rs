@@ -2037,13 +2037,15 @@ impl CiActionCtx<'_> {
     }
 
     /// A `Section::Ci` action key; returns whether it was claimed. `v` drills in,
-    /// `o` opens the run page, `r`/`R` re-run (all/failed), `c` cancels,
+    /// `o` opens the run page, `r`/`R` re-run (failed/all), `c` confirms cancel,
     /// `g` force-refreshes the run history.
     pub(crate) fn panel_key(
         &mut self,
         key: KeyCode,
         cursor: usize,
         overlay: &mut Option<crate::detail::DetailOverlay>,
+        guard: &mut crate::panel::confirm::TwoPress,
+        now: std::time::Instant,
     ) -> bool {
         match key {
             KeyCode::Char('v') => {
@@ -2067,17 +2069,18 @@ impl CiActionCtx<'_> {
                 true
             }
             KeyCode::Char(c @ ('r' | 'R')) => {
-                if let Some(run_id) = self.run_id_at(cursor) {
-                    self.spawn_mutation(DetailAction::CiRerun {
-                        run_id,
-                        failed: c == 'R',
-                    });
+                if let Some(action) = ci_key_action(c, self.run_id_at(cursor)) {
+                    self.spawn_mutation(action);
                 }
                 true
             }
             KeyCode::Char('c') => {
                 if let Some(run_id) = self.run_id_at(cursor) {
-                    self.spawn_mutation(DetailAction::CiCancel { run_id });
+                    if let Err(prompt) = ci_cancel_gate(guard, &run_id, now) {
+                        self.model.status = prompt;
+                    } else {
+                        self.spawn_mutation(DetailAction::CiCancel { run_id });
+                    }
                 }
                 true
             }
@@ -2086,9 +2089,70 @@ impl CiActionCtx<'_> {
     }
 }
 
+fn ci_key_action(key: char, run_id: Option<String>) -> Option<DetailAction> {
+    let run_id = run_id?;
+    match key {
+        'r' => Some(DetailAction::CiRerun {
+            run_id,
+            failed: true,
+        }),
+        'R' => Some(DetailAction::CiRerun {
+            run_id,
+            failed: false,
+        }),
+        _ => None,
+    }
+}
+
+pub(crate) fn ci_cancel_gate(
+    guard: &mut crate::panel::confirm::TwoPress,
+    run_id: &str,
+    now: std::time::Instant,
+) -> Result<(), String> {
+    if guard.confirm(&format!("ci-cancel:{run_id}"), now) {
+        Ok(())
+    } else {
+        Err(crate::panel::confirm::arm_prompt(
+            'c',
+            &format!("cancel run {}", run_id.chars().take(8).collect::<String>()),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ci_r_reruns_failed_and_R_all() {
+        assert!(matches!(
+            ci_key_action('r', Some("run".into())),
+            Some(DetailAction::CiRerun { failed: true, .. })
+        ));
+        assert!(matches!(
+            ci_key_action('R', Some("run".into())),
+            Some(DetailAction::CiRerun { failed: false, .. })
+        ));
+    }
+
+    #[test]
+    fn ci_cancel_requires_a_second_press_for_the_same_run() {
+        let mut guard = crate::panel::confirm::TwoPress::default();
+        let now = std::time::Instant::now();
+        assert!(
+            ci_cancel_gate(&mut guard, "12345678-rest", now)
+                .unwrap_err()
+                .contains("12345678")
+        );
+        assert!(
+            ci_cancel_gate(
+                &mut guard,
+                "12345678-rest",
+                now + std::time::Duration::from_secs(1),
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn rerun_without_pr_is_refused() {
