@@ -21305,10 +21305,8 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
-                        // Export is `E`: the accordion's width cycle claims a
-                        // bare `e` for every section, so the old `e` arm was
-                        // unreachable dead code.
-                        (Section::Logs, KeyCode::Char('E')) => {
+                        // `e` and `E` belong to the shared accordion width cycle.
+                        (Section::Logs, KeyCode::Char('w')) => {
                             let lines: Vec<String> = crate::panel::sections::logs::visible_lines(
                                 &model.panel,
                                 &panel_ui,
@@ -21323,19 +21321,32 @@ async fn event_loop<T: Terminal>(
                                     .log
                                     .dir_path()
                                     .join(format!("export-{ts}.log"));
+                                let count = lines.len();
                                 let content = lines.join("\n");
-                                match std::fs::write(&export_path, &content) {
-                                    Ok(()) => {
-                                        model.status = format!(
-                                            "Exported {} lines to {}",
-                                            lines.len(),
-                                            export_path.display()
-                                        );
+                                model.status = format!("Exporting {count} lines…");
+                                let toast_tx = refresh_tx.clone();
+                                let export_waker = waker.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let toast = match std::fs::write(&export_path, &content) {
+                                        Ok(()) => crate::hydrate::RefreshKind::Toast {
+                                            message: format!(
+                                                "Exported {count} lines to {}",
+                                                export_path.display()
+                                            ),
+                                            priority: thegn_core::notification::Priority::Info,
+                                        },
+                                        Err(error) => crate::hydrate::RefreshKind::Toast {
+                                            message: format!("Export failed: {error}"),
+                                            priority: thegn_core::notification::Priority::Alert,
+                                        },
+                                    };
+                                    if let Err(error) = toast_tx.send(toast) {
+                                        tracing::debug!(target: "thegn::panel", %error, "log export toast receiver is gone");
                                     }
-                                    Err(e) => {
-                                        model.status = format!("Export failed: {e}");
+                                    if let Err(error) = export_waker.wake() {
+                                        tracing::debug!(target: "thegn::panel", %error, "log export toast wake failed");
                                     }
-                                }
+                                });
                             }
                             true
                         }
@@ -21528,8 +21539,16 @@ async fn event_loop<T: Terminal>(
                         }
                         // -- media: keyboard transport keys use the same intent
                         // mapping as the frame's mouse hit targets.
-                        (Section::Media, KeyCode::Char(c @ (' ' | 'n' | 'p' | 's' | 'L'))) => {
-                            let action = crate::media_panel::action_for_key(&KeyCode::Char(c))
+                        (Section::Media, key)
+                            if matches!(
+                                &key,
+                                KeyCode::Char(
+                                    ' ' | 'n' | 'p' | 's' | 'L' | '+' | '-' | '[' | ']' | 'f'
+                                ) | KeyCode::LeftArrow
+                                    | KeyCode::RightArrow
+                            ) =>
+                        {
+                            let action = crate::media_panel::action_for_key(&key)
                                 .expect("media key table and handler must agree");
                             if current_config.media.enabled {
                                 crate::media_ctl::spawn_media_action(
