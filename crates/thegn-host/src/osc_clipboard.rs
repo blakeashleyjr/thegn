@@ -3,7 +3,6 @@
 
 pub(crate) const MAX_DECODED: usize = 64 * 1024;
 pub(crate) const MAX_WIRE: usize = MAX_DECODED.div_ceil(3) * 4 + 9;
-const MAX_SKIP_STRING_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Default)]
 enum State {
@@ -18,7 +17,6 @@ enum State {
     },
     SkipString {
         escape: bool,
-        bytes: usize,
     },
 }
 
@@ -58,10 +56,7 @@ impl Clipboard {
                             self.partial.extend_from_slice(b"\x1b]");
                             State::Osc { escape: false }
                         }
-                        b'P' | b'_' | b'^' | b'X' => State::SkipString {
-                            escape: false,
-                            bytes: 0,
-                        },
+                        b'P' | b'_' | b'^' | b'X' => State::SkipString { escape: false },
                         0x1b => State::Escape,
                         _ => State::Text,
                     };
@@ -105,7 +100,7 @@ impl Clipboard {
                         };
                     }
                 }
-                State::SkipString { escape, bytes } => {
+                State::SkipString { escape } => {
                     // CAN/SUB abort control strings. ESC followed by anything
                     // except ST aborts the string and starts a fresh escape
                     // sequence with the byte that followed ESC.
@@ -119,19 +114,13 @@ impl Clipboard {
                                 self.partial.extend_from_slice(b"\x1b]");
                                 State::Osc { escape: false }
                             }
-                            b'P' | b'_' | b'^' | b'X' => State::SkipString {
-                                escape: false,
-                                bytes: 0,
-                            },
+                            b'P' | b'_' | b'^' | b'X' => State::SkipString { escape: false },
                             0x1b => State::Escape,
                             _ => State::Text,
                         };
-                    } else if bytes >= MAX_SKIP_STRING_BYTES {
-                        self.state = State::Text;
                     } else {
                         self.state = State::SkipString {
                             escape: byte == 0x1b,
-                            bytes: bytes + 1,
                         };
                     }
                 }
@@ -304,7 +293,7 @@ mod tests {
         assert!(c.has_pending());
     }
     #[test]
-    fn clipboard_sequences_inside_other_control_strings_are_not_admitted() {
+    fn control_string_bodies_without_esc_are_inert_and_esc_aborts_them() {
         for kind in b"P_^X" {
             let mut c = Clipboard::default();
             c.feed(&[0x1b, *kind]);
@@ -318,6 +307,13 @@ mod tests {
                 Some(b"\x1b]52;c;eg==\x07".as_slice())
             );
         }
+
+        let mut c = Clipboard::default();
+        c.feed(b"\x1bPpayload\x1b]52;c;eA==\x07");
+        assert_eq!(
+            pending(&mut c).as_deref(),
+            Some(b"\x1b]52;c;eA==\x07".as_slice())
+        );
     }
 
     #[test]
@@ -336,18 +332,6 @@ mod tests {
                 Some(b"\x1b]52;c;eA==\x07".as_slice())
             );
         }
-    }
-
-    #[test]
-    fn skip_string_byte_cap_recovers_to_ground() {
-        let mut c = Clipboard::default();
-        c.feed(b"\x1bP");
-        c.feed(&vec![b'x'; MAX_SKIP_STRING_BYTES + 1]);
-        c.feed(b"\x1b]52;c;eA==\x07");
-        assert_eq!(
-            pending(&mut c).as_deref(),
-            Some(b"\x1b]52;c;eA==\x07".as_slice())
-        );
     }
 
     #[test]

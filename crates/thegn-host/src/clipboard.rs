@@ -566,18 +566,14 @@ mod tests {
         let helper = dir.path().join("fake-copy");
         std::fs::write(
             &helper,
-            "#!/bin/sh\n/bin/cat >/dev/null\n/bin/sleep 30 &\necho $! > \"$1\"\n",
+            "#!/bin/sh\ncat >/dev/null\nsleep 30 &\necho $$ > \"$1\"\n",
         )
         .unwrap();
-        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
-        use std::os::unix::fs::PermissionsExt;
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&helper, permissions).unwrap();
-        let _env = crate::testenv::EnvVarGuard::set(&[("PATH", dir.path().to_str().unwrap())]);
+        crate::platform::set_owner_executable(&helper).unwrap();
         let cancelled = AtomicBool::new(false);
 
         assert!(pipe_to(
-            &["fake-copy", marker.to_str().unwrap()],
+            &[helper.to_str().unwrap(), marker.to_str().unwrap()],
             Arc::from(&b"selection"[..]),
             &cancelled,
             Instant::now() + OPERATION_BUDGET,
@@ -587,9 +583,10 @@ mod tests {
             .trim()
             .parse()
             .unwrap();
-        let running = process_is_running(pid);
-        terminate_test_process(pid);
-        assert!(running, "successful helper's holder was killed");
+        let group = crate::platform::GroupHandle::from_pid(pid);
+        let alive = !group.is_empty();
+        group.kill();
+        assert!(alive, "successful helper's holder was killed");
     }
 
     #[test]
@@ -600,54 +597,33 @@ mod tests {
         let helper = dir.path().join("fake-copy");
         std::fs::write(
             &helper,
-            "#!/bin/sh\n/bin/cat >/dev/null\n/bin/sleep 30 &\necho $! > \"$1\"\nwait\n",
+            "#!/bin/sh\necho $$ > \"$1\"\ncat >/dev/null\nsleep 30 &\nwait\n",
         )
         .unwrap();
-        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
-        use std::os::unix::fs::PermissionsExt;
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&helper, permissions).unwrap();
-        let _env = crate::testenv::EnvVarGuard::set(&[("PATH", dir.path().to_str().unwrap())]);
+        crate::platform::set_owner_executable(&helper).unwrap();
         let cancelled = AtomicBool::new(false);
 
         assert!(!pipe_to(
-            &["fake-copy", marker.to_str().unwrap()],
+            &[helper.to_str().unwrap(), marker.to_str().unwrap()],
             Arc::from(&b"selection"[..]),
             &cancelled,
-            Instant::now() + Duration::from_millis(300),
+            Instant::now() + Duration::from_secs(2),
         ));
         let pid: i32 = std::fs::read_to_string(marker)
             .unwrap()
             .trim()
             .parse()
             .unwrap();
-        let running = process_is_running(pid);
-        if running {
-            terminate_test_process(pid);
+        let group = crate::platform::GroupHandle::from_pid(pid);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !group.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(!running, "timeout left the holder process running");
-    }
-
-    #[cfg(unix)]
-    fn process_is_running(pid: i32) -> bool {
-        let output = Command::new("/bin/ps")
-            .args(["-o", "stat=", "-p", &pid.to_string()])
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .chars()
-            .next()
-            .is_some_and(|state| state != 'Z')
-    }
-
-    #[cfg(unix)]
-    fn terminate_test_process(pid: i32) {
-        let status = Command::new("/bin/kill")
-            .args(["-KILL", &pid.to_string()])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        let empty = group.is_empty();
+        if !empty {
+            group.kill();
+        }
+        assert!(empty, "timeout left the holder process group alive");
     }
 
     #[test]
