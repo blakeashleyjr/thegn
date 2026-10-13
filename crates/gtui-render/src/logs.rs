@@ -1,5 +1,5 @@
 use gtui_core::frame::{FieldType, Frame};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
@@ -9,7 +9,13 @@ impl LogsRenderer {
     /// Build the logs widget for a panel `rows` tall and `width` wide. Only the
     /// first `rows` lines can ever be visible (no scroll state), so only those
     /// are built; each borrows from `frame` and is clipped to the width budget.
-    pub fn render<'a>(frame: &'a Frame, title: &str, rows: usize, width: usize) -> Paragraph<'a> {
+    pub fn render<'a>(
+        frame: &'a Frame,
+        title: &str,
+        rows: usize,
+        width: usize,
+        colors: &crate::RenderColors,
+    ) -> Paragraph<'a> {
         let mut lines = Vec::new();
 
         if !frame.fields.is_empty() {
@@ -20,7 +26,7 @@ impl LogsRenderer {
                 for val_str in s_field.strings().iter().take(rows) {
                     lines.push(Line::from(vec![Span::styled(
                         crate::clip_chars(val_str, budget),
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(colors.text),
                     )]));
                 }
             } else {
@@ -33,6 +39,8 @@ impl LogsRenderer {
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors.border))
+                .title_style(Style::default().fg(colors.title))
                 .title(title.to_string()),
         )
     }
@@ -51,7 +59,7 @@ mod tests {
         let field = Field::new_str("line", vec!["hello".into(), "world".into()]);
         let frame = Frame::new(vec![field]);
 
-        let p = LogsRenderer::render(&frame, "Logs", 10, 40);
+        let p = LogsRenderer::render(&frame, "Logs", 10, 40, &crate::RenderColors::default());
         let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 10));
         p.render(buffer.area, &mut buffer);
 
@@ -71,10 +79,16 @@ mod tests {
         for v in f.strings().to_vec() {
             lines.push(Line::from(vec![Span::styled(
                 v,
-                Style::default().fg(Color::Gray),
+                Style::default().fg(crate::RenderColors::default().text),
             )]));
         }
-        let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("L"));
+        let p = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(crate::RenderColors::default().border))
+                .title_style(Style::default().fg(crate::RenderColors::default().title))
+                .title("L"),
+        );
         let mut b = Buffer::empty(area);
         p.render(area, &mut b);
         b
@@ -89,8 +103,28 @@ mod tests {
         for (w, h) in [(40u16, 10u16), (7, 3), (80, 24), (2, 2)] {
             let area = Rect::new(0, 0, w, h);
             let mut got = Buffer::empty(area);
-            LogsRenderer::render(&frame, "L", h as usize, w as usize).render(area, &mut got);
+            LogsRenderer::render(
+                &frame,
+                "L",
+                h as usize,
+                w as usize,
+                &crate::RenderColors::default(),
+            )
+            .render(area, &mut got);
             assert_eq!(got, reference(&frame, area), "{w}x{h}");
         }
+    }
+
+    #[test]
+    fn supplied_text_color_reaches_the_buffer() {
+        let frame = Frame::new(vec![Field::new_str("line", vec!["hello".into()])]);
+        let colors = crate::RenderColors {
+            text: ratatui::style::Color::Rgb(1, 2, 3),
+            ..crate::RenderColors::default()
+        };
+        let area = Rect::new(0, 0, 12, 5);
+        let mut buffer = Buffer::empty(area);
+        LogsRenderer::render(&frame, "L", 2, 12, &colors).render(area, &mut buffer);
+        assert_eq!(buffer.cell((1, 1)).unwrap().fg, colors.text);
     }
 }

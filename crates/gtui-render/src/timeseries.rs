@@ -1,5 +1,5 @@
 use gtui_core::frame::{FieldType, Frame};
-use ratatui::style::Color;
+use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, canvas::Canvas, canvas::Line};
 
 pub struct TimeseriesRenderer;
@@ -285,8 +285,9 @@ impl TimeseriesRenderer {
         title: &str,
         bounds: [f64; 4], // [x_min, x_max, y_min, y_max]
         width: usize,
+        colors: &crate::RenderColors,
     ) -> Canvas<'a, impl Fn(&mut ratatui::widgets::canvas::Context) + 'a> {
-        Self::render_in_window(frame, title, bounds, None, width)
+        Self::render_in_window(frame, title, bounds, None, width, colors)
     }
 
     /// Render a time series against an optional inclusive timestamp window.
@@ -297,7 +298,9 @@ impl TimeseriesRenderer {
         bounds: [f64; 4], // [x_min, x_max, y_min, y_max]
         window: Option<[f64; 2]>,
         width: usize,
+        colors: &crate::RenderColors,
     ) -> Canvas<'a, impl Fn(&mut ratatui::widgets::canvas::Context) + 'a> {
+        let colors = *colors;
         let y_field = frame.fields.iter().find(|f| f.ty == FieldType::Float64);
         let time_field = y_field.and_then(|y| {
             frame
@@ -324,6 +327,8 @@ impl TimeseriesRenderer {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_style(Style::default().fg(colors.border))
+                    .title_style(Style::default().fg(colors.title))
                     .title(title.to_string()),
             )
             .x_bounds(x_bounds)
@@ -336,7 +341,7 @@ impl TimeseriesRenderer {
                             y1,
                             x2,
                             y2,
-                            color: Color::Green,
+                            color: colors.series,
                         });
                     }
                 } else {
@@ -346,7 +351,7 @@ impl TimeseriesRenderer {
                             y1,
                             x2,
                             y2,
-                            color: Color::Green,
+                            color: colors.series,
                         });
                     }
                 }
@@ -367,7 +372,13 @@ mod tests {
         let field = Field::new("val", FieldType::Float64, vec![1.0, 5.0, 2.0]);
         let frame = Frame::new(vec![field]);
 
-        let canvas = TimeseriesRenderer::render(&frame, "CPU", [0.0, 2.0, 0.0, 6.0], 20);
+        let canvas = TimeseriesRenderer::render(
+            &frame,
+            "CPU",
+            [0.0, 2.0, 0.0, 6.0],
+            20,
+            &crate::RenderColors::default(),
+        );
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 10));
 
         canvas.render(buffer.area, &mut buffer);
@@ -376,11 +387,31 @@ mod tests {
         assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "┌");
     }
 
+    #[test]
+    fn supplied_series_color_reaches_the_buffer() {
+        let frame = Frame::new(vec![Field::new("val", FieldType::Float64, vec![0.0, 1.0])]);
+        let colors = crate::RenderColors {
+            series: ratatui::style::Color::Rgb(1, 2, 3),
+            ..crate::RenderColors::default()
+        };
+        let area = Rect::new(0, 0, 20, 10);
+        let mut buffer = Buffer::empty(area);
+        TimeseriesRenderer::render(&frame, "T", [0.0, 1.0, 0.0, 1.0], 20, &colors)
+            .render(area, &mut buffer);
+        assert!(buffer.content.iter().any(|cell| cell.fg == colors.series));
+    }
+
     /// The pre-borrow walk: every sample, cloned vec.
     fn reference(frame: &Frame, bounds: [f64; 4], area: Rect) -> Buffer {
         let vals = frame.fields[0].floats().to_vec();
         let c = Canvas::default()
-            .block(Block::default().borders(Borders::ALL).title(""))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(crate::RenderColors::default().border))
+                    .title_style(Style::default().fg(crate::RenderColors::default().title))
+                    .title(""),
+            )
             .x_bounds([bounds[0], bounds[1]])
             .y_bounds([bounds[2], bounds[3]])
             .paint(move |ctx| {
@@ -393,7 +424,7 @@ mod tests {
                             y1: py,
                             x2: x,
                             y2: v,
-                            color: Color::Green,
+                            color: crate::RenderColors::default().series,
                         });
                     }
                     prev = Some((x, v));
@@ -411,7 +442,8 @@ mod tests {
         let bounds = [0.0, 149.0, -11.0, 11.0];
         let area = Rect::new(0, 0, 40, 10);
         let mut got = Buffer::empty(area);
-        let canvas = TimeseriesRenderer::render(&frame, "", bounds, 40);
+        let canvas =
+            TimeseriesRenderer::render(&frame, "", bounds, 40, &crate::RenderColors::default());
         canvas.render(area, &mut got);
         assert_eq!(got, reference(&frame, bounds, area));
         assert_eq!(plot_points(frame.fields[0].floats(), 40).len(), 150);
