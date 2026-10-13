@@ -349,7 +349,8 @@ fn task_detail_segs(
         && !r.output_tail.is_empty()
     {
         out.push(vec![seg(g3(), "─── output ───────────────────────────")]);
-        for line in r.output_tail.lines().take(8) {
+        let lines: Vec<&str> = r.output_tail.lines().collect();
+        for line in lines.iter().skip(lines.len().saturating_sub(8)) {
             out.push(vec![seg(g2(), truncate(line, w))]);
         }
     }
@@ -405,6 +406,36 @@ mod tests {
         let s = status_segs(Some(&failed));
         let text: String = s.iter().map(|sg| sg.text.clone()).collect();
         assert!(text.contains('✗'), "{text}");
+    }
+
+    #[test]
+    fn task_detail_shows_last_eight_output_lines() {
+        let output_tail = (1..=20)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let run = crate::panel::TaskRunRecord {
+            output_tail,
+            ..Default::default()
+        };
+        let task = thegn_core::config::Task {
+            name: "build".into(),
+            command: "make".into(),
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+            kind: TaskKind::Build,
+            matcher: None,
+            scope: None,
+        };
+        let lines = task_detail_segs(&task, Some(&run), 100)
+            .into_iter()
+            .flatten()
+            .map(|segment| segment.text)
+            .collect::<Vec<_>>();
+        assert!(lines.iter().any(|line| line == "line 13"), "{lines:?}");
+        assert!(lines.iter().any(|line| line == "line 20"), "{lines:?}");
+        assert!(!lines.iter().any(|line| line == "line 1"), "{lines:?}");
     }
 
     #[test]
