@@ -4771,7 +4771,7 @@ fn dispatch_menu_choice(
                 if panel_ui.git.focus == GitView::PatchBuilding
                     && let Some(home) = panel_ui.open.home_view()
                 {
-                    panel_ui.git.retarget(home);
+                    panel_ui.git.back(home);
                 }
                 if let Some(width) = panel_ui.git.retract_width() {
                     panel_ui.width = width;
@@ -8901,6 +8901,9 @@ async fn event_loop<T: Terminal>(
             // Git interaction state is per-worktree: cursors, flows, marks
             // and fetched docs all reset; `op_gen` bumps so in-flight op/doc
             // results die on arrival. Overlays target the old worktree.
+            if let Some(width) = panel_ui.git.widened_from.take() {
+                panel_ui.width = width;
+            }
             panel_ui.git.reset_for_worktree(panel_ui.open.home_view());
             // The accordion cursor is per-worktree too: leaving it where the
             // OLD worktree's list had it highlighted the new worktree's Nth
@@ -19260,6 +19263,7 @@ async fn event_loop<T: Terminal>(
                     // remembered preference, like a manual `e`.
                     if let GitMsg::WidthBlocked(inner, want) = msg {
                         panel_ui.width = want;
+                        panel_ui.git.widened_from = None;
                         panel_ui.remember_width();
                         panel_ui.scroll = 0;
                         persist_panel_state(&panel_ui);
