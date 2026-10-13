@@ -135,6 +135,8 @@ pub enum PrViewOutcome {
     Pending,
     /// Close the view.
     Close,
+    /// Ask for a merge method and explicit confirmation.
+    ConfirmMerge,
     /// Run this action off the loop (the view stays open).
     Act(PrViewAction),
     /// Open the selected review/file anchor through the host IDE seam.
@@ -151,8 +153,10 @@ pub enum PrViewOutcome {
 pub enum PrViewAction {
     /// Open the PR in the system browser.
     OpenUrl(String),
-    /// Squash-merge the PR.
-    Merge,
+    /// Merge the PR with the selected method.
+    Merge {
+        method: thegn_core::forge::model::MergeMethod,
+    },
     /// Approve (no body).
     Approve,
     /// Re-run failed checks.
@@ -480,7 +484,7 @@ impl PrView {
         }
         // Global write/action keys (available from any tab where the PR exists).
         match key {
-            KeyCode::Char('M') => return PrViewOutcome::Act(PrViewAction::Merge),
+            KeyCode::Char('M') => return PrViewOutcome::ConfirmMerge,
             KeyCode::Char('A') => return PrViewOutcome::Act(PrViewAction::Approve),
             KeyCode::Char('R') => {
                 self.open_composer(ComposerTarget::Review(ReviewState::RequestChanges));
@@ -837,6 +841,10 @@ impl PrView {
             field: TextArea::default(),
         });
         self.status = None;
+    }
+
+    pub(crate) fn start_comment(&mut self) {
+        self.open_composer(ComposerTarget::PrComment);
     }
 
     pub fn handle_paste(&mut self, s: &str) {
@@ -1647,10 +1655,10 @@ mod tests {
     #[test]
     fn global_actions_and_composer_flow() {
         let mut v = sample();
-        // Merge / approve are immediate.
+        // Merge requires a method choice; approve remains immediate.
         assert_eq!(
             v.handle_key(&KeyCode::Char('M'), Modifiers::NONE),
-            PrViewOutcome::Act(PrViewAction::Merge)
+            PrViewOutcome::ConfirmMerge
         );
         assert_eq!(
             v.handle_key(&KeyCode::Char('A'), Modifiers::NONE),
