@@ -17,9 +17,11 @@ the full tool.
   (binary and mode-only changes say so instead of a diff); `space`
   stages; `e` widens to the full-screen lazygit-style git frame, where
   `↵` drills into **staging** (line-level stage/unstage).
-- **commits** — the branch's log; pick a commit to view or operate on.
-  `E` edits (interactive rebase stopping at the commit) — bare `e` is
-  always the panel width cycle.
+- **commits** — the branch's log; pick a commit to operate on. `E` edits
+  (interactive rebase stopping at the commit) — bare `e` is always the panel
+  width cycle. Rebase `s` (squash), `f` (fixup), and `d` (drop) ask for
+  confirmation first; `i` plans from the selected commit and refuses merge
+  ranges.
 - **branches** — local branches: check out, create, delete; open-PR
   badges ride each row. In the wide frame the main region shows the
   **selected** branch's own recent commits (HEAD's while it loads).
@@ -31,7 +33,9 @@ the full tool.
   `o` pages it in bat, `O` opens your editor, `y` reveals it in yazi.
 
 Inside the git-family sections (changes/commits/branches/stash — not
-files), `?` shows that section's own key cheatsheet. Marks, ranges, and
+files), `?` shows that section's own key cheatsheet. A drill's temporary
+auto-widen retracts when Esc leaves the last drill; shrinking to resting
+width leaves the drill open, and Esc returns to the view that opened it. Marks, ranges, and
 flows follow lazygit conventions. An action key that needs a wider view
 **widens the panel and performs the action** in one press (the status
 crumb says so); drill detail views at the half width carry a breadcrumb

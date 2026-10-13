@@ -59,7 +59,10 @@ const EXAMPLE_CONFIG: &str = include_str!("../../../../config/config.toml.exampl
 /// keybindings and config-reference pages. Total — validation errors are
 /// returned, not thrown; in CI the ratchet test asserts the list is empty.
 pub fn build_registry(cfg: &thegn_core::config::Config) -> (HelpRegistry, Vec<ValidationError>) {
-    let mut sources: Vec<String> = SOURCES.iter().map(|s| (*s).to_string()).collect();
+    let mut sources: Vec<String> = SOURCES
+        .iter()
+        .map(|s| super::gen_pages::expand_keys_directives(s))
+        .collect();
     sources.push(super::gen_pages::keybindings_page(cfg));
     sources.push(thegn_core::help::config_ref::page(EXAMPLE_CONFIG));
     let refs: Vec<&str> = sources.iter().map(String::as_str).collect();
@@ -210,5 +213,20 @@ mod tests {
         // frontmatter validation makes those permanently unclaimable, which
         // keeps this assertion from rotting as pages grow.
         assert_eq!(reg.page_for_context("panel:not-a-section"), Some("index"));
+    }
+
+    #[test]
+    fn registry_contains_expanded_panel_key_directives() {
+        let (reg, errors) = build_registry(&thegn_core::config::Config::default());
+        assert!(errors.is_empty(), "registry validation: {errors:?}");
+        let panel = reg.page("panel").expect("panel page");
+        assert!(
+            panel.body.contains("Keys: `w` export"),
+            "logs keys expanded"
+        );
+        assert!(
+            !panel.body.contains("{{keys:"),
+            "directives are expanded before registry construction"
+        );
     }
 }

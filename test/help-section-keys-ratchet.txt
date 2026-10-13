@@ -1,0 +1,14 @@
+# help-section-keys-ratchet — real section keys omitted from section_keys tables.
+# These entries shrink when section_keys starts advertising them.
+# Media volume: `+` and `-` adjust volume but are absent from MEDIA.
+panel:media:+
+panel:media:-
+# Media chapters/fullscreen: `[` and `]` skip chapters; `f` toggles fullscreen.
+panel:media:[
+panel:media:]
+panel:media:f
+# Notifications: `A` shows read rows and `/` searches; neither is in its hint table.
+panel:notifications:/
+panel:notifications:A
+# PR queue: `h` invokes the configured handoff, not in its table.
+panel:prq:h
