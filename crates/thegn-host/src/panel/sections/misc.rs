@@ -1109,7 +1109,9 @@ fn sandbox_with(ctx: &SectionCtx, show_all: bool) -> Vec<PanelRow> {
             });
         }
     }
-    rows.push(sandbox_hint(ctx, show_all));
+    if let Some(row) = sandbox_hint(ctx, show_all) {
+        rows.push(row);
+    }
     rows
 }
 
@@ -1245,11 +1247,13 @@ fn sandbox_full_with(ctx: &SectionCtx, show_all: bool) -> Vec<PanelRow> {
             row
         }
     }));
-    rows.push(sandbox_hint(ctx, show_all));
+    if let Some(row) = sandbox_hint(ctx, show_all) {
+        rows.push(row);
+    }
     rows
 }
 
-fn sandbox_hint(ctx: &SectionCtx, show_all: bool) -> PanelRow {
+fn sandbox_hint(ctx: &SectionCtx, show_all: bool) -> Option<PanelRow> {
     let model = ctx.model;
     let target = crate::handlers::sandbox_panel::target(
         &model.containers,
@@ -1276,7 +1280,11 @@ fn sandbox_hint(ctx: &SectionCtx, show_all: bool) -> PanelRow {
             },
         ));
     }
-    hint_row(&hints)
+    if hints.is_empty() {
+        None
+    } else {
+        Some(hint_row(&hints))
+    }
 }
 
 pub(super) fn db() -> Vec<PanelRow> {
@@ -1401,5 +1409,22 @@ mod tests {
         assert!(!rendered.contains("s stop"));
         assert!(!rendered.contains("r restart"));
         assert!(!rendered.contains("l logs"));
+    }
+
+    #[test]
+    fn off_state_with_no_containers_has_no_empty_hint_row() {
+        let model = FrameModel::default();
+        let ui = PanelUi {
+            open: Section::Sandbox,
+            width: PanelWidth::Normal,
+            ..PanelUi::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 40,
+            rows: 12,
+        };
+        assert!(sandbox_hint(&ctx, false).is_none());
     }
 }
