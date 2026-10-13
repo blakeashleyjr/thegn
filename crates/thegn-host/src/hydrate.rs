@@ -3508,13 +3508,8 @@ pub(crate) fn build_panel(
         // corrupt row; parse just this window.
         let tail_lines = read_log_tail_lines(&log_path, cur_len, LOG_TAIL_BYTES);
 
-        if hints.open == crate::panel::Section::Logs {
-            let start = tail_lines.len().saturating_sub(500);
-            panel.log_lines = tail_lines[start..].to_vec();
-        }
-
-        // Always keep a bounded tail (unlike section-gated `log_lines`) so the
-        // notification → log drilldown modal has data without new blocking I/O.
+        // Always keep a bounded tail so the notification → log drilldown modal
+        // has data without new blocking I/O.
         // The drilldown opens error-gated, and errors are sparse, so a plain last-N
         // slice usually held none of them ("no matching log lines"). Fold the recent
         // ERRORs back in — see `error_inclusive_tail`. Built from the same bounded
@@ -3636,10 +3631,10 @@ fn parse_review_task_notification(
     Some((thread_id.to_string(), path, line))
 }
 
-/// Size of the fixed END-of-file read used to build the Logs section tail +
-/// drilldown payload. 256 KB is thousands of log lines — far more than the
-/// 500-line `log_lines` / 400-line `log_tail` windows ever show — while bounding
-/// the per-pass read regardless of the file's (up to 5 MB) size.
+/// Size of the fixed END-of-file read used to build the Logs drilldown payload.
+/// 256 KB is thousands of log lines — far more than the 400-line `log_tail`
+/// window ever shows — while bounding the per-pass read regardless of the
+/// file's (up to 5 MB) size.
 const LOG_TAIL_BYTES: u64 = 256 * 1024;
 
 /// Process-global incremental log-scan state: `(last_scanned_len, error_total)`.

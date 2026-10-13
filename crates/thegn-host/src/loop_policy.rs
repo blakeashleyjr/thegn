@@ -50,18 +50,35 @@ pub fn log_apply_budget(input_pending: bool) -> usize {
     if input_pending { 32 } else { 256 }
 }
 
+/// Whether a parsed log belongs to a target that must not dirty the frame.
+pub fn is_render_noise(log: &ParsedLog) -> bool {
+    log.target.as_deref().is_some_and(|target| {
+        target == "thegn::frame"
+            || target == "thegn::perf"
+            || target.starts_with("thegn::frame::")
+            || target.starts_with("thegn::perf::")
+    })
+}
+
 /// Apply one bounded log slice to display storage, retaining the newest rows.
-/// Returns whether visible Logs content changed and should be repainted.
-pub fn apply_log_slice(rows: &mut Vec<ParsedLog>, slice: Vec<ParsedLog>, visible: bool) -> bool {
+/// Returns whether visible Logs received a non-render-noise row to repaint.
+pub fn apply_log_slice(
+    rows: &mut Vec<ParsedLog>,
+    first_seq: &mut u64,
+    slice: Vec<ParsedLog>,
+    visible: bool,
+) -> bool {
     if slice.is_empty() {
         return false;
     }
+    let dirty = visible && slice.iter().any(|log| !is_render_noise(log));
     rows.extend(slice);
     if rows.len() > LOG_RETAIN {
         let overflow = rows.len() - LOG_RETAIN;
         rows.drain(0..overflow);
+        *first_seq += overflow as u64;
     }
-    visible
+    dirty
 }
 
 /// Stash high-water: stop receiving from the PTY channel once this many bytes
@@ -168,12 +185,14 @@ mod tests {
     fn log_slice_visibility_controls_dirty_result() {
         let slice = vec![thegn_core::log::parser::parse_log("one")];
         let mut hidden = Vec::new();
-        assert!(!apply_log_slice(&mut hidden, slice, false));
+        let mut first_seq = 0;
+        assert!(!apply_log_slice(&mut hidden, &mut first_seq, slice, false));
         assert_eq!(hidden.len(), 1);
 
         let mut visible = Vec::new();
         assert!(apply_log_slice(
             &mut visible,
+            &mut first_seq,
             vec![thegn_core::log::parser::parse_log("one")],
             true,
         ));
@@ -193,16 +212,57 @@ mod tests {
             original: gap.clone(),
             message: gap,
             worktree: None,
+            target: None,
         };
         let mut rows = Vec::new();
+        let mut first_seq = 0;
 
-        assert!(apply_log_slice(&mut rows, slice, true));
+        assert!(apply_log_slice(&mut rows, &mut first_seq, slice, true));
         assert_eq!(rows.len(), LOG_RETAIN);
+        assert_eq!(first_seq, 2);
         assert_eq!(rows[0].message, "line-2");
         assert_eq!(rows[497].message, "line-499");
         assert!(rows[498].message.contains("3 log lines dropped"));
         assert_eq!(rows[499].message, "line-501");
         assert_eq!(rows[LOG_RETAIN - 1].message, "line-1001");
+    }
+
+    #[test]
+    fn noise_only_slice_is_not_dirty() {
+        let noise = || {
+            thegn_core::log::parser::parse_log(
+                "2026-06-05T12:00:00  DEBUG thegn::frame  full frame chosen",
+            )
+        };
+        let mut rows = Vec::new();
+        let mut first_seq = 0;
+        assert!(!apply_log_slice(
+            &mut rows,
+            &mut first_seq,
+            vec![noise(), noise()],
+            true,
+        ));
+        assert_eq!(rows.len(), 2);
+        assert!(apply_log_slice(
+            &mut rows,
+            &mut first_seq,
+            vec![thegn_core::log::parser::parse_log(
+                "2026-06-05T12:00:01  INFO  thegn::db  ready",
+            )],
+            true,
+        ));
+    }
+
+    #[test]
+    fn ring_drop_advances_first_seq() {
+        let slice = (0..LOG_RETAIN + 5)
+            .map(|index| thegn_core::log::parser::parse_log(&format!("line-{index}")))
+            .collect();
+        let mut rows = Vec::new();
+        let mut first_seq = 0;
+        assert!(apply_log_slice(&mut rows, &mut first_seq, slice, true));
+        assert_eq!(first_seq, 5);
+        assert_eq!(rows.len(), LOG_RETAIN);
     }
 
     #[test]

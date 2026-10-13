@@ -805,15 +805,15 @@ pub struct PanelData {
     /// counts use. Empty ⇒ fall back to `default_priority` (headless tests).
     pub notification_priority:
         std::collections::BTreeMap<&'static str, thegn_core::notification::Priority>,
-    /// Last 500 lines of thegn.log, parsed. Empty when THEGN_LOG is unset.
-    pub log_lines: Vec<thegn_core::log_view::LogLine>,
     /// A bounded tail of parsed thegn.log — the last ~400 lines *plus* the most
     /// recent preceding ERROR lines (see `log_view::error_inclusive_tail`), so the
-    /// error-gated notification drilldown is never empty. Kept on *every* refresh
-    /// (unlike `log_lines`, which is section-gated), without new blocking I/O.
+    /// error-gated notification drilldown is never empty. Kept on *every* refresh,
+    /// without new blocking I/O.
     pub log_tail: Vec<thegn_core::log_view::LogLine>,
     /// Structured logs for the tg-log feature.
     pub log_lines_structured: Vec<thegn_core::log::parser::ParsedLog>,
+    /// Sequence number of the first row in the bounded structured-log ring.
+    pub log_first_seq: u64,
     /// Configured + auto-discovered task specs for the Tasks section.
     pub task_specs: Vec<thegn_core::config::Task>,
     /// Last-run record per task name (keyed by `Task::name`).
@@ -1187,7 +1187,7 @@ pub struct PanelUi {
     pub logs_filter_editing: bool,
     /// Level gate: `None` = all levels; `Some(L)` shows lines at L and above.
     pub logs_level: Option<thegn_core::log_view::LogLevel>,
-    /// When true, the cursor auto-jumps to the newest line on each hydration.
+    /// When true, the cursor auto-jumps to the newest line on each arrival.
     pub logs_tail: bool,
     /// Active free-text filter query for the Files section's tree (`/` mode).
     pub files_filter: String,
