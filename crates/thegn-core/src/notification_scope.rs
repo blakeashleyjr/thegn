@@ -1,7 +1,9 @@
 //! The ONE predicate for "does this notification belong to the active repo's
 //! inbox?".
 //!
-//! It is deliberately FAIL-OPEN on the worktree registry: a row tagged with a
+//! Registry paths exclude empty-repo stub rows, which attribute a worktree to
+//! no repo and must not close the fail-open path. It is deliberately FAIL-OPEN
+//! on the worktree registry: a row tagged with a
 //! path the `worktrees` table does not know — the repo's own main checkout
 //! (which never gets a row), an externally-created worktree, a path renamed
 //! outside thegn — is KEPT rather than hidden. Only a row tagged with a KNOWN
@@ -14,6 +16,17 @@
 //! second copy to drift.
 
 use std::collections::HashSet;
+
+/// Build the paths positively attributed to a repository. Environment-bind
+/// stubs have an empty repo root and therefore remain unknown/fail-open.
+pub fn registry_known_paths<'a>(
+    rows: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> HashSet<String> {
+    rows.into_iter()
+        .filter(|(_, repo_root)| !repo_root.is_empty())
+        .map(|(worktree, _)| worktree.to_string())
+        .collect()
+}
 
 /// Whether a notification tagged `worktree_path` shows in the repo-scoped
 /// inbox. `repo_paths` are the active repo's registered worktrees; `all_known`
@@ -31,9 +44,33 @@ pub fn shows_in_repo_inbox(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Db;
+    use crate::store::WorkspaceStore;
 
     fn set(paths: &[&str]) -> HashSet<String> {
         paths.iter().map(|p| (*p).to_string()).collect()
+    }
+
+    #[test]
+    fn stub_registry_row_stays_fail_open() {
+        let known = registry_known_paths([("/repo", ""), ("/wt/b", "/other")]);
+        assert!(!known.contains("/repo"));
+        assert!(shows_in_repo_inbox("/repo", &set(&["/wt/a"]), &known));
+    }
+
+    #[test]
+    fn sys03_env_pin_stub_does_not_hide_the_main_checkout() {
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("tab", "/repo", "/wt/a", "feat", None, None)
+            .unwrap();
+        db.set_worktree_env("/repo", "dev").unwrap();
+        let worktrees = db.worktrees().unwrap();
+        let known = registry_known_paths(
+            worktrees
+                .iter()
+                .map(|row| (row.worktree.as_str(), row.repo_root.as_str())),
+        );
+        assert!(shows_in_repo_inbox("/repo", &set(&["/wt/a"]), &known));
     }
 
     #[test]
