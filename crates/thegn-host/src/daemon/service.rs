@@ -2719,7 +2719,7 @@ mod tests {
             .await
             .insert("s1".into(), shutdown_test_entry(msg_tx));
 
-        let (actor_dropped_tx, actor_dropped_rx) = oneshot::channel();
+        let (actor_dropped_tx, actor_dropped_rx) = oneshot::channel::<()>();
         svc.actor_tasks.lock().await.push(tokio::spawn(async move {
             let _actor_dropped_tx = actor_dropped_tx;
             std::future::pending::<()>().await;
