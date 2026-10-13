@@ -928,8 +928,13 @@ fn timeline_section(events: &[thegn_core::models::TimelineEvent]) -> Vec<PanelRo
 }
 
 pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
+    let show_all = crate::panel::scope::system_all();
+    sandbox_with(ctx, show_all)
+}
+
+fn sandbox_with(ctx: &SectionCtx, show_all: bool) -> Vec<PanelRow> {
     if ctx.full() && !ctx.model.containers.is_empty() {
-        return sandbox_full(ctx);
+        return sandbox_full_with(ctx, show_all);
     }
     let (model, deep) = (ctx.model, ctx.deep());
     let mut rows: Vec<PanelRow> = Vec::new();
@@ -1015,6 +1020,10 @@ pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
                         g2(),
                         "○ not sandboxed",
                     )])));
+                    rows.push(PanelRow::plain(Line::segs(vec![
+                        sp(2),
+                        seg(g2(), "sandbox off — set [sandbox] backend (see F1)"),
+                    ])));
                 }
             }
             if !model.containers.is_empty() {
@@ -1056,7 +1065,6 @@ pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
     // worktree's / another host's containers don't clutter the view. A hint
     // advertises the toggle; at the resting width the hint row below carries
     // it, so pressing `g` is never invisible.
-    let show_all = crate::panel::scope::system_all();
     if deep && !show_all && !model.containers.is_empty() {
         rows.push(PanelRow::blank());
         rows.push(PanelRow::plain(Line::segs(vec![seg(
@@ -1065,43 +1073,47 @@ pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
         )])));
     }
     if deep && show_all && !model.containers.is_empty() {
+        let visible = crate::handlers::sandbox_panel::visible_containers(
+            &model.containers,
+            &model.active_container_name,
+            show_all,
+        );
+        let cursor = ctx.ui.cursor.min(visible.len().saturating_sub(1));
         rows.push(PanelRow::blank());
         rows.push(PanelRow::plain(Line::segs(vec![
             seg(g2(), "ALL CONTAINERS").bold(),
-            seg(g(), format!("  {}", model.containers.len())),
+            seg(g(), format!("  {}", visible.len())),
         ])));
-        for c in &model.containers {
+        for (i, c) in visible.iter().enumerate() {
+            let selected = i == cursor;
             let mark = if c.ours {
                 seg(hue(Hue::Green), "● ")
             } else {
                 seg(g2(), "○ ")
             };
-            rows.push(PanelRow::plain(Line::split(
+            let row = PanelRow::plain(Line::split(
                 vec![
+                    seg(super::t(), if selected { "▶ " } else { "  " }),
                     mark,
-                    seg(d(), c.name.clone()),
+                    seg(if selected { super::t() } else { d() }, c.name.clone()),
                     seg(g(), format!(" · {}", c.backend)),
                 ],
                 vec![seg(
                     g(),
                     format!("cpu {} · mem {} · net {}", c.cpu, c.mem, c.net),
                 )],
-            )));
+            ))
+            .with_hit(PanelHit::Row(Section::Sandbox, i));
+            rows.push(if selected {
+                row.with_bg(crate::seg::Tok::SelAccent)
+            } else {
+                row
+            });
         }
     }
-    rows.push(hint_row(&[
-        ("s", "stop"),
-        ("r", "restart"),
-        ("l", "logs"),
-        (
-            "g",
-            if show_all {
-                "this worktree"
-            } else {
-                "all containers"
-            },
-        ),
-    ]));
+    if let Some(row) = sandbox_hint(ctx, show_all) {
+        rows.push(row);
+    }
     rows
 }
 
@@ -1109,7 +1121,7 @@ pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
 /// already on the model — the narrow widths just can't seat them side by side).
 /// Container rows are cursor targets so the container action keys act on the
 /// highlighted row.
-fn sandbox_full(ctx: &SectionCtx) -> Vec<PanelRow> {
+fn sandbox_full_with(ctx: &SectionCtx, show_all: bool) -> Vec<PanelRow> {
     use super::{rule, t, two_col};
     let model = ctx.model;
     let cols = ctx.cols;
@@ -1149,13 +1161,18 @@ fn sandbox_full(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
     rows.push(rule());
 
-    let cursor = ctx.ui.cursor.min(model.containers.len().saturating_sub(1));
+    let visible = crate::handlers::sandbox_panel::visible_containers(
+        &model.containers,
+        &model.active_container_name,
+        show_all,
+    );
+    let cursor = ctx.ui.cursor.min(visible.len().saturating_sub(1));
     let list_w = (cols / 2).clamp(30, 60);
     let mut list_rows: Vec<Vec<crate::seg::Seg>> = vec![vec![
         seg(g2(), "CONTAINERS").bold(),
-        seg(g(), format!("  {}", model.containers.len())),
+        seg(g(), format!("  {}", visible.len())),
     ]];
-    for (i, c) in model.containers.iter().enumerate() {
+    for (i, c) in visible.iter().enumerate() {
         let sel = i == cursor;
         let mark = if c.ours {
             seg(hue(Hue::Green), "● ")
@@ -1169,7 +1186,7 @@ fn sandbox_full(ctx: &SectionCtx) -> Vec<PanelRow> {
             seg(g(), format!(" · {} · {}", c.backend, c.status)),
         ]);
     }
-    if let Some(c) = model.containers.get(cursor) {
+    if let Some(c) = visible.get(cursor) {
         list_rows.push(Vec::new());
         list_rows.push(vec![
             seg(g(), "cpu "),
@@ -1216,30 +1233,60 @@ fn sandbox_full(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
 
     let combined = two_col(&list_rows, &detail, list_w, 2);
-    let n = model.containers.len();
+    let n = visible.len();
     rows.extend(combined.into_iter().enumerate().map(|(row_i, line)| {
         let row = PanelRow::plain(line);
         // Row 0 is the column title; container j sits at row j+1.
         if row_i >= 1 && row_i <= n {
-            row.with_hit(PanelHit::Row(Section::Sandbox, row_i - 1))
+            let selected = row_i - 1 == cursor;
+            let row = row.with_hit(PanelHit::Row(Section::Sandbox, row_i - 1));
+            if selected {
+                row.with_bg(crate::seg::Tok::SelAccent)
+            } else {
+                row
+            }
         } else {
             row
         }
     }));
-    rows.push(hint_row(&[
-        ("s", "stop"),
-        ("r", "restart"),
-        ("l", "logs"),
-        (
+    if let Some(row) = sandbox_hint(ctx, show_all) {
+        rows.push(row);
+    }
+    rows
+}
+
+fn sandbox_hint(ctx: &SectionCtx, show_all: bool) -> Option<PanelRow> {
+    let model = ctx.model;
+    let target = crate::handlers::sandbox_panel::target(
+        &model.containers,
+        &model.active_container_name,
+        show_all,
+        ctx.ui.width,
+        ctx.ui.cursor,
+    );
+    let mut hints = Vec::new();
+    if let Some(container) = target {
+        if container.ours {
+            hints.extend([("s", "stop"), ("r", "restart"), ("l", "logs")]);
+        } else {
+            hints.extend([("l", "logs"), ("", "(read-only)")]);
+        }
+    }
+    if !model.containers.is_empty() {
+        hints.push((
             "g",
-            if crate::panel::scope::system_all() {
+            if show_all {
                 "this worktree"
             } else {
                 "all containers"
             },
-        ),
-    ]));
-    rows
+        ));
+    }
+    if hints.is_empty() {
+        None
+    } else {
+        Some(hint_row(&hints))
+    }
 }
 
 pub(super) fn db() -> Vec<PanelRow> {
@@ -1251,4 +1298,135 @@ pub(super) fn db() -> Vec<PanelRow> {
             "db introspection not wired yet",
         )])),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chrome::FrameModel;
+    use crate::layout::PanelWidth;
+    use crate::panel::PanelUi;
+    use thegn_core::sandbox::ContainerInfo;
+
+    fn container(name: &str, ours: bool) -> ContainerInfo {
+        ContainerInfo {
+            name: name.into(),
+            image: "image".into(),
+            status: "running".into(),
+            ours,
+            backend: "podman".into(),
+            cpu: String::new(),
+            mem: String::new(),
+            net: String::new(),
+            containment: "worktree+caches".into(),
+            mounts: String::new(),
+        }
+    }
+
+    fn model_with_containers() -> FrameModel {
+        FrameModel {
+            containers: vec![
+                container("thegn-repo-home", true),
+                container("postgres-dev", false),
+            ],
+            active_container_name: "thegn-repo-home".into(),
+            ..FrameModel::default()
+        }
+    }
+
+    fn text(rows: &[PanelRow]) -> String {
+        rows.iter()
+            .flat_map(|row| match &row.line {
+                Line::Segs(segs) => segs.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>(),
+                Line::Split { l, r } => l.iter().chain(r).map(|seg| seg.text.as_str()).collect(),
+                Line::SplitMinLeft { l, r, .. } => {
+                    l.iter().chain(r).map(|seg| seg.text.as_str()).collect()
+                }
+                Line::Blank | Line::Fill { .. } => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn full_respects_worktree_scope() {
+        let model = model_with_containers();
+        let ui = PanelUi {
+            open: Section::Sandbox,
+            width: PanelWidth::Full,
+            ..PanelUi::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 100,
+            rows: 30,
+        };
+        assert!(!text(&sandbox_full_with(&ctx, false)).contains("postgres-dev"));
+    }
+
+    #[test]
+    fn half_all_container_rows_have_contiguous_hits() {
+        let model = model_with_containers();
+        let ui = PanelUi {
+            open: Section::Sandbox,
+            width: PanelWidth::Half,
+            cursor: 1,
+            ..PanelUi::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 60,
+            rows: 30,
+        };
+        let rows = sandbox_with(&ctx, true);
+        let hits: Vec<usize> = rows
+            .iter()
+            .filter_map(|row| match row.hit {
+                Some(PanelHit::Row(Section::Sandbox, index)) => Some(index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hits, vec![0, 1]);
+    }
+
+    #[test]
+    fn off_state_has_setup_banner_without_dead_actions() {
+        let model = FrameModel::default();
+        let ui = PanelUi {
+            open: Section::Sandbox,
+            width: PanelWidth::Normal,
+            ..PanelUi::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 40,
+            rows: 12,
+        };
+        let rows = sandbox_with(&ctx, false);
+        let rendered = text(&rows);
+        assert!(rendered.contains("sandbox off — set [sandbox] backend (see F1)"));
+        assert!(!rendered.contains("s stop"));
+        assert!(!rendered.contains("r restart"));
+        assert!(!rendered.contains("l logs"));
+    }
+
+    #[test]
+    fn off_state_with_no_containers_has_no_empty_hint_row() {
+        let model = FrameModel::default();
+        let ui = PanelUi {
+            open: Section::Sandbox,
+            width: PanelWidth::Normal,
+            ..PanelUi::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 40,
+            rows: 12,
+        };
+        assert!(sandbox_hint(&ctx, false).is_none());
+    }
 }
