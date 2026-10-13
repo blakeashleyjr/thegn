@@ -49,17 +49,25 @@ fn panel_doc_sections(heading: &str) -> Vec<crate::panel::Section> {
         .collect()
 }
 
-fn panel_chord_advertised(sections: &[crate::panel::Section], token: &str, chord: char) -> bool {
+fn is_panel_doc_chord(token: &str) -> bool {
+    token == "↵" || (token.len() == 1 && token.as_bytes()[0].is_ascii_graphic())
+}
+
+fn panel_chord_matches(table_chord: &str, token: &str) -> bool {
+    table_chord == token || (token == "↵" && table_chord.eq_ignore_ascii_case("enter"))
+}
+
+fn panel_chord_advertised(sections: &[crate::panel::Section], token: &str) -> bool {
     sections.iter().any(|section| {
         crate::panel::section_keys::section_keys(*section)
             .iter()
-            .any(|key| key.chord == token)
+            .any(|key| panel_chord_matches(key.chord, token))
             || section.home_view().is_some_and(|view| {
                 crate::panel::gitui::context_keys(view)
                     .iter()
-                    .any(|key| key.chord == token)
+                    .any(|key| panel_chord_matches(key.chord, token))
             })
-    }) || "eEjkJK0123456789".contains(chord)
+    }) || (token.len() == 1 && "eEjkJK0123456789".contains(token))
 }
 
 fn known_unadvertised_section(
@@ -104,6 +112,14 @@ fn panel_doc_chords_are_section_keys() {
             sections = panel_doc_sections(heading);
             directive_seen = false;
             authored_keys = false;
+        } else if line.starts_with("## ") {
+            assert!(
+                !directive_seen || !authored_keys,
+                "a generated key directive cannot share a subsection with a hand-written Keys run"
+            );
+            sections.clear();
+            directive_seen = false;
+            authored_keys = false;
         }
         if let Some(key) = line
             .trim()
@@ -123,16 +139,16 @@ fn panel_doc_chords_are_section_keys() {
         let spans: Vec<&str> = line.split('`').collect();
         for index in (1..spans.len()).step_by(2) {
             let token = spans[index];
-            let mut chars = token.chars();
-            let Some(chord) = chars.next() else { continue };
-            if chars.next().is_some() {
+            if !is_panel_doc_chord(token) {
                 continue;
             }
+            let mut chars = token.chars();
+            let Some(chord) = chars.next() else { continue };
             if sections.is_empty() {
                 continue;
             }
             match (
-                panel_chord_advertised(&sections, token, chord),
+                panel_chord_advertised(&sections, token),
                 known_unadvertised_section(&sections, chord),
             ) {
                 (false, Some(section)) => {
@@ -174,7 +190,7 @@ fn help_section_keys_ratchet_update() {
         "# help-section-keys-ratchet — `panel:<section>:<chord>` prose entries".to_string(),
         "# containing real chords omitted from the subsection's section tables. Shrink only."
             .to_string(),
-        "# notifications A and /; logs Y; environments t; media + - [ ] f.".to_string(),
+        "# notifications A and /; logs Y; environments t; media + - [ ] f; PR queue h.".to_string(),
     ];
     let body = source
         .split_once("---\n")
@@ -185,6 +201,8 @@ fn help_section_keys_ratchet_update() {
     for line in body.lines() {
         if let Some(heading) = line.strip_prefix("### ") {
             sections = panel_doc_sections(heading);
+        } else if line.starts_with("## ") {
+            sections.clear();
         }
         if let Some(key) = line
             .trim()
@@ -199,12 +217,12 @@ fn help_section_keys_ratchet_update() {
             continue;
         }
         for token in line.split('`').skip(1).step_by(2) {
-            let mut chars = token.chars();
-            let Some(ch) = chars.next() else { continue };
-            if chars.next().is_some() {
+            if !is_panel_doc_chord(token) {
                 continue;
             }
-            if !panel_chord_advertised(&sections, token, ch)
+            let mut chars = token.chars();
+            let Some(ch) = chars.next() else { continue };
+            if !panel_chord_advertised(&sections, token)
                 && let Some(section) = known_unadvertised_section(&sections, ch)
             {
                 debt.insert(format!("panel:{}:{token}", section.as_key()));
@@ -214,6 +232,20 @@ fn help_section_keys_ratchet_update() {
     lines.extend(debt);
     std::fs::write(panel_keys_ratchet_path(), lines.join("\n") + "\n")
         .expect("write panel key ratchet");
+}
+
+#[test]
+fn panel_doc_chords_filter_glyphs_and_match_enter_alias() {
+    assert!(is_panel_doc_chord("x"));
+    assert!(is_panel_doc_chord("↵"));
+    assert!(!is_panel_doc_chord("◈"));
+    assert!(!is_panel_doc_chord("✋"));
+    assert!(!is_panel_doc_chord("space"));
+
+    assert!(panel_chord_advertised(
+        &[crate::panel::Section::Commits],
+        "↵"
+    ));
 }
 
 fn read_allowlist(path: PathBuf) -> Vec<String> {
