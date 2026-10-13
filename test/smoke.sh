@@ -92,7 +92,9 @@ cleanup() {
     fi
   done
   [[ -d "$TMP/.local/share/containers" ]] && podman unshare rm -rf "$TMP/.local/share/containers" >/dev/null 2>&1 || true
-  local pause_pid_file="${XDG_RUNTIME_DIR:-}/libpod/tmp/pause.pid"
+  # Cleanup must stay inside this test's runtime root even if a signal arrives
+  # before the isolated XDG_RUNTIME_DIR export below.
+  local pause_pid_file="$TMP/run/libpod/tmp/pause.pid"
   if [[ -f $pause_pid_file ]]; then
     kill "$(cat "$pause_pid_file" 2>/dev/null)" 2>/dev/null || true
   fi
