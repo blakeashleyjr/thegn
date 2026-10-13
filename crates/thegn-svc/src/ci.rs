@@ -41,6 +41,12 @@ const CI_CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const CI_LOG_TIMEOUT: Duration = Duration::from_secs(60);
 const CI_CLI_MAX_STDOUT: usize = 8 * 1024 * 1024;
 const CI_CLI_MAX_STDERR: usize = 64 * 1024;
+const PROVIDER_JSON_MAX_DEPTH: usize = 32;
+const PROVIDER_JSON_MAX_NODES: usize = 262_144;
+const PROVIDER_JSON_MAX_CONTAINER_ITEMS: usize = 10_000;
+const PROVIDER_JSON_MAX_STRING_BYTES: usize = 1024 * 1024;
+const MAX_PROVIDER_FIELD_BYTES: usize = 4096;
+const FALLBACK_READER_GRACE: Duration = Duration::from_millis(500);
 
 /// A CI/CD backend for one provider. Read methods first; mutations are
 /// capability-gated via [`Self::caps`] so a provider can decline what it can't do.
@@ -309,27 +315,20 @@ fn run_cli(cmd: Command, cancel: &AtomicBool) -> Result<String, CiError> {
 }
 
 fn run_cli_within(
-    mut cmd: Command,
+    cmd: Command,
     limits: crate::issue::gh_run::Limits,
     cancel: &AtomicBool,
 ) -> Result<String, CiError> {
     use crate::issue::gh_run::run_blocking;
-    use crate::plugin::proc::bounded_group_termination_supported;
-
-    if !bounded_group_termination_supported() {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(CiError::Other("CI provider command cancelled".into()));
-        }
-        // Preserve the established platform behavior where process-group
-        // termination is unavailable; bounded tree ownership is supported on
-        // platforms accepted by the shared runner.
-        let out = cmd
-            .output()
-            .map_err(|error| CiError::Other(error.to_string()))?;
-        return if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    if !crate::plugin::proc::bounded_group_termination_supported() {
+        let max_stdout = limits.max_stdout;
+        let (stdout, status, stderr) = run_fallback_bounded(cmd, limits, cancel, move |reader| {
+            read_capped(reader, max_stdout)
+        })?;
+        return if status.success() {
+            Ok(String::from_utf8_lossy(&stdout).into_owned())
         } else {
-            Err(classify_stderr(&String::from_utf8_lossy(&out.stderr)))
+            Err(classify_stderr(&stderr))
         };
     }
 
@@ -345,6 +344,257 @@ fn ci_run_error(error: crate::issue::gh_run::RunError) -> CiError {
         RunError::Truncated => CiError::Other("provider output byte budget exhausted".into()),
         RunError::Io(message) => CiError::Other(format!("CI provider command failed: {message}")),
         RunError::Cancelled => CiError::Other("CI provider command cancelled".into()),
+    }
+}
+
+/// Run the bounded std-only fallback used where process-tree termination is
+/// unavailable. Reader threads own the pipes, while this worker owns the child
+/// and polls a single deadline and cancellation flag.
+fn run_fallback_bounded<T, F>(
+    mut cmd: Command,
+    limits: crate::issue::gh_run::Limits,
+    cancel: &AtomicBool,
+    consume: F,
+) -> Result<(T, std::process::ExitStatus, String), CiError>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut dyn Read) -> Result<T, CiError> + Send + 'static,
+{
+    use std::sync::mpsc::{self, TryRecvError};
+    use std::time::Instant;
+
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(CiError::Other("CI provider command cancelled".into()));
+    }
+    let deadline = Instant::now() + limits.timeout;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                CiError::NotInstalled
+            } else {
+                CiError::Other(format!("CI provider command failed: {error}"))
+            }
+        })?;
+    let Some(stdout) = child.stdout.take() else {
+        fallback_kill_reap(&mut child, "missing stdout pipe");
+        return Err(CiError::Other("provider stdout was not piped".into()));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        fallback_kill_reap(&mut child, "missing stderr pipe");
+        return Err(CiError::Other("provider stderr was not piped".into()));
+    };
+
+    let (out_tx, out_rx) = mpsc::channel();
+    let output_reader = std::thread::Builder::new()
+        .spawn(move || {
+            let mut stdout = stdout;
+            let result = consume(&mut stdout);
+            if let Err(error) = out_tx.send(result) {
+                tracing::debug!(target: "thegn::ci", %error, "failed to return provider stdout result");
+            }
+        })
+        .map_err(|error| {
+            fallback_kill_reap(&mut child, "stdout reader setup failed");
+            CiError::Other(format!("provider stdout reader setup failed: {error}"))
+        })?;
+    let (err_tx, err_rx) = mpsc::channel();
+    let max_stderr = limits.max_stderr;
+    let error_reader = match std::thread::Builder::new().spawn(move || {
+        let result = read_stderr_checked(stderr, max_stderr);
+        if let Err(error) = err_tx.send(result) {
+            tracing::debug!(target: "thegn::ci", %error, "failed to return provider stderr result");
+        }
+    }) {
+        Ok(reader) => reader,
+        Err(error) => {
+            fallback_kill_reap(&mut child, "stderr reader setup failed");
+            match out_rx.recv_timeout(FALLBACK_READER_GRACE) {
+                Ok(Ok(_)) => {}
+                Ok(Err(reader_error)) => {
+                    tracing::debug!(target: "thegn::ci", %reader_error, "stdout reader failed during fallback setup cleanup")
+                }
+                Err(receive_error) => {
+                    tracing::debug!(target: "thegn::ci", %receive_error, "stdout reader cleanup grace expired")
+                }
+            }
+            drop(output_reader);
+            return Err(CiError::Other(format!(
+                "provider stderr reader setup failed: {error}"
+            )));
+        }
+    };
+
+    let mut output = None;
+    let mut stderr = None;
+    let mut status = None;
+    let mut exited_at = None;
+    let mut terminal_error = None;
+    loop {
+        if output.is_none() {
+            match out_rx.try_recv() {
+                Ok(Ok(value)) => output = Some(value),
+                Ok(Err(error)) => terminal_error = Some(error),
+                Err(TryRecvError::Disconnected) => {
+                    terminal_error.get_or_insert_with(|| {
+                        CiError::Other("provider stdout reader stopped".into())
+                    });
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if stderr.is_none() {
+            match err_rx.try_recv() {
+                Ok(Ok(value)) => stderr = Some(value),
+                Ok(Err(error)) => {
+                    terminal_error.get_or_insert(error);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    terminal_error.get_or_insert_with(|| {
+                        CiError::Other("provider stderr reader stopped".into())
+                    });
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if terminal_error.is_some() || cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit)) => {
+                    status = Some(exit);
+                    exited_at = Some(Instant::now());
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    terminal_error = Some(CiError::Other(format!(
+                        "provider process wait failed: {error}"
+                    )));
+                    break;
+                }
+            }
+        }
+        if status.is_some() && output.is_some() && stderr.is_some() {
+            break;
+        }
+        let now = Instant::now();
+        if now >= deadline || exited_at.is_some_and(|at| now >= at + FALLBACK_READER_GRACE) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let cancelled = cancel.load(std::sync::atomic::Ordering::Relaxed);
+    let timed_out = status.is_none() && terminal_error.is_none() && !cancelled;
+    if status.is_none() {
+        match fallback_terminate(&mut child) {
+            Ok(exit) => status = Some(exit),
+            Err(error) => terminal_error = Some(error),
+        }
+    }
+
+    let grace_deadline = Instant::now() + FALLBACK_READER_GRACE;
+    while (output.is_none() || stderr.is_none()) && Instant::now() < grace_deadline {
+        if output.is_none() {
+            match out_rx.try_recv() {
+                Ok(Ok(value)) => output = Some(value),
+                Ok(Err(error)) => terminal_error = Some(error),
+                Err(TryRecvError::Disconnected | TryRecvError::Empty) => {}
+            }
+        }
+        if stderr.is_none() {
+            match err_rx.try_recv() {
+                Ok(Ok(value)) => stderr = Some(value),
+                Ok(Err(error)) => terminal_error = Some(error),
+                Err(TryRecvError::Disconnected | TryRecvError::Empty) => {}
+            }
+        }
+        if output.is_none() || stderr.is_none() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    drop(output_reader);
+    drop(error_reader);
+    if cancelled {
+        return Err(CiError::Other("CI provider command cancelled".into()));
+    }
+    if timed_out {
+        return Err(CiError::Other("CI provider command timed out".into()));
+    }
+    if let Some(error) = terminal_error {
+        return Err(error);
+    }
+    let output =
+        output.ok_or_else(|| CiError::Other("provider stdout reader grace expired".into()))?;
+    let stderr =
+        stderr.ok_or_else(|| CiError::Other("provider stderr reader grace expired".into()))?;
+    let status =
+        status.ok_or_else(|| CiError::Other("provider process has no terminal status".into()))?;
+    Ok((output, status, stderr))
+}
+
+fn fallback_kill_reap(child: &mut std::process::Child, reason: &str) {
+    if let Err(error) = child.kill() {
+        tracing::debug!(target: "thegn::ci", %error, reason, "failed to kill fallback provider child");
+    }
+    let deadline = std::time::Instant::now() + FALLBACK_READER_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            Ok(None) => {
+                tracing::debug!(target: "thegn::ci", reason, "fallback provider child reap grace expired");
+                return;
+            }
+            Err(error) => {
+                tracing::debug!(target: "thegn::ci", %error, reason, "failed to reap fallback provider child");
+                return;
+            }
+        }
+    }
+}
+
+fn fallback_terminate(
+    child: &mut std::process::Child,
+) -> Result<std::process::ExitStatus, CiError> {
+    if let Err(error) = child.kill() {
+        tracing::debug!(target: "thegn::ci", %error, "failed to kill fallback provider child");
+    }
+    let deadline = std::time::Instant::now() + FALLBACK_READER_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            Ok(None) => return Err(CiError::Other("provider process reap grace expired".into())),
+            Err(error) => {
+                return Err(CiError::Other(format!(
+                    "provider process wait failed: {error}"
+                )));
+            }
+        }
+    }
+}
+
+fn read_stderr_checked<R: Read>(mut reader: R, max: usize) -> Result<String, CiError> {
+    let mut bytes = Vec::with_capacity(max.min(64 * 1024));
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .map_err(|error| CiError::Other(format!("provider stderr read failed: {error}")))?;
+        if n == 0 {
+            return Ok(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        let retained = n.min(max.saturating_sub(bytes.len()));
+        bytes.extend_from_slice(&chunk[..retained]);
     }
 }
 
@@ -385,57 +635,17 @@ fn run_cli_capped(cmd: Command, max: usize, cancel: &AtomicBool) -> Result<Strin
             cancel,
         );
     }
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(CiError::Other("CI provider command cancelled".into()));
-    }
-    let mut cmd = cmd;
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| CiError::Other(error.to_string()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| CiError::Other("provider stdout was not piped".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| CiError::Other("provider stderr was not piped".into()))?;
-    let err_thread = std::thread::spawn(|| read_stderr(stderr));
-    let output = read_capped(stdout, max);
-    if output.is_err() {
-        // best-effort: the bounded read error is primary; still attempt to stop
-        // and reap the child so it cannot outlive the failed read.
-        if let Err(error) = child.kill()
-            && error.kind() != std::io::ErrorKind::InvalidInput
-        {
-            tracing::debug!(target: "thegn::ci", "failed to kill provider after output limit");
-        }
-        if let Err(error) = child.wait() {
-            tracing::debug!(target: "thegn::ci", "failed to reap provider after output limit");
-            return Err(CiError::Other(format!(
-                "provider process wait failed: {}",
-                error.kind()
-            )));
-        }
-        if err_thread.join().is_err() {
-            tracing::debug!(target: "thegn::ci", "provider stderr reader panicked after output limit");
-        }
-        return output.map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-    }
-    let status = child
-        .wait()
-        .map_err(|error| CiError::Other(error.to_string()))?;
-    let stderr = err_thread
-        .join()
-        .map_err(|_| CiError::Other("provider stderr reader panicked".into()))?;
-    let output = output?;
+    let limits = crate::issue::gh_run::Limits {
+        timeout: CI_CLI_TIMEOUT,
+        max_stdout: max,
+        max_stderr: CI_CLI_MAX_STDERR,
+    };
+    let (output, status, stderr) =
+        run_fallback_bounded(cmd, limits, cancel, move |reader| read_capped(reader, max))?;
     if !status.success() {
         return Err(classify_stderr(&stderr));
     }
-    String::from_utf8(output).map_err(|_| CiError::Other("provider output was not UTF-8".into()))
+    Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
 /// Run a log-producing command while retaining only its newest complete lines.
@@ -477,38 +687,12 @@ fn run_bounded_log_within(
         return Ok(CiLog { text, truncated });
     }
 
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(CiError::Other("CI provider command cancelled".into()));
-    }
-
-    let mut cmd = cmd;
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| CiError::Other(e.to_string()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| CiError::Other("provider stdout was not piped".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| CiError::Other("provider stderr was not piped".into()))?;
-
-    let out_thread = std::thread::spawn(|| collect_log(stdout));
-    let err_thread = std::thread::spawn(|| read_stderr(stderr));
-    let status = child.wait().map_err(|e| CiError::Other(e.to_string()))?;
-    let (text, truncated) = out_thread
-        .join()
-        .map_err(|_| CiError::Other("provider log reader panicked".into()))??;
-    let stderr = err_thread
-        .join()
-        .map_err(|_| CiError::Other("provider stderr reader panicked".into()))?;
+    let (log_result, status, stderr) =
+        run_fallback_bounded(cmd, limits, cancel, |reader| collect_log(reader))?;
     if !status.success() {
         return Err(classify_stderr(&stderr));
     }
+    let (text, truncated) = log_result;
     Ok(CiLog { text, truncated })
 }
 
@@ -624,26 +808,154 @@ fn push_log_line(
     }
 }
 
-fn read_stderr<R: Read>(mut reader: R) -> String {
-    let mut bytes = Vec::new();
-    let mut chunk = [0u8; 4096];
-    while let Ok(n) = reader.read(&mut chunk) {
-        if n == 0 {
-            break;
-        }
-        if bytes.len() < 64 * 1024 {
-            let take = n.min(64 * 1024 - bytes.len());
-            bytes.extend_from_slice(&chunk[..take]);
-        }
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
 fn nonempty(s: &serde_json::Value, key: &str) -> Option<String> {
     s.get(key)
         .and_then(|v| v.as_str())
+        .filter(|value| value.len() <= MAX_PROVIDER_FIELD_BYTES)
         .map(str::to_string)
         .filter(|v| !v.is_empty())
+}
+
+/// Allocation-free structural scan before serde constructs a provider tree.
+fn preflight_provider_json(input: &[u8]) -> Result<(), &'static str> {
+    if input.len() > CI_CLI_MAX_STDOUT {
+        return Err("json byte limit");
+    }
+    let mut stack: Vec<(u8, usize, bool)> = Vec::new();
+    let mut nodes = 0usize;
+    let mut i = 0usize;
+    while i < input.len() {
+        match input[i] {
+            b' ' | b'\n' | b'\r' | b'\t' | b':' => i += 1,
+            b',' => {
+                if let Some((_, commas, has_item)) = stack.last_mut()
+                    && *has_item
+                {
+                    *commas = commas.saturating_add(1);
+                    *has_item = false;
+                }
+                i += 1;
+            }
+            b'{' | b'[' => {
+                nodes = nodes.saturating_add(1);
+                if nodes > PROVIDER_JSON_MAX_NODES {
+                    return Err("json node limit");
+                }
+                if let Some((_, _, has_item)) = stack.last_mut() {
+                    *has_item = true;
+                }
+                stack.push((input[i], 0, false));
+                if stack.len() > PROVIDER_JSON_MAX_DEPTH {
+                    return Err("json depth limit");
+                }
+                i += 1;
+            }
+            b'}' | b']' => {
+                let expected = if input[i] == b'}' { b'{' } else { b'[' };
+                let Some((kind, commas, has_item)) = stack.pop() else {
+                    return Err("json nesting");
+                };
+                if kind != expected {
+                    return Err("json nesting");
+                }
+                if commas.saturating_add(usize::from(has_item)) > PROVIDER_JSON_MAX_CONTAINER_ITEMS
+                {
+                    return Err("json container limit");
+                }
+                i += 1;
+            }
+            b'"' => {
+                if let Some((_, _, has_item)) = stack.last_mut() {
+                    *has_item = true;
+                }
+                nodes = nodes.saturating_add(1);
+                if nodes > PROVIDER_JSON_MAX_NODES {
+                    return Err("json node limit");
+                }
+                i += 1;
+                let mut decoded = 0usize;
+                let mut closed = false;
+                while i < input.len() {
+                    match input[i] {
+                        b'"' => {
+                            i += 1;
+                            closed = true;
+                            break;
+                        }
+                        b'\\' => {
+                            i += 1;
+                            let Some(escape) = input.get(i).copied() else {
+                                return Err("json string");
+                            };
+                            if escape == b'u' {
+                                if i + 4 >= input.len()
+                                    || !input[i + 1..i + 5].iter().all(|b| b.is_ascii_hexdigit())
+                                {
+                                    return Err("json escape");
+                                }
+                                decoded = decoded.saturating_add(3);
+                                i += 5;
+                            } else if matches!(
+                                escape,
+                                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't'
+                            ) {
+                                decoded = decoded.saturating_add(1);
+                                i += 1;
+                            } else {
+                                return Err("json escape");
+                            }
+                        }
+                        b if b < 0x20 => return Err("json control"),
+                        _ => {
+                            decoded = decoded.saturating_add(1);
+                            i += 1;
+                        }
+                    }
+                    if decoded > PROVIDER_JSON_MAX_STRING_BYTES {
+                        return Err("json string limit");
+                    }
+                }
+                if !closed {
+                    return Err("json string");
+                }
+            }
+            _ => {
+                if let Some((_, _, has_item)) = stack.last_mut() {
+                    *has_item = true;
+                }
+                nodes = nodes.saturating_add(1);
+                if nodes > PROVIDER_JSON_MAX_NODES {
+                    return Err("json node limit");
+                }
+                while i < input.len()
+                    && !matches!(input[i], b' ' | b'\n' | b'\r' | b'\t' | b',' | b']' | b'}')
+                {
+                    i += 1;
+                }
+            }
+        }
+    }
+    if stack.is_empty() {
+        Ok(())
+    } else {
+        Err("json nesting")
+    }
+}
+
+fn decode_provider_json<T: serde::de::DeserializeOwned>(
+    json: &str,
+    what: &str,
+) -> Result<T, String> {
+    preflight_provider_json(json.as_bytes())
+        .map_err(|reason| format!("invalid {what} response: {reason}"))?;
+    serde_json::from_str(json).map_err(|error| format!("invalid {what} response: {error}"))
+}
+
+fn cap_provider_rows(mut runs: Vec<CiRun>, limit: usize) -> (Vec<CiRun>, usize) {
+    let keep = limit.max(1);
+    let discarded = runs.len().saturating_sub(keep);
+    runs.truncate(keep);
+    (runs, discarded)
 }
 
 /// Parse provider JSON identifiers as unsigned JSON integers. Provider IDs do
@@ -887,8 +1199,10 @@ impl CiProvider for GithubCi {
         }
         let json = run_cli(self.command(loc, &args)?, &self.cancel)?;
         let (runs, discarded_rows) = parse_gh_runs_with_discarded(&json).map_err(CiError::Other)?;
+        let (runs, overflow) = cap_provider_rows(runs, limit);
+        let discarded_rows = discarded_rows.saturating_add(overflow);
         if discarded_rows > 0 {
-            tracing::warn!(target: "thegn::ci", discarded_rows, "discarded malformed GitHub run rows");
+            tracing::warn!(target: "thegn::ci", discarded_rows, "discarded malformed or excess GitHub run rows");
         }
         Ok(CiRunList {
             runs,
@@ -900,8 +1214,8 @@ impl CiProvider for GithubCi {
         let args = github_run_detail_argv(run_id)?;
         let argv: Vec<_> = args.iter().map(String::as_str).collect();
         let json = run_cli(self.command(loc, &argv)?, &self.cancel)?;
-        let value: serde_json::Value = serde_json::from_str(&json)
-            .map_err(|error| CiError::Other(format!("invalid provider run response: {error}")))?;
+        let value: serde_json::Value =
+            decode_provider_json(&json, "provider run").map_err(CiError::Other)?;
         let observed = value
             .get("databaseId")
             .cloned()
@@ -995,14 +1309,13 @@ pub fn parse_gh_runs(json: &str) -> Result<Vec<CiRun>, String> {
 }
 
 pub fn parse_gh_runs_with_discarded(json: &str) -> Result<(Vec<CiRun>, usize), String> {
-    let rows = serde_json::from_str::<Vec<serde_json::Value>>(json)
-        .map_err(|error| format!("invalid GitHub runs response: {error}"))?;
+    let rows = decode_provider_json::<Vec<serde_json::Value>>(json, "GitHub runs")?;
     Ok(parse_provider_row(&rows, gh_run_from_value))
 }
 
 /// Parse `gh run view <id> --json …` (a single object, with `jobs`).
 pub fn parse_gh_run_detail(json: &str) -> Option<CiRun> {
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let v: serde_json::Value = decode_provider_json(json, "GitHub run").ok()?;
     if !v.is_object() {
         return None;
     }
@@ -1112,8 +1425,7 @@ fn warn_unknown_github_state(kind: &str, status: &str, conclusion: Option<&str>)
 
 /// Parse `gh workflow list --json id,name,path,state`.
 pub fn parse_gh_workflows(json: &str) -> Result<Vec<CiWorkflow>, String> {
-    let arr = serde_json::from_str::<Vec<serde_json::Value>>(json)
-        .map_err(|error| format!("invalid GitHub workflows response: {error}"))?;
+    let arr = decode_provider_json::<Vec<serde_json::Value>>(json, "GitHub workflows")?;
     arr.iter()
         .map(|v| {
             Some(CiWorkflow {
@@ -1282,8 +1594,10 @@ impl CiProvider for GitlabCi {
         )?;
         let (runs, discarded) =
             parse_gitlab_pipelines_with_discarded(&json).map_err(CiError::Other)?;
+        let (runs, overflow) = cap_provider_rows(runs, limit);
+        let discarded = discarded.saturating_add(overflow);
         if discarded > 0 {
-            tracing::warn!(target: "thegn::ci", discarded_rows = discarded, "discarded malformed GitLab pipeline rows");
+            tracing::warn!(target: "thegn::ci", discarded_rows = discarded, "discarded malformed or excess GitLab pipeline rows");
         }
         Ok(CiRunList {
             runs,
@@ -1302,13 +1616,14 @@ impl CiProvider for GitlabCi {
             self.command(loc, &remote, &["api", &run_endpoint])?,
             &self.cancel,
         )?;
-        let value: serde_json::Value = serde_json::from_str(&pipe_json).map_err(|error| {
-            CiError::Other(format!("invalid provider pipeline response: {error}"))
-        })?;
+        let value: serde_json::Value =
+            decode_provider_json(&pipe_json, "provider pipeline").map_err(CiError::Other)?;
         let observed = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
-        let mut run = parse_gitlab_pipeline_detail(&pipe_json).ok_or_else(|| {
-            CiError::Other(format!("invalid provider pipeline identifier {observed}"))
-        })?;
+        let mut run = gitlab_pipeline_from_value(&value)
+            .filter(|_| nonempty(&value, "status").is_some())
+            .ok_or_else(|| {
+                CiError::Other(format!("invalid provider pipeline identifier {observed}"))
+            })?;
         validate_ci_id(&run.id)?;
         if run.id != run_id {
             return Err(CiError::Other(format!(
@@ -1331,12 +1646,10 @@ impl CiProvider for GitlabCi {
             )?;
             bytes = bytes.saturating_add(jobs_json.len());
             let page_rows =
-                serde_json::from_str::<Vec<serde_json::Value>>(&jobs_json).map_err(|error| {
-                    CiError::Other(format!("invalid GitLab jobs response: {error}"))
-                })?;
+                decode_provider_json::<Vec<serde_json::Value>>(&jobs_json, "GitLab jobs")
+                    .map_err(CiError::Other)?;
             let page_length = page_rows.len();
-            let (parsed, discarded) =
-                parse_gitlab_jobs_with_discarded(&jobs_json).map_err(CiError::Other)?;
+            let (parsed, discarded) = parse_provider_row(&page_rows, gitlab_job_from_value);
             for job in parsed {
                 if !ids.insert(job.id.clone()) {
                     return Err(CiError::Other(format!(
@@ -1615,14 +1928,13 @@ pub fn parse_gitlab_pipelines(json: &str) -> Result<Vec<CiRun>, String> {
 }
 
 pub fn parse_gitlab_pipelines_with_discarded(json: &str) -> Result<(Vec<CiRun>, usize), String> {
-    let rows = serde_json::from_str::<Vec<serde_json::Value>>(json)
-        .map_err(|error| format!("invalid GitLab pipelines response: {error}"))?;
+    let rows = decode_provider_json::<Vec<serde_json::Value>>(json, "GitLab pipelines")?;
     Ok(parse_provider_row(&rows, gitlab_pipeline_from_value))
 }
 
 /// Parse `GET projects/:id/pipelines/:id` (single object) into a run header.
 pub fn parse_gitlab_pipeline_detail(json: &str) -> Option<CiRun> {
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let v: serde_json::Value = decode_provider_json(json, "GitLab pipeline").ok()?;
     if !v.is_object() {
         return None;
     }
@@ -1660,22 +1972,23 @@ pub fn parse_gitlab_jobs(json: &str) -> Result<Vec<CiJob>, String> {
 }
 
 pub fn parse_gitlab_jobs_with_discarded(json: &str) -> Result<(Vec<CiJob>, usize), String> {
-    let arr = serde_json::from_str::<Vec<serde_json::Value>>(json)
-        .map_err(|error| format!("invalid GitLab jobs response: {error}"))?;
-    Ok(parse_provider_row(&arr, |v| {
-        let id = json_id(v, "id")?;
-        let status = nonempty(v, "status")?;
-        warn_unknown_gitlab_state(&status);
-        Some(CiJob {
-            id,
-            name: nonempty(v, "name").unwrap_or_default(),
-            state: CiState::from_gitlab(&status),
-            url: nonempty(v, "web_url"),
-            started_at: nonempty(v, "started_at"),
-            finished_at: nonempty(v, "finished_at"),
-            steps: Vec::new(),
-        })
-    }))
+    let arr = decode_provider_json::<Vec<serde_json::Value>>(json, "GitLab jobs")?;
+    Ok(parse_provider_row(&arr, gitlab_job_from_value))
+}
+
+fn gitlab_job_from_value(v: &serde_json::Value) -> Option<CiJob> {
+    let id = json_id(v, "id")?;
+    let status = nonempty(v, "status")?;
+    warn_unknown_gitlab_state(&status);
+    Some(CiJob {
+        id,
+        name: nonempty(v, "name").unwrap_or_default(),
+        state: CiState::from_gitlab(&status),
+        url: nonempty(v, "web_url"),
+        started_at: nonempty(v, "started_at"),
+        finished_at: nonempty(v, "finished_at"),
+        steps: Vec::new(),
+    })
 }
 
 fn warn_unknown_gitlab_state(status: &str) {
@@ -1703,6 +2016,10 @@ fn warn_unknown_gitlab_state(status: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shell_available() -> bool {
+        Command::new("sh").arg("-c").arg("sleep 0").output().is_ok()
+    }
 
     fn bounded_shell_available() -> bool {
         crate::plugin::proc::bounded_group_termination_supported()
@@ -1740,6 +2057,186 @@ mod tests {
             matches!(result, Err(CiError::Other(message)) if message == "CI provider command timed out")
         );
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn fallback_runner_times_out_a_hung_provider() {
+        if !shell_available() {
+            return;
+        }
+        let start = std::time::Instant::now();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30"]);
+        let result = run_fallback_bounded(
+            cmd,
+            test_limits(Duration::from_millis(200), 1024),
+            &test_cancel(),
+            |reader| read_capped(reader, 1024),
+        );
+        assert!(
+            matches!(result, Err(CiError::Other(message)) if message == "CI provider command timed out")
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn fallback_runner_succeeds_after_stdout_closes_before_exit() {
+        if !shell_available() {
+            return;
+        }
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf ok; exec 1>&-; sleep 0.2; echo err >&2"]);
+        let result = run_fallback_bounded(
+            cmd,
+            test_limits(Duration::from_secs(10), 1024),
+            &test_cancel(),
+            |reader| read_capped(reader, 1024),
+        );
+        let (stdout, status, stderr) = result.unwrap();
+        assert!(status.success());
+        assert_eq!(stdout, b"ok".to_vec());
+        assert_eq!(stderr, "err\n");
+    }
+
+    #[test]
+    fn fallback_runner_returns_nonzero_status_and_stderr() {
+        if !shell_available() {
+            return;
+        }
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exec 1>&-; sleep 0.2; echo bad >&2; exit 3"]);
+        let result = run_fallback_bounded(
+            cmd,
+            test_limits(Duration::from_secs(10), 1024),
+            &test_cancel(),
+            |reader| read_capped(reader, 1024),
+        );
+        let (stdout, status, stderr) = result.unwrap();
+        assert!(stdout.is_empty());
+        assert!(!status.success());
+        assert_eq!(stderr, "bad\n");
+    }
+
+    #[test]
+    fn fallback_runner_collects_multiline_log_output() {
+        if !shell_available() {
+            return;
+        }
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf 'first\\nsecond\\n'"]);
+        let result = run_fallback_bounded(
+            cmd,
+            test_limits(Duration::from_secs(10), 1024),
+            &test_cancel(),
+            |reader| collect_log(reader),
+        );
+        let ((text, truncated), status, stderr) = result.unwrap();
+        assert!(status.success());
+        assert_eq!(text, "first\nsecond\n");
+        assert!(!truncated);
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn fallback_runner_observes_cancellation() {
+        if !shell_available() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancel);
+        let start = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                signal.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "sleep 30"]);
+            let result = run_fallback_bounded(
+                cmd,
+                test_limits(Duration::from_secs(10), 1024),
+                &cancel,
+                |reader| read_capped(reader, 1024),
+            );
+            assert!(
+                matches!(result, Err(CiError::Other(message)) if message == "CI provider command cancelled")
+            );
+        });
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn fallback_runner_bounds_a_descendant_holding_stdout() {
+        if !shell_available() {
+            return;
+        }
+        let start = std::time::Instant::now();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30 & echo ok"]);
+        let result = run_fallback_bounded(
+            cmd,
+            test_limits(Duration::from_secs(10), 1024),
+            &test_cancel(),
+            |reader| read_capped(reader, 1024),
+        );
+        assert!(
+            matches!(result, Err(CiError::Other(message)) if message == "provider stdout reader grace expired")
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn provider_json_preflight_rejects_structure_and_field_overflow() {
+        let too_many = format!(
+            "[{}]",
+            vec!["0"; PROVIDER_JSON_MAX_CONTAINER_ITEMS + 1].join(",")
+        );
+        assert!(parse_gh_runs_with_discarded(&too_many).is_err());
+
+        let object = format!(
+            "{{{}}}",
+            (0..52)
+                .map(|index| format!("\"k{index}\":0"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let many_nodes = format!("[{}]", vec![object; 2500].join(","));
+        assert!(parse_gh_runs_with_discarded(&many_nodes).is_err());
+
+        let nested = format!(
+            "{}0{}",
+            "[".repeat(PROVIDER_JSON_MAX_DEPTH + 1),
+            "]".repeat(PROVIDER_JSON_MAX_DEPTH + 1)
+        );
+        assert!(parse_gh_runs_with_discarded(&nested).is_err());
+
+        let oversized = "x".repeat(PROVIDER_JSON_MAX_STRING_BYTES + 1);
+        let row = format!(
+            r#"[{{"databaseId":1,"workflowName":"CI","status":"completed","displayTitle":"{oversized}"}}]"#
+        );
+        assert!(parse_gh_runs_with_discarded(&row).is_err());
+    }
+
+    #[test]
+    fn oversized_retained_status_discards_provider_row() {
+        let status = "s".repeat(MAX_PROVIDER_FIELD_BYTES + 1);
+        let payload = format!(r#"[{{"databaseId":1,"workflowName":"CI","status":"{status}"}}]"#);
+        let (runs, discarded) = parse_gh_runs_with_discarded(&payload).unwrap();
+        assert!(runs.is_empty());
+        assert_eq!(discarded, 1);
+    }
+
+    #[test]
+    fn provider_run_rows_are_capped_to_requested_limit() {
+        let payload = r#"[
+          {"databaseId":1,"workflowName":"one","status":"completed"},
+          {"databaseId":2,"workflowName":"two","status":"completed"},
+          {"databaseId":3,"workflowName":"three","status":"completed"}
+        ]"#;
+        let (runs, _) = parse_gh_runs_with_discarded(payload).unwrap();
+        let (runs, overflow) = cap_provider_rows(runs, 2);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(overflow, 1);
     }
 
     #[test]

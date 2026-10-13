@@ -905,6 +905,22 @@ pub struct Db {
     pub(crate) schema_mismatch: Option<i64>,
 }
 
+static BACKGROUND_WORKER_HOOK: OnceLock<fn()> = OnceLock::new();
+
+/// Install the host's policy for core-owned background worker threads.
+/// Registration is first-set-wins so core remains independent of host crates.
+pub fn set_background_worker_hook(hook: fn()) {
+    if BACKGROUND_WORKER_HOOK.set(hook).is_err() {
+        tracing::debug!("background worker hook was already installed");
+    }
+}
+
+fn enter_background_worker() {
+    if let Some(hook) = BACKGROUND_WORKER_HOOK.get() {
+        hook();
+    }
+}
+
 /// A no-migration handle for one cataloged operation on an already-existing
 /// schema. The held shared lease prevents an authorized controller from
 /// migrating the file while this operation is using the older shape.
@@ -922,6 +938,32 @@ impl CompatibleDb {
     pub const fn operation(&self) -> SchemaOperation {
         self.operation
     }
+}
+
+fn spawn_semantic_sweep(path: PathBuf) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("thegn-sem-prune".to_string())
+        .spawn(move || {
+            enter_background_worker();
+            match Db::open_connection(&path) {
+                Ok(conn) => {
+                    if let Err(error) = conn.busy_timeout(std::time::Duration::from_millis(5000)) {
+                        tracing::warn!(%error, "semantic prune sweep failed");
+                        return;
+                    }
+                    let sweep_db = Db {
+                        conn,
+                        schema_mismatch: None,
+                    };
+                    if let Err(error) = sweep_missing_semantic_files(&sweep_db, 512) {
+                        tracing::warn!(%error, "semantic prune sweep failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "semantic prune sweep failed");
+                }
+            }
+        })
 }
 
 impl Db {
@@ -1209,29 +1251,7 @@ impl Db {
                 // the bounded-delete sweep on its own worker so opening the
                 // DB from the event loop never waits for that walk.
                 let sweep_path = path.clone();
-                if let Err(error) = std::thread::Builder::new()
-                    .name("thegn-sem-prune".to_string())
-                    .spawn(move || match Db::open_connection(&sweep_path) {
-                        Ok(conn) => {
-                            if let Err(error) =
-                                conn.busy_timeout(std::time::Duration::from_millis(5000))
-                            {
-                                tracing::warn!(%error, "semantic prune sweep failed");
-                                return;
-                            }
-                            let sweep_db = Db {
-                                conn,
-                                schema_mismatch: None,
-                            };
-                            if let Err(error) = sweep_missing_semantic_files(&sweep_db, 512) {
-                                tracing::warn!(%error, "semantic prune sweep failed");
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "semantic prune sweep failed");
-                        }
-                    })
-                {
+                if let Err(error) = spawn_semantic_sweep(sweep_path) {
                     tracing::debug!(%error, "could not start semantic entity prune worker");
                 }
             });

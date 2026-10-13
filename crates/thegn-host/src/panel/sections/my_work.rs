@@ -5,6 +5,7 @@
 //! headers do not, so the live `ui.cursor` walks only actionable rows and the
 //! Enter handler can index the same `work::sort_rows` order.
 
+use thegn_core::pipeline_report::display_cell;
 use thegn_core::work::{WorkGroup, WorkKind, WorkRow};
 
 use crate::seg::{Line, seg, sp};
@@ -29,8 +30,9 @@ fn kind_hue(kind: WorkKind) -> crate::seg::Tok {
 }
 
 fn truncate(s: &str, max: usize) -> String {
+    let s = display_cell(s);
     if s.chars().count() <= max {
-        return s.to_string();
+        return s;
     }
     let cut: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{}…", cut.trim_end())
@@ -92,13 +94,15 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         // ◈ marker when a worktree is already linked.
         let sigil = provider_sigil(&row.provider).to_string();
         let link_mark = if row.is_linked() { "◈ " } else { "" };
+        let repo = display_cell(&short_repo(&row.repo));
+        let number = display_cell(&row.number);
         let repo_part = if row.repo.is_empty() {
             String::new()
         } else {
-            format!("{} ", short_repo(&row.repo))
+            format!("{repo} ")
         };
         let prefix_len =
-            2 + link_mark.len() + repo_part.chars().count() + row.number.chars().count() + 1;
+            2 + link_mark.len() + repo_part.chars().count() + number.chars().count() + 1;
         let title = truncate(&row.title, cols.saturating_sub(prefix_len));
 
         let mut segs = vec![seg(kind_hue(row.kind), sigil), seg(g(), " ".to_string())];
@@ -108,7 +112,7 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         if !repo_part.is_empty() {
             segs.push(seg(g2(), repo_part));
         }
-        segs.push(seg(d(), row.number.clone()));
+        segs.push(seg(d(), number));
         segs.push(seg(g(), " ".to_string()));
         segs.push(seg(t(), title));
 
@@ -224,5 +228,61 @@ mod spec {
         let ordered = ordered_rows(&panel);
         assert_eq!(ordered[0].group, WorkGroup::ReviewRequested);
         assert_eq!(ordered[1].number, "ABC-1"); // higher urgency first within group
+    }
+
+    #[test]
+    fn truncate_replaces_terminal_and_format_controls_before_cutting() {
+        let rendered = truncate("ok\r\nforged\u{202e}\u{200b}", 40);
+        assert!(
+            !rendered
+                .chars()
+                .any(|ch| matches!(ch, '\r' | '\n' | '\u{202e}' | '\u{200b}'))
+        );
+        assert!(rendered.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn content_replaces_hostile_work_row_cells() {
+        let mut work = row(WorkGroup::Assigned, "#1\n", 1);
+        work.title = "a\r\nb\x1b]52;c;QQ==\x07".into();
+        work.repo = "o/r\r".into();
+        work.url = "https://example.test/a\n".into();
+        let model = crate::chrome::FrameModel {
+            panel: PanelData {
+                my_work: vec![work],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ui = crate::panel::PanelUi {
+            open: Section::Mine,
+            width: crate::layout::PanelWidth::Half,
+            ..Default::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 75,
+            rows: 32,
+        };
+        let text = content(&ctx)
+            .iter()
+            .filter_map(|row| match &row.line {
+                Line::Segs(segs) => {
+                    Some(segs.iter().map(|seg| seg.text.clone()).collect::<String>())
+                }
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            !text
+                .chars()
+                .any(|ch| matches!(ch, '\r' | '\n' | '\x1b' | '\x07')),
+            "{text:?}"
+        );
+        assert!(
+            text.contains('\u{fffd}'),
+            "hostile cells are visibly replaced: {text:?}"
+        );
     }
 }
