@@ -1081,7 +1081,7 @@
     },
     {
       "change": "rework-shell-completions",
-      "lifecycle": "active",
+      "lifecycle": "archived",
       "disposition": "residual-split",
       "owners": [
         {
@@ -1089,7 +1089,8 @@
           "project": "Cross-Platform Support & Verification"
         }
       ],
-      "summary": "The live completion engine shipped; packaging verification and cleanup remain."
+      "summary": "The dynamic completion engine shipped; packaged bash/zsh/fish verification for both names awaits the primary's nix build; the static proposal was retired 2026-10-12.",
+      "archive_path": "openspec/changes/archive/2026-10-12-rework-shell-completions/"
     },
     {
       "change": "safe-merged-worktree-cleanup",

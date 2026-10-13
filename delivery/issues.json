@@ -299,13 +299,6 @@
       ]
     },
     {
-      "issue": "THE-143",
-      "project": "Cross-Platform Support & Verification",
-      "changes": [
-        "rework-shell-completions"
-      ]
-    },
-    {
       "issue": "THE-145",
       "project": "Cross-Platform Support & Verification",
       "changes": [
