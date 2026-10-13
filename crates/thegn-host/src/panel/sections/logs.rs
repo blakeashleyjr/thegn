@@ -438,9 +438,8 @@ mod tests {
 
     #[test]
     fn half_rows_show_target_normal_rows_do_not() {
-        let log = thegn_core::log::parser::parse_log(
-            "2026-06-05T12:00:00  INFO  thegn::db  wt=wt-one  connected",
-        );
+        let log =
+            thegn_core::log::parser::parse_log("2026-06-05T12:00:00  INFO  thegn::db  connected");
         let model = model_with_logs(vec![log], 0);
         let render_width = |width| {
             let ui = PanelUi {
@@ -461,7 +460,7 @@ mod tests {
         assert!(normal.contains("12:00:00"));
         assert!(normal.contains("connected"));
         assert!(!normal.contains("thegn::db"));
-        assert!(half.contains("thegn::db [wt-one]"));
+        assert!(half.contains("thegn::db [global]"));
     }
 
     #[test]

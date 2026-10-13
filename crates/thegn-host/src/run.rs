@@ -11253,8 +11253,10 @@ async fn event_loop<T: Terminal>(
             model.weather_cfg = current_config.weather.clone();
             let ws = (!session.id.is_empty()).then_some(session.id.as_str());
             model.pins = supervisor.chips(&current_config, ws);
-            let log_anchor = crate::panel::sections::logs::cursor_seq(&model.panel, &panel_ui);
-            crate::panel::sections::logs::repin(&model.panel, &mut panel_ui, log_anchor);
+            if panel_ui.open == crate::panel::Section::Logs || panel_ui.logs_tail {
+                let log_anchor = crate::panel::sections::logs::cursor_seq(&model.panel, &panel_ui);
+                crate::panel::sections::logs::repin(&model.panel, &mut panel_ui, log_anchor);
+            }
             // Clamp the accordion cursor to the fresh model's row count and
             // re-mirror the per-section cursors. A mutation that shrank the
             // open list (drop a stash, delete a branch, commit away the last
@@ -13684,14 +13686,22 @@ async fn event_loop<T: Terminal>(
             if !slice.is_empty() {
                 loop_perf.tick(crate::perf::WakeSource::Other);
                 // Avoid the render -> own-log -> tail -> render feedback loop.
-                let anchor = crate::panel::sections::logs::cursor_seq(&model.panel, &panel_ui);
+                let track_cursor =
+                    panel_ui.open == crate::panel::Section::Logs || panel_ui.logs_tail;
+                let anchor = if track_cursor {
+                    crate::panel::sections::logs::cursor_seq(&model.panel, &panel_ui)
+                } else {
+                    None
+                };
                 dirty |= crate::loop_policy::apply_log_slice(
                     &mut model.panel.log_lines_structured,
                     &mut model.panel.log_first_seq,
                     slice,
                     want_panel && panel_ui.open == crate::panel::Section::Logs,
                 );
-                crate::panel::sections::logs::repin(&model.panel, &mut panel_ui, anchor);
+                if track_cursor {
+                    crate::panel::sections::logs::repin(&model.panel, &mut panel_ui, anchor);
+                }
             }
             logs_ingress.has_pending()
         };
@@ -20150,6 +20160,7 @@ async fn event_loop<T: Terminal>(
                                 if up
                                     && panel_ui.open == crate::panel::Section::Logs
                                     && panel_ui.logs_tail
+                                    && panel_ui.cursor > 0
                                 {
                                     panel_ui.logs_tail = false;
                                     model.status = "Logs: tail paused (a resumes)".into();
