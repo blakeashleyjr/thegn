@@ -2586,7 +2586,8 @@ fn open_panel_section(
     // detail view `git.focus` last held (e.g. Staging) — Enter on a commit
     // then ran the staging-line action and looked like a no-op.
     if let Some(view) = s.home_view() {
-        panel_ui.git.focus = view;
+        panel_ui.git.retarget(view);
+        panel_ui.git.widened_from = None;
     }
     // Land at the top of the new section's items (row_mode tracks panel focus,
     // not the section, so a focused panel keeps walking rows across switches).
@@ -2660,6 +2661,13 @@ fn cycle_panel_width(
     } else {
         panel_ui.width.cycle()
     };
+    panel_ui.git.widened_from = None;
+    if let Some(home) = panel_ui.open.home_view()
+        && panel_ui.width == crate::layout::PanelWidth::Normal
+        && gitui::GitUi::is_drill(panel_ui.git.focus)
+    {
+        panel_ui.git.retarget(home);
+    }
     panel_ui.remember_width();
     panel_ui.scroll = 0;
     persist_panel_state(panel_ui);
@@ -3843,7 +3851,7 @@ fn handle_git_msg(
                     let pane = s.pane;
                     panel_ui.git.stage_doc = None;
                     panel_ui.git.staging = Some(s);
-                    panel_ui.git.focus = GitView::Staging;
+                    panel_ui.git.drill(GitView::Staging);
                     spawn_stage_doc_fetch(
                         panel_ui.git.op_gen,
                         wires.session,
@@ -3856,11 +3864,25 @@ fn handle_git_msg(
             }
             GitView::Commits => {
                 if let Some(c) = sel_commit(panel_ui, model) {
+                    if let Some(marked) = panel_ui.git.patch_conflicts_with(&c.sha) {
+                        if marked > 0 {
+                            let commit = match &panel_ui.git.flow {
+                                GitFlow::Patch(p) => p.commit.chars().take(7).collect::<String>(),
+                                _ => String::new(),
+                            };
+                            model.status = format!(
+                                "custom patch on {commit} has {marked} marked line(s): C-p to apply or discard it first"
+                            );
+                            return GitAfter::None;
+                        }
+                        panel_ui.git.flow = GitFlow::None;
+                        panel_ui.git.patch_docs.clear();
+                    }
                     panel_ui.git.drilled_commit = Some(c.sha.clone());
                     panel_ui.git.commit_files.clear();
                     panel_ui.git.cur.commit_files = 0;
                     panel_ui.cursor = 0;
-                    panel_ui.git.focus = GitView::CommitFiles;
+                    panel_ui.git.drill(GitView::CommitFiles);
                     spawn_commit_files_fetch(
                         panel_ui.git.op_gen,
                         wires.session,
@@ -3877,6 +3899,20 @@ fn handle_git_msg(
                     .get(panel_ui.git.cur.commit_files)
                     .map(|(p, _, _)| p.clone());
                 if let (Some(path), Some(sha)) = (file, panel_ui.git.drilled_commit.clone()) {
+                    if let Some(marked) = panel_ui.git.patch_conflicts_with(&sha) {
+                        if marked > 0 {
+                            let commit = match &panel_ui.git.flow {
+                                GitFlow::Patch(p) => p.commit.chars().take(7).collect::<String>(),
+                                _ => String::new(),
+                            };
+                            model.status = format!(
+                                "custom patch on {commit} has {marked} marked line(s): C-p to apply or discard it first"
+                            );
+                            return GitAfter::None;
+                        }
+                        panel_ui.git.flow = GitFlow::None;
+                        panel_ui.git.patch_docs.clear();
+                    }
                     match &mut panel_ui.git.flow {
                         GitFlow::Patch(p) => p.path = path.clone(),
                         f => {
@@ -3889,7 +3925,7 @@ fn handle_git_msg(
                     }
                     panel_ui.git.patch_doc = None;
                     panel_ui.git.staging = Some(gitui::StagingUi::new(&path));
-                    panel_ui.git.focus = GitView::PatchBuilding;
+                    panel_ui.git.drill(GitView::PatchBuilding);
                     spawn_patch_doc_fetch(
                         panel_ui.git.op_gen,
                         wires.session,
@@ -3910,7 +3946,7 @@ fn handle_git_msg(
                 if let Some(r) = row {
                     panel_ui.git.drilled_commit = Some(r.sha.clone());
                     panel_ui.git.commit_files.clear();
-                    panel_ui.git.focus = GitView::CommitFiles;
+                    panel_ui.git.drill(GitView::CommitFiles);
                     spawn_commit_files_fetch(
                         panel_ui.git.op_gen,
                         wires.session,
@@ -3962,7 +3998,7 @@ fn handle_git_msg(
                 panel_ui.git.blame_rows.clear();
                 panel_ui.git.blame_cursor = 0;
                 panel_ui.git.blame_scroll = 0;
-                panel_ui.git.focus = GitView::Blame;
+                panel_ui.git.drill(GitView::Blame);
                 spawn_blame_fetch(
                     panel_ui.git.op_gen,
                     wires.session,
@@ -3984,39 +4020,7 @@ fn handle_git_msg(
             } else if git.sel_anchor.is_some() {
                 git.sel_anchor = None;
             } else {
-                match git.focus {
-                    GitView::Staging => {
-                        git.staging = None;
-                        git.stage_doc = None;
-                        git.focus = panel_ui.open.home_view().unwrap_or(GitView::Files);
-                    }
-                    GitView::PatchBuilding => {
-                        git.staging = None;
-                        git.focus = GitView::CommitFiles;
-                    }
-                    GitView::CommitFiles => {
-                        git.drilled_commit = None;
-                        git.commit_files.clear();
-                        git.focus = GitView::Commits;
-                    }
-                    GitView::RebaseTodo => {
-                        if !matches!(&git.flow, GitFlow::Rebase(r) if r.running) {
-                            git.flow = GitFlow::None;
-                        }
-                        git.focus = GitView::Commits;
-                    }
-                    GitView::Blame => {
-                        git.blame_rows.clear();
-                        git.blame_path = None;
-                        // Return to whichever view launched blame.
-                        git.focus = if git.drilled_commit.is_some() {
-                            GitView::CommitFiles
-                        } else {
-                            panel_ui.open.home_view().unwrap_or(GitView::Files)
-                        };
-                    }
-                    _ => {}
-                }
+                git.back(panel_ui.open.home_view().unwrap_or(GitView::Files));
             }
         }
         // ---- staging / patch building ------------------------------------
@@ -4822,9 +4826,18 @@ fn dispatch_menu_choice(
             }
         }
         MenuChoice::PatchReset => {
-            if let GitFlow::Patch(p) = &mut panel_ui.git.flow {
-                p.marks.clear();
-                model.status = "patch reset".into();
+            if matches!(panel_ui.git.flow, GitFlow::Patch(_)) {
+                panel_ui.git.flow = GitFlow::None;
+                panel_ui.git.patch_docs.clear();
+                if panel_ui.git.focus == GitView::PatchBuilding
+                    && let Some(home) = panel_ui.open.home_view()
+                {
+                    panel_ui.git.back(home);
+                }
+                if let Some(width) = panel_ui.git.retract_width() {
+                    panel_ui.width = width;
+                }
+                model.status = "patch discarded".into();
             }
         }
         MenuChoice::DiffExit => {
@@ -8949,7 +8962,10 @@ async fn event_loop<T: Terminal>(
             // Git interaction state is per-worktree: cursors, flows, marks
             // and fetched docs all reset; `op_gen` bumps so in-flight op/doc
             // results die on arrival. Overlays target the old worktree.
-            panel_ui.git.reset_for_worktree();
+            if let Some(width) = panel_ui.git.widened_from.take() {
+                panel_ui.width = width;
+            }
+            panel_ui.git.reset_for_worktree(panel_ui.open.home_view());
             // The accordion cursor is per-worktree too: leaving it where the
             // OLD worktree's list had it highlighted the new worktree's Nth
             // row while the (freshly-zeroed) git cursor acted on row 0.
@@ -10099,7 +10115,13 @@ async fn event_loop<T: Terminal>(
                             if matches!(panel_ui.git.flow, GitFlow::Rebase(_)) {
                                 panel_ui.git.flow = GitFlow::None;
                                 if panel_ui.git.focus == GitView::RebaseTodo {
-                                    panel_ui.git.focus = GitView::Commits;
+                                    panel_ui.git.back(
+                                        panel_ui.open.home_view().unwrap_or(GitView::Commits),
+                                    );
+                                    if let Some(width) = panel_ui.git.retract_width() {
+                                        panel_ui.width = width;
+                                        need_relayout = true;
+                                    }
                                 }
                             }
                         }
@@ -10111,11 +10133,18 @@ async fn event_loop<T: Terminal>(
                         FlowEnd::Patch => {
                             if matches!(panel_ui.git.flow, GitFlow::Patch(_)) {
                                 panel_ui.git.flow = GitFlow::None;
+                                panel_ui.git.patch_docs.clear();
                                 if matches!(
                                     panel_ui.git.focus,
                                     GitView::PatchBuilding | GitView::CommitFiles
                                 ) {
-                                    panel_ui.git.focus = GitView::Commits;
+                                    panel_ui.git.retarget(
+                                        panel_ui.open.home_view().unwrap_or(GitView::Commits),
+                                    );
+                                    if let Some(width) = panel_ui.git.retract_width() {
+                                        panel_ui.width = width;
+                                        need_relayout = true;
+                                    }
                                 }
                             }
                         }
@@ -13196,6 +13225,12 @@ async fn event_loop<T: Terminal>(
         // the lock and let the rows reflow under a held pointer.
         model.sidebar_drag_lock = sidebar_mouse_ui.layout_lock();
         model.panel_focused = focus.panel();
+        if panel_ui
+            .git
+            .normalize(panel_ui.open.home_view(), panel_ui.width)
+        {
+            dirty = true;
+        }
         model.center_focused = focus.center();
         model.masthead_focused = focus.masthead();
         model.statusbar_focused = focus.statusbar();
@@ -19282,6 +19317,12 @@ async fn event_loop<T: Terminal>(
                 {
                     panel_ui.row_mode = true;
                 }
+                if panel_ui
+                    .git
+                    .normalize(panel_ui.open.home_view(), panel_ui.width)
+                {
+                    dirty = true;
+                }
                 // Panel zone, git-family contexts: the table-driven git keys
                 // resolve BEFORE the accordion (space = stage-line in the
                 // staging view, stage-file in the files list, …). Ctrl is
@@ -19303,6 +19344,7 @@ async fn event_loop<T: Terminal>(
                     // remembered preference, like a manual `e`.
                     if let GitMsg::WidthBlocked(inner, want) = msg {
                         panel_ui.width = want;
+                        panel_ui.git.widened_from = None;
                         panel_ui.remember_width();
                         panel_ui.scroll = 0;
                         persist_panel_state(&panel_ui);
@@ -19323,7 +19365,8 @@ async fn event_loop<T: Terminal>(
                         confirm_op: &mut pending_confirm_op,
                         custom_cmds: &mut custom_menu_cmds,
                     };
-                    match handle_git_msg(msg, &mut panel_ui, &mut model, &wires, &mut ov) {
+                    let after = handle_git_msg(msg, &mut panel_ui, &mut model, &wires, &mut ov);
+                    match after {
                         GitAfter::None => {}
                         GitAfter::NewWorktree => {
                             forced_palette_action = Some(crate::keymap::Action::NewWorktree);
@@ -19372,6 +19415,13 @@ async fn event_loop<T: Terminal>(
                         )
                     {
                         panel_ui.width = crate::layout::PanelWidth::Half;
+                        if panel_ui.git.widened_from.is_none() {
+                            panel_ui.git.widened_from = Some(crate::layout::PanelWidth::Normal);
+                        }
+                        need_relayout = true;
+                    }
+                    if let Some(width) = panel_ui.git.retract_width() {
+                        panel_ui.width = width;
                         need_relayout = true;
                     }
                     dirty = true;
