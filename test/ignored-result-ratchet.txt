@@ -442,13 +442,5 @@ crates/thegn-host/src/mise_provider.rs
 crates/thegn-host/src/cmd/automations.rs
 crates/thegn-host/src/platform/mod.rs
 crates/thegn-svc/src/git/submodule.rs
-#
-# SUSPECT — pinned to record the concern, not to bless it. `ci_autofix.rs:236`
-# drops the result of `agent_run::run(...)` immediately after stamping the row
-# `AgentRunning`. If the launch fails, the row keeps claiming a live worker —
-# the same "the row lies about being live" class the pipeline reaper was built
-# to end. Next burn-down candidate; needs the failure surfaced and the status
-# rolled back.
-crates/thegn-host/src/ci_autofix.rs
 # git_config_heal.rs (THE-371): best-effort lock-file cleanup on failure paths and a post-rename directory fsync; the original config is intact either way.
 crates/thegn-core/src/git_config_heal.rs
