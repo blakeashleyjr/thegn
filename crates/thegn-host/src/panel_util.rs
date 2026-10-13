@@ -148,6 +148,28 @@ pub(crate) fn persist_panel_state(panel_ui: &crate::panel::PanelUi) {
     });
 }
 
+pub(crate) fn persist_help_state(page: &str, scroll: usize) {
+    let page = page.to_string();
+    let scroll = scroll.to_string();
+    crate::db_task::persist(move |db| {
+        if let Err(error) = db.set_ui_state("panel.help", "page", &page) {
+            tracing::debug!(target: "thegn::panel", %error, "persisting help page failed");
+        }
+        if let Err(error) = db.set_ui_state("panel.help", "scroll", &scroll) {
+            tracing::debug!(target: "thegn::panel", %error, "persisting help scroll failed");
+        }
+    });
+}
+
+pub(crate) fn help_persist_due(
+    open: crate::panel::Section,
+    page: &str,
+    scroll: usize,
+    last: Option<(&str, usize)>,
+) -> bool {
+    open == crate::panel::Section::Help && last != Some((page, scroll))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +193,28 @@ mod tests {
             editor_launch(&cfg, "a'b.rs", None).command,
             r"ed 'a'\''b.rs' +"
         );
+    }
+
+    #[test]
+    fn help_persist_is_due_only_for_a_changed_open_help_view() {
+        assert!(!help_persist_due(
+            crate::panel::Section::Help,
+            "index",
+            0,
+            Some(("index", 0))
+        ));
+        assert!(help_persist_due(
+            crate::panel::Section::Help,
+            "panel",
+            4,
+            Some(("index", 0))
+        ));
+        assert!(!help_persist_due(
+            crate::panel::Section::Keys,
+            "index",
+            0,
+            None
+        ));
     }
 
     #[test]

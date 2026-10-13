@@ -17,6 +17,7 @@ use crate::layer::{Anchor, LayerSpec, open_layer};
 use crate::seg::{self, Line, Seg, Tok, seg, sp};
 use thegn_core::help::{HelpRegistry, LinkTarget, SearchHit, TocNode};
 
+use super::HelpAnchor;
 use super::render::{RenderedPage, render_page};
 
 type RenderKey = (String, usize, Option<usize>);
@@ -28,6 +29,12 @@ pub enum HelpOutcome {
     /// Open the current page in the panel's Help section (the `o` key).
     OpenInPanel,
     Pending,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverlayTarget {
+    Anchor(HelpAnchor),
+    Heading(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +77,7 @@ pub struct HelpOverlay {
     /// `None` before the first render, when a click can't mean anything yet.
     hits: Option<HitAreas>,
     rendered_cache: Option<(RenderKey, Rc<RenderedPage>)>,
+    pending_target: Option<OverlayTarget>,
     search_cache: HashMap<String, Vec<SearchHit>>,
     search_cache_order: VecDeque<String>,
 }
@@ -149,6 +157,15 @@ fn flatten_toc(
 
 impl HelpOverlay {
     pub fn new(reg: Arc<HelpRegistry>, page: String, badge: String) -> Self {
+        Self::new_at(reg, page, None, badge)
+    }
+
+    pub fn new_at(
+        reg: Arc<HelpRegistry>,
+        page: String,
+        target: Option<OverlayTarget>,
+        badge: String,
+    ) -> Self {
         let mut toc_rows = Vec::new();
         flatten_toc(reg.toc(), 0, &reg, &mut toc_rows);
         let toc_sel = toc_rows
@@ -171,6 +188,7 @@ impl HelpOverlay {
             badge,
             hits: None,
             rendered_cache: None,
+            pending_target: target,
             search_cache: HashMap::new(),
             search_cache_order: VecDeque::new(),
         }
@@ -178,6 +196,10 @@ impl HelpOverlay {
 
     pub fn page_id(&self) -> &str {
         &self.page
+    }
+
+    pub fn anchor(&mut self) -> Option<HelpAnchor> {
+        super::anchor_at(&self.rendered().headings, self.scroll)
     }
 
     fn rendered(&mut self) -> Rc<RenderedPage> {
@@ -495,6 +517,20 @@ impl HelpOverlay {
         let body_y = inner.y + 2;
         let body_h = inner.rows - 3;
         self.last_dims = (content_w, body_h);
+        if let Some(target) = self.pending_target.take() {
+            let rendered = self.rendered();
+            self.scroll = match target {
+                OverlayTarget::Anchor(anchor) => {
+                    super::scroll_for(&rendered.headings, anchor, rendered.lines.len())
+                }
+                OverlayTarget::Heading(heading) => {
+                    super::heading_for_section(&rendered.headings, &heading, &heading)
+                        .and_then(|ordinal| rendered.headings.get(ordinal).map(|(line, _)| *line))
+                        .unwrap_or(0)
+                }
+            }
+            .min(self.max_scroll(rendered.lines.len()));
+        }
         let mut hits = HitAreas {
             left_x: (inner.x, inner.x + toc_w),
             content_y: body_y,
@@ -838,6 +874,19 @@ mod tests {
         HelpOverlay::new(registry(), "index".to_string(), "F1".to_string())
     }
 
+    fn render_at(ov: &mut HelpOverlay, cols: usize, rows: usize) {
+        let mut surface = Surface::new(cols, rows);
+        ov.render(
+            &mut surface,
+            Rect {
+                x: 0,
+                y: 0,
+                cols,
+                rows,
+            },
+        );
+    }
+
     fn key(ov: &mut HelpOverlay, k: KeyCode) -> HelpOutcome {
         ov.handle_key(&k, Modifiers::NONE)
     }
@@ -853,6 +902,44 @@ mod tests {
             ov.handle_key(&KeyCode::Char('c'), Modifiers::CTRL),
             HelpOutcome::Close
         );
+    }
+
+    #[test]
+    fn new_at_heading_scrolls_to_the_section() {
+        let reg = registry();
+        let mut ov = HelpOverlay::new_at(
+            reg,
+            "panel".to_string(),
+            Some(OverlayTarget::Heading("merge".to_string())),
+            "F1".to_string(),
+        );
+        render_at(&mut ov, 100, 30);
+        let rendered = ov.rendered();
+        let expected = super::super::heading_for_section(&rendered.headings, "merge", "merge")
+            .and_then(|ordinal| rendered.headings.get(ordinal).map(|(line, _)| *line))
+            .unwrap();
+        assert!(ov.scroll > 0);
+        assert_eq!(ov.scroll, expected);
+    }
+
+    #[test]
+    fn anchor_round_trips_across_widths() {
+        let reg = registry();
+        let mut narrow = HelpOverlay::new(reg.clone(), "panel".to_string(), "F1".to_string());
+        render_at(&mut narrow, 84, 30);
+        let rendered = narrow.rendered();
+        let heading =
+            super::super::heading_for_section(&rendered.headings, "merge", "merge").unwrap();
+        narrow.scroll = rendered.headings[heading].0 + 2;
+        let anchor = narrow.anchor().unwrap();
+        let mut wide = HelpOverlay::new_at(
+            reg,
+            "panel".to_string(),
+            Some(OverlayTarget::Anchor(anchor)),
+            "F1".to_string(),
+        );
+        render_at(&mut wide, 120, 30);
+        assert_eq!(wide.anchor(), Some(anchor));
     }
 
     #[test]
