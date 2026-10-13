@@ -34,7 +34,7 @@ pub enum HelpOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverlayTarget {
     Anchor(HelpAnchor),
-    Heading(String),
+    Heading { key: String, label: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +199,9 @@ impl HelpOverlay {
     }
 
     pub fn anchor(&mut self) -> Option<HelpAnchor> {
+        if let Some(OverlayTarget::Anchor(anchor)) = self.pending_target.as_ref() {
+            return Some(*anchor);
+        }
         super::anchor_at(&self.rendered().headings, self.scroll)
     }
 
@@ -523,8 +526,8 @@ impl HelpOverlay {
                 OverlayTarget::Anchor(anchor) => {
                     super::scroll_for(&rendered.headings, anchor, rendered.lines.len())
                 }
-                OverlayTarget::Heading(heading) => {
-                    super::heading_for_section(&rendered.headings, &heading, &heading)
+                OverlayTarget::Heading { key, label } => {
+                    super::heading_for_section(&rendered.headings, &key, &label)
                         .and_then(|ordinal| rendered.headings.get(ordinal).map(|(line, _)| *line))
                         .unwrap_or(0)
                 }
@@ -910,7 +913,10 @@ mod tests {
         let mut ov = HelpOverlay::new_at(
             reg,
             "panel".to_string(),
-            Some(OverlayTarget::Heading("merge".to_string())),
+            Some(OverlayTarget::Heading {
+                key: "no-key-match".to_string(),
+                label: "Merge".to_string(),
+            }),
             "F1".to_string(),
         );
         render_at(&mut ov, 100, 30);
@@ -940,6 +946,21 @@ mod tests {
         );
         render_at(&mut wide, 120, 30);
         assert_eq!(wide.anchor(), Some(anchor));
+    }
+
+    #[test]
+    fn anchor_returns_a_pending_anchor_before_first_render() {
+        let anchor = HelpAnchor {
+            heading: 2,
+            offset: 3,
+        };
+        let mut ov = HelpOverlay::new_at(
+            registry(),
+            "panel".to_string(),
+            Some(OverlayTarget::Anchor(anchor)),
+            "F1".to_string(),
+        );
+        assert_eq!(ov.anchor(), Some(anchor));
     }
 
     #[test]

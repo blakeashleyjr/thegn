@@ -11,7 +11,7 @@
 //! but never returned by [`resolve`], which only ever sees the focus state.
 
 use crate::focus::Zone;
-use crate::panel::{PanelUi, SECTION_ORDER, Section};
+use crate::panel::{PanelUi, SECTION_ORDER};
 
 /// The `zone:*` key for a focus zone. `Panel` resolves through the open
 /// section instead (see [`resolve`]); its zone key exists as the fallback
@@ -74,6 +74,7 @@ pub const MONITOR: &str = "overlay:monitor";
 mod tests {
     use super::*;
     use crate::focus::FocusState;
+    use crate::panel::Section;
 
     #[test]
     fn panel_focus_resolves_to_the_open_section() {
