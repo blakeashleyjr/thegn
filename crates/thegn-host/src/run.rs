@@ -5219,17 +5219,30 @@ fn spawn_test_run_task(
 ) {
     tokio::spawn(async move {
         let _permit = sem.acquire_owned().await;
-        if let Ok(outcome) = tokio::task::spawn_blocking(move || {
+        let outcome_worktree = worktree.clone();
+        let outcome_task = task_spec.clone();
+        let result = tokio::task::spawn_blocking(move || {
             // Resolve the worktree's location off-loop so a remote/provider
             // worktree runs its tests in the env (via the bridge/control
             // transport), not on the host. Local worktrees are unchanged.
             let loc = thegn_core::remote::GitLoc::for_worktree(&worktree);
             crate::task::run_task(worktree, &loc, generation, task_spec, &limits)
         })
-        .await
-        {
-            let _ = tx.send(outcome); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        .await;
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => crate::task::failed_test_run_outcome(
+                outcome_worktree,
+                generation,
+                outcome_task,
+                error,
+            ),
+        };
+        if let Err(error) = tx.send(outcome) {
+            tracing::debug!(target: "thegn::tests", %error, "test run outcome receiver is gone");
+        }
+        if let Err(error) = waker.wake() {
+            tracing::debug!(target: "thegn::tests", %error, "test run outcome wake failed");
         }
     });
 }
@@ -5247,14 +5260,27 @@ fn spawn_test_discovery(
 ) {
     tokio::spawn(async move {
         let _permit = sem.acquire_owned().await;
-        if let Ok(result) = tokio::task::spawn_blocking(move || {
+        let outcome_worktree = worktree.clone();
+        let outcome_task = task_spec.clone();
+        let result = tokio::task::spawn_blocking(move || {
             let loc = thegn_core::remote::GitLoc::for_worktree(&worktree);
             crate::task::discover_tests(worktree, &loc, generation, task_spec, &limits)
         })
-        .await
-        {
-            let _ = tx.send(result); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        .await;
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => crate::task::failed_test_discovery_outcome(
+                outcome_worktree,
+                generation,
+                outcome_task,
+                error,
+            ),
+        };
+        if let Err(error) = tx.send(outcome) {
+            tracing::debug!(target: "thegn::tests", %error, "test discovery outcome receiver is gone");
+        }
+        if let Err(error) = waker.wake() {
+            tracing::debug!(target: "thegn::tests", %error, "test discovery outcome wake failed");
         }
     });
 }
@@ -5263,21 +5289,22 @@ fn spawn_test_discovery(
 /// Reading only — never spawns a run (no auto-run).
 /// Load cached test state; `detect` runs the `detect_test_task` FS scan only when
 /// needed (D2: the per-switch caller passes `false` to keep that scan off the loop).
+struct TestCacheWiring<'a> {
+    tx: &'a tokio_mpsc::UnboundedSender<(String, u64, Option<crate::panel::TestCache>)>,
+    waker: &'a TerminalWaker,
+}
+
 fn sync_tests_for_worktree(
     ui: &mut crate::panel::PanelUi,
     worktree: &std::path::Path,
     cfg: &thegn_core::config::Config,
     detect: bool,
     cache_load: &mut run_test_cache::TestCacheLoad,
+    wiring: TestCacheWiring<'_>,
 ) {
     let key = worktree.to_string_lossy();
-    if cache_load.begin_sync(&key)
-        && let Ok(db) = thegn_core::db::Db::open()
-    {
-        if let Some(cache) = run_test_cache::load_test_cache(&db, &key) {
-            ui.tests.apply_cache(cache);
-        }
-        cache_load.finish_sync(&key);
+    if cache_load.begin_sync(&key) {
+        run_test_cache::spawn_test_cache_load(cache_load, &key, wiring.tx, wiring.waker);
     }
     if detect && ui.tests.task.is_none() {
         ui.tests.task = crate::task::detect_test_task(worktree, cfg);
@@ -6734,6 +6761,9 @@ async fn event_loop<T: Terminal>(
     // Named task (Tasks section) run outcomes — separate from the test runner.
     let (named_task_run_tx, mut named_task_run_rx) =
         tokio_mpsc::unbounded_channel::<crate::task::TaskOutcome>();
+    let (job_output_tx, mut job_output_rx) =
+        tokio_mpsc::unbounded_channel::<std::result::Result<PathBuf, String>>();
+    let mut restart_arm = crate::task::RestartArm::default();
     // Off-loop worktree-rename completions (audit run.rs:12131/12147): the git
     // subprocesses + dir move run on spawn_blocking and land here to re-key the
     // session group by identity.
@@ -6757,14 +6787,21 @@ async fn event_loop<T: Terminal>(
     let (workspace_clone_tx, mut workspace_clone_rx) =
         tokio_mpsc::unbounded_channel::<crate::workspace_create::CloneEvent>();
     let mut test_generation: u64 = 0;
+    let mut test_discovery_generation: u64 = 0;
     // Monotonic generation for named-task (Jobs section) runs (audit
     // run.rs:14462): a superseded run's cleanup only deregisters the slot when
     // it still owns the generation, so each new run MUST bump this — otherwise a
     // killed run's `wait()` wakeup deregisters the LIVE run's process group and
     // Stop ('s') silently no-ops.
     let mut named_task_generation: u64 = 0;
-    let mut loaded_tests_worktree = String::new();
+    let mut loaded_tests_worktree = active_tab_path(&session).to_string_lossy().into_owned();
     let mut test_cache_load = run_test_cache::TestCacheLoad::default();
+    run_test_cache::spawn_test_cache_load(
+        &mut test_cache_load,
+        &loaded_tests_worktree,
+        &test_cache_tx,
+        &waker,
+    );
     let mut deferred_test_discoveries = Vec::new();
     let mut deferred_test_runs = Vec::new();
     // Bounds concurrent test/discovery jobs across worktrees so explicit runs
@@ -8809,19 +8846,12 @@ async fn event_loop<T: Terminal>(
             // Tests tab shows it instantly; discovery stays lazy (on tab open).
             panel_ui.tests = crate::panel::TestPanelState::default();
             loaded_tests_worktree = current_worktree.to_string_lossy().into_owned();
-            let cache_seq = test_cache_load.begin_switch(&loaded_tests_worktree);
-            let cache_worktree = loaded_tests_worktree.clone();
-            let cache_tx = test_cache_tx.clone();
-            let cache_waker = waker.clone();
-            crate::db_task::persist(move |db| {
-                let cache = run_test_cache::load_test_cache(db, &cache_worktree);
-                if let Err(error) = cache_tx.send((cache_worktree, cache_seq, cache)) {
-                    tracing::debug!(target: "thegn::db", %error, "test cache load receiver is gone");
-                }
-                if let Err(error) = cache_waker.wake() {
-                    tracing::debug!(target: "thegn::db", %error, "test cache load wake failed");
-                }
-            });
+            run_test_cache::spawn_test_cache_load(
+                &mut test_cache_load,
+                &loaded_tests_worktree,
+                &test_cache_tx,
+                &waker,
+            );
             // Immediate hydrate for the newly-focused worktree. Paint this
             // worktree's last-known slice (panel + tab-bar chips + timeline)
             // from the cache (seeded by prior visits and neighbor prefetch) so
@@ -9614,7 +9644,8 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
         }
-        let ready_discoveries = if test_cache_load.is_pending(&loaded_tests_worktree) {
+        let active_tests_wt = active_tab_path(&session).to_string_lossy().into_owned();
+        let ready_discoveries = if test_cache_load.is_pending(&active_tests_wt) {
             Vec::new()
         } else {
             std::mem::take(&mut deferred_test_discoveries)
@@ -9624,21 +9655,33 @@ async fn event_loop<T: Terminal>(
             .chain(std::iter::from_fn(|| test_discovery_rx.try_recv().ok()))
         {
             loop_perf.tick(crate::perf::WakeSource::Other);
-            if d.generation == test_generation && d.worktree == loaded_tests_worktree {
-                if test_cache_load.is_pending(&d.worktree) {
-                    deferred_test_discoveries.push(d);
-                    continue;
+            match run_test_cache::outcome_disposition(
+                &d.worktree,
+                d.generation,
+                &active_tests_wt,
+                test_discovery_generation,
+                test_cache_load.is_pending(&active_tests_wt),
+            ) {
+                run_test_cache::OutcomeDisposition::Apply => {
+                    panel_ui.tests.discovering = false;
+                    panel_ui.tests.task = Some(d.task);
+                    if let Some(err) = d.error {
+                        panel_ui.tests.summary.error = Some(err);
+                    } else {
+                        panel_ui.tests.merge_discovered(&d.nodes);
+                        panel_ui.tests.summary.error = None;
+                    }
+                    persist_tests_for_worktree(&panel_ui, &d.worktree);
+                    dirty = true;
                 }
-                panel_ui.tests.discovering = false;
-                panel_ui.tests.task = Some(d.task);
-                if let Some(err) = d.error {
-                    panel_ui.tests.summary.error = Some(err);
-                } else {
-                    panel_ui.tests.merge_discovered(&d.nodes);
-                    panel_ui.tests.summary.error = None;
+                run_test_cache::OutcomeDisposition::Defer => deferred_test_discoveries.push(d),
+                disposition => {
+                    tracing::debug!(target: "thegn::tests", reason = ?disposition, worktree = %d.worktree, generation = d.generation, "dropped test outcome");
+                    if d.worktree == active_tests_wt && disposition.clears_active_latch() {
+                        panel_ui.tests.discovering = false;
+                        dirty = true;
+                    }
                 }
-                persist_tests_for_worktree(&panel_ui, &d.worktree);
-                dirty = true;
             }
         }
         // Background test-locate results (Tests `o`/`b`): complete the open
@@ -9759,6 +9802,34 @@ async fn event_loop<T: Terminal>(
             }
             dirty = true;
         }
+        while let Ok(result) = job_output_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            match result {
+                Ok(path) => {
+                    let bat = keymap
+                        .config()
+                        .tool_command("bat")
+                        .unwrap_or("bat --paging=always")
+                        .to_string();
+                    let cmd = format!("{bat} {}", test_shell_quote(&path.to_string_lossy()));
+                    let cwd = active_cwd(&session);
+                    open_command_pane(
+                        &mut session,
+                        &mut panes,
+                        focused,
+                        &cmd,
+                        cwd.as_deref(),
+                        chrome.center,
+                    );
+                    focus.zone = crate::focus::Zone::Center;
+                    refresh_tab_model(&mut model, &session, &mut sb);
+                    model.status = "Opened task output".into();
+                    need_relayout = true;
+                }
+                Err(error) => model.status = format!("Could not write task output: {error}"),
+            }
+            dirty = true;
+        }
         // LSP-pushed diagnostics → Problems panel (a second source alongside
         // tasks). The store persists across hydration swaps and is partitioned
         // by the worktree root stamped on each message; only the ACTIVE
@@ -9845,7 +9916,8 @@ async fn event_loop<T: Terminal>(
         }
         // Run results: the latest run upserts each reported test's status while
         // leaving other tests' most-recent status intact.
-        let ready_runs = if test_cache_load.is_pending(&loaded_tests_worktree) {
+        let active_tests_wt = active_tab_path(&session).to_string_lossy().into_owned();
+        let ready_runs = if test_cache_load.is_pending(&active_tests_wt) {
             Vec::new()
         } else {
             std::mem::take(&mut deferred_test_runs)
@@ -9855,80 +9927,113 @@ async fn event_loop<T: Terminal>(
             .chain(std::iter::from_fn(|| test_run_rx.try_recv().ok()))
         {
             loop_perf.tick(crate::perf::WakeSource::Other);
-            if outcome.generation == test_generation && outcome.worktree == loaded_tests_worktree {
-                if test_cache_load.is_pending(&outcome.worktree) {
-                    deferred_test_runs.push(outcome);
-                    continue;
-                }
-                panel_ui.tests.running = false;
-                panel_ui.tests.task = Some(outcome.task.clone());
-                panel_ui
-                    .tests
-                    .merge_results(&crate::task::parse_task_outcome(&outcome));
-                if outcome.exit_code != Some(0) && panel_ui.tests.summary.failed == 0 {
-                    panel_ui.tests.summary.failed = 1;
-                }
-                panel_ui.tests.summary.error = outcome
-                    .truncated
-                    .then(|| "output truncated before parsing completed".to_string());
-                panel_ui
-                    .tests
-                    .push_history(crate::testkit::model::TestRunRec {
-                        at: thegn_core::util::now(),
-                        passed: panel_ui.tests.summary.passed,
-                        failed: panel_ui.tests.summary.failed,
-                        skipped: panel_ui.tests.summary.skipped,
-                        duration_ms: outcome.duration_ms as u64,
-                        branch: model.panel.branch.clone(),
-                    });
-                persist_tests_for_worktree(&panel_ui, &outcome.worktree);
-                if outcome.exit_code != Some(0) {
-                    let wt = outcome.worktree.clone();
-                    let failed = panel_ui.tests.summary.failed;
-                    let msg = format!(
-                        "tests: {} failure{}",
-                        failed,
-                        if failed == 1 { "" } else { "s" }
-                    );
-                    // Route the failure: rules / DND / modes decide the desktop
-                    // toast + sound; the inbox record is gated by a drop rule.
-                    let dec = crate::notify::route(&notify_state, "test_failed", &wt, &msg, &wt);
-                    let event = thegn_core::event_bus::Event::TestsFailed {
-                        worktree: wt.clone(),
-                        count: failed,
-                    };
-                    // Surface the failure on the event bus → desktop toast +
-                    // sidebar alert badge (item 28/430).
-                    if dec.desktop {
-                        event_bus.publish_with_notification(&event);
+            match run_test_cache::outcome_disposition(
+                &outcome.worktree,
+                outcome.generation,
+                &active_tests_wt,
+                test_generation,
+                test_cache_load.is_pending(&active_tests_wt),
+            ) {
+                run_test_cache::OutcomeDisposition::Apply => {
+                    if test_cache_load.is_pending(&outcome.worktree) {
+                        deferred_test_runs.push(outcome);
+                        continue;
+                    }
+                    panel_ui.tests.running = false;
+                    panel_ui.tests.summary.running = false;
+                    panel_ui.tests.task = Some(outcome.task.clone());
+                    if outcome.exit_code.is_none() {
+                        panel_ui.tests.summary.error = Some(
+                            outcome
+                                .stdout_stderr
+                                .lines()
+                                .next()
+                                .unwrap_or("test run did not complete")
+                                .to_string(),
+                        );
+                        persist_tests_for_worktree(&panel_ui, &outcome.worktree);
+                        model.status = panel_ui.tests.summary.error.clone().unwrap_or_default();
+                        dirty = true;
                     } else {
-                        event_bus.publish(&event);
-                    }
-                    if dec.record {
-                        let routed = dec.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let Ok(db) = thegn_core::db::Db::open() else {
-                                return;
+                        panel_ui
+                            .tests
+                            .merge_results(&crate::task::parse_task_outcome(&outcome));
+                        if outcome.exit_code != Some(0) && panel_ui.tests.summary.failed == 0 {
+                            panel_ui.tests.summary.failed = 1;
+                        }
+                        panel_ui.tests.summary.error = outcome
+                            .truncated
+                            .then(|| "output truncated before parsing completed".to_string());
+                        panel_ui
+                            .tests
+                            .push_history(crate::testkit::model::TestRunRec {
+                                at: thegn_core::util::now(),
+                                passed: panel_ui.tests.summary.passed,
+                                failed: panel_ui.tests.summary.failed,
+                                skipped: panel_ui.tests.summary.skipped,
+                                duration_ms: outcome.duration_ms as u64,
+                                branch: model.panel.branch.clone(),
+                            });
+                        persist_tests_for_worktree(&panel_ui, &outcome.worktree);
+                        if outcome.exit_code != Some(0) {
+                            let wt = outcome.worktree.clone();
+                            let failed = panel_ui.tests.summary.failed;
+                            let msg = format!(
+                                "tests: {} failure{}",
+                                failed,
+                                if failed == 1 { "" } else { "s" }
+                            );
+                            // Route the failure: rules / DND / modes decide the desktop
+                            // toast + sound; the inbox record is gated by a drop rule.
+                            let dec =
+                                crate::notify::route(&notify_state, "test_failed", &wt, &msg, &wt);
+                            let event = thegn_core::event_bus::Event::TestsFailed {
+                                worktree: wt.clone(),
+                                count: failed,
                             };
-                            let _ = crate::automation_events::insert_routed(
-                                &db,
-                                "test_failed",
-                                &wt,
-                                &msg,
-                                &wt,
-                                Default::default(),
-                                &routed,
-                                false,
-                            ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                        });
+                            // Surface the failure on the event bus → desktop toast +
+                            // sidebar alert badge (item 28/430).
+                            if dec.desktop {
+                                event_bus.publish_with_notification(&event);
+                            } else {
+                                event_bus.publish(&event);
+                            }
+                            if dec.record {
+                                let routed = dec.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let Ok(db) = thegn_core::db::Db::open() else {
+                                        return;
+                                    };
+                                    let _ = crate::automation_events::insert_routed(
+                                        &db,
+                                        "test_failed",
+                                        &wt,
+                                        &msg,
+                                        &wt,
+                                        Default::default(),
+                                        &routed,
+                                        false,
+                                    ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                                });
+                            }
+                        }
+                        model.status = format!(
+                            "Tests finished in {:.1}s: {}",
+                            outcome.duration_ms as f64 / 1000.0,
+                            panel_ui.tests.summary.label()
+                        );
+                        dirty = true;
                     }
                 }
-                model.status = format!(
-                    "Tests finished in {:.1}s: {}",
-                    outcome.duration_ms as f64 / 1000.0,
-                    panel_ui.tests.summary.label()
-                );
-                dirty = true;
+                run_test_cache::OutcomeDisposition::Defer => deferred_test_runs.push(outcome),
+                disposition => {
+                    tracing::debug!(target: "thegn::tests", reason = ?disposition, worktree = %outcome.worktree, generation = outcome.generation, "dropped test outcome");
+                    if outcome.worktree == active_tests_wt && disposition.clears_active_latch() {
+                        panel_ui.tests.running = false;
+                        panel_ui.tests.summary.running = false;
+                        dirty = true;
+                    }
+                }
             }
         }
 
@@ -15661,11 +15766,15 @@ async fn event_loop<T: Terminal>(
                                         keymap.config(),
                                         true,
                                         &mut test_cache_load,
+                                        TestCacheWiring {
+                                            tx: &test_cache_tx,
+                                            waker: &waker,
+                                        },
                                     );
                                     maybe_discover_tests(
                                         &mut panel_ui,
                                         &session,
-                                        &mut test_generation,
+                                        &mut test_discovery_generation,
                                         test_discovery_tx.clone(),
                                         waker.clone(),
                                         keymap.config(),
@@ -19338,11 +19447,15 @@ async fn event_loop<T: Terminal>(
                                     keymap.config(),
                                     true,
                                     &mut test_cache_load,
+                                    TestCacheWiring {
+                                        tx: &test_cache_tx,
+                                        waker: &waker,
+                                    },
                                 );
                                 maybe_discover_tests(
                                     &mut panel_ui,
                                     &session,
-                                    &mut test_generation,
+                                    &mut test_discovery_generation,
                                     test_discovery_tx.clone(),
                                     waker.clone(),
                                     keymap.config(),
@@ -19684,35 +19797,59 @@ async fn event_loop<T: Terminal>(
                                                 .get(panel_ui.tasks_cursor)
                                                 .cloned();
                                             if let Some(task) = task {
-                                                let run_rec = crate::panel::TaskRunRecord {
-                                                    name: task.name.clone(),
-                                                    running: true,
-                                                    ..Default::default()
-                                                };
-                                                model
+                                                let is_running = model
                                                     .panel
                                                     .task_last_runs
-                                                    .insert(task.name.clone(), run_rec);
-                                                model.status = format!("Running: {}", task.name);
-                                                let test_task =
-                                                    crate::task::test_task_from_config(&task);
-                                                let wt = crate::hydrate::active_tab_path(&session);
-                                                let tx2 = named_task_run_tx.clone();
-                                                let wk2 = waker.clone();
-                                                let limits2 = keymap.config().limits.clone();
-                                                named_task_generation += 1;
-                                                let run_gen = named_task_generation;
-                                                tokio::task::spawn_blocking(move || {
-                                                    let loc =
-                                                        thegn_core::remote::GitLoc::for_worktree(
-                                                            &wt,
-                                                        );
-                                                    let outcome = crate::task::run_task(
-                                                        wt, &loc, run_gen, test_task, &limits2,
+                                                    .get(&task.name)
+                                                    .is_some_and(|record| record.running);
+                                                if is_running
+                                                    && !restart_arm.confirm(
+                                                        &task.name,
+                                                        std::time::Instant::now(),
+                                                    )
+                                                {
+                                                    model.status = format!(
+                                                        "'{}' is running: press Enter again to restart",
+                                                        task.name
                                                     );
-                                                    let _ = tx2.send(outcome); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                                                    let _ = wk2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                                                });
+                                                } else {
+                                                    restart_arm.clear();
+                                                    let run_rec = crate::panel::TaskRunRecord {
+                                                        name: task.name.clone(),
+                                                        running: true,
+                                                        ..Default::default()
+                                                    };
+                                                    model
+                                                        .panel
+                                                        .task_last_runs
+                                                        .insert(task.name.clone(), run_rec);
+                                                    model.status =
+                                                        format!("Running: {}", task.name);
+                                                    let test_task =
+                                                        crate::task::test_task_from_config(&task);
+                                                    let wt =
+                                                        crate::hydrate::active_tab_path(&session);
+                                                    let tx2 = named_task_run_tx.clone();
+                                                    let wk2 = waker.clone();
+                                                    let limits2 = keymap.config().limits.clone();
+                                                    named_task_generation += 1;
+                                                    let run_gen = named_task_generation;
+                                                    tokio::task::spawn_blocking(move || {
+                                                        let loc =
+                                                            thegn_core::remote::GitLoc::for_worktree(
+                                                                &wt,
+                                                            );
+                                                        let outcome = crate::task::run_job(
+                                                            wt, &loc, run_gen, test_task, &limits2,
+                                                        );
+                                                        if let Err(error) = tx2.send(outcome) {
+                                                            tracing::debug!(target: "thegn::tasks", %error, "job outcome receiver is gone");
+                                                        }
+                                                        if let Err(error) = wk2.wake() {
+                                                            tracing::debug!(target: "thegn::tasks", %error, "job outcome wake failed");
+                                                        }
+                                                    });
+                                                }
                                             }
                                         }
                                         Section::Problems => {
@@ -20068,8 +20205,14 @@ async fn event_loop<T: Terminal>(
                                 keymap.config(),
                                 true,
                                 &mut test_cache_load,
+                                TestCacheWiring {
+                                    tx: &test_cache_tx,
+                                    waker: &waker,
+                                },
                             );
-                            if let Some(base) = panel_ui.tests.task.clone() {
+                            if test_cache_load.is_pending(&wt.to_string_lossy()) {
+                                model.status = "Loading test state…".into();
+                            } else if let Some(base) = panel_ui.tests.task.clone() {
                                 if !panel_ui.tests.running {
                                     let task_spec = test_task_for_run(&panel_ui.tests, kind, base);
                                     test_generation += 1;
@@ -20100,9 +20243,15 @@ async fn event_loop<T: Terminal>(
                                 keymap.config(),
                                 true,
                                 &mut test_cache_load,
+                                TestCacheWiring {
+                                    tx: &test_cache_tx,
+                                    waker: &waker,
+                                },
                             );
-                            if let Some(task) = panel_ui.tests.task.clone() {
-                                test_generation += 1;
+                            if test_cache_load.is_pending(&wt.to_string_lossy()) {
+                                model.status = "Loading test state…".into();
+                            } else if let Some(task) = panel_ui.tests.task.clone() {
+                                test_discovery_generation += 1;
                                 panel_ui.tests.discovering = true;
                                 panel_ui.tests.summary.error = None;
                                 // Force re-discovery and record the current
@@ -20112,7 +20261,7 @@ async fn event_loop<T: Terminal>(
                                     test_discovery_tx.clone(),
                                     waker.clone(),
                                     wt,
-                                    test_generation,
+                                    test_discovery_generation,
                                     task,
                                     keymap.config().limits.clone(),
                                     test_sem.clone(),
@@ -20219,31 +20368,50 @@ async fn event_loop<T: Terminal>(
                             // Re-run: same as Enter but without moving cursor.
                             let task = model.panel.task_specs.get(panel_ui.tasks_cursor).cloned();
                             if let Some(task) = task {
-                                let run_rec = crate::panel::TaskRunRecord {
-                                    name: task.name.clone(),
-                                    running: true,
-                                    ..Default::default()
-                                };
-                                model
+                                let is_running = model
                                     .panel
                                     .task_last_runs
-                                    .insert(task.name.clone(), run_rec);
-                                model.status = format!("Re-running: {}", task.name);
-                                let test_task = crate::task::test_task_from_config(&task);
-                                let wt = crate::hydrate::active_tab_path(&session);
-                                let tx2 = named_task_run_tx.clone();
-                                let wk2 = waker.clone();
-                                let limits2 = keymap.config().limits.clone();
-                                named_task_generation += 1;
-                                let run_gen = named_task_generation;
-                                tokio::task::spawn_blocking(move || {
-                                    let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-                                    let outcome = crate::task::run_task(
-                                        wt, &loc, run_gen, test_task, &limits2,
+                                    .get(&task.name)
+                                    .is_some_and(|record| record.running);
+                                if is_running
+                                    && !restart_arm.confirm(&task.name, std::time::Instant::now())
+                                {
+                                    model.status = format!(
+                                        "'{}' is running: press r again to restart",
+                                        task.name
                                     );
-                                    let _ = tx2.send(outcome); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                                    let _ = wk2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                                });
+                                } else {
+                                    restart_arm.clear();
+                                    let run_rec = crate::panel::TaskRunRecord {
+                                        name: task.name.clone(),
+                                        running: true,
+                                        ..Default::default()
+                                    };
+                                    model
+                                        .panel
+                                        .task_last_runs
+                                        .insert(task.name.clone(), run_rec);
+                                    model.status = format!("Re-running: {}", task.name);
+                                    let test_task = crate::task::test_task_from_config(&task);
+                                    let wt = crate::hydrate::active_tab_path(&session);
+                                    let tx2 = named_task_run_tx.clone();
+                                    let wk2 = waker.clone();
+                                    let limits2 = keymap.config().limits.clone();
+                                    named_task_generation += 1;
+                                    let run_gen = named_task_generation;
+                                    tokio::task::spawn_blocking(move || {
+                                        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+                                        let outcome = crate::task::run_job(
+                                            wt, &loc, run_gen, test_task, &limits2,
+                                        );
+                                        if let Err(error) = tx2.send(outcome) {
+                                            tracing::debug!(target: "thegn::tasks", %error, "job outcome receiver is gone");
+                                        }
+                                        if let Err(error) = wk2.wake() {
+                                            tracing::debug!(target: "thegn::tasks", %error, "job outcome wake failed");
+                                        }
+                                    });
+                                }
                             }
                             true
                         }
@@ -20252,11 +20420,15 @@ async fn event_loop<T: Terminal>(
                             let task = model.panel.task_specs.get(panel_ui.tasks_cursor).cloned();
                             if let Some(task) = task {
                                 let wt = crate::hydrate::active_tab_path(&session);
-                                crate::task::cancel_slot(&format!("{}:run", wt.display()));
-                                if let Some(rec) = model.panel.task_last_runs.get_mut(&task.name) {
+                                if let Some(rec) = model.panel.task_last_runs.get_mut(&task.name)
+                                    && rec.running
+                                {
+                                    crate::task::cancel_job(&wt, &task.name);
                                     rec.running = false;
+                                    model.status = format!("Stopped: {}", task.name);
+                                } else {
+                                    model.status = format!("'{}' is not running", task.name);
                                 }
-                                model.status = format!("Stopped: {}", task.name);
                             }
                             true
                         }
@@ -20278,33 +20450,22 @@ async fn event_loop<T: Terminal>(
                                             &task.name
                                         )
                                     ));
-                                // Write off the loop (no blocking fs on the loop).
-                                {
-                                    let tmp = tmp.clone();
-                                    let out = rec.output_tail.clone();
-                                    tokio::task::spawn_blocking(move || {
-                                        let _ = std::fs::write(&tmp, out); // best-effort: tmp snapshot of the output tail: a failed write loses the tail only
-                                    });
-                                }
-                                let bat = keymap
-                                    .config()
-                                    .tool_command("bat")
-                                    .unwrap_or("bat --paging=always")
-                                    .to_string();
-                                let cmd =
-                                    format!("{bat} {}", test_shell_quote(&tmp.to_string_lossy()));
-                                let cwd_o = active_cwd(&session);
-                                open_command_pane(
-                                    &mut session,
-                                    &mut panes,
-                                    focused,
-                                    &cmd,
-                                    cwd_o.as_deref(),
-                                    chrome.center,
-                                );
-                                focus.zone = crate::focus::Zone::Center;
-                                refresh_tab_model(&mut model, &session, &mut sb);
-                                need_relayout = true;
+                                let tmp_write = tmp.clone();
+                                let output = rec.output_tail.clone();
+                                let tx = job_output_tx.clone();
+                                let wake = waker.clone();
+                                model.status = format!("Opening output of {}…", task.name);
+                                tokio::task::spawn_blocking(move || {
+                                    let result = std::fs::write(&tmp_write, output)
+                                        .map(|()| tmp_write)
+                                        .map_err(|error| error.to_string());
+                                    if let Err(error) = tx.send(result) {
+                                        tracing::debug!(target: "thegn::tasks", %error, "job output receiver is gone");
+                                    }
+                                    if let Err(error) = wake.wake() {
+                                        tracing::debug!(target: "thegn::tasks", %error, "job output wake failed");
+                                    }
+                                });
                             } else {
                                 model.status = "No output captured yet".into();
                             }

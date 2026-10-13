@@ -287,6 +287,49 @@ fn test_run_waits_for_pending_cache_then_overwrites_cached_status() {
 }
 
 #[test]
+fn active_worktree_test_outcomes_apply_without_a_prior_switch() {
+    // The old gate compared against an empty loaded_tests_worktree on startup.
+    assert_eq!(
+        super::run_test_cache::outcome_disposition("/wt/a", 3, "/wt/a", 3, false),
+        super::run_test_cache::OutcomeDisposition::Apply
+    );
+}
+
+#[test]
+fn test_outcome_disposition_checks_worktree_generation_then_cache_fence() {
+    use super::run_test_cache::OutcomeDisposition as D;
+
+    assert_eq!(
+        super::run_test_cache::outcome_disposition("/wt/b", 3, "/wt/a", 3, false),
+        D::DropOtherWorktree
+    );
+    assert_eq!(
+        super::run_test_cache::outcome_disposition("/wt/a", 2, "/wt/a", 3, false),
+        D::DropStaleGeneration
+    );
+    assert!(D::DropStaleGeneration.clears_active_latch());
+    assert!(!D::DropOtherWorktree.clears_active_latch());
+    assert_eq!(
+        super::run_test_cache::outcome_disposition("/wt/a", 3, "/wt/a", 3, true),
+        D::Defer
+    );
+}
+
+#[test]
+fn discovery_and_run_generations_are_independent() {
+    use super::run_test_cache::OutcomeDisposition as D;
+
+    assert_eq!(
+        super::run_test_cache::outcome_disposition("/wt/a", 7, "/wt/a", 7, false),
+        D::Apply
+    );
+    assert_eq!(
+        super::run_test_cache::outcome_disposition("/wt/a", 6, "/wt/a", 7, false),
+        D::DropStaleGeneration
+    );
+}
+
+#[test]
 fn test_cache_load_roundtrips_and_rejects_corrupt_json() {
     use thegn_core::store::CacheStore as _;
 
