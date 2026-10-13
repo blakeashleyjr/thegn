@@ -7002,7 +7002,7 @@ async fn event_loop<T: Terminal>(
     // `[panel] sections` reorders/hides accordions; a persisted open section
     // the config hid snaps to the first visible one. The keys section renders
     // the cheatsheet groups cached here (refreshed on config reload).
-    panel_ui.set_order(crate::panel::resolve_order(keymap.config()));
+    panel_ui.apply_config(keymap.config());
     layout::set_panel_width_cfg(
         panel_cols_pref.or(keymap.config().panel.width),
         keymap.config().panel.half_ratio,
@@ -12477,7 +12477,7 @@ async fn event_loop<T: Terminal>(
                     model.weather_cfg = new_cfg.weather.clone();
                     // Live `[panel] sections` reload: reorder/hide accordions;
                     // the keys section's cheatsheet follows the new keymap.
-                    panel_ui.set_order(crate::panel::resolve_order(&new_cfg));
+                    panel_ui.apply_config(&new_cfg);
                     layout::set_panel_width_cfg(
                         panel_cols_pref.or(new_cfg.panel.width),
                         new_cfg.panel.half_ratio,
@@ -18162,6 +18162,7 @@ async fn event_loop<T: Terminal>(
                                 &mut pending_host_consent,
                                 &current_config,
                                 Some(&host_ui),
+                                Some(&refresh_tx),
                             ) {
                                 model.status = status;
                                 dirty = true;
@@ -20063,6 +20064,12 @@ async fn event_loop<T: Terminal>(
                                 panel_ui.sync_section_cursors();
                             }
                             PanelMsg::Select => {
+                                if let Some(reason) = panel_ui.off_reason(panel_ui.open) {
+                                    model.status =
+                                        format!("{} is off: {reason}", panel_ui.open.label());
+                                    dirty = true;
+                                    continue;
+                                }
                                 // Enter always executes the item at cursor.
                                 // (row_mode is set by j/k on first navigation.)
                                 panel_ui.row_mode = true;
@@ -20623,6 +20630,13 @@ async fn event_loop<T: Terminal>(
                     // file-hop arms were removed: Full routes Changes to the
                     // lazygit frame, which reads none of the state they
                     // mutated — every press was a silent no-op.)
+                    if let Some(reason) = panel_ui.off_reason(panel_ui.open)
+                        && matches!(k.key, KeyCode::Char(_))
+                    {
+                        model.status = format!("{} is off: {reason}", panel_ui.open.label());
+                        dirty = true;
+                        continue;
+                    }
                     let handled = match (panel_ui.open, k.key) {
                         // -- git: copy the HEAD sha (wide views) -------------
                         (Section::Pr, KeyCode::Char('y')) if panel_ui.width.is_expanded() => {
@@ -22749,6 +22763,18 @@ async fn event_loop<T: Terminal>(
                                 focus.zone = crate::focus::Zone::Panel;
                             }
                             Action::OpenPrQueue => {
+                                if !current_config.pr_queue.enabled {
+                                    model.status =
+                                        "PR queue is off — set [pr_queue] enabled = true".into();
+                                    dirty = true;
+                                    continue;
+                                }
+                                if !panel_ui.order.contains(&crate::panel::Section::PrQueue) {
+                                    model.status =
+                                        "PR queue is hidden — add prq to [panel] sections".into();
+                                    dirty = true;
+                                    continue;
+                                }
                                 panel_auto_revealed = None;
                                 if chrome.panel.is_none() {
                                     want_panel = true;
@@ -22772,6 +22798,12 @@ async fn event_loop<T: Terminal>(
                                 focus.zone = crate::focus::Zone::Panel;
                             }
                             Action::PrQueueAdd => {
+                                if !current_config.pr_queue.enabled {
+                                    model.status =
+                                        "PR queue is off — set [pr_queue] enabled = true".into();
+                                    dirty = true;
+                                    continue;
+                                }
                                 crate::handlers::pr_queue::spawn_add(
                                     &prq_tx,
                                     &waker,
@@ -22779,6 +22811,12 @@ async fn event_loop<T: Terminal>(
                                 );
                             }
                             Action::PrQueueRefresh => {
+                                if !current_config.pr_queue.enabled {
+                                    model.status =
+                                        "PR queue is off — set [pr_queue] enabled = true".into();
+                                    dirty = true;
+                                    continue;
+                                }
                                 // One pass at a time: two would race the same
                                 // rows and the same forge.
                                 if prq_inflight {

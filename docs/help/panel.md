@@ -16,8 +16,6 @@ contexts:
     panel:logs,
     panel:hosts,
     panel:telemetry,
-    panel:debug,
-    panel:db,
   ]
 actions: [focus-panel, toggle-panel]
 ---
@@ -33,8 +31,7 @@ accordion — four tabs, one open section at a time:
   attention), the branch's PR + the repo's open PRs, CI runs, the merge
   queue, the PR queue, issues, problems, jobs, tests, symbols
 - **system** — notifications, logs, sandbox, hosts, environments, shares,
-  port forwards, telemetry, media, usage, keys — plus two **reserved**
-  stubs, `debug` and `db` (see below)
+  port forwards, telemetry, media, usage, keys
 - **help** — this documentation, docked (the twin of the `F1` overlay)
 
 ## Keys
@@ -326,17 +323,6 @@ facts line plus a legend. `r` re-gathers now instead of waiting out the
 poll. On by default; `[usage] enabled = false` turns the feature off
 and hides this section. The `[usage] warn_percent` / `crit_percent`
 thresholds colour it with the same gauge and overlay.
-
-### db and debug — reserved placeholders
-
-Two system-tab section names are reserved stubs, not features: **db**
-renders "no database detected" over a "db introspection not wired yet"
-line, and **debug** renders "no session", an empty `BREAKPOINTS` list and
-a "debugger integration not wired yet" line. Neither has keys or
-behaviour behind it, and neither appears in the built-in accordion — they
-stay out of the tab rotation until the database and debugger
-integrations land, at which point they become real sections and this
-page will document them as such.
 
 ## The help tab
 
