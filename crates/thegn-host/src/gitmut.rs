@@ -813,6 +813,17 @@ mod tests {
         ));
     }
 
+    #[expect(clippy::disallowed_methods)]
+    fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = thegn_core::util::git_cmd(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
     #[test]
     fn execute_runs_a_commit_and_reports_errors_one_line() {
         let dir = tmp_repo("exec");
@@ -856,21 +867,8 @@ mod tests {
         let dir = tmp_repo("fixup-head");
         let loc = GitLoc::Local(dir.clone());
         commit_file_via_execute(&dir, &loc, "two\n", "c1");
-        let head = thegn_core::util::git_cmd(&dir)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap();
-        assert!(head.status.success());
-        let head = String::from_utf8(head.stdout).unwrap().trim().to_owned();
-        let tree_before = thegn_core::util::git_cmd(&dir)
-            .args(["rev-parse", "HEAD^{tree}"])
-            .output()
-            .unwrap();
-        assert!(tree_before.status.success());
-        let tree_before = String::from_utf8(tree_before.stdout)
-            .unwrap()
-            .trim()
-            .to_owned();
+        let head = git_out(&dir, &["rev-parse", "HEAD"]);
+        let tree_before = git_out(&dir, &["rev-parse", "HEAD^{tree}"]);
 
         assert!(matches!(
             execute(
@@ -883,28 +881,10 @@ mod tests {
             ),
             GitOpResult::Ok(_)
         ));
-        let log = thegn_core::util::git_cmd(&dir)
-            .args(["rev-list", "--count", "HEAD"])
-            .output()
-            .unwrap();
-        assert!(log.status.success());
-        assert_eq!(String::from_utf8(log.stdout).unwrap().trim(), "1");
-        let tree_after = thegn_core::util::git_cmd(&dir)
-            .args(["rev-parse", "HEAD^{tree}"])
-            .output()
-            .unwrap();
-        assert!(tree_after.status.success());
-        assert_eq!(
-            String::from_utf8(tree_after.stdout).unwrap().trim(),
-            tree_before
-        );
-        let git_dir = thegn_core::util::git_cmd(&dir)
-            .args(["rev-parse", "--git-path", "rebase-merge"])
-            .output()
-            .unwrap();
-        assert!(git_dir.status.success());
+        assert_eq!(git_out(&dir, &["rev-list", "--count", "HEAD"]), "1");
+        assert_eq!(git_out(&dir, &["rev-parse", "HEAD^{tree}"]), tree_before);
         assert!(
-            !dir.join(String::from_utf8(git_dir.stdout).unwrap().trim())
+            !dir.join(git_out(&dir, &["rev-parse", "--git-path", "rebase-merge"]))
                 .exists()
         );
         if let Err(error) = std::fs::remove_dir_all(&dir) {
@@ -917,21 +897,8 @@ mod tests {
         let dir = tmp_repo("squash-head");
         let loc = GitLoc::Local(dir.clone());
         commit_file_via_execute(&dir, &loc, "two\n", "c1");
-        let head = thegn_core::util::git_cmd(&dir)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap();
-        assert!(head.status.success());
-        let head = String::from_utf8(head.stdout).unwrap().trim().to_owned();
-        let tree_before = thegn_core::util::git_cmd(&dir)
-            .args(["rev-parse", "HEAD^{tree}"])
-            .output()
-            .unwrap();
-        assert!(tree_before.status.success());
-        let tree_before = String::from_utf8(tree_before.stdout)
-            .unwrap()
-            .trim()
-            .to_owned();
+        let head = git_out(&dir, &["rev-parse", "HEAD"]);
+        let tree_before = git_out(&dir, &["rev-parse", "HEAD^{tree}"]);
 
         assert!(matches!(
             execute(
@@ -944,28 +911,10 @@ mod tests {
             ),
             GitOpResult::Ok(_)
         ));
-        let count = thegn_core::util::git_cmd(&dir)
-            .args(["rev-list", "--count", "HEAD"])
-            .output()
-            .unwrap();
-        assert!(count.status.success());
-        assert_eq!(String::from_utf8(count.stdout).unwrap().trim(), "1");
-        let tree_after = thegn_core::util::git_cmd(&dir)
-            .args(["rev-parse", "HEAD^{tree}"])
-            .output()
-            .unwrap();
-        assert!(tree_after.status.success());
-        assert_eq!(
-            String::from_utf8(tree_after.stdout).unwrap().trim(),
-            tree_before
-        );
-        let git_dir = thegn_core::util::git_cmd(&dir)
-            .args(["rev-parse", "--git-path", "rebase-merge"])
-            .output()
-            .unwrap();
-        assert!(git_dir.status.success());
+        assert_eq!(git_out(&dir, &["rev-list", "--count", "HEAD"]), "1");
+        assert_eq!(git_out(&dir, &["rev-parse", "HEAD^{tree}"]), tree_before);
         assert!(
-            !dir.join(String::from_utf8(git_dir.stdout).unwrap().trim())
+            !dir.join(git_out(&dir, &["rev-parse", "--git-path", "rebase-merge"]))
                 .exists()
         );
         if let Err(error) = std::fs::remove_dir_all(&dir) {
@@ -979,23 +928,10 @@ mod tests {
         let loc = GitLoc::Local(dir.clone());
         commit_file_via_execute(&dir, &loc, "two\n", "c1");
         commit_file_via_execute(&dir, &loc, "three\n", "c2");
-        let commits = thegn_core::util::git_cmd(&dir)
-            .args(["rev-list", "--reverse", "HEAD"])
-            .output()
-            .unwrap();
-        assert!(commits.status.success());
-        let commits = String::from_utf8(commits.stdout).unwrap();
+        let commits = git_out(&dir, &["rev-list", "--reverse", "HEAD"]);
         let shas: Vec<String> = commits.lines().map(str::to_owned).collect();
         assert_eq!(shas.len(), 3);
-        let tree_before = thegn_core::util::git_cmd(&dir)
-            .args(["rev-parse", "HEAD^{tree}"])
-            .output()
-            .unwrap();
-        assert!(tree_before.status.success());
-        let tree_before = String::from_utf8(tree_before.stdout)
-            .unwrap()
-            .trim()
-            .to_owned();
+        let tree_before = git_out(&dir, &["rev-parse", "HEAD^{tree}"]);
 
         assert!(matches!(
             execute(
@@ -1008,28 +944,10 @@ mod tests {
             ),
             GitOpResult::Ok(_)
         ));
-        let count = thegn_core::util::git_cmd(&dir)
-            .args(["rev-list", "--count", "HEAD"])
-            .output()
-            .unwrap();
-        assert!(count.status.success());
-        assert_eq!(String::from_utf8(count.stdout).unwrap().trim(), "1");
-        let tree_after = thegn_core::util::git_cmd(&dir)
-            .args(["rev-parse", "HEAD^{tree}"])
-            .output()
-            .unwrap();
-        assert!(tree_after.status.success());
-        assert_eq!(
-            String::from_utf8(tree_after.stdout).unwrap().trim(),
-            tree_before
-        );
-        let git_dir = thegn_core::util::git_cmd(&dir)
-            .args(["rev-parse", "--git-path", "rebase-merge"])
-            .output()
-            .unwrap();
-        assert!(git_dir.status.success());
+        assert_eq!(git_out(&dir, &["rev-list", "--count", "HEAD"]), "1");
+        assert_eq!(git_out(&dir, &["rev-parse", "HEAD^{tree}"]), tree_before);
         assert!(
-            !dir.join(String::from_utf8(git_dir.stdout).unwrap().trim())
+            !dir.join(git_out(&dir, &["rev-parse", "--git-path", "rebase-merge"]))
                 .exists()
         );
         if let Err(error) = std::fs::remove_dir_all(&dir) {
