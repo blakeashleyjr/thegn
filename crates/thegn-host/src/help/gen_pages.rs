@@ -12,6 +12,43 @@
 
 use crate::keymap_merge::{Binding, Source, collect, zones};
 
+/// Expand authored `{{keys:<section>}}` lines from the tables the panel uses.
+pub fn expand_keys_directives(src: &str) -> String {
+    src.lines()
+        .map(|line| {
+            let Some(key) = line
+                .strip_prefix("{{keys:")
+                .and_then(|s| s.strip_suffix("}}"))
+            else {
+                return line.to_string();
+            };
+            let Some(section) = crate::panel::Section::from_key(key) else {
+                return line.to_string();
+            };
+            let pairs: Vec<(String, String)> = if let Some(view) = section.home_view() {
+                crate::panel::gitui::context_keys(view)
+                    .into_iter()
+                    .map(|k| (k.chord.to_string(), k.label.to_string()))
+                    .collect()
+            } else {
+                crate::panel::section_keys::section_keys(section)
+                    .iter()
+                    .map(|k| (k.chord.to_string(), k.label.to_string()))
+                    .collect()
+            };
+            format!(
+                "Keys: {}",
+                pairs
+                    .iter()
+                    .map(|(c, l)| format!("`{c}` {}", escape(l)))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Section heading for a zone key from the fold.
 fn zone_heading(zone: &str) -> String {
     match zone {
@@ -230,5 +267,32 @@ mod tests {
         assert_eq!(zone_heading("global"), "Everywhere");
         assert_eq!(zone_heading("panel:merge"), "Panel · merge");
         assert_eq!(zone_heading("mystery"), "mystery");
+    }
+
+    #[test]
+    fn keys_directives_use_section_tables() {
+        let logs = expand_keys_directives("{{keys:logs}}");
+        assert!(logs.contains("`w` export"), "{logs}");
+        let changes = expand_keys_directives("{{keys:changes}}");
+        assert!(changes.contains("stage"), "git context table: {changes}");
+    }
+
+    #[test]
+    fn every_keys_directive_names_a_section() {
+        for src in crate::help::pages::SOURCES {
+            for line in src.lines().filter(|line| line.starts_with("{{keys:")) {
+                let key = line
+                    .strip_prefix("{{keys:")
+                    .and_then(|s| s.strip_suffix("}}"));
+                assert!(
+                    key.and_then(crate::panel::Section::from_key).is_some(),
+                    "unknown directive: {line}"
+                );
+            }
+        }
+        assert_eq!(
+            expand_keys_directives("{{keys:not-a-section}}"),
+            "{{keys:not-a-section}}"
+        );
     }
 }

@@ -347,7 +347,7 @@ local caches are served stale and it restores on the next success.
 
 Named `[env.<name>]` execution environments (local, container, or a cloud
 provider) appear in the panel's **system → environments** section — `↵`
-binds the cursor env to the active worktree, `t` tests its provider
+(re)binds the cursor env to the active worktree, `t` tests its provider
 token (the outcome pops as a toast and is logged), `n` opens the add
 wizard, and `x`
 removes it after a confirm (removal also forgets the stored token). An
@@ -401,13 +401,12 @@ tunes keepalives, timeouts, and retry backoff for flaky links.
 The panel's **system → sandbox** section shows the live state for the
 focused worktree: the backend, image, mounts, DNS filtering, and the
 container's status and cpu/mem/net when one exists; the wider views add
-the activity timeline. `g` widens it from this worktree to every
-container on the machine; at full width the containers table sits beside
-the timeline. Container actions: `s` stops and `r` restarts the
-highlighted container (at the narrow widths, the worktree's own
-container), and `l` tails its logs live in a center pane (`<runtime> logs
---tail 200 -f`). Stop and restart run off the UI loop and report their
-outcome as a toast.
+the activity timeline. Containers thegn did not create are listed
+read-only: `s` and `r` are refused with a status, while `l` still opens
+their logs. `s` and `r` on thegn-owned containers ask first. `g` scopes
+the full table too; Half-width `g` rows are selectable. When sandboxing is
+off, a one-line banner says so. Log, stop, and restart work runs off the UI
+loop and reports its outcome as a toast.
 
 The machine-global view is the system monitor's **Containers** tab
 ([[system-monitor]]), which lists every backend's containers with live
