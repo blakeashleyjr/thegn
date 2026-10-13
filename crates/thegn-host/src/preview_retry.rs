@@ -32,6 +32,10 @@ impl PendingPreviewOob {
         }
     }
 
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
     #[cfg(test)]
     fn pending(&self) -> Option<&[u8]> {
         self.pending.as_deref()
@@ -52,6 +56,15 @@ impl PendingCornerOob {
     pub(crate) fn require_delete(&mut self) {
         self.delete_pending = true;
         self.draw = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_pending(&self) -> bool {
+        self.delete_pending || self.draw.is_some()
+    }
+
+    pub(crate) fn blocks_output(&self, visible: bool) -> bool {
+        self.delete_pending || (visible && self.draw.is_some())
     }
 
     /// Retain the newest complete draw. Hidden draws wait until the corner is
@@ -98,6 +111,87 @@ impl PendingCornerOob {
         (self.delete_pending, self.draw.as_deref())
     }
 }
+
+/// Retains the newest admissible host clipboard copy. An oversized copy is
+/// warned about and dropped without displacing an already retained copy.
+#[derive(Debug, Default)]
+pub(crate) struct PendingClipboardOob {
+    pending: Option<Vec<u8>>,
+}
+
+impl PendingClipboardOob {
+    pub(crate) fn offer(
+        &mut self,
+        bytes: Vec<u8>,
+        submit: impl FnMut(Vec<u8>) -> Result<(), Vec<u8>>,
+    ) {
+        if bytes.len() > crate::frame_writer::OOB_QUEUE_BYTES {
+            tracing::warn!(
+                target: "thegn::frame",
+                bytes = bytes.len(),
+                "dropping oversized host clipboard OSC 52"
+            );
+            return;
+        }
+        self.pending = Some(bytes);
+        self.retry(submit);
+    }
+
+    pub(crate) fn retry(&mut self, mut submit: impl FnMut(Vec<u8>) -> Result<(), Vec<u8>>) {
+        let Some(bytes) = self.pending.take() else {
+            return;
+        };
+        if let Err(bytes) = submit(bytes) {
+            self.pending = Some(bytes);
+        }
+    }
+
+    #[cfg(test)]
+    fn pending(&self) -> Option<&[u8]> {
+        self.pending.as_deref()
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+}
+
+/// The muse marker is ordered after retained output and may be cancelled by
+/// newly observed PTY input before a later retry.
+#[derive(Debug, Default)]
+pub(crate) struct PendingReadyMarker {
+    pending: bool,
+}
+
+impl PendingReadyMarker {
+    pub(crate) fn offer(&mut self, submit: impl FnMut(Vec<u8>) -> Result<(), Vec<u8>>) {
+        self.pending = true;
+        self.retry(false, submit);
+    }
+
+    pub(crate) fn retry(
+        &mut self,
+        input_pending: bool,
+        mut submit: impl FnMut(Vec<u8>) -> Result<(), Vec<u8>>,
+    ) {
+        if !self.pending || input_pending {
+            return;
+        }
+        if submit(MUSE_READY_MARKER.to_vec()).is_ok() {
+            self.pending = false;
+        }
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        self.pending = false;
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pending
+    }
+}
+
+pub(crate) const MUSE_READY_MARKER: &[u8] = b"\x1b]5379;muse:ready\x07";
 
 #[cfg(test)]
 mod tests {
@@ -209,5 +303,104 @@ mod tests {
         slot.offer_draw(Vec::new(), true, |_| Ok(()));
         let actual = slot.state();
         assert_eq!((actual.0, actual.1.map(<[u8]>::to_vec)), pending);
+    }
+
+    #[test]
+    fn refused_clipboard_is_retained_and_retried_once() {
+        let mut slot = PendingClipboardOob::default();
+        slot.offer(vec![1, 2], Err);
+        assert_eq!(slot.pending(), Some([1, 2].as_slice()));
+
+        let submitted = RefCell::new(Vec::new());
+        slot.retry(|bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.retry(|bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert_eq!(*submitted.borrow(), vec![vec![1, 2]]);
+    }
+
+    #[test]
+    fn newer_clipboard_offer_supersedes_refused_copy() {
+        let mut slot = PendingClipboardOob::default();
+        slot.offer(vec![1], Err);
+        slot.offer(vec![2], Err);
+        assert_eq!(slot.pending(), Some([2].as_slice()));
+        let submitted = RefCell::new(Vec::new());
+        slot.retry(|bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert_eq!(*submitted.borrow(), vec![vec![2]]);
+    }
+
+    #[test]
+    fn oversized_clipboard_is_dropped_without_replacing_pending_copy() {
+        let mut slot = PendingClipboardOob::default();
+        let submitted = RefCell::new(Vec::new());
+        slot.offer(vec![2; crate::frame_writer::OOB_QUEUE_BYTES + 1], |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert!(submitted.borrow().is_empty());
+        assert_eq!(slot.pending(), None);
+
+        slot.offer(vec![1], Err);
+        slot.offer(vec![2; crate::frame_writer::OOB_QUEUE_BYTES + 1], |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert!(submitted.borrow().is_empty());
+        assert_eq!(slot.pending(), Some([1].as_slice()));
+    }
+
+    #[test]
+    fn refused_ready_marker_waits_for_input_clear_and_can_be_cancelled() {
+        let mut slot = PendingReadyMarker::default();
+        slot.offer(Err);
+        assert!(slot.is_pending());
+
+        let submitted = RefCell::new(Vec::new());
+        slot.retry(true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert!(submitted.borrow().is_empty());
+        assert!(slot.is_pending());
+
+        slot.retry(false, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert_eq!(*submitted.borrow(), vec![MUSE_READY_MARKER.to_vec()]);
+        assert!(!slot.is_pending());
+
+        slot.offer(Err);
+        slot.cancel();
+        assert!(!slot.is_pending());
+    }
+
+    #[test]
+    fn hidden_retained_corner_draw_does_not_block_ready_marker() {
+        let mut corner = PendingCornerOob::default();
+        corner.offer_draw(vec![1], false, Err);
+        assert!(corner.is_pending());
+        assert!(!corner.blocks_output(false));
+        assert!(corner.blocks_output(true));
+
+        let mut marker = PendingReadyMarker::default();
+        marker.offer(Err);
+        let submitted = RefCell::new(Vec::new());
+        if !corner.blocks_output(false) {
+            marker.retry(false, |bytes| {
+                submitted.borrow_mut().push(bytes);
+                Ok(())
+            });
+        }
+        assert_eq!(*submitted.borrow(), vec![MUSE_READY_MARKER.to_vec()]);
+        assert!(!marker.is_pending());
     }
 }
