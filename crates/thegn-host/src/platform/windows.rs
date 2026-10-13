@@ -742,6 +742,24 @@ impl GroupHandle {
         self.terminate();
     }
 
+    /// Stop applying kill-on-close to this Job Object so a successful helper
+    /// may leave a background clipboard owner running after its leader exits.
+    /// Returns false only if Windows refused to update the job limits.
+    pub fn detach(&self) -> bool {
+        let Some(job) = &self.job else {
+            return true;
+        };
+        let info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) != 0
+        }
+    }
+
     /// Whether the retained Job Object has no active processes.
     pub fn is_empty(&self) -> bool {
         let Some(job) = &self.job else {

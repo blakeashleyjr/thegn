@@ -3,6 +3,7 @@
 
 pub(crate) const MAX_DECODED: usize = 64 * 1024;
 pub(crate) const MAX_WIRE: usize = MAX_DECODED.div_ceil(3) * 4 + 9;
+const MAX_SKIP_STRING_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Default)]
 enum State {
@@ -17,6 +18,7 @@ enum State {
     },
     SkipString {
         escape: bool,
+        bytes: usize,
     },
 }
 
@@ -56,7 +58,10 @@ impl Clipboard {
                             self.partial.extend_from_slice(b"\x1b]");
                             State::Osc { escape: false }
                         }
-                        b'P' | b'_' | b'^' | b'X' => State::SkipString { escape: false },
+                        b'P' | b'_' | b'^' | b'X' => State::SkipString {
+                            escape: false,
+                            bytes: 0,
+                        },
                         0x1b => State::Escape,
                         _ => State::Text,
                     };
@@ -100,17 +105,35 @@ impl Clipboard {
                         };
                     }
                 }
-                State::SkipString { escape } => {
-                    // DCS/APC/PM/SOS bodies may contain OSC-looking bytes or
-                    // BEL. Only ST ends these strings; their contents cannot
-                    // become top-level clipboard commands.
-                    self.state = if escape && byte == b'\\' {
-                        State::Text
+                State::SkipString { escape, bytes } => {
+                    // CAN/SUB abort control strings. ESC followed by anything
+                    // except ST aborts the string and starts a fresh escape
+                    // sequence with the byte that followed ESC.
+                    if byte == 0x18 || byte == 0x1a || escape && byte == b'\\' {
+                        self.state = State::Text;
+                    } else if escape {
+                        // Process the byte after ESC through the same escape
+                        // transitions as a top-level sequence.
+                        self.state = match byte {
+                            b']' => {
+                                self.partial.extend_from_slice(b"\x1b]");
+                                State::Osc { escape: false }
+                            }
+                            b'P' | b'_' | b'^' | b'X' => State::SkipString {
+                                escape: false,
+                                bytes: 0,
+                            },
+                            0x1b => State::Escape,
+                            _ => State::Text,
+                        };
+                    } else if bytes >= MAX_SKIP_STRING_BYTES {
+                        self.state = State::Text;
                     } else {
-                        State::SkipString {
+                        self.state = State::SkipString {
                             escape: byte == 0x1b,
-                        }
-                    };
+                            bytes: bytes + 1,
+                        };
+                    }
                 }
                 State::Discard { escape } => {
                     self.state = if byte == 7 || escape && byte == b'\\' {
@@ -285,7 +308,9 @@ mod tests {
         for kind in b"P_^X" {
             let mut c = Clipboard::default();
             c.feed(&[0x1b, *kind]);
-            c.feed(b"payload\x1b]52;c;eA==\x07more\x1b]52;c;eQ==\x07\x1b");
+            // OSC-looking text and BEL remain inert until ST; an ESC would
+            // abort the control string and begin a new sequence.
+            c.feed(b"payload]52;c;eA==\x07more]52;c;eQ==\x07\x1b");
             assert!(!c.has_pending());
             c.feed(b"\\\x1b]52;c;eg==\x07");
             assert_eq!(
@@ -293,6 +318,36 @@ mod tests {
                 Some(b"\x1b]52;c;eg==\x07".as_slice())
             );
         }
+    }
+
+    #[test]
+    fn aborted_apc_does_not_hide_following_osc52() {
+        for abort in [b"\x18".as_slice(), b"\x1b]".as_slice()] {
+            let mut c = Clipboard::default();
+            c.feed(b"\x1b_payload");
+            c.feed(abort);
+            if abort == b"\x1b]" {
+                c.feed(b"52;c;eA==\x07");
+            } else {
+                c.feed(b"\x1b]52;c;eA==\x07");
+            }
+            assert_eq!(
+                pending(&mut c).as_deref(),
+                Some(b"\x1b]52;c;eA==\x07".as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn skip_string_byte_cap_recovers_to_ground() {
+        let mut c = Clipboard::default();
+        c.feed(b"\x1bP");
+        c.feed(&vec![b'x'; MAX_SKIP_STRING_BYTES + 1]);
+        c.feed(b"\x1b]52;c;eA==\x07");
+        assert_eq!(
+            pending(&mut c).as_deref(),
+            Some(b"\x1b]52;c;eA==\x07".as_slice())
+        );
     }
 
     #[test]

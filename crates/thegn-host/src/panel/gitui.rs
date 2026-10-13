@@ -684,6 +684,35 @@ pub fn display_map(ui: &GitUi, view: GitView, data: &crate::panel::PanelData) ->
     (0..len).collect()
 }
 
+/// Paste into the active git filter only while its panel input owns focus.
+/// Returns false when the paste belongs to the terminal pane instead.
+pub fn paste_filter(
+    ui: &mut GitUi,
+    panel_visible: bool,
+    panel_focused: bool,
+    text: &str,
+    data: &crate::panel::PanelData,
+) -> bool {
+    let view = {
+        let Some(filter) = ui
+            .filter
+            .as_mut()
+            .filter(|filter| panel_visible && panel_focused && filter.editing)
+        else {
+            return false;
+        };
+        filter.query.push_str(text);
+        filter.view
+    };
+    let map = display_map(ui, view, data);
+    let max_cursor = map.len().saturating_sub(1);
+    if let Some(filter) = ui.filter.as_mut() {
+        filter.map = map;
+    }
+    ui.cur.set(view, ui.cur.get(view).min(max_cursor));
+    true
+}
+
 /// Translate the focused list's display cursor to its source index.
 pub fn source_at(ui: &GitUi, view: GitView, data: &crate::panel::PanelData) -> Option<usize> {
     display_map(ui, view, data).get(ui.cur.get(view)).copied()
@@ -1159,6 +1188,23 @@ mod tests {
         };
         ui.git.focus = view;
         ui
+    }
+
+    #[test]
+    fn filter_paste_requires_visible_panel_focus_and_editing() {
+        let data = crate::panel::PanelData::default();
+        let mut ui = ui_at(GitView::Files, PanelWidth::Full).git;
+        ui.filter = Some(ListFilter {
+            view: GitView::Files,
+            query: "old".into(),
+            editing: true,
+            map: Vec::new(),
+        });
+        assert!(!paste_filter(&mut ui, false, true, "paste", &data));
+        assert!(!paste_filter(&mut ui, true, false, "paste", &data));
+        assert_eq!(ui.filter.as_ref().unwrap().query, "old");
+        assert!(paste_filter(&mut ui, true, true, " paste", &data));
+        assert_eq!(ui.filter.as_ref().unwrap().query, "old paste");
     }
 
     #[test]
