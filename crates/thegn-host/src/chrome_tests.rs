@@ -938,8 +938,14 @@ fn masthead_network_widget_selects_medium_icon_and_preserves_rates() {
         masthead_widget("net", &model)
             .unwrap()
             .text
-            .starts_with(&model.stats_icons.net_icon)
+            .starts_with(glyphs.net_wifi)
     );
+    crate::caps::test_override::with_unicode(thegn_core::termcaps::UnicodeLevel::Ascii, || {
+        let ascii_glyphs = crate::caps::active_glyphs();
+        let wifi = masthead_widget("net", &model).unwrap();
+        assert!(ascii_glyphs.net_wifi.is_ascii());
+        assert!(wifi.text.starts_with(ascii_glyphs.net_wifi));
+    });
 
     model.stats.net_medium = NetMedium::Unknown;
     assert!(
