@@ -3,6 +3,7 @@
 
 use crate::seg::{Line, Seg, seg, sp};
 use thegn_core::theme::Hue;
+use thegn_core::viz;
 
 use super::{
     PanelHit, PanelRow, Section, SectionCtx, ac, d, f, g, g2, g3, hint_row, hue, pr_state_hue,
@@ -19,7 +20,26 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
 /// Normal/Half: PR header, checks, review threads, log; Half adds issues and
 /// a 12-week velocity strip from the fetched git docs.
 fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
-    let (data, deep) = (&ctx.model.panel, ctx.deep());
+    let mut rows = header_and_checks(ctx);
+    rows.extend(threads_and_open_prs(ctx));
+    rows.extend(log_issues_velocity(ctx));
+    rows.push(PanelRow::blank());
+    rows.push(if ctx.model.panel.pr.is_some() {
+        hint_row(&[
+            ("M", "merge"),
+            ("A", "approve"),
+            ("c", "comment"),
+            ("r", "rerun"),
+            ("o", "browser"),
+        ])
+    } else {
+        hint_row(&[("c", "create PR")])
+    });
+    rows
+}
+
+fn header_and_checks(ctx: &SectionCtx) -> Vec<PanelRow> {
+    let data = &ctx.model.panel;
     let mut rows: Vec<PanelRow> = Vec::new();
     match &data.pr {
         Some(pr) => {
@@ -96,86 +116,6 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
                 }
                 rows.push(PanelRow::blank());
             }
-
-            // REVIEW — decision + unresolved threads.
-            let unresolved = data.threads.iter().filter(|t| !t.resolved).count();
-            let top_level = data.review_snapshot.as_ref().map_or(0, |snapshot| {
-                snapshot.conversation.comments.len()
-                    + snapshot
-                        .conversation
-                        .reviews
-                        .iter()
-                        .filter(|review| !review.body.trim().is_empty())
-                        .count()
-            });
-            let mut per_file: Vec<(String, usize)> = Vec::new();
-            for thread in data.threads.iter().filter(|thread| !thread.resolved) {
-                if let Some((_, count)) = per_file.iter_mut().find(|(path, _)| *path == thread.path)
-                {
-                    *count += 1;
-                } else {
-                    per_file.push((thread.path.clone(), 1));
-                }
-            }
-            if !data.threads.is_empty() || pr.review_decision.is_some() || top_level > 0 {
-                let decision = pr
-                    .review_decision
-                    .as_deref()
-                    .unwrap_or("REVIEW_REQUIRED")
-                    .to_lowercase()
-                    .replace('_', " ");
-                let mut l = vec![
-                    seg(g2(), "REVIEW").bold(),
-                    seg(g(), format!("  {decision}")),
-                ];
-                if unresolved > 0 {
-                    l.push(seg(
-                        g(),
-                        format!(" {} ", crate::caps::active_glyphs().middot),
-                    ));
-                    l.push(seg(hue(Hue::Amber), format!("⊘{unresolved} unresolved")));
-                }
-                if top_level > 0 {
-                    l.push(seg(g(), " · "));
-                    l.push(seg(g(), format!("{top_level} top-level")));
-                }
-                rows.push(PanelRow::plain(Line::segs(l)));
-                if !per_file.is_empty() {
-                    rows.push(PanelRow::plain(Line::segs(vec![
-                        seg(g2(), "files: "),
-                        seg(
-                            g(),
-                            per_file
-                                .iter()
-                                .take(6)
-                                .map(|(path, count)| format!("{path} x{count}"))
-                                .collect::<Vec<_>>()
-                                .join(&format!(" {} ", crate::caps::active_glyphs().middot)),
-                        ),
-                    ])));
-                }
-                for (i, th) in visible_threads(data, deep).enumerate() {
-                    let mark = if th.resolved {
-                        seg(hue(Hue::Green), "✓ ")
-                    } else {
-                        seg(hue(Hue::Amber), "⊘ ")
-                    };
-                    let at = match th.line {
-                        Some(l) => format!("{}:{l}", th.path),
-                        None => th.path.clone(),
-                    };
-                    rows.push(
-                        PanelRow::plain(Line::segs(vec![
-                            mark,
-                            seg(hue(Hue::Purple), th.author.clone()),
-                            seg(g(), format!(" · {at} · ")),
-                            seg(d(), format!("“{}”", th.snippet)),
-                        ]))
-                        .with_hit(PanelHit::Row(Section::Pr, i)),
-                    );
-                }
-                rows.push(PanelRow::blank());
-            }
         }
         None => {
             rows.push(PanelRow::plain(Line::segs(vec![seg(
@@ -187,61 +127,13 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
             rows.push(PanelRow::blank());
         }
     }
+    rows
+}
 
-    // OPEN PRS — the repo's other open PRs (from `gh pr list` via the
-    // repo-keyed `pr_branch_cache`), so the section answers "what's open on
-    // this repo", not only "what's open on this branch". The current branch's
-    // own PR is the detail above, so it's skipped here. ◈ marks a PR whose
-    // head branch already has a local worktree.
-    {
-        let others: Vec<&thegn_core::forge::model::PrHeader> = data
-            .open_prs
-            .iter()
-            .filter(|p| p.head_ref != data.branch)
-            .collect();
-        if !others.is_empty() {
-            let cap = if deep { 8 } else { 4 };
-            let mut header = vec![
-                seg(g2(), "OPEN PRS").bold(),
-                seg(g(), format!("  {} open on this repo", others.len())),
-            ];
-            // Age tag once the cache is meaningfully old (offline / gh
-            // failing): stale-but-shown beats blank, but it must SAY so.
-            if let Some(at) = data.open_prs_fetched_at {
-                let age = thegn_core::util::now().saturating_sub(at);
-                if age > 600 {
-                    header.push(seg(f(), format!("  ({} ago)", super::fmt_secs(age))));
-                }
-            }
-            rows.push(PanelRow::plain(Line::segs(header)));
-            for p in others.iter().take(cap) {
-                let linked = ctx
-                    .model
-                    .sidebar_db_worktrees
-                    .iter()
-                    .any(|w| w.branch == p.head_ref);
-                let mut l = vec![seg(ac(), format!("#{} ", p.number))];
-                if linked {
-                    l.push(seg(g2(), "◈ "));
-                }
-                l.push(seg(f(), p.head_ref.clone()));
-                let state_chip = if p.is_draft {
-                    Seg::chip(g(), " draft ")
-                } else {
-                    Seg::chip(pr_state_hue(&p.state, p.is_draft), format!(" {} ", p.state))
-                };
-                rows.push(PanelRow::plain(Line::split(l, vec![state_chip])));
-            }
-            if others.len() > cap {
-                rows.push(PanelRow::plain(Line::segs(vec![seg(
-                    g(),
-                    format!("… +{} more", others.len() - cap),
-                )])));
-            }
-            rows.push(PanelRow::blank());
-        }
-    }
-
+fn log_issues_velocity(ctx: &SectionCtx) -> Vec<PanelRow> {
+    let data = &ctx.model.panel;
+    let deep = ctx.deep();
+    let mut rows = Vec::new();
     // LOG — graph rows.
     if !data.log.is_empty() {
         let mut r = vec![seg(d(), "")];
@@ -309,18 +201,147 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
         }
     }
 
-    rows.push(PanelRow::blank());
-    rows.push(if data.pr.is_some() {
-        hint_row(&[
-            ("M", "merge"),
-            ("A", "approve"),
-            ("c", "comment"),
-            ("r", "rerun"),
-            ("o", "browser"),
-        ])
-    } else {
-        hint_row(&[("c", "create PR")])
-    });
+    rows
+}
+
+fn threads_and_open_prs(ctx: &SectionCtx) -> Vec<PanelRow> {
+    let (data, deep) = (&ctx.model.panel, ctx.deep());
+    let mut rows: Vec<PanelRow> = Vec::new();
+    if let Some(pr) = &data.pr {
+        // REVIEW — decision + unresolved threads.
+        let unresolved = data.threads.iter().filter(|t| !t.resolved).count();
+        let top_level = data.review_snapshot.as_ref().map_or(0, |snapshot| {
+            snapshot.conversation.comments.len()
+                + snapshot
+                    .conversation
+                    .reviews
+                    .iter()
+                    .filter(|review| !review.body.trim().is_empty())
+                    .count()
+        });
+        let mut per_file: Vec<(String, usize)> = Vec::new();
+        for thread in data.threads.iter().filter(|thread| !thread.resolved) {
+            if let Some((_, count)) = per_file.iter_mut().find(|(path, _)| *path == thread.path) {
+                *count += 1;
+            } else {
+                per_file.push((thread.path.clone(), 1));
+            }
+        }
+        if !data.threads.is_empty() || pr.review_decision.is_some() || top_level > 0 {
+            let decision = pr
+                .review_decision
+                .as_deref()
+                .unwrap_or("REVIEW_REQUIRED")
+                .to_lowercase()
+                .replace('_', " ");
+            let mut l = vec![
+                seg(g2(), "REVIEW").bold(),
+                seg(g(), format!("  {decision}")),
+            ];
+            if unresolved > 0 {
+                l.push(seg(
+                    g(),
+                    format!(" {} ", crate::caps::active_glyphs().middot),
+                ));
+                l.push(seg(hue(Hue::Amber), format!("⊘{unresolved} unresolved")));
+            }
+            if top_level > 0 {
+                l.push(seg(g(), " · "));
+                l.push(seg(g(), format!("{top_level} top-level")));
+            }
+            rows.push(PanelRow::plain(Line::segs(l)));
+            if !per_file.is_empty() {
+                rows.push(PanelRow::plain(Line::segs(vec![
+                    seg(g2(), "files: "),
+                    seg(
+                        g(),
+                        per_file
+                            .iter()
+                            .take(6)
+                            .map(|(path, count)| format!("{path} x{count}"))
+                            .collect::<Vec<_>>()
+                            .join(&format!(" {} ", crate::caps::active_glyphs().middot)),
+                    ),
+                ])));
+            }
+            for (i, th) in visible_threads(data, deep).enumerate() {
+                let mark = if th.resolved {
+                    seg(hue(Hue::Green), "✓ ")
+                } else {
+                    seg(hue(Hue::Amber), "⊘ ")
+                };
+                let at = match th.line {
+                    Some(l) => format!("{}:{l}", th.path),
+                    None => th.path.clone(),
+                };
+                rows.push(
+                    PanelRow::plain(Line::segs(vec![
+                        mark,
+                        seg(hue(Hue::Purple), th.author.clone()),
+                        seg(g(), format!(" · {at} · ")),
+                        seg(d(), format!("“{}”", th.snippet)),
+                    ]))
+                    .with_hit(PanelHit::Row(Section::Pr, i)),
+                );
+            }
+            rows.push(PanelRow::blank());
+        }
+    }
+
+    // OPEN PRS — the repo's other open PRs (from `gh pr list` via the
+    // repo-keyed `pr_branch_cache`), so the section answers "what's open on
+    // this repo", not only "what's open on this branch". The current branch's
+    // own PR is the detail above, so it's skipped here. ◈ marks a PR whose
+    // head branch already has a local worktree.
+    {
+        let others: Vec<&thegn_core::forge::model::PrHeader> = data
+            .open_prs
+            .iter()
+            .filter(|p| p.head_ref != data.branch)
+            .collect();
+        if !others.is_empty() {
+            let cap = if deep { 8 } else { 4 };
+            let mut header = vec![
+                seg(g2(), "OPEN PRS").bold(),
+                seg(g(), format!("  {} open on this repo", others.len())),
+            ];
+            // Age tag once the cache is meaningfully old (offline / gh
+            // failing): stale-but-shown beats blank, but it must SAY so.
+            if let Some(at) = data.open_prs_fetched_at {
+                let age = thegn_core::util::now().saturating_sub(at);
+                if age > 600 {
+                    header.push(seg(f(), format!("  ({} ago)", super::fmt_secs(age))));
+                }
+            }
+            rows.push(PanelRow::plain(Line::segs(header)));
+            for p in others.iter().take(cap) {
+                let linked = ctx
+                    .model
+                    .sidebar_db_worktrees
+                    .iter()
+                    .any(|w| w.branch == p.head_ref);
+                let mut l = vec![seg(ac(), format!("#{} ", p.number))];
+                if linked {
+                    l.push(seg(g2(), "◈ "));
+                }
+                l.push(seg(f(), p.head_ref.clone()));
+                let state_chip = if p.is_draft {
+                    Seg::chip(g(), " draft ")
+                } else {
+                    Seg::chip(pr_state_hue(&p.state, p.is_draft), format!(" {} ", p.state))
+                };
+                rows.push(PanelRow::plain(Line::split(l, vec![state_chip])));
+            }
+            if others.len() > cap {
+                rows.push(PanelRow::plain(Line::segs(vec![seg(
+                    g(),
+                    format!("… +{} more", others.len() - cap),
+                )])));
+            }
+            rows.push(PanelRow::blank());
+        }
+    }
+
     rows
 }
 
@@ -348,25 +369,8 @@ fn log_row(row: &thegn_svc::git::LogRow) -> PanelRow {
 // ---- Full: the PR summary and review threads, with OPEN PRS ----------------
 
 fn full_pr(ctx: &SectionCtx) -> Vec<PanelRow> {
-    let rows = list(ctx);
-    let review = rows
-        .iter()
-        .position(|row| row_text(row).starts_with("REVIEW"));
-    let open_prs = rows
-        .iter()
-        .position(|row| row_text(row).starts_with("OPEN PRS"));
-    let tail = ["LOG", "ISSUES", "VELOCITY"]
-        .iter()
-        .filter_map(|heading| {
-            rows.iter()
-                .position(|row| row_text(row).starts_with(heading))
-        })
-        .min();
-    let left_end = review.or(open_prs).or(tail).unwrap_or(rows.len());
-    let right_start = review.or(open_prs).unwrap_or(left_end);
-    let right_end = tail.unwrap_or_else(|| rows.len().saturating_sub(2));
-    let left = &rows[..left_end];
-    let right = &rows[right_start..right_end];
+    let left = header_and_checks(ctx);
+    let right = threads_and_open_prs(ctx);
     let left_segs = left.iter().map(row_segs).collect::<Vec<_>>();
     let right_segs = right.iter().map(row_segs).collect::<Vec<_>>();
     let mut out = if ctx.cols >= 100 {
@@ -376,10 +380,10 @@ fn full_pr(ctx: &SectionCtx) -> Vec<PanelRow> {
             .map(PanelRow::plain)
             .collect::<Vec<_>>();
         for (index, row) in right.iter().enumerate() {
-            if let Some(hit) = row.hit.clone() {
-                if let Some(target) = combined.get_mut(index) {
-                    target.hit = Some(hit);
-                }
+            if let Some(hit) = row.hit.clone()
+                && let Some(target) = combined.get_mut(index)
+            {
+                target.hit = Some(hit);
             }
         }
         combined
@@ -416,8 +420,4 @@ fn row_segs(row: &PanelRow) -> Vec<Seg> {
             segs
         }
     }
-}
-
-fn row_text(row: &PanelRow) -> String {
-    row_segs(row).into_iter().map(|part| part.text).collect()
 }

@@ -684,7 +684,7 @@ pub fn pr_merge_menu(number: u64, blockers: &[String]) -> MenuOverlay {
     let body = if blockers.is_empty() {
         "no known blockers".to_string()
     } else {
-        format!("known blockers:\n{}", blockers.join("\n"))
+        format!("blockers: {}", blockers.join(" · "))
     };
     MenuOverlay::new_with_default(
         MenuKindTag::Confirm,
@@ -2194,12 +2194,11 @@ mod tests {
             MenuOutcome::Pick(MenuChoice::Confirm { tag: "pr-merge", arg }) if arg == "rebase"
         ));
         let blocked = pr_merge_menu(7, &["unit tests failing".into()]);
+        let body = blocked.body.as_deref().unwrap_or_default();
+        assert!(body.contains("unit tests failing"));
         assert!(
-            blocked
-                .body
-                .as_deref()
-                .unwrap_or_default()
-                .contains("unit tests failing")
+            !body.contains('\n'),
+            "menu body must occupy one row: {body:?}"
         );
         assert!(blocked.items().iter().take(3).all(|item| item.danger));
     }
