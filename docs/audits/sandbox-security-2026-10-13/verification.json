@@ -1,0 +1,12 @@
+{
+  "checks": "Python syntax, JSON/JSONL/TOML parsing and local Markdown file/anchor links",
+  "counts": {
+    "python_syntax": 6,
+    "json": 12,
+    "jsonl": 5,
+    "toml": 1,
+    "local_markdown_links": 52
+  },
+  "errors": [],
+  "scope": "Audit artifacts only; runtime/product verification in runtime-evidence.md"
+}

@@ -1,0 +1,79 @@
+{
+  "checks": [
+    {
+      "check": "copying linked directory retains host common Git directory",
+      "result": "pass"
+    },
+    {
+      "check": "private .git is a directory inside the private copy",
+      "result": "pass"
+    },
+    {
+      "check": "private common Git directory differs from host",
+      "result": "pass"
+    },
+    {
+      "check": "private objects have no alternates",
+      "result": "pass"
+    },
+    {
+      "check": "private object files share no host object inodes",
+      "result": "pass"
+    },
+    {
+      "check": "ignored file excluded; dirty and untracked files imported",
+      "result": "pass"
+    },
+    {
+      "check": "sandbox commits and refs leave host refs unchanged",
+      "result": "pass"
+    },
+    {
+      "check": "host tracked and untracked baseline untouched before sync",
+      "result": "pass"
+    },
+    {
+      "check": "file patch includes tracked, deleted untracked, new and binary changes",
+      "result": "pass"
+    },
+    {
+      "check": "file patch contains no sandbox refs or commit history",
+      "result": "pass"
+    },
+    {
+      "check": "private files and Git repo survive reader process replacement",
+      "result": "pass"
+    },
+    {
+      "check": "baseline comparison detects host edit without overwriting either side",
+      "result": "pass"
+    },
+    {
+      "check": "patch applies tracked and untracked edits and binary bytes",
+      "result": "pass"
+    },
+    {
+      "check": "patch leaves host Git refs and pointer unchanged",
+      "result": "pass"
+    },
+    {
+      "check": "ignored file is unchanged by sync",
+      "result": "pass"
+    },
+    {
+      "check": "advanced baseline makes repeat sync empty",
+      "result": "pass"
+    },
+    {
+      "check": "interrupted journal model recognizes old/new states",
+      "result": "pass"
+    },
+    {
+      "check": "interrupted journal model refuses unexpected concurrent bytes",
+      "result": "pass"
+    }
+  ],
+  "passed": 18,
+  "patch_sha256": "04cbf7973e79dbc36764ca8cb307d6e858ab2cb99f546501b2aed49e5a0d1137",
+  "scope": "synthetic Git primitives and recovery predicates; no Thegn private-copy implementation exists"
+}
