@@ -58,6 +58,7 @@ impl PendingCornerOob {
         self.draw = None;
     }
 
+    #[cfg(test)]
     pub(crate) fn is_pending(&self) -> bool {
         self.delete_pending || self.draw.is_some()
     }
