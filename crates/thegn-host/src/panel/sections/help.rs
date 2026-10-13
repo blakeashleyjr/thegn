@@ -103,6 +103,7 @@ mod tests {
         let model = FrameModel::default();
         let ui = PanelUi {
             open: Section::Help,
+            tab: crate::panel::PanelTab::Help,
             width,
             scroll,
             help: HelpPanelState {
@@ -213,10 +214,20 @@ mod tests {
                 .expect("Help is scrollable at every width");
             assert!(extent.owns_nav);
             let content_cols = if width == PanelWidth::Full { 37 } else { 36 };
-            let viewport = super::super::scroll_viewport(&ui, 12);
+            let viewport = super::super::scroll_viewport(&model, &ui, 39, 12);
             assert_eq!(
                 extent.max,
-                line_count(&ctx(&model, &ui, content_cols)).saturating_sub(viewport - 2)
+                line_count(&ctx(&model, &ui, content_cols))
+                    .saturating_sub(viewport.saturating_sub(2))
+            );
+
+            let tiny_extent = super::super::scroll_extent(Section::Help, &model, &ui, 39, 1)
+                .expect("Help remains scrollable in a tiny frame");
+            let tiny_viewport = super::super::scroll_viewport(&model, &ui, 39, 1);
+            assert_eq!(
+                tiny_extent.max,
+                line_count(&ctx(&model, &ui, content_cols))
+                    .saturating_sub(tiny_viewport.saturating_sub(2))
             );
         }
     }

@@ -937,13 +937,46 @@ pub struct ScrollExtent {
     pub owns_nav: bool,
 }
 
-/// The estimated body height shared by rendering and scroll routing.
-pub fn scroll_viewport(ui: &PanelUi, rows: usize) -> usize {
+/// The body height shared by rendering and scroll routing.
+pub fn scroll_viewport(
+    model: &crate::chrome::FrameModel,
+    ui: &PanelUi,
+    cols: usize,
+    rows: usize,
+) -> usize {
+    let header_rows = crate::panel::frame::header_rows(model, false, cols).len();
     if ui.width == crate::layout::PanelWidth::Full {
-        rows.saturating_sub(1 + 4 + 1 + 2)
+        crate::panel::budget::allocate_full(
+            rows.saturating_sub(1),
+            header_rows,
+            rail_row_count(ui, cols),
+        )
+        .body_rows
     } else {
-        rows.saturating_sub(1 + 4 + ui.visible_section_count() + 2)
+        rows.saturating_sub(1 + header_rows + ui.visible_section_count() + 2)
     }
+}
+
+fn rail_row_count(ui: &PanelUi, cols: usize) -> usize {
+    let visible: Vec<_> = ui
+        .tab_sections()
+        .into_iter()
+        .map(|section| section.label())
+        .collect();
+    let mut rows = 0;
+    let mut x = 1usize;
+    for (i, label) in visible.iter().enumerate() {
+        let entry_width = (i + 1).to_string().len() + 1 + label.chars().count();
+        let separator_width = if x > 1 { 3 } else { 0 };
+        if x + separator_width + entry_width > cols.saturating_sub(1) && x > 1 {
+            rows += 1;
+            x = 1;
+        } else if separator_width > 0 {
+            x += separator_width;
+        }
+        x += entry_width;
+    }
+    if visible.is_empty() { rows } else { rows + 1 }
 }
 
 pub fn scroll_moves(ext: ScrollExtent, up: bool, scroll: usize) -> bool {
@@ -1019,7 +1052,7 @@ pub fn scroll_extent(
         }),
         rows,
     };
-    let viewport = scroll_viewport(ui, rows);
+    let viewport = scroll_viewport(model, ui, cols, rows);
     match section {
         Section::Help => Some(ScrollExtent {
             max: help::line_count(&ctx).saturating_sub(viewport.saturating_sub(2)),

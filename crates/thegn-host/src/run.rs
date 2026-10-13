@@ -19229,8 +19229,10 @@ async fn event_loop<T: Terminal>(
                         panel_geom(&chrome).1,
                     )
                 {
-                    let (_, rows) = panel_geom(&chrome);
-                    let page = crate::panel::sections::scroll_viewport(&panel_ui, rows).max(1);
+                    let (cols, rows) = panel_geom(&chrome);
+                    let page =
+                        crate::panel::sections::scroll_viewport(&model, &panel_ui, cols, rows)
+                            .max(1);
                     if let Some(mut target) = crate::panel::sections::scroll_step(
                         ext,
                         &k.key,
