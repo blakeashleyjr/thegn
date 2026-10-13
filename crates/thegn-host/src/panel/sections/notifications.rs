@@ -79,6 +79,29 @@ fn filter_bar(ctx: &SectionCtx) -> PanelRow {
     ]))
 }
 
+fn committed_filter_bar(ctx: &SectionCtx) -> PanelRow {
+    PanelRow::plain(Line::segs(vec![seg(
+        f(),
+        format!("/ {}  (/ then Esc clears)", ctx.ui.notifications_filter),
+    )]))
+}
+
+fn filter_row(ctx: &SectionCtx) -> PanelRow {
+    if ctx.ui.notifications_filter_editing {
+        filter_bar(ctx)
+    } else {
+        committed_filter_bar(ctx)
+    }
+}
+
+fn empty_label(ctx: &SectionCtx) -> String {
+    if ctx.ui.notifications_filter.is_empty() {
+        "inbox zero".into()
+    } else {
+        format!("no matches for /{}/", ctx.ui.notifications_filter)
+    }
+}
+
 // ---- main entry point -------------------------------------------------------
 
 pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
@@ -98,12 +121,15 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let cursor = ctx.ui.notifications_cursor;
     let mut rows = Vec::new();
 
-    if ctx.ui.notifications_filter_editing {
-        rows.push(filter_bar(ctx));
+    if ctx.ui.notifications_filter_editing || !ctx.ui.notifications_filter.is_empty() {
+        rows.push(filter_row(ctx));
     }
 
     if items.is_empty() {
-        rows.push(PanelRow::plain(Line::segs(vec![seg(f(), "inbox zero")])));
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            f(),
+            empty_label(ctx),
+        )])));
         rows.push(hint_row(&[("/ ", "search"), ("A", "show read")]));
         return rows;
     }
@@ -171,12 +197,15 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let cursor = ctx.ui.notifications_cursor;
     let mut rows = Vec::new();
 
-    if ctx.ui.notifications_filter_editing {
-        rows.push(filter_bar(ctx));
+    if ctx.ui.notifications_filter_editing || !ctx.ui.notifications_filter.is_empty() {
+        rows.push(filter_row(ctx));
     }
 
     if items.is_empty() {
-        rows.push(PanelRow::plain(Line::segs(vec![seg(f(), "inbox zero")])));
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            f(),
+            empty_label(ctx),
+        )])));
         rows.push(hint_row(&[("/ ", "search"), ("A", "show read")]));
         return rows;
     }
@@ -265,14 +294,24 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let mut rows = Vec::new();
 
     // Header bar
-    let unread = ctx
-        .model
-        .panel
-        .notifications
-        .iter()
-        .filter(|n| !n.read)
-        .count();
-    let total = ctx.model.panel.notifications.len();
+    let counts = ctx.model.panel.notification_counts();
+    let mut count_parts = Vec::new();
+    if counts.alert > 0 {
+        count_parts.push(format!("⚑ {} alert", counts.alert));
+    }
+    if counts.alert + counts.notice > 0 {
+        count_parts.push(format!("{} unread", counts.alert + counts.notice));
+    }
+    if counts.info > 0 {
+        count_parts.push(format!("{} low", counts.info));
+    }
+    count_parts.push(format!("{} shown", ctx.model.panel.notifications.len()));
+    if ctx.ui.notifications_show_read && ctx.model.panel.notifications_hidden_read > 0 {
+        count_parts.push(format!(
+            "+{} older read",
+            ctx.model.panel.notifications_hidden_read
+        ));
+    }
     let show_tag = if ctx.ui.notifications_show_read {
         " [all]"
     } else {
@@ -283,21 +322,28 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     } else {
         format!(" /{}/ ", ctx.ui.notifications_filter)
     };
+    let mut header = format!("  {}", count_parts.join(" · "));
+    if !show_tag.is_empty() {
+        header.push_str(show_tag);
+    }
+    if !filt_tag.is_empty() {
+        header.push_str(&filt_tag);
+    }
     rows.push(PanelRow::plain(Line::segs(vec![
         seg(d(), "NOTIFICATIONS"),
-        seg(
-            f(),
-            format!("  ⚑ {unread} unread / {total}{show_tag}{filt_tag}"),
-        ),
+        seg(f(), header),
     ])));
     rows.push(rule());
 
-    if ctx.ui.notifications_filter_editing {
-        rows.push(filter_bar(ctx));
+    if ctx.ui.notifications_filter_editing || !ctx.ui.notifications_filter.is_empty() {
+        rows.push(filter_row(ctx));
     }
 
     if items.is_empty() {
-        rows.push(PanelRow::plain(Line::segs(vec![seg(f(), "inbox zero")])));
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            f(),
+            empty_label(ctx),
+        )])));
         rows.push(hint_row(&[("/ ", "search"), ("A", "show read")]));
         return rows;
     }
@@ -399,6 +445,32 @@ fn notification_detail_segs(n: &Notification, w: usize) -> Vec<Vec<Seg>> {
 mod tests {
     use super::*;
 
+    fn rendered_text(rows: &[PanelRow]) -> String {
+        rows.iter()
+            .filter_map(|row| match &row.line {
+                Line::Segs(segs) => Some(
+                    segs.iter()
+                        .map(|part| part.text.as_str())
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn test_notification(kind: NotificationKind, read: bool, message: &str) -> Notification {
+        Notification {
+            id: 1,
+            kind,
+            source_ref: "THE-1".into(),
+            message: message.into(),
+            created_at_ms: 1,
+            read,
+            worktree_path: String::new(),
+        }
+    }
+
     #[test]
     fn truncate_adds_ellipsis() {
         assert_eq!(truncate("hello world", 8), "hello w…");
@@ -428,5 +500,88 @@ mod tests {
             assert!(!text.contains(ch), "rendered text contains {ch:?}");
         }
         assert!(text.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn committed_filter_is_visible_at_normal_and_half() {
+        let model = crate::chrome::FrameModel::default();
+        for width in [
+            crate::layout::PanelWidth::Normal,
+            crate::layout::PanelWidth::Half,
+        ] {
+            let ui = crate::panel::PanelUi {
+                open: Section::Notifications,
+                width,
+                notifications_filter: "zzz".into(),
+                ..Default::default()
+            };
+            let text = rendered_text(&content(&SectionCtx {
+                model: &model,
+                ui: &ui,
+                cols: 75,
+                rows: 20,
+            }));
+            assert!(text.contains("/ zzz  (/ then Esc clears)"));
+        }
+    }
+
+    #[test]
+    fn filtered_empty_state_says_no_matches() {
+        let mut model = crate::chrome::FrameModel::default();
+        model.panel.notifications = vec![test_notification(
+            NotificationKind::Assigned,
+            false,
+            "different text",
+        )];
+        let ui = crate::panel::PanelUi {
+            open: Section::Notifications,
+            notifications_filter: "zzz".into(),
+            ..Default::default()
+        };
+        let text = rendered_text(&content(&SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 75,
+            rows: 20,
+        }));
+        assert!(text.contains("no matches for /zzz/"));
+        assert!(!text.contains("inbox zero"));
+    }
+
+    #[test]
+    fn full_header_counts_match_the_chip() {
+        let mut model = crate::chrome::FrameModel::default();
+        model.panel.notifications = vec![
+            test_notification(NotificationKind::AgentFailed, false, "alert one"),
+            Notification {
+                id: 2,
+                ..test_notification(NotificationKind::TestFailed, false, "alert two")
+            },
+            Notification {
+                id: 3,
+                ..test_notification(NotificationKind::Assigned, false, "notice")
+            },
+            Notification {
+                id: 4,
+                ..test_notification(NotificationKind::WorktreeCreated, false, "info")
+            },
+        ];
+        let ui = crate::panel::PanelUi {
+            open: Section::Notifications,
+            width: crate::layout::PanelWidth::Full,
+            ..Default::default()
+        };
+        let text = rendered_text(&content(&SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 150,
+            rows: 20,
+        }));
+        assert!(text.contains("⚑ 2 alert · 3 unread · 1 low · 4 shown"));
+        let chip = crate::panel::sections::summary(Section::Notifications, &model)
+            .iter()
+            .map(|part| part.text.as_str())
+            .collect::<String>();
+        assert!(chip.contains("⚑ 2"));
     }
 }

@@ -4,6 +4,8 @@
 //! dirty (chrome damage → a Full render), so the render-plan invariants are
 //! untouched.
 
+use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use termwiz::input::{KeyCode, Modifiers};
@@ -16,6 +18,8 @@ use crate::seg::{self, Line, Seg, Tok, seg, sp};
 use thegn_core::help::{HelpRegistry, LinkTarget, SearchHit, TocNode};
 
 use super::render::{RenderedPage, render_page};
+
+type RenderKey = (String, usize, Option<usize>);
 
 /// What the loop should do after a key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +69,9 @@ pub struct HelpOverlay {
     /// Where things were painted on the last render, for mouse hit-testing.
     /// `None` before the first render, when a click can't mean anything yet.
     hits: Option<HitAreas>,
+    rendered_cache: Option<(RenderKey, Rc<RenderedPage>)>,
+    search_cache: HashMap<String, Vec<SearchHit>>,
+    search_cache_order: VecDeque<String>,
 }
 
 /// The last frame's clickable geometry. Recorded by `render` so clicks land on
@@ -86,20 +93,40 @@ struct HitAreas {
 /// The dim preview line under a search hit: the matched body line with the
 /// query itself inverted. `hl_start`/`hl_len` are **char** offsets (the core
 /// matcher folds ASCII case over chars), so slice by chars, not bytes.
-fn snippet_segs(sn: &thegn_core::help::Snippet) -> Vec<Seg> {
+fn snippet_segs(sn: &thegn_core::help::Snippet, width: usize) -> Vec<Seg> {
     let chars: Vec<char> = sn.text.chars().collect();
     let start = sn.hl_start.min(chars.len());
     let end = (start + sn.hl_len).min(chars.len());
     let take = |r: std::ops::Range<usize>| chars[r].iter().collect::<String>();
     let mut out = vec![sp(3)];
-    if start > 0 {
-        out.push(seg(Tok::Slot(S::Ghost), take(0..start)));
+    let budget = width.saturating_sub(4).max(1);
+    let mut window_start = start.saturating_sub(budget.saturating_sub(end - start) / 3);
+    let mut leading = window_start > 0;
+    let mut content_budget = budget.saturating_sub(usize::from(leading));
+    if end.saturating_sub(window_start) > content_budget {
+        window_start = end.saturating_sub(content_budget);
+        leading = window_start > 0;
+        content_budget = budget.saturating_sub(usize::from(leading));
+    }
+    let mut window_end = window_start.saturating_add(content_budget).min(chars.len());
+    if window_end < chars.len() && window_end < end {
+        window_end = end.min(chars.len());
+    }
+    let trailing = window_end < chars.len();
+    if leading {
+        out.push(seg(Tok::Slot(S::Ghost), "…"));
+    }
+    if window_start < start {
+        out.push(seg(Tok::Slot(S::Ghost), take(window_start..start)));
     }
     if end > start {
         out.push(seg(Tok::Slot(S::Text), take(start..end)).bg(Tok::SelAccent));
     }
-    if end < chars.len() {
-        out.push(seg(Tok::Slot(S::Ghost), take(end..chars.len())));
+    if end < window_end {
+        out.push(seg(Tok::Slot(S::Ghost), take(end..window_end)));
+    }
+    if trailing {
+        out.push(seg(Tok::Slot(S::Ghost), "…"));
     }
     out
 }
@@ -143,6 +170,9 @@ impl HelpOverlay {
             last_dims: (72, 20),
             badge,
             hits: None,
+            rendered_cache: None,
+            search_cache: HashMap::new(),
+            search_cache_order: VecDeque::new(),
         }
     }
 
@@ -150,11 +180,20 @@ impl HelpOverlay {
         &self.page
     }
 
-    fn rendered(&self) -> RenderedPage {
+    fn rendered(&mut self) -> Rc<RenderedPage> {
+        let key = (self.page.clone(), self.last_dims.0, self.link_sel);
+        if let Some((cached_key, rendered)) = &self.rendered_cache
+            && cached_key == &key
+        {
+            return Rc::clone(rendered);
+        }
         // `page_blocks` appends the "Referenced by" footer, whose entries are
         // ordinary links — so `n`/`p`/`↵` reach them like any other.
+        // An open overlay keeps its registry Arc for its whole lifetime.
         let blocks = super::render::page_blocks(&self.reg, &self.page);
-        render_page(&blocks, self.last_dims.0, self.link_sel)
+        let rendered = Rc::new(render_page(&blocks, self.last_dims.0, self.link_sel));
+        self.rendered_cache = Some((key, Rc::clone(&rendered)));
+        rendered
     }
 
     fn max_scroll(&self, total_lines: usize) -> usize {
@@ -202,13 +241,18 @@ impl HelpOverlay {
         };
         match &link.target {
             LinkTarget::Page(id) => self.goto(id.clone(), 0),
-            // External URLs can't open from a TUI portably; put the target on
-            // the bounded clipboard worker. Completion or rejection is
-            // surfaced by the event-loop outcome drain without retaining the
-            // URL in a status or diagnostic message.
+            // Open externally, falling back to the bounded clipboard worker
+            // when the platform opener rejects the URL.
             LinkTarget::Url(url) => {
-                if let Err(error) = crate::clipboard::copy(url) {
-                    tracing::debug!(target: "thegn::clipboard", %error, "clipboard request rejected");
+                if let Err(error) = crate::actions::open_url_detached(url) {
+                    tracing::debug!(
+                        target: "thegn::help",
+                        error = error.label(),
+                        "opening help URL failed; copying it instead"
+                    );
+                    if let Err(error) = crate::clipboard::copy(url) {
+                        tracing::debug!(target: "thegn::clipboard", %error, "clipboard request rejected");
+                    }
                 }
             }
         }
@@ -240,11 +284,25 @@ impl HelpOverlay {
 
     fn run_search(&mut self) {
         if let Some(s) = self.search.as_mut() {
-            s.hits = thegn_core::help::search(
-                self.reg.pages(),
-                &s.query,
-                &crate::fff_backend::fuzzy_rank,
-            );
+            let query = s.query.clone();
+            let hits = if let Some(hits) = self.search_cache.get(&query) {
+                hits.clone()
+            } else {
+                let hits = thegn_core::help::search(
+                    self.reg.pages(),
+                    &query,
+                    &crate::fff_backend::fuzzy_rank,
+                );
+                if self.search_cache.len() >= 16
+                    && let Some(oldest) = self.search_cache_order.pop_front()
+                {
+                    self.search_cache.remove(&oldest);
+                }
+                self.search_cache_order.push_back(query.clone());
+                self.search_cache.insert(query, hits.clone());
+                hits
+            };
+            s.hits = hits;
             s.sel = 0;
             s.scroll = 0;
         }
@@ -323,6 +381,18 @@ impl HelpOverlay {
             KeyCode::Char('[') => self.back(),
             KeyCode::Char(']') => self.forward(),
             KeyCode::Backspace => self.back(),
+            KeyCode::Char('y') => {
+                let Some(idx) = self.link_sel else {
+                    return HelpOutcome::Pending;
+                };
+                let rendered = self.rendered();
+                if let Some(link) = rendered.links.get(idx)
+                    && let LinkTarget::Url(url) = &link.target
+                    && let Err(error) = crate::clipboard::copy(url)
+                {
+                    tracing::debug!(target: "thegn::clipboard", %error, "clipboard request rejected");
+                }
+            }
             _ => match self.side {
                 Side::Toc => self.toc_key(key),
                 Side::Content => self.content_key(key),
@@ -380,7 +450,15 @@ impl HelpOverlay {
 
     /// Wheel scrolling from the mouse pre-dispatch.
     pub fn scroll_by(&mut self, delta: isize) {
-        let max = self.max_scroll(self.rendered().lines.len());
+        if let Some(search) = self.search.as_mut() {
+            search.sel = search
+                .sel
+                .saturating_add_signed(delta)
+                .min(search.hits.len().saturating_sub(1));
+            return;
+        }
+        let len = self.rendered().lines.len();
+        let max = self.max_scroll(len);
         self.scroll = self.scroll.saturating_add_signed(delta).min(max);
     }
 
@@ -486,6 +564,7 @@ impl HelpOverlay {
             }
         }
         if let Some(s) = &self.search {
+            hits.left_x = (inner.x, inner.x + inner.cols);
             let scroll = s.scroll;
             for (i, hit) in s.hits.iter().skip(scroll).take(visible).enumerate() {
                 let y = body_y + i * ROWS_PER_HIT;
@@ -512,7 +591,7 @@ impl HelpOverlay {
                         inner.x,
                         y + 1,
                         inner.cols,
-                        &Line::segs(snippet_segs(sn)),
+                        &Line::segs(snippet_segs(sn, inner.cols)),
                         panel,
                     );
                 }
@@ -532,21 +611,53 @@ impl HelpOverlay {
             return;
         }
         {
-            // Keep the cursor row visible.
-            if self.toc_sel < self.toc_scroll {
-                self.toc_scroll = self.toc_sel;
-            } else if self.toc_sel >= self.toc_scroll + body_h {
-                self.toc_scroll = self.toc_sel + 1 - body_h;
+            // Very short bodies cannot fit both overflow markers and an item.
+            // Show rows only there, keeping the cursor visible.
+            if body_h < 3 {
+                self.toc_scroll = self.toc_sel.saturating_sub(body_h.saturating_sub(1));
+            } else {
+                // Markers consume rows, so settle the scroll against the
+                // capacity left after deciding which markers are present.
+                loop {
+                    let top = self.toc_scroll > 0;
+                    let provisional_capacity = body_h - usize::from(top);
+                    let bottom = self.toc_scroll + provisional_capacity < self.toc_rows.len();
+                    let capacity = body_h - usize::from(top) - usize::from(bottom);
+                    if self.toc_sel < self.toc_scroll {
+                        self.toc_scroll = self.toc_sel;
+                    } else if self.toc_sel >= self.toc_scroll + capacity {
+                        self.toc_scroll = self.toc_sel + 1 - capacity;
+                    } else {
+                        break;
+                    }
+                }
             }
+            let top_marker = body_h >= 3 && self.toc_scroll > 0;
+            let bottom_marker = body_h >= 3
+                && self.toc_scroll + body_h - usize::from(top_marker) < self.toc_rows.len();
+            let item_capacity = body_h - usize::from(top_marker) - usize::from(bottom_marker);
+            if top_marker {
+                let above = self.toc_scroll;
+                let label = format!("↑{above}");
+                seg::draw_line(
+                    surface,
+                    inner.x,
+                    body_y,
+                    toc_w,
+                    &Line::segs(vec![sp(1), seg(Tok::Slot(S::Ghost), label)]),
+                    panel,
+                );
+            }
+            let item_offset = usize::from(top_marker);
             for (i, (depth, id, title)) in self
                 .toc_rows
                 .iter()
                 .skip(self.toc_scroll)
-                .take(body_h)
+                .take(item_capacity)
                 .enumerate()
             {
                 let row = self.toc_scroll + i;
-                hits.left_rows.push((body_y + i, row));
+                hits.left_rows.push((body_y + item_offset + i, row));
                 let current = *id == self.page;
                 let cursor = row == self.toc_sel;
                 let mut label = seg(
@@ -567,9 +678,21 @@ impl HelpOverlay {
                 seg::draw_line(
                     surface,
                     inner.x,
-                    body_y + i,
+                    body_y + item_offset + i,
                     toc_w,
                     &Line::segs(segs),
+                    panel,
+                );
+            }
+            if bottom_marker && body_h > 0 {
+                let below = self.toc_rows.len() - (self.toc_scroll + item_capacity);
+                let label = format!("+{below} more");
+                seg::draw_line(
+                    surface,
+                    inner.x,
+                    body_y + body_h - 1,
+                    toc_w,
+                    &Line::segs(vec![sp(1), seg(Tok::Slot(S::Ghost), label)]),
                     panel,
                 );
             }
@@ -620,14 +743,15 @@ impl HelpOverlay {
                 ("esc", "close"),
             ]
         } else {
-            // Seven hints is the most this row holds; labels are kept short so
+            // Eight hints is the most this row holds; labels are kept short so
             // the set survives a typical width (it truncates on a narrow
             // terminal, as it always has).
             &[
                 ("↑↓", "scroll"),
                 ("n p", "links"),
                 ("↵", "follow"),
-                ("[ ]", "back"),
+                ("[ ]", "back/fwd"),
+                ("tab", "contents"),
                 ("/", "search"),
                 ("o", "panel"),
                 ("esc", "close"),
@@ -660,19 +784,23 @@ impl HelpOverlay {
         let Some(hits) = self.hits.clone() else {
             return HelpOutcome::Pending;
         };
-        // Left pane: TOC rows, or search results while searching.
+        if self.search.is_some() {
+            if x >= hits.left_x.0
+                && x < hits.left_x.1
+                && let Some((_, idx)) = hits.left_rows.iter().find(|(row, _)| *row == y)
+                && let Some(s) = self.search.as_mut()
+            {
+                s.sel = *idx;
+                self.open_hit();
+            }
+            return HelpOutcome::Pending;
+        }
+        // Left pane: TOC rows.
         if x >= hits.left_x.0 && x < hits.left_x.1 {
             if let Some((_, idx)) = hits.left_rows.iter().find(|(row, _)| *row == y) {
-                if self.search.is_some() {
-                    if let Some(s) = self.search.as_mut() {
-                        s.sel = *idx;
-                    }
-                    self.open_hit();
-                } else {
-                    self.side = Side::Toc;
-                    self.toc_sel = (*idx).min(self.toc_rows.len().saturating_sub(1));
-                    self.open_toc_row();
-                }
+                self.side = Side::Toc;
+                self.toc_sel = (*idx).min(self.toc_rows.len().saturating_sub(1));
+                self.open_toc_row();
             }
             return HelpOutcome::Pending;
         }
@@ -697,6 +825,7 @@ impl HelpOverlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
 
     fn registry() -> Arc<HelpRegistry> {
         let (reg, errors) =
@@ -765,6 +894,29 @@ mod tests {
     }
 
     #[test]
+    fn short_toc_body_keeps_the_cursor_on_a_drawn_row() {
+        let mut ov = overlay();
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            cols: 100,
+            rows: 7,
+        };
+        let mut surface = Surface::new(100, 7);
+        for _ in 0..ov.toc_rows.len() {
+            key(&mut ov, KeyCode::DownArrow);
+            ov.render(&mut surface, screen);
+            let hits = ov.hits.as_ref().unwrap();
+            assert!(
+                hits.left_rows.iter().any(|(_, row)| *row == ov.toc_sel),
+                "selected TOC row {} is absent from {:?}",
+                ov.toc_sel,
+                hits.left_rows
+            );
+        }
+    }
+
+    #[test]
     fn search_finds_and_jumps() {
         let mut ov = overlay();
         key(&mut ov, KeyCode::Char('/'));
@@ -808,6 +960,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn search_click_uses_full_hit_row_and_does_not_follow_hidden_page_links() {
+        let (mut ov, screen) = rendered_overlay();
+        key(&mut ov, KeyCode::Char('/'));
+        for c in "worktree".chars() {
+            key(&mut ov, KeyCode::Char(c));
+        }
+        assert!(!ov.search.as_ref().unwrap().hits.is_empty());
+        let expected_page = ov.search.as_ref().unwrap().hits[0].page.clone();
+        assert_ne!(
+            expected_page, "index",
+            "fixture hit must leave the current page"
+        );
+        let mut surface = Surface::new(100, 30);
+        ov.render(&mut surface, screen);
+        let y = ov.hits.as_ref().unwrap().left_rows[0].0;
+        let x = ov.hits.as_ref().unwrap().left_x.1 - 2;
+        ov.handle_click(x, y);
+        assert!(ov.search.is_none(), "the clicked hit was opened");
+        assert_eq!(ov.page_id(), expected_page);
+    }
+
+    #[test]
+    fn search_wheel_moves_selection_without_scrolling_page() {
+        let mut ov = overlay();
+        key(&mut ov, KeyCode::Char('/'));
+        for c in "the".chars() {
+            key(&mut ov, KeyCode::Char(c));
+        }
+        assert!(ov.search.as_ref().unwrap().hits.len() > 3);
+        let before_scroll = ov.scroll;
+        let before_sel = ov.search.as_ref().unwrap().sel;
+        ov.scroll_by(3);
+        assert_eq!(ov.scroll, before_scroll);
+        assert!(ov.search.as_ref().unwrap().sel > before_sel);
+    }
+
+    #[test]
+    fn exact_search_queries_are_kept_in_the_bounded_cache() {
+        let mut ov = overlay();
+        key(&mut ov, KeyCode::Char('/'));
+        for c in "the".chars() {
+            key(&mut ov, KeyCode::Char(c));
+        }
+        let first_hits = ov.search.as_ref().unwrap().hits.clone();
+        assert_eq!(ov.search_cache.get("the"), Some(&first_hits));
+        let sentinel = vec![SearchHit {
+            page: "cached-sentinel".into(),
+            title: "cached sentinel".into(),
+            score: 0,
+            snippet: None,
+        }];
+        ov.search_cache.insert("the".into(), sentinel.clone());
+        key(&mut ov, KeyCode::Backspace);
+        key(&mut ov, KeyCode::Char('e'));
+        assert_eq!(ov.search.as_ref().unwrap().query, "the");
+        assert_eq!(ov.search.as_ref().unwrap().hits, sentinel);
+        assert!(ov.search_cache.len() <= 16);
+    }
+
+    #[test]
+    fn rendered_page_cache_keys_page_width_and_link_selection() {
+        let mut ov = overlay();
+        let first = ov.rendered();
+        let second = ov.rendered();
+        assert!(Rc::ptr_eq(&first, &second));
+
+        ov.link_sel = Some(0);
+        let selected = ov.rendered();
+        assert!(!Rc::ptr_eq(&first, &selected));
+        ov.last_dims.0 += 1;
+        let resized = ov.rendered();
+        assert!(!Rc::ptr_eq(&selected, &resized));
+    }
+
     /// Hits used to render as a bare title list; the snippet was computed,
     /// tested, and thrown away. It is now drawn under each hit.
     #[test]
@@ -843,7 +1070,7 @@ mod tests {
             hl_len: 4,
             section: None,
         };
-        let segs = snippet_segs(&sn);
+        let segs = snippet_segs(&sn, 80);
         let joined: String = segs.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(joined.trim_start(), "naïve — Bold text");
         // Out-of-range offsets clamp instead of panicking on a multibyte slice.
@@ -853,9 +1080,27 @@ mod tests {
             hl_len: 99,
             section: None,
         };
-        let segs = snippet_segs(&bad);
+        let segs = snippet_segs(&bad, 80);
         let joined: String = segs.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(joined.trim_start(), "naïve");
+    }
+
+    #[test]
+    fn snippet_window_keeps_a_late_match_visible() {
+        let text = "introductory words that continue for a while and finally EXPORT the result";
+        let start = text.find("EXPORT").unwrap();
+        let sn = thegn_core::help::Snippet {
+            text: text.to_string(),
+            hl_start: text[..start].chars().count(),
+            hl_len: "EXPORT".chars().count(),
+            section: None,
+        };
+        let segs = snippet_segs(&sn, 30);
+        assert!(
+            segs.iter()
+                .any(|seg| seg.text == "EXPORT" && seg.bg == Some(Tok::SelAccent))
+        );
+        assert!(segs.iter().any(|seg| seg.text == "…"));
     }
 
     #[test]
@@ -876,7 +1121,8 @@ mod tests {
         for _ in 0..500 {
             key(&mut ov, KeyCode::DownArrow);
         }
-        let max = ov.max_scroll(ov.rendered().lines.len());
+        let len = ov.rendered().lines.len();
+        let max = ov.max_scroll(len);
         assert_eq!(ov.scroll, max);
         key(&mut ov, KeyCode::Char('g'));
         assert_eq!(ov.scroll, 0);
@@ -907,6 +1153,22 @@ mod tests {
         assert!(text.contains("thegn"), "page body drawn: {text}");
         assert!(text.contains("Welcome"), "TOC row drawn");
         assert!(text.contains("help"), "layer title");
+    }
+
+    #[test]
+    fn content_footer_names_back_forward_and_contents() {
+        let mut ov = overlay();
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            cols: 180,
+            rows: 40,
+        };
+        let mut surface = Surface::new(180, 40);
+        ov.render(&mut surface, screen);
+        let text = surface.screen_chars_to_string();
+        assert!(text.contains("back/fwd"), "{text}");
+        assert!(text.contains("contents"), "{text}");
     }
 
     /// Render once so `hits` is populated, then click.
@@ -1052,10 +1314,10 @@ mod tests {
         let screen = Rect {
             x: 0,
             y: 0,
-            cols: 120,
+            cols: 180,
             rows: 34,
         };
-        let mut s = Surface::new(120, 34);
+        let mut s = Surface::new(180, 34);
         ov.render(&mut s, screen);
         let text = s.screen_chars_to_string();
         for want in ["scroll", "follow", "search", "panel", "close"] {

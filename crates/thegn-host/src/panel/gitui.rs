@@ -265,6 +265,10 @@ impl ViewCursors {
 #[derive(Debug, Clone, Default)]
 pub struct GitUi {
     pub focus: GitView,
+    /// Views that launched each active drill, oldest first.
+    pub return_to: Vec<GitView>,
+    /// Width to restore after the last automatically widened drill is left.
+    pub widened_from: Option<PanelWidth>,
     pub cur: ViewCursors,
     /// Range anchor in the focused LIST view (`v` / shift+↓).
     pub sel_anchor: Option<usize>,
@@ -316,6 +320,137 @@ pub struct GitUi {
 }
 
 impl GitUi {
+    /// Whether this context is a detail view rather than an accordion list.
+    pub fn is_drill(view: GitView) -> bool {
+        matches!(
+            view,
+            GitView::Staging
+                | GitView::CommitFiles
+                | GitView::PatchBuilding
+                | GitView::RebaseTodo
+                | GitView::Blame
+        )
+    }
+
+    /// Enter a detail view while remembering the context that launched it.
+    pub fn drill(&mut self, to: GitView) {
+        self.return_to.push(self.focus);
+        self.focus = to;
+    }
+
+    /// Number of marked lines that would be lost by switching patch commits.
+    pub fn patch_conflicts_with(&self, sha: &str) -> Option<usize> {
+        match &self.flow {
+            GitFlow::Patch(p) if p.commit != sha => Some(p.marked()),
+            _ => None,
+        }
+    }
+
+    fn clear_drill_state(&mut self) {
+        self.staging = None;
+        self.stage_doc = None;
+        self.drilled_commit = None;
+        self.commit_files.clear();
+        self.patch_doc = None;
+        self.blame_path = None;
+        self.blame_rows.clear();
+        self.blame_cursor = 0;
+        self.blame_scroll = 0;
+        self.sel_anchor = None;
+    }
+
+    /// Return focus to a section's home context, dropping transient drill state.
+    pub fn retarget(&mut self, home: GitView) {
+        self.clear_drill_state();
+        if self
+            .filter
+            .as_ref()
+            .is_some_and(|filter| filter.view != home)
+        {
+            self.filter = None;
+        }
+        self.return_to.clear();
+        if matches!(&self.flow, GitFlow::Patch(p) if p.marked() == 0) {
+            self.flow = GitFlow::None;
+            self.patch_docs.clear();
+        }
+        self.focus = home;
+    }
+
+    /// Pop one drill layer. Returns false for a list focus so Esc can leave row mode.
+    pub fn back(&mut self, home: GitView) -> bool {
+        if !Self::is_drill(self.focus) {
+            let stale = self.staging.is_some()
+                || self.stage_doc.is_some()
+                || self.drilled_commit.is_some()
+                || !self.commit_files.is_empty()
+                || self.patch_doc.is_some()
+                || self.blame_path.is_some()
+                || !self.blame_rows.is_empty();
+            if stale {
+                self.clear_drill_state();
+            }
+            return false;
+        }
+
+        match self.focus {
+            GitView::Staging => {
+                self.staging = None;
+                self.stage_doc = None;
+            }
+            GitView::PatchBuilding => self.staging = None,
+            GitView::CommitFiles => {
+                self.drilled_commit = None;
+                self.commit_files.clear();
+                self.patch_doc = None;
+                if matches!(&self.flow, GitFlow::Patch(p) if p.marked() == 0) {
+                    self.flow = GitFlow::None;
+                    self.patch_docs.clear();
+                }
+            }
+            GitView::RebaseTodo => {
+                if !matches!(&self.flow, GitFlow::Rebase(r) if r.running) {
+                    self.flow = GitFlow::None;
+                }
+            }
+            GitView::Blame => {
+                self.blame_path = None;
+                self.blame_rows.clear();
+                self.blame_cursor = 0;
+                self.blame_scroll = 0;
+            }
+            _ => {}
+        }
+        let return_to = self.return_to.pop();
+        self.focus = return_to
+            .filter(|view| *view == home || Self::is_drill(*view))
+            .unwrap_or(home);
+        true
+    }
+
+    /// Repair focus after section, width, or tab changes.
+    pub fn normalize(&mut self, home: Option<GitView>, width: PanelWidth) -> bool {
+        let Some(home) = home else {
+            return false;
+        };
+        let inconsistent = (Self::is_drill(self.focus) && width == PanelWidth::Normal)
+            || (!Self::is_drill(self.focus) && self.focus != home);
+        if inconsistent {
+            self.retarget(home);
+            return true;
+        }
+        false
+    }
+
+    /// Take the remembered width once focus has left the final drill.
+    pub fn retract_width(&mut self) -> Option<PanelWidth> {
+        if !Self::is_drill(self.focus) {
+            self.widened_from.take()
+        } else {
+            None
+        }
+    }
+
     /// The focused list's selected inclusive range (anchor-aware).
     pub fn selection(&self) -> std::ops::RangeInclusive<usize> {
         let cur = self.cur.get(self.focus);
@@ -326,8 +461,9 @@ impl GitUi {
     }
 
     /// Reset transient state when the worktree changes underneath.
-    pub fn reset_for_worktree(&mut self) {
+    pub fn reset_for_worktree(&mut self, home: Option<GitView>) {
         *self = GitUi {
+            focus: home.unwrap_or_default(),
             op_gen: self.op_gen + 1,
             ..GitUi::default()
         };
@@ -807,28 +943,6 @@ pub fn todo_move(todos: &mut Vec<TodoEntry>, cursor: usize, up: bool) -> usize {
     }
 }
 
-/// Build the pick-everything todo PURELY from the loaded commit list
-/// (newest-first), oldest first as `git rebase -i` expects; the base is the
-/// oldest commit's parent (`<sha>^`, or `--root` for a root commit).
-pub fn todo_from_commits(commits: &[crate::panel::CommitRow]) -> Option<(String, Vec<TodoEntry>)> {
-    let oldest = commits.last()?;
-    let base = if oldest.parents.is_empty() {
-        "--root".to_string()
-    } else {
-        format!("{}^", oldest.sha)
-    };
-    let todos: Vec<TodoEntry> = commits
-        .iter()
-        .rev()
-        .map(|c| TodoEntry {
-            action: TodoAction::Pick,
-            sha: c.short.clone(),
-            subject: c.subject.clone(),
-        })
-        .collect();
-    Some((base, todos))
-}
-
 /// Mirror an externally-driven rebase (started in a shell pane, say) into
 /// the flow state from the hydrated merge banner, and clear a finished one.
 /// Returns the status note to show when the rebase ended. The caller must
@@ -848,6 +962,14 @@ pub fn sync_rebase_flow(git: &mut GitUi, banner: Option<(&str, usize)>) -> Optio
                         ..RebaseUi::default()
                     });
                 }
+                GitFlow::Patch(p) if p.marked() == 0 => {
+                    git.patch_docs.clear();
+                    git.flow = GitFlow::Rebase(RebaseUi {
+                        running: true,
+                        conflict: unresolved > 0,
+                        ..RebaseUi::default()
+                    });
+                }
                 _ => {}
             }
             None
@@ -855,7 +977,7 @@ pub fn sync_rebase_flow(git: &mut GitUi, banner: Option<(&str, usize)>) -> Optio
         None if matches!(&git.flow, GitFlow::Rebase(r) if r.running) => {
             git.flow = GitFlow::None;
             if git.focus == GitView::RebaseTodo {
-                git.focus = GitView::Commits;
+                git.back(GitView::Commits);
             }
             Some("rebase finished")
         }
@@ -897,7 +1019,10 @@ pub fn sync_sequencer_flow(git: &mut GitUi, label: Option<&str>, onto: &str, unr
                 if git.merge_conflict_total.is_none() {
                     git.merge_conflict_total = Some(unresolved);
                 }
-            } else if matches!(git.flow, GitFlow::None) || is_sequencer_flow(&git.flow) {
+            } else if matches!(git.flow, GitFlow::None)
+                || is_sequencer_flow(&git.flow)
+                || matches!(&git.flow, GitFlow::Patch(p) if p.marked() == 0)
+            {
                 // Fresh detection, or the kind changed under us: install the
                 // new flavor with a fresh conflict total. A running Rebase
                 // flow is left alone (that's `sync_rebase_flow`'s domain).
@@ -910,6 +1035,7 @@ pub fn sync_sequencer_flow(git: &mut GitUi, label: Option<&str>, onto: &str, unr
                     "CHERRY-PICK" => GitFlow::CherryPick(ui),
                     _ => GitFlow::Revert(ui),
                 };
+                git.patch_docs.clear();
                 git.merge_conflict_total = Some(unresolved);
             }
         }
@@ -1037,11 +1163,12 @@ pub fn git_key(key: &KeyCode, mods: Modifiers, ui: &crate::panel::PanelUi) -> Op
     if matches!(key, KeyCode::Escape) {
         let peelable = ui.git.filter.is_some()
             || ui.git.sel_anchor.is_some()
-            || ui.git.staging.is_some()
-            || !matches!(
-                view,
-                GitView::Files | GitView::Branches | GitView::Commits | GitView::Stash
-            );
+            || ui
+                .git
+                .staging
+                .as_ref()
+                .is_some_and(|staging| staging.anchor.is_some())
+            || GitUi::is_drill(view);
         return peelable.then_some(GitMsg::Back);
     }
     // Plain cursor keys belong to the accordion in list views (it owns
@@ -1630,9 +1757,6 @@ mod tests {
                 author: "Ada".into(),
                 date: 0,
                 refs: String::new(),
-                // The oldest (last) commit is a root commit when i == n-1
-                // only if the test wants it; default: every commit has a
-                // parent so `todo_from_commits` uses `<sha>^`.
                 parents: vec!["p".into()],
             })
             .collect()
@@ -1708,10 +1832,16 @@ mod tests {
 
     #[test]
     fn todo_reducers_retag_toggle_and_move() {
-        let (base, mut todos) = todo_from_commits(&commits(3)).unwrap();
-        // Oldest-first picks; base is the oldest sha + "^".
+        let mut todos: Vec<TodoEntry> = commits(3)
+            .into_iter()
+            .rev()
+            .map(|commit| TodoEntry {
+                action: TodoAction::Pick,
+                sha: commit.short,
+                subject: commit.subject,
+            })
+            .collect();
         assert_eq!(todos.len(), 3);
-        assert!(base.ends_with('^'));
         assert_eq!(todos[0].subject, "commit 2");
         assert!(todos.iter().all(|t| t.action == TodoAction::Pick));
 
@@ -1728,13 +1858,6 @@ mod tests {
         assert_eq!(todos[0].sha, sha);
         // Refused moves keep the cursor (already at the top).
         assert_eq!(todo_move(&mut todos, 0, true), 0);
-
-        // A root commit rebases from --root.
-        let mut root = commits(2);
-        root.last_mut().unwrap().parents.clear();
-        let (base, _) = todo_from_commits(&root).unwrap();
-        assert_eq!(base, "--root");
-        assert!(todo_from_commits(&[]).is_none());
     }
 
     #[test]
@@ -1877,6 +2000,204 @@ mod tests {
                 want,
                 "{view:?}"
             );
+        }
+    }
+
+    #[test]
+    fn worktree_reset_lands_on_the_open_sections_home() {
+        let mut git = GitUi::default();
+        git.reset_for_worktree(Some(GitView::Commits));
+        assert_eq!(git.focus, GitView::Commits);
+        let ui = PanelUi {
+            open: Section::Commits,
+            row_mode: true,
+            git,
+            ..Default::default()
+        };
+        assert_ne!(
+            git_key(&KeyCode::Char(' '), Modifiers::NONE, &ui),
+            Some(GitMsg::StageToggleFile)
+        );
+    }
+
+    #[test]
+    fn normalize_peels_drills_at_normal() {
+        let mut git = GitUi {
+            focus: GitView::CommitFiles,
+            drilled_commit: Some("abc123".into()),
+            ..GitUi::default()
+        };
+        assert!(git.normalize(Some(GitView::Commits), PanelWidth::Normal));
+        assert_eq!(git.focus, GitView::Commits);
+        assert_eq!(git.drilled_commit, None);
+        let ui = PanelUi {
+            open: Section::Commits,
+            row_mode: true,
+            git,
+            ..Default::default()
+        };
+        assert!(
+            context_keys(ui.git.focus)
+                .iter()
+                .any(|entry| entry.chord == "enter" && entry.label == "files")
+        );
+
+        let mut git = GitUi {
+            focus: GitView::CommitFiles,
+            ..GitUi::default()
+        };
+        assert!(!git.normalize(Some(GitView::Commits), PanelWidth::Half));
+        assert_eq!(git.focus, GitView::CommitFiles);
+    }
+
+    #[test]
+    fn back_returns_to_the_launching_view() {
+        let mut git = GitUi {
+            focus: GitView::Files,
+            ..GitUi::default()
+        };
+        git.drill(GitView::Blame);
+        git.drill(GitView::CommitFiles);
+        assert!(git.back(GitView::Files));
+        assert_eq!(git.focus, GitView::Blame);
+        assert!(git.back(GitView::Files));
+        assert_eq!(git.focus, GitView::Files);
+    }
+
+    #[test]
+    fn normalize_fixes_a_foreign_list_focus() {
+        let mut git = GitUi {
+            focus: GitView::Commits,
+            ..GitUi::default()
+        };
+        assert!(git.normalize(Some(GitView::Files), PanelWidth::Half));
+        assert_eq!(git.focus, GitView::Files);
+    }
+
+    #[test]
+    fn patch_commit_conflicts_report_marked_lines() {
+        let mut git = GitUi {
+            flow: GitFlow::Patch(PatchUi {
+                commit: "first".into(),
+                marks: std::collections::HashMap::from([(
+                    "file.rs".into(),
+                    std::collections::BTreeSet::from([2, 4]),
+                )]),
+                ..PatchUi::default()
+            }),
+            ..GitUi::default()
+        };
+        assert_eq!(git.patch_conflicts_with("second"), Some(2));
+        assert_eq!(git.patch_conflicts_with("first"), None);
+        if let GitFlow::Patch(patch) = &mut git.flow {
+            patch.marks.clear();
+        }
+        assert_eq!(git.patch_conflicts_with("second"), Some(0));
+    }
+
+    #[test]
+    fn back_from_commit_files_ends_only_an_unmarked_patch() {
+        let mut git = GitUi {
+            focus: GitView::CommitFiles,
+            flow: GitFlow::Patch(PatchUi {
+                commit: "abc".into(),
+                ..PatchUi::default()
+            }),
+            ..GitUi::default()
+        };
+        assert!(git.back(GitView::Commits));
+        assert_eq!(git.flow, GitFlow::None);
+
+        let mut git = GitUi {
+            focus: GitView::CommitFiles,
+            flow: GitFlow::Patch(PatchUi {
+                commit: "abc".into(),
+                marks: std::collections::HashMap::from([(
+                    "file.rs".into(),
+                    std::collections::BTreeSet::from([1]),
+                )]),
+                ..PatchUi::default()
+            }),
+            ..GitUi::default()
+        };
+        assert!(git.back(GitView::Commits));
+        assert!(matches!(git.flow, GitFlow::Patch(_)));
+    }
+
+    #[test]
+    fn external_rebase_replaces_an_unmarked_patch_flow() {
+        let mut git = GitUi {
+            flow: GitFlow::Patch(PatchUi::default()),
+            ..GitUi::default()
+        };
+        sync_rebase_flow(&mut git, Some(("REBASING", 0)));
+        assert!(matches!(git.flow, GitFlow::Rebase(_)));
+
+        let mut git = GitUi {
+            flow: GitFlow::Patch(PatchUi::default()),
+            ..GitUi::default()
+        };
+        sync_sequencer_flow(&mut git, Some("CHERRY-PICK"), "abc", 0);
+        assert!(matches!(git.flow, GitFlow::CherryPick(_)));
+    }
+
+    #[test]
+    fn stale_staging_in_a_list_view_does_not_swallow_esc() {
+        let mut ui = ui_at(GitView::Commits, PanelWidth::Half);
+        ui.git.staging = Some(StagingUi::new("stale.rs"));
+        assert_eq!(git_key(&KeyCode::Escape, Modifiers::NONE, &ui), None);
+    }
+
+    #[test]
+    fn retract_restores_width_after_last_drill() {
+        let mut git = GitUi {
+            focus: GitView::Staging,
+            widened_from: Some(PanelWidth::Normal),
+            ..GitUi::default()
+        };
+        assert_eq!(git.retract_width(), None);
+        assert!(git.back(GitView::Files));
+        assert_eq!(git.retract_width(), Some(PanelWidth::Normal));
+        assert_eq!(git.retract_width(), None);
+    }
+
+    #[test]
+    fn normalize_preserves_the_focus_invariant_for_every_home_view() {
+        let homes = [
+            GitView::Files,
+            GitView::Commits,
+            GitView::Branches,
+            GitView::Stash,
+        ];
+        let views = [
+            GitView::Files,
+            GitView::Branches,
+            GitView::Commits,
+            GitView::Stash,
+            GitView::Staging,
+            GitView::CommitFiles,
+            GitView::PatchBuilding,
+            GitView::RebaseTodo,
+            GitView::Blame,
+        ];
+        for home in homes {
+            for view in views {
+                for width in [PanelWidth::Normal, PanelWidth::Half, PanelWidth::Full] {
+                    let mut git = GitUi {
+                        focus: view,
+                        ..GitUi::default()
+                    };
+                    git.normalize(Some(home), width);
+                    assert!(
+                        git.focus == home || GitUi::is_drill(git.focus),
+                        "home={home:?} view={view:?} width={width:?} focus={:?}",
+                        git.focus
+                    );
+                    if width == PanelWidth::Normal {
+                        assert_eq!(git.focus, home);
+                    }
+                }
+            }
         }
     }
 }

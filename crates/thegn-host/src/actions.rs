@@ -948,7 +948,6 @@ pub(crate) fn run_pr_view_action(
     action: crate::pr_view::PrViewAction,
 ) {
     use crate::pr_view::PrViewAction as A;
-    use thegn_core::forge::model::MergeMethod;
     use thegn_core::forge::{ForgeError, LineComment, PrRef, RepoRef};
 
     if let A::OpenUrl(url) = &action {
@@ -956,7 +955,14 @@ pub(crate) fn run_pr_view_action(
         return;
     }
     let (label, status): (&'static str, &'static str) = match &action {
-        A::Merge => ("pr merge", "Merging PR (squash)…"),
+        A::Merge { method } => (
+            "pr merge",
+            match method {
+                thegn_core::forge::model::MergeMethod::Squash => "Merging PR (squash)…",
+                thegn_core::forge::model::MergeMethod::Merge => "Merging PR (merge)…",
+                thegn_core::forge::model::MergeMethod::Rebase => "Merging PR (rebase)…",
+            },
+        ),
         A::Approve => ("pr approve", "Approving PR…"),
         A::Rerun => ("pr rerun-checks", "Re-running failed checks…"),
         A::Comment { .. } => ("pr comment", "Posting comment…"),
@@ -976,7 +982,7 @@ pub(crate) fn run_pr_view_action(
         let forge = forges.for_loc(&loc);
         let cur = PrRef::Current;
         let res: Result<(), ForgeError> = match action {
-            A::Merge => forge.merge_pr(&loc, cur, MergeMethod::Squash, false, false),
+            A::Merge { method } => forge.merge_pr(&loc, cur, method, false, false),
             A::Approve => forge.submit_review(
                 &loc,
                 cur,
@@ -1018,58 +1024,233 @@ pub(crate) fn run_pr_view_action(
     });
 }
 
-/// The panel `Section::Pr` action keys (`M` merge, `A` approve, `r` re-run,
-/// `o` browser, `c` create). Merge/approve/re-run reuse the PR-view executor;
-/// `o`/`c` are handled here. Returns whether the key was claimed.
-pub(crate) fn panel_pr_action_key(
-    key: char,
-    model: &mut FrameModel,
+pub(crate) struct PanelPrActionCtx<'a> {
+    pub(crate) model: &'a mut FrameModel,
+    pub(crate) session: &'a Session,
+    pub(crate) refresh_tx: &'a UnboundedSender<RefreshKind>,
+    pub(crate) waker: &'a TerminalWaker,
+    pub(crate) active_menu: &'a mut Option<crate::menu::MenuOverlay>,
+    pub(crate) pr_view: &'a mut Option<PrView>,
+    pub(crate) pr_view_gen: &'a mut u64,
+    pub(crate) pr_view_tx: &'a UnboundedSender<PrViewData>,
+}
+
+/// Blockers known from the cached panel snapshot. Empty means no known blocker.
+pub(crate) fn pr_merge_blockers(panel: &crate::panel::PanelData) -> Vec<String> {
+    use crate::panel::CheckState;
+    let mut blockers = Vec::new();
+    let failed: Vec<&str> = panel
+        .checks
+        .iter()
+        .filter(|check| check.state == CheckState::Fail)
+        .map(|check| check.name.as_str())
+        .collect();
+    if !failed.is_empty() {
+        blockers.push(format!("{} failing check(s): {}", failed.len(), failed[0]));
+    }
+    let pending = panel
+        .checks
+        .iter()
+        .filter(|check| check.state == CheckState::Pending)
+        .count();
+    if pending > 0 {
+        blockers.push(format!("{pending} pending check(s)"));
+    }
+    if panel
+        .pr
+        .as_ref()
+        .and_then(|pr| pr.review_decision.as_deref())
+        == Some("CHANGES_REQUESTED")
+    {
+        blockers.push("changes requested".into());
+    }
+    let unresolved = panel
+        .threads
+        .iter()
+        .filter(|thread| !thread.resolved)
+        .count();
+    if unresolved > 0 {
+        blockers.push(format!("{unresolved} unresolved review thread(s)"));
+    }
+    if panel.pr.as_ref().is_some_and(|pr| pr.is_draft) {
+        blockers.push("draft PR".into());
+    }
+    if panel.pr_mergeable == "CONFLICTING" {
+        blockers.push("conflicting merge".into());
+    }
+    if matches!(
+        panel.pr_merge_state.as_str(),
+        "BLOCKED" | "DIRTY" | "BEHIND"
+    ) {
+        blockers.push(format!(
+            "merge state {}",
+            panel.pr_merge_state.to_lowercase()
+        ));
+    }
+    blockers
+}
+
+pub(crate) fn pr_merge_method(arg: &str) -> Option<thegn_core::forge::model::MergeMethod> {
+    use thegn_core::forge::model::MergeMethod;
+    match arg {
+        "squash" => Some(MergeMethod::Squash),
+        "merge" => Some(MergeMethod::Merge),
+        "rebase" => Some(MergeMethod::Rebase),
+        _ => None,
+    }
+}
+
+fn pr_rerun_refusal(panel: &crate::panel::PanelData) -> Option<&'static str> {
+    panel
+        .pr
+        .is_none()
+        .then_some("No pull request: nothing to re-run")
+}
+
+pub(crate) fn run_pr_merge(
     session: &Session,
     refresh_tx: &UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
+    model: &mut FrameModel,
+    method: thegn_core::forge::model::MergeMethod,
+) {
+    run_pr_view_action(
+        session,
+        refresh_tx,
+        waker,
+        model,
+        crate::pr_view::PrViewAction::Merge { method },
+    );
+}
+
+pub(crate) fn run_pr_create(
+    session: &Session,
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+    model: &mut FrameModel,
+) {
+    model.status = "Creating PR from branch commits…".into();
+    let wt = active_tab_path(session);
+    let tx = refresh_tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+        let opts = thegn_core::forge::model::CreateOpts {
+            title: None,
+            body: None,
+            base: None,
+            draft: false,
+            web: false,
+            fill: true,
+        };
+        let forges = crate::forge_handle::get();
+        if let Err(e) = forges.for_loc(&loc).create_pr(&loc, &opts) {
+            thegn_core::msg::warn(&format!("pr create failed: {}", e.describe()));
+        }
+        if tx.send(RefreshKind::Pr).is_ok()
+            && let Err(error) = waker.wake()
+        {
+            tracing::debug!(target: "thegn::pr", %error, "terminal wake after PR creation failed");
+        }
+    });
+}
+
+pub(crate) fn handle_pr_menu_pick(
+    choice: &crate::menu::MenuChoice,
+    session: &Session,
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+    model: &mut FrameModel,
 ) -> bool {
+    match choice {
+        crate::menu::MenuChoice::Confirm {
+            tag: "pr-merge",
+            arg,
+        } => {
+            if let Some(method) = pr_merge_method(arg) {
+                run_pr_merge(session, refresh_tx, waker, model, method);
+            }
+            true
+        }
+        crate::menu::MenuChoice::Confirm {
+            tag: "pr-create", ..
+        } => {
+            run_pr_create(session, refresh_tx, waker, model);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Route panel PR action keys. Returns whether the key was claimed.
+pub(crate) fn panel_pr_action_key(key: char, ctx: &mut PanelPrActionCtx<'_>) -> bool {
     use crate::pr_view::PrViewAction as A;
-    let has_pr = model.panel.pr.is_some();
+    let has_pr = ctx.model.panel.pr.is_some();
     match key {
-        'M' if has_pr => run_pr_view_action(session, refresh_tx, waker, model, A::Merge),
-        'M' => model.status = "No pull request to merge".into(),
-        'A' if has_pr => run_pr_view_action(session, refresh_tx, waker, model, A::Approve),
-        'A' => model.status = "No pull request to approve".into(),
-        'r' => run_pr_view_action(session, refresh_tx, waker, model, A::Rerun),
+        'M' if has_pr => {
+            let number = ctx.model.panel.pr.as_ref().map_or(0, |pr| pr.number);
+            let blockers = pr_merge_blockers(&ctx.model.panel);
+            *ctx.active_menu = Some(crate::menu::pr_merge_menu(number, &blockers));
+            ctx.model.status = "confirm PR merge".into();
+        }
+        'M' => ctx.model.status = "No pull request to merge".into(),
+        'A' if has_pr => run_pr_view_action(
+            ctx.session,
+            ctx.refresh_tx,
+            ctx.waker,
+            ctx.model,
+            A::Approve,
+        ),
+        'A' => ctx.model.status = "No pull request to approve".into(),
+        'r' => {
+            if let Some(status) = pr_rerun_refusal(&ctx.model.panel) {
+                ctx.model.status = status.into();
+            } else {
+                run_pr_view_action(ctx.session, ctx.refresh_tx, ctx.waker, ctx.model, A::Rerun);
+            }
+        }
         'o' if has_pr => {
-            let url = model
+            let url = ctx
+                .model
                 .panel
                 .pr
                 .as_ref()
                 .map(|p| p.url.clone())
                 .unwrap_or_default();
-            run_pr_view_action(session, refresh_tx, waker, model, A::OpenUrl(url));
+            run_pr_view_action(
+                ctx.session,
+                ctx.refresh_tx,
+                ctx.waker,
+                ctx.model,
+                A::OpenUrl(url),
+            );
         }
-        'o' => model.status = "No pull request to open".into(),
-        'c' if has_pr => model.status = "A pull request already exists".into(),
+        'o' => ctx.model.status = "No pull request to open".into(),
+        'c' if has_pr => {
+            if let Some(mut view) = open_pr_view(
+                ctx.model,
+                ctx.session,
+                ctx.pr_view_gen,
+                ctx.pr_view_tx,
+                ctx.waker,
+                ctx.refresh_tx,
+            ) {
+                view.start_comment();
+                *ctx.pr_view = Some(view);
+            }
+        }
         'c' => {
-            model.status = "Creating PR from branch commits…".into();
-            let wt = active_tab_path(session);
-            let tx = refresh_tx.clone();
-            let waker = waker.clone();
-            tokio::task::spawn_blocking(move || {
-                let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-                let opts = thegn_core::forge::model::CreateOpts {
-                    title: None,
-                    body: None,
-                    base: None,
-                    draft: false,
-                    web: false,
-                    fill: true,
-                };
-                let forges = crate::forge_handle::get();
-                if let Err(e) = forges.for_loc(&loc).create_pr(&loc, &opts) {
-                    thegn_core::msg::warn(&format!("pr create failed: {}", e.describe()));
-                }
-                if tx.send(RefreshKind::Pr).is_ok() {
-                    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                }
-            });
+            let branch = ctx.model.panel.branch.clone();
+            *ctx.active_menu = Some(crate::menu::confirm_menu(
+                "create pull request?",
+                format!(
+                    "push {branch} and open a PR titled from its commits (gh pr create --fill)?"
+                ),
+                "pr-create",
+                String::new(),
+                false,
+            ));
+            ctx.model.status = "confirm PR create".into();
         }
         _ => return false,
     }
@@ -1283,6 +1464,11 @@ pub(crate) fn dispatch_pr_view_key(
     match v.handle_key(key, mods) {
         PrViewOutcome::Close => *view = None,
         PrViewOutcome::Pending => {}
+        PrViewOutcome::ConfirmMerge => {
+            let blockers = pr_merge_blockers(&model.panel);
+            *active_menu = Some(crate::menu::pr_merge_menu(v.number, &blockers));
+            model.status = "confirm PR merge".into();
+        }
         PrViewOutcome::Act(crate::pr_view::PrViewAction::Handoff(selection)) => {
             if matches!(
                 crate::review_handoff::target(session, panes, cfg),
@@ -1903,6 +2089,63 @@ impl CiActionCtx<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rerun_without_pr_is_refused() {
+        assert_eq!(
+            pr_rerun_refusal(&crate::panel::PanelData::default()),
+            Some("No pull request: nothing to re-run")
+        );
+    }
+
+    #[test]
+    fn pr_merge_blockers_reports_failure_review_and_unresolved_thread() {
+        let blocked = crate::panel::PanelData {
+            pr: Some(crate::panel::PrSummary {
+                number: 7,
+                title: "Review".into(),
+                state: "OPEN".into(),
+                url: "https://github.com/acme/repo/pull/7".into(),
+                is_draft: false,
+                review_decision: Some("CHANGES_REQUESTED".into()),
+            }),
+            checks: vec![crate::panel::CheckLine {
+                name: "unit tests".into(),
+                state: crate::panel::CheckState::Fail,
+                duration_secs: None,
+                details_url: None,
+            }],
+            threads: vec![thegn_core::forge::model::ReviewThreadRow {
+                resolved: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(pr_merge_blockers(&blocked).len(), 3);
+        assert!(
+            pr_merge_blockers(&blocked)
+                .iter()
+                .any(|line| line.contains("unit tests"))
+        );
+        let clear = crate::panel::PanelData {
+            pr: Some(crate::panel::PrSummary {
+                number: 7,
+                title: "Review".into(),
+                state: "OPEN".into(),
+                url: "https://github.com/acme/repo/pull/7".into(),
+                is_draft: false,
+                review_decision: None,
+            }),
+            checks: vec![crate::panel::CheckLine {
+                name: "unit tests".into(),
+                state: crate::panel::CheckState::Pass,
+                duration_secs: None,
+                details_url: None,
+            }],
+            ..Default::default()
+        };
+        assert!(pr_merge_blockers(&clear).is_empty());
+    }
 
     #[test]
     fn windows_opener_uses_fileprotocolhandler_with_url_as_one_arg() {

@@ -157,6 +157,17 @@ pub struct TestRunRec {
 
 /// Runs kept in [`TestCache::history`] (newest first).
 pub const TEST_HISTORY_CAP: usize = 20;
+/// Maximum number of failures shown in the compact Tests panel.
+pub const FAILURE_CAP: usize = 6;
+
+/// The bounded failure list shown by the compact Tests panel.
+pub fn failing_tests<'a>(
+    nodes: impl Iterator<Item = &'a TestNode>,
+) -> impl Iterator<Item = &'a TestNode> {
+    nodes
+        .filter(|n| n.kind == TestNodeKind::Test && n.state == TestState::Fail)
+        .take(FAILURE_CAP)
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestCache {
@@ -317,6 +328,24 @@ impl TestPanelState {
         visible
             .get(self.cursor)
             .and_then(|idx| self.nodes.get(*idx))
+    }
+
+    /// Select the `i`th failure shown by the compact Tests panel, if that test
+    /// is also visible under the active tree filter.
+    pub fn select_failure(&mut self, i: usize) {
+        let Some(id) = failing_tests(self.by_id.values())
+            .nth(i)
+            .map(|n| n.id.clone())
+        else {
+            return;
+        };
+        let visible = self.visible_indices();
+        if let Some(position) = visible
+            .iter()
+            .position(|&idx| self.nodes.get(idx).is_some_and(|node| node.id == id))
+        {
+            self.cursor = position;
+        }
     }
 
     /// The package/module/suite that a run-by-package (`p`) targets: the
@@ -875,6 +904,30 @@ mod tests {
             nodes
                 .iter()
                 .any(|n| n.kind == TestNodeKind::Group && n.label == "host")
+        );
+    }
+
+    #[test]
+    fn select_failure_maps_to_visible_node_and_keeps_hidden_selection_unchanged() {
+        let mut state = TestPanelState::default();
+        state.merge_results(&[
+            test_node("a::first", TestState::Fail, None, None),
+            test_node("b::second", TestState::Fail, None, None),
+            test_node("c::pass", TestState::Pass, None, None),
+        ]);
+
+        state.select_failure(1);
+        assert_eq!(
+            state.selected_node().map(|node| node.id.as_str()),
+            Some("b::second")
+        );
+
+        state.cursor = 2;
+        state.filter = "first".into();
+        state.select_failure(1);
+        assert_eq!(
+            state.cursor, 2,
+            "filtered out failure must not change cursor"
         );
     }
 }

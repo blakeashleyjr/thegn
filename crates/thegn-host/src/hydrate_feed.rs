@@ -87,7 +87,7 @@ pub(crate) fn populate_notifications(
     // Scope BEFORE capping: with the cap applied first, a noisy sibling repo
     // (50+ rows in the window) pushed this repo's rows out entirely — the
     // ⚑/✉ chips read 0 while the ✋ chip and the sidebar badge still counted.
-    if let Ok(mut notifications) = db.get_all_notifications(FETCH_CAP) {
+    if let Ok(mut notifications) = db.get_inbox_notifications(FETCH_CAP) {
         use thegn_core::notification::Priority;
         if !crate::panel::scope::system_all() {
             let repo_paths = crate::hydrate::repo_worktree_paths(db, repo_root);
@@ -96,7 +96,12 @@ pub(crate) fn populate_notifications(
             // function, so the two cannot drift apart again (THE-68).
             let all_known: std::collections::HashSet<String> = db
                 .worktrees()
-                .map(|wts| wts.into_iter().map(|w| w.worktree).collect())
+                .map(|wts| {
+                    thegn_core::notification_scope::registry_known_paths(
+                        wts.iter()
+                            .map(|w| (w.worktree.as_str(), w.repo_root.as_str())),
+                    )
+                })
                 .unwrap_or_default();
             notifications.retain(|n| {
                 thegn_core::notification_scope::shows_in_repo_inbox(
@@ -125,16 +130,41 @@ pub(crate) fn populate_notifications(
             .iter()
             .map(|k| (k.as_str(), app_cfg.notifications.priority_of(*k)))
             .collect();
-        notifications.truncate(INBOX_ROWS);
+        let (notifications, hidden_read) = cap_inbox(notifications, INBOX_READ_ROWS);
+        panel.notifications_hidden_read = hidden_read;
         panel.notifications = notifications;
     }
 }
 
-/// Rows the inbox list shows (newest first).
-const INBOX_ROWS: usize = 50;
+/// Read rows retained in the inbox, in addition to every fetched unread row.
+const INBOX_READ_ROWS: usize = 50;
 /// Rows read from the DB before scoping — generous so scoping never starves
 /// the active repo; the table is pruned of old read rows on a schedule.
 const FETCH_CAP: usize = 2000;
+
+/// Keep every unread row plus the newest `read_cap` read rows, newest first.
+/// Returns the number of read rows omitted from the visible inbox.
+fn cap_inbox(mut rows: Vec<Notification>, read_cap: usize) -> (Vec<Notification>, usize) {
+    rows.sort_by(|a, b| {
+        b.created_at_ms
+            .cmp(&a.created_at_ms)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    let read_total = rows.iter().filter(|row| row.read).count();
+    let mut kept_reads = 0;
+    rows.retain(|row| {
+        if !row.read {
+            true
+        } else if kept_reads < read_cap {
+            kept_reads += 1;
+            true
+        } else {
+            false
+        }
+    });
+    let hidden_read = read_total.saturating_sub(kept_reads);
+    (rows, hidden_read)
+}
 
 /// Sidebar sort weight for an issue priority (urgent → high → … → none).
 pub(crate) fn issue_urgency(p: thegn_core::issue::IssuePriority) -> u8 {
@@ -152,6 +182,7 @@ pub(crate) fn issue_urgency(p: thegn_core::issue::IssuePriority) -> u8 {
 mod tests {
     use super::*;
     use thegn_core::notification::NotificationKind;
+    use thegn_core::store::NotificationStore;
 
     fn log_notif(created_at_ms: i64, message: &str) -> Notification {
         Notification {
@@ -163,6 +194,64 @@ mod tests {
             read: false,
             worktree_path: String::new(),
         }
+    }
+
+    #[test]
+    fn cap_inbox_keeps_every_unread_row() {
+        let mut rows = (1..=3)
+            .map(|time| Notification {
+                id: time,
+                kind: NotificationKind::Assigned,
+                source_ref: format!("U-{time}"),
+                message: "unread".into(),
+                created_at_ms: time,
+                read: false,
+                worktree_path: String::new(),
+            })
+            .collect::<Vec<_>>();
+        rows.extend((0..55).map(|index| Notification {
+            id: 100 + index,
+            kind: NotificationKind::Assigned,
+            source_ref: format!("R-{index}"),
+            message: "read".into(),
+            created_at_ms: 100 + index,
+            read: true,
+            worktree_path: String::new(),
+        }));
+
+        let (kept, hidden) = cap_inbox(rows, 50);
+        assert_eq!(kept.len(), 53);
+        assert_eq!(hidden, 5);
+        assert_eq!(kept.iter().filter(|row| !row.read).count(), 3);
+        assert!(kept.windows(2).all(|pair| {
+            pair[0].created_at_ms > pair[1].created_at_ms
+                || (pair[0].created_at_ms == pair[1].created_at_ms && pair[0].id > pair[1].id)
+        }));
+    }
+
+    #[test]
+    fn populate_notifications_reaches_old_unread_rows() {
+        let db = Db::open_memory().unwrap();
+        for index in 0..3 {
+            db.put_notification("assigned", &format!("U-{index}"), "unread", "")
+                .unwrap();
+        }
+        for index in 0..55 {
+            let id = db
+                .put_notification("assigned", &format!("R-{index}"), "read", "")
+                .unwrap();
+            db.mark_notification_read(id).unwrap();
+        }
+
+        let mut panel = crate::panel::PanelData::default();
+        let config = thegn_core::config::Config::default();
+        populate_notifications(&db, std::path::Path::new("/repo"), &config, &mut panel);
+
+        assert_eq!(
+            panel.notifications.iter().filter(|row| !row.read).count(),
+            3
+        );
+        assert_eq!(panel.notifications_hidden_read, 5);
     }
 
     #[test]

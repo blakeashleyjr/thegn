@@ -26,6 +26,13 @@ pub(crate) fn action_for_key(key: &KeyCode) -> Option<MediaAction> {
         KeyCode::Char('p') => Some(MediaAction::Previous),
         KeyCode::Char('s') => Some(MediaAction::Shuffle),
         KeyCode::Char('L') => Some(MediaAction::Loop),
+        KeyCode::Char('+') => Some(MediaAction::VolumeUp),
+        KeyCode::Char('-') => Some(MediaAction::VolumeDown),
+        KeyCode::Char(']') => Some(MediaAction::ChapterNext),
+        KeyCode::Char('[') => Some(MediaAction::ChapterPrev),
+        KeyCode::Char('f') => Some(MediaAction::Fullscreen),
+        KeyCode::RightArrow => Some(MediaAction::SeekForward),
+        KeyCode::LeftArrow => Some(MediaAction::SeekBack),
         _ => None,
     }
 }
@@ -45,6 +52,34 @@ mod tests {
         assert_eq!(
             action_for_key(&KeyCode::Char('p')),
             Some(MediaAction::Previous)
+        );
+        assert_eq!(
+            action_for_key(&KeyCode::Char('+')),
+            Some(MediaAction::VolumeUp)
+        );
+        assert_eq!(
+            action_for_key(&KeyCode::Char('-')),
+            Some(MediaAction::VolumeDown)
+        );
+        assert_eq!(
+            action_for_key(&KeyCode::Char(']')),
+            Some(MediaAction::ChapterNext)
+        );
+        assert_eq!(
+            action_for_key(&KeyCode::Char('[')),
+            Some(MediaAction::ChapterPrev)
+        );
+        assert_eq!(
+            action_for_key(&KeyCode::Char('f')),
+            Some(MediaAction::Fullscreen)
+        );
+        assert_eq!(
+            action_for_key(&KeyCode::RightArrow),
+            Some(MediaAction::SeekForward)
+        );
+        assert_eq!(
+            action_for_key(&KeyCode::LeftArrow),
+            Some(MediaAction::SeekBack)
         );
         assert_eq!(action_for_key(&KeyCode::Char('x')), None);
     }

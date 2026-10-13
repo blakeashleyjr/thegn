@@ -94,6 +94,19 @@ pub(crate) fn sorted_filtered_issues<'a>(
     list
 }
 
+pub(crate) fn issue_at_cursor<'a>(
+    panel: &'a crate::panel::PanelData,
+    ui: &crate::panel::PanelUi,
+) -> Option<&'a Issue> {
+    sorted_filtered_issues(
+        panel,
+        &ui.issues_filter,
+        ui.issues_project_filter.as_deref(),
+    )
+    .into_iter()
+    .nth(ui.cursor)
+}
+
 fn sorted_issues<'a>(ctx: &'a SectionCtx) -> Vec<&'a Issue> {
     sorted_filtered_issues(
         &ctx.model.panel,
@@ -125,7 +138,7 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
 
     let mut rows = Vec::new();
-    let cursor = ctx.ui.issues_cursor;
+    let cursor = ctx.ui.cursor;
     let data = &ctx.model.panel;
 
     for (i, issue) in issues.iter().enumerate() {
@@ -181,8 +194,8 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows.push(hint_row(&[
         ("↵", "link"),
         ("o", "browser"),
-        ("n", "new"),
-        ("e", "edit"),
+        ("a", "assign me"),
+        ("b", "branch"),
     ]));
     rows
 }
@@ -198,7 +211,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
 
     let mut rows = Vec::new();
-    let cursor = ctx.ui.issues_cursor;
+    let cursor = ctx.ui.cursor;
     let data = &ctx.model.panel;
 
     for (i, issue) in issues.iter().enumerate() {
@@ -280,9 +293,10 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows.push(hint_row(&[
         ("↵", "link"),
         ("o", "browser"),
-        ("n", "new"),
-        ("e", "edit"),
-        ("/", "filter"),
+        ("a", "assign me"),
+        ("b", "branch"),
+        ("D", "dispatch"),
+        ("r", "refresh"),
     ]));
     rows
 }
@@ -337,7 +351,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         return rows;
     }
 
-    let cursor = ctx.ui.issues_cursor;
+    let cursor = ctx.ui.cursor;
     let list_w = (cols / 3).max(30);
     let detail_w = cols.saturating_sub(list_w + 2);
 
@@ -374,12 +388,16 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     };
 
     let combined = two_col(&list_rows, &detail_rows, list_w, 2);
-    let header_offset = rows.len();
     let combined_rows: Vec<PanelRow> = combined
         .into_iter()
         .enumerate()
         .map(|(i, l)| {
-            PanelRow::plain(l).with_hit(PanelHit::Row(Section::Issues, header_offset + i))
+            let row = PanelRow::plain(l);
+            if i < list_rows.len() {
+                row.with_hit(PanelHit::Row(Section::Issues, i))
+            } else {
+                row
+            }
         })
         .collect();
     rows.extend(combined_rows);
@@ -388,9 +406,10 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows.push(hint_row(&[
         ("↵", "link"),
         ("o", "browser"),
-        ("n", "new"),
-        ("e", "edit status"),
         ("a", "assign me"),
+        ("b", "branch"),
+        ("D", "dispatch"),
+        ("r", "refresh"),
     ]));
     rows
 }
@@ -548,5 +567,89 @@ mod tests {
         let by_query = sorted_filtered_issues(&data, "app-1", None);
         assert_eq!(by_query.len(), 1);
         assert_eq!(by_query[0].id, "APP-1");
+    }
+
+    #[test]
+    fn issue_at_cursor_uses_sorted_filtered_visible_order() {
+        let data = panel_with(vec![
+            issue("low", IssuePriority::Low, IssueStatus::Todo, ""),
+            issue("urgent", IssuePriority::Urgent, IssueStatus::Todo, ""),
+            issue("high", IssuePriority::High, IssueStatus::Todo, ""),
+            issue("medium", IssuePriority::Medium, IssueStatus::Todo, ""),
+        ]);
+        let ui = crate::panel::PanelUi {
+            open: Section::Issues,
+            cursor: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            issue_at_cursor(&data, &ui).map(|issue| issue.id.as_str()),
+            Some("medium")
+        );
+
+        let filtered_ui = crate::panel::PanelUi {
+            open: Section::Issues,
+            cursor: 0,
+            issues_filter: "high".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            issue_at_cursor(&data, &filtered_ui).map(|issue| issue.id.as_str()),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn issues_render_selection_and_full_hits_use_list_ordinals() {
+        let data = panel_with(vec![
+            issue("low", IssuePriority::Low, IssueStatus::Todo, ""),
+            issue("urgent", IssuePriority::Urgent, IssueStatus::Todo, ""),
+            issue("high", IssuePriority::High, IssueStatus::Todo, ""),
+            issue("medium", IssuePriority::Medium, IssueStatus::Todo, ""),
+        ]);
+        let full_ui = crate::panel::PanelUi {
+            open: Section::Issues,
+            width: crate::layout::PanelWidth::Full,
+            cursor: 1,
+            ..Default::default()
+        };
+        let full_ctx = SectionCtx {
+            model: &crate::chrome::FrameModel {
+                panel: data.clone(),
+                ..Default::default()
+            },
+            ui: &full_ui,
+            cols: 150,
+            rows: 40,
+        };
+        let full_rows = content(&full_ctx);
+        let hits: Vec<_> = full_rows.iter().filter_map(|row| row.hit).collect();
+        assert_eq!(
+            hits,
+            (0..4)
+                .map(|i| PanelHit::Row(Section::Issues, i))
+                .collect::<Vec<_>>()
+        );
+
+        let normal_ui = crate::panel::PanelUi {
+            open: Section::Issues,
+            cursor: 1,
+            ..Default::default()
+        };
+        let normal_ctx = SectionCtx {
+            model: &crate::chrome::FrameModel {
+                panel: data,
+                ..Default::default()
+            },
+            ui: &normal_ui,
+            cols: 60,
+            rows: 40,
+        };
+        let selected: Vec<_> = content(&normal_ctx)
+            .into_iter()
+            .filter(|row| row.bg == Some(crate::seg::Tok::SelAccent))
+            .collect();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].hit, Some(PanelHit::Row(Section::Issues, 1)));
     }
 }

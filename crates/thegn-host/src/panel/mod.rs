@@ -313,12 +313,11 @@ impl Section {
         }
     }
 
-    /// The lazygit-family sections that share [`gitui::GitUi`] state and the
-    /// Full-width git frame.
+    /// The sections that share [`gitui::GitUi`] state and the Full-width git frame.
     pub fn is_git_family(self) -> bool {
         matches!(
             self,
-            Section::Changes | Section::Commits | Section::Branches | Section::Stash | Section::Pr
+            Section::Changes | Section::Commits | Section::Branches | Section::Stash
         )
     }
 
@@ -745,8 +744,10 @@ pub struct PanelData {
     pub unread_notifications: usize,
     /// Alert-priority unread count — drives the red ⚑ attention flag.
     pub alert_notifications: usize,
-    /// Full notification list (newest first, capped at 50) for the inbox section.
+    /// Full notification list: every unread row plus the newest 50 read rows.
     pub notifications: Vec<thegn_core::notification::Notification>,
+    /// Read rows beyond the 50-row inbox read window.
+    pub notifications_hidden_read: usize,
     /// Per-kind *effective* priority (`[notifications.priority]` overrides
     /// folded over the built-in defaults), snapshotted with the list so the
     /// render layer groups and counts rows by the same priority the badge
@@ -786,6 +787,14 @@ pub struct PanelData {
     pub toolchain: Option<crate::toolchain_ui::ToolchainStatus>,
 }
 
+/// Counts unread rows in hand by effective priority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NotificationCounts {
+    pub alert: usize,
+    pub notice: usize,
+    pub info: usize,
+}
+
 impl PanelData {
     /// The effective priority of a notification kind: the hydration-time
     /// snapshot of `[notifications.priority]` when present, else the built-in
@@ -799,6 +808,19 @@ impl PanelData {
             .get(kind.as_str())
             .copied()
             .unwrap_or_else(|| kind.default_priority())
+    }
+
+    /// Count unread notifications in hand by their effective priority.
+    pub fn notification_counts(&self) -> NotificationCounts {
+        let mut counts = NotificationCounts::default();
+        for row in self.notifications.iter().filter(|row| !row.read) {
+            match self.priority_of(row.kind) {
+                thegn_core::notification::Priority::Alert => counts.alert += 1,
+                thegn_core::notification::Priority::Notice => counts.notice += 1,
+                thegn_core::notification::Priority::Info => counts.info += 1,
+            }
+        }
+        counts
     }
 
     /// Mark the rows selected by `pick` read *in the model* and recount the
@@ -823,20 +845,9 @@ impl PanelData {
     /// in hand (the hydration path computes them over the full scoped set
     /// before capping the list; after a clear the two agree).
     fn recount_unread(&mut self) {
-        use thegn_core::notification::Priority;
-        let (mut alert, mut counted) = (0, 0);
-        for n in self.notifications.iter().filter(|n| !n.read) {
-            match self.priority_of(n.kind) {
-                Priority::Alert => {
-                    alert += 1;
-                    counted += 1;
-                }
-                Priority::Notice => counted += 1,
-                Priority::Info => {}
-            }
-        }
-        self.alert_notifications = alert;
-        self.unread_notifications = counted;
+        let counts = self.notification_counts();
+        self.alert_notifications = counts.alert;
+        self.unread_notifications = counts.alert + counts.notice;
     }
 }
 
@@ -1103,8 +1114,6 @@ pub struct PanelUi {
     pub symbols_show_refs: bool,
     /// Row cursor within the Tasks section's list.
     pub tasks_cursor: usize,
-    /// Row cursor within the Issues section's list (persisted across section switches).
-    pub issues_cursor: usize,
     /// Active free-text filter query for the Issues section (`/` mode).
     pub issues_filter: String,
     /// Optional project/sprint ID filter for the Issues section (`f` key cycles).
@@ -1159,7 +1168,6 @@ impl Default for PanelUi {
             symbols_cursor: 0,
             symbols_show_refs: false,
             tasks_cursor: 0,
-            issues_cursor: 0,
             issues_filter: String::new(),
             issues_project_filter: None,
             notifications_cursor: 0,
@@ -1205,6 +1213,7 @@ impl PanelUi {
         self.tab = tab;
         self.row_mode = false;
         self.cursor = 0;
+        self.scroll = 0;
         self.ensure_open_valid();
         self.recall_width();
     }
@@ -1458,12 +1467,7 @@ fn diff_from_state(
 /// Trim a full test cache into the section snapshot: summary numbers, the
 /// failing tests (name + file:line), and the run history.
 pub fn tests_lite(cache: &crate::testkit::model::TestCache) -> TestsLite {
-    const FAILURE_CAP: usize = 6;
-    let failures = cache
-        .nodes
-        .iter()
-        .filter(|n| n.kind == TestNodeKind::Test && n.state == TestState::Fail)
-        .take(FAILURE_CAP)
+    let failures = crate::testkit::model::failing_tests(cache.nodes.iter())
         .map(|n| {
             let at = n
                 .location
@@ -1535,11 +1539,12 @@ pub enum PanelMsg {
 impl PanelUi {
     /// Mirror the accordion cursor into the per-section cursors that dispatch
     /// reads: the git view cursor (`git.cur`) plus the notifications / logs /
-    /// jobs / symbols / problems cursors. EVERY write to `self.cursor` must be
-    /// followed by this call — a highlight that moves without it leaves the
-    /// action keys pointing at a different row than the one on screen (the
-    /// audit's "clicked file 7, staged file 0 / deleted the wrong branch"
-    /// class). Centralised so a new cursor-write site can't forget a mirror.
+    /// jobs / symbols / problems / issues / tests cursors. EVERY write to
+    /// `self.cursor` must be followed by this call; otherwise a moved
+    /// highlight leaves the action keys pointing at a different row than the
+    /// one on screen (the audit's "clicked file 7, staged file 0 / deleted the
+    /// wrong branch" class). Centralised so a new cursor-write site can't
+    /// forget a mirror.
     pub fn sync_section_cursors(&mut self) {
         if let Some(v) = self.open.home_view() {
             self.git.cur.set(v, self.cursor);
@@ -1550,6 +1555,13 @@ impl PanelUi {
             Section::Jobs => self.tasks_cursor = self.cursor,
             Section::Symbols => self.symbols_cursor = self.cursor,
             Section::Problems => self.problems_cursor = self.cursor,
+            Section::Tests => {
+                if self.width == crate::layout::PanelWidth::Full {
+                    self.tests.cursor = self.cursor;
+                } else {
+                    self.tests.select_failure(self.cursor);
+                }
+            }
             _ => {}
         }
     }
@@ -1968,6 +1980,88 @@ mod tests {
         // No location falls back to the first message line.
         assert_eq!(lite.failures[1].1, "expected EPERM, got Ok(())");
         assert_eq!(lite.history.len(), 1);
+    }
+
+    #[test]
+    fn tests_cursor_sync_tracks_visible_tree_and_compact_failure_ordinals() {
+        use crate::testkit::model::*;
+
+        let node = |id: &str, state: TestState| TestNode {
+            id: id.into(),
+            label: id.into(),
+            depth: 0,
+            kind: TestNodeKind::Test,
+            state,
+            location: Some(TestLocation {
+                path: format!("{id}.rs"),
+                line: 7,
+                column: None,
+            }),
+            message: None,
+            placeholder: false,
+        };
+        let mut ui = PanelUi {
+            open: Section::Tests,
+            width: crate::layout::PanelWidth::Half,
+            cursor: 1,
+            ..Default::default()
+        };
+        ui.tests.merge_results(&[
+            node("a-first-failure", TestState::Fail),
+            node("b-second-failure", TestState::Fail),
+            node("c-pass", TestState::Pass),
+        ]);
+        ui.sync_section_cursors();
+        let compact = tests_lite(&ui.tests.to_cache());
+        assert_eq!(
+            ui.tests.selected_node().map(|n| n.label.as_str()),
+            Some(compact.failures[1].0.as_str())
+        );
+
+        ui.width = crate::layout::PanelWidth::Full;
+        ui.cursor = 3;
+        ui.sync_section_cursors();
+        let visible = ui.tests.visible_indices();
+        assert_eq!(
+            ui.tests.selected_node().map(|node| node.id.as_str()),
+            Some(ui.tests.nodes[visible[3]].id.as_str())
+        );
+        assert_eq!(
+            ui.tests
+                .selected_node()
+                .and_then(|node| node.location.as_ref())
+                .map(|location| location.path.as_str()),
+            Some("b-second-failure.rs")
+        );
+
+        ui.tests.filter = "second".into();
+        ui.cursor = 0;
+        ui.sync_section_cursors();
+        let model = crate::chrome::FrameModel {
+            panel: PanelData::default(),
+            ..Default::default()
+        };
+        let ctx = sections::SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 100,
+            rows: 40,
+        };
+        let rows = sections::content(Section::Tests, &ctx);
+        let hits: Vec<_> = rows.iter().filter_map(|row| row.hit).collect();
+        let visible_count = ui.tests.visible_indices().len();
+        assert_eq!(
+            hits,
+            (0..visible_count)
+                .map(|i| PanelHit::Row(Section::Tests, i))
+                .collect::<Vec<_>>()
+        );
+        let selected: Vec<_> = rows
+            .iter()
+            .filter(|row| row.bg == Some(crate::seg::Tok::SelAccent))
+            .collect();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].hit, Some(PanelHit::Row(Section::Tests, 0)));
     }
 
     #[test]

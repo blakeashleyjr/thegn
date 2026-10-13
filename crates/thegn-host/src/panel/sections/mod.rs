@@ -4,7 +4,6 @@
 //! a Full view that owns the whole band (the former overlay layouts).
 
 use thegn_core::theme::Hue;
-use thegn_core::viz;
 
 use crate::chrome::S;
 use crate::seg::{self, Line, Seg, Tok, seg, sp};
@@ -192,14 +191,6 @@ fn rule() -> PanelRow {
     PanelRow::plain(Line::Fill {
         ch: '╌', fg: g3()
     })
-}
-
-/// The loading line for a body whose document fetch is still out.
-fn spinner_row(tick: u64, what: &str) -> PanelRow {
-    PanelRow::plain(Line::segs(vec![
-        seg(ac(), viz::spin(tick).to_string()),
-        seg(d(), format!(" loading {what}…")),
-    ]))
 }
 
 /// Compose two columns of seg rows into single lines: the left column is
@@ -659,7 +650,7 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
         }
         Section::Keys => vec![seg(g2(), "?")],
-        Section::Help => vec![seg(g2(), "F1")],
+        Section::Help => vec![seg(g2(), model.chord("help").to_string())],
         Section::Mine => {
             let rows = &model.panel.my_work;
             if rows.is_empty() {
@@ -724,9 +715,10 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             // lifecycle events stays quiet — but it must not claim "inbox
             // zero" while the open list shows unread rows: those surface as a
             // dim low-priority count instead.
-            let alert = model.panel.alert_notifications;
-            let unread = model.panel.unread_notifications;
-            let raw_unread = model.panel.notifications.iter().filter(|n| !n.read).count();
+            let counts = model.panel.notification_counts();
+            let alert = counts.alert;
+            let unread = counts.alert + counts.notice;
+            let raw_unread = counts.info;
             if alert > 0 {
                 vec![seg(hue(Hue::Red), format!("⚑ {alert}"))]
             } else if unread > 0 {
@@ -927,6 +919,169 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Logs => logs::content(ctx),
         Section::Media => media::content(ctx),
         Section::Usage => usage::content(ctx),
+    }
+}
+
+/// The scroll bounds and navigation ownership for hitless panel bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollExtent {
+    pub max: usize,
+    pub owns_nav: bool,
+}
+
+/// The body height shared by rendering and scroll routing.
+pub fn scroll_viewport(
+    model: &crate::chrome::FrameModel,
+    ui: &PanelUi,
+    cols: usize,
+    rows: usize,
+) -> usize {
+    let header_rows = crate::panel::frame::header_rows(model, false, cols).len();
+    if ui.width == crate::layout::PanelWidth::Full {
+        crate::panel::budget::allocate_full(
+            rows.saturating_sub(1),
+            header_rows,
+            rail_row_count(ui, cols),
+        )
+        .body_rows
+    } else {
+        rows.saturating_sub(1 + header_rows + ui.visible_section_count() + 2)
+    }
+}
+
+fn rail_row_count(ui: &PanelUi, cols: usize) -> usize {
+    let visible: Vec<_> = ui
+        .tab_sections()
+        .into_iter()
+        .map(|section| section.label())
+        .collect();
+    let mut rows = 0;
+    let mut x = 1usize;
+    for (i, label) in visible.iter().enumerate() {
+        let entry_width = (i + 1).to_string().len() + 1 + label.chars().count();
+        let separator_width = if x > 1 { 3 } else { 0 };
+        if x + separator_width + entry_width > cols.saturating_sub(1) && x > 1 {
+            rows += 1;
+            x = 1;
+        } else if separator_width > 0 {
+            x += separator_width;
+        }
+        x += entry_width;
+    }
+    if visible.is_empty() { rows } else { rows + 1 }
+}
+
+pub fn scroll_moves(ext: ScrollExtent, up: bool, scroll: usize) -> bool {
+    if up { scroll > 0 } else { scroll < ext.max }
+}
+
+/// Apply one body-scroll key, returning the clamped target when the key belongs
+/// to this scroll extent.
+pub fn scroll_step(
+    ext: ScrollExtent,
+    key: &termwiz::input::KeyCode,
+    mods: termwiz::input::Modifiers,
+    scroll: usize,
+    page: usize,
+) -> Option<usize> {
+    let amount = match *key {
+        termwiz::input::KeyCode::PageDown if mods.is_empty() => page,
+        termwiz::input::KeyCode::PageUp if mods.is_empty() => page,
+        termwiz::input::KeyCode::Char('d') if mods == termwiz::input::Modifiers::CTRL => {
+            (page / 2).max(1)
+        }
+        termwiz::input::KeyCode::Char('u') if mods == termwiz::input::Modifiers::CTRL => {
+            (page / 2).max(1)
+        }
+        termwiz::input::KeyCode::Home if mods.is_empty() && ext.owns_nav => {
+            return Some(0);
+        }
+        termwiz::input::KeyCode::End if mods.is_empty() && ext.owns_nav => {
+            return Some(ext.max);
+        }
+        termwiz::input::KeyCode::Char('g') if mods.is_empty() && ext.owns_nav => {
+            return Some(0);
+        }
+        termwiz::input::KeyCode::Char('G')
+            if !mods.contains(termwiz::input::Modifiers::CTRL)
+                && !mods.contains(termwiz::input::Modifiers::ALT)
+                && ext.owns_nav =>
+        {
+            return Some(ext.max);
+        }
+        termwiz::input::KeyCode::Char('j') if mods.is_empty() && ext.owns_nav => 1,
+        termwiz::input::KeyCode::Char('k') if mods.is_empty() && ext.owns_nav => 1,
+        _ => return None,
+    };
+    let up = matches!(
+        *key,
+        termwiz::input::KeyCode::PageUp
+            | termwiz::input::KeyCode::Char('u')
+            | termwiz::input::KeyCode::Char('k')
+    );
+    if up {
+        Some(scroll.min(ext.max).saturating_sub(amount))
+    } else {
+        Some(scroll.saturating_add(amount).min(ext.max))
+    }
+}
+
+/// Returns the viewport's maximum scroll and whether it owns j/k and g/G.
+pub fn scroll_extent(
+    section: Section,
+    model: &crate::chrome::FrameModel,
+    ui: &PanelUi,
+    cols: usize,
+    rows: usize,
+) -> Option<ScrollExtent> {
+    let ctx = SectionCtx {
+        model,
+        ui,
+        cols: cols.saturating_sub(if ui.width == crate::layout::PanelWidth::Full {
+            2
+        } else {
+            3
+        }),
+        rows,
+    };
+    let viewport = scroll_viewport(model, ui, cols, rows);
+    match section {
+        Section::Help => Some(ScrollExtent {
+            max: help::line_count(&ctx).saturating_sub(viewport.saturating_sub(2)),
+            owns_nav: true,
+        }),
+        Section::Telemetry => Some(ScrollExtent {
+            max: telemetry::row_count(&ctx).saturating_sub(viewport.saturating_sub(1)),
+            owns_nav: true,
+        }),
+        Section::Keys
+            if matches!(
+                ui.width,
+                crate::layout::PanelWidth::Half | crate::layout::PanelWidth::Full
+            ) =>
+        {
+            let lines: usize = ui
+                .docs
+                .cfg_keys
+                .iter()
+                .map(|g| g.rows.len() + 2)
+                .sum::<usize>()
+                + 8;
+            Some(ScrollExtent {
+                max: lines.div_ceil(2).saturating_sub(1),
+                owns_nav: true,
+            })
+        }
+        Section::Stash if ui.width == crate::layout::PanelWidth::Full => Some(ScrollExtent {
+            max: ui
+                .git
+                .stash_diff
+                .as_ref()
+                .map(|(_, text)| text.lines().count().saturating_sub(1))
+                .unwrap_or(0),
+            owns_nav: false,
+        }),
+        _ => None,
     }
 }
 
@@ -1256,7 +1411,6 @@ mod spec {
     fn docs() -> PanelDocs {
         let mut docs = PanelDocs {
             git: Some(GitDocs {
-                heat: vec![[0, 1, 2, 3, 4, 0, 1]; 36],
                 weekly: vec![3; 36],
                 log: vec![thegn_svc::git::LogRow {
                     graph: "*".into(),
@@ -1265,7 +1419,6 @@ mod spec {
                     refs: "HEAD -> main".into(),
                 }],
                 total: 108,
-                head_branch: "main".into(),
             }),
             cfg_keys: crate::keyhint::cheatsheet_groups(&thegn_core::config::Config::default()),
             ..Default::default()
@@ -1376,22 +1529,39 @@ mod spec {
     fn notifications_summary_flags_alerts_not_info() {
         let seg_text = |segs: &[Seg]| segs.iter().map(|s| s.text.clone()).collect::<String>();
         let mut m = FrameModel::default();
+        let notification = |id, kind| thegn_core::notification::Notification {
+            id,
+            kind,
+            source_ref: format!("ref:{id}"),
+            message: "notification".into(),
+            created_at_ms: id,
+            read: false,
+            worktree_path: String::new(),
+        };
 
-        // Info-only inbox (worktree created / process exited never count): no flag.
-        m.panel.alert_notifications = 0;
-        m.panel.unread_notifications = 0;
+        // Info-only unread inbox: count it quietly without raising a flag.
+        m.panel.notifications = vec![notification(
+            1,
+            thegn_core::notification::NotificationKind::WorktreeCreated,
+        )];
         let s = seg_text(&summary(Section::Notifications, &m));
-        assert_eq!(s, "inbox zero");
+        assert_eq!(s, "1 low");
         assert!(!s.contains('⚑'));
 
         // Notice-priority unread: a neutral count, still no red flag.
-        m.panel.unread_notifications = 2;
+        m.panel.notifications = vec![
+            notification(2, thegn_core::notification::NotificationKind::Assigned),
+            notification(3, thegn_core::notification::NotificationKind::Assigned),
+        ];
         let s = seg_text(&summary(Section::Notifications, &m));
         assert_eq!(s, "2 unread");
         assert!(!s.contains('⚑'));
 
         // An Alert raises the red flag and wins precedence over the unread count.
-        m.panel.alert_notifications = 1;
+        m.panel.notifications.push(notification(
+            4,
+            thegn_core::notification::NotificationKind::TestFailed,
+        ));
         let s = seg_text(&summary(Section::Notifications, &m));
         assert_eq!(s, "⚑ 1");
     }
@@ -1903,12 +2073,43 @@ mod spec {
             "{f}"
         );
         assert!(f.contains("c0") && f.contains("c1"), "core sparkrow: {f}");
-        let f = render(Section::Pr, PanelWidth::Full);
-        assert!(
-            f.contains("COMMITS") && f.contains("VELOCITY") && f.contains("LOG"),
-            "{f}"
-        );
-        assert!(f.contains("abc1234"), "{f}");
+        let mut pr_model = model();
+        pr_model.panel.pr = Some(crate::panel::PrSummary {
+            number: 7,
+            title: "Views page".into(),
+            state: "OPEN".into(),
+            url: "https://github.com/o/r/pull/7".into(),
+            is_draft: false,
+            review_decision: None,
+        });
+        pr_model.panel.checks.push(crate::panel::CheckLine {
+            name: "build".into(),
+            state: crate::panel::CheckState::Pass,
+            duration_secs: None,
+            details_url: None,
+        });
+        pr_model
+            .panel
+            .open_prs
+            .push(thegn_core::forge::model::PrHeader {
+                number: 8,
+                head_ref: "other-topic".into(),
+                state: "OPEN".into(),
+                url: "https://github.com/o/r/pull/8".into(),
+                is_draft: false,
+            });
+        let mut pr_ui = ui(PanelWidth::Full, Section::Pr);
+        pr_ui.docs.git = None;
+        let pr_ctx = SectionCtx {
+            model: &pr_model,
+            ui: &pr_ui,
+            cols: 150,
+            rows: 38,
+        };
+        let f = text(&content(Section::Pr, &pr_ctx));
+        assert!(f.contains("CHECKS") && f.contains("OPEN PRS"), "{f}");
+        assert!(f.contains("Views page"), "{f}");
+        assert!(!f.contains("VELOCITY") && !f.contains("LOG"), "{f}");
         // (Changes at Full is rendered by the git-family frame, not this
         // module — its old side-by-side body was removed.)
         let f = render(Section::Keys, PanelWidth::Full);
@@ -1930,7 +2131,12 @@ mod spec {
             cols: 150,
             rows: 38,
         };
-        assert!(text(&content(Section::Pr, &ctx)).contains("loading"));
+        let rendered = text(&content(Section::Pr, &ctx));
+        assert!(!rendered.contains("loading"), "{rendered}");
+        assert!(
+            !rendered.contains("VELOCITY") && !rendered.contains("LOG"),
+            "{rendered}"
+        );
         // (Changes-at-Full no longer has a doc-backed body here — the
         // git-family frame owns that width.)
     }

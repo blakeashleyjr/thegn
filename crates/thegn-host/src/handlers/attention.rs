@@ -292,7 +292,14 @@ pub(crate) fn mark_all_read(
                     // (THE-68).
                     let all_known: Vec<String> = db
                         .worktrees()
-                        .map(|wts| wts.into_iter().map(|w| w.worktree).collect())
+                        .map(|wts| {
+                            thegn_core::notification_scope::registry_known_paths(
+                                wts.iter()
+                                    .map(|w| (w.worktree.as_str(), w.repo_root.as_str())),
+                            )
+                            .into_iter()
+                            .collect()
+                        })
                         .unwrap_or_default();
                     let _ = db.mark_notifications_read_scoped(&paths, &all_known); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                     // A live raised hand (OSC 9 / OSC 777) is the SAME demand
@@ -340,10 +347,81 @@ pub(crate) fn mark_all_read(
     };
 }
 
+/// Build the panel inbox's explicit clear-all confirmation. The counts come
+/// from the hydrated inbox and needs-you projection, so the loop does no I/O.
+pub(crate) fn clear_all_confirm(
+    model: &FrameModel,
+    scope_all: bool,
+    filter_active: bool,
+) -> Option<crate::menu::MenuOverlay> {
+    let unread = model
+        .panel
+        .notifications
+        .iter()
+        .filter(|row| !row.read)
+        .count();
+    let needs_you = needs_user_for_ack(model).len();
+    if unread == 0 && needs_you == 0 {
+        return None;
+    }
+    let scope = if scope_all {
+        "all worktrees"
+    } else {
+        "this repo"
+    };
+    let filter_note = if filter_active {
+        " · the /filter is ignored"
+    } else {
+        ""
+    };
+    Some(crate::menu::confirm_menu(
+        "clear all notifications?",
+        format!(
+            "marks {unread} unread read and acks {needs_you} needs-you signal(s) · scope: {scope}{filter_note}"
+        ),
+        "notifications-clear-all",
+        String::new(),
+        true,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use thegn_core::attention::{AttentionReason, AttentionTier};
+
+    #[test]
+    fn clear_all_confirm_is_absent_for_empty_inbox() {
+        assert!(clear_all_confirm(&FrameModel::default(), false, false).is_none());
+    }
+
+    #[test]
+    fn clear_all_confirm_picks_tagged_confirmation() {
+        let mut model = FrameModel::default();
+        model
+            .panel
+            .notifications
+            .push(thegn_core::notification::Notification {
+                id: 1,
+                kind: thegn_core::notification::NotificationKind::Assigned,
+                source_ref: "THE-1".into(),
+                message: "assigned".into(),
+                created_at_ms: 1,
+                read: false,
+                worktree_path: String::new(),
+            });
+        let mut menu = clear_all_confirm(&model, false, false).expect("confirm menu");
+        assert_eq!(
+            menu.handle_key(
+                &termwiz::input::KeyCode::Char('y'),
+                termwiz::input::Modifiers::NONE,
+            ),
+            crate::menu::MenuOutcome::Pick(crate::menu::MenuChoice::Confirm {
+                tag: "notifications-clear-all",
+                arg: String::new(),
+            })
+        );
+    }
 
     fn score(tier: AttentionTier) -> AttentionScore {
         AttentionScore {
