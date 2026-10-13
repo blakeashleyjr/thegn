@@ -1212,14 +1212,14 @@ mod tests {
         }
     }
 
-    fn cache_host(
-        input_result: tg_kit::InputResult,
-    ) -> (
+    type CacheHost = (
         AppHost,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) {
+    );
+
+    fn cache_host(input_result: tg_kit::InputResult) -> CacheHost {
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let redraw = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pump_change = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
