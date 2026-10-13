@@ -81,8 +81,8 @@ const TESTS: &[SectionKey] = &[
     k('r', "r", "run"),
     k('R', "R", "all"),
     k('f', "f", "failed"),
-    k('o', "o", "output"),
-    k('b', "b", "bisect"),
+    k('o', "o", "editor"),
+    k('b', "b", "peek"),
     nav("↵", "open"),
 ];
 const CI: &[SectionKey] = &[
@@ -112,10 +112,10 @@ const FILES: &[SectionKey] = &[
     k('y', "y", "yazi"),
 ];
 const ISSUES: &[SectionKey] = &[
-    nav("j/k", "row"),
     nav("↵", "link"),
     k('o', "o", "browser"),
     k('a', "a", "assign me"),
+    k('b', "b", "branch"),
     k('D', "D", "dispatch"),
     k('r', "r", "refresh"),
 ];
@@ -152,7 +152,7 @@ const LOGS: &[SectionKey] = &[
     // `a` = "all scopes", which was a different key's job).
     k('a', "a", "tail"),
     k('g', "g", "scope"),
-    k('E', "E", "export"),
+    k('w', "w", "export"),
 ];
 const SYMBOLS: &[SectionKey] = &[
     nav("↵", "go to def"),
@@ -206,6 +206,9 @@ const SHARE: &[SectionKey] = &[
     k('x', "x", "stop"),
 ];
 const ROW_ONLY: &[SectionKey] = &[nav("j/k", "row")];
+const HELP: &[SectionKey] = &[nav("j/k", "scroll")];
+const TELEMETRY: &[SectionKey] = &[nav("j/k", "scroll")];
+const KEYS: &[SectionKey] = &[nav("j/k", "scroll")];
 
 /// Row-mode keys for a section. Order is display order; the statusbar shows a
 /// prefix, so the most useful keys come first.
@@ -231,7 +234,10 @@ pub fn section_keys(section: Section) -> &'static [SectionKey] {
         Section::Media => MEDIA,
         Section::Usage => USAGE,
         Section::Share => SHARE,
-        // Row-nav-only sections (Debug, Db, Telemetry, Keys, Help, …)
+        Section::Help => HELP,
+        Section::Telemetry => TELEMETRY,
+        Section::Keys => KEYS,
+        // Row-nav-only sections (Debug, Db, …)
         // and the git family, which draws from `gitui::context_keys` instead.
         _ => ROW_ONLY,
     }
@@ -354,6 +360,84 @@ mod tests {
     /// key; the shared accordion vocabulary is arrows, `j/k`, `↵`, `1-9`, etc.
     fn looks_like_section_key(chord: &str) -> bool {
         chord == "space" || (chord.len() == 1 && chord.chars().all(|c| c.is_ascii_alphabetic()))
+    }
+
+    fn hint_row_labels(src: &str) -> BTreeMap<String, BTreeSet<String>> {
+        let mut body_labels: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut rest = src;
+        while let Some(pos) = rest.find("hint_row(&[") {
+            rest = &rest[pos + "hint_row(&[".len()..];
+            let end = rest.find("])").unwrap_or(rest.len());
+            let block = &rest[..end];
+            let mut depth = 0usize;
+            let mut tuple = String::new();
+            for c in block.chars() {
+                match c {
+                    '(' => {
+                        depth += 1;
+                        if depth == 1 {
+                            tuple.clear();
+                            continue;
+                        }
+                    }
+                    ')' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            let lits: Vec<&str> = tuple
+                                .split('"')
+                                .enumerate()
+                                .filter(|(i, _)| i % 2 == 1)
+                                .map(|(_, s)| s)
+                                .collect();
+                            if let Some((chord, labels)) = lits.split_first() {
+                                let entry =
+                                    body_labels.entry(chord.trim().to_string()).or_default();
+                                for label in labels {
+                                    entry.insert(label.to_string());
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+                if depth >= 1 {
+                    tuple.push(c);
+                }
+            }
+        }
+        body_labels
+    }
+
+    // Each mapped file renders one section; misc.rs renders several sections
+    // and is deliberately left out of hint ownership parsing.
+    fn renderer_sources() -> Vec<(Section, &'static str)> {
+        vec![
+            (
+                Section::Notifications,
+                include_str!("sections/notifications.rs"),
+            ),
+            (Section::Logs, include_str!("sections/logs.rs")),
+            (Section::MergeQueue, include_str!("sections/merge_queue.rs")),
+            (Section::Across, include_str!("sections/across.rs")),
+            (Section::Ci, include_str!("sections/ci.rs")),
+            (Section::Hosts, include_str!("sections/hosts.rs")),
+            (Section::Issues, include_str!("sections/issues.rs")),
+            (Section::Jobs, include_str!("sections/tasks.rs")),
+            (Section::Problems, include_str!("sections/problems.rs")),
+            (Section::Symbols, include_str!("sections/symbols.rs")),
+            (Section::Pr, include_str!("sections/git.rs")),
+            (Section::Mine, include_str!("sections/my_work.rs")),
+            (Section::PrQueue, include_str!("sections/pr_queue.rs")),
+            (
+                Section::Environments,
+                include_str!("sections/environments.rs"),
+            ),
+            (Section::Usage, include_str!("sections/usage.rs")),
+            (Section::Keys, include_str!("sections/keys.rs")),
+            (Section::Help, include_str!("sections/help.rs")),
+            (Section::Telemetry, include_str!("sections/telemetry.rs")),
+        ]
     }
 
     #[test]
@@ -498,55 +582,7 @@ mod tests {
             (Section::Symbols, include_str!("sections/symbols.rs")),
         ];
         for (section, src) in files {
-            // Collect ("chord", "label") pairs from every hint_row(&[...])
-            // call in the file: successive `("a", "b")` string-literal pairs.
-            let mut body_labels: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-            let mut rest = *src;
-            while let Some(pos) = rest.find("hint_row(&[") {
-                rest = &rest[pos + "hint_row(&[".len()..];
-                let end = rest.find("])").unwrap_or(rest.len());
-                let block = &rest[..end];
-                // Walk the block's top-level `(...)` tuples by paren depth
-                // (labels may be `if`-expressions spanning lines and calls);
-                // within a tuple, the FIRST string literal is the chord and
-                // every remaining literal is one of its possible labels.
-                let mut depth = 0usize;
-                let mut tuple = String::new();
-                for c in block.chars() {
-                    match c {
-                        '(' => {
-                            depth += 1;
-                            if depth == 1 {
-                                tuple.clear();
-                                continue;
-                            }
-                        }
-                        ')' => {
-                            depth = depth.saturating_sub(1);
-                            if depth == 0 {
-                                let lits: Vec<&str> = tuple
-                                    .split('"')
-                                    .enumerate()
-                                    .filter(|(i, _)| i % 2 == 1)
-                                    .map(|(_, s)| s)
-                                    .collect();
-                                if let Some((chord, labels)) = lits.split_first() {
-                                    let entry =
-                                        body_labels.entry(chord.trim().to_string()).or_default();
-                                    for l in labels {
-                                        entry.insert(l.to_string());
-                                    }
-                                }
-                                continue;
-                            }
-                        }
-                        _ => {}
-                    }
-                    if depth >= 1 {
-                        tuple.push(c);
-                    }
-                }
-            }
+            let body_labels = hint_row_labels(src);
             for sk in section_keys(*section) {
                 let Some(labels) = body_labels.get(sk.chord) else {
                     continue;
@@ -565,5 +601,253 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn logs_export_is_reachable() {
+        use crate::layout::PanelWidth;
+        use termwiz::input::{KeyCode, Modifiers};
+
+        let export = section_keys(Section::Logs)
+            .iter()
+            .find(|key| key.label == "export")
+            .expect("Logs export key is advertised");
+        let chord = export.key.expect("export is a section action");
+        let ui = crate::panel::PanelUi {
+            open: Section::Logs,
+            row_mode: true,
+            width: PanelWidth::Normal,
+            ..crate::panel::PanelUi::default()
+        };
+        assert!(crate::panel::accordion_key(&KeyCode::Char(chord), Modifiers::NONE, &ui).is_none());
+        assert!(
+            dispatched()
+                .get("Logs")
+                .is_some_and(|keys| keys.contains(&chord))
+        );
+    }
+
+    #[test]
+    fn panel_key_reachability_ratchet() {
+        use crate::layout::PanelWidth;
+        use crate::panel::gitui::GitView;
+        use termwiz::input::{KeyCode, Modifiers};
+
+        // Mirrors the scroll-route lane's body scroll destinations (L10).
+        const SCROLL_BODIES: &[Section] = &[Section::Help, Section::Keys, Section::Telemetry];
+        const GIT_VIEWS: &[GitView] = &[
+            GitView::Files,
+            GitView::Branches,
+            GitView::Commits,
+            GitView::Stash,
+            GitView::Staging,
+            GitView::CommitFiles,
+            GitView::PatchBuilding,
+            GitView::RebaseTodo,
+            GitView::Blame,
+        ];
+        const WIDTHS: &[PanelWidth] = &[PanelWidth::Normal, PanelWidth::Half, PanelWidth::Full];
+
+        let renderers = renderer_sources();
+        let row_sources = vec![
+            include_str!("sections/usage.rs"),
+            include_str!("sections/telemetry.rs"),
+            include_str!("sections/tasks.rs"),
+            include_str!("sections/symbols.rs"),
+            include_str!("sections/stash.rs"),
+            include_str!("sections/problems.rs"),
+            include_str!("sections/pr_queue.rs"),
+            include_str!("sections/notifications.rs"),
+            include_str!("sections/my_work.rs"),
+            include_str!("sections/merge_queue.rs"),
+            include_str!("sections/media.rs"),
+            include_str!("sections/logs.rs"),
+            include_str!("sections/keys.rs"),
+            include_str!("sections/issues.rs"),
+            include_str!("sections/hosts.rs"),
+            include_str!("sections/help.rs"),
+            include_str!("sections/environments.rs"),
+            include_str!("sections/ci.rs"),
+            include_str!("sections/changes.rs"),
+            include_str!("sections/branches.rs"),
+            include_str!("sections/git.rs"),
+            include_str!("sections/across.rs"),
+            include_str!("sections/commits.rs"),
+            include_str!("sections/misc.rs"), // Multi-section renderer; excluded from hint ownership above.
+            include_str!("sections/mod.rs"),
+            include_str!("gitfull.rs"),
+            include_str!("frame.rs"),
+        ];
+        let dispatched = dispatched();
+        let mut violations = BTreeSet::new();
+
+        for section in SECTION_ORDER {
+            if section.home_view().is_some() {
+                continue;
+            }
+            let name = format!("{section:?}");
+            let mut advertised: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            let mut hint_nav_chords = BTreeSet::new();
+            for key in section_keys(section) {
+                if let Some(ch) = key.key {
+                    advertised
+                        .entry(if ch == ' ' {
+                            "space".into()
+                        } else {
+                            ch.to_string()
+                        })
+                        .or_default()
+                        .insert(key.label.to_string());
+                }
+                if key.chord == "j/k" {
+                    let has_rows = row_sources
+                        .iter()
+                        .any(|src| src.contains(&format!("Row(Section::{name}")));
+                    if key.label == "scroll" {
+                        if !SCROLL_BODIES.contains(&section) {
+                            violations.insert(format!("{name} j/k no-rows"));
+                        }
+                    } else if !has_rows {
+                        violations.insert(format!("{name} j/k no-rows"));
+                    }
+                }
+            }
+            if let Some((_, src)) = renderers.iter().find(|(owner, _)| *owner == section) {
+                for (chord, labels) in hint_row_labels(src) {
+                    let chord = chord.trim().to_string();
+                    if chord == "space" || chord.chars().count() == 1 {
+                        if chord
+                            .chars()
+                            .next()
+                            .is_some_and(|c| matches!(c, 'j' | 'k' | 'J' | 'K' | '0'..='9'))
+                        {
+                            hint_nav_chords.insert(chord.clone());
+                        }
+                        advertised.entry(chord).or_default().extend(labels);
+                    }
+                }
+            }
+
+            for (chord, labels) in advertised {
+                let (key, base_mods) = match chord.as_str() {
+                    "space" => (KeyCode::Char(' '), Modifiers::NONE),
+                    value if value.chars().count() == 1 => (
+                        KeyCode::Char(value.chars().next().unwrap()),
+                        Modifiers::NONE,
+                    ),
+                    _ => continue,
+                };
+                let ch = match &key {
+                    KeyCode::Char(c) => Some(*c),
+                    _ => None,
+                };
+                let mut modifier_cases = vec![base_mods];
+                if ch.is_some_and(|c| c.is_ascii_uppercase()) {
+                    modifier_cases.push(Modifiers::SHIFT);
+                }
+                let accordion_named = ch.is_some_and(|c| {
+                    (c == 'e'
+                        && labels.iter().any(|label| {
+                            let label = label.to_lowercase();
+                            label.contains("expand")
+                                || label.contains("widen")
+                                || label.contains("full")
+                        }))
+                        || (c == 'E'
+                            && labels.iter().any(|label| {
+                                let label = label.to_lowercase();
+                                label.contains("shrink") || label.contains("narrow")
+                            }))
+                });
+                for width in WIDTHS {
+                    let ui = crate::panel::PanelUi {
+                        open: section,
+                        tab: section.tab(),
+                        row_mode: true,
+                        width: *width,
+                        ..crate::panel::PanelUi::default()
+                    };
+                    for mods in &modifier_cases {
+                        if !accordion_named
+                            && !hint_nav_chords.contains(&chord)
+                            && crate::panel::accordion_key(&key, *mods, &ui).is_some()
+                        {
+                            violations.insert(format!("{name} {chord} accordion"));
+                        }
+                        if section.is_git_family() {
+                            for view in GIT_VIEWS {
+                                let git_ui = crate::panel::PanelUi {
+                                    open: section,
+                                    tab: section.tab(),
+                                    row_mode: true,
+                                    width: *width,
+                                    git: crate::panel::gitui::GitUi {
+                                        focus: *view,
+                                        ..crate::panel::gitui::GitUi::default()
+                                    },
+                                    ..crate::panel::PanelUi::default()
+                                };
+                                if crate::panel::gitui::git_key_chg(
+                                    &key,
+                                    *mods,
+                                    &git_ui,
+                                    &crate::chrome::FrameModel::default(),
+                                )
+                                .is_some()
+                                {
+                                    violations.insert(format!("{name} {chord} git-key"));
+                                }
+                            }
+                        }
+                    }
+                }
+                if !section.is_git_family()
+                    && !section_keys(section).iter().any(|entry| {
+                        entry.key.is_some_and(|c| {
+                            if chord == "space" {
+                                c == ' '
+                            } else {
+                                chord == c.to_string()
+                            }
+                        })
+                    })
+                    && let Some(c) = ch
+                    && !dispatched.get(&name).is_some_and(|keys| keys.contains(&c))
+                {
+                    violations.insert(format!("{name} {chord} undispatched"));
+                }
+            }
+        }
+
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let allow_path = std::path::Path::new(manifest).join("../../test/panel-key-ratchet.txt");
+        let existing = std::fs::read_to_string(&allow_path).unwrap();
+        let header: Vec<String> = existing
+            .lines()
+            .take_while(|line| line.trim().is_empty() || line.trim_start().starts_with('#'))
+            .filter(|line| line.trim() != "# RATCHET-EMPTY")
+            .map(str::to_string)
+            .collect();
+        if std::env::var("THEGN_RATCHET_UPDATE").as_deref() == Ok("1") {
+            let mut output = header;
+            if output.last().is_some_and(|line| !line.trim().is_empty()) {
+                output.push(String::new());
+            }
+            if violations.is_empty() {
+                output.push("# RATCHET-EMPTY".to_string());
+            } else {
+                output.extend(violations.iter().cloned());
+            }
+            std::fs::write(allow_path, output.join("\n") + "\n").unwrap();
+            return;
+        }
+        let pinned =
+            thegn_core::test_support::ratchet::allowlist(manifest, "panel-key-ratchet.txt");
+        let additions: Vec<_> = violations.difference(&pinned).cloned().collect();
+        let stale: Vec<_> = pinned.difference(&violations).cloned().collect();
+        assert!(
+            additions.is_empty() && stale.is_empty(),
+            "panel key reachability debt changed. New violations: {additions:?}; stale entries (delete them): {stale:?}. Move the section key off the claimed chord, or drop the hint."
+        );
     }
 }
