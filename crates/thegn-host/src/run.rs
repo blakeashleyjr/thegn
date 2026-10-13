@@ -1881,44 +1881,10 @@ fn request_preview_scan(
     );
 }
 
-type SharePersistJob = Box<dyn FnOnce(&thegn_core::db::Db) + Send>;
-
 /// Persist a share lifecycle event to the `shares` table (resurrection layer).
 fn persist_share_event(ev: &crate::share::ShareEvent) {
-    use crate::share::ShareEvent;
-    let write: Option<SharePersistJob> = match ev {
-        ShareEvent::Up {
-            worktree,
-            port,
-            provider,
-            url,
-            ..
-        } => {
-            let canonical = url.canonical();
-            let worktree = worktree.clone();
-            let port = *port;
-            let provider = (*provider).to_string();
-            Some(Box::new(move |db: &thegn_core::db::Db| {
-                if let Err(error) =
-                    db.upsert_share(&worktree, port, &provider, Some(&canonical), "up")
-                {
-                    tracing::debug!(target: "thegn::db", error = %error, "share persist failed");
-                }
-            }))
-        }
-        ShareEvent::Failed { worktree, port, .. } | ShareEvent::Down { worktree, port, .. } => {
-            let worktree = worktree.clone();
-            let port = *port;
-            Some(Box::new(move |db: &thegn_core::db::Db| {
-                if let Err(error) = db.delete_share(&worktree, port) {
-                    tracing::debug!(target: "thegn::db", error = %error, "share delete persist failed");
-                }
-            }))
-        }
-    };
-    if let Some(write) = write {
-        crate::db_task::persist(write);
-    }
+    let op = crate::share::share_persist_for(ev);
+    crate::db_task::persist(move |db| crate::share::apply_share_persist(db, op));
 }
 
 /// The active worktree's `(worktree_path, workspace_repo_path)`, or `None` when
@@ -6921,7 +6887,7 @@ async fn event_loop<T: Terminal>(
     {
         for row in db.list_shares().unwrap_or_default() {
             if row.state == "up" {
-                let _ = share_supervisor.start(
+                match share_supervisor.start(
                     // best-effort: restore: a failed share restart is re-attempted on the next launch
                     &keymap.config().share,
                     &row.worktree,
@@ -6929,7 +6895,36 @@ async fn event_loop<T: Terminal>(
                     None, // restore re-resolves via `[share] provider`
                     &share_tx,
                     &waker,
-                );
+                ) {
+                    Ok(()) => {
+                        if let Some(generation) =
+                            share_supervisor.generation_of(&row.worktree, row.local_port)
+                        {
+                            let worktree = row.worktree.clone();
+                            let port = row.local_port;
+                            let previous_generation = row.generation;
+                            crate::db_task::persist(move |db| {
+                                match db.rebind_share_generation(
+                                    &worktree,
+                                    port,
+                                    previous_generation,
+                                    generation,
+                                ) {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        tracing::debug!(target: "thegn::db", %worktree, port, previous_generation, generation, "share resurrection generation rebind lost its compare-and-swap")
+                                    }
+                                    Err(error) => {
+                                        tracing::debug!(target: "thegn::db", %error, "share resurrection generation rebind failed")
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::share", %error, worktree = %row.worktree, port = row.local_port, "share resurrection start failed")
+                    }
+                }
             }
         }
     }
@@ -20536,11 +20531,18 @@ async fn event_loop<T: Terminal>(
                                 Some((wt, port)) => {
                                     let stopped = share_supervisor.stop(&wt, Some(port));
                                     let did_stop = !stopped.is_empty();
-                                    let stopped_ports = stopped;
+                                    let stopped_runs = stopped;
                                     crate::db_task::persist(move |db| {
-                                        for port in stopped_ports {
-                                            if let Err(error) = db.delete_share(&wt, port) {
-                                                tracing::debug!(target: "thegn::db", %error, "stopped share cache delete failed");
+                                        for (port, generation) in stopped_runs {
+                                            match db.delete_share_generation(&wt, port, generation)
+                                            {
+                                                Ok(true) => {}
+                                                Ok(false) => {
+                                                    tracing::debug!(target: "thegn::db", %wt, port, generation, "stale stopped share delete left another generation intact")
+                                                }
+                                                Err(error) => {
+                                                    tracing::debug!(target: "thegn::db", %error, "stopped share cache delete failed")
+                                                }
                                             }
                                         }
                                     });

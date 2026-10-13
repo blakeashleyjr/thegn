@@ -12,6 +12,8 @@ pub struct ShareRow {
     pub public_url: Option<String>,
     pub state: String,
     pub created_at: i64,
+    /// Owning supervisor/CLI run; `0` means this row predates schema v81.
+    pub generation: u64,
 }
 
 /// A persisted auto port forward (`[forward]`) — the resurrection record for a

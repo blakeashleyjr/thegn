@@ -6,9 +6,9 @@
 //! the child — and reports state back over a tokio mpsc channel, pulsing the
 //! `TerminalWaker` exactly as the config/LSP/refresh producers do.
 //!
-//! The supervisor itself is pure bookkeeping (no DB, no rendering); the event
-//! loop persists rows and re-syncs the [`crate::chrome::FrameModel`] from
-//! [`ShareSupervisor::views`].
+//! The supervisor itself is pure bookkeeping (no DB, no rendering). Its event
+//! persistence projection is generation-fenced; the loop re-syncs the
+//! [`crate::chrome::FrameModel`] from [`ShareSupervisor::views`].
 
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use termwiz::terminal::TerminalWaker;
 use thegn_core::config::ShareConfig;
 use thegn_core::share::build_share_spec;
+use thegn_core::store::WorktreeAuxStore;
 use thegn_svc::share::PublicEndpoint;
 use thegn_svc::share::ShareProvider;
 use tokio::sync::mpsc::UnboundedSender;
@@ -45,6 +46,86 @@ pub enum ShareEvent {
         provider: &'static str,
         error: String,
     },
+}
+
+pub(crate) enum SharePersist {
+    Upsert {
+        worktree: String,
+        port: u16,
+        generation: u64,
+        provider: String,
+        url: String,
+    },
+    DeleteIfOwned {
+        worktree: String,
+        port: u16,
+        generation: u64,
+    },
+}
+
+/// Pure projection of a supervisor event into its durable operation.
+pub(crate) fn share_persist_for(ev: &ShareEvent) -> SharePersist {
+    match ev {
+        ShareEvent::Up {
+            worktree,
+            port,
+            generation,
+            provider,
+            url,
+        } => SharePersist::Upsert {
+            worktree: worktree.clone(),
+            port: *port,
+            generation: *generation,
+            provider: (*provider).to_string(),
+            url: url.canonical(),
+        },
+        ShareEvent::Down {
+            worktree,
+            port,
+            generation,
+        }
+        | ShareEvent::Failed {
+            worktree,
+            port,
+            generation,
+            ..
+        } => SharePersist::DeleteIfOwned {
+            worktree: worktree.clone(),
+            port: *port,
+            generation: *generation,
+        },
+    }
+}
+
+pub(crate) fn apply_share_persist(db: &thegn_core::db::Db, op: SharePersist) {
+    match op {
+        SharePersist::Upsert {
+            worktree,
+            port,
+            generation,
+            provider,
+            url,
+        } => {
+            if let Err(error) =
+                db.upsert_share(&worktree, port, generation, &provider, Some(&url), "up")
+            {
+                tracing::debug!(target: "thegn::db", %error, "share persist failed");
+            }
+        }
+        SharePersist::DeleteIfOwned {
+            worktree,
+            port,
+            generation,
+        } => match db.delete_share_generation(&worktree, port, generation) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(target: "thegn::db", %worktree, port, generation, "stale share delete left another generation intact")
+            }
+            Err(error) => {
+                tracing::debug!(target: "thegn::db", %error, "share delete persist failed")
+            }
+        },
+    }
 }
 
 /// The lifecycle state of one share, as the UI sees it.
@@ -206,6 +287,16 @@ impl ShareSupervisor {
         self.instances
             .iter()
             .any(|i| i.worktree == worktree && i.port == port && i.generation != generation)
+    }
+
+    /// Generation of the live, non-stopping share at `(worktree, port)`.
+    pub fn generation_of(&self, worktree: &str, port: u16) -> Option<u64> {
+        self.instances
+            .iter()
+            .find(|i| {
+                i.worktree == worktree && i.port == port && !matches!(i.state, ShareState::Stopping)
+            })
+            .map(|i| i.generation)
     }
 
     /// Render-facing snapshot of all shares for `worktree` (badge + panel).
@@ -377,16 +468,16 @@ impl ShareSupervisor {
     }
 
     /// Stop shares on `worktree`: a specific `port`, or all (`None`). Returns
-    /// the stopped ports — callers use them for DB cleanup, which must key off
+    /// the stopped `(port, generation)` pairs — callers use them for DB cleanup, which must key off
     /// the supervisor's own state, never a possibly-stale render mirror.
-    pub fn stop(&mut self, worktree: &str, port: Option<u16>) -> Vec<u16> {
+    pub fn stop(&mut self, worktree: &str, port: Option<u16>) -> Vec<(u16, u64)> {
         let mut stopped = Vec::new();
         // Failed instances already received a terminal event and have no
         // worker left to await. Remove them before mutating the live records.
         self.instances.retain(|i| {
             let matched = i.worktree == worktree && port.is_none_or(|p| p == i.port);
             if matched && matches!(i.state, ShareState::Failed(_)) {
-                stopped.push(i.port);
+                stopped.push((i.port, i.generation));
                 false
             } else {
                 true
@@ -395,7 +486,7 @@ impl ShareSupervisor {
         for i in &mut self.instances {
             let matched = i.worktree == worktree && port.is_none_or(|p| p == i.port);
             if matched && !matches!(i.state, ShareState::Stopping) {
-                stopped.push(i.port);
+                stopped.push((i.port, i.generation));
                 i.kill();
                 // Retain this generation until its worker acknowledges teardown.
                 i.state = ShareState::Stopping;
@@ -755,7 +846,8 @@ mod tests {
             event_tx: None,
             event_waker: None,
         });
-        assert_eq!(sup.stop("/wt", Some(3000)), vec![3000]);
+        assert_eq!(sup.stop("/wt", Some(3000)), vec![(3000, 31)]);
+        assert_eq!(sup.generation_of("/wt", 3000), None);
         assert_eq!(sup.instances.len(), 1);
         assert!(matches!(sup.instances[0].state, ShareState::Stopping));
         assert!(sup.views("/wt")[0].stopping);
@@ -781,7 +873,7 @@ mod tests {
             event_tx: None,
             event_waker: None,
         });
-        assert_eq!(sup.stop("/wt", Some(3000)), vec![3000]);
+        assert_eq!(sup.stop("/wt", Some(3000)), vec![(3000, 51)]);
         assert!(sup.on_event(ShareEvent::Failed {
             worktree: "/wt".into(),
             port: 3000,
@@ -852,5 +944,101 @@ mod tests {
         };
         assert_eq!(socket_view.copy_value().as_deref(), Some("bore.pub:4123"));
         assert!(socket_view.browser_url().is_none());
+    }
+
+    #[test]
+    fn fenced_persistence_keeps_new_up_after_old_down() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let up = ShareEvent::Up {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 2,
+            provider: "bore",
+            url: PublicEndpoint::parse_url("https://new.test").unwrap(),
+        };
+        apply_share_persist(&db, share_persist_for(&up));
+        let old_down = ShareEvent::Down {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 1,
+        };
+        apply_share_persist(&db, share_persist_for(&old_down));
+        assert_eq!(db.list_shares().unwrap()[0].generation, 2);
+
+        let failed = ShareEvent::Failed {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 2,
+            provider: "bore",
+            error: "provider failed".into(),
+        };
+        apply_share_persist(&db, share_persist_for(&failed));
+        assert!(db.list_shares().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stop_start_storm_returns_each_generation_and_live_generation_only() {
+        let mut sup = ShareSupervisor::new();
+        let instance = |generation| ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation,
+            provider: "bore",
+            public: true,
+            state: ShareState::Starting,
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        };
+        sup.instances.push(instance(61));
+        assert_eq!(sup.stop("/wt", Some(3000)), vec![(3000, 61)]);
+        sup.instances.push(instance(62));
+        assert_eq!(sup.generation_of("/wt", 3000), Some(62));
+        assert_eq!(sup.stop("/wt", Some(3000)), vec![(3000, 62)]);
+        assert_eq!(sup.generation_of("/wt", 3000), None);
+        assert_eq!(
+            sup.instances.len(),
+            2,
+            "both stopped generations await terminal ack"
+        );
+        for generation in [61, 62] {
+            assert!(sup.on_event(ShareEvent::Down {
+                worktree: "/wt".into(),
+                port: 3000,
+                generation,
+            }));
+        }
+        assert!(sup.instances.is_empty());
+    }
+
+    #[test]
+    fn fenced_deletes_are_scoped_to_worktree_even_when_ports_match() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let first = ShareEvent::Up {
+            worktree: "/wt/a".into(),
+            port: 3000,
+            generation: 10,
+            provider: "bore",
+            url: PublicEndpoint::parse_url("https://a.test").unwrap(),
+        };
+        let second = ShareEvent::Up {
+            worktree: "/wt/b".into(),
+            port: 3000,
+            generation: 20,
+            provider: "bore",
+            url: PublicEndpoint::parse_url("https://b.test").unwrap(),
+        };
+        apply_share_persist(&db, share_persist_for(&first));
+        apply_share_persist(&db, share_persist_for(&second));
+        let down = ShareEvent::Down {
+            worktree: "/wt/a".into(),
+            port: 3000,
+            generation: 10,
+        };
+        apply_share_persist(&db, share_persist_for(&down));
+        let rows = db.list_shares().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].worktree, "/wt/b");
+        assert_eq!(rows[0].generation, 20);
     }
 }

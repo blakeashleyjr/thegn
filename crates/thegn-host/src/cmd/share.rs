@@ -85,10 +85,10 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
         Err(e) => return on_error_exit(spec.on_error, e),
     };
     let db = Db::open().ok(); // best-effort: cache: only the share state rows read/write the DB; the launch errors above exit loudly
+    let generation = cli_generation()?;
 
     match launch {
         ShareLaunch::Process(plan) => {
-            let generation = cli_generation()?;
             let statedir = match share::share_state_dir(&wt_path, &kind, port, generation) {
                 Ok(path) => path,
                 Err(e) => return on_error_exit(spec.on_error, e),
@@ -103,13 +103,18 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
             outln!("share: press Ctrl-C to stop");
             if let Some(db) = &db {
                 let url = running.public_url.canonical();
-                let _ = db.upsert_share(&wt, port, &kind, Some(&url), "up"); // best-effort: cache write: the share state row feeds the UI/`share list`; the share itself is already up
+                if let Err(error) = db.upsert_share(&wt, port, generation, &kind, Some(&url), "up")
+                {
+                    tracing::debug!(target: "thegn::db", %error, "share cache upsert failed");
+                }
             }
             // Block until the client exits (Ctrl-C tears down the group).
             // CLI path: `thegn share` runs the tunnel in the foreground by design.
             running.wait();
             if let Some(db) = &db {
-                let _ = db.delete_share(&wt, port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                if let Err(error) = db.delete_share_generation(&wt, port, generation) {
+                    tracing::debug!(target: "thegn::db", %error, "share cache delete failed");
+                }
             }
         }
         ShareLaunch::SidecarServe(serve) => {
@@ -131,7 +136,10 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
             outln!("share: 127.0.0.1:{port} → {display_endpoint}");
             outln!("share: serve persists in the tailnet; `share stop {port}` to remove");
             if let Some(db) = &db {
-                let _ = db.upsert_share(&wt, port, &kind, Some(&url), "up"); // best-effort: cache write: the share state row feeds the UI/`share list`; the share itself is already up
+                if let Err(error) = db.upsert_share(&wt, port, generation, &kind, Some(&url), "up")
+                {
+                    tracing::debug!(target: "thegn::db", %error, "share cache upsert failed");
+                }
             }
         }
     }

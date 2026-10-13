@@ -407,8 +407,10 @@ pub(crate) fn stop_worktree_share(
     let stopped = share_supervisor.stop(&wt, None);
     if let Ok(db) = thegn_core::db::Db::open() {
         use thegn_core::store::WorktreeAuxStore as _;
-        for port in &stopped {
-            let _ = db.delete_share(&wt, *port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        for (port, generation) in &stopped {
+            if let Err(error) = db.delete_share_generation(&wt, *port, *generation) {
+                tracing::debug!(target: "thegn::db", %error, "stopped share cache delete failed");
+            }
         }
     }
     model.shares = crate::run::current_share_views(share_supervisor, session);
