@@ -112,8 +112,8 @@ pub(crate) fn spawn_test_cache_load(
         if let Err(error) = waker.wake() {
             tracing::debug!(target: "thegn::db", %error, "test cache load wake failed");
         }
-        if let Err(error) = done_tx.send(()) {
-            tracing::debug!(target: "thegn::db", %error, "test cache load completion receiver is gone");
+        if done_tx.send(()).is_err() {
+            tracing::debug!(target: "thegn::db", "test cache load completion receiver is gone");
         }
     });
     tokio::spawn(async move {
