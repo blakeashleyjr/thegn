@@ -348,6 +348,24 @@ mod tests {
     }
 
     #[test]
+    fn untracked_diff_is_all_adds_and_leaves_status_untracked() {
+        let repo = TestRepo::new("stage-untracked-read");
+        commit_empty(&repo.dir, "base");
+        std::fs::write(repo.dir.join("new.txt"), "a\nb\n").unwrap();
+        let diff = CliGit.untracked_diff(&repo.loc(), "new.txt").unwrap();
+        assert!(has_line(&diff, "+a"), "{diff}");
+        assert!(has_line(&diff, "+b"), "{diff}");
+        assert!(
+            parse_patch(&diff)[0]
+                .hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .all(|line| line.kind == LineKind::Add)
+        );
+        assert!(repo.out(&["status", "--porcelain"]).contains("?? new.txt"));
+    }
+
+    #[test]
     fn discard_file_restores_tracked_and_removes_untracked() {
         let repo = TestRepo::new("discard-file");
         repo.commit_file("t.txt", "original\n", "base");
