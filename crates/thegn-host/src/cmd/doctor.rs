@@ -711,9 +711,7 @@ fn providers_report(cfg: &Config) {
     }
 }
 
-/// The `Secrets` section: one probe row per backend kind (keyring/file/env,
-/// with `exec` reserved), then one presence-only line per configured secret
-/// field — its backend and `resolves`/`missing`, never a value (THE-66).
+/// Find hard-linked secret staging files that can retain replaced contents.
 fn secret_hard_link_notes(state_thegn: &std::path::Path) -> Vec<String> {
     fn append_directory_notes(dir: &std::path::Path, notes: &mut Vec<String>) {
         match thegn_core::fsperm::hard_linked_files(dir) {
@@ -764,6 +762,9 @@ fn secret_hard_link_notes(state_thegn: &std::path::Path) -> Vec<String> {
     notes
 }
 
+/// The `Secrets` section: one probe row per backend kind (keyring/file/env,
+/// with `exec` reserved), then one presence-only line per configured secret
+/// field — its backend and `resolves`/`missing`, never a value (THE-66).
 fn secrets_report(cfg: &Config) {
     use thegn_core::seam::Availability;
     outln!("Secrets (broker backend → availability)");
