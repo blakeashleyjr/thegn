@@ -877,24 +877,7 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows
 }
 
-// ---- debug / sandbox / db ----------------------------------------------------
-
-pub(super) fn debug() -> Vec<PanelRow> {
-    vec![
-        PanelRow::plain(Line::split(
-            vec![seg(g2(), "○ no session")],
-            vec![seg(g(), "—")],
-        )),
-        PanelRow::blank(),
-        PanelRow::plain(Line::segs(vec![seg(g2(), "BREAKPOINTS").bold()])),
-        PanelRow::plain(Line::segs(vec![sp(2), seg(g2(), "none set")])),
-        PanelRow::blank(),
-        PanelRow::plain(Line::segs(vec![seg(
-            g2(),
-            "debugger integration not wired yet",
-        )])),
-    ]
-}
+// ---- sandbox ----------------------------------------------------------------
 
 /// Render the unified activity timeline (sandbox audit + LLM-proxy spend) for the
 /// active worktree, newest first. Shared by the OCI and non-OCI branches of the
@@ -1309,17 +1292,6 @@ fn sandbox_hint(ctx: &SectionCtx, show_all: bool) -> Option<PanelRow> {
     } else {
         Some(hint_row(&hints))
     }
-}
-
-pub(super) fn db() -> Vec<PanelRow> {
-    vec![
-        PanelRow::plain(Line::segs(vec![seg(g2(), "○ no database detected")])),
-        PanelRow::blank(),
-        PanelRow::plain(Line::segs(vec![seg(
-            g2(),
-            "db introspection not wired yet",
-        )])),
-    ]
 }
 
 #[cfg(test)]

@@ -81,10 +81,14 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
     }
     // Per-section keys come from the single-source table, which is checked
     // against the real dispatch arms by `section_keys`' drift test.
-    let pairs: Vec<(String, String)> = crate::panel::section_keys::section_keys(ui.open)
-        .iter()
-        .map(|sk| (sk.chord.to_string(), sk.label.to_string()))
-        .collect();
+    let pairs: Vec<(String, String)> = if ui.off_reason(ui.open).is_some() {
+        Vec::new()
+    } else {
+        crate::panel::section_keys::section_keys(ui.open)
+            .iter()
+            .map(|sk| (sk.chord.to_string(), sk.label.to_string()))
+            .collect()
+    };
     // "esc back" leads every row-mode hint list so the exit path is always visible.
     let mut result: Vec<(String, String)> = vec![("esc".to_string(), "back".to_string())];
     result.extend(pairs);
@@ -222,5 +226,15 @@ mod tests {
             .unwrap();
         let n: usize = jump.trim_start_matches("1-").parse().unwrap();
         assert!(n <= 9, "{jump}");
+    }
+    #[test]
+    fn off_section_advertises_no_section_keys() {
+        let ui = PanelUi {
+            row_mode: true,
+            open: Section::PrQueue,
+            off: vec![(Section::PrQueue, "off — set [pr_queue] enabled = true")],
+            ..PanelUi::default()
+        };
+        assert_eq!(panel_help_pairs(&ui), vec![("esc".into(), "back".into())]);
     }
 }

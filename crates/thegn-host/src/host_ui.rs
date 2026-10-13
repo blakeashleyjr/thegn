@@ -303,6 +303,9 @@ pub(crate) fn drive_host(
     cfg: &Config,
     host_ui: &crate::host_flow::HostUiTx,
 ) -> String {
+    if !crate::channel_state::allows(thegn_core::channel::Feature::Providers) {
+        return format!("host {name}: hosts are dev-channel only (THEGN_CHANNEL=dev)");
+    }
     let Some(binding) = cfg.host_binding(name) else {
         return format!("host {name}: invalid [host.{name}] config");
     };
