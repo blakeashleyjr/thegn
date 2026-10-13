@@ -1387,13 +1387,13 @@ mod spec {
             worktree_path: String::new(),
         };
 
-        // Info-only inbox (worktree created / process exited never count): no flag.
+        // Info-only unread inbox: count it quietly without raising a flag.
         m.panel.notifications = vec![notification(
             1,
             thegn_core::notification::NotificationKind::WorktreeCreated,
         )];
         let s = seg_text(&summary(Section::Notifications, &m));
-        assert_eq!(s, "inbox zero");
+        assert_eq!(s, "1 low");
         assert!(!s.contains('⚑'));
 
         // Notice-priority unread: a neutral count, still no red flag.
