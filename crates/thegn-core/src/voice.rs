@@ -165,6 +165,25 @@ impl VoiceTransition {
     }
 }
 
+/// Normalize transcript text before it is inserted into a pane.
+///
+/// Control characters become spaces, then all whitespace runs collapse to one
+/// ASCII space and leading/trailing whitespace is removed.
+pub fn normalize_transcript(raw: &str) -> String {
+    raw.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Reduce one voice event.  Legal transitions are `Idle → Recording →
 /// Transcribing → Idle`; stale, duplicate, and mismatched-pane events are
 /// ignored.  A request id is allocated only when capture completes, which
@@ -243,7 +262,7 @@ pub fn reduce(state: &VoiceState, next_request_id: &mut u64, event: VoiceEvent) 
                 transcript,
             },
         ) if *pane_id == event_pane && *request_id == event_request => {
-            let text = transcript.trim().to_string();
+            let text = normalize_transcript(&transcript);
             let effects = if text.is_empty() {
                 Vec::new()
             } else {
@@ -514,6 +533,98 @@ mod tests {
             );
             assert_eq!(result.state, VoiceState::Idle);
             assert!(result.effects.is_empty());
+        }
+    }
+
+    #[test]
+    fn transcript_line_breaks_are_inserted_as_spaces() {
+        let mut id = 0;
+        let recording = reduce_from(
+            &VoiceState::Idle,
+            &mut id,
+            VoiceEvent::Start {
+                pane_id: 1,
+                now_ms: 0,
+            },
+        )
+        .state;
+        let pending = reduce_from(
+            &recording,
+            &mut id,
+            VoiceEvent::CaptureComplete {
+                pane_id: 1,
+                wav: vec![1],
+            },
+        )
+        .state;
+        let result = reduce_from(
+            &pending,
+            &mut id,
+            VoiceEvent::TranscriptSucceeded {
+                pane_id: 1,
+                request_id: 1,
+                transcript: "first line\nsecond line\r\n".into(),
+            },
+        );
+
+        assert_eq!(
+            result.effects,
+            vec![VoiceEffect::Inject {
+                pane_id: 1,
+                transcript: "first line second line".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn transcript_control_characters_are_not_injected() {
+        let mut id = 0;
+        let recording = reduce_from(
+            &VoiceState::Idle,
+            &mut id,
+            VoiceEvent::Start {
+                pane_id: 1,
+                now_ms: 0,
+            },
+        )
+        .state;
+        let pending = reduce_from(
+            &recording,
+            &mut id,
+            VoiceEvent::CaptureComplete {
+                pane_id: 1,
+                wav: vec![1],
+            },
+        )
+        .state;
+        let result = reduce_from(
+            &pending,
+            &mut id,
+            VoiceEvent::TranscriptSucceeded {
+                pane_id: 1,
+                request_id: 1,
+                transcript: "hi\x1b[31m there\x07".into(),
+            },
+        );
+
+        assert_eq!(
+            result.effects,
+            vec![VoiceEffect::Inject {
+                pane_id: 1,
+                transcript: "hi [31m there".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn transcript_normalization_collapses_whitespace_and_controls() {
+        for (raw, expected) in [
+            ("a\t\tb", "a b"),
+            ("  x  ", "x"),
+            ("\u{85}y", "y"),
+            ("", ""),
+        ] {
+            assert_eq!(normalize_transcript(raw), expected);
         }
     }
 }
