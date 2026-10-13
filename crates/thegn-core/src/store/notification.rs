@@ -53,6 +53,13 @@ pub trait NotificationStore {
     fn get_all_notifications(&self, limit: usize)
     -> Result<Vec<crate::notification::Notification>>;
 
+    /// Unread first, then read; each newest first with an `id DESC` tie-break,
+    /// capped at `limit`.
+    fn get_inbox_notifications(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::notification::Notification>>;
+
     /// Mark a single notification as read.
     fn mark_notification_read(&self, id: i64) -> Result<()>;
 

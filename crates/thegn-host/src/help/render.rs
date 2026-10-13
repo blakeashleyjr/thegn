@@ -165,9 +165,25 @@ impl Flow {
             }};
         }
 
-        for atom in atoms {
+        let mut atom_idx = 0;
+        while atom_idx < atoms.len() {
+            if !atoms[atom_idx].space {
+                let mut group_end = atom_idx + 1;
+                while group_end < atoms.len() && !atoms[group_end].space {
+                    group_end += 1;
+                }
+                let group_width: usize = atoms[atom_idx..group_end]
+                    .iter()
+                    .map(|atom| atom.seg.text.width())
+                    .sum();
+                if group_width <= avail && group_width > avail.saturating_sub(cur_w) && cur_w > 0 {
+                    break_line!();
+                }
+            }
+            let atom = &atoms[atom_idx];
             if atom.space {
                 if cur_w == 0 {
+                    atom_idx += 1;
                     continue; // no leading spaces on any line
                 }
                 let room = avail - cur_w;
@@ -176,6 +192,7 @@ impl Flow {
                     cur.push(seg_like(&atom.seg, &atom.seg.text[..take]));
                     cur_w += take;
                 }
+                atom_idx += 1;
                 continue;
             }
             let w = atom.seg.text.width();
@@ -196,15 +213,17 @@ impl Flow {
             };
             if w <= avail - cur_w {
                 note_link(self, atom.link);
-                cur.push(atom.seg);
+                cur.push(atom.seg.clone());
                 cur_w += w;
+                atom_idx += 1;
                 continue;
             }
             if w <= avail && cur_w > 0 {
                 break_line!();
                 note_link(self, atom.link);
-                cur.push(atom.seg);
+                cur.push(atom.seg.clone());
                 cur_w += w;
+                atom_idx += 1;
                 continue;
             }
             // Wider than a whole line: hard-split on display cells.
@@ -225,6 +244,7 @@ impl Flow {
                     break_line!();
                 }
             }
+            atom_idx += 1;
         }
         if !cur.is_empty() || !emitted_any {
             let mut segs = head;
@@ -259,24 +279,46 @@ impl Flow {
 
 /// Clip a seg run to `cols` display cells, then pad to exactly `cols`.
 fn clip_and_pad(segs: Vec<Seg>, cols: usize) -> Vec<Seg> {
+    let total: usize = segs.iter().map(|s| s.text.width()).sum();
+    let clipped = total > cols;
+    let target = if clipped {
+        cols.saturating_sub(1)
+    } else {
+        cols
+    };
     let mut out: Vec<Seg> = Vec::new();
+    let mut ellipsis_style: Option<Seg> = None;
     let mut used = 0usize;
     for s in segs {
-        if used >= cols {
+        if used >= target {
+            ellipsis_style = Some(s);
             break;
         }
         let w = s.text.width();
-        if used + w <= cols {
+        if used + w <= target {
             used += w;
+            ellipsis_style = Some(s.clone());
             out.push(s);
         } else {
-            let chunk = crate::seg::take_cols(&s.text, cols - used);
+            let chunk = crate::seg::take_cols(&s.text, target - used);
             if !chunk.is_empty() {
                 used += chunk.width();
                 out.push(seg_like(&s, chunk));
             }
+            ellipsis_style = Some(s);
             break;
         }
+    }
+    if clipped && cols > 0 {
+        let ellipsis = ellipsis_style
+            .map(|s| seg_like(&s, "…"))
+            .unwrap_or_else(|| seg(Tok::Slot(S::Text), "…"));
+        if used < target {
+            out.push(sp(target - used));
+            used = target;
+        }
+        out.push(ellipsis);
+        used += 1;
     }
     if used < cols {
         out.push(sp(cols - used));
@@ -315,6 +357,37 @@ pub fn page_blocks(reg: &thegn_core::help::HelpRegistry, id: &str) -> Vec<Block>
         return Vec::new();
     };
     let mut blocks = page.blocks.clone();
+    let relabel = |spans: &mut [Inline]| {
+        for span in spans {
+            if let Inline::Link {
+                target: LinkTarget::Page(target),
+                label,
+            } = span
+                && label.as_str() == target.as_str()
+                && let Some(target_page) = reg.page(target.as_str())
+            {
+                *label = target_page.meta.title.clone();
+            }
+        }
+    };
+    for block in &mut blocks {
+        match block {
+            Block::Heading { spans, .. } | Block::Para(spans) | Block::Quote(spans) => {
+                relabel(spans)
+            }
+            Block::List(items) => {
+                for item in items {
+                    relabel(&mut item.spans);
+                }
+            }
+            Block::Table { header, rows } => {
+                for cell in header.iter_mut().chain(rows.iter_mut().flatten()) {
+                    relabel(cell);
+                }
+            }
+            Block::Code { .. } | Block::Rule => {}
+        }
+    }
     let back = reg.backlinks(id);
     if back.is_empty() {
         return blocks;
@@ -397,12 +470,25 @@ pub fn render_page(blocks: &[Block], width: usize, selected_link: Option<usize>)
                     text.lines().collect()
                 };
                 for line in lines {
-                    let clipped = crate::seg::take_cols(line, width.saturating_sub(2));
-                    let pad = width.saturating_sub(clipped.width() + 1);
-                    f.lines.push(Line::segs(vec![
-                        seg(Tok::Slot(S::Dim), format!(" {clipped}{}", " ".repeat(pad)))
+                    let code_width = width.saturating_sub(2);
+                    if line.width() > code_width && code_width > 0 {
+                        let clipped = crate::seg::take_cols(line, code_width - 1);
+                        let pad = width.saturating_sub(clipped.width() + 2);
+                        f.lines.push(Line::segs(vec![
+                            seg(
+                                Tok::Slot(S::Dim),
+                                format!(" {clipped}{}{ellipsis}", " ".repeat(pad), ellipsis = "…"),
+                            )
                             .bg(Tok::Slot(S::Raise)),
-                    ]));
+                        ]));
+                    } else {
+                        let clipped = crate::seg::take_cols(line, code_width);
+                        let pad = width.saturating_sub(clipped.width() + 1);
+                        f.lines.push(Line::segs(vec![
+                            seg(Tok::Slot(S::Dim), format!(" {clipped}{}", " ".repeat(pad)))
+                                .bg(Tok::Slot(S::Raise)),
+                        ]));
+                    }
                 }
             }
             Block::List(items) => {
@@ -457,14 +543,31 @@ pub fn render_page(blocks: &[Block], width: usize, selected_link: Option<usize>)
                     continue;
                 }
                 // Natural widths from the plain text of every cell.
-                let mut natural = vec![1usize; cols];
+                let mut cells = vec![Vec::new(); cols];
                 for row in std::iter::once(header).chain(rows.iter()) {
                     for (i, cell) in row.iter().take(cols).enumerate() {
-                        natural[i] = natural[i].max(markdown::plain(cell).width());
+                        cells[i].push(markdown::plain(cell).width());
                     }
                 }
+                let mut natural: Vec<usize> = cells
+                    .iter()
+                    .map(|widths| widths.iter().copied().max().unwrap_or(1).max(1))
+                    .collect();
                 let sep = format!(" {} ", g.box_v);
                 let sep_w = sep.width() * cols.saturating_sub(1);
+                if natural.iter().sum::<usize>() + sep_w > width {
+                    for (n, values) in natural.iter_mut().zip(cells.iter_mut()) {
+                        values.sort_unstable();
+                        *n = values
+                            .get(
+                                (values.len().saturating_mul(90).saturating_add(99) / 100)
+                                    .saturating_sub(1),
+                            )
+                            .copied()
+                            .unwrap_or(*n)
+                            .max(1);
+                    }
+                }
                 let widths = column_widths(&natural, width.saturating_sub(sep_w));
                 let table_w: usize = widths.iter().sum::<usize>() + sep_w;
 
@@ -556,6 +659,35 @@ mod tests {
     }
 
     #[test]
+    fn styled_punctuation_stays_with_the_word() {
+        let blocks = parse("a **b**, c\n");
+        let [Block::Para(spans)] = blocks.as_slice() else {
+            panic!("paragraph fixture parsed");
+        };
+        let mut next_link = 0;
+        let mut link_meta = Vec::new();
+        let mut flow_atoms = Vec::new();
+        atoms(
+            spans,
+            false,
+            &mut next_link,
+            None,
+            &mut link_meta,
+            &mut flow_atoms,
+        );
+        let mut flow = Flow {
+            width: 3,
+            lines: Vec::new(),
+            links: Vec::new(),
+            headings: Vec::new(),
+        };
+        flow.flow(flow_atoms, &[], &[], &link_meta);
+        let texts: Vec<String> = flow.lines.iter().map(line_text).collect();
+        assert!(texts.iter().any(|line| line.contains("b,")), "{texts:?}");
+        assert!(!texts.iter().any(|line| line.starts_with(',')), "{texts:?}");
+    }
+
+    #[test]
     fn heading_is_recorded_and_h1_gets_a_rule() {
         let page = render_page(&parse("# Title\n\nbody\n"), 40, None);
         assert_eq!(page.headings, vec![(0, "Title".to_string())]);
@@ -610,6 +742,16 @@ mod tests {
         assert_eq!(code.len(), 1);
         assert_eq!(line_text(code[0]).width(), 20, "padded to full width");
         assert!(line_text(code[0]).contains("ls -la"));
+    }
+
+    #[test]
+    fn clipped_code_line_ends_with_ellipsis() {
+        let page = render_page(&parse("```\n012345678901234567890123\n```\n"), 12, None);
+        let code = page.lines.iter().find(|line| {
+            matches!(line, Line::Segs(segs) if segs.iter().any(|seg| seg.bg == Some(Tok::Slot(S::Raise))))
+        }).unwrap();
+        assert!(line_text(code).ends_with('…'));
+        assert_eq!(line_text(code).width(), 12);
     }
 
     #[test]
@@ -688,6 +830,71 @@ mod tests {
                 assert!(line_text(l).width() <= w, "width {w}: {:?}", line_text(l));
             }
         }
+    }
+
+    #[test]
+    fn clipped_table_cell_ends_with_ellipsis_at_exact_width() {
+        let page = render_page(
+            &parse(
+                "| key | label |
+| --- | --- |
+| extraordinarily-long-key | surviving label |
+",
+            ),
+            18,
+            None,
+        );
+        let text = page
+            .lines
+            .iter()
+            .map(line_text)
+            .find(|line| line.contains('│') && line.contains('…'))
+            .unwrap();
+        assert!(text.ends_with('…'), "{text:?}");
+        assert_eq!(text.width(), 18);
+    }
+
+    #[test]
+    fn clipped_cell_ellipsis_keeps_the_style_of_the_cut_segment() {
+        let clipped = clip_and_pad(
+            vec![
+                seg(Tok::Slot(S::Dim), "codewords").bg(Tok::Slot(S::Raise)),
+                seg(Tok::Slot(S::Text), " trailing").bg(Tok::SelAccent),
+            ],
+            7,
+        );
+        let ellipsis = clipped.last().unwrap();
+        assert_eq!(ellipsis.text, "…");
+        assert_eq!(ellipsis.bg, Some(Tok::Slot(S::Raise)));
+        assert_eq!(clipped.iter().map(|seg| seg.text.width()).sum::<usize>(), 7);
+    }
+
+    #[test]
+    fn table_p90_cap_preserves_the_label_column() {
+        let mut source = String::from(
+            "| key | label |\n| --- | --- |\n| extraordinarily-long-key-for-one-row | exceptionally-long-label-that-is-also-over-40-chars |\n",
+        );
+        for _ in 0..10 {
+            source.push_str("| aaa | label-kept-readable |\n");
+        }
+        let page = render_page(&parse(&source), 30, None);
+        assert!(
+            page.lines
+                .iter()
+                .any(|line| line_text(line).contains("label-kept-readable"))
+        );
+    }
+
+    #[test]
+    fn page_blocks_relabels_bare_page_links_with_titles() {
+        let (reg, errors) =
+            crate::help::pages::build_registry(&thegn_core::config::Config::default());
+        assert!(errors.is_empty(), "{errors:?}");
+        let title = reg.page("sidebar").unwrap().meta.title.clone();
+        let page = render_page(&page_blocks(&reg, "index"), 80, None);
+        assert!(page.links.iter().any(|link| {
+            matches!(&link.target, LinkTarget::Page(id) if id == "sidebar") && link.label == title
+        }));
     }
 
     /// Link indices are page-global and register strictly in order, so a table

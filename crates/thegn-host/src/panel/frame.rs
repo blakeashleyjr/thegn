@@ -813,6 +813,79 @@ mod tests {
     }
 
     #[test]
+    fn pr_full_uses_the_section_page_and_keeps_the_tabs() {
+        let model = model_with(PanelData {
+            branch: "topic".into(),
+            pr: Some(crate::panel::PrSummary {
+                number: 7,
+                title: "review me".into(),
+                state: "OPEN".into(),
+                url: "https://github.com/acme/repo/pull/7".into(),
+                is_draft: false,
+                review_decision: None,
+            }),
+            checks: vec![crate::panel::CheckLine {
+                name: "build".into(),
+                state: crate::panel::CheckState::Pass,
+                duration_secs: None,
+                details_url: None,
+            }],
+            ..Default::default()
+        });
+        let ui = PanelUi {
+            open: Section::Pr,
+            tab: PanelTab::Work,
+            width: crate::layout::PanelWidth::Full,
+            ..Default::default()
+        };
+        let frame = build_panel(&model, &ui, 160, 40, true);
+        let all = frame
+            .rows
+            .iter()
+            .map(|row| text_of(&row.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("work"), "tab bar missing: {all}");
+        assert!(all.contains("CHECKS"), "PR checks missing: {all}");
+        assert!(
+            !all.contains("STATUS") && !all.contains("FILES"),
+            "git frame leaked: {all}"
+        );
+    }
+
+    #[test]
+    fn git_key_does_not_claim_pr_for_either_previous_focus() {
+        use termwiz::input::{KeyCode, Modifiers};
+        for focus in [
+            super::super::gitui::GitView::Files,
+            super::super::gitui::GitView::Commits,
+        ] {
+            let ui = PanelUi {
+                open: Section::Pr,
+                row_mode: true,
+                git: super::super::gitui::GitUi {
+                    focus,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            for key in [
+                KeyCode::Enter,
+                KeyCode::Char('c'),
+                KeyCode::Char(' '),
+                KeyCode::Char('s'),
+                KeyCode::Char('d'),
+            ] {
+                assert_eq!(
+                    super::super::gitui::git_key(&key, Modifiers::NONE, &ui),
+                    None,
+                    "{focus:?} {key:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn frame_header_caps_overflowing_change_totals_without_panicking() {
         let first = ChangeRow {
             added: u32::MAX,

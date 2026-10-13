@@ -105,8 +105,9 @@ pub fn wrap_capped(argv: &[String], limits: &LimitsConfig, backend: CapBackend) 
 }
 
 /// Live child registry for single-flight + real cancellation. Keyed by a logical
-/// slot (`"<worktree>:run"` / `"<worktree>:disc"`); the value is `(generation,
-/// group handle)` — a pgid on unix, a kill-on-close Job Object on Windows.
+/// slot (`"<worktree>:test"`, `"<worktree>:disc"`, or
+/// `"<worktree>:job:<name>"`); the value is `(generation, group handle)` — a
+/// pgid on unix, a kill-on-close Job Object on Windows.
 /// Starting a newer job in the same slot kills the older group so a superseded
 /// `cargo test` stops burning CPU immediately.
 fn registry() -> &'static Mutex<HashMap<String, (u64, crate::platform::GroupHandle)>> {
@@ -125,18 +126,61 @@ pub fn cancel_slot(slot: &str) {
     }
 }
 
-/// True if a thegn-spawned `cargo` job (test run or discovery) is currently
-/// registered for `worktree` — the cleanup guard that keeps an auto/manual
+/// True if a thegn-spawned test, discovery, or named job is currently registered
+/// for `worktree` — the cleanup guard that keeps an auto/manual
 /// `clean` from yanking `target/` out from under a build this process started.
 /// (An *external* `cargo build` in a pane is covered separately: `clean_target`
 /// prefers `cargo clean`, which takes the build lock and serializes.)
 pub fn slot_active(worktree: &std::path::Path) -> bool {
-    let run = format!("{}:run", worktree.display());
+    let prefix = format!("{}:", worktree.display());
+    let test = format!("{prefix}test");
     let disc = format!("{}:disc", worktree.display());
     registry()
         .lock()
-        .map(|m| m.contains_key(&run) || m.contains_key(&disc))
+        .map(|m| {
+            m.contains_key(&test)
+                || m.contains_key(&disc)
+                || m.keys()
+                    .any(|slot| slot.starts_with(&format!("{prefix}job:")))
+        })
         .unwrap_or(false)
+}
+
+pub fn test_slot(worktree: &Path) -> String {
+    format!("{}:test", worktree.display())
+}
+
+pub fn job_slot(worktree: &Path, name: &str) -> String {
+    format!("{}:job:{name}", worktree.display())
+}
+
+const RESTART_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
+
+#[derive(Debug, Default)]
+pub struct RestartArm {
+    armed: Option<(String, Instant)>,
+}
+
+impl RestartArm {
+    pub fn confirm(&mut self, name: &str, now: Instant) -> bool {
+        let confirmed = self.armed.as_ref().is_some_and(|(armed_name, armed_at)| {
+            armed_name == name && now.saturating_duration_since(*armed_at) < RESTART_CONFIRM_WINDOW
+        });
+        if confirmed {
+            self.armed = None;
+            return true;
+        }
+        self.armed = Some((name.to_owned(), now));
+        false
+    }
+
+    pub fn clear(&mut self) {
+        self.armed = None;
+    }
+}
+
+pub fn cancel_job(worktree: &Path, name: &str) {
+    cancel_slot(&job_slot(worktree, name));
 }
 
 /// Outcome of one capped child run.
@@ -355,6 +399,38 @@ pub struct TaskOutcome {
     pub duration_ms: u128,
     pub truncated: bool,
     pub stdout_stderr: String,
+}
+
+pub fn failed_test_run_outcome(
+    worktree: PathBuf,
+    generation: u64,
+    task: TestTask,
+    error: impl std::fmt::Display,
+) -> TaskOutcome {
+    TaskOutcome {
+        worktree: worktree.to_string_lossy().into_owned(),
+        generation,
+        task,
+        exit_code: None,
+        duration_ms: 0,
+        truncated: false,
+        stdout_stderr: format!("test run did not complete: {error}"),
+    }
+}
+
+pub fn failed_test_discovery_outcome(
+    worktree: PathBuf,
+    generation: u64,
+    task: TestTask,
+    error: impl std::fmt::Display,
+) -> DiscoveryOutcome {
+    DiscoveryOutcome {
+        worktree: worktree.to_string_lossy().into_owned(),
+        generation,
+        task,
+        nodes: Vec::new(),
+        error: Some(format!("test discovery did not complete: {error}")),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -716,8 +792,53 @@ pub fn run_task(
     task: TestTask,
     limits: &LimitsConfig,
 ) -> TaskOutcome {
+    run_task_in(
+        worktree.clone(),
+        loc,
+        generation,
+        task,
+        limits,
+        test_slot(&worktree),
+        secs_to_timeout(limits.test_timeout_secs),
+    )
+}
+
+pub fn run_job(
+    worktree: PathBuf,
+    loc: &GitLoc,
+    generation: u64,
+    task: TestTask,
+    limits: &LimitsConfig,
+) -> TaskOutcome {
+    let slot = job_slot(&worktree, &task.name);
+    run_task_in(
+        worktree,
+        loc,
+        generation,
+        task,
+        limits,
+        slot,
+        secs_to_timeout(limits.test_timeout_secs),
+    )
+}
+
+pub(crate) fn job_outcome_is_stale(
+    latest_generation: Option<u64>,
+    outcome_generation: u64,
+) -> bool {
+    latest_generation.is_some_and(|latest| outcome_generation < latest)
+}
+
+fn run_task_in(
+    worktree: PathBuf,
+    loc: &GitLoc,
+    generation: u64,
+    task: TestTask,
+    limits: &LimitsConfig,
+    slot: String,
+    timeout: Option<Duration>,
+) -> TaskOutcome {
     let started = Instant::now();
-    let slot = format!("{}:run", worktree.display());
     let out = run_capped(
         &task.command,
         loc,
@@ -725,7 +846,7 @@ pub fn run_task(
         limits,
         &slot,
         generation,
-        secs_to_timeout(limits.test_timeout_secs),
+        timeout,
     );
     let stdout_stderr = if out.timed_out {
         format!(
@@ -1249,6 +1370,13 @@ pub fn dap_launch_descriptor(task: &TestTask, target_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn private_temp_dir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("thegn-task-runner-")
+            .tempdir()
+            .unwrap()
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("tg-task-{name}-{}", std::process::id()));
@@ -1832,12 +1960,186 @@ mod tests {
         assert!(!out.timed_out, "this run was cancelled, not timed out");
     }
 
+    #[test]
+    fn jobs_have_independent_slots_and_tests_never_kill_a_job() {
+        let _dir = private_temp_dir();
+        let wt = _dir.path().to_path_buf();
+        let slow_slot = job_slot(&wt, "slow");
+        let other_slot = job_slot(&wt, "other");
+        let wt_thread = wt.clone();
+        let slow = std::thread::spawn(move || {
+            run_job(
+                wt_thread.clone(),
+                &GitLoc::Local(wt_thread),
+                1,
+                TestTask::new("slow", "sleep 30", "generic"),
+                &uncapped(),
+            )
+        });
+        let wt_thread = wt.clone();
+        let other = std::thread::spawn(move || {
+            run_job(
+                wt_thread.clone(),
+                &GitLoc::Local(wt_thread),
+                4,
+                TestTask::new("other", "sleep 30", "generic"),
+                &uncapped(),
+            )
+        });
+        let mut waited = 0;
+        while {
+            let map = registry().lock().unwrap();
+            map.get(&slow_slot).is_none() || map.get(&other_slot).is_none()
+        } && waited < 100
+        {
+            std::thread::sleep(Duration::from_millis(20));
+            waited += 1;
+        }
+        let both_registered = {
+            let map = registry().lock().unwrap();
+            map.contains_key(&slow_slot) && map.contains_key(&other_slot)
+        };
+        let fast = run_job(
+            wt.clone(),
+            &GitLoc::Local(wt.clone()),
+            2,
+            TestTask::new("fast", "true", "generic"),
+            &uncapped(),
+        );
+        assert_eq!(fast.exit_code, Some(0));
+        let test = run_task(
+            wt.clone(),
+            &GitLoc::Local(wt.clone()),
+            3,
+            TestTask::new("unit", "true", "generic"),
+            &uncapped(),
+        );
+        assert_eq!(test.exit_code, Some(0));
+        let both_survived_starts = {
+            let map = registry().lock().unwrap();
+            map.contains_key(&slow_slot) && map.contains_key(&other_slot)
+        };
+        cancel_job(&wt, "slow");
+        let started = Instant::now();
+        while !slow.is_finished() && started.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let slow_finished = slow.is_finished();
+        let slow_outcome = slow.join().unwrap();
+        let other_remained_after_stopping_slow =
+            registry().lock().unwrap().contains_key(&other_slot);
+        cancel_job(&wt, "other");
+        let started = Instant::now();
+        while !other.is_finished() && started.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let other_finished = other.is_finished();
+        let other_outcome = other.join().unwrap();
+        assert!(both_registered, "both jobs should occupy separate slots");
+        assert!(
+            both_survived_starts,
+            "tests and other jobs leave slow running"
+        );
+        assert!(slow_finished, "cancelled job should finish promptly");
+        assert!(
+            other_remained_after_stopping_slow,
+            "stopping slow leaves other running"
+        );
+        assert!(
+            other_finished,
+            "the second job should finish after its own cancellation"
+        );
+        assert_ne!(slow_outcome.exit_code, Some(0));
+        assert_ne!(other_outcome.exit_code, Some(0));
+    }
+
+    #[test]
+    fn slot_active_counts_tests_discovery_and_jobs_only_for_this_worktree() {
+        let _dir = private_temp_dir();
+        let wt = _dir.path().join("wt");
+        let sibling = PathBuf::from(format!("{}c", wt.display()));
+        let key = job_slot(&wt, "x");
+        registry().lock().unwrap().insert(
+            key.clone(),
+            (1, crate::platform::GroupHandle::from_pid(4242)),
+        );
+        assert!(slot_active(&wt));
+        registry().lock().unwrap().remove(&key);
+        let sibling_key = job_slot(&sibling, "x");
+        registry().lock().unwrap().insert(
+            sibling_key.clone(),
+            (1, crate::platform::GroupHandle::from_pid(4242)),
+        );
+        assert!(!slot_active(&wt));
+        registry().lock().unwrap().remove(&sibling_key);
+        let key = format!("{}:disc", wt.display());
+        registry().lock().unwrap().insert(
+            key.clone(),
+            (1, crate::platform::GroupHandle::from_pid(4242)),
+        );
+        assert!(slot_active(&wt));
+        registry().lock().unwrap().remove(&key);
+        let key = test_slot(&wt);
+        registry().lock().unwrap().insert(
+            key.clone(),
+            (1, crate::platform::GroupHandle::from_pid(4242)),
+        );
+        assert!(slot_active(&wt));
+        assert!(!slot_active(&sibling));
+        registry().lock().unwrap().remove(&key);
+    }
+
+    #[test]
+    fn restart_arm_needs_two_presses_on_the_same_task_within_the_window() {
+        let t0 = Instant::now();
+        let mut arm = RestartArm::default();
+        assert!(!arm.confirm("a", t0));
+        assert!(arm.confirm("a", t0 + Duration::from_secs(1)));
+        assert!(!arm.confirm("a", t0 + Duration::from_secs(2)));
+        assert!(!arm.confirm("b", t0 + Duration::from_secs(3)));
+        assert!(!arm.confirm("a", t0 + Duration::from_secs(4)));
+        assert!(!arm.confirm("a", t0 + Duration::from_secs(8)));
+    }
+
+    #[test]
+    fn older_job_outcome_is_stale_after_restart() {
+        assert!(job_outcome_is_stale(Some(2), 1));
+        assert!(!job_outcome_is_stale(Some(2), 2));
+        assert!(!job_outcome_is_stale(None, 1));
+    }
+
+    #[test]
+    fn panicking_test_worker_produces_a_failure_outcome() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let join_error = runtime.block_on(async {
+            tokio::spawn(async { panic!("worker panic") })
+                .await
+                .unwrap_err()
+        });
+        let outcome = failed_test_run_outcome(
+            PathBuf::from("/wt/a"),
+            4,
+            TestTask::new("unit", "cargo test", "cargo-test"),
+            join_error,
+        );
+        assert_eq!(outcome.exit_code, None);
+        assert_eq!(outcome.duration_ms, 0);
+        assert!(!outcome.truncated);
+        assert!(
+            outcome
+                .stdout_stderr
+                .starts_with("test run did not complete:")
+        );
+    }
+
     /// The watchdog kills a run that overruns its deadline and flags it as a
     /// timeout — the no-hang-forever guarantee.
     #[test]
     fn run_capped_timeout_kills_and_flags() {
         let wt = temp_dir("timeout");
-        let slot = format!("{}:run", wt.display());
+        let slot = test_slot(&wt);
         let start = Instant::now();
         let out = run_capped(
             "sleep 30",
@@ -1854,6 +2156,26 @@ mod tests {
         );
         assert!(out.timed_out, "the deadline should mark the run timed out");
         let _ = std::fs::remove_dir_all(wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn jobs_inherit_the_test_timeout_limit() {
+        let dir = private_temp_dir();
+        let wt = dir.path().to_path_buf();
+        let limits = LimitsConfig {
+            test_timeout_secs: 1,
+            ..uncapped()
+        };
+        let outcome = run_job(
+            wt.clone(),
+            &GitLoc::Local(wt),
+            1,
+            TestTask::new("slow", "sleep 2", "generic"),
+            &limits,
+        );
+
+        assert_eq!(outcome.exit_code, Some(124));
+        assert!(outcome.stdout_stderr.starts_with("test run exceeded 1s"));
     }
 
     /// Metadata-based cargo discovery parses targets without compiling.
@@ -2594,12 +2916,12 @@ mod discovery_tests {
     fn slot_active_reflects_registry() {
         let wt = temp_dir2("slot");
         assert!(!slot_active(&wt), "no slot registered yet");
-        let slot = format!("{}:run", wt.display());
+        let slot = test_slot(&wt);
         registry().lock().unwrap().insert(
             slot.clone(),
             (1, crate::platform::GroupHandle::from_pid(4242)),
         );
-        assert!(slot_active(&wt), "active while a run slot is registered");
+        assert!(slot_active(&wt), "active while a test slot is registered");
         registry().lock().unwrap().remove(&slot);
         assert!(!slot_active(&wt), "inactive after the slot clears");
         let _ = std::fs::remove_dir_all(wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller

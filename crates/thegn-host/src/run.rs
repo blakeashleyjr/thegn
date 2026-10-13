@@ -402,11 +402,9 @@ fn kick_git_docs_fetch(
         let now = thegn_core::util::now();
         let epochs = git.commit_times(&loc, WEEKS).unwrap_or_default();
         let data = GitDocs {
-            heat: thegn_core::gitviz::heat_grid(&epochs, now, WEEKS),
             weekly: thegn_core::gitviz::weekly_counts(&epochs, now, WEEKS),
             log: git.log_graph(&loc, 40).unwrap_or_default(),
             total: epochs.len() as u32,
-            head_branch: git.current_branch(&loc).unwrap_or_default(),
         };
         if tx.send((generation, DocsPayload::Git(data))).is_ok() {
             let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
@@ -1732,26 +1730,26 @@ fn panel_geom(chrome: &layout::ChromeLayout) -> (usize, usize) {
         .unwrap_or((layout::PANEL_COLS, 40))
 }
 
-/// The accordion immediately after `from` in the live order (no wrap) — the
-/// cursor flows into it when Down is pressed at the bottom of `from`. Every
-/// accordion is visited, including those with no actionable rows (you land on
-/// the header and the next Down flows onward). None at the last accordion.
+/// The next accordion in the active tab (no wrap) — the cursor flows into it
+/// when Down is pressed at the bottom of `from`. None at the tab's last accordion.
 fn next_section_in_order(
     from: crate::panel::Section,
     ui: &crate::panel::PanelUi,
 ) -> Option<crate::panel::Section> {
-    let idx = ui.order.iter().position(|&s| s == from)?;
-    ui.order.get(idx + 1).copied()
+    let sections = ui.tab_sections();
+    let idx = sections.iter().position(|&s| s == from)?;
+    sections.get(idx + 1).copied()
 }
 
-/// The accordion immediately before `from` in the live order (no wrap); the
-/// cursor flows into its LAST item when Up is pressed at the top of `from`.
+/// The previous accordion in the active tab (no wrap); Up flows into its LAST
+/// item when pressed at the top of `from`.
 fn prev_section_in_order(
     from: crate::panel::Section,
     ui: &crate::panel::PanelUi,
 ) -> Option<crate::panel::Section> {
-    let idx = ui.order.iter().position(|&s| s == from)?;
-    idx.checked_sub(1).and_then(|i| ui.order.get(i).copied())
+    let sections = ui.tab_sections();
+    let idx = sections.iter().position(|&s| s == from)?;
+    idx.checked_sub(1).and_then(|i| sections.get(i).copied())
 }
 
 /// A worktree group's working directory, falling back to the process cwd.
@@ -2586,7 +2584,8 @@ fn open_panel_section(
     // detail view `git.focus` last held (e.g. Staging) — Enter on a commit
     // then ran the staging-line action and looked like a no-op.
     if let Some(view) = s.home_view() {
-        panel_ui.git.focus = view;
+        panel_ui.git.retarget(view);
+        panel_ui.git.widened_from = None;
     }
     // Land at the top of the new section's items (row_mode tracks panel focus,
     // not the section, so a focused panel keeps walking rows across switches).
@@ -2660,6 +2659,13 @@ fn cycle_panel_width(
     } else {
         panel_ui.width.cycle()
     };
+    panel_ui.git.widened_from = None;
+    if let Some(home) = panel_ui.open.home_view()
+        && panel_ui.width == crate::layout::PanelWidth::Normal
+        && gitui::GitUi::is_drill(panel_ui.git.focus)
+    {
+        panel_ui.git.retarget(home);
+    }
     panel_ui.remember_width();
     panel_ui.scroll = 0;
     persist_panel_state(panel_ui);
@@ -2926,6 +2932,11 @@ enum GitDoc {
     /// A paused rebase's live state, preserving read errors; `Ok(None)` means
     /// the pause vanished before the read landed.
     Rebase(std::result::Result<Option<thegn_svc::git::RebaseStatus>, String>),
+    /// A selected-commit interactive rebase plan, keyed by its base.
+    RebasePlan {
+        base: String,
+        result: std::result::Result<Vec<thegn_core::rebase_todo::TodoEntry>, String>,
+    },
     /// `git blame --porcelain` output parsed into per-line rows.
     Blame(Vec<crate::panel::BlameRow>),
     /// The selected stash's patch (`stash show -p -u`), keyed by index.
@@ -3115,6 +3126,34 @@ fn spawn_rebase_status_fetch(
             .map_err(|error| error.to_string());
         if tx.send((generation, GitDoc::Rebase(status))).is_ok() {
             let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        }
+    });
+}
+
+/// Plan an interactive rebase from the selected commit off the UI loop.
+fn spawn_rebase_plan_fetch(
+    generation: u64,
+    session: &crate::session::Session,
+    oldest: String,
+    base: String,
+    tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
+    waker: &TerminalWaker,
+) {
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        use thegn_svc::git::RebaseOps;
+        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+        let result = thegn_svc::git::CliGit
+            .rebase_todo_for(&loc, &oldest)
+            .map_err(|error| error.to_string());
+        if tx
+            .send((generation, GitDoc::RebasePlan { base, result }))
+            .is_ok()
+            && let Err(error) = wk.wake()
+        {
+            tracing::debug!(target: "thegn::git", %error, "could not wake loop for rebase plan");
         }
     });
 }
@@ -3810,7 +3849,7 @@ fn handle_git_msg(
                     let pane = s.pane;
                     panel_ui.git.stage_doc = None;
                     panel_ui.git.staging = Some(s);
-                    panel_ui.git.focus = GitView::Staging;
+                    panel_ui.git.drill(GitView::Staging);
                     spawn_stage_doc_fetch(
                         panel_ui.git.op_gen,
                         wires.session,
@@ -3823,11 +3862,25 @@ fn handle_git_msg(
             }
             GitView::Commits => {
                 if let Some(c) = sel_commit(panel_ui, model) {
+                    if let Some(marked) = panel_ui.git.patch_conflicts_with(&c.sha) {
+                        if marked > 0 {
+                            let commit = match &panel_ui.git.flow {
+                                GitFlow::Patch(p) => p.commit.chars().take(7).collect::<String>(),
+                                _ => String::new(),
+                            };
+                            model.status = format!(
+                                "custom patch on {commit} has {marked} marked line(s): C-p to apply or discard it first"
+                            );
+                            return GitAfter::None;
+                        }
+                        panel_ui.git.flow = GitFlow::None;
+                        panel_ui.git.patch_docs.clear();
+                    }
                     panel_ui.git.drilled_commit = Some(c.sha.clone());
                     panel_ui.git.commit_files.clear();
                     panel_ui.git.cur.commit_files = 0;
                     panel_ui.cursor = 0;
-                    panel_ui.git.focus = GitView::CommitFiles;
+                    panel_ui.git.drill(GitView::CommitFiles);
                     spawn_commit_files_fetch(
                         panel_ui.git.op_gen,
                         wires.session,
@@ -3844,6 +3897,20 @@ fn handle_git_msg(
                     .get(panel_ui.git.cur.commit_files)
                     .map(|(p, _, _)| p.clone());
                 if let (Some(path), Some(sha)) = (file, panel_ui.git.drilled_commit.clone()) {
+                    if let Some(marked) = panel_ui.git.patch_conflicts_with(&sha) {
+                        if marked > 0 {
+                            let commit = match &panel_ui.git.flow {
+                                GitFlow::Patch(p) => p.commit.chars().take(7).collect::<String>(),
+                                _ => String::new(),
+                            };
+                            model.status = format!(
+                                "custom patch on {commit} has {marked} marked line(s): C-p to apply or discard it first"
+                            );
+                            return GitAfter::None;
+                        }
+                        panel_ui.git.flow = GitFlow::None;
+                        panel_ui.git.patch_docs.clear();
+                    }
                     match &mut panel_ui.git.flow {
                         GitFlow::Patch(p) => p.path = path.clone(),
                         f => {
@@ -3856,7 +3923,7 @@ fn handle_git_msg(
                     }
                     panel_ui.git.patch_doc = None;
                     panel_ui.git.staging = Some(gitui::StagingUi::new(&path));
-                    panel_ui.git.focus = GitView::PatchBuilding;
+                    panel_ui.git.drill(GitView::PatchBuilding);
                     spawn_patch_doc_fetch(
                         panel_ui.git.op_gen,
                         wires.session,
@@ -3877,7 +3944,7 @@ fn handle_git_msg(
                 if let Some(r) = row {
                     panel_ui.git.drilled_commit = Some(r.sha.clone());
                     panel_ui.git.commit_files.clear();
-                    panel_ui.git.focus = GitView::CommitFiles;
+                    panel_ui.git.drill(GitView::CommitFiles);
                     spawn_commit_files_fetch(
                         panel_ui.git.op_gen,
                         wires.session,
@@ -3929,7 +3996,7 @@ fn handle_git_msg(
                 panel_ui.git.blame_rows.clear();
                 panel_ui.git.blame_cursor = 0;
                 panel_ui.git.blame_scroll = 0;
-                panel_ui.git.focus = GitView::Blame;
+                panel_ui.git.drill(GitView::Blame);
                 spawn_blame_fetch(
                     panel_ui.git.op_gen,
                     wires.session,
@@ -3951,39 +4018,7 @@ fn handle_git_msg(
             } else if git.sel_anchor.is_some() {
                 git.sel_anchor = None;
             } else {
-                match git.focus {
-                    GitView::Staging => {
-                        git.staging = None;
-                        git.stage_doc = None;
-                        git.focus = panel_ui.open.home_view().unwrap_or(GitView::Files);
-                    }
-                    GitView::PatchBuilding => {
-                        git.staging = None;
-                        git.focus = GitView::CommitFiles;
-                    }
-                    GitView::CommitFiles => {
-                        git.drilled_commit = None;
-                        git.commit_files.clear();
-                        git.focus = GitView::Commits;
-                    }
-                    GitView::RebaseTodo => {
-                        if !matches!(&git.flow, GitFlow::Rebase(r) if r.running) {
-                            git.flow = GitFlow::None;
-                        }
-                        git.focus = GitView::Commits;
-                    }
-                    GitView::Blame => {
-                        git.blame_rows.clear();
-                        git.blame_path = None;
-                        // Return to whichever view launched blame.
-                        git.focus = if git.drilled_commit.is_some() {
-                            GitView::CommitFiles
-                        } else {
-                            panel_ui.open.home_view().unwrap_or(GitView::Files)
-                        };
-                    }
-                    _ => {}
-                }
+                git.back(panel_ui.open.home_view().unwrap_or(GitView::Files));
             }
         }
         // ---- staging / patch building ------------------------------------
@@ -4245,12 +4280,23 @@ fn handle_git_msg(
         GitMsg::Squash | GitMsg::Fixup => {
             if let Some((oldest, targets)) = gitui::commit_selection(&panel_ui.git, &model.panel) {
                 panel_ui.git.sel_anchor = None;
-                let op = if msg == GitMsg::Squash {
-                    GitOp::Squash { oldest, targets }
+                if msg == GitMsg::Squash {
+                    confirm_git_op(
+                        ov,
+                        "squash?",
+                        format!("folds {} commit(s) into the commit below", targets.len()),
+                        true,
+                        GitOp::Squash { oldest, targets },
+                    );
                 } else {
-                    GitOp::Fixup { oldest, targets }
-                };
-                enqueue(panel_ui, model, op);
+                    confirm_git_op(
+                        ov,
+                        "fixup?",
+                        format!("folds {} commit(s) into the commit below", targets.len()),
+                        true,
+                        GitOp::Fixup { oldest, targets },
+                    );
+                }
             }
         }
         GitMsg::Drop => {
@@ -4353,15 +4399,32 @@ fn handle_git_msg(
             // it rather than clobbering the live flow with a fresh plan.
             if matches!(&panel_ui.git.flow, GitFlow::Rebase(r) if r.running) {
                 panel_ui.git.focus = GitView::RebaseTodo;
-            } else if let Some((base, todos)) = gitui::todo_from_commits(&model.panel.commits) {
-                panel_ui.git.flow = GitFlow::Rebase(gitui::RebaseUi {
-                    base,
-                    todos,
-                    ..Default::default()
-                });
-                panel_ui.git.focus = GitView::RebaseTodo;
+            } else if let Some((oldest, _)) = gitui::commit_selection(&panel_ui.git, &model.panel) {
+                if let Some(commit) = model
+                    .panel
+                    .commits
+                    .iter()
+                    .find(|commit| commit.sha == oldest)
+                {
+                    let base = if commit.parents.is_empty() {
+                        "--root".to_string()
+                    } else {
+                        format!("{}^", commit.sha)
+                    };
+                    spawn_rebase_plan_fetch(
+                        panel_ui.git.op_gen,
+                        wires.session,
+                        oldest,
+                        base,
+                        wires.doc_tx,
+                        wires.waker,
+                    );
+                    model.status = "planning interactive rebase…".into();
+                } else {
+                    model.status = "no commit selected".into();
+                }
             } else {
-                model.status = "no commits loaded".into();
+                model.status = "no commit selected".into();
             }
         }
         GitMsg::ConfirmRebase => {
@@ -4761,9 +4824,18 @@ fn dispatch_menu_choice(
             }
         }
         MenuChoice::PatchReset => {
-            if let GitFlow::Patch(p) = &mut panel_ui.git.flow {
-                p.marks.clear();
-                model.status = "patch reset".into();
+            if matches!(panel_ui.git.flow, GitFlow::Patch(_)) {
+                panel_ui.git.flow = GitFlow::None;
+                panel_ui.git.patch_docs.clear();
+                if panel_ui.git.focus == GitView::PatchBuilding
+                    && let Some(home) = panel_ui.open.home_view()
+                {
+                    panel_ui.git.back(home);
+                }
+                if let Some(width) = panel_ui.git.retract_width() {
+                    panel_ui.width = width;
+                }
+                model.status = "patch discarded".into();
             }
         }
         MenuChoice::DiffExit => {
@@ -5219,17 +5291,30 @@ fn spawn_test_run_task(
 ) {
     tokio::spawn(async move {
         let _permit = sem.acquire_owned().await;
-        if let Ok(outcome) = tokio::task::spawn_blocking(move || {
+        let outcome_worktree = worktree.clone();
+        let outcome_task = task_spec.clone();
+        let result = tokio::task::spawn_blocking(move || {
             // Resolve the worktree's location off-loop so a remote/provider
             // worktree runs its tests in the env (via the bridge/control
             // transport), not on the host. Local worktrees are unchanged.
             let loc = thegn_core::remote::GitLoc::for_worktree(&worktree);
             crate::task::run_task(worktree, &loc, generation, task_spec, &limits)
         })
-        .await
-        {
-            let _ = tx.send(outcome); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        .await;
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => crate::task::failed_test_run_outcome(
+                outcome_worktree,
+                generation,
+                outcome_task,
+                error,
+            ),
+        };
+        if let Err(error) = tx.send(outcome) {
+            tracing::debug!(target: "thegn::tests", %error, "test run outcome receiver is gone");
+        }
+        if let Err(error) = waker.wake() {
+            tracing::debug!(target: "thegn::tests", %error, "test run outcome wake failed");
         }
     });
 }
@@ -5247,14 +5332,27 @@ fn spawn_test_discovery(
 ) {
     tokio::spawn(async move {
         let _permit = sem.acquire_owned().await;
-        if let Ok(result) = tokio::task::spawn_blocking(move || {
+        let outcome_worktree = worktree.clone();
+        let outcome_task = task_spec.clone();
+        let result = tokio::task::spawn_blocking(move || {
             let loc = thegn_core::remote::GitLoc::for_worktree(&worktree);
             crate::task::discover_tests(worktree, &loc, generation, task_spec, &limits)
         })
-        .await
-        {
-            let _ = tx.send(result); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        .await;
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => crate::task::failed_test_discovery_outcome(
+                outcome_worktree,
+                generation,
+                outcome_task,
+                error,
+            ),
+        };
+        if let Err(error) = tx.send(outcome) {
+            tracing::debug!(target: "thegn::tests", %error, "test discovery outcome receiver is gone");
+        }
+        if let Err(error) = waker.wake() {
+            tracing::debug!(target: "thegn::tests", %error, "test discovery outcome wake failed");
         }
     });
 }
@@ -5263,21 +5361,22 @@ fn spawn_test_discovery(
 /// Reading only — never spawns a run (no auto-run).
 /// Load cached test state; `detect` runs the `detect_test_task` FS scan only when
 /// needed (D2: the per-switch caller passes `false` to keep that scan off the loop).
+struct TestCacheWiring<'a> {
+    tx: &'a tokio_mpsc::UnboundedSender<(String, u64, Option<crate::panel::TestCache>)>,
+    waker: &'a TerminalWaker,
+}
+
 fn sync_tests_for_worktree(
     ui: &mut crate::panel::PanelUi,
     worktree: &std::path::Path,
     cfg: &thegn_core::config::Config,
     detect: bool,
     cache_load: &mut run_test_cache::TestCacheLoad,
+    wiring: TestCacheWiring<'_>,
 ) {
     let key = worktree.to_string_lossy();
-    if cache_load.begin_sync(&key)
-        && let Ok(db) = thegn_core::db::Db::open()
-    {
-        if let Some(cache) = run_test_cache::load_test_cache(&db, &key) {
-            ui.tests.apply_cache(cache);
-        }
-        cache_load.finish_sync(&key);
+    if cache_load.begin_sync(&key) {
+        run_test_cache::spawn_test_cache_load(cache_load, &key, wiring.tx, wiring.waker);
     }
     if detect && ui.tests.task.is_none() {
         ui.tests.task = crate::task::detect_test_task(worktree, cfg);
@@ -6734,6 +6833,9 @@ async fn event_loop<T: Terminal>(
     // Named task (Tasks section) run outcomes — separate from the test runner.
     let (named_task_run_tx, mut named_task_run_rx) =
         tokio_mpsc::unbounded_channel::<crate::task::TaskOutcome>();
+    let (job_output_tx, mut job_output_rx) =
+        tokio_mpsc::unbounded_channel::<std::result::Result<PathBuf, String>>();
+    let mut restart_arm = crate::task::RestartArm::default();
     // Off-loop worktree-rename completions (audit run.rs:12131/12147): the git
     // subprocesses + dir move run on spawn_blocking and land here to re-key the
     // session group by identity.
@@ -6757,14 +6859,23 @@ async fn event_loop<T: Terminal>(
     let (workspace_clone_tx, mut workspace_clone_rx) =
         tokio_mpsc::unbounded_channel::<crate::workspace_create::CloneEvent>();
     let mut test_generation: u64 = 0;
+    let mut test_discovery_generation: u64 = 0;
     // Monotonic generation for named-task (Jobs section) runs (audit
     // run.rs:14462): a superseded run's cleanup only deregisters the slot when
     // it still owns the generation, so each new run MUST bump this — otherwise a
     // killed run's `wait()` wakeup deregisters the LIVE run's process group and
     // Stop ('s') silently no-ops.
     let mut named_task_generation: u64 = 0;
-    let mut loaded_tests_worktree = String::new();
+    let mut latest_job_generation: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    let mut loaded_tests_worktree = active_tab_path(&session).to_string_lossy().into_owned();
     let mut test_cache_load = run_test_cache::TestCacheLoad::default();
+    run_test_cache::spawn_test_cache_load(
+        &mut test_cache_load,
+        &loaded_tests_worktree,
+        &test_cache_tx,
+        &waker,
+    );
     let mut deferred_test_discoveries = Vec::new();
     let mut deferred_test_runs = Vec::new();
     // Bounds concurrent test/discovery jobs across worktrees so explicit runs
@@ -8809,19 +8920,12 @@ async fn event_loop<T: Terminal>(
             // Tests tab shows it instantly; discovery stays lazy (on tab open).
             panel_ui.tests = crate::panel::TestPanelState::default();
             loaded_tests_worktree = current_worktree.to_string_lossy().into_owned();
-            let cache_seq = test_cache_load.begin_switch(&loaded_tests_worktree);
-            let cache_worktree = loaded_tests_worktree.clone();
-            let cache_tx = test_cache_tx.clone();
-            let cache_waker = waker.clone();
-            crate::db_task::persist(move |db| {
-                let cache = run_test_cache::load_test_cache(db, &cache_worktree);
-                if let Err(error) = cache_tx.send((cache_worktree, cache_seq, cache)) {
-                    tracing::debug!(target: "thegn::db", %error, "test cache load receiver is gone");
-                }
-                if let Err(error) = cache_waker.wake() {
-                    tracing::debug!(target: "thegn::db", %error, "test cache load wake failed");
-                }
-            });
+            run_test_cache::spawn_test_cache_load(
+                &mut test_cache_load,
+                &loaded_tests_worktree,
+                &test_cache_tx,
+                &waker,
+            );
             // Immediate hydrate for the newly-focused worktree. Paint this
             // worktree's last-known slice (panel + tab-bar chips + timeline)
             // from the cache (seeded by prior visits and neighbor prefetch) so
@@ -8888,7 +8992,10 @@ async fn event_loop<T: Terminal>(
             // Git interaction state is per-worktree: cursors, flows, marks
             // and fetched docs all reset; `op_gen` bumps so in-flight op/doc
             // results die on arrival. Overlays target the old worktree.
-            panel_ui.git.reset_for_worktree();
+            if let Some(width) = panel_ui.git.widened_from.take() {
+                panel_ui.width = width;
+            }
+            panel_ui.git.reset_for_worktree(panel_ui.open.home_view());
             // The accordion cursor is per-worktree too: leaving it where the
             // OLD worktree's list had it highlighted the new worktree's Nth
             // row while the (freshly-zeroed) git cursor acted on row 0.
@@ -9614,7 +9721,8 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
         }
-        let ready_discoveries = if test_cache_load.is_pending(&loaded_tests_worktree) {
+        let active_tests_wt = active_tab_path(&session).to_string_lossy().into_owned();
+        let ready_discoveries = if test_cache_load.is_pending(&active_tests_wt) {
             Vec::new()
         } else {
             std::mem::take(&mut deferred_test_discoveries)
@@ -9624,21 +9732,33 @@ async fn event_loop<T: Terminal>(
             .chain(std::iter::from_fn(|| test_discovery_rx.try_recv().ok()))
         {
             loop_perf.tick(crate::perf::WakeSource::Other);
-            if d.generation == test_generation && d.worktree == loaded_tests_worktree {
-                if test_cache_load.is_pending(&d.worktree) {
-                    deferred_test_discoveries.push(d);
-                    continue;
+            match run_test_cache::outcome_disposition(
+                &d.worktree,
+                d.generation,
+                &active_tests_wt,
+                test_discovery_generation,
+                test_cache_load.is_pending(&active_tests_wt),
+            ) {
+                run_test_cache::OutcomeDisposition::Apply => {
+                    panel_ui.tests.discovering = false;
+                    panel_ui.tests.task = Some(d.task);
+                    if let Some(err) = d.error {
+                        panel_ui.tests.summary.error = Some(err);
+                    } else {
+                        panel_ui.tests.merge_discovered(&d.nodes);
+                        panel_ui.tests.summary.error = None;
+                    }
+                    persist_tests_for_worktree(&panel_ui, &d.worktree);
+                    dirty = true;
                 }
-                panel_ui.tests.discovering = false;
-                panel_ui.tests.task = Some(d.task);
-                if let Some(err) = d.error {
-                    panel_ui.tests.summary.error = Some(err);
-                } else {
-                    panel_ui.tests.merge_discovered(&d.nodes);
-                    panel_ui.tests.summary.error = None;
+                run_test_cache::OutcomeDisposition::Defer => deferred_test_discoveries.push(d),
+                disposition => {
+                    tracing::debug!(target: "thegn::tests", reason = ?disposition, worktree = %d.worktree, generation = d.generation, "dropped test outcome");
+                    if d.worktree == active_tests_wt && disposition.clears_active_latch() {
+                        panel_ui.tests.discovering = false;
+                        dirty = true;
+                    }
                 }
-                persist_tests_for_worktree(&panel_ui, &d.worktree);
-                dirty = true;
             }
         }
         // Background test-locate results (Tests `o`/`b`): complete the open
@@ -9698,15 +9818,22 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
         // Named task (Tasks section) run outcomes.
-        let active_task_wt = active_tab_path(&session).to_string_lossy().into_owned();
+        let active_task_wt = active_tests_wt.as_str();
         while let Ok(outcome) = named_task_run_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Other);
+            if crate::task::job_outcome_is_stale(
+                latest_job_generation.get(&outcome.task.name).copied(),
+                outcome.generation,
+            ) {
+                tracing::debug!(target: "thegn::tasks", task = %outcome.task.name, generation = outcome.generation, latest = ?latest_job_generation.get(&outcome.task.name), "dropped stale job outcome");
+                continue;
+            }
             // Gate on the outcome's worktree (audit run.rs:8081): a task that
             // finishes AFTER the user switched worktrees must not inject its
             // (worktree-A-relative) diagnostics + run record into worktree B's
             // panel. The sibling test-runner drain gates the same way. Drop the
             // mismatch — its state is per-worktree and re-derived on return.
-            if !active_task_wt.is_empty() && outcome.worktree != active_task_wt {
+            if !active_task_wt.is_empty() && outcome.worktree.as_str() != active_task_wt {
                 continue;
             }
             let elapsed_s = outcome.duration_ms as f64 / 1000.0;
@@ -9756,6 +9883,34 @@ async fn event_loop<T: Terminal>(
                     });
                 }
                 model.panel.diagnostics.sort_by_key(|d| d.severity as u8);
+            }
+            dirty = true;
+        }
+        while let Ok(result) = job_output_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            match result {
+                Ok(path) => {
+                    let bat = keymap
+                        .config()
+                        .tool_command("bat")
+                        .unwrap_or("bat --paging=always")
+                        .to_string();
+                    let cmd = format!("{bat} {}", test_shell_quote(&path.to_string_lossy()));
+                    let cwd = active_cwd(&session);
+                    open_command_pane(
+                        &mut session,
+                        &mut panes,
+                        focused,
+                        &cmd,
+                        cwd.as_deref(),
+                        chrome.center,
+                    );
+                    focus.zone = crate::focus::Zone::Center;
+                    refresh_tab_model(&mut model, &session, &mut sb);
+                    model.status = "Opened task output".into();
+                    need_relayout = true;
+                }
+                Err(error) => model.status = format!("Could not write task output: {error}"),
             }
             dirty = true;
         }
@@ -9845,7 +10000,7 @@ async fn event_loop<T: Terminal>(
         }
         // Run results: the latest run upserts each reported test's status while
         // leaving other tests' most-recent status intact.
-        let ready_runs = if test_cache_load.is_pending(&loaded_tests_worktree) {
+        let ready_runs = if test_cache_load.is_pending(&active_tests_wt) {
             Vec::new()
         } else {
             std::mem::take(&mut deferred_test_runs)
@@ -9855,80 +10010,109 @@ async fn event_loop<T: Terminal>(
             .chain(std::iter::from_fn(|| test_run_rx.try_recv().ok()))
         {
             loop_perf.tick(crate::perf::WakeSource::Other);
-            if outcome.generation == test_generation && outcome.worktree == loaded_tests_worktree {
-                if test_cache_load.is_pending(&outcome.worktree) {
-                    deferred_test_runs.push(outcome);
-                    continue;
-                }
-                panel_ui.tests.running = false;
-                panel_ui.tests.task = Some(outcome.task.clone());
-                panel_ui
-                    .tests
-                    .merge_results(&crate::task::parse_task_outcome(&outcome));
-                if outcome.exit_code != Some(0) && panel_ui.tests.summary.failed == 0 {
-                    panel_ui.tests.summary.failed = 1;
-                }
-                panel_ui.tests.summary.error = outcome
-                    .truncated
-                    .then(|| "output truncated before parsing completed".to_string());
-                panel_ui
-                    .tests
-                    .push_history(crate::testkit::model::TestRunRec {
-                        at: thegn_core::util::now(),
-                        passed: panel_ui.tests.summary.passed,
-                        failed: panel_ui.tests.summary.failed,
-                        skipped: panel_ui.tests.summary.skipped,
-                        duration_ms: outcome.duration_ms as u64,
-                        branch: model.panel.branch.clone(),
-                    });
-                persist_tests_for_worktree(&panel_ui, &outcome.worktree);
-                if outcome.exit_code != Some(0) {
-                    let wt = outcome.worktree.clone();
-                    let failed = panel_ui.tests.summary.failed;
-                    let msg = format!(
-                        "tests: {} failure{}",
-                        failed,
-                        if failed == 1 { "" } else { "s" }
-                    );
-                    // Route the failure: rules / DND / modes decide the desktop
-                    // toast + sound; the inbox record is gated by a drop rule.
-                    let dec = crate::notify::route(&notify_state, "test_failed", &wt, &msg, &wt);
-                    let event = thegn_core::event_bus::Event::TestsFailed {
-                        worktree: wt.clone(),
-                        count: failed,
-                    };
-                    // Surface the failure on the event bus → desktop toast +
-                    // sidebar alert badge (item 28/430).
-                    if dec.desktop {
-                        event_bus.publish_with_notification(&event);
+            match run_test_cache::outcome_disposition(
+                &outcome.worktree,
+                outcome.generation,
+                &active_tests_wt,
+                test_generation,
+                test_cache_load.is_pending(&active_tests_wt),
+            ) {
+                run_test_cache::OutcomeDisposition::Apply => {
+                    panel_ui.tests.running = false;
+                    panel_ui.tests.summary.running = false;
+                    panel_ui.tests.task = Some(outcome.task.clone());
+                    if outcome.exit_code.is_none() {
+                        panel_ui.tests.summary.error = Some(
+                            outcome
+                                .stdout_stderr
+                                .lines()
+                                .next()
+                                .unwrap_or("test run did not complete")
+                                .to_string(),
+                        );
+                        persist_tests_for_worktree(&panel_ui, &outcome.worktree);
+                        model.status = panel_ui.tests.summary.error.clone().unwrap_or_default();
+                        dirty = true;
                     } else {
-                        event_bus.publish(&event);
-                    }
-                    if dec.record {
-                        let routed = dec.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let Ok(db) = thegn_core::db::Db::open() else {
-                                return;
+                        panel_ui
+                            .tests
+                            .merge_results(&crate::task::parse_task_outcome(&outcome));
+                        if outcome.exit_code != Some(0) && panel_ui.tests.summary.failed == 0 {
+                            panel_ui.tests.summary.failed = 1;
+                        }
+                        panel_ui.tests.summary.error = outcome
+                            .truncated
+                            .then(|| "output truncated before parsing completed".to_string());
+                        panel_ui
+                            .tests
+                            .push_history(crate::testkit::model::TestRunRec {
+                                at: thegn_core::util::now(),
+                                passed: panel_ui.tests.summary.passed,
+                                failed: panel_ui.tests.summary.failed,
+                                skipped: panel_ui.tests.summary.skipped,
+                                duration_ms: outcome.duration_ms as u64,
+                                branch: model.panel.branch.clone(),
+                            });
+                        persist_tests_for_worktree(&panel_ui, &outcome.worktree);
+                        if outcome.exit_code != Some(0) {
+                            let wt = outcome.worktree.clone();
+                            let failed = panel_ui.tests.summary.failed;
+                            let msg = format!(
+                                "tests: {} failure{}",
+                                failed,
+                                if failed == 1 { "" } else { "s" }
+                            );
+                            // Route the failure: rules / DND / modes decide the desktop
+                            // toast + sound; the inbox record is gated by a drop rule.
+                            let dec =
+                                crate::notify::route(&notify_state, "test_failed", &wt, &msg, &wt);
+                            let event = thegn_core::event_bus::Event::TestsFailed {
+                                worktree: wt.clone(),
+                                count: failed,
                             };
-                            let _ = crate::automation_events::insert_routed(
-                                &db,
-                                "test_failed",
-                                &wt,
-                                &msg,
-                                &wt,
-                                Default::default(),
-                                &routed,
-                                false,
-                            ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                        });
+                            // Surface the failure on the event bus → desktop toast +
+                            // sidebar alert badge (item 28/430).
+                            if dec.desktop {
+                                event_bus.publish_with_notification(&event);
+                            } else {
+                                event_bus.publish(&event);
+                            }
+                            if dec.record {
+                                let routed = dec.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let Ok(db) = thegn_core::db::Db::open() else {
+                                        return;
+                                    };
+                                    let _ = crate::automation_events::insert_routed(
+                                        &db,
+                                        "test_failed",
+                                        &wt,
+                                        &msg,
+                                        &wt,
+                                        Default::default(),
+                                        &routed,
+                                        false,
+                                    ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                                });
+                            }
+                        }
+                        model.status = format!(
+                            "Tests finished in {:.1}s: {}",
+                            outcome.duration_ms as f64 / 1000.0,
+                            panel_ui.tests.summary.label()
+                        );
+                        dirty = true;
                     }
                 }
-                model.status = format!(
-                    "Tests finished in {:.1}s: {}",
-                    outcome.duration_ms as f64 / 1000.0,
-                    panel_ui.tests.summary.label()
-                );
-                dirty = true;
+                run_test_cache::OutcomeDisposition::Defer => deferred_test_runs.push(outcome),
+                disposition => {
+                    tracing::debug!(target: "thegn::tests", reason = ?disposition, worktree = %outcome.worktree, generation = outcome.generation, "dropped test outcome");
+                    if outcome.worktree == active_tests_wt && disposition.clears_active_latch() {
+                        panel_ui.tests.running = false;
+                        panel_ui.tests.summary.running = false;
+                        dirty = true;
+                    }
+                }
             }
         }
 
@@ -10038,7 +10222,13 @@ async fn event_loop<T: Terminal>(
                             if matches!(panel_ui.git.flow, GitFlow::Rebase(_)) {
                                 panel_ui.git.flow = GitFlow::None;
                                 if panel_ui.git.focus == GitView::RebaseTodo {
-                                    panel_ui.git.focus = GitView::Commits;
+                                    panel_ui.git.back(
+                                        panel_ui.open.home_view().unwrap_or(GitView::Commits),
+                                    );
+                                    if let Some(width) = panel_ui.git.retract_width() {
+                                        panel_ui.width = width;
+                                        need_relayout = true;
+                                    }
                                 }
                             }
                         }
@@ -10050,11 +10240,18 @@ async fn event_loop<T: Terminal>(
                         FlowEnd::Patch => {
                             if matches!(panel_ui.git.flow, GitFlow::Patch(_)) {
                                 panel_ui.git.flow = GitFlow::None;
+                                panel_ui.git.patch_docs.clear();
                                 if matches!(
                                     panel_ui.git.focus,
                                     GitView::PatchBuilding | GitView::CommitFiles
                                 ) {
-                                    panel_ui.git.focus = GitView::Commits;
+                                    panel_ui.git.retarget(
+                                        panel_ui.open.home_view().unwrap_or(GitView::Commits),
+                                    );
+                                    if let Some(width) = panel_ui.git.retract_width() {
+                                        panel_ui.width = width;
+                                        need_relayout = true;
+                                    }
                                 }
                             }
                         }
@@ -10276,6 +10473,26 @@ async fn event_loop<T: Terminal>(
                     rebase_sync_inflight = false;
                     if let Some(error) = apply_rebase_doc(&mut panel_ui.git.flow, status) {
                         model.status = format!("Rebase status unavailable: {error}");
+                    }
+                }
+                GitDoc::RebasePlan { base, result } => {
+                    if !matches!(&panel_ui.git.flow, GitFlow::None) {
+                        tracing::debug!(target: "thegn::git", "dropping rebase plan because another git flow owns the editor");
+                        model.status = "interactive rebase: another git flow is active".into();
+                    } else {
+                        match result {
+                            Ok(todos) => {
+                                panel_ui.git.flow = GitFlow::Rebase(gitui::RebaseUi {
+                                    base,
+                                    todos,
+                                    ..Default::default()
+                                });
+                                panel_ui.git.focus = GitView::RebaseTodo;
+                            }
+                            Err(error) => {
+                                model.status = format!("interactive rebase: {error}");
+                            }
+                        }
                     }
                 }
                 GitDoc::Blame(rows) => {
@@ -13115,6 +13332,12 @@ async fn event_loop<T: Terminal>(
         // the lock and let the rows reflow under a held pointer.
         model.sidebar_drag_lock = sidebar_mouse_ui.layout_lock();
         model.panel_focused = focus.panel();
+        if panel_ui
+            .git
+            .normalize(panel_ui.open.home_view(), panel_ui.width)
+        {
+            dirty = true;
+        }
         model.center_focused = focus.center();
         model.masthead_focused = focus.masthead();
         model.statusbar_focused = focus.statusbar();
@@ -15228,6 +15451,36 @@ async fn event_loop<T: Terminal>(
                             dirty = true;
                             continue;
                         }
+                        let (pc, pr) = panel_geom(&chrome);
+                        if let Some(ext) = crate::panel::sections::scroll_extent(
+                            panel_ui.open,
+                            &model,
+                            &panel_ui,
+                            pc,
+                            pr,
+                        ) && ext.owns_nav
+                            && crate::panel::sections::scroll_moves(ext, up, panel_ui.scroll)
+                        {
+                            let (ticks, leftover) = drain_wheel_ticks(up, || {
+                                pending_input.pop_front().or_else(|| {
+                                    buf.terminal()
+                                        .poll_input(Some(std::time::Duration::ZERO))
+                                        .ok()
+                                        .flatten()
+                                })
+                            });
+                            if let Some(ev) = leftover {
+                                pending_input.push_front(ev);
+                            }
+                            let delta = ticks.saturating_mul(3);
+                            panel_ui.scroll = if up {
+                                panel_ui.scroll.min(ext.max).saturating_sub(delta)
+                            } else {
+                                panel_ui.scroll.saturating_add(delta).min(ext.max)
+                            };
+                            dirty = true;
+                            continue;
+                        }
                         // Row mode walks the open section's rows; section mode
                         // wheels through the accordion itself.
                         if panel_ui.row_mode {
@@ -15661,11 +15914,15 @@ async fn event_loop<T: Terminal>(
                                         keymap.config(),
                                         true,
                                         &mut test_cache_load,
+                                        TestCacheWiring {
+                                            tx: &test_cache_tx,
+                                            waker: &waker,
+                                        },
                                     );
                                     maybe_discover_tests(
                                         &mut panel_ui,
                                         &session,
-                                        &mut test_generation,
+                                        &mut test_discovery_generation,
                                         test_discovery_tx.clone(),
                                         waker.clone(),
                                         keymap.config(),
@@ -17382,6 +17639,16 @@ async fn event_loop<T: Terminal>(
                                 dirty = true;
                                 continue;
                             }
+                            if crate::actions::handle_pr_menu_pick(
+                                &choice,
+                                &session,
+                                &refresh_tx,
+                                &waker,
+                                &mut model,
+                            ) {
+                                dirty = true;
+                                continue;
+                            }
                             // Sandbox-halt/ask modal `[r] retry` / `[h] run on host`.
                             {
                                 let active_wt = active_cwd(&session);
@@ -17439,6 +17706,32 @@ async fn event_loop<T: Terminal>(
                                         confirm_delete: current_config.confirm_delete,
                                     },
                                     targets,
+                                );
+                                dirty = true;
+                                continue;
+                            }
+                            if let menu::MenuChoice::Confirm {
+                                tag: "notifications-clear-all",
+                                ..
+                            } = &choice
+                            {
+                                crate::handlers::attention::mark_all_read(
+                                    &mut model,
+                                    &refresh_tx,
+                                    &waker,
+                                );
+                                hydration_gen += 1;
+                                crate::hydrate::spawn_model_hydration(
+                                    model_tx.clone(),
+                                    hydration_gen,
+                                    session.clone_for_hydrate(),
+                                    Some(waker.clone()),
+                                    crate::hydrate::HydrateHints {
+                                        open: panel_ui.open,
+                                        expanded: panel_ui.width.is_expanded(),
+                                        ..Default::default()
+                                    },
+                                    None,
                                 );
                                 dirty = true;
                                 continue;
@@ -17694,6 +17987,27 @@ async fn event_loop<T: Terminal>(
                                 Some(&host_ui),
                             ) {
                                 model.status = status;
+                                dirty = true;
+                                continue;
+                            }
+                            if let Some(outcome) = crate::handlers::sandbox_panel::resolve_choice(
+                                &choice,
+                                &model.containers,
+                            ) {
+                                match outcome {
+                                    Ok(req) => {
+                                        model.status =
+                                            crate::handlers::sandbox_panel::control_status(&req);
+                                        crate::handlers::sandbox_panel::spawn_control(
+                                            keymap.config().sandbox.clone(),
+                                            active_tab_path(&session),
+                                            req,
+                                            refresh_tx.clone(),
+                                            waker.clone(),
+                                        );
+                                    }
+                                    Err(status) => model.status = status,
+                                }
                                 dirty = true;
                                 continue;
                             }
@@ -19180,6 +19494,67 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                let paging_key = matches!(
+                    k.key,
+                    KeyCode::PageDown
+                        | KeyCode::PageUp
+                        | KeyCode::Home
+                        | KeyCode::End
+                        | KeyCode::Char('d' | 'u' | 'g' | 'G')
+                );
+                if forced_palette_action.is_none()
+                    && focus.panel()
+                    && paging_key
+                    && let Some(ext) = crate::panel::sections::scroll_extent(
+                        panel_ui.open,
+                        &model,
+                        &panel_ui,
+                        panel_geom(&chrome).0,
+                        panel_geom(&chrome).1,
+                    )
+                {
+                    let (cols, rows) = panel_geom(&chrome);
+                    let page =
+                        crate::panel::sections::scroll_viewport(&model, &panel_ui, cols, rows)
+                            .max(1);
+                    if let Some(mut target) = crate::panel::sections::scroll_step(
+                        ext,
+                        &k.key,
+                        k.modifiers,
+                        panel_ui.scroll,
+                        page,
+                    ) {
+                        if matches!(
+                            k.key,
+                            KeyCode::PageDown | KeyCode::PageUp | KeyCode::Char('d' | 'u')
+                        ) {
+                            let (repeat, leftover) = drain_key_repeats(&k, || {
+                                pending_input.pop_front().or_else(|| {
+                                    buf.terminal()
+                                        .poll_input(Some(std::time::Duration::ZERO))
+                                        .ok()
+                                        .flatten()
+                                })
+                            });
+                            if let Some(ev) = leftover {
+                                pending_input.push_front(ev);
+                            }
+                            for _ in 1..repeat {
+                                target = crate::panel::sections::scroll_step(
+                                    ext,
+                                    &k.key,
+                                    k.modifiers,
+                                    target,
+                                    page,
+                                )
+                                .unwrap_or(target);
+                            }
+                        }
+                        panel_ui.scroll = target;
+                        dirty = true;
+                        continue;
+                    }
+                }
                 // Enter on a git-family LIST (commits / branches / stash)
                 // drills into the row at cursor — even before j/k has entered
                 // row-mode (the panel starts in section-nav mode on focus, see
@@ -19200,6 +19575,12 @@ async fn event_loop<T: Terminal>(
                     )
                 {
                     panel_ui.row_mode = true;
+                }
+                if panel_ui
+                    .git
+                    .normalize(panel_ui.open.home_view(), panel_ui.width)
+                {
+                    dirty = true;
                 }
                 // Panel zone, git-family contexts: the table-driven git keys
                 // resolve BEFORE the accordion (space = stage-line in the
@@ -19222,6 +19603,7 @@ async fn event_loop<T: Terminal>(
                     // remembered preference, like a manual `e`.
                     if let GitMsg::WidthBlocked(inner, want) = msg {
                         panel_ui.width = want;
+                        panel_ui.git.widened_from = None;
                         panel_ui.remember_width();
                         panel_ui.scroll = 0;
                         persist_panel_state(&panel_ui);
@@ -19242,7 +19624,8 @@ async fn event_loop<T: Terminal>(
                         confirm_op: &mut pending_confirm_op,
                         custom_cmds: &mut custom_menu_cmds,
                     };
-                    match handle_git_msg(msg, &mut panel_ui, &mut model, &wires, &mut ov) {
+                    let after = handle_git_msg(msg, &mut panel_ui, &mut model, &wires, &mut ov);
+                    match after {
                         GitAfter::None => {}
                         GitAfter::NewWorktree => {
                             forced_palette_action = Some(crate::keymap::Action::NewWorktree);
@@ -19291,6 +19674,13 @@ async fn event_loop<T: Terminal>(
                         )
                     {
                         panel_ui.width = crate::layout::PanelWidth::Half;
+                        if panel_ui.git.widened_from.is_none() {
+                            panel_ui.git.widened_from = Some(crate::layout::PanelWidth::Normal);
+                        }
+                        need_relayout = true;
+                    }
+                    if let Some(width) = panel_ui.git.retract_width() {
+                        panel_ui.width = width;
                         need_relayout = true;
                     }
                     dirty = true;
@@ -19338,11 +19728,15 @@ async fn event_loop<T: Terminal>(
                                     keymap.config(),
                                     true,
                                     &mut test_cache_load,
+                                    TestCacheWiring {
+                                        tx: &test_cache_tx,
+                                        waker: &waker,
+                                    },
                                 );
                                 maybe_discover_tests(
                                     &mut panel_ui,
                                     &session,
-                                    &mut test_generation,
+                                    &mut test_discovery_generation,
                                     test_discovery_tx.clone(),
                                     waker.clone(),
                                     keymap.config(),
@@ -19378,8 +19772,8 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             PanelMsg::CursorDown | PanelMsg::CursorUp => {
-                                // j/k always navigate items; entering row mode
-                                // on the first keypress activates selection highlighting.
+                                // Enter row mode on the first j/k press; hitless
+                                // scroll bodies intercept this route below.
                                 panel_ui.row_mode = true;
                                 // One clamped step per QUEUED key: held-key
                                 // repeats are drained and applied in a single
@@ -19399,48 +19793,39 @@ async fn event_loop<T: Terminal>(
                                     // Front, not back: the leftover precedes whatever is still queued.
                                     pending_input.push_front(ev);
                                 }
-                                // Full-view scroll documents (the git log, the
-                                // cheatsheet): j/k move the viewport, not a row
-                                // cursor. Changes is EXCLUDED — at Full it renders
-                                // the lazygit git frame (a navigable FILES list +
-                                // staging main region), so its arrows drive the
-                                // list cursor / section flow like every other
-                                // git-family list (Commits/Branches/Stash).
-                                // Keys scrolls at BOTH expanded widths — its
-                                // Half view is the same hit-free chip column,
-                                // so without the scroll route `j` at Half left
-                                // the section with the overflow unreachable.
-                                if (panel_ui.width == layout::PanelWidth::Full
-                                    && matches!(panel_ui.open, Section::Pr | Section::Keys))
-                                    || (panel_ui.width == layout::PanelWidth::Half
-                                        && panel_ui.open == Section::Keys)
+                                // Hitless panel bodies own j/k at every supported
+                                // width; Stash detail leaves these keys to its list.
+                                let geom = panel_geom(&chrome);
+                                if let Some(ext) = crate::panel::sections::scroll_extent(
+                                    panel_ui.open,
+                                    &model,
+                                    &panel_ui,
+                                    geom.0,
+                                    geom.1,
+                                ) && ext.owns_nav
+                                    && crate::panel::sections::scroll_moves(
+                                        ext,
+                                        up,
+                                        panel_ui.scroll,
+                                    )
                                 {
-                                    let max = match panel_ui.open {
-                                        Section::Pr => panel_ui
-                                            .docs
-                                            .git
-                                            .as_ref()
-                                            .map(|d| d.log.len().saturating_sub(1))
-                                            .unwrap_or(0),
-                                        // Two balanced columns → height ≈ half
-                                        // the total group lines (clamped again
-                                        // at render).
-                                        _ => {
-                                            let lines: usize = panel_ui
-                                                .docs
-                                                .cfg_keys
-                                                .iter()
-                                                .map(|g| g.rows.len() + 2)
-                                                .sum::<usize>()
-                                                + 8;
-                                            lines.div_ceil(2).saturating_sub(1)
-                                        }
-                                    };
-                                    panel_ui.scroll = if up {
-                                        panel_ui.scroll.saturating_sub(repeat)
+                                    let key = if up {
+                                        KeyCode::Char('k')
                                     } else {
-                                        (panel_ui.scroll + repeat).min(max)
+                                        KeyCode::Char('j')
                                     };
+                                    let mut target = panel_ui.scroll;
+                                    for _ in 0..repeat {
+                                        target = crate::panel::sections::scroll_step(
+                                            ext,
+                                            &key,
+                                            Modifiers::NONE,
+                                            target,
+                                            1,
+                                        )
+                                        .unwrap_or(target);
+                                    }
+                                    panel_ui.scroll = target;
                                     dirty = true;
                                     continue;
                                 }
@@ -19548,12 +19933,26 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Tests => {
-                                            let target = model
-                                                .panel
-                                                .tests
-                                                .as_ref()
-                                                .and_then(|t| t.failures.get(panel_ui.cursor))
-                                                .and_then(|(_, at)| parse_file_line(at));
+                                            let target = if panel_ui.width
+                                                == crate::layout::PanelWidth::Full
+                                            {
+                                                panel_ui.tests.selected_node().and_then(|node| {
+                                                    node.location.as_ref().map(|loc| {
+                                                        let worktree = active_tab_path(&session);
+                                                        (
+                                                            resolve_loc_path(&worktree, &loc.path),
+                                                            loc.line,
+                                                        )
+                                                    })
+                                                })
+                                            } else {
+                                                model
+                                                    .panel
+                                                    .tests
+                                                    .as_ref()
+                                                    .and_then(|t| t.failures.get(panel_ui.cursor))
+                                                    .and_then(|(_, at)| parse_file_line(at))
+                                            };
                                             if let Some((path, line)) = target {
                                                 let cwd = active_cwd(&session);
                                                 if open_editor(
@@ -19572,7 +19971,7 @@ async fn event_loop<T: Terminal>(
                                                 need_relayout = true;
                                             } else {
                                                 model.status =
-                                                    "No source location for this failure".into();
+                                                    "No source location for this test".into();
                                             }
                                         }
                                         Section::Files => {
@@ -19684,35 +20083,61 @@ async fn event_loop<T: Terminal>(
                                                 .get(panel_ui.tasks_cursor)
                                                 .cloned();
                                             if let Some(task) = task {
-                                                let run_rec = crate::panel::TaskRunRecord {
-                                                    name: task.name.clone(),
-                                                    running: true,
-                                                    ..Default::default()
-                                                };
-                                                model
+                                                let is_running = model
                                                     .panel
                                                     .task_last_runs
-                                                    .insert(task.name.clone(), run_rec);
-                                                model.status = format!("Running: {}", task.name);
-                                                let test_task =
-                                                    crate::task::test_task_from_config(&task);
-                                                let wt = crate::hydrate::active_tab_path(&session);
-                                                let tx2 = named_task_run_tx.clone();
-                                                let wk2 = waker.clone();
-                                                let limits2 = keymap.config().limits.clone();
-                                                named_task_generation += 1;
-                                                let run_gen = named_task_generation;
-                                                tokio::task::spawn_blocking(move || {
-                                                    let loc =
-                                                        thegn_core::remote::GitLoc::for_worktree(
-                                                            &wt,
-                                                        );
-                                                    let outcome = crate::task::run_task(
-                                                        wt, &loc, run_gen, test_task, &limits2,
+                                                    .get(&task.name)
+                                                    .is_some_and(|record| record.running);
+                                                if is_running
+                                                    && !restart_arm.confirm(
+                                                        &task.name,
+                                                        std::time::Instant::now(),
+                                                    )
+                                                {
+                                                    model.status = format!(
+                                                        "'{}' is running: press Enter again to restart",
+                                                        task.name
                                                     );
-                                                    let _ = tx2.send(outcome); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                                                    let _ = wk2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                                                });
+                                                } else {
+                                                    restart_arm.clear();
+                                                    let run_rec = crate::panel::TaskRunRecord {
+                                                        name: task.name.clone(),
+                                                        running: true,
+                                                        ..Default::default()
+                                                    };
+                                                    model
+                                                        .panel
+                                                        .task_last_runs
+                                                        .insert(task.name.clone(), run_rec);
+                                                    model.status =
+                                                        format!("Running: {}", task.name);
+                                                    let test_task =
+                                                        crate::task::test_task_from_config(&task);
+                                                    let wt =
+                                                        crate::hydrate::active_tab_path(&session);
+                                                    let tx2 = named_task_run_tx.clone();
+                                                    let wk2 = waker.clone();
+                                                    let limits2 = keymap.config().limits.clone();
+                                                    named_task_generation += 1;
+                                                    let run_gen = named_task_generation;
+                                                    latest_job_generation
+                                                        .insert(task.name.clone(), run_gen);
+                                                    tokio::task::spawn_blocking(move || {
+                                                        let loc =
+                                                            thegn_core::remote::GitLoc::for_worktree(
+                                                                &wt,
+                                                            );
+                                                        let outcome = crate::task::run_job(
+                                                            wt, &loc, run_gen, test_task, &limits2,
+                                                        );
+                                                        if let Err(error) = tx2.send(outcome) {
+                                                            tracing::debug!(target: "thegn::tasks", %error, "job outcome receiver is gone");
+                                                        }
+                                                        if let Err(error) = wk2.wake() {
+                                                            tracing::debug!(target: "thegn::tasks", %error, "job outcome wake failed");
+                                                        }
+                                                    });
+                                                }
                                             }
                                         }
                                         Section::Problems => {
@@ -20046,10 +20471,16 @@ async fn event_loop<T: Terminal>(
                         (Section::Pr, KeyCode::Char(c @ ('M' | 'A' | 'c' | 'r' | 'o'))) => {
                             crate::actions::panel_pr_action_key(
                                 c,
-                                &mut model,
-                                &session,
-                                &refresh_tx,
-                                &waker,
+                                &mut crate::actions::PanelPrActionCtx {
+                                    model: &mut model,
+                                    session: &session,
+                                    refresh_tx: &refresh_tx,
+                                    waker: &waker,
+                                    active_menu: &mut active_menu,
+                                    pr_view: &mut pr_view,
+                                    pr_view_gen: &mut pr_view_gen,
+                                    pr_view_tx: &pr_view_tx,
+                                },
                             )
                         }
                         // -- tests: run / discover (capped, single-flight) ---
@@ -20068,8 +20499,14 @@ async fn event_loop<T: Terminal>(
                                 keymap.config(),
                                 true,
                                 &mut test_cache_load,
+                                TestCacheWiring {
+                                    tx: &test_cache_tx,
+                                    waker: &waker,
+                                },
                             );
-                            if let Some(base) = panel_ui.tests.task.clone() {
+                            if test_cache_load.is_pending(&wt.to_string_lossy()) {
+                                model.status = "Loading test state…".into();
+                            } else if let Some(base) = panel_ui.tests.task.clone() {
                                 if !panel_ui.tests.running {
                                     let task_spec = test_task_for_run(&panel_ui.tests, kind, base);
                                     test_generation += 1;
@@ -20100,9 +20537,15 @@ async fn event_loop<T: Terminal>(
                                 keymap.config(),
                                 true,
                                 &mut test_cache_load,
+                                TestCacheWiring {
+                                    tx: &test_cache_tx,
+                                    waker: &waker,
+                                },
                             );
-                            if let Some(task) = panel_ui.tests.task.clone() {
-                                test_generation += 1;
+                            if test_cache_load.is_pending(&wt.to_string_lossy()) {
+                                model.status = "Loading test state…".into();
+                            } else if let Some(task) = panel_ui.tests.task.clone() {
+                                test_discovery_generation += 1;
                                 panel_ui.tests.discovering = true;
                                 panel_ui.tests.summary.error = None;
                                 // Force re-discovery and record the current
@@ -20112,7 +20555,7 @@ async fn event_loop<T: Terminal>(
                                     test_discovery_tx.clone(),
                                     waker.clone(),
                                     wt,
-                                    test_generation,
+                                    test_discovery_generation,
                                     task,
                                     keymap.config().limits.clone(),
                                     test_sem.clone(),
@@ -20219,31 +20662,51 @@ async fn event_loop<T: Terminal>(
                             // Re-run: same as Enter but without moving cursor.
                             let task = model.panel.task_specs.get(panel_ui.tasks_cursor).cloned();
                             if let Some(task) = task {
-                                let run_rec = crate::panel::TaskRunRecord {
-                                    name: task.name.clone(),
-                                    running: true,
-                                    ..Default::default()
-                                };
-                                model
+                                let is_running = model
                                     .panel
                                     .task_last_runs
-                                    .insert(task.name.clone(), run_rec);
-                                model.status = format!("Re-running: {}", task.name);
-                                let test_task = crate::task::test_task_from_config(&task);
-                                let wt = crate::hydrate::active_tab_path(&session);
-                                let tx2 = named_task_run_tx.clone();
-                                let wk2 = waker.clone();
-                                let limits2 = keymap.config().limits.clone();
-                                named_task_generation += 1;
-                                let run_gen = named_task_generation;
-                                tokio::task::spawn_blocking(move || {
-                                    let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-                                    let outcome = crate::task::run_task(
-                                        wt, &loc, run_gen, test_task, &limits2,
+                                    .get(&task.name)
+                                    .is_some_and(|record| record.running);
+                                if is_running
+                                    && !restart_arm.confirm(&task.name, std::time::Instant::now())
+                                {
+                                    model.status = format!(
+                                        "'{}' is running: press r again to restart",
+                                        task.name
                                     );
-                                    let _ = tx2.send(outcome); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                                    let _ = wk2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                                });
+                                } else {
+                                    restart_arm.clear();
+                                    let run_rec = crate::panel::TaskRunRecord {
+                                        name: task.name.clone(),
+                                        running: true,
+                                        ..Default::default()
+                                    };
+                                    model
+                                        .panel
+                                        .task_last_runs
+                                        .insert(task.name.clone(), run_rec);
+                                    model.status = format!("Re-running: {}", task.name);
+                                    let test_task = crate::task::test_task_from_config(&task);
+                                    let wt = crate::hydrate::active_tab_path(&session);
+                                    let tx2 = named_task_run_tx.clone();
+                                    let wk2 = waker.clone();
+                                    let limits2 = keymap.config().limits.clone();
+                                    named_task_generation += 1;
+                                    let run_gen = named_task_generation;
+                                    latest_job_generation.insert(task.name.clone(), run_gen);
+                                    tokio::task::spawn_blocking(move || {
+                                        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+                                        let outcome = crate::task::run_job(
+                                            wt, &loc, run_gen, test_task, &limits2,
+                                        );
+                                        if let Err(error) = tx2.send(outcome) {
+                                            tracing::debug!(target: "thegn::tasks", %error, "job outcome receiver is gone");
+                                        }
+                                        if let Err(error) = wk2.wake() {
+                                            tracing::debug!(target: "thegn::tasks", %error, "job outcome wake failed");
+                                        }
+                                    });
+                                }
                             }
                             true
                         }
@@ -20252,11 +20715,15 @@ async fn event_loop<T: Terminal>(
                             let task = model.panel.task_specs.get(panel_ui.tasks_cursor).cloned();
                             if let Some(task) = task {
                                 let wt = crate::hydrate::active_tab_path(&session);
-                                crate::task::cancel_slot(&format!("{}:run", wt.display()));
-                                if let Some(rec) = model.panel.task_last_runs.get_mut(&task.name) {
+                                if let Some(rec) = model.panel.task_last_runs.get_mut(&task.name)
+                                    && rec.running
+                                {
+                                    crate::task::cancel_job(&wt, &task.name);
                                     rec.running = false;
+                                    model.status = format!("Stopped: {}", task.name);
+                                } else {
+                                    model.status = format!("'{}' is not running", task.name);
                                 }
-                                model.status = format!("Stopped: {}", task.name);
                             }
                             true
                         }
@@ -20278,33 +20745,22 @@ async fn event_loop<T: Terminal>(
                                             &task.name
                                         )
                                     ));
-                                // Write off the loop (no blocking fs on the loop).
-                                {
-                                    let tmp = tmp.clone();
-                                    let out = rec.output_tail.clone();
-                                    tokio::task::spawn_blocking(move || {
-                                        let _ = std::fs::write(&tmp, out); // best-effort: tmp snapshot of the output tail: a failed write loses the tail only
-                                    });
-                                }
-                                let bat = keymap
-                                    .config()
-                                    .tool_command("bat")
-                                    .unwrap_or("bat --paging=always")
-                                    .to_string();
-                                let cmd =
-                                    format!("{bat} {}", test_shell_quote(&tmp.to_string_lossy()));
-                                let cwd_o = active_cwd(&session);
-                                open_command_pane(
-                                    &mut session,
-                                    &mut panes,
-                                    focused,
-                                    &cmd,
-                                    cwd_o.as_deref(),
-                                    chrome.center,
-                                );
-                                focus.zone = crate::focus::Zone::Center;
-                                refresh_tab_model(&mut model, &session, &mut sb);
-                                need_relayout = true;
+                                let tmp_write = tmp.clone();
+                                let output = rec.output_tail.clone();
+                                let tx = job_output_tx.clone();
+                                let wake = waker.clone();
+                                model.status = format!("Opening output of {}…", task.name);
+                                tokio::task::spawn_blocking(move || {
+                                    let result = std::fs::write(&tmp_write, output)
+                                        .map(|()| tmp_write)
+                                        .map_err(|error| error.to_string());
+                                    if let Err(error) = tx.send(result) {
+                                        tracing::debug!(target: "thegn::tasks", %error, "job output receiver is gone");
+                                    }
+                                    if let Err(error) = wake.wake() {
+                                        tracing::debug!(target: "thegn::tasks", %error, "job output wake failed");
+                                    }
+                                });
                             } else {
                                 model.status = "No output captured yet".into();
                             }
@@ -20716,32 +21172,17 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
-                        // `a` clears all — the one clear-all key shared with the
-                        // unified overlay, and routed through the same handler so
-                        // it means the same thing. Crucially that also ACKS the
-                        // live needs-you signals: a CI failure is derived from the
-                        // PR/CI cache rather than an inbox row, so marking
-                        // notifications read alone left the `✋` badge lit and it
-                        // reappeared on the next hydration pass.
+                        // `a` asks for confirmation before clearing the inbox
+                        // and acknowledging live needs-you signals.
                         (Section::Notifications, KeyCode::Char('a')) => {
-                            crate::handlers::attention::mark_all_read(
-                                &mut model,
-                                &refresh_tx,
-                                &waker,
-                            );
-                            hydration_gen += 1;
-                            crate::hydrate::spawn_model_hydration(
-                                model_tx.clone(),
-                                hydration_gen,
-                                session.clone_for_hydrate(),
-                                Some(waker.clone()),
-                                crate::hydrate::HydrateHints {
-                                    open: panel_ui.open,
-                                    expanded: panel_ui.width.is_expanded(),
-                                    ..Default::default()
-                                },
-                                None,
-                            );
+                            match crate::handlers::attention::clear_all_confirm(
+                                &model,
+                                crate::panel::scope::system_all(),
+                                !panel_ui.notifications_filter.is_empty(),
+                            ) {
+                                Some(menu) => active_menu = Some(menu),
+                                None => model.status = "inbox already clear".into(),
+                            }
                             true
                         }
                         (Section::Notifications, KeyCode::Char('d')) => {
@@ -20809,95 +21250,47 @@ async fn event_loop<T: Terminal>(
                             );
                             true
                         }
-                        // Container actions: `s` stop / `r` restart the
-                        // highlighted container (Full view cursor; the active
-                        // worktree's own container at the narrow widths),
-                        // `l` tails its logs in a center pane. Stop/restart
-                        // run off-loop; the outcome lands as a toast + a
-                        // model refresh.
+                        // Sandbox actions resolve against the renderer's shared
+                        // width and scope model; destructive actions confirm.
                         (Section::Sandbox, KeyCode::Char(c @ ('s' | 'r' | 'l'))) => {
-                            let sel = if panel_ui.width == crate::layout::PanelWidth::Full {
-                                model
-                                    .containers
-                                    .get(
-                                        panel_ui
-                                            .cursor
-                                            .min(model.containers.len().saturating_sub(1)),
-                                    )
-                                    .cloned()
-                            } else {
-                                model
-                                    .containers
-                                    .iter()
-                                    .find(|k| k.ours && k.name == model.active_container_name)
-                                    .cloned()
-                            };
-                            match sel {
-                                None => {
-                                    model.status =
-                                        "no container to act on (OCI sandboxes only)".into();
+                            let show_all = crate::panel::scope::system_all();
+                            match crate::handlers::sandbox_panel::key(
+                                c,
+                                &model.containers,
+                                &model.active_container_name,
+                                show_all,
+                                panel_ui.width,
+                                panel_ui.cursor,
+                            ) {
+                                crate::handlers::sandbox_panel::SandboxKey::NoTarget(status)
+                                | crate::handlers::sandbox_panel::SandboxKey::Refused(status) => {
+                                    model.status = status;
                                 }
-                                Some(cont) => {
+                                crate::handlers::sandbox_panel::SandboxKey::Confirm(menu) => {
+                                    active_menu = Some(menu);
+                                }
+                                crate::handlers::sandbox_panel::SandboxKey::Logs(cont) => {
                                     let backend =
                                         thegn_core::sandbox::Backend::parse(&cont.backend)
                                             .unwrap_or(thegn_core::sandbox::Backend::Podman);
-                                    if c == 'l' {
-                                        let argv = thegn_core::sandbox::container_logs_argv(
-                                            &keymap.config().sandbox,
-                                            backend,
-                                            &cont.name,
-                                        );
-                                        let cmd = argv.join(" ");
-                                        let cwd_o = active_cwd(&session);
-                                        open_command_pane(
-                                            &mut session,
-                                            &mut panes,
-                                            focused,
-                                            &cmd,
-                                            cwd_o.as_deref(),
-                                            chrome.center,
-                                        );
-                                        focus.zone = crate::focus::Zone::Center;
-                                        refresh_tab_model(&mut model, &session, &mut sb);
-                                        need_relayout = true;
-                                    } else {
-                                        let action = if c == 's' { "stop" } else { "restart" };
-                                        model.status = format!("{action}ing {}…", cont.name);
-                                        let cfg_sb = keymap.config().sandbox.clone();
-                                        // Best-effort placement: the active
-                                        // worktree's host. A foreign-host row
-                                        // (all-scope) may miss; the toast says so.
-                                        let wt = active_tab_path(&session);
-                                        let refresh = refresh_tx.clone();
-                                        let wk = waker.clone();
-                                        let name = cont.name.clone();
-                                        let action = action.to_string();
-                                        tokio::task::spawn_blocking(move || {
-                                            let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-                                            let ok = thegn_core::sandbox::container_control(
-                                                &cfg_sb, &loc, backend, &name, &action,
-                                            );
-                                            let message = if ok {
-                                                format!("{name}: {action} ✓")
-                                            } else {
-                                                format!("{name}: {action} failed")
-                                            };
-                                            let priority = if ok {
-                                                thegn_core::notification::Priority::Info
-                                            } else {
-                                                thegn_core::notification::Priority::Alert
-                                            };
-                                            // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                                            let _ =
-                                                refresh.send(crate::hydrate::RefreshKind::Toast {
-                                                    message,
-                                                    priority,
-                                                });
-                                            let _ =
-                                                refresh.send(crate::hydrate::RefreshKind::Model); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                                            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                                        });
-                                    }
+                                    let argv = thegn_core::sandbox::container_logs_argv(
+                                        &keymap.config().sandbox,
+                                        backend,
+                                        &cont.name,
+                                    );
+                                    let cmd = argv.join(" ");
+                                    let cwd_o = active_cwd(&session);
+                                    open_command_pane(
+                                        &mut session,
+                                        &mut panes,
+                                        focused,
+                                        &cmd,
+                                        cwd_o.as_deref(),
+                                        chrome.center,
+                                    );
+                                    focus.zone = crate::focus::Zone::Center;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
                                 }
                             }
                             true
@@ -20994,10 +21387,8 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
-                        // Export is `E`: the accordion's width cycle claims a
-                        // bare `e` for every section, so the old `e` arm was
-                        // unreachable dead code.
-                        (Section::Logs, KeyCode::Char('E')) => {
+                        // `e` and `E` belong to the shared accordion width cycle.
+                        (Section::Logs, KeyCode::Char('w')) => {
                             let lines: Vec<String> = crate::panel::sections::logs::visible_lines(
                                 &model.panel,
                                 &panel_ui,
@@ -21012,19 +21403,32 @@ async fn event_loop<T: Terminal>(
                                     .log
                                     .dir_path()
                                     .join(format!("export-{ts}.log"));
+                                let count = lines.len();
                                 let content = lines.join("\n");
-                                match std::fs::write(&export_path, &content) {
-                                    Ok(()) => {
-                                        model.status = format!(
-                                            "Exported {} lines to {}",
-                                            lines.len(),
-                                            export_path.display()
-                                        );
+                                model.status = format!("Exporting {count} lines…");
+                                let toast_tx = refresh_tx.clone();
+                                let export_waker = waker.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let toast = match std::fs::write(&export_path, &content) {
+                                        Ok(()) => crate::hydrate::RefreshKind::Toast {
+                                            message: format!(
+                                                "Exported {count} lines to {}",
+                                                export_path.display()
+                                            ),
+                                            priority: thegn_core::notification::Priority::Info,
+                                        },
+                                        Err(error) => crate::hydrate::RefreshKind::Toast {
+                                            message: format!("Export failed: {error}"),
+                                            priority: thegn_core::notification::Priority::Alert,
+                                        },
+                                    };
+                                    if let Err(error) = toast_tx.send(toast) {
+                                        tracing::debug!(target: "thegn::panel", %error, "log export toast receiver is gone");
                                     }
-                                    Err(e) => {
-                                        model.status = format!("Export failed: {e}");
+                                    if let Err(error) = export_waker.wake() {
+                                        tracing::debug!(target: "thegn::panel", %error, "log export toast wake failed");
                                     }
-                                }
+                                });
                             }
                             true
                         }
@@ -21217,8 +21621,16 @@ async fn event_loop<T: Terminal>(
                         }
                         // -- media: keyboard transport keys use the same intent
                         // mapping as the frame's mouse hit targets.
-                        (Section::Media, KeyCode::Char(c @ (' ' | 'n' | 'p' | 's' | 'L'))) => {
-                            let action = crate::media_panel::action_for_key(&KeyCode::Char(c))
+                        (Section::Media, key)
+                            if matches!(
+                                &key,
+                                KeyCode::Char(
+                                    ' ' | 'n' | 'p' | 's' | 'L' | '+' | '-' | '[' | ']' | 'f'
+                                ) | KeyCode::LeftArrow
+                                    | KeyCode::RightArrow
+                            ) =>
+                        {
+                            let action = crate::media_panel::action_for_key(&key)
                                 .expect("media key table and handler must agree");
                             if current_config.media.enabled {
                                 crate::media_ctl::spawn_media_action(
