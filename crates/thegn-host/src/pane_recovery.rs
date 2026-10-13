@@ -84,6 +84,13 @@ pub(crate) async fn recover(
         let operation = async {
             match source.attach(id, cols, rows).await {
                 Ok(session) => Ok(Recovery::Attached(session)),
+                Err(attach_error)
+                    if attach_error
+                        .downcast_ref::<thegn_svc::control::client::BootstrapError>()
+                        .is_some() =>
+                {
+                    Ok(Recovery::Exhausted(attach_error))
+                }
                 Err(attach_error) => match source.session_absent(id).await {
                     Ok(true) => Ok(Recovery::Absent),
                     Ok(false) => Err(attach_error),
@@ -130,6 +137,8 @@ mod tests {
         session: Mutex<Option<ExecSession>>,
         absent: bool,
         query_error: bool,
+        bootstrap_error: bool,
+        absence_calls: AtomicU32,
         hung: bool,
         kills: Mutex<Vec<String>>,
     }
@@ -148,6 +157,8 @@ mod tests {
             })),
             absent: false,
             query_error: false,
+            bootstrap_error: false,
+            absence_calls: AtomicU32::new(0),
             hung: false,
             kills: Mutex::new(Vec::new()),
         }
@@ -169,6 +180,15 @@ mod tests {
                 if self.hung {
                     std::future::pending::<()>().await;
                 }
+                if self.bootstrap_error {
+                    return Err(anyhow::Error::new(
+                        thegn_svc::control::client::BootstrapError::VersionSkew {
+                            server: "test daemon".into(),
+                            daemon_proto: 2,
+                            client_proto: 1,
+                        },
+                    ));
+                }
                 if attempt < self.failures {
                     return Err(anyhow!("temporary transport failure"));
                 }
@@ -181,6 +201,7 @@ mod tests {
         }
         fn session_absent<'a>(&'a self, _: &'a str) -> BoxFuture<'a, anyhow::Result<bool>> {
             Box::pin(async move {
+                self.absence_calls.fetch_add(1, Ordering::SeqCst);
                 if self.query_error {
                     Err(anyhow!("roster unavailable"))
                 } else {
@@ -249,6 +270,24 @@ mod tests {
         ));
         assert_eq!(absent.calls.load(Ordering::SeqCst), 1);
         drop(tx);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_error_stops_recovery_before_absence_query() {
+        let (_tx, rx) = mpsc::channel(1);
+        let mut source = source(0);
+        source.bootstrap_error = true;
+        let result = recover(&source, "same-id", 80, 24, &rx, policy()).await;
+        let Recovery::Exhausted(error) = result else {
+            panic!("bootstrap error must exhaust recovery immediately")
+        };
+        assert!(
+            error
+                .downcast_ref::<thegn_svc::control::client::BootstrapError>()
+                .is_some()
+        );
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(source.absence_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
