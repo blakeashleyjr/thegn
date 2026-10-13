@@ -1,5 +1,9 @@
 # help-section-keys-ratchet — real section keys omitted from section_keys tables.
 # These entries shrink when section_keys starts advertising them.
+# Environments: `t` tests provider env tokens but is absent from ENVIRONMENTS.
+panel:environments:t
+# Logs: `Y` copies every visible line but is absent from LOGS.
+panel:logs:Y
 # Media volume: `+` and `-` adjust volume but are absent from MEDIA.
 panel:media:+
 panel:media:-

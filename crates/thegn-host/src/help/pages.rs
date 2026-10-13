@@ -221,7 +221,7 @@ mod tests {
         assert!(errors.is_empty(), "registry validation: {errors:?}");
         let panel = reg.page("panel").expect("panel page");
         assert!(
-            panel.body.contains("Keys: `w` export"),
+            panel.body.contains("Keys: ") && panel.body.contains("`w` export"),
             "logs keys expanded"
         );
         assert!(

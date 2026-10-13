@@ -1,6 +1,6 @@
 ---
 id: panel
-title: Diff / PR panel
+title: Right panel
 order: 5
 contexts:
   [
@@ -41,7 +41,8 @@ accordion — four tabs, one open section at a time:
 
 - `Tab` / `Shift-Tab` — cycle tabs; `1`–`9`, `0` jump to the tab's first ten sections
 - `j k` / `↑↓` — move through rows; Help, Telemetry, and Keys scroll their
-  body. On the Help tab, movement stops at the tab's first and last section.
+  body. At a section's edge, `j k` flow into the next section, stopping at
+  the tab's first/last section.
 - `↵` — act on the cursor row (open, jump, link — per section below);
   `Esc` steps back out of the rows
 - `e` — cycle the width: normal → half → full-screen; `E` shrinks the width,
@@ -352,14 +353,14 @@ The environment currently bound to the worktree carries a visible bound marker.
 badge focus the same System section. Its Normal/Half/Full widths progressively
 show track, controls, and queue/artwork.
 
+{{keys:media}}
+
 Additional keys: `+`/`-` adjust volume · `[`/`]` move chapters · `f`
 toggles fullscreen.
 
 {{keys:share}}
 
 {{keys:forward}}
-
-{{keys:media}}
 
 **telemetry** scrolls and shows live stats/loop-profiler data; DISK shows
 one row per device with used percent.

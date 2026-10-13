@@ -21,8 +21,9 @@ actions: [pr-open, pr-create]
    is available; PR review shows the PR head diff, inline threads, outdated
    feedback, and top-level comments. Stale, loading, unsupported, and absent
    snapshots are labeled rather than attached to local lines.
-4. Act from the panel's _pr_ section: `M` opens a merge-method menu (squash
-   is the default) and lists blockers; `c` comments when a PR exists and asks
+4. Act from the panel's _pr_ section: `A` approves and `o` opens the PR in
+   your browser. `M` opens a merge-method menu (squash is the default) and
+   lists blockers; `c` comments when a PR exists and asks
    before creating one otherwise. `r` needs a PR. Enter opens the PR view;
    Full shows its two-column page: header and checks beside threads and OPEN
    PRS. Or run `gh` in the pane, or open the PR view for the conversation

@@ -14,7 +14,8 @@ is rendered in-process.
 
 In the `F1` overlay, press `/` to search every page; `Tab` switches between
 the contents list and the page; `↵` follows a link; `[` goes back. The
-docked panel tab scrolls its help body.
+docked panel tab scrolls its help body. Press `F1` anywhere to open this help at
+the page for whatever has focus.
 
 ## Start here
 

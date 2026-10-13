@@ -402,11 +402,12 @@ The panel's **system → sandbox** section shows the live state for the
 focused worktree: the backend, image, mounts, DNS filtering, and the
 container's status and cpu/mem/net when one exists; the wider views add
 the activity timeline. Containers thegn did not create are listed
-read-only: `s` and `r` are refused with a status, while `l` still opens
-their logs. `s` and `r` on thegn-owned containers ask first. `g` scopes
-the full table too; Half-width `g` rows are selectable. When sandboxing is
-off, a one-line banner says so. Log, stop, and restart work runs off the UI
-loop and reports its outcome as a toast.
+read-only: `s` and `r` are refused with a status, while `l` opens a live
+logs pane (`<runtime> logs --tail 200 -f`). `s` and `r` on thegn-owned
+containers ask first. `g` widens to every container; it scopes the full
+table too, and Half-width `g` rows are selectable. When sandboxing is off,
+a one-line banner says so. Stop and restart work runs off the UI loop and
+reports its outcome as a toast.
 
 The machine-global view is the system monitor's **Containers** tab
 ([[system-monitor]]), which lists every backend's containers with live
