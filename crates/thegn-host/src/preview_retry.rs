@@ -205,7 +205,9 @@ mod tests {
         assert_eq!(slot.state(), (true, None));
         slot.offer_draw(vec![2], false, |_| Ok(()));
         let pending = slot.state();
+        let pending = (pending.0, pending.1.map(<[u8]>::to_vec));
         slot.offer_draw(Vec::new(), true, |_| Ok(()));
-        assert_eq!(slot.state(), pending);
+        let actual = slot.state();
+        assert_eq!((actual.0, actual.1.map(<[u8]>::to_vec)), pending);
     }
 }
