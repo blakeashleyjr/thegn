@@ -1003,3 +1003,12 @@ clarifying the generic observer contract MUST NOT remove or rename those frames.
 - **WHEN** a client attaches to a live daemon-owned session
 - **THEN** it receives the current emulator snapshot and then pane deltas on the
   attach path, independent of generic observer filters
+
+#### Scenario: Sustained sequence gaps end the pane
+
+- **WHEN** a pane's daemon attach stream repeatedly reports sequence gaps
+  throughout the configured `[daemon] stream_gap_window_secs` window
+- **THEN** the pane relay backs off between reconnects and ends the pane with a
+  stream unstable diagnostic and exit status 254, while the daemon session
+  continues running
+- **AND** a value of `0` disables the window limit but retains reconnect backoff

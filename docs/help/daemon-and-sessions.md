@@ -211,6 +211,11 @@ reap** — a detached session lives until you close its pane, kill it, or
 the machine restarts. That is what makes "come back tomorrow" work. A
 non-zero value reaps on expiry instead.
 
+`[daemon] stream_gap_window_secs` (default 600) ends a pane after sustained
+attach-stream sequence gaps that keep forcing reconnects and fresh snapshots.
+Set it to `0` to keep retrying indefinitely; retries still use increasing
+backoff delays.
+
 `[daemon] idle_exit_secs` (default 30 minutes) exits the daemon once it
 holds no sessions at all. A daemon started by `thegn serve` ignores it —
 it keeps its listener up for clients that have not attached yet.
