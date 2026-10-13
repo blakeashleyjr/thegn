@@ -152,6 +152,7 @@ pub struct AppHost {
     pub active: ActiveApp,
     tab_order: Vec<ActiveApp>,
     default_tab: String,
+    observe_config_snapshot: thegn_core::config_observe::ObserveConfig,
 }
 
 impl AppHost {
@@ -167,6 +168,7 @@ impl AppHost {
             active: ActiveApp::Work,
             tab_order,
             default_tab: "work".into(),
+            observe_config_snapshot: thegn_core::config_observe::ObserveConfig::default(),
         }
     }
 
@@ -182,6 +184,12 @@ impl AppHost {
     /// When the configured default changes, it takes effect immediately. If
     /// the active tile is removed or disabled, the configured default wins.
     pub fn reconcile(&mut self, cfg: &thegn_core::config::Config) {
+        if self.observe_config_snapshot != cfg.observe {
+            if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == "observe") {
+                *slot = AppSlot::new(slot.id, slot.label);
+            }
+            self.observe_config_snapshot = cfg.observe.clone();
+        }
         let active_id = self.active_id().map(str::to_owned);
         let previous_default = self.default_tab.clone();
         let default_id = cfg.apps.normalized_default_tab(cfg.observe.enabled);
@@ -946,11 +954,40 @@ mod tests {
         host.reconcile(&cfg);
         assert!(events.lock().unwrap().is_empty());
         assert_eq!(host.slots[0].id, "observe");
+        assert!(matches!(host.slots[0].state, SlotState::Running(_)));
 
         cfg.observe.enabled = false;
         host.reconcile(&cfg);
         assert!(host.slots.is_empty());
         assert_eq!(*events.lock().unwrap(), vec!["shutdown"]);
+    }
+
+    #[test]
+    fn reconcile_reloads_running_observe_when_config_changes() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.observe.enabled = true;
+        let mut host = AppHost::from_config(&cfg);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        host.slots[0] = lifecycle_slot(events.clone(), false);
+
+        cfg.observe.dashboard_path = "dashboards/new.toml".into();
+        host.reconcile(&cfg);
+
+        assert_eq!(*events.lock().unwrap(), vec!["shutdown"]);
+        assert!(matches!(host.slots[0].state, SlotState::Unloaded));
+    }
+
+    #[test]
+    fn reconcile_retries_failed_observe_when_config_changes() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.observe.enabled = true;
+        let mut host = AppHost::from_config(&cfg);
+        host.slots[0].state = SlotState::Failed("dashboard could not be loaded".into());
+
+        cfg.observe.dashboard_path = "dashboards/fixed.toml".into();
+        host.reconcile(&cfg);
+
+        assert!(matches!(host.slots[0].state, SlotState::Unloaded));
     }
 
     #[test]

@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 /// `[observe]` — the embedded observability app tab.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ObserveConfig {
     /// Show the "Observe" tab in the top-level app-tab strip. Off by default.
@@ -23,7 +23,11 @@ pub struct ObserveConfig {
     pub refresh_interval_secs: u64,
     /// Dashboard source: empty ⇒ the built-in host-metrics dashboard; otherwise a
     /// path to a dashboard TOML (tilde-expanded), loaded via `gtui_core::dashboard`.
-    /// Load errors fail the Observe tab visibly; they do not select the built-in dashboard.
+    /// Custom dashboards are limited to 1 MiB, 64 panels, 16 targets per panel,
+    /// 4096 bytes per expression, 256 bytes per title/description/ref id, and
+    /// 10,000 grid rows; refresh cadence is clamped to 1..=3600 seconds. Load
+    /// errors fail the Observe tab visibly; they do not select the built-in
+    /// dashboard. Changing `[observe]` on config reload rebuilds the tab.
     pub dashboard_path: String,
     pub prometheus: PrometheusSourceConfig,
     pub loki: LokiSourceConfig,
@@ -42,7 +46,7 @@ impl Default for ObserveConfig {
 }
 
 /// `[observe.prometheus]` — a Prometheus HTTP endpoint for dashboard panels.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct PrometheusSourceConfig {
     /// Base URL (e.g. `http://localhost:9090`). Empty ⇒ Prometheus panels report
@@ -62,7 +66,7 @@ impl Default for PrometheusSourceConfig {
 }
 
 /// `[observe.loki]` — a Loki HTTP endpoint for log panels.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct LokiSourceConfig {
     /// Base URL (e.g. `http://localhost:3100`). Empty ⇒ Loki panels report
