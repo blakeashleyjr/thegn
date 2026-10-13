@@ -30,10 +30,11 @@ fn toolchain_label(toolchain: &crate::toolchain_ui::ToolchainStatus) -> String {
 
 /// ● token present (green) · ✗ token missing (red) · ● no token needed (dim).
 fn glyph(e: &EnvSnapshot) -> Seg {
+    let glyphs = crate::caps::active_glyphs();
     match e.token {
-        Some(true) => seg(hue(Hue::Green), "●"),
-        Some(false) => seg(hue(Hue::Red), "✗"),
-        None => seg(g(), "●"),
+        Some(true) => seg(hue(Hue::Green), glyphs.dot_filled),
+        Some(false) => seg(hue(Hue::Red), glyphs.cross),
+        None => seg(g(), glyphs.dot_filled),
     }
 }
 
@@ -83,6 +84,12 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             seg(d(), format!(" {}", e.name)),
             seg(g(), format!("  {}", e.kind)),
         ];
+        if e.bound {
+            left.push(seg(
+                hue(Hue::Green),
+                format!("  {} bound", crate::caps::active_glyphs().dot_filled),
+            ));
+        }
         if !e.region.is_empty() {
             left.push(seg(g(), format!("  {}", e.region)));
         }
@@ -99,12 +106,16 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
                 .with_hit(PanelHit::Row(Section::Environments, i)),
         );
     }
-    rows.push(hint_row(&[
-        ("enter", "bind here"),
-        ("t", "test"),
-        ("x", "remove"),
-        ("n", "new…"),
-    ]));
+    let selected = envs.get(ctx.ui.cursor);
+    let enter_hint = selected
+        .map(|env| if env.bound { "bound" } else { "rebind here" })
+        .unwrap_or("rebind here");
+    let mut hints = vec![("enter", enter_hint)];
+    if selected.is_some_and(|env| env.placement == "provider") {
+        hints.push(("t", "test"));
+    }
+    hints.extend([("x", "remove"), ("n", "new…")]);
+    rows.push(hint_row(&hints));
     if let Some(toolchain) = &ctx.model.panel.toolchain {
         rows.push(PanelRow::plain(Line::segs(vec![seg(
             d(),
@@ -112,4 +123,69 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         )])));
     }
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chrome::FrameModel;
+    use crate::layout::PanelWidth;
+    use crate::panel::sections::SectionCtx;
+    use crate::panel::{PanelData, PanelUi};
+
+    #[test]
+    fn bound_marker_renders_on_only_the_bound_env_row() {
+        let model = FrameModel {
+            panel: PanelData {
+                environments: vec![
+                    EnvSnapshot {
+                        name: "a".into(),
+                        kind: "local".into(),
+                        placement: "local".into(),
+                        region: String::new(),
+                        size: String::new(),
+                        bound: false,
+                        token: None,
+                    },
+                    EnvSnapshot {
+                        name: "b".into(),
+                        kind: "provider".into(),
+                        placement: "provider".into(),
+                        region: String::new(),
+                        size: String::new(),
+                        bound: true,
+                        token: Some(false),
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ui = PanelUi {
+            open: Section::Environments,
+            width: PanelWidth::Normal,
+            ..Default::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 80,
+            rows: 20,
+        };
+        let rows = content(&ctx);
+        let text = |row: &PanelRow| match &row.line {
+            Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => l
+                .iter()
+                .chain(r)
+                .map(|part| part.text.as_str())
+                .collect::<String>(),
+            Line::Segs(parts) => parts.iter().map(|part| part.text.as_str()).collect(),
+            Line::Blank | Line::Fill { .. } => String::new(),
+        };
+
+        let a = text(&rows[0]);
+        let b = text(&rows[1]);
+        assert!(!a.contains("bound"));
+        assert!(b.contains("bound"));
+    }
 }
