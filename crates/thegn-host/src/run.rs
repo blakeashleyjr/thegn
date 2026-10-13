@@ -10342,6 +10342,7 @@ async fn event_loop<T: Terminal>(
                 GitDoc::RebasePlan { base, result } => {
                     if !matches!(&panel_ui.git.flow, GitFlow::None) {
                         tracing::debug!(target: "thegn::git", "dropping rebase plan because another git flow owns the editor");
+                        model.status = "interactive rebase: another git flow is active".into();
                     } else {
                         match result {
                             Ok(todos) => {
