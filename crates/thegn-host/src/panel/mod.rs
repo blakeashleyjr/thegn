@@ -189,18 +189,13 @@ pub enum Section {
     /// Built-in documentation, rendered from the embedded help registry —
     /// the docked twin of the F1 overlay (`o` there opens the page here).
     Help,
-    // Placeholder sections — kept as dead variants for future use.
-    #[allow(dead_code)]
-    Debug,
-    #[allow(dead_code)]
-    Db,
 }
 
 /// The accordion's built-in display order — the default when `[panel]
 /// sections` is unset. Grouped by tab:
 /// - Git (5): Changes, Commits, Branches, Stash, Files
 /// - Work (11): Mine, Across, Pr, Ci, MergeQueue, PrQueue, Issues, Problems, Jobs, Tests, Symbols
-/// - System (11): Notifications, Logs, Sandbox, Hosts, Environments, Share, Forward, Telemetry, Media, Usage, Keys
+/// - System (11): Notifications, Logs, Sandbox, Hosts, Environments, Share, Forward, Telemetry, Keys, Media, Usage
 /// - Help (1): Help
 ///
 /// The live order (config-reordered, possibly trimmed) rides on
@@ -233,9 +228,9 @@ pub const SECTION_ORDER: [Section; 28] = [
     Section::Share,
     Section::Forward,
     Section::Telemetry,
+    Section::Keys,
     Section::Media,
     Section::Usage,
-    Section::Keys,
     // Help tab
     Section::Help,
 ];
@@ -259,11 +254,9 @@ impl Section {
             Section::Jobs => "jobs",
             Section::Tests => "tests",
             Section::Symbols => "symbols",
-            Section::Debug => "debug",
             Section::Sandbox => "sandbox",
             Section::Hosts => "hosts",
             Section::Environments => "environments",
-            Section::Db => "db",
             Section::Telemetry => "telemetry",
             Section::Keys => "keys",
             Section::Help => "help",
@@ -306,9 +299,7 @@ impl Section {
             | Section::Telemetry
             | Section::Media
             | Section::Usage
-            | Section::Keys
-            | Section::Debug
-            | Section::Db => PanelTab::System,
+            | Section::Keys => PanelTab::System,
             Section::Help => PanelTab::Help,
         }
     }
@@ -361,31 +352,88 @@ pub struct HelpPanelState {
 /// position); an empty/absent list — or one that names no real section —
 /// falls back to the built-in order. Sections left out are hidden.
 pub fn resolve_order(cfg: &thegn_core::config::Config) -> Vec<Section> {
+    resolve_order_in(cfg, crate::channel_state::current())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionGate {
+    On,
+    Off(&'static str),
+}
+
+pub fn section_gate(
+    section: Section,
+    cfg: &thegn_core::config::Config,
+    channel: thegn_core::channel::Channel,
+) -> SectionGate {
+    use thegn_core::channel::Feature;
+    match section {
+        Section::PrQueue if !cfg.pr_queue.enabled => {
+            SectionGate::Off("off — set [pr_queue] enabled = true")
+        }
+        Section::Hosts | Section::Environments if !Feature::Providers.allowed_in(channel) => {
+            SectionGate::Off("dev-channel only — run with THEGN_CHANNEL=dev")
+        }
+        Section::Media if !cfg.media.enabled => {
+            SectionGate::Off("off — set [media] enabled = true")
+        }
+        Section::Usage if !cfg.usage.enabled => {
+            SectionGate::Off("off — set [usage] enabled = true")
+        }
+        _ => SectionGate::On,
+    }
+}
+
+pub fn resolve_order_in(
+    cfg: &thegn_core::config::Config,
+    channel: thegn_core::channel::Channel,
+) -> Vec<Section> {
     let mut out: Vec<Section> = Vec::new();
     for key in &cfg.panel.sections {
-        if let Some(s) = Section::from_key(key)
-            && !out.contains(&s)
+        if let Some(section) = Section::from_key(key)
+            && !out.contains(&section)
         {
-            out.push(s);
+            out.push(section);
         }
     }
     if out.is_empty() {
         out.extend(SECTION_ORDER);
     }
-    // `[media] enabled = false` (the default) hides the Media section — its
-    // doc always claimed this, but nothing filtered it, so a never-configured
-    // feature rendered a section whose every affordance was dead. An explicit
-    // `[panel] sections` listing "media" still keeps it (user's call).
-    if !cfg.media.enabled && !cfg.panel.sections.iter().any(|k| k == "media") {
-        out.retain(|s| *s != Section::Media);
-    }
-    // Same rule for `[usage] enabled = false`: a turned-off feature must not
-    // leave a permanently empty accordion row behind. An explicit `[panel]
-    // sections` listing "usage" still keeps it (user's call).
-    if !cfg.usage.enabled && !cfg.panel.sections.iter().any(|k| k == "usage") {
-        out.retain(|s| *s != Section::Usage);
-    }
+    out.retain(|section| {
+        section_gate(*section, cfg, channel) == SectionGate::On
+            || cfg.panel.sections.iter().any(|key| key == section.as_key())
+    });
     out
+}
+
+pub fn off_sections(
+    cfg: &thegn_core::config::Config,
+    channel: thegn_core::channel::Channel,
+) -> Vec<(Section, &'static str)> {
+    cfg.panel
+        .sections
+        .iter()
+        .filter_map(|key| {
+            let section = Section::from_key(key)?;
+            match section_gate(section, cfg, channel) {
+                SectionGate::On => None,
+                SectionGate::Off(reason) => Some((section, reason)),
+            }
+        })
+        .fold(Vec::new(), |mut found, item| {
+            if !found.iter().any(|(section, _)| *section == item.0) {
+                found.push(item);
+            }
+            found
+        })
+}
+
+pub fn section_digit(index: usize) -> Option<char> {
+    match index {
+        0..=8 => char::from_u32('1' as u32 + index as u32),
+        9 => Some('0'),
+        _ => None,
+    }
 }
 
 /// The Changes section's FILE-row count in its current view: all rows when
@@ -1062,6 +1110,8 @@ pub struct PanelUi {
     /// tabs. Sections are filtered to the active tab before display.
     /// The numbered jump keys index the ACTIVE TAB's slice. Never empty.
     pub order: Vec<Section>,
+    /// Explicitly listed sections that are present but disabled by config/channel.
+    pub off: Vec<(Section, &'static str)>,
     /// The active top-level tab (Git / Work / System).
     pub tab: PanelTab,
     /// Which accordion section is open (exactly one; must belong to `tab`).
@@ -1149,6 +1199,7 @@ impl Default for PanelUi {
             help: HelpPanelState::default(),
             media: media::MediaPanelState::default(),
             order: SECTION_ORDER.to_vec(),
+            off: Vec::new(),
             tab: PanelTab::default(),
             open: Section::default(),
             width: crate::layout::PanelWidth::default(),
@@ -1205,6 +1256,18 @@ impl PanelUi {
         self.order = order;
         self.ensure_open_valid();
         self.recall_width();
+    }
+
+    pub fn apply_config(&mut self, cfg: &thegn_core::config::Config) {
+        self.off = off_sections(cfg, crate::channel_state::current());
+        self.set_order(resolve_order(cfg));
+    }
+
+    pub fn off_reason(&self, section: Section) -> Option<&'static str> {
+        self.off
+            .iter()
+            .find(|(candidate, _)| *candidate == section)
+            .map(|(_, reason)| *reason)
     }
 
     /// Switch to a different top-level tab; snaps `open` to the first section
@@ -1579,19 +1642,14 @@ pub fn accordion_key(key: &KeyCode, mods: Modifiers, ui: &PanelUi) -> Option<Pan
         // Full. (Commits row-mode never sees this: its git table claims `E`
         // first for edit-rebase.)
         KeyCode::Char('E') => return Some(PanelMsg::ShrinkExpand),
-        KeyCode::Char(c @ '1'..='9') if !alt => {
-            let idx = (*c as usize) - ('1' as usize);
-            let tab_secs = ui.tab_sections();
-            if let Some(&s) = tab_secs.get(idx) {
-                return Some(PanelMsg::Open(s));
-            }
-        }
-        // `0` = the 10th section: the Work and System tabs both hold ten, and
-        // the section headers number them 1..10 — without this the advertised
-        // `10` jump had no key.
-        KeyCode::Char('0') if !alt => {
-            if let Some(&s) = ui.tab_sections().get(9) {
-                return Some(PanelMsg::Open(s));
+        KeyCode::Char(c) if !alt => {
+            let index = match c {
+                '1'..='9' => Some((*c as usize) - ('1' as usize)),
+                '0' => Some(9),
+                _ => None,
+            };
+            if let Some(section) = index.and_then(|i| ui.tab_sections().get(i).copied()) {
+                return Some(PanelMsg::Open(section));
             }
         }
         _ => {}
@@ -1685,8 +1743,16 @@ mod tests {
     #[test]
     fn resolve_order_reorders_hides_and_survives_junk() {
         let mut cfg = thegn_core::config::Config::default();
-        // Empty (the default) → the built-in order, all sections visible.
-        assert_eq!(resolve_order(&cfg), SECTION_ORDER.to_vec());
+        // The gated default omits disabled PrQueue and Media sections.
+        let expected: Vec<_> = SECTION_ORDER
+            .iter()
+            .copied()
+            .filter(|section| !matches!(section, Section::PrQueue | Section::Media))
+            .collect();
+        assert_eq!(
+            resolve_order_in(&cfg, thegn_core::channel::Channel::Dev),
+            expected
+        );
         // A custom list reorders; omitted sections are hidden; unknown keys
         // and duplicates are ignored. Old "prs" alias still resolves.
         cfg.panel.sections = vec!["prs".into(), "nope".into(), "changes".into(), "prs".into()];
@@ -1696,7 +1762,10 @@ mod tests {
         assert_eq!(resolve_order(&cfg), vec![Section::Pr, Section::Changes]);
         // All-junk lists fall back to the built-in order (never empty).
         cfg.panel.sections = vec!["bogus".into()];
-        assert_eq!(resolve_order(&cfg), SECTION_ORDER.to_vec());
+        assert_eq!(
+            resolve_order_in(&cfg, thegn_core::channel::Channel::Dev),
+            expected
+        );
     }
 
     #[test]
@@ -2375,5 +2444,112 @@ mod tests {
         assert_eq!(fp.path, "README.md");
         assert!(fp.lines.is_empty());
         assert!(fp.error.is_none());
+    }
+    #[test]
+    fn prq_hidden_when_disabled_unless_listed() {
+        use thegn_core::channel::Channel;
+        let mut cfg = thegn_core::config::Config::default();
+        let order = resolve_order_in(&cfg, Channel::Dev);
+        assert!(!order.contains(&Section::PrQueue));
+        cfg.panel.sections = vec!["prq".into(), "mine".into()];
+        assert_eq!(
+            resolve_order_in(&cfg, Channel::Dev),
+            vec![Section::PrQueue, Section::Mine]
+        );
+        assert_eq!(
+            off_sections(&cfg, Channel::Dev),
+            vec![(Section::PrQueue, "off — set [pr_queue] enabled = true",)]
+        );
+    }
+
+    #[test]
+    fn hosts_and_envs_hidden_on_stable() {
+        use thegn_core::channel::Channel;
+        let cfg = thegn_core::config::Config::default();
+        let stable = resolve_order_in(&cfg, Channel::Stable);
+        assert!(!stable.contains(&Section::Hosts));
+        assert!(!stable.contains(&Section::Environments));
+        let dev = resolve_order_in(&cfg, Channel::Dev);
+        assert!(dev.contains(&Section::Hosts));
+        assert!(dev.contains(&Section::Environments));
+    }
+
+    #[test]
+    fn no_printed_number_exceeds_ten() {
+        use thegn_core::channel::Channel;
+        let cfg = thegn_core::config::Config {
+            pr_queue: thegn_core::config::PrQueueConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let order = resolve_order_in(&cfg, Channel::Dev);
+        for tab in [
+            PanelTab::Git,
+            PanelTab::Work,
+            PanelTab::System,
+            PanelTab::Help,
+        ] {
+            let sections: Vec<_> = order
+                .iter()
+                .copied()
+                .filter(|section| section.tab() == tab)
+                .collect();
+            let ui = PanelUi {
+                tab,
+                order: order.clone(),
+                ..Default::default()
+            };
+            for (index, section) in sections.iter().enumerate() {
+                if let Some(digit) = section_digit(index) {
+                    assert_eq!(
+                        accordion_key(&KeyCode::Char(digit), Modifiers::NONE, &ui),
+                        Some(PanelMsg::Open(*section))
+                    );
+                }
+            }
+        }
+        let defaults = resolve_order_in(&thegn_core::config::Config::default(), Channel::Dev);
+        for tab in [
+            PanelTab::Git,
+            PanelTab::Work,
+            PanelTab::System,
+            PanelTab::Help,
+        ] {
+            assert!(
+                defaults
+                    .iter()
+                    .filter(|section| section.tab() == tab)
+                    .count()
+                    <= 10
+            );
+        }
+    }
+
+    #[test]
+    fn keys_is_numbered_with_media_and_usage_on() {
+        let cfg = thegn_core::config::Config {
+            media: thegn_core::config::MediaConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            pr_queue: thegn_core::config::PrQueueConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let system: Vec<_> = resolve_order_in(&cfg, thegn_core::channel::Channel::Dev)
+            .into_iter()
+            .filter(|section| section.tab() == PanelTab::System)
+            .collect();
+        assert!(
+            system
+                .iter()
+                .position(|section| *section == Section::Keys)
+                .unwrap()
+                < 10
+        );
     }
 }

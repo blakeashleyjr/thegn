@@ -608,7 +608,6 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
             _ => vec![seg(g(), "not run")],
         },
-        Section::Debug => vec![seg(g2(), "○ idle")],
         Section::Sandbox => {
             // Summarise the ACTIVE worktree's sandbox — the same match the
             // body uses. The old "any of our containers anywhere" check lit
@@ -635,7 +634,6 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 }
             }
         }
-        Section::Db => vec![seg(g2(), "—")],
         Section::Hosts => hosts::summary(model),
         Section::Environments => environments::summary(model),
         Section::Telemetry => {
@@ -888,6 +886,12 @@ fn compact_count(n: u64) -> String {
 
 /// A section's content rows for the current view.
 pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
+    if let Some(reason) = ctx.ui.off_reason(section) {
+        return vec![PanelRow::plain(Line::segs(vec![seg(
+            g2(),
+            format!("{} is off: {reason}", section.label()),
+        )]))];
+    }
     match section {
         Section::Changes => changes::content(ctx),
         Section::Commits => commits::content(ctx),
@@ -902,13 +906,11 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Jobs => tasks::content(ctx),
         Section::Tests => misc::tests(ctx),
         Section::Symbols => symbols::content(ctx),
-        Section::Debug => misc::debug(),
         Section::Sandbox => misc::sandbox(ctx),
         Section::Hosts => hosts::content(ctx),
         Section::Environments => environments::content(ctx),
         Section::Share => misc::share(ctx),
         Section::Forward => misc::forward(ctx),
-        Section::Db => misc::db(),
         Section::Telemetry => telemetry::content(ctx),
         Section::Keys => keys::content(ctx),
         Section::Help => help::content(ctx),
@@ -958,7 +960,7 @@ fn rail_row_count(ui: &PanelUi, cols: usize) -> usize {
     let mut rows = 0;
     let mut x = 1usize;
     for (i, label) in visible.iter().enumerate() {
-        let entry_width = (i + 1).to_string().len() + 1 + label.chars().count();
+        let entry_width = crate::panel::section_digit(i).map_or(0, |_| 2) + label.chars().count();
         let separator_width = if x > 1 { 3 } else { 0 };
         if x + separator_width + entry_width > cols.saturating_sub(1) && x > 1 {
             rows += 1;
@@ -1998,6 +2000,29 @@ mod spec {
     }
 
     #[test]
+    fn off_section_renders_banner_only() {
+        let m = model();
+        let reason = "off — set [pr_queue] enabled = true";
+        let u = PanelUi {
+            off: vec![(Section::PrQueue, reason)],
+            ..ui(PanelWidth::Normal, Section::PrQueue)
+        };
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 39,
+            rows: 28,
+        };
+        let rows = content(Section::PrQueue, &ctx);
+        assert_eq!(rows.len(), 1);
+        assert!(text(&rows).contains(reason));
+        assert!(
+            rows.iter()
+                .all(|row| !matches!(row.hit, Some(PanelHit::Row(_, _))))
+        );
+    }
+
+    #[test]
     fn every_section_renders_three_distinct_views() {
         for section in crate::panel::SECTION_ORDER {
             let n = render(section, PanelWidth::Normal);
@@ -2006,18 +2031,14 @@ mod spec {
             assert!(!n.is_empty(), "{section:?} normal");
             assert!(!h.is_empty(), "{section:?} half");
             assert!(!f.is_empty(), "{section:?} full");
-            // Debug/Db are dead-code placeholder sections — distinctness is
-            // waived, as is PrQueue (a flat list whose empty/default render has
-            // no width-specific full view). Changes' accordion body is
+            // PrQueue is a flat list whose empty/default render has no
+            // width-specific full view. Changes' accordion body is
             // Half == Full by design: the production Full view is the
             // git-family frame (`gitfull`), not this renderer. Everything else
             // — including the once-waived logs/share/forward/merge-queue/across
             // /sandbox — now renders a real list+detail Full body over the
             // populated fixture.
-            if matches!(
-                section,
-                Section::Debug | Section::Db | Section::Changes | Section::PrQueue
-            ) {
+            if matches!(section, Section::Changes | Section::PrQueue) {
                 continue;
             }
             assert_ne!(n, f, "{section:?}: normal vs full");
