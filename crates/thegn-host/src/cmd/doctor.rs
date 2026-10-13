@@ -1178,25 +1178,24 @@ fn system_metrics_json(cfg: &Config) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
-fn network_path_json(selection: &thegn_metrics::MediumSelection) -> serde_json::Value {
-    let medium = match selection.medium {
+fn medium_word(medium: thegn_metrics::NetMedium) -> &'static str {
+    match medium {
         thegn_metrics::NetMedium::Ethernet => "ethernet",
         thegn_metrics::NetMedium::Wifi => "wifi",
         thegn_metrics::NetMedium::Unknown => "generic",
-    };
+    }
+}
+
+fn network_path_json(selection: &thegn_metrics::MediumSelection) -> serde_json::Value {
     serde_json::json!({
-        "medium": medium,
+        "medium": medium_word(selection.medium),
         "interface": selection.iface.as_deref(),
         "reason": selection.reason.word(),
     })
 }
 
 fn network_path_report(selection: &thegn_metrics::MediumSelection) {
-    let medium = match selection.medium {
-        thegn_metrics::NetMedium::Ethernet => "ethernet",
-        thegn_metrics::NetMedium::Wifi => "wifi",
-        thegn_metrics::NetMedium::Unknown => "generic",
-    };
+    let medium = medium_word(selection.medium);
     if let Some(iface) = &selection.iface {
         outln!(
             "  net path      {medium} via {iface} ({})",
@@ -4016,6 +4015,13 @@ fn summary(c: &TermCaps) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn medium_word_maps_each_network_medium() {
+        assert_eq!(medium_word(thegn_metrics::NetMedium::Ethernet), "ethernet");
+        assert_eq!(medium_word(thegn_metrics::NetMedium::Wifi), "wifi");
+        assert_eq!(medium_word(thegn_metrics::NetMedium::Unknown), "generic");
+    }
 
     #[test]
     fn network_path_json_explains_selected_interface_and_fallback() {

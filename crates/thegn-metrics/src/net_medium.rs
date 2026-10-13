@@ -145,7 +145,9 @@ fn is_physical(medium: NetMedium) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{IfaceFact, MediumReason, NetMedium, select_medium, select_medium_explained};
+    use super::{
+        IfaceFact, MediumReason, MediumSelection, NetMedium, select_medium, select_medium_explained,
+    };
 
     fn fact(name: &str, medium: NetMedium, up: bool, default_route: bool) -> IfaceFact {
         IfaceFact {
@@ -298,7 +300,7 @@ mod tests {
         }
         assert_eq!(
             MediumSelection::probe_unavailable(),
-            super::MediumSelection {
+            MediumSelection {
                 medium: NetMedium::Unknown,
                 iface: None,
                 reason: MediumReason::ProbeUnavailable,
