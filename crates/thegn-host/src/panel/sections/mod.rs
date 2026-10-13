@@ -1084,6 +1084,16 @@ pub fn scroll_extent(
                     .as_ref()
                     .map(|(_, text)| text.lines().count().saturating_sub(1))
                     .unwrap_or(0)
+            } else if matches!(
+                ui.git.focus,
+                super::gitui::GitView::CommitFiles | super::gitui::GitView::PatchBuilding
+            ) {
+                ui.git
+                    .commit_files
+                    .get(ui.git.cur.commit_files)
+                    .and_then(|(path, _, _)| ui.git.patch_docs.get(path))
+                    .map(|doc| doc.diff.lines().count().saturating_sub(1))
+                    .unwrap_or(0)
             } else {
                 ui.git
                     .commit_show

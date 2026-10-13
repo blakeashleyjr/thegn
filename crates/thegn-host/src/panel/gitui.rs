@@ -312,8 +312,13 @@ pub struct GitUi {
     /// Every patch doc fetched this flow, by path — custom-patch rendering
     /// needs the diff of EVERY marked file, not just the one on screen.
     pub patch_docs: std::collections::HashMap<String, StageDocState>,
+    /// Failed per-file commit diffs, keyed by commit sha and path.
+    pub patch_failed: std::collections::HashMap<(String, String), String>,
+    pub patch_selected_path: Option<String>,
     pub commit_show: Option<(CommitDetailKey, std::result::Result<String, String>)>,
     pub commit_show_key: Option<CommitDetailKey>,
+    /// Selection used solely to reset the cursor-follow detail scroll.
+    pub commit_scroll_key: Option<CommitDetailKey>,
     /// Acceptance cutoff for arriving git-op results (same idiom as
     /// `hunks_gen`).
     pub op_gen: u64,
@@ -371,10 +376,14 @@ impl GitUi {
         self.drilled_commit = None;
         self.commit_files.clear();
         self.commit_files_load = DocLoad::Pending;
+        self.patch_docs.clear();
+        self.patch_failed.clear();
+        self.patch_selected_path = None;
         self.patch_doc = None;
         self.patch_load = DocLoad::Pending;
         self.commit_show = None;
         self.commit_show_key = None;
+        self.commit_scroll_key = None;
         self.blame_path = None;
         self.blame_rows.clear();
         self.blame_load = DocLoad::Pending;
@@ -534,6 +543,7 @@ impl GitUi {
     pub fn accept_patch_doc(
         &mut self,
         sha: &str,
+        path: &str,
         result: std::result::Result<StageDocState, String>,
     ) -> bool {
         if self.drilled_commit.as_deref() != Some(sha) {
@@ -541,10 +551,17 @@ impl GitUi {
         }
         let state = match result {
             Ok(state) => {
+                if state.path != path {
+                    return false;
+                }
+                self.patch_failed
+                    .remove(&(sha.to_string(), path.to_string()));
                 self.patch_load = DocLoad::Ready;
                 state
             }
             Err(error) => {
+                self.patch_failed
+                    .insert((sha.to_string(), path.to_string()), error.clone());
                 self.patch_doc = None;
                 self.patch_load = DocLoad::Failed(error);
                 return true;
@@ -640,11 +657,21 @@ impl GitUi {
 
     pub fn click_drill_row(&mut self, index: usize) {
         match self.focus {
-            GitView::CommitFiles => self.cur.commit_files = index,
-            GitView::Blame => self.blame_cursor = index,
+            GitView::CommitFiles => {
+                self.cur.commit_files = index.min(self.commit_files.len().saturating_sub(1));
+            }
+            GitView::Blame => {
+                self.blame_cursor = index.min(self.blame_rows.len().saturating_sub(1));
+            }
             GitView::Staging | GitView::PatchBuilding => {
                 if let Some(staging) = self.staging.as_mut() {
-                    staging.cursor = index;
+                    let doc = match self.focus {
+                        GitView::Staging => self.stage_doc.as_ref(),
+                        _ => self.patch_doc.as_ref(),
+                    };
+                    staging.cursor = doc
+                        .map(|state| staging::clamp_cursor(&state.doc, index))
+                        .unwrap_or(0);
                     staging.anchor = None;
                 }
             }
@@ -688,11 +715,15 @@ impl GitUi {
             }
             GitView::CommitFiles => {
                 let max = self.commit_files.len().saturating_sub(1);
+                let previous = self.cur.commit_files;
                 self.cur.commit_files = if down {
                     (self.cur.commit_files + 1).min(max)
                 } else {
                     self.cur.commit_files.saturating_sub(1)
                 };
+                if self.cur.commit_files != previous {
+                    self.patch_doc = None;
+                }
             }
             _ => {}
         }
@@ -1395,10 +1426,7 @@ pub fn git_key(key: &KeyCode, mods: Modifiers, ui: &crate::panel::PanelUi) -> Op
         // the width it needs and let it widen-and-perform. Keys whose effect
         // is width-independent (staging the row, the commit / discard modals)
         // execute at every width without widening.
-        PanelWidth::Normal
-            if (msg == GitMsg::Drill && matches!(view, GitView::Branches | GitView::Stash))
-                || (!is_navigation(&msg) && !works_at_normal(&msg)) =>
-        {
+        PanelWidth::Normal if !is_navigation(&msg) && !works_at_normal(&msg) => {
             let want = if needs_full(&msg) {
                 PanelWidth::Full
             } else {
@@ -1696,6 +1724,23 @@ mod tests {
         git.step_view_cursor(false);
         git.step_view_cursor(false); // clamps at 0
         assert_eq!(git.cur.commit_files, 0);
+    }
+
+    #[test]
+    fn click_drill_row_clamps_list_and_diff_cursors() {
+        let mut git = GitUi {
+            focus: GitView::CommitFiles,
+            commit_files: vec![("a.rs".into(), 1, 0)],
+            ..Default::default()
+        };
+        git.click_drill_row(99);
+        assert_eq!(git.cur.commit_files, 0);
+
+        git.focus = GitView::PatchBuilding;
+        git.staging = Some(StagingUi::new("a.rs"));
+        git.patch_doc = Some(StageDocState::default());
+        git.click_drill_row(99);
+        assert_eq!(git.staging.as_ref().map(|st| st.cursor), Some(0));
     }
 
     #[test]
@@ -2282,8 +2327,24 @@ mod tests {
             path: "stale.rs".into(),
             ..Default::default()
         };
-        assert!(!git.accept_patch_doc("A", Ok(state)));
+        assert!(!git.accept_patch_doc("A", "new.rs", Ok(state)));
         assert!(git.patch_docs.is_empty());
+    }
+
+    #[test]
+    fn patch_failure_is_retained_for_its_commit_and_path() {
+        let mut git = GitUi {
+            drilled_commit: Some("A".into()),
+            ..Default::default()
+        };
+        assert!(git.accept_patch_doc("A", "a.rs", Err("git show failed".into())));
+        assert_eq!(
+            git.patch_failed
+                .get(&("A".into(), "a.rs".into()))
+                .map(String::as_str),
+            Some("git show failed")
+        );
+        assert!(!git.patch_failed.contains_key(&("B".into(), "a.rs".into())));
     }
 
     #[test]
@@ -2319,11 +2380,12 @@ mod tests {
     }
 
     #[test]
-    fn branches_and_stash_enter_widens_at_normal() {
+    fn branches_and_stash_enter_dispatches_drill_at_normal() {
         for view in [GitView::Branches, GitView::Stash] {
             let ui = ui_at(view, PanelWidth::Normal);
-            assert!(
-                matches!(git_key(&KeyCode::Enter, Modifiers::NONE, &ui), Some(GitMsg::WidthBlocked(inner, PanelWidth::Half)) if *inner == GitMsg::Drill)
+            assert_eq!(
+                git_key(&KeyCode::Enter, Modifiers::NONE, &ui),
+                Some(GitMsg::Drill)
             );
         }
     }
