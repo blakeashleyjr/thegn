@@ -700,6 +700,13 @@ mod tests {
         RebaseOpts::default()
     }
 
+    fn flock_available() -> bool {
+        std::process::Command::new("sh")
+            .args(["-c", "command -v flock >/dev/null 2>&1"])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
     /// File names in HEAD's tree.
     fn tree(r: &TestRepo) -> String {
         r.out(&["ls-tree", "--name-only", "HEAD"])
@@ -1301,6 +1308,9 @@ mod tests {
 
     #[test]
     fn remote_todo_rewrite_refuses_a_symlink_without_touching_its_target() {
+        if !flock_available() {
+            return;
+        }
         let r = linear("edit-remote-symlink-todo");
         let c2 = r.sha_of("c2");
         assert_eq!(
@@ -1344,6 +1354,9 @@ mod tests {
 
     #[test]
     fn checked_provider_todo_rewrite_publishes_when_exact_bytes_match() {
+        if !flock_available() {
+            return;
+        }
         let r = linear("checked-provider-todo-rewrite");
         let c2 = r.sha_of("c2");
         assert_eq!(
