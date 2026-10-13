@@ -34,6 +34,7 @@ pub struct NotificationsConfig {
     pub surface_self_log_errors: bool,
     pub github_mentions: bool,
     pub agent_attention_inbox: bool,
+    /// Show merge-queue hold notifications on desktop and other transient sinks.
     pub merge_queue_hold_desktop: bool,
     #[serde(default = "default_agent_error_signatures")]
     pub agent_error_signatures: Vec<String>,

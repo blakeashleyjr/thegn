@@ -310,4 +310,9 @@ changes elsewhere.
 
 The full sidebar token and optional `mq` widget show queue depth; the _merge_
 section lists entries with their gate state. Failures surface as
-notifications. E2E baselines are not re-recorded for this behavior change.
+notifications. Deferred and red-gate holds create inbox-only `queue_held`
+notices, while bookkeeping or persistence failures create inbox-only
+`queue_needs_human` entries. Set `[notifications] merge_queue_hold_desktop = true`
+(`THEGN_NOTIFICATIONS_MERGE_QUEUE_HOLD_DESKTOP`) to include these notices in
+desktop notifications, toasts, sound, and push. E2E baselines are not re-recorded
+for this behavior change.

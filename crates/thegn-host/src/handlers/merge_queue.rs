@@ -572,7 +572,7 @@ fn step_notification(
         MqStatus::Deferred => Some((
             NotificationKind::QueueHeld,
             format!(
-                "merge queue: {branch} deferred (conflict, not landed): {}",
+                "merge queue: {branch} deferred (not landed): {}",
                 bounded_headline(detail)
             ),
         )),
@@ -1678,7 +1678,7 @@ mod tests {
                     ),
                     MqStatus::Deferred => assert_eq!(
                         message,
-                        "merge queue: feature deferred (conflict, not landed): reason"
+                        "merge queue: feature deferred (not landed): reason"
                     ),
                     MqStatus::GateFailed => assert_eq!(
                         message,
