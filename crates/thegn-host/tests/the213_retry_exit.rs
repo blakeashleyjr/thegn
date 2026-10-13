@@ -68,7 +68,7 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env("XDG_STATE_HOME", self.root.path().join("state"))
             .env("XDG_RUNTIME_DIR", self.root.path().join("runtime"))
-            .env("TMPDIR", self.root.path().join("tmp"))
+            .env("TMPDIR", self.root.path())
             .env("THEGN_NO_MIGRATE", "1")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env_remove("THEGN_LOG")
