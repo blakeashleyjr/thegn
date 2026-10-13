@@ -12,8 +12,13 @@
 //!   host translates termwiz into these, the standalone harness translates
 //!   crossterm.
 //! - [`Theme`] — semantic tokens → sRGB, with [`Theme::prism`] defaults that
-//!   mirror thegn's chrome palette and a tolerant config loader so a
-//!   standalone binary picks up the user's thegn theme.
+//!   mirror thegn's chrome palette. [`Theme::load_thegn_config_checked`] reads
+//!   only XDG `thegn/config.toml`, with a 256 KiB limit and regular-file check,
+//!   and returns a typed [`theme::ThemeLoad`] outcome distinguishing selected Prism
+//!   from fallback cases. Named presets resolve exactly only with the
+//!   `host-presets` feature. It does not read `--config`, `THEGN_*`,
+//!   `THEGN_PROFILE`, or local user themes; use [`Theme::load_from_path`] for
+//!   an explicit file.
 //! - `standalone::run` (feature `standalone`) — a ~zero-idle crossterm loop
 //!   that shrinks each app's `main` to a few lines.
 //!
