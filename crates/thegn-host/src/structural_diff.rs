@@ -292,6 +292,7 @@ mod tests {
     }
 
     fn git(dir: &tempfile::TempDir, args: &[&str]) {
+        #[expect(clippy::disallowed_methods, reason = "test fixture git command")]
         let output = thegn_core::util::git_cmd(dir.path())
             .args(["-c", "commit.gpgsign=false"])
             .args(args)
