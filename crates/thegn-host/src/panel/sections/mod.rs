@@ -937,6 +937,70 @@ pub struct ScrollExtent {
     pub owns_nav: bool,
 }
 
+/// The estimated body height shared by rendering and scroll routing.
+pub fn scroll_viewport(ui: &PanelUi, rows: usize) -> usize {
+    if ui.width == crate::layout::PanelWidth::Full {
+        rows.saturating_sub(1 + 4 + 1 + 2)
+    } else {
+        rows.saturating_sub(1 + 4 + ui.visible_section_count() + 2)
+    }
+}
+
+pub fn scroll_moves(ext: ScrollExtent, up: bool, scroll: usize) -> bool {
+    if up { scroll > 0 } else { scroll < ext.max }
+}
+
+/// Apply one body-scroll key, returning the clamped target when the key belongs
+/// to this scroll extent.
+pub fn scroll_step(
+    ext: ScrollExtent,
+    key: &termwiz::input::KeyCode,
+    mods: termwiz::input::Modifiers,
+    scroll: usize,
+    page: usize,
+) -> Option<usize> {
+    let amount = match *key {
+        termwiz::input::KeyCode::PageDown if mods.is_empty() => page,
+        termwiz::input::KeyCode::PageUp if mods.is_empty() => page,
+        termwiz::input::KeyCode::Char('d') if mods == termwiz::input::Modifiers::CTRL => {
+            (page / 2).max(1)
+        }
+        termwiz::input::KeyCode::Char('u') if mods == termwiz::input::Modifiers::CTRL => {
+            (page / 2).max(1)
+        }
+        termwiz::input::KeyCode::Home if mods.is_empty() && ext.owns_nav => {
+            return Some(0);
+        }
+        termwiz::input::KeyCode::End if mods.is_empty() && ext.owns_nav => {
+            return Some(ext.max);
+        }
+        termwiz::input::KeyCode::Char('g') if mods.is_empty() && ext.owns_nav => {
+            return Some(0);
+        }
+        termwiz::input::KeyCode::Char('G')
+            if !mods.contains(termwiz::input::Modifiers::CTRL)
+                && !mods.contains(termwiz::input::Modifiers::ALT)
+                && ext.owns_nav =>
+        {
+            return Some(ext.max);
+        }
+        termwiz::input::KeyCode::Char('j') if mods.is_empty() && ext.owns_nav => 1,
+        termwiz::input::KeyCode::Char('k') if mods.is_empty() && ext.owns_nav => 1,
+        _ => return None,
+    };
+    let up = matches!(
+        *key,
+        termwiz::input::KeyCode::PageUp
+            | termwiz::input::KeyCode::Char('u')
+            | termwiz::input::KeyCode::Char('k')
+    );
+    if up {
+        Some(scroll.min(ext.max).saturating_sub(amount))
+    } else {
+        Some(scroll.saturating_add(amount).min(ext.max))
+    }
+}
+
 /// Returns the viewport's maximum scroll and whether it owns j/k and g/G.
 pub fn scroll_extent(
     section: Section,
@@ -948,16 +1012,21 @@ pub fn scroll_extent(
     let ctx = SectionCtx {
         model,
         ui,
-        cols,
+        cols: cols.saturating_sub(if ui.width == crate::layout::PanelWidth::Full {
+            2
+        } else {
+            3
+        }),
         rows,
     };
+    let viewport = scroll_viewport(ui, rows);
     match section {
         Section::Help => Some(ScrollExtent {
-            max: help::line_count(&ctx).saturating_sub(rows.saturating_sub(2)),
+            max: help::line_count(&ctx).saturating_sub(viewport.saturating_sub(2)),
             owns_nav: true,
         }),
         Section::Telemetry => Some(ScrollExtent {
-            max: telemetry::row_count(&ctx).saturating_sub(rows),
+            max: telemetry::row_count(&ctx).saturating_sub(viewport.saturating_sub(1)),
             owns_nav: true,
         }),
         Section::Keys

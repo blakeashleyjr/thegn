@@ -15236,6 +15236,7 @@ async fn event_loop<T: Terminal>(
                             pc,
                             pr,
                         ) && ext.owns_nav
+                            && crate::panel::sections::scroll_moves(ext, up, panel_ui.scroll)
                         {
                             let (ticks, leftover) = drain_wheel_ticks(up, || {
                                 pending_input.pop_front().or_else(|| {
@@ -19209,8 +19210,17 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                let paging_key = matches!(
+                    k.key,
+                    KeyCode::PageDown
+                        | KeyCode::PageUp
+                        | KeyCode::Home
+                        | KeyCode::End
+                        | KeyCode::Char('d' | 'u' | 'g' | 'G')
+                );
                 if forced_palette_action.is_none()
                     && focus.panel()
+                    && paging_key
                     && let Some(ext) = crate::panel::sections::scroll_extent(
                         panel_ui.open,
                         &model,
@@ -19220,63 +19230,41 @@ async fn event_loop<T: Terminal>(
                     )
                 {
                     let (_, rows) = panel_geom(&chrome);
-                    let page = rows.saturating_sub(2).max(1);
-                    let step = match k.key {
-                        KeyCode::PageDown if k.modifiers.is_empty() => Some(page as isize),
-                        KeyCode::PageUp if k.modifiers.is_empty() => Some(-(page as isize)),
-                        KeyCode::Char('d') if k.modifiers == Modifiers::CTRL => {
-                            Some((page / 2).max(1) as isize)
-                        }
-                        KeyCode::Char('u') if k.modifiers == Modifiers::CTRL => {
-                            Some(-((page / 2).max(1) as isize))
-                        }
-                        _ => None,
-                    };
-                    let mut handled = step.is_some();
-                    if ext.owns_nav {
-                        match k.key {
-                            KeyCode::Home if k.modifiers.is_empty() => {
-                                panel_ui.scroll = 0;
-                                handled = true;
+                    let page = crate::panel::sections::scroll_viewport(&panel_ui, rows).max(1);
+                    if let Some(mut target) = crate::panel::sections::scroll_step(
+                        ext,
+                        &k.key,
+                        k.modifiers,
+                        panel_ui.scroll,
+                        page,
+                    ) {
+                        if matches!(
+                            k.key,
+                            KeyCode::PageDown | KeyCode::PageUp | KeyCode::Char('d' | 'u')
+                        ) {
+                            let (repeat, leftover) = drain_key_repeats(&k, || {
+                                pending_input.pop_front().or_else(|| {
+                                    buf.terminal()
+                                        .poll_input(Some(std::time::Duration::ZERO))
+                                        .ok()
+                                        .flatten()
+                                })
+                            });
+                            if let Some(ev) = leftover {
+                                pending_input.push_front(ev);
                             }
-                            KeyCode::End if k.modifiers.is_empty() => {
-                                panel_ui.scroll = ext.max;
-                                handled = true;
+                            for _ in 1..repeat {
+                                target = crate::panel::sections::scroll_step(
+                                    ext,
+                                    &k.key,
+                                    k.modifiers,
+                                    target,
+                                    page,
+                                )
+                                .unwrap_or(target);
                             }
-                            KeyCode::Char('g') if k.modifiers.is_empty() => {
-                                panel_ui.scroll = 0;
-                                handled = true;
-                            }
-                            KeyCode::Char('G')
-                                if !k.modifiers.contains(Modifiers::CTRL)
-                                    && !k.modifiers.contains(Modifiers::ALT) =>
-                            {
-                                panel_ui.scroll = ext.max;
-                                handled = true;
-                            }
-                            _ => {}
                         }
-                    }
-                    if let Some(step) = step {
-                        let (repeat, leftover) = drain_key_repeats(&k, || {
-                            pending_input.pop_front().or_else(|| {
-                                buf.terminal()
-                                    .poll_input(Some(std::time::Duration::ZERO))
-                                    .ok()
-                                    .flatten()
-                            })
-                        });
-                        if let Some(ev) = leftover {
-                            pending_input.push_front(ev);
-                        }
-                        let delta = step.unsigned_abs().saturating_mul(repeat);
-                        panel_ui.scroll = if step < 0 {
-                            panel_ui.scroll.min(ext.max).saturating_sub(delta)
-                        } else {
-                            panel_ui.scroll.saturating_add(delta).min(ext.max)
-                        };
-                    }
-                    if handled {
+                        panel_ui.scroll = target;
                         dirty = true;
                         continue;
                     }
@@ -19510,12 +19498,29 @@ async fn event_loop<T: Terminal>(
                                     geom.0,
                                     geom.1,
                                 ) && ext.owns_nav
+                                    && crate::panel::sections::scroll_moves(
+                                        ext,
+                                        up,
+                                        panel_ui.scroll,
+                                    )
                                 {
-                                    panel_ui.scroll = if up {
-                                        panel_ui.scroll.min(ext.max).saturating_sub(repeat)
+                                    let key = if up {
+                                        KeyCode::Char('k')
                                     } else {
-                                        panel_ui.scroll.saturating_add(repeat).min(ext.max)
+                                        KeyCode::Char('j')
                                     };
+                                    let mut target = panel_ui.scroll;
+                                    for _ in 0..repeat {
+                                        target = crate::panel::sections::scroll_step(
+                                            ext,
+                                            &key,
+                                            Modifiers::NONE,
+                                            target,
+                                            1,
+                                        )
+                                        .unwrap_or(target);
+                                    }
+                                    panel_ui.scroll = target;
                                     dirty = true;
                                     continue;
                                 }
