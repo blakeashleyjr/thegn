@@ -6794,6 +6794,8 @@ async fn event_loop<T: Terminal>(
     // killed run's `wait()` wakeup deregisters the LIVE run's process group and
     // Stop ('s') silently no-ops.
     let mut named_task_generation: u64 = 0;
+    let mut latest_job_generation: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
     let mut loaded_tests_worktree = active_tab_path(&session).to_string_lossy().into_owned();
     let mut test_cache_load = run_test_cache::TestCacheLoad::default();
     run_test_cache::spawn_test_cache_load(
@@ -9741,15 +9743,22 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
         // Named task (Tasks section) run outcomes.
-        let active_task_wt = active_tab_path(&session).to_string_lossy().into_owned();
+        let active_task_wt = active_tests_wt.as_str();
         while let Ok(outcome) = named_task_run_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Other);
+            if crate::task::job_outcome_is_stale(
+                latest_job_generation.get(&outcome.task.name).copied(),
+                outcome.generation,
+            ) {
+                tracing::debug!(target: "thegn::tasks", task = %outcome.task.name, generation = outcome.generation, latest = ?latest_job_generation.get(&outcome.task.name), "dropped stale job outcome");
+                continue;
+            }
             // Gate on the outcome's worktree (audit run.rs:8081): a task that
             // finishes AFTER the user switched worktrees must not inject its
             // (worktree-A-relative) diagnostics + run record into worktree B's
             // panel. The sibling test-runner drain gates the same way. Drop the
             // mismatch — its state is per-worktree and re-derived on return.
-            if !active_task_wt.is_empty() && outcome.worktree != active_task_wt {
+            if !active_task_wt.is_empty() && outcome.worktree.as_str() != active_task_wt {
                 continue;
             }
             let elapsed_s = outcome.duration_ms as f64 / 1000.0;
@@ -9916,7 +9925,6 @@ async fn event_loop<T: Terminal>(
         }
         // Run results: the latest run upserts each reported test's status while
         // leaving other tests' most-recent status intact.
-        let active_tests_wt = active_tab_path(&session).to_string_lossy().into_owned();
         let ready_runs = if test_cache_load.is_pending(&active_tests_wt) {
             Vec::new()
         } else {
@@ -9935,10 +9943,6 @@ async fn event_loop<T: Terminal>(
                 test_cache_load.is_pending(&active_tests_wt),
             ) {
                 run_test_cache::OutcomeDisposition::Apply => {
-                    if test_cache_load.is_pending(&outcome.worktree) {
-                        deferred_test_runs.push(outcome);
-                        continue;
-                    }
                     panel_ui.tests.running = false;
                     panel_ui.tests.summary.running = false;
                     panel_ui.tests.task = Some(outcome.task.clone());
@@ -19834,6 +19838,8 @@ async fn event_loop<T: Terminal>(
                                                     let limits2 = keymap.config().limits.clone();
                                                     named_task_generation += 1;
                                                     let run_gen = named_task_generation;
+                                                    latest_job_generation
+                                                        .insert(task.name.clone(), run_gen);
                                                     tokio::task::spawn_blocking(move || {
                                                         let loc =
                                                             thegn_core::remote::GitLoc::for_worktree(
@@ -20399,6 +20405,7 @@ async fn event_loop<T: Terminal>(
                                     let limits2 = keymap.config().limits.clone();
                                     named_task_generation += 1;
                                     let run_gen = named_task_generation;
+                                    latest_job_generation.insert(task.name.clone(), run_gen);
                                     tokio::task::spawn_blocking(move || {
                                         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
                                         let outcome = crate::task::run_job(

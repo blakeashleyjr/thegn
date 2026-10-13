@@ -100,6 +100,10 @@ pub(crate) fn spawn_test_cache_load(
     let worktree = worktree.to_owned();
     let tx = tx.clone();
     let waker = waker.clone();
+    let fallback_worktree = worktree.clone();
+    let fallback_tx = tx.clone();
+    let fallback_waker = waker.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     crate::db_task::persist(move |db| {
         let cache = load_test_cache(db, &worktree);
         if let Err(error) = tx.send((worktree, seq, cache)) {
@@ -107,6 +111,19 @@ pub(crate) fn spawn_test_cache_load(
         }
         if let Err(error) = waker.wake() {
             tracing::debug!(target: "thegn::db", %error, "test cache load wake failed");
+        }
+        if let Err(error) = done_tx.send(()) {
+            tracing::debug!(target: "thegn::db", %error, "test cache load completion receiver is gone");
+        }
+    });
+    tokio::spawn(async move {
+        if done_rx.await.is_err() {
+            if let Err(error) = fallback_tx.send((fallback_worktree, seq, None)) {
+                tracing::debug!(target: "thegn::db", %error, "test cache load receiver is gone");
+            }
+            if let Err(error) = fallback_waker.wake() {
+                tracing::debug!(target: "thegn::db", %error, "test cache load wake failed");
+            }
         }
     });
 }
