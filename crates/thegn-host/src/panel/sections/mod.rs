@@ -30,7 +30,7 @@ pub(crate) mod notifications;
 mod pr_queue;
 mod problems;
 mod stash;
-mod symbols;
+pub(crate) mod symbols;
 mod tasks;
 mod telemetry;
 mod usage;

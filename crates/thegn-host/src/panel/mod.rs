@@ -824,6 +824,8 @@ pub struct PanelData {
     /// `file` is the repo-relative path the outline was computed for ("" = none).
     pub symbols_file: String,
     pub symbols: Vec<SymbolRow>,
+    /// Message for the last completed references request, including no-LSP.
+    pub symbols_note: String,
     /// Per-`[host.*]` display snapshots (hosts-as-resources): built off-loop
     /// from the config + DB by hydration, live-merged on the loop from
     /// `HostRuntime` after each drain. Feeds the `Hosts` section, the sidebar
@@ -1165,6 +1167,10 @@ pub struct PanelUi {
     /// When true, the Symbols section shows find-references results for the last
     /// selected symbol instead of the file outline (`r` toggles on, `o`/esc off).
     pub symbols_show_refs: bool,
+    /// The Symbols body is listing changed files for an explicit pick.
+    pub symbols_picker: bool,
+    /// Explicit file chosen with `f`; takes precedence over the focused editor.
+    pub symbols_pick: Option<String>,
     /// Row cursor within the Tasks section's list.
     pub tasks_cursor: usize,
     /// Active free-text filter query for the Issues section (`/` mode).
@@ -1221,6 +1227,8 @@ impl Default for PanelUi {
             problems_cursor: 0,
             symbols_cursor: 0,
             symbols_show_refs: false,
+            symbols_picker: false,
+            symbols_pick: None,
             tasks_cursor: 0,
             issues_filter: String::new(),
             issues_project_filter: None,
