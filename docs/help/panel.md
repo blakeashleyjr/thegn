@@ -225,7 +225,7 @@ failing sibling when there is one. History is behind the drill-in.
 
 {{keys:ci}}
 
-`↵` and `v` open the run's detail popup. The **f** action is available
+`v` (or Enter) opens the run's detail popup. The **f** action is available
 inside that popup, not as a panel key. The drill reads bounded, redacted
 job-log tails from the CI cache first and labels their source, age, truncation,
 and redaction state while a missing or stale entry is fetched off-loop. In
