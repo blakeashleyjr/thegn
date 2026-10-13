@@ -62,6 +62,10 @@ impl PendingCornerOob {
         self.delete_pending || self.draw.is_some()
     }
 
+    pub(crate) fn blocks_output(&self, visible: bool) -> bool {
+        self.delete_pending || (visible && self.draw.is_some())
+    }
+
     /// Retain the newest complete draw. Hidden draws wait until the corner is
     /// visible; every admission failure leaves the bytes here for a later wake.
     pub(crate) fn offer_draw(
@@ -172,9 +176,8 @@ impl PendingReadyMarker {
         if !self.pending || input_pending {
             return;
         }
-        match submit(MUSE_READY_MARKER.to_vec()) {
-            Ok(()) => self.pending = false,
-            Err(_) => {}
+        if submit(MUSE_READY_MARKER.to_vec()).is_ok() {
+            self.pending = false;
         }
     }
 
@@ -377,5 +380,26 @@ mod tests {
         slot.offer(Err);
         slot.cancel();
         assert!(!slot.is_pending());
+    }
+
+    #[test]
+    fn hidden_retained_corner_draw_does_not_block_ready_marker() {
+        let mut corner = PendingCornerOob::default();
+        corner.offer_draw(vec![1], false, Err);
+        assert!(corner.is_pending());
+        assert!(!corner.blocks_output(false));
+        assert!(corner.blocks_output(true));
+
+        let mut marker = PendingReadyMarker::default();
+        marker.offer(Err);
+        let submitted = RefCell::new(Vec::new());
+        if !corner.blocks_output(false) {
+            marker.retry(false, |bytes| {
+                submitted.borrow_mut().push(bytes);
+                Ok(())
+            });
+        }
+        assert_eq!(*submitted.borrow(), vec![MUSE_READY_MARKER.to_vec()]);
+        assert!(!marker.is_pending());
     }
 }
