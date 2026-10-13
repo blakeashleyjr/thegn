@@ -96,11 +96,10 @@ pub struct AppSlot {
     /// The last focus state told to the tile. The initial hidden state is
     /// recorded without sending a focus-loss callback.
     focus_told: Option<bool>,
+    /// The last dimensions delivered through `on_resize`.
+    last_size: Option<(u16, u16)>,
     /// The last rendered buffer, re-blitted on frames where the tile reported
     /// no change.
-    // Not read yet: the run loop re-renders the focused tile every frame rather
-    // than reusing this. Wiring it is the caching optimization, not a fix.
-    #[allow(dead_code)]
     pub last_buf: Option<Buffer>,
 }
 
@@ -112,6 +111,7 @@ impl AppSlot {
             state: SlotState::Unloaded,
             visible_told: None,
             focus_told: None,
+            last_size: None,
             last_buf: None,
         }
     }
@@ -337,6 +337,64 @@ impl AppHost {
         }
     }
 
+    /// Select a top-level tab. Visibility callbacks and cache invalidation are
+    /// synchronized by `sync_visibility` on the next loop turn.
+    pub fn set_active(&mut self, target: ActiveApp) {
+        self.active = target;
+    }
+
+    /// Deliver a key event to the active tile. Returns whether a tile owned it.
+    pub fn handle_active_input(&mut self, event: tg_kit::InputEvent) -> bool {
+        let ActiveApp::Tile(index) = self.active else {
+            return false;
+        };
+        let Some(slot) = self.slots.get_mut(index) else {
+            return true;
+        };
+        let Some(tile) = slot.state.tile_mut() else {
+            return true;
+        };
+        match tile.handle_input(event) {
+            tg_kit::InputResult::Ignored => {}
+            tg_kit::InputResult::Consumed => slot.last_buf = None,
+            tg_kit::InputResult::Exit => {
+                slot.last_buf = None;
+                self.active = ActiveApp::Work;
+            }
+        }
+        true
+    }
+
+    /// Render the active tile into its cached buffer, returning it for blitting.
+    /// `area` is the tile-local rectangle (origin zero) in the host surface.
+    pub fn render_active(&mut self, area: tg_kit::ratatui::layout::Rect) -> Option<&Buffer> {
+        let ActiveApp::Tile(index) = self.active else {
+            return None;
+        };
+        let slot = self.slots.get_mut(index)?;
+        let SlotState::Running(tile) = &mut slot.state else {
+            slot.last_buf = None;
+            slot.last_size = None;
+            return None;
+        };
+        let size = (area.width, area.height);
+        if slot.last_size != Some(size) {
+            tile.on_resize(size.0, size.1);
+            slot.last_size = Some(size);
+            slot.last_buf = None;
+        }
+        if slot.last_buf.is_none() || tile.wants_redraw() {
+            let buf = slot.last_buf.get_or_insert_with(|| Buffer::empty(area));
+            if buf.area == area {
+                buf.reset();
+            } else {
+                *buf = Buffer::empty(area);
+            }
+            tile.render(area, buf);
+        }
+        slot.last_buf.as_ref()
+    }
+
     /// Deliver a bracketed paste to the visible tile. An active tile owns the
     /// paste even when it is still loading, has failed, or ignores the event:
     /// allowing it to fall through could inject text into the hidden shell.
@@ -347,11 +405,13 @@ impl AppHost {
         let Some(slot) = self.slots.get_mut(index) else {
             return PasteRoute::Consumed;
         };
-        if let SlotState::Running(tile) = &mut slot.state
-            && tile.handle_input(tg_kit::InputEvent::Paste(text.to_owned()))
+        if let SlotState::Running(tile) = &mut slot.state {
+            slot.last_buf = None;
+            if tile.handle_input(tg_kit::InputEvent::Paste(text.to_owned()))
                 == tg_kit::InputResult::Exit
-        {
-            self.active = ActiveApp::Work;
+            {
+                self.active = ActiveApp::Work;
+            }
         }
         PasteRoute::Consumed
     }
@@ -367,12 +427,15 @@ impl AppHost {
             let SlotState::Running(tile) = &mut slot.state else {
                 slot.visible_told = None;
                 slot.focus_told = None;
+                slot.last_buf = None;
+                slot.last_size = None;
                 continue;
             };
             let visible = active == ActiveApp::Tile(i);
             if visible {
                 if slot.visible_told != Some(true) {
                     slot.visible_told = Some(true);
+                    slot.last_buf = None;
                     tile.on_visible(true);
                 }
                 if slot.focus_told != Some(true) {
@@ -405,6 +468,9 @@ impl AppHost {
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if let SlotState::Running(t) = &mut slot.state {
                 let changed = t.pump();
+                if changed {
+                    slot.last_buf = None;
+                }
                 if Some(i) == active_idx {
                     active_dirty |= changed;
                 }
@@ -1098,5 +1164,153 @@ mod tests {
         assert_eq!(host.route_paste("done"), PasteRoute::Consumed);
         assert_eq!(host.active, ActiveApp::Work);
         assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    struct CacheTile {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        redraw: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        pump_change: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        input_result: tg_kit::InputResult,
+    }
+
+    impl AppTile for CacheTile {
+        fn id(&self) -> &'static str {
+            "observe"
+        }
+        fn title(&self) -> String {
+            "Observe".into()
+        }
+        fn pump(&mut self) -> bool {
+            self.pump_change
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        }
+        fn wants_redraw(&self) -> bool {
+            self.redraw.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn handle_input(&mut self, _event: tg_kit::InputEvent) -> tg_kit::InputResult {
+            self.input_result
+        }
+        fn render(&mut self, area: tg_kit::ratatui::layout::Rect, buf: &mut Buffer) {
+            let mut events = self.events.lock().unwrap();
+            let count = events
+                .iter()
+                .filter(|event| event.starts_with("render:"))
+                .count()
+                + 1;
+            events.push(format!("render:{count}"));
+            if area.width > 0 && area.height > 0 {
+                buf.cell_mut((0, 0))
+                    .expect("test render area contains its origin")
+                    .set_symbol(&count.to_string());
+            }
+        }
+        fn on_resize(&mut self, cols: u16, rows: u16) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("resize:{cols}x{rows}"));
+        }
+    }
+
+    type CacheHost = (
+        AppHost,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    );
+
+    fn cache_host(input_result: tg_kit::InputResult) -> CacheHost {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let redraw = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pump_change = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut slot = AppSlot::new("observe", "Observe");
+        slot.state = SlotState::Running(Box::new(CacheTile {
+            events: events.clone(),
+            redraw: redraw.clone(),
+            pump_change: pump_change.clone(),
+            input_result,
+        }));
+        let mut host = AppHost::new(vec![slot]);
+        host.set_active(ActiveApp::Tile(0));
+        (host, events, redraw, pump_change)
+    }
+
+    #[test]
+    fn render_active_reuses_unchanged_buffer_and_honors_redraw_signal() {
+        let (mut host, events, redraw, _) = cache_host(tg_kit::InputResult::Ignored);
+        let area = tg_kit::ratatui::layout::Rect::new(0, 0, 4, 2);
+        let first = host.render_active(area).unwrap().clone();
+        let second = host.render_active(area).unwrap();
+        assert_eq!(*events.lock().unwrap(), vec!["resize:4x2", "render:1"]);
+        assert_eq!(&first, second);
+
+        redraw.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(host.render_active(area).is_some());
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["resize:4x2", "render:1", "render:2"]
+        );
+    }
+
+    #[test]
+    fn render_active_delivers_resize_once_and_renders_at_new_size() {
+        let (mut host, events, _, _) = cache_host(tg_kit::InputResult::Ignored);
+        let first = tg_kit::ratatui::layout::Rect::new(0, 0, 4, 2);
+        let resized = tg_kit::ratatui::layout::Rect::new(0, 0, 5, 3);
+        assert!(host.render_active(first).is_some());
+        assert!(host.render_active(resized).is_some());
+        assert!(host.render_active(resized).is_some());
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["resize:4x2", "render:1", "resize:5x3", "render:2"]
+        );
+    }
+
+    #[test]
+    fn changed_pump_invalidates_cached_buffer() {
+        let (mut host, events, _, pump_change) = cache_host(tg_kit::InputResult::Ignored);
+        let area = tg_kit::ratatui::layout::Rect::new(0, 0, 4, 2);
+        assert!(host.render_active(area).is_some());
+        pump_change.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(host.pump_all());
+        assert!(host.render_active(area).is_some());
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["resize:4x2", "render:1", "render:2"]
+        );
+    }
+
+    #[test]
+    fn becoming_visible_invalidates_cached_buffer() {
+        let (mut host, events, _, _) = cache_host(tg_kit::InputResult::Ignored);
+        let area = tg_kit::ratatui::layout::Rect::new(0, 0, 4, 2);
+        host.sync_visibility();
+        assert!(host.render_active(area).is_some());
+        host.set_active(ActiveApp::Work);
+        host.sync_visibility();
+        host.set_active(ActiveApp::Tile(0));
+        host.sync_visibility();
+        assert!(host.render_active(area).is_some());
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["resize:4x2", "render:1", "render:2"]
+        );
+    }
+
+    #[test]
+    fn active_exit_returns_to_work_and_failed_slot_clears_cache() {
+        let (mut host, _, _, _) = cache_host(tg_kit::InputResult::Exit);
+        let area = tg_kit::ratatui::layout::Rect::new(0, 0, 4, 2);
+        assert!(host.render_active(area).is_some());
+        assert!(host.handle_active_input(tg_kit::InputEvent::key(tg_kit::Key::Escape)));
+        assert_eq!(host.active, ActiveApp::Work);
+        assert!(host.render_active(area).is_none());
+
+        host.set_active(ActiveApp::Tile(0));
+        assert!(host.render_active(area).is_some());
+        host.slots[0].state = SlotState::Failed("injected failure".into());
+        assert!(host.render_active(area).is_none());
+        assert!(host.slots[0].last_buf.is_none());
+        assert_eq!(host.slots[0].last_size, None);
     }
 }

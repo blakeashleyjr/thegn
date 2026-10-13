@@ -41,9 +41,8 @@ pub trait AppTile {
     fn pump(&mut self) -> bool;
 
     /// Whether the tile needs a redraw. The host re-runs [`render`] only when
-    /// this is `true`; otherwise it re-blits the cached buffer. The standalone
-    /// harness honours this contract; the thegn host does not yet use the
-    /// redraw signal or cached buffer.
+    /// this is `true` or its cached buffer was invalidated; otherwise it
+    /// re-blits the cached buffer.
     ///
     /// [`render`]: AppTile::render
     fn wants_redraw(&self) -> bool;
@@ -78,8 +77,9 @@ pub trait AppTile {
     /// tab is never stale when shown. Must not block. Default: ignore.
     fn on_visible(&mut self, _visible: bool) {}
 
-    /// The tile's draw area changed size. Default: ignore (most tiles relayout
-    /// from `area` in [`render`]).
+    /// The tile's draw area changed size. The host delivers this before the
+    /// first render at the new size; a hidden tile receives it when next shown.
+    /// Default: ignore (most tiles relayout from `area` in [`render`]).
     ///
     /// [`render`]: AppTile::render
     fn on_resize(&mut self, _cols: u16, _rows: u16) {}
@@ -87,7 +87,7 @@ pub trait AppTile {
     /// Tear down: abort spawned tasks and drop clients. Long-lived external
     /// daemons an app may talk to are intentionally NOT killed here. The thegn
     /// host calls this once when a running slot is dropped, including removal
-    /// on disable or reload and host exit. `on_resize` and the redraw buffer
-    /// cache are not yet driven by the thegn host.
+    /// on disable or reload and host exit. `on_resize` is delivered before the
+    /// first render at each new size; a hidden tile receives it when shown.
     fn shutdown(&mut self) {}
 }
