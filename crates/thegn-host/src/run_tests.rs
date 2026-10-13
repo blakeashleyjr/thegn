@@ -4182,3 +4182,84 @@ fn switching_panel_tabs_resets_scroll_to_the_top() {
     ui.switch_tab(crate::panel::PanelTab::Help);
     assert_eq!(ui.scroll, 0);
 }
+
+#[test]
+fn scroll_step_handles_paging_keys_and_clamps_to_extent() {
+    use termwiz::input::{KeyCode, Modifiers};
+
+    let ext = crate::panel::sections::ScrollExtent {
+        max: 20,
+        owns_nav: true,
+    };
+    let step = crate::panel::sections::scroll_step;
+    assert_eq!(
+        step(ext, &KeyCode::PageDown, Modifiers::NONE, 10, 8),
+        Some(18)
+    );
+    assert_eq!(step(ext, &KeyCode::PageUp, Modifiers::NONE, 10, 8), Some(2));
+    assert_eq!(
+        step(ext, &KeyCode::Char('d'), Modifiers::CTRL, 10, 8),
+        Some(14)
+    );
+    assert_eq!(
+        step(ext, &KeyCode::Char('u'), Modifiers::CTRL, 10, 8),
+        Some(6)
+    );
+    assert_eq!(
+        step(ext, &KeyCode::Char('g'), Modifiers::NONE, 10, 8),
+        Some(0)
+    );
+    assert_eq!(
+        step(ext, &KeyCode::Char('G'), Modifiers::NONE, 10, 8),
+        Some(20)
+    );
+    assert_eq!(step(ext, &KeyCode::Home, Modifiers::NONE, 10, 8), Some(0));
+    assert_eq!(step(ext, &KeyCode::End, Modifiers::NONE, 10, 8), Some(20));
+    assert_eq!(
+        step(ext, &KeyCode::PageDown, Modifiers::NONE, 18, 8),
+        Some(20)
+    );
+    assert_eq!(step(ext, &KeyCode::PageUp, Modifiers::NONE, 2, 8), Some(0));
+    assert_eq!(
+        step(ext, &KeyCode::Char('j'), Modifiers::NONE, 20, 1),
+        Some(20)
+    );
+    assert_eq!(
+        step(ext, &KeyCode::Char('k'), Modifiers::NONE, 0, 1),
+        Some(0)
+    );
+    assert_eq!(
+        step(ext, &KeyCode::Char('j'), Modifiers::NONE, 10, 1),
+        Some(11)
+    );
+    assert_eq!(
+        step(ext, &KeyCode::Char('k'), Modifiers::NONE, 10, 1),
+        Some(9)
+    );
+
+    let stash_ext = crate::panel::sections::ScrollExtent {
+        max: 20,
+        owns_nav: false,
+    };
+    assert_eq!(
+        step(stash_ext, &KeyCode::PageDown, Modifiers::NONE, 10, 8),
+        Some(18)
+    );
+    assert_eq!(
+        step(stash_ext, &KeyCode::Char('G'), Modifiers::NONE, 10, 8),
+        None
+    );
+}
+
+#[test]
+fn section_scroll_falls_through_at_both_scroll_boundaries() {
+    let ext = crate::panel::sections::ScrollExtent {
+        max: 5,
+        owns_nav: true,
+    };
+    let can_move = crate::panel::sections::scroll_moves;
+    assert!(!can_move(ext, true, 0));
+    assert!(!can_move(ext, false, ext.max));
+    assert!(can_move(ext, true, 1));
+    assert!(can_move(ext, false, ext.max - 1));
+}

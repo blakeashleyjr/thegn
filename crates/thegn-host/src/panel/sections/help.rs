@@ -3,18 +3,26 @@
 //! width. A one-entry memo avoids flowing the same page twice in one frame.
 
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use crate::seg::{Line, seg};
 
 use super::{PanelRow, SectionCtx, d, hint_row};
 
+type PageMemo = (
+    Arc<thegn_core::help::HelpRegistry>,
+    String,
+    usize,
+    Vec<Line>,
+);
+
 thread_local! {
-    static PAGE_MEMO: RefCell<Option<(usize, String, usize, Vec<Line>)>> = const { RefCell::new(None) };
+    static PAGE_MEMO: RefCell<Option<PageMemo>> = const { RefCell::new(None) };
 }
 
-fn rendered_lines(ctx: &SectionCtx) -> Vec<Line> {
+fn with_lines<R>(ctx: &SectionCtx, f: impl FnOnce(&[Line]) -> R) -> R {
     let Some(reg) = ctx.ui.help.reg.as_ref() else {
-        return Vec::new();
+        return f(&[]);
     };
     let page_id = if ctx.ui.help.page.is_empty() {
         "index"
@@ -22,32 +30,34 @@ fn rendered_lines(ctx: &SectionCtx) -> Vec<Line> {
         ctx.ui.help.page.as_str()
     };
     let Some(page) = reg.page(page_id).or_else(|| reg.page("index")) else {
-        return Vec::new();
+        return f(&[]);
     };
     let width = ctx.cols.saturating_sub(1).max(8);
-    let registry = std::sync::Arc::as_ptr(reg) as usize;
     let id = page.meta.id.clone();
-    if let Some(lines) = PAGE_MEMO.with(|memo| {
-        memo.borrow()
-            .as_ref()
-            .filter(|(ptr, cached_id, cached_width, _)| {
-                *ptr == registry && *cached_id == id && *cached_width == width
+    let cached = PAGE_MEMO.with(|memo| {
+        let memo = memo.borrow();
+        memo.as_ref()
+            .filter(|(cached_reg, cached_id, cached_width, _)| {
+                Arc::ptr_eq(cached_reg, reg) && *cached_id == id && *cached_width == width
             })
-            .map(|(_, _, _, lines)| lines.clone())
-    }) {
-        return lines;
+            .is_some()
+    });
+    if !cached {
+        let blocks = crate::help::render::page_blocks(reg, &id);
+        let lines = crate::help::render::render_page(&blocks, width, None).lines;
+        PAGE_MEMO.with(|memo| *memo.borrow_mut() = Some((Arc::clone(reg), id, width, lines)));
     }
-    let blocks = crate::help::render::page_blocks(reg, &id);
-    let lines = crate::help::render::render_page(&blocks, width, None).lines;
-    PAGE_MEMO.with(|memo| *memo.borrow_mut() = Some((registry, id, width, lines.clone())));
-    lines
+    PAGE_MEMO.with(|memo| {
+        let memo = memo.borrow();
+        f(&memo.as_ref().expect("page memo was just populated").3)
+    })
 }
 
 pub(super) fn line_count(ctx: &SectionCtx) -> usize {
     if ctx.ui.help.reg.is_none() {
         return 1;
     }
-    rendered_lines(ctx).len()
+    with_lines(ctx, <[Line]>::len)
 }
 
 pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
@@ -57,25 +67,27 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             "help registry not loaded",
         )]))];
     }
-    let lines = rendered_lines(ctx);
-    if lines.is_empty() {
-        return vec![PanelRow::plain(Line::segs(vec![seg(d(), "no help pages")]))];
-    }
-    let body = ctx.rows.saturating_sub(2); // blank + pinned footer
-    let scroll = ctx.ui.scroll.min(lines.len().saturating_sub(1));
-    let mut rows: Vec<PanelRow> = lines
-        .into_iter()
-        .skip(scroll)
-        .take(body)
-        .map(PanelRow::plain)
-        .collect();
-    rows.push(PanelRow::blank());
-    rows.push(hint_row(&[
-        ("j/k", "scroll"),
-        (ctx.model.chord("help"), "full help"),
-        ("esc", "back"),
-    ]));
-    rows
+    with_lines(ctx, |lines| {
+        if lines.is_empty() {
+            return vec![PanelRow::plain(Line::segs(vec![seg(d(), "no help pages")]))];
+        }
+        let body = ctx.rows.saturating_sub(2); // blank + pinned footer
+        let scroll = ctx.ui.scroll.min(lines.len().saturating_sub(1));
+        let mut rows: Vec<PanelRow> = lines
+            .iter()
+            .cloned()
+            .skip(scroll)
+            .take(body)
+            .map(PanelRow::plain)
+            .collect();
+        rows.push(PanelRow::blank());
+        rows.push(hint_row(&[
+            ("j/k", "scroll"),
+            (ctx.model.chord("help"), "full help"),
+            ("esc", "back"),
+        ]));
+        rows
+    })
 }
 
 #[cfg(test)]
@@ -122,7 +134,13 @@ mod tests {
                     .map(|s| s.text.as_str())
                     .collect::<Vec<_>>()
                     .join(""),
-                _ => String::new(),
+                Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => l
+                    .iter()
+                    .chain(r)
+                    .map(|s| s.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(""),
+                Line::Fill { ch, .. } => ch.to_string(),
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -194,9 +212,34 @@ mod tests {
             let extent = super::super::scroll_extent(Section::Help, &model, &ui, 39, 12)
                 .expect("Help is scrollable at every width");
             assert!(extent.owns_nav);
+            let content_cols = if width == PanelWidth::Full { 37 } else { 36 };
+            let viewport = super::super::scroll_viewport(&ui, 12);
             assert_eq!(
                 extent.max,
-                line_count(&ctx(&model, &ui, 39)).saturating_sub(10)
+                line_count(&ctx(&model, &ui, content_cols)).saturating_sub(viewport - 2)
+            );
+        }
+    }
+
+    #[test]
+    fn max_scroll_displays_the_last_help_line_in_normal_and_full_frames() {
+        for width in [PanelWidth::Normal, PanelWidth::Full] {
+            let (model, mut ui) = fixture(width, 0);
+            let extent = super::super::scroll_extent(Section::Help, &model, &ui, 80, 40)
+                .expect("Help is scrollable");
+            ui.scroll = extent.max;
+            let content_cols = if width == PanelWidth::Full { 78 } else { 77 };
+            let registry = ui.help.reg.as_ref().expect("fixture registry");
+            let blocks = crate::help::render::page_blocks(registry, "index");
+            let lines = crate::help::render::render_page(&blocks, content_cols - 1, None).lines;
+            let last_line = lines.last().expect("index page has lines");
+            let last_text = text(&[PanelRow::plain(last_line.clone())]);
+            assert!(!last_text.is_empty(), "last page line must contain text");
+            let frame = crate::panel::frame::build_panel(&model, &ui, 80, 40, true);
+            let rendered = text(&frame.rows);
+            assert!(
+                rendered.contains(&last_text),
+                "last Help page line was absent at {width:?}"
             );
         }
     }

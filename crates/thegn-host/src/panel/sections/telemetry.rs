@@ -443,7 +443,7 @@ fn disk_rows(ctx: &SectionCtx, meter_w: usize) -> Vec<PanelRow> {
         } else {
             hue(Hue::Teal)
         };
-        let used_pct = 100 - disk.free_pct;
+        let used_pct = 100u8.saturating_sub(disk.free_pct);
         let mut l = vec![
             sp(1),
             seg(d(), format!("{} ", trunc_pad(&disk.mount, 10))),
@@ -653,7 +653,28 @@ mod tests {
             cols: 80,
             rows: 12,
         };
-        assert_eq!(extent.max, row_count(&ctx).saturating_sub(12));
+        let viewport = super::super::scroll_viewport(&ui, 12);
+        assert_eq!(extent.max, row_count(&ctx).saturating_sub(viewport - 1));
+    }
+
+    #[test]
+    fn disk_free_percentage_above_one_hundred_saturates_used_percentage() {
+        let (mut model, ui) = fixture(0);
+        model.stats.disks.push(thegn_metrics::DiskInfo {
+            name: "device-a".into(),
+            mount: "/".into(),
+            free_pct: 120,
+            read_bps: 0,
+            write_bps: 0,
+            kind: thegn_metrics::DiskKind::Ssd,
+        });
+        let rendered = text(&content(&SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 80,
+            rows: 30,
+        }));
+        assert!(rendered.contains("  0%"), "{rendered}");
     }
 
     #[test]
