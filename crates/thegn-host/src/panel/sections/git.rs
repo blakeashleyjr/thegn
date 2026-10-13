@@ -3,6 +3,7 @@
 
 use crate::seg::{Line, Seg, seg, sp};
 use thegn_core::theme::Hue;
+use thegn_core::viz;
 
 use super::{
     PanelHit, PanelRow, Section, SectionCtx, ac, d, f, g, g2, g3, hint_row, hue, pr_state_hue,
