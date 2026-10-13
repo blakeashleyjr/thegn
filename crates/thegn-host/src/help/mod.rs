@@ -188,7 +188,7 @@ mod tests {
                 page: "git-and-diffs".to_string(),
                 reg: Some(Arc::clone(&reg)),
             },
-            scroll: 8,
+            scroll: 6,
             ..Default::default()
         };
         let ctx = crate::panel::sections::SectionCtx {
@@ -199,6 +199,13 @@ mod tests {
         };
         crate::panel::sections::help::content(&ctx);
         let panel_anchor = crate::panel::sections::help::anchor_at(&ui).unwrap();
+        assert_eq!(
+            panel_anchor,
+            HelpAnchor {
+                heading: 0,
+                offset: 6,
+            }
+        );
         let focus = crate::focus::FocusState {
             zone: crate::focus::Zone::Panel,
             ..Default::default()
