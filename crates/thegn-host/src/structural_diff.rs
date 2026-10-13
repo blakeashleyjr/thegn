@@ -292,7 +292,7 @@ mod tests {
     }
 
     fn git(dir: &tempfile::TempDir, args: &[&str]) {
-        let status = thegn_core::util::git_cmd(dir.path())
+        let output = thegn_core::util::git_cmd(dir.path())
             .args(["-c", "commit.gpgsign=false"])
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -300,9 +300,9 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "structural-diff@example.invalid")
             .env("GIT_COMMITTER_NAME", "Structural Diff Test")
             .env("GIT_COMMITTER_EMAIL", "structural-diff@example.invalid")
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success(), "git command failed: {args:?}");
+        assert!(output.status.success(), "git command failed: {args:?}");
     }
 
     fn capture_with(difft: &str, timeout: Duration) -> Result<Vec<StyledLine>> {
