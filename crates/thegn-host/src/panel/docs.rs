@@ -1,5 +1,5 @@
 //! Loop-fetched documents the section bodies render from: the git section's
-//! heat/velocity/log payload, the rolling telemetry history, and the cached
+//! velocity/log payload, the rolling telemetry history, and the cached
 //! cheatsheet groups. Fetch results are generation-tagged so strays from
 //! before a worktree switch die on arrival.
 
@@ -7,14 +7,11 @@
 /// and cached per worktree by the event loop.
 #[derive(Debug, Clone)]
 pub struct GitDocs {
-    /// `heat[week][weekday]` levels 0..=4, oldest week first, Mon=0.
-    pub heat: Vec<[u8; 7]>,
     /// Weekly commit totals over the same window, oldest first.
     pub weekly: Vec<u32>,
     pub log: Vec<thegn_svc::git::LogRow>,
     /// Commits in the window (the VELOCITY headline).
     pub total: u32,
-    pub head_branch: String,
 }
 
 /// Off-loop panel-document fetch results, tagged with the loop's docs
@@ -85,11 +82,9 @@ mod tests {
             refs: refs.into(),
         };
         let mut docs = GitDocs {
-            heat: Vec::new(),
             weekly: Vec::new(),
             log: vec![row("aaa1111", ""), row("bbb2222", "HEAD -> main")],
             total: 2,
-            head_branch: "main".into(),
         };
         assert_eq!(copy_target_sha(&docs), Some("bbb2222".into()));
         // Without a HEAD decoration the first real commit row wins.
