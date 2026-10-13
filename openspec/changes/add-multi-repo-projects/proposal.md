@@ -47,8 +47,8 @@ sole source of truth in each member repo and no super-repo state is invented
   branches ("feature sets"). Derived, never persisted — git stays the source
   of truth per repo; the DB only caches what it already caches.
 - **Sidebar**: member workspaces render grouped under a collapsible program
-  header row; unprojected workspaces render exactly as today. Header rows are
-  orderable and their collapse state persists tombstone-free.
+  header row; workspaces outside any program render exactly as today. Header
+  rows are orderable and their collapse state persists tombstone-free.
 - **Cross-repo aggregation**: the Across aggregation model gains a program
   scope — excerpts from a feature set's worktrees across member repos, with
   repo-qualified labels, populated off the event loop.
