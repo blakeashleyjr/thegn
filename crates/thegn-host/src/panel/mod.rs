@@ -103,6 +103,8 @@ pub enum PanelHit {
     Expand,
     /// The i-th actionable row of a section's content.
     Row(Section, usize),
+    /// A row inside an open git drill's own document/list.
+    GitDrill(usize),
     /// A painted media transport control. Unlike a row, this is a direct
     /// operation target and is shared by keyboard and mouse dispatch.
     MediaAction(MediaAction),

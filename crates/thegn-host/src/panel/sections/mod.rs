@@ -1072,15 +1072,32 @@ pub fn scroll_extent(
                 owns_nav: true,
             })
         }
-        Section::Stash if ui.width == crate::layout::PanelWidth::Full => Some(ScrollExtent {
-            max: ui
-                .git
-                .stash_diff
-                .as_ref()
-                .map(|(_, text)| text.lines().count().saturating_sub(1))
-                .unwrap_or(0),
-            owns_nav: false,
-        }),
+        Section::Stash | Section::Commits
+            if matches!(
+                ui.width,
+                crate::layout::PanelWidth::Half | crate::layout::PanelWidth::Full
+            ) =>
+        {
+            let max = if section == Section::Stash {
+                ui.git
+                    .stash_diff
+                    .as_ref()
+                    .map(|(_, text)| text.lines().count().saturating_sub(1))
+                    .unwrap_or(0)
+            } else {
+                ui.git
+                    .commit_show
+                    .as_ref()
+                    .filter(|(key, _)| ui.git.commit_show_key.as_ref() == Some(key))
+                    .and_then(|(_, result)| result.as_ref().ok())
+                    .map(|text| text.lines().count().saturating_sub(1))
+                    .unwrap_or(0)
+            };
+            Some(ScrollExtent {
+                max,
+                owns_nav: false,
+            })
+        }
         _ => None,
     }
 }

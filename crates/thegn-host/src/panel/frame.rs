@@ -369,21 +369,27 @@ pub fn build_panel(
         return build_full(model, ui, cols, rows, focused);
     }
 
-    // A drill detail view (commit files, staging, patch, blame, rebase todo)
-    // is only rendered by the git frame. Render it INTO the half-width panel —
+    // A git detail or cursor-follow home region is rendered by the git frame
+    // inside the half-width panel —
     // the center pane stays visible — instead of forcing the screen-filling
     // Full layout (which hides all chrome and feels like a trap). The accordion
     // list views keep the vertical skeleton below.
     if ui.width == crate::layout::PanelWidth::Half
         && ui.open.is_git_family()
-        && matches!(
+        && (matches!(
             ui.git.focus,
             super::gitui::GitView::Staging
                 | super::gitui::GitView::CommitFiles
                 | super::gitui::GitView::PatchBuilding
                 | super::gitui::GitView::Blame
                 | super::gitui::GitView::RebaseTodo
-        )
+        ) || (ui.open.home_view() == Some(ui.git.focus)
+            && matches!(
+                ui.git.focus,
+                super::gitui::GitView::Commits
+                    | super::gitui::GitView::Branches
+                    | super::gitui::GitView::Stash
+            )))
     {
         return super::gitfull::build_git_full(model, ui, cols, rows, focused);
     }
@@ -699,13 +705,23 @@ pub fn section_rows(
     cols: usize,
     rows: usize,
 ) -> usize {
-    // At Full width the git-family sections are rendered by the lazygit frame
+    // At Full width, and at Half for the commit/branch/stash homes, git-family
+    // sections are rendered by the lazygit frame
     // (`gitfull::build_git_full`, see `build_panel`), NOT by
     // `sections::content` — counting the accordion renderer's hits here
     // reported 0 for Changes (whose accordion Full body has no hit rows), so
     // `j`/`k` left the section and every action targeted row 0. Count the same
     // display space the git frame renders and `gitui::source_at` consumes.
-    if ui.width == crate::layout::PanelWidth::Full
+    if (ui.width == crate::layout::PanelWidth::Full
+        || (ui.width == crate::layout::PanelWidth::Half
+            && matches!(
+                section,
+                crate::panel::Section::Commits
+                    | crate::panel::Section::Branches
+                    | crate::panel::Section::Stash
+            )
+            && ui.open.home_view() == section.home_view()
+            && Some(ui.git.focus) == section.home_view()))
         && section.is_git_family()
         && let Some(view) = section.home_view()
     {

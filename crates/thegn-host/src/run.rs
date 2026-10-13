@@ -2927,8 +2927,15 @@ fn enqueue_git_op(
 /// A fetched git document for the line-cursor views.
 enum GitDoc {
     Stage(gitui::StageDocState),
-    CommitFiles(Vec<(String, u32, u32)>),
-    Patch(gitui::StageDocState),
+    CommitFiles {
+        sha: String,
+        result: std::result::Result<Vec<(String, u32, u32)>, String>,
+    },
+    Patch {
+        sha: String,
+        path: String,
+        result: std::result::Result<gitui::StageDocState, String>,
+    },
     /// A paused rebase's live state, preserving read errors; `Ok(None)` means
     /// the pause vanished before the read landed.
     Rebase(std::result::Result<Option<thegn_svc::git::RebaseStatus>, String>),
@@ -2938,7 +2945,14 @@ enum GitDoc {
         result: std::result::Result<Vec<thegn_core::rebase_todo::TodoEntry>, String>,
     },
     /// `git blame --porcelain` output parsed into per-line rows.
-    Blame(Vec<crate::panel::BlameRow>),
+    Blame {
+        path: String,
+        result: std::result::Result<Vec<crate::panel::BlameRow>, String>,
+    },
+    CommitShow {
+        key: gitui::CommitDetailKey,
+        result: std::result::Result<String, String>,
+    },
     /// The selected stash's patch (`stash show -p -u`), keyed by index.
     StashDiff(usize, String),
     /// The selected branch's log, keyed by branch name.
@@ -3176,38 +3190,44 @@ fn spawn_commit_files_fetch(
         let git = thegn_svc::git::CliGit;
         // `sha^..sha` covers ordinary commits; a root commit has no parent,
         // so fall back to counting the commit diff's own +/- lines.
-        let files: Vec<(String, u32, u32)> = match git.diff_refs(&loc, &format!("{sha}^"), &sha) {
-            Ok(v) if !v.is_empty() => v
-                .into_iter()
-                .map(|d| (d.path, d.added, d.deleted))
-                .collect(),
-            _ => git
-                .commit_diff(&loc, &sha, None)
-                .map(|d| {
-                    thegn_core::patch::parse_patch(&d)
-                        .into_iter()
-                        .map(|f| {
-                            let (a, del) = f.hunks.iter().flat_map(|h| &h.lines).fold(
-                                (0u32, 0u32),
-                                |(a, d), l| match l.kind {
-                                    LineKind::Add => (a + 1, d),
-                                    LineKind::Del => (a, d + 1),
-                                    _ => (a, d),
-                                },
-                            );
-                            (f.new_path.clone(), a, del)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        };
-        if tx.send((generation, GitDoc::CommitFiles(files))).is_ok() {
-            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        let files: std::result::Result<Vec<(String, u32, u32)>, String> =
+            match git.diff_refs(&loc, &format!("{sha}^"), &sha) {
+                Ok(v) if !v.is_empty() => v
+                    .into_iter()
+                    .map(|d| (d.path, d.added, d.deleted))
+                    .collect::<Vec<_>>()
+                    .into(),
+                Ok(_) | Err(_) => git
+                    .commit_diff(&loc, &sha, None)
+                    .map(|d| {
+                        thegn_core::patch::parse_patch(&d)
+                            .into_iter()
+                            .map(|f| {
+                                let (a, del) = f.hunks.iter().flat_map(|h| &h.lines).fold(
+                                    (0u32, 0u32),
+                                    |(a, d), l| match l.kind {
+                                        LineKind::Add => (a + 1, d),
+                                        LineKind::Del => (a, d + 1),
+                                        _ => (a, d),
+                                    },
+                                );
+                                (f.new_path.clone(), a, del)
+                            })
+                            .collect()
+                    })
+                    .map_err(|error| error.to_string()),
+            };
+        if tx
+            .send((generation, GitDoc::CommitFiles { sha, result: files }))
+            .is_ok()
+            && let Err(error) = wk.wake()
+        {
+            tracing::debug!(target: "thegn::git", %error, "could not wake loop for commit files");
         }
     });
 }
 
-/// Fetch one file of a drilled commit's diff (the patch-building doc).
+/// Fetch one file of a drilled commit's diff (read-only preview and patch feed).
 fn spawn_patch_doc_fetch(
     generation: u64,
     session: &crate::session::Session,
@@ -3222,18 +3242,22 @@ fn spawn_patch_doc_fetch(
     tokio::task::spawn_blocking(move || {
         use thegn_svc::git::GitBackend;
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-        let diff = thegn_svc::git::CliGit
+        let state_path = path.clone();
+        let result = thegn_svc::git::CliGit
             .commit_diff(&loc, &sha, Some(&path))
-            .unwrap_or_default();
-        let doc = crate::panel::staging::build(&path, &diff);
-        let state = gitui::StageDocState {
-            path,
-            pane: StagePane::Unstaged,
-            doc,
-            diff,
-        };
-        if tx.send((generation, GitDoc::Patch(state))).is_ok() {
-            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            .map_err(|error| error.to_string())
+            .map(|diff| gitui::StageDocState {
+                doc: crate::panel::staging::build(&state_path, &diff),
+                path: state_path,
+                pane: StagePane::Unstaged,
+                diff,
+            });
+        if tx
+            .send((generation, GitDoc::Patch { sha, path, result }))
+            .is_ok()
+            && let Err(error) = wk.wake()
+        {
+            tracing::debug!(target: "thegn::git", %error, "could not wake loop for commit patch");
         }
     });
 }
@@ -3262,26 +3286,51 @@ fn spawn_blame_fetch(
         // off-loop: inside spawn_blocking
         #[expect(clippy::disallowed_methods)]
         let output = thegn_core::util::git_cmd(&wt).args(&args).output();
-        // Don't silently paint an empty blame as if it succeeded: a spawn failure
-        // (no git) or a non-zero exit (bad rev / not tracked) is logged at warn so
-        // the empty view is diagnosable; the empty rows still resolve the loading
-        // state rather than hanging.
-        let rows = match output {
+        // Keep command failures distinct from a successful empty parse so the
+        // blame view can resolve to an explicit unavailable state.
+        let result = match output {
             Ok(out) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout);
-                crate::panel::parse_blame_porcelain(&text)
+                Ok(crate::panel::parse_blame_porcelain(&text))
             }
-            Ok(out) => {
-                tracing::warn!(target: "thegn::git", "blame failed: {}", String::from_utf8_lossy(&out.stderr).trim());
-                Vec::new()
-            }
-            Err(e) => {
-                tracing::warn!(target: "thegn::git", "blame spawn failed: {e}");
-                Vec::new()
-            }
+            Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+            Err(e) => Err(e.to_string()),
         };
-        if tx.send((generation, GitDoc::Blame(rows))).is_ok() {
-            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        if tx
+            .send((generation, GitDoc::Blame { path, result }))
+            .is_ok()
+            && let Err(error) = wk.wake()
+        {
+            tracing::debug!(target: "thegn::git", %error, "could not wake loop for blame");
+        }
+    });
+}
+
+fn spawn_commit_show_fetch(
+    generation: u64,
+    session: &crate::session::Session,
+    key: gitui::CommitDetailKey,
+    tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
+    waker: &TerminalWaker,
+) {
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        use thegn_svc::git::GitBackend;
+        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+        let result = if let Some(base) = &key.base {
+            thegn_svc::git::CliGit.range_patch(&loc, base, &key.sha)
+        } else {
+            thegn_svc::git::CliGit.commit_show(&loc, &key.sha)
+        }
+        .map_err(|error| error.to_string());
+        if tx
+            .send((generation, GitDoc::CommitShow { key, result }))
+            .is_ok()
+            && let Err(error) = wk.wake()
+        {
+            tracing::debug!(target: "thegn::git", %error, "could not wake loop for commit detail");
         }
     });
 }
@@ -3878,6 +3927,9 @@ fn handle_git_msg(
                     }
                     panel_ui.git.drilled_commit = Some(c.sha.clone());
                     panel_ui.git.commit_files.clear();
+                    panel_ui.git.commit_files_load = gitui::DocLoad::Pending;
+                    panel_ui.git.patch_docs.clear();
+                    panel_ui.git.patch_doc = None;
                     panel_ui.git.cur.commit_files = 0;
                     panel_ui.cursor = 0;
                     panel_ui.git.drill(GitView::CommitFiles);
@@ -3897,8 +3949,10 @@ fn handle_git_msg(
                     .get(panel_ui.git.cur.commit_files)
                     .map(|(p, _, _)| p.clone());
                 if let (Some(path), Some(sha)) = (file, panel_ui.git.drilled_commit.clone()) {
-                    if let Some(marked) = panel_ui.git.patch_conflicts_with(&sha) {
-                        if marked > 0 {
+                    panel_ui.git.patch_doc = None;
+                    match panel_ui.git.open_commit_file(&sha, &path) {
+                        Ok(()) => {}
+                        Err(marked) => {
                             let commit = match &panel_ui.git.flow {
                                 GitFlow::Patch(p) => p.commit.chars().take(7).collect::<String>(),
                                 _ => String::new(),
@@ -3906,32 +3960,8 @@ fn handle_git_msg(
                             model.status = format!(
                                 "custom patch on {commit} has {marked} marked line(s): C-p to apply or discard it first"
                             );
-                            return GitAfter::None;
-                        }
-                        panel_ui.git.flow = GitFlow::None;
-                        panel_ui.git.patch_docs.clear();
-                    }
-                    match &mut panel_ui.git.flow {
-                        GitFlow::Patch(p) => p.path = path.clone(),
-                        f => {
-                            *f = GitFlow::Patch(gitui::PatchUi {
-                                commit: sha.clone(),
-                                path: path.clone(),
-                                marks: Default::default(),
-                            })
                         }
                     }
-                    panel_ui.git.patch_doc = None;
-                    panel_ui.git.staging = Some(gitui::StagingUi::new(&path));
-                    panel_ui.git.drill(GitView::PatchBuilding);
-                    spawn_patch_doc_fetch(
-                        panel_ui.git.op_gen,
-                        wires.session,
-                        sha,
-                        path,
-                        wires.doc_tx,
-                        wires.waker,
-                    );
                 }
             }
             GitView::Blame => {
@@ -3944,6 +3974,7 @@ fn handle_git_msg(
                 if let Some(r) = row {
                     panel_ui.git.drilled_commit = Some(r.sha.clone());
                     panel_ui.git.commit_files.clear();
+                    panel_ui.git.commit_files_load = gitui::DocLoad::Pending;
                     panel_ui.git.drill(GitView::CommitFiles);
                     spawn_commit_files_fetch(
                         panel_ui.git.op_gen,
@@ -3954,26 +3985,20 @@ fn handle_git_msg(
                     );
                 }
             }
-            GitView::Branches => {
-                // The demand check kicks the selected branch's log fetch on
-                // the next dirty frame; the main region renders it on landing.
-                model.status = "branch log in the main region".into();
-            }
-            GitView::Stash => {
-                // Same: the demand check fetches `stash show -p -u`.
-                model.status = "stash diff in the main region".into();
-            }
+            GitView::Branches | GitView::Stash => {}
             _ => {}
         },
         GitMsg::BlameFile => {
             // `b` in Files → blame HEAD version; `b` in CommitFiles → blame that commit's version.
+            let mut unavailable = false;
             let (path, sha) = match panel_ui.git.focus {
                 GitView::Files => {
-                    let path = model
-                        .panel
-                        .changes
-                        .get(panel_ui.git.cur.files)
-                        .map(|c| c.path.clone());
+                    let row = sel_change(panel_ui, model);
+                    unavailable = row.as_ref().is_some_and(|row| {
+                        matches!(row.stage, crate::panel::Stage::Untracked)
+                            || row.status.starts_with('A')
+                    });
+                    let path = row.map(|c| c.path);
                     (path, "HEAD".to_string())
                 }
                 GitView::CommitFiles => {
@@ -3992,8 +4017,13 @@ fn handle_git_msg(
                 _ => (None, String::new()),
             };
             if let Some(p) = path {
+                if unavailable {
+                    model.status = format!("blame unavailable: {p} is not in HEAD");
+                    return GitAfter::None;
+                }
                 panel_ui.git.blame_path = Some(p.clone());
                 panel_ui.git.blame_rows.clear();
+                panel_ui.git.blame_load = gitui::DocLoad::Pending;
                 panel_ui.git.blame_cursor = 0;
                 panel_ui.git.blame_scroll = 0;
                 panel_ui.git.drill(GitView::Blame);
@@ -4095,14 +4125,14 @@ fn handle_git_msg(
                     model.status = reason;
                     return GitAfter::None;
                 }
-                if let (Some(path), GitFlow::Patch(p)) = (path, &mut panel_ui.git.flow) {
-                    let marks = p.marks.entry(path).or_default();
-                    for i in toggles {
-                        if !marks.remove(&i) {
-                            marks.insert(i);
-                        }
+                if let Some(path) = path
+                    && !toggles.is_empty()
+                    && panel_ui.git.drilled_commit.is_some()
+                {
+                    panel_ui.git.mark_patch_lines(&path, &toggles);
+                    if let GitFlow::Patch(patch) = &panel_ui.git.flow {
+                        model.status = format!("{} line(s) in patch", patch.marked());
                     }
-                    model.status = format!("{} line(s) in patch", p.marked());
                 }
                 if let Some(s) = panel_ui.git.staging.as_mut() {
                     s.anchor = None;
@@ -4534,7 +4564,11 @@ fn handle_git_msg(
                 });
             }
             gitui::MenuKind::Patch => {
-                *ov.menu = Some(menu::patch_menu());
+                if matches!(panel_ui.git.flow, GitFlow::Patch(_)) {
+                    *ov.menu = Some(menu::patch_menu());
+                } else {
+                    model.status = "nothing marked: space adds lines to a patch".into();
+                }
             }
             gitui::MenuKind::Bisect => {
                 *ov.menu = Some(menu::bisect_menu(matches!(
@@ -6642,6 +6676,8 @@ async fn event_loop<T: Terminal>(
     // re-kicks on selection change or worktree switch but never duplicates.
     let mut stash_diff_inflight: Option<(u64, usize)> = None;
     let mut branch_log_inflight: Option<(u64, String)> = None;
+    let mut commit_show_inflight: Option<(u64, gitui::CommitDetailKey)> = None;
+    let mut commit_file_inflight: Option<(u64, String, String)> = None;
     // A computed undo/redo plan awaiting its confirm pick.
     let mut pending_undo: Option<(thegn_core::reflog::UndoPlan, bool)> = None;
     // A destructive git op parked behind the open confirm menu.
@@ -10456,18 +10492,22 @@ async fn event_loop<T: Terminal>(
                         panel_ui.git.stage_doc = Some(state);
                     }
                 }
-                GitDoc::CommitFiles(files) => {
-                    panel_ui.git.commit_files = files;
-                    let max = panel_ui.git.commit_files.len().saturating_sub(1);
-                    let cur = panel_ui.git.cur.get(GitView::CommitFiles).min(max);
-                    panel_ui.git.cur.set(GitView::CommitFiles, cur);
+                GitDoc::CommitFiles { sha, result } => {
+                    if !panel_ui.git.accept_commit_files(&sha, result) {
+                        tracing::debug!(target: "thegn::git", %sha, "dropping stale commit-files result");
+                    }
                 }
-                GitDoc::Patch(state) => {
-                    panel_ui
-                        .git
-                        .patch_docs
-                        .insert(state.path.clone(), state.clone());
-                    panel_ui.git.patch_doc = Some(state);
+                GitDoc::Patch { sha, path, result } => {
+                    if commit_file_inflight.as_ref().is_some_and(
+                        |(_, inflight_sha, inflight_path)| {
+                            inflight_sha == &sha && inflight_path == &path
+                        },
+                    ) {
+                        commit_file_inflight = None;
+                    }
+                    if !panel_ui.git.accept_patch_doc(&sha, result) {
+                        tracing::debug!(target: "thegn::git", %sha, "dropping stale commit patch result");
+                    }
                 }
                 GitDoc::Rebase(status) => {
                     rebase_sync_inflight = false;
@@ -10495,11 +10535,25 @@ async fn event_loop<T: Terminal>(
                         }
                     }
                 }
-                GitDoc::Blame(rows) => {
-                    if panel_ui.git.focus == GitView::Blame {
-                        panel_ui.git.blame_cursor =
-                            panel_ui.git.blame_cursor.min(rows.len().saturating_sub(1));
-                        panel_ui.git.blame_rows = rows;
+                GitDoc::Blame { path, result } => {
+                    if !panel_ui.git.accept_blame(&path, result) {
+                        tracing::debug!(target: "thegn::git", %path, "dropping stale blame result");
+                    }
+                }
+                GitDoc::CommitShow { key, result } => {
+                    if commit_show_inflight
+                        .as_ref()
+                        .is_some_and(|(_, inflight_key)| inflight_key == &key)
+                    {
+                        commit_show_inflight = None;
+                    }
+                    let current = (panel_ui.git.focus == GitView::Commits)
+                        .then(|| sel_commit(&panel_ui, &model))
+                        .flatten()
+                        .map(|commit| panel_ui.git.selected_commit_detail_key(&commit.sha));
+                    panel_ui.git.commit_show_key = current.clone();
+                    if !panel_ui.git.accept_commit_show(key.clone(), result) {
+                        tracing::debug!(target: "thegn::git", sha = %key.sha, "dropping stale commit detail result");
                     }
                 }
                 GitDoc::StashDiff(index, text) => {
@@ -13989,9 +14043,8 @@ async fn event_loop<T: Terminal>(
                     && which_key.is_empty()
                     && toasts.is_empty(),
             );
-            // Demand-driven git docs for the expanded frame's stash/branches
-            // main regions: on a dirty frame that is about to render one of
-            // them, make sure the SELECTED row's document is fetched
+            // Demand-driven git docs for expanded git detail regions: on a dirty
+            // frame that is about to render one, fetch the selected row's doc
             // (off-loop, generation-tagged, deduped by the inflight key).
             // Gated on `dirty` so the idle path never runs the checks.
             if dirty && want_panel && panel_ui.width.is_expanded() {
@@ -14022,6 +14075,56 @@ async fn event_loop<T: Terminal>(
                     branch_log_inflight = Some((opgen, name.clone()));
                     spawn_branch_log_fetch(opgen, &session, name, &gitdoc_tx, &waker);
                 }
+                if panel_ui.git.focus == GitView::Commits
+                    && let Some(commit) = sel_commit(&panel_ui, &model)
+                {
+                    let key = panel_ui.git.selected_commit_detail_key(&commit.sha);
+                    if panel_ui.git.commit_show_key.as_ref() != Some(&key) {
+                        panel_ui.scroll = 0;
+                        panel_ui.git.commit_show_key = Some(key.clone());
+                    }
+                    if panel_ui
+                        .git
+                        .commit_show
+                        .as_ref()
+                        .is_none_or(|(loaded, _)| loaded != &key)
+                        && commit_show_inflight.as_ref() != Some(&(opgen, key.clone()))
+                    {
+                        commit_show_inflight = Some((opgen, key.clone()));
+                        spawn_commit_show_fetch(opgen, &session, key, &gitdoc_tx, &waker);
+                    }
+                }
+                if matches!(
+                    panel_ui.git.focus,
+                    GitView::CommitFiles | GitView::PatchBuilding
+                ) && let Some(sha) = panel_ui.git.drilled_commit.clone()
+                    && let Some((path, _, _)) =
+                        panel_ui.git.commit_files.get(panel_ui.git.cur.commit_files)
+                    && !panel_ui.git.patch_docs.contains_key(path)
+                    && commit_file_inflight.as_ref() != Some(&(opgen, sha.clone(), path.clone()))
+                {
+                    let path = path.clone();
+                    panel_ui.git.patch_doc = None;
+                    panel_ui.git.patch_load = gitui::DocLoad::Pending;
+                    commit_file_inflight = Some((opgen, sha.clone(), path.clone()));
+                    spawn_patch_doc_fetch(opgen, &session, sha, path, &gitdoc_tx, &waker);
+                }
+            }
+            if dirty
+                && want_panel
+                && panel_ui.width == crate::layout::PanelWidth::Full
+                && panel_ui.git.focus == GitView::Files
+                && let Some(change) = sel_change(&panel_ui, &model)
+            {
+                spawn_hunk_fetch(
+                    &change.path,
+                    &session,
+                    &panel_ui,
+                    &mut hunk_inflight,
+                    &hunk_tx,
+                    &waker,
+                    hydration_gen,
+                );
             }
             // The damage-compositor decision (pure, unit-tested in render_plan):
             // with no chrome/overlay/geometry damage, a wake that touched only
@@ -15484,16 +15587,35 @@ async fn event_loop<T: Terminal>(
                         // Row mode walks the open section's rows; section mode
                         // wheels through the accordion itself.
                         if panel_ui.row_mode {
-                            let (pc, pr) = panel_geom(&chrome);
-                            let max =
-                                crate::panel::frame::actionable_rows(&model, &panel_ui, pc, pr)
-                                    .saturating_sub(1);
-                            panel_ui.cursor = if up {
-                                panel_ui.cursor.saturating_sub(1)
+                            let (ticks, leftover) = drain_wheel_ticks(up, || {
+                                pending_input.pop_front().or_else(|| {
+                                    buf.terminal()
+                                        .poll_input(Some(std::time::Duration::ZERO))
+                                        .ok()
+                                        .flatten()
+                                })
+                            });
+                            if let Some(ev) = leftover {
+                                pending_input.push_front(ev);
+                            }
+                            if gitui::GitUi::is_drill(panel_ui.git.focus) {
+                                for _ in 0..ticks {
+                                    panel_ui.git.step_view_cursor(!up);
+                                }
                             } else {
-                                (panel_ui.cursor + 1).min(max)
-                            };
-                            panel_ui.sync_section_cursors();
+                                let (pc, pr) = panel_geom(&chrome);
+                                let max =
+                                    crate::panel::frame::actionable_rows(&model, &panel_ui, pc, pr)
+                                        .saturating_sub(1);
+                                for _ in 0..ticks {
+                                    panel_ui.cursor = if up {
+                                        panel_ui.cursor.saturating_sub(1)
+                                    } else {
+                                        (panel_ui.cursor + 1).min(max)
+                                    };
+                                }
+                                panel_ui.sync_section_cursors();
+                            }
                         } else {
                             let next = if up {
                                 panel_ui.prev_section()
@@ -15961,6 +16083,11 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Some(crate::panel::PanelHit::Row(sec, i)) => {
+                                if gitui::GitUi::is_drill(panel_ui.git.focus)
+                                    && let Some(view) = sec.home_view()
+                                {
+                                    panel_ui.git.retarget(view);
+                                }
                                 // A click can land on a NON-open section's rows
                                 // (the Full git frame renders all four lists at
                                 // once) — focus that section first, exactly as
@@ -16082,6 +16209,9 @@ async fn event_loop<T: Terminal>(
                                     panel_ui.switch_tab(t);
                                     persist_panel_state(&panel_ui);
                                 }
+                            }
+                            Some(crate::panel::PanelHit::GitDrill(i)) => {
+                                panel_ui.git.click_drill_row(i);
                             }
                             Some(crate::panel::PanelHit::Tab(t)) => {
                                 panel_ui.switch_tab(t);
