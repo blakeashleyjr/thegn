@@ -3211,8 +3211,11 @@ pub(crate) fn build_panel(
     // HostRuntime progress on top after each drain.
     panel.hosts = crate::host_ui::host_snapshots(app_cfg, db);
     // Per-[env.*] display snapshots for the System ▸ Environments section (kind,
-    // region/size, token presence). Cheap config walk; empty without any [env.*].
-    panel.environments = crate::env_ui::env_snapshots(app_cfg);
+    // region/size, token presence, effective binding). Skip the DB read if empty.
+    let bound = (!app_cfg.env.is_empty())
+        .then(|| db.effective_env(&cwd.to_string_lossy(), &scope_repo_root.to_string_lossy()))
+        .flatten();
+    panel.environments = crate::env_ui::env_snapshots(app_cfg, bound.as_deref());
     let toolchain_root = thegn_core::repo::main_worktree(cwd).unwrap_or_else(|| cwd.to_path_buf());
     panel.toolchain = Some(crate::toolchain_ui::worktree_status(
         app_cfg,

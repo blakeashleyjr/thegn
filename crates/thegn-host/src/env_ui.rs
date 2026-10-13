@@ -18,6 +18,8 @@ pub struct EnvSnapshot {
     pub placement: String,
     pub region: String,
     pub size: String,
+    /// Whether this is the worktree's effective environment (including inherited defaults).
+    pub bound: bool,
     /// `Some(true/false)` whether a token resolves for a provider env; `None` for
     /// non-provider placements (which need no token).
     pub token: Option<bool>,
@@ -25,7 +27,7 @@ pub struct EnvSnapshot {
 
 /// Build the display list for every configured env (sorted by name). Cheap: a
 /// map walk + one secret probe per provider env.
-pub fn env_snapshots(cfg: &Config) -> Vec<EnvSnapshot> {
+pub fn env_snapshots(cfg: &Config, bound: Option<&str>) -> Vec<EnvSnapshot> {
     let mut v: Vec<EnvSnapshot> = cfg
         .env
         .iter()
@@ -53,12 +55,71 @@ pub fn env_snapshots(cfg: &Config) -> Vec<EnvSnapshot> {
                 placement,
                 region: e.provider.region.clone(),
                 size: e.provider.size.clone(),
+                bound: bound == Some(name.as_str()),
                 token,
             }
         })
         .collect();
     v.sort_by(|a, b| a.name.cmp(&b.name));
     v
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BindDecision {
+    NoWorktree,
+    AlreadyBound,
+    Bind,
+}
+
+pub(crate) fn bind_decision(env: &EnvSnapshot, worktree: &str) -> BindDecision {
+    if worktree.trim().is_empty() {
+        BindDecision::NoWorktree
+    } else if env.bound {
+        BindDecision::AlreadyBound
+    } else {
+        BindDecision::Bind
+    }
+}
+
+fn already_bound_status(env: &EnvSnapshot) -> String {
+    format!(
+        "env '{}' is already this worktree's effective env",
+        env.name
+    )
+}
+
+pub(crate) fn bind_env_blocking(
+    db: &thegn_core::db::Db,
+    worktree: &str,
+    env: &str,
+) -> (String, thegn_core::notification::Priority) {
+    use thegn_core::notification::Priority;
+    use thegn_core::store::WorkspaceStore;
+
+    match db.set_worktree_env(worktree, env) {
+        Ok(()) => (
+            format!("bound env '{env}' to this worktree"),
+            Priority::Info,
+        ),
+        Err(error) => (format!("bind failed: {error}"), Priority::Alert),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TestDecision {
+    NotProvider(String),
+    Provider,
+}
+
+pub(crate) fn test_decision(env: &EnvSnapshot) -> TestDecision {
+    if env.placement == "provider" {
+        TestDecision::Provider
+    } else {
+        TestDecision::NotProvider(format!(
+            "env '{}' is a {} env — `t` tests provider tokens only",
+            env.name, env.placement
+        ))
+    }
 }
 
 /// The SecretRef (or bare env-var name) a provider env's token resolves from:
@@ -98,11 +159,11 @@ pub(crate) fn remove_env_confirmed(
 }
 
 /// Handle an action key on the `Environments` panel row at `cursor`:
-/// - **Enter** — bind this env to the active worktree (`db.set_worktree_env`).
+/// - **Enter** — bind this env to the active worktree off-loop.
 /// - **x** — CONFIRM, then remove the `[env.<name>]` from config + forget its
 ///   stored token. The confirm is non-negotiable: this deletes the provider
 ///   credential from the OS keyring, which one stray keystroke must not do.
-/// - **t** — test the provider token off-loop (a `list()` call); the outcome
+/// - **t** — test provider envs off-loop (a `list()` call); the outcome
 ///   pops as a toast where the user is looking (and is logged to System ▸
 ///   Logs; blocking the render loop is not acceptable).
 ///
@@ -131,21 +192,39 @@ pub fn panel_key(
     };
     match key {
         KeyCode::Enter => {
-            if worktree.trim().is_empty() {
-                model.status = "no active worktree to bind (open one first)".into();
-                return true;
-            }
-            use thegn_core::store::WorkspaceStore;
-            model.status = match thegn_core::db::Db::open()
-                .and_then(|db| db.set_worktree_env(worktree, &env.name))
-            {
-                Ok(()) => {
-                    // Rehydrate so the tab-bar placement/backend chips pick up
-                    // the new binding without waiting for another refresh.
-                    let _ = refresh_tx.send(crate::hydrate::RefreshKind::Model); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                    format!("bound env '{}' to this worktree", env.name)
+            match bind_decision(&env, worktree) {
+                BindDecision::NoWorktree => {
+                    model.status = "no active worktree to bind (open one first)".into();
                 }
-                Err(e) => format!("bind failed: {e}"),
+                BindDecision::AlreadyBound => {
+                    model.status = already_bound_status(&env);
+                }
+                BindDecision::Bind => {
+                    model.status = format!("binding env '{}'…", env.name);
+                    let wt = worktree.to_string();
+                    let name = env.name.clone();
+                    let toast = refresh_tx.clone();
+                    let refresh = refresh_tx.clone();
+                    let wk = waker.clone();
+                    drop(tokio::task::spawn_blocking(move || {
+                        use thegn_core::notification::Priority;
+                        let (message, priority) = match thegn_core::db::Db::open() {
+                            Ok(db) => bind_env_blocking(&db, &wt, &name),
+                            Err(error) => (format!("bind failed: {error}"), Priority::Alert),
+                        };
+                        if let Err(error) =
+                            toast.send(crate::hydrate::RefreshKind::Toast { message, priority })
+                        {
+                            tracing::debug!(target: "thegn::env", %error, "bind toast consumer is gone");
+                        }
+                        if let Err(error) = refresh.send(crate::hydrate::RefreshKind::Model) {
+                            tracing::debug!(target: "thegn::env", %error, "bind model refresh consumer is gone");
+                        }
+                        if let Err(error) = wk.wake() {
+                            tracing::debug!(target: "thegn::env", %error, "bind wake failed");
+                        }
+                    }));
+                }
             };
             true
         }
@@ -163,6 +242,10 @@ pub fn panel_key(
             true
         }
         KeyCode::Char('t') => {
+            if let TestDecision::NotProvider(message) = test_decision(&env) {
+                model.status = message;
+                return true;
+            }
             model.status = format!("testing env '{}'…", env.name);
             let pc = cfg.env.get(&env.name).map(|e| e.provider.clone());
             let name = env.name.clone();
@@ -241,7 +324,7 @@ mod tests {
         cfg.env
             .insert("a-local".into(), thegn_core::config::EnvConfig::default());
 
-        let snaps = env_snapshots(&cfg);
+        let snaps = env_snapshots(&cfg, None);
         // Sorted by name.
         assert_eq!(snaps[0].name, "a-local");
         assert_eq!(snaps[0].placement, "local");
@@ -261,6 +344,90 @@ mod tests {
             "h".into(),
             provider_env("hetzner", "TG_ENVUI_DEFINITELY_UNSET", ""),
         );
-        assert_eq!(env_snapshots(&cfg)[0].token, Some(false));
+        assert_eq!(env_snapshots(&cfg, None)[0].token, Some(false));
+    }
+
+    #[test]
+    fn snapshots_mark_the_bound_env() {
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "a".into(),
+            thegn_core::config::EnvConfig {
+                placement: PlacementMode::Local,
+                ..Default::default()
+            },
+        );
+        cfg.env.insert("b".into(), provider_env("fly", "", ""));
+
+        let snaps = env_snapshots(&cfg, Some("b"));
+        assert!(!snaps[0].bound);
+        assert!(snaps[1].bound);
+    }
+
+    #[test]
+    fn bind_decision_skips_the_already_bound_env() {
+        let env = EnvSnapshot {
+            name: "dev".into(),
+            kind: "local".into(),
+            placement: "local".into(),
+            region: String::new(),
+            size: String::new(),
+            bound: true,
+            token: None,
+        };
+        assert_eq!(bind_decision(&env, "/wt"), BindDecision::AlreadyBound);
+        assert_eq!(bind_decision(&env, ""), BindDecision::NoWorktree);
+    }
+
+    #[test]
+    fn already_bound_status_describes_the_effective_env() {
+        let env = EnvSnapshot {
+            name: "dev".into(),
+            kind: "local".into(),
+            placement: "local".into(),
+            region: String::new(),
+            size: String::new(),
+            bound: true,
+            token: None,
+        };
+
+        assert_eq!(
+            already_bound_status(&env),
+            "env 'dev' is already this worktree's effective env"
+        );
+    }
+
+    #[test]
+    fn bind_env_blocking_writes_the_pin() {
+        use thegn_core::store::WorkspaceStore;
+        let db = thegn_core::db::Db::open_memory().unwrap();
+
+        let (status, priority) = bind_env_blocking(&db, "/wt/x", "dev");
+        assert!(status.contains("bound env 'dev'"));
+        assert_eq!(priority, thegn_core::notification::Priority::Info);
+        assert_eq!(db.worktree_env("/wt/x").unwrap().as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn test_decision_only_offers_provider_tests() {
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "local".into(),
+            thegn_core::config::EnvConfig {
+                placement: PlacementMode::Local,
+                ..Default::default()
+            },
+        );
+        cfg.env
+            .insert("provider".into(), provider_env("fly", "", ""));
+        let snaps = env_snapshots(&cfg, None);
+        let local = snaps.iter().find(|env| env.name == "local").unwrap();
+        let provider = snaps.iter().find(|env| env.name == "provider").unwrap();
+
+        assert!(matches!(
+            test_decision(local),
+            TestDecision::NotProvider(message) if message.contains("provider tokens only")
+        ));
+        assert_eq!(test_decision(provider), TestDecision::Provider);
     }
 }
