@@ -10,34 +10,6 @@ use super::{
     visible_threads,
 };
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum PrRow<'a> {
-    Thread(usize),
-    OpenPr(&'a thegn_core::forge::model::PrHeader),
-}
-
-pub(crate) fn pr_row_at(
-    data: &crate::panel::PanelData,
-    deep: bool,
-    cursor: usize,
-) -> Option<PrRow<'_>> {
-    let thread_count = if data.pr.is_some() {
-        visible_threads(data, deep).count()
-    } else {
-        0
-    };
-    if cursor < thread_count {
-        return Some(PrRow::Thread(cursor));
-    }
-    let cap = if deep { 8 } else { 4 };
-    data.open_prs
-        .iter()
-        .filter(|p| p.head_ref != data.branch)
-        .take(cap)
-        .nth(cursor - thread_count)
-        .map(PrRow::OpenPr)
-}
-
 pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     if ctx.full() {
         return full_pr(ctx);
@@ -348,12 +320,18 @@ fn threads_and_open_prs(ctx: &SectionCtx) -> Vec<PanelRow> {
             } else {
                 0
             };
-            let active_repo = ctx
+            let active_path = ctx
                 .model
                 .sidebar_db_worktrees
                 .iter()
                 .find(|w| w.tab_name == ctx.model.worktree)
-                .map(|w| w.repo_path.as_str());
+                .map(|w| w.path.as_str());
+            let active_repo = active_path.and_then(|path| {
+                crate::handlers::take_me_there::active_repo_path(
+                    path,
+                    &ctx.model.sidebar_db_worktrees,
+                )
+            });
             for (j, p) in others.iter().take(cap).enumerate() {
                 let linked =
                     ctx.model.sidebar_db_worktrees.iter().any(|w| {
@@ -530,6 +508,14 @@ mod pr_row_tests {
     #[test]
     fn pr_row_at_resolves_an_open_pr() {
         let mut model = crate::chrome::FrameModel::default();
+        model.panel.pr = Some(crate::panel::PrSummary {
+            number: 9,
+            title: "Current".into(),
+            state: "OPEN".into(),
+            url: "https://github.com/a/b/pull/9".into(),
+            is_draft: false,
+            review_decision: None,
+        });
         model
             .panel
             .open_prs
@@ -547,8 +533,13 @@ mod pr_row_tests {
                 resolved: false,
                 ..Default::default()
             });
-        assert!(
-            matches!(pr_row_at(&model.panel, false, 1), Some(PrRow::OpenPr(pr)) if pr.number == 42)
-        );
+        assert!(matches!(
+            crate::handlers::take_me_there::pr_row_at(&model.panel, false, 0),
+            Some(crate::handlers::take_me_there::PrRow::Thread(0))
+        ));
+        assert!(matches!(
+            crate::handlers::take_me_there::pr_row_at(&model.panel, false, 1),
+            Some(crate::handlers::take_me_there::PrRow::OpenPr(pr)) if pr.number == 42
+        ));
     }
 }
