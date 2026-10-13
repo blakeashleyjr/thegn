@@ -414,7 +414,7 @@ fn compose_enter_refuses_unsupported_apple_backend() {
     );
     match enter_argv(&s, "true") {
         Err(EnterError::Refused(refusal)) => {
-            assert_eq!(refusal.class, RefusalClass::ComposePolicy);
+            assert_eq!(refusal.class, RefusalClass::ComposeTarget);
             assert_eq!(refusal.backend, "apple");
             assert!(refusal.path.is_none());
             assert!(refusal.message.contains("unsupported for backend 'apple'"));
