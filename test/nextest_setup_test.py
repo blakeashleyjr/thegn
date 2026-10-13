@@ -22,15 +22,17 @@ def setup_command():
     return command[2]
 
 
-def run(script, tmpdir, path_prefix=None):
+def run(script, tmpdir, path_prefix=None, env_path=None):
     env = os.environ.copy()
     path = env.get("PATH", "")
     if path_prefix is not None:
         path = f"{path_prefix}{os.pathsep}{path}"
+    if env_path is None:
+        env_path = Path(tmpdir) / "env"
     env.update({
         "PATH": path,
         "TMPDIR": str(tmpdir),
-        "NEXTEST_ENV": str(Path(tmpdir) / "env"),
+        "NEXTEST_ENV": str(env_path),
     })
     return subprocess.run(
         ["sh", "-c", script], env=env, stdout=subprocess.PIPE,
@@ -92,10 +94,11 @@ class NextestSetupTests(unittest.TestCase):
         parent = self.temporary_directory()
         missing_tmpdir = parent / "missing"
 
-        result = run(setup_command(), missing_tmpdir)
+        env_path = parent / "env"
+        result = run(setup_command(), missing_tmpdir, env_path=env_path)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertFalse((parent / "env").exists())
+        self.assertFalse(env_path.exists())
 
 
 if __name__ == "__main__":
