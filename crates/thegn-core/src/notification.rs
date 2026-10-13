@@ -73,6 +73,8 @@ pub enum NotificationKind {
     QueueReady,
     /// The merge-queue agent gave up on a branch — human intervention needed.
     QueueNeedsHuman,
+    /// A merge-queue branch was deferred or failed its gate.
+    QueueHeld,
     /// A queued pull request merged (by thegn or by the forge's auto-merge).
     PrQueueMerged,
     /// A queued pull request is green and mergeable, awaiting a manual merge.
@@ -166,7 +168,7 @@ impl NotificationKind {
     /// Every notification kind, for exhaustive iteration (config classification,
     /// SQL `IN` set construction, tests). Kept in sync with the enum by the
     /// `notification_kind_*` tests, which loop over this.
-    pub const ALL: [NotificationKind; 30] = [
+    pub const ALL: [NotificationKind; 31] = [
         Self::Assigned,
         Self::Mentioned,
         Self::StatusChanged,
@@ -185,6 +187,7 @@ impl NotificationKind {
         Self::QueueLanded,
         Self::QueueReady,
         Self::QueueNeedsHuman,
+        Self::QueueHeld,
         Self::PrQueueMerged,
         Self::PrQueueReady,
         Self::PrQueueNeedsHuman,
@@ -222,6 +225,7 @@ impl NotificationKind {
             Self::QueueLanded => "queue_landed",
             Self::QueueReady => "queue_ready",
             Self::QueueNeedsHuman => "queue_needs_human",
+            Self::QueueHeld => "queue_held",
             Self::PrQueueMerged => "pr_queue_merged",
             Self::PrQueueReady => "pr_queue_ready",
             Self::PrQueueNeedsHuman => "pr_queue_needs_human",
@@ -284,6 +288,7 @@ impl NotificationKind {
             // the default threshold without claiming the red Alert group.
             | Self::CalendarReminder
             | Self::UpstreamBehind => Priority::Notice,
+            Self::QueueHeld => Priority::Notice,
             Self::Automation => Priority::Notice,
         }
     }
@@ -319,6 +324,7 @@ impl NotificationKind {
             Self::CalendarChanged => "◷",
             Self::QueueReady => "◆",
             Self::QueueNeedsHuman => "✋",
+            Self::QueueHeld => "◆",
             Self::UpstreamBehind => "↓",
         }
     }
@@ -353,6 +359,7 @@ impl NotificationKind {
             Self::QueueLanded => (gl.check, Hue::Green),
             Self::QueueReady => (gl.diamond_filled, Hue::Green),
             Self::QueueNeedsHuman => (gl.attention, Hue::Red),
+            Self::QueueHeld => (gl.diamond_filled, Hue::Amber),
             Self::PrQueueMerged => (gl.check, Hue::Green),
             Self::PrQueueReady => ("⑂", Hue::Blue),
             Self::PrQueueNeedsHuman => (gl.attention, Hue::Red),
@@ -389,6 +396,7 @@ impl NotificationKind {
             Self::QueueLanded => "merge queue landed",
             Self::QueueReady => "merge queue ready to land",
             Self::QueueNeedsHuman => "merge queue needs you",
+            Self::QueueHeld => "merge queue hold",
             Self::PrQueueMerged => "pull request merged",
             Self::PrQueueReady => "pull request ready to merge",
             Self::PrQueueNeedsHuman => "pr queue needs you",
@@ -483,7 +491,7 @@ mod tests {
             assert_eq!(kind.as_str(), serde_name, "{kind:?}");
             assert!(seen.insert(kind), "{kind:?} duplicated in ALL");
         }
-        assert_eq!(seen.len(), 30, "ALL is missing kinds");
+        assert_eq!(seen.len(), 31, "ALL is missing kinds");
     }
 
     #[test]
@@ -530,6 +538,13 @@ mod tests {
             };
             assert_eq!(p, expected, "{kind:?}");
         }
+        assert_eq!(NotificationKind::QueueHeld.default_priority(), Notice);
+        assert_eq!(
+            NotificationKind::ALL
+                .into_iter()
+                .find(|kind| kind.as_str() == "queue_held"),
+            Some(NotificationKind::QueueHeld)
+        );
     }
 
     #[test]

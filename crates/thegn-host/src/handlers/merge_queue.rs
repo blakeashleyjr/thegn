@@ -407,8 +407,33 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                             }
                             StepReaction::Transient => {}
                         }
-                        if let Some((kind, message)) = step_notification(status, &branch, &detail) {
-                            notify_queue(ctx, kind, &worktree, message);
+                        match status {
+                            MqStatus::Deferred | MqStatus::GateFailed => {
+                                if ctx
+                                    .notify_state
+                                    .latch_queue_hold(&worktree, Some(status.as_str()))
+                                    && let Some((kind, message)) =
+                                        step_notification(status, &branch, &detail)
+                                {
+                                    notify_queue_hold(ctx, kind, &worktree, message);
+                                }
+                            }
+                            MqStatus::Queued
+                            | MqStatus::Folding
+                            | MqStatus::Verifying
+                            | MqStatus::AgentRunning => {}
+                            MqStatus::Landed
+                            | MqStatus::Ready
+                            | MqStatus::NeedsHuman
+                            | MqStatus::GateError
+                            | MqStatus::AgentBlocked => {
+                                ctx.notify_state.latch_queue_hold(&worktree, None);
+                                if let Some((kind, message)) =
+                                    step_notification(status, &branch, &detail)
+                                {
+                                    notify_queue(ctx, kind, &worktree, message);
+                                }
+                            }
                         }
                     }
                     None => {
@@ -450,6 +475,16 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                         now,
                         std::time::Duration::from_secs(10),
                     );
+                }
+                for (kind, key, message) in done_notifications(&out) {
+                    let state = if key.starts_with("bookkeeping:") {
+                        "bookkeeping_failed"
+                    } else {
+                        "persistence_failed"
+                    };
+                    if ctx.notify_state.latch_queue_hold(&key, Some(state)) {
+                        notify_queue_hold(ctx, kind, "", message);
+                    }
                 }
                 let (msg, success) = drive_summary(&out);
                 if success {
@@ -506,7 +541,7 @@ fn step_reaction(status: MqStatus) -> StepReaction {
 }
 
 /// Build the inbox/desktop notification for statuses that warrant one.
-/// Infrastructure holds expose only their bounded headline, never gate logs.
+/// Hold notifications expose only a bounded one-line headline.
 fn step_notification(
     status: MqStatus,
     branch: &str,
@@ -526,8 +561,7 @@ fn step_notification(
             format!("merge queue: {branch} needs a human — {detail}"),
         )),
         MqStatus::GateError | MqStatus::AgentBlocked => {
-            let headline = detail.lines().next().unwrap_or_default();
-            let headline = thegn_core::notification_render::truncate_chars(headline, 200, "…");
+            let headline = bounded_headline(detail);
             Some((
                 NotificationKind::QueueNeedsHuman,
                 format!(
@@ -535,13 +569,52 @@ fn step_notification(
                 ),
             ))
         }
-        MqStatus::Deferred
-        | MqStatus::GateFailed
-        | MqStatus::Queued
-        | MqStatus::Folding
-        | MqStatus::Verifying
-        | MqStatus::AgentRunning => None,
+        MqStatus::Deferred => Some((
+            NotificationKind::QueueHeld,
+            format!(
+                "merge queue: {branch} deferred (not landed): {}",
+                bounded_headline(detail)
+            ),
+        )),
+        MqStatus::GateFailed => Some((
+            NotificationKind::QueueHeld,
+            format!(
+                "merge queue: {branch} gate failed (red build): {}",
+                bounded_headline(detail)
+            ),
+        )),
+        MqStatus::Queued | MqStatus::Folding | MqStatus::Verifying | MqStatus::AgentRunning => None,
     }
+}
+
+fn bounded_headline(detail: &str) -> String {
+    let headline = detail.lines().next().unwrap_or_default();
+    thegn_core::notification_render::truncate_chars(headline, 200, "…")
+}
+
+fn done_notifications(
+    out: &crate::merge_driver::DriveOutcome,
+) -> Vec<(NotificationKind, String, String)> {
+    let mut notifications = Vec::new();
+    for failure in &out.bookkeeping_failed {
+        let error = bounded_headline(&failure.error);
+        notifications.push((
+            NotificationKind::QueueNeedsHuman,
+            format!("bookkeeping:{}:{}", failure.target, failure.new_oid),
+            format!(
+                "merge queue: {} landed on {} ({}→{}) but bookkeeping failed: {}; run `thegn merge drain` to reconcile",
+                failure.branch, failure.target, failure.old_oid, failure.new_oid, error
+            ),
+        ));
+    }
+    for line in &out.persistence_errors {
+        notifications.push((
+            NotificationKind::QueueNeedsHuman,
+            format!("persistence:{line}"),
+            format!("merge queue state write failed: {}", bounded_headline(line)),
+        ));
+    }
+    notifications
 }
 
 /// Patch (or insert) the panel's queue row for `worktree` so a drive step
@@ -679,6 +752,44 @@ fn notify_queue(ctx: &mut DrainCtx, kind: NotificationKind, worktree: &str, mess
                     ..Default::default()
                 },
             );
+        }
+    });
+}
+
+/// Route hold/bookkeeping notifications to the inbox by default. Desktop sinks
+/// remain available behind the explicit queue-hold setting.
+fn notify_queue_hold(ctx: &mut DrainCtx, kind: NotificationKind, worktree: &str, message: String) {
+    if ctx.notify_state.merge_queue_hold_desktop() {
+        notify_queue(ctx, kind, worktree, message);
+        return;
+    }
+    let dec = crate::notify::route_inbox_only(
+        ctx.notify_state,
+        kind.as_str(),
+        worktree,
+        &message,
+        worktree,
+    );
+    let kind_name = kind.as_str().to_string();
+    let wt = worktree.to_string();
+    tokio::task::spawn_blocking(move || match Db::open() {
+        Ok(db) if dec.record => {
+            if let Err(error) = crate::automation_events::insert_routed(
+                &db,
+                &kind_name,
+                &wt,
+                &message,
+                &wt,
+                Default::default(),
+                &dec,
+                false,
+            ) {
+                tracing::debug!(target: "thegn::merge", %error, "could not record merge queue hold notification");
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::debug!(target: "thegn::merge", %error, "could not open inbox DB for merge queue hold notification");
         }
     });
 }
@@ -1539,9 +1650,8 @@ mod tests {
                 MqStatus::NeedsHuman | MqStatus::GateError | MqStatus::AgentBlocked => {
                     Some(NotificationKind::QueueNeedsHuman)
                 }
-                MqStatus::Deferred
-                | MqStatus::GateFailed
-                | MqStatus::Queued
+                MqStatus::Deferred | MqStatus::GateFailed => Some(NotificationKind::QueueHeld),
+                MqStatus::Queued
                 | MqStatus::Folding
                 | MqStatus::Verifying
                 | MqStatus::AgentRunning => None,
@@ -1566,9 +1676,15 @@ mod tests {
                         message,
                         "merge queue: feature held (environment/policy, not a code verdict): reason"
                     ),
-                    MqStatus::Deferred
-                    | MqStatus::GateFailed
-                    | MqStatus::Queued
+                    MqStatus::Deferred => assert_eq!(
+                        message,
+                        "merge queue: feature deferred (not landed): reason"
+                    ),
+                    MqStatus::GateFailed => assert_eq!(
+                        message,
+                        "merge queue: feature gate failed (red build): reason"
+                    ),
+                    MqStatus::Queued
                     | MqStatus::Folding
                     | MqStatus::Verifying
                     | MqStatus::AgentRunning => {
@@ -1598,6 +1714,47 @@ mod tests {
         assert_eq!(kind, NotificationKind::QueueNeedsHuman);
         assert!(message.chars().count() <= 270);
         assert!(message.ends_with('…'));
+    }
+
+    #[test]
+    fn gate_failed_notification_has_a_bounded_one_line_headline() {
+        let detail = format!("{}\nsecond line", "x".repeat(5_000));
+        let (kind, message) = step_notification(MqStatus::GateFailed, "feature", &detail)
+            .expect("red gate holds notify the inbox");
+        assert_eq!(kind, NotificationKind::QueueHeld);
+        assert!(!message.contains('\n'));
+        assert!(message.starts_with("merge queue: feature gate failed (red build): "));
+        assert!(message.chars().count() <= 270);
+        assert!(message.ends_with('…'));
+    }
+
+    #[test]
+    fn done_notifications_include_bookkeeping_oids_and_persistence_error() {
+        let out = crate::merge_driver::DriveOutcome {
+            bookkeeping_failed: vec![crate::merge_driver::RefAdvancedBookkeepingFailed {
+                branch: "feature".into(),
+                target: "main".into(),
+                old_oid: "4babb0901f2c3d4e5f60718293a4b5c6d7e8f901".into(),
+                new_oid: "1234567890123456789012345678901234567890".into(),
+                error: "database locked".into(),
+            }],
+            persistence_errors: vec!["status write failed".into()],
+            ..crate::merge_driver::DriveOutcome::default()
+        };
+        let notifications = done_notifications(&out);
+        assert_eq!(notifications.len(), 2);
+        assert_eq!(notifications[0].0, NotificationKind::QueueNeedsHuman);
+        assert_eq!(
+            notifications[0].1,
+            "bookkeeping:main:1234567890123456789012345678901234567890"
+        );
+        assert!(notifications[0].2.contains(
+            "4babb0901f2c3d4e5f60718293a4b5c6d7e8f901→1234567890123456789012345678901234567890"
+        ));
+        assert!(notifications[0].2.contains("thegn merge drain"));
+        assert_eq!(notifications[1].0, NotificationKind::QueueNeedsHuman);
+        assert_eq!(notifications[1].1, "persistence:status write failed");
+        assert!(notifications[1].2.contains("status write failed"));
     }
 
     /// THE-515 fixture: a real git repo named `acme` plus an isolated state
