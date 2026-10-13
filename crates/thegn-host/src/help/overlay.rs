@@ -19,6 +19,8 @@ use thegn_core::help::{HelpRegistry, LinkTarget, SearchHit, TocNode};
 
 use super::render::{RenderedPage, render_page};
 
+type RenderKey = (String, usize, Option<usize>);
+
 /// What the loop should do after a key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelpOutcome {
@@ -67,7 +69,7 @@ pub struct HelpOverlay {
     /// Where things were painted on the last render, for mouse hit-testing.
     /// `None` before the first render, when a click can't mean anything yet.
     hits: Option<HitAreas>,
-    rendered_cache: Option<((String, usize, Option<usize>), Rc<RenderedPage>)>,
+    rendered_cache: Option<(RenderKey, Rc<RenderedPage>)>,
     search_cache: HashMap<String, Vec<SearchHit>>,
     search_cache_order: VecDeque<String>,
 }
@@ -243,7 +245,11 @@ impl HelpOverlay {
             // when the platform opener rejects the URL.
             LinkTarget::Url(url) => {
                 if let Err(error) = crate::actions::open_url_detached(url) {
-                    tracing::debug!(target: "thegn::help", %error, "opening help URL failed; copying it instead");
+                    tracing::debug!(
+                        target: "thegn::help",
+                        error = error.label(),
+                        "opening help URL failed; copying it instead"
+                    );
                     if let Err(error) = crate::clipboard::copy(url) {
                         tracing::debug!(target: "thegn::clipboard", %error, "clipboard request rejected");
                     }
@@ -451,7 +457,8 @@ impl HelpOverlay {
                 .min(search.hits.len().saturating_sub(1));
             return;
         }
-        let max = self.max_scroll(self.rendered().lines.len());
+        let len = self.rendered().lines.len();
+        let max = self.max_scroll(len);
         self.scroll = self.scroll.saturating_add_signed(delta).min(max);
     }
 
@@ -604,18 +611,31 @@ impl HelpOverlay {
             return;
         }
         {
-            // Keep the cursor row visible.
-            if self.toc_sel < self.toc_scroll {
-                self.toc_scroll = self.toc_sel;
-            } else if self.toc_sel >= self.toc_scroll + body_h {
-                self.toc_scroll = self.toc_sel + 1 - body_h;
+            // Very short bodies cannot fit both overflow markers and an item.
+            // Show rows only there, keeping the cursor visible.
+            if body_h < 3 {
+                self.toc_scroll = self.toc_sel.saturating_sub(body_h.saturating_sub(1));
+            } else {
+                // Markers consume rows, so settle the scroll against the
+                // capacity left after deciding which markers are present.
+                loop {
+                    let top = self.toc_scroll > 0;
+                    let provisional_capacity = body_h - usize::from(top);
+                    let bottom = self.toc_scroll + provisional_capacity < self.toc_rows.len();
+                    let capacity = body_h - usize::from(top) - usize::from(bottom);
+                    if self.toc_sel < self.toc_scroll {
+                        self.toc_scroll = self.toc_sel;
+                    } else if self.toc_sel >= self.toc_scroll + capacity {
+                        self.toc_scroll = self.toc_sel + 1 - capacity;
+                    } else {
+                        break;
+                    }
+                }
             }
-            let top_marker = self.toc_scroll > 0;
-            let mut item_capacity = body_h.saturating_sub(usize::from(top_marker));
-            let bottom_marker = self.toc_scroll + item_capacity < self.toc_rows.len();
-            if bottom_marker {
-                item_capacity = item_capacity.saturating_sub(1);
-            }
+            let top_marker = body_h >= 3 && self.toc_scroll > 0;
+            let bottom_marker = body_h >= 3
+                && self.toc_scroll + body_h - usize::from(top_marker) < self.toc_rows.len();
+            let item_capacity = body_h - usize::from(top_marker) - usize::from(bottom_marker);
             if top_marker {
                 let above = self.toc_scroll;
                 let label = format!("↑{above}");
@@ -664,7 +684,7 @@ impl HelpOverlay {
                     panel,
                 );
             }
-            if self.toc_scroll + item_capacity < self.toc_rows.len() && body_h > 0 {
+            if bottom_marker && body_h > 0 {
                 let below = self.toc_rows.len() - (self.toc_scroll + item_capacity);
                 let label = format!("+{below} more");
                 seg::draw_line(
@@ -874,6 +894,29 @@ mod tests {
     }
 
     #[test]
+    fn short_toc_body_keeps_the_cursor_on_a_drawn_row() {
+        let mut ov = overlay();
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            cols: 100,
+            rows: 7,
+        };
+        let mut surface = Surface::new(100, 7);
+        for _ in 0..ov.toc_rows.len() {
+            key(&mut ov, KeyCode::DownArrow);
+            ov.render(&mut surface, screen);
+            let hits = ov.hits.as_ref().unwrap();
+            assert!(
+                hits.left_rows.iter().any(|(_, row)| *row == ov.toc_sel),
+                "selected TOC row {} is absent from {:?}",
+                ov.toc_sel,
+                hits.left_rows
+            );
+        }
+    }
+
+    #[test]
     fn search_finds_and_jumps() {
         let mut ov = overlay();
         key(&mut ov, KeyCode::Char('/'));
@@ -963,10 +1006,17 @@ mod tests {
         }
         let first_hits = ov.search.as_ref().unwrap().hits.clone();
         assert_eq!(ov.search_cache.get("the"), Some(&first_hits));
+        let sentinel = vec![SearchHit {
+            page: "cached-sentinel".into(),
+            title: "cached sentinel".into(),
+            score: 0,
+            snippet: None,
+        }];
+        ov.search_cache.insert("the".into(), sentinel.clone());
         key(&mut ov, KeyCode::Backspace);
         key(&mut ov, KeyCode::Char('e'));
         assert_eq!(ov.search.as_ref().unwrap().query, "the");
-        assert_eq!(ov.search.as_ref().unwrap().hits, first_hits);
+        assert_eq!(ov.search.as_ref().unwrap().hits, sentinel);
         assert!(ov.search_cache.len() <= 16);
     }
 
@@ -1071,7 +1121,8 @@ mod tests {
         for _ in 0..500 {
             key(&mut ov, KeyCode::DownArrow);
         }
-        let max = ov.max_scroll(ov.rendered().lines.len());
+        let len = ov.rendered().lines.len();
+        let max = ov.max_scroll(len);
         assert_eq!(ov.scroll, max);
         key(&mut ov, KeyCode::Char('g'));
         assert_eq!(ov.scroll, 0);
