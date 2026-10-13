@@ -2373,4 +2373,136 @@ mod tests {
         assert!(!backlog.retry_clipboards(64, |_| Some(false)));
         assert!(backlog.clipboard_ready.is_empty());
     }
+
+    #[test]
+    fn single_released_slot_serves_every_competing_pane_in_bounded_passes() {
+        let mut backlog = PtyBacklog::default();
+        for id in 1..=4 {
+            backlog.clipboard_pending(id);
+        }
+        let mut admitted = Vec::new();
+        for _ in 0..4 {
+            let mut slot_taken = false;
+            backlog.retry_clipboards(4, |id| {
+                if slot_taken {
+                    Some(true)
+                } else {
+                    slot_taken = true;
+                    admitted.push(id);
+                    Some(false)
+                }
+            });
+            let accepted = *admitted.last().expect("one slot is released each pass");
+            // Model a flooding pane that publishes another set after admission.
+            backlog.clipboard_pending(accepted);
+        }
+
+        assert_eq!(admitted, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn flooding_pane_cannot_delay_another_panes_exit_barrier() {
+        let mut backlog = PtyBacklog::default();
+        backlog.push(1, vec![b'f'; 2 * 1024 * 1024]);
+        backlog.clipboard_pending(1);
+        backlog.push(2, b"short tail\n".to_vec());
+        backlog.pending_exit(2, Some(0));
+        let mut completed = Vec::new();
+
+        for _ in 0..4 {
+            let pass = drain_backlog_work(
+                &mut backlog,
+                128 * 1024,
+                Duration::from_secs(5),
+                Instant::now(),
+                |_, _, _| {},
+                || false,
+            );
+            completed.extend(pass.completed_exits);
+            backlog.retry_clipboards(1, |_| Some(true));
+            backlog.clipboard_pending(1);
+            if completed.iter().any(|(id, _)| *id == 2) {
+                break;
+            }
+        }
+
+        assert_eq!(completed, [(2, Some(0))]);
+        assert!(backlog.clipboard_ready.contains(&1));
+    }
+
+    #[test]
+    fn seeded_hostile_clipboard_trace_stays_bounded_and_fair() {
+        const PANES: u32 = 8;
+        let mut backlog = PtyBacklog::default();
+        let mut retired = HashSet::new();
+        let mut seed = 0x6d2b_79f5_u32;
+
+        for _ in 0..3000 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let id = seed % PANES + 1;
+            match (seed >> 8) % 4 {
+                0 => {
+                    if !retired.contains(&id) {
+                        backlog.clipboard_pending(id);
+                    }
+                }
+                1 => backlog.barrier(id),
+                2 => {
+                    backlog.retire(id);
+                    retired.insert(id);
+                }
+                _ => {
+                    let budget = ((seed >> 16) as usize % 3) + 1;
+                    let mut calls = 0;
+                    backlog.retry_clipboards(budget, |pending_id| {
+                        calls += 1;
+                        if (seed.wrapping_add(pending_id) & 1) == 0 {
+                            Some(false)
+                        } else {
+                            Some(true)
+                        }
+                    });
+                    assert!(calls <= budget, "retry call exceeded its attempt budget");
+                }
+            }
+
+            let unique = backlog
+                .clipboard_ready
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            assert_eq!(unique.len(), backlog.clipboard_ready.len());
+            assert!(
+                backlog
+                    .clipboard_ready
+                    .iter()
+                    .all(|pending_id| !retired.contains(pending_id))
+            );
+        }
+
+        let expected = backlog
+            .clipboard_ready
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut admissions = Vec::new();
+        for _ in 0..expected.len() {
+            let mut slot_taken = false;
+            let mut accepted = None;
+            backlog.retry_clipboards(1, |id| {
+                if slot_taken {
+                    Some(true)
+                } else {
+                    slot_taken = true;
+                    accepted = Some(id);
+                    Some(false)
+                }
+            });
+            let id = accepted.expect("one slot is released per fairness pass");
+            admissions.push(id);
+            backlog.clipboard_pending(id);
+        }
+        assert_eq!(admissions.iter().copied().collect::<HashSet<_>>(), expected);
+        assert_eq!(admissions.len(), expected.len());
+    }
 }
