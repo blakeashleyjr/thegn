@@ -1805,16 +1805,22 @@ mod tests {
         let mut changed = old.clone();
         changed.added = 1;
         assert_eq!(
-            staging_refetch("f", &[old.clone()], &[changed]),
+            staging_refetch("f", std::slice::from_ref(&old), &[changed]),
             Some(false)
         );
         let staged = change("f", crate::panel::Stage::Untracked);
-        assert_eq!(staging_refetch("f", &[old.clone()], &[staged]), Some(true));
-        assert_eq!(staging_refetch("f", &[old.clone()], &[]), Some(false));
+        assert_eq!(
+            staging_refetch("f", std::slice::from_ref(&old), &[staged]),
+            Some(true)
+        );
+        assert_eq!(
+            staging_refetch("f", std::slice::from_ref(&old), &[]),
+            Some(false)
+        );
         assert_eq!(
             staging_refetch(
                 "f",
-                &[old.clone()],
+                std::slice::from_ref(&old),
                 &[old.clone(), change("other", crate::panel::Stage::Unstaged),]
             ),
             None

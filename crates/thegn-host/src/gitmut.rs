@@ -57,9 +57,6 @@ pub enum GitOp {
         path: String,
         unstage: bool,
     },
-    IntentToAdd {
-        path: String,
-    },
     DiscardFile {
         path: String,
         untracked: bool,
@@ -250,7 +247,6 @@ impl GitOp {
             GitOp::DiscardLines { .. } => "discarding lines",
             GitOp::StageFile { unstage: false, .. } => "staging",
             GitOp::StageFile { .. } => "unstaging",
-            GitOp::IntentToAdd { .. } => "tracking",
             GitOp::DiscardFile { .. } => "discarding",
             GitOp::DiscardFiles { .. } => "rolling back",
             GitOp::StageAll => "staging all",
@@ -389,7 +385,6 @@ fn touches_index(op: &GitOp) -> bool {
         GitOp::StageLines { .. }
             | GitOp::StageUntrackedLines { .. }
             | GitOp::StageFile { .. }
-            | GitOp::IntentToAdd { .. }
             | GitOp::StageAll
             | GitOp::UnstageAll
             | GitOp::Commit { .. }
@@ -511,7 +506,6 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
         } else {
             g.stage(loc, &path)
         }),
-        GitOp::IntentToAdd { path } => done(g.intent_to_add(loc, &path)),
         GitOp::DiscardFile { path, untracked } => done(g.discard_file(loc, &path, untracked)),
         GitOp::DiscardFiles { paths } => {
             let n = paths.len();
