@@ -206,6 +206,10 @@ pub struct TestPanelState {
     pub cursor: usize,
     pub scroll: usize,
     pub filter: String,
+    /// Whether the filter is currently being edited in the Tests panel.
+    pub filter_editing: bool,
+    /// Last applied run's worktree and captured output.
+    pub last_output: Option<(String, String)>,
     /// Manifest fingerprint recorded at the last discovery. Compared against a
     /// freshly-computed one to decide whether discovery can be skipped.
     pub fingerprint: String,
@@ -214,6 +218,60 @@ pub struct TestPanelState {
 }
 
 impl TestPanelState {
+    /// Return every failing test id in display-tree order, once per id.
+    pub fn failing_ids(&self) -> Vec<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.nodes
+            .iter()
+            .filter(|node| node.kind == TestNodeKind::Test && node.state == TestState::Fail)
+            .filter(|node| seen.insert(node.id.clone()))
+            .map(|node| node.id.clone())
+            .collect()
+    }
+
+    /// Apply one filter-editing operation. Returns whether state changed.
+    pub fn edit_filter(&mut self, edit: FilterEdit) -> bool {
+        match edit {
+            FilterEdit::Push(ch) => {
+                self.filter.push(ch);
+                self.cursor = 0;
+                true
+            }
+            FilterEdit::Pop => {
+                let changed = self.filter.pop().is_some();
+                if changed {
+                    self.cursor = 0;
+                }
+                changed
+            }
+            FilterEdit::Commit => {
+                let changed = self.filter_editing;
+                self.filter_editing = false;
+                changed
+            }
+            FilterEdit::Clear => {
+                let changed = self.filter_editing || !self.filter.is_empty();
+                self.filter_editing = false;
+                self.filter.clear();
+                changed
+            }
+        }
+    }
+
+    /// Apply a filter edit and reset both the tree and accordion cursors when
+    /// the visible set changes because text was pushed or popped.
+    pub fn edit_filter_with_panel_cursor(
+        &mut self,
+        edit: FilterEdit,
+        panel_cursor: &mut usize,
+    ) -> bool {
+        let changed = self.edit_filter(edit);
+        if changed && matches!(edit, FilterEdit::Push(_) | FilterEdit::Pop) {
+            *panel_cursor = 0;
+        }
+        changed
+    }
+
     /// Record a completed run at the head of the history (capped).
     pub fn push_history(&mut self, rec: TestRunRec) {
         self.history.insert(0, rec);
@@ -384,6 +442,14 @@ impl TestPanelState {
         self.stale = true;
         self.summary.stale = true;
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterEdit {
+    Push(char),
+    Pop,
+    Commit,
+    Clear,
 }
 
 pub fn test_name_of(test_id: &str) -> &str {
@@ -844,6 +910,69 @@ mod tests {
             .iter()
             .filter(|n| n.kind == TestNodeKind::Test)
             .collect()
+    }
+
+    #[test]
+    fn filter_edit_narrows_visible_nodes() {
+        let mut state = TestPanelState::default();
+        state.merge_results(&[
+            test_node("alpha::first", TestState::Pass, None, None),
+            test_node("beta::second", TestState::Pass, None, None),
+        ]);
+        let before = state.visible_indices().len();
+        state.cursor = 1;
+        state.filter_editing = true;
+
+        for ch in "alpha".chars() {
+            assert!(state.edit_filter(FilterEdit::Push(ch)));
+        }
+        assert_eq!(state.cursor, 0);
+        let after = state.visible_indices();
+        assert!(!after.is_empty() && after.len() < before);
+        assert!(after.iter().all(|&index| {
+            let node = &state.nodes[index];
+            node.id.contains("alpha") || node.label.contains("alpha")
+        }));
+
+        assert!(state.edit_filter(FilterEdit::Clear));
+        assert!(state.filter.is_empty());
+        assert!(!state.filter_editing);
+        assert_eq!(state.visible_indices().len(), before);
+    }
+
+    #[test]
+    fn filter_edit_resets_tree_and_panel_cursors() {
+        let mut state = TestPanelState::default();
+        let mut panel_cursor = 7;
+        state.cursor = 4;
+        state.filter_editing = true;
+
+        assert!(state.edit_filter_with_panel_cursor(FilterEdit::Push('a'), &mut panel_cursor));
+        assert_eq!(state.cursor, 0);
+        assert_eq!(panel_cursor, 0);
+
+        state.cursor = 3;
+        panel_cursor = 5;
+        assert!(state.edit_filter_with_panel_cursor(FilterEdit::Pop, &mut panel_cursor));
+        assert_eq!(state.cursor, 0);
+        assert_eq!(panel_cursor, 0);
+    }
+
+    #[test]
+    fn failing_ids_lists_all_failures_once() {
+        let state = TestPanelState {
+            nodes: vec![
+                test_node("mod::a", TestState::Fail, None, None),
+                test_node("mod::a", TestState::Fail, None, None),
+                test_node("mod::b", TestState::Fail, None, None),
+                test_node("mod::pass", TestState::Pass, None, None),
+            ],
+            ..TestPanelState::default()
+        };
+        assert_eq!(
+            state.failing_ids(),
+            vec!["mod::a".to_string(), "mod::b".to_string()]
+        );
     }
 
     #[test]
