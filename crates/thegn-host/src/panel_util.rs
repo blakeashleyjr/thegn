@@ -41,7 +41,8 @@ pub(crate) fn spawn_editor_detached(command: &str, cwd: Option<&std::path::Path>
 /// Open `path` in the editor the way its placement wants: terminal editors
 /// get a center tab (or, with `in_pane`, a split next to `focused`); windowed
 /// editors are spawned detached so no dead pane is left behind. Returns
-/// whether a tab/pane was opened (the caller then moves focus to the center).
+/// whether the editor placement is pane-based (the caller then moves focus to
+/// the center).
 #[allow(clippy::too_many_arguments)] // mirrors open_command_pane's shape + placement inputs
 pub(crate) fn open_editor(
     session: &mut crate::session::Session,
@@ -85,7 +86,7 @@ pub(crate) fn open_editor(
                 );
                 panes.note_editor_file(focused, path.to_string_lossy().into_owned());
             }
-            opened
+            true
         }
     }
 }
