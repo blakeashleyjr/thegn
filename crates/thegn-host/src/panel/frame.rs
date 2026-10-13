@@ -427,22 +427,28 @@ pub fn build_panel(
         if on {
             label = label.bold();
         }
-        // Each accordion is numbered; the number is its open shortcut within the tab.
-        let number = crate::panel::section_digit(i)
-            .map_or_else(|| " ".to_string(), |digit| digit.to_string());
-        let num = seg(Tok::Slot(if on { S::Accent } else { S::Ghost2 }), number).bold();
-        let mut srow = PanelRow::plain(Line::split(
-            {
-                let mut l = vec![sp(1), num, sp(1), label];
-                l.push(sp(0));
-                l
-            },
-            {
-                let mut r = sections::summary(section, model);
-                r.push(sp(1));
-                r
-            },
-        ))
+        // Numbered accordions reserve a digit and separator. Sections past
+        // the tenth keep the label column compact and have no jump shortcut.
+        let digit = crate::panel::section_digit(i);
+        let mut left = vec![sp(1)];
+        if let Some(digit) = digit {
+            left.push(
+                seg(
+                    Tok::Slot(if on { S::Accent } else { S::Ghost2 }),
+                    digit.to_string(),
+                )
+                .bold(),
+            );
+            left.push(sp(1));
+        } else {
+            left.push(sp(1));
+        }
+        left.push(label);
+        let mut srow = PanelRow::plain(Line::split(left, {
+            let mut r = sections::summary(section, model);
+            r.push(sp(1));
+            r
+        }))
         .with_hit(PanelHit::OpenSection(section));
         if on {
             srow = srow.with_bg(Tok::Slot(S::Bg1));
