@@ -12371,6 +12371,7 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
         }
+        let plugin_backlog = !plugin_rx.is_empty();
         crate::handlers::plugins::flush_alerts(&mut plugins_state);
         dirty |= crate::worktree_lifecycle::apply_completions(
             &mut session,
@@ -14651,7 +14652,7 @@ async fn event_loop<T: Terminal>(
             defer_timeout,
             dirty,
             !pending_input.is_empty(),
-            budget_exhausted || log_backlog,
+            budget_exhausted || log_backlog || plugin_backlog,
         );
         let polled = match pending_input.pop_front() {
             Some(ev) => Ok(Some(ev)),
