@@ -526,6 +526,10 @@ impl PrivateDir {
                 Ok(stat) => {
                     let kind = SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT;
                     if kind == SFlag::S_IFREG && stat.st_nlink > 1 {
+                        #[allow(
+                            clippy::unnecessary_cast,
+                            reason = "st_nlink is u16 on macOS, u64 on Linux"
+                        )]
                         let extra = (stat.st_nlink as u64).saturating_sub(1);
                         if let Some(note) = hard_link_residue_note(&self.path.join(name), extra) {
                             tracing::warn!(target: "thegn::fsperm", path = %self.path.join(name).display(), "{note}");
@@ -924,9 +928,9 @@ mod tests {
         let private = ensure_private_dir_beneath(anchor.path(), Path::new("p")).unwrap();
         let old_link = anchor.path().join("outside");
         private.write_owner_only_atomic("env", b"old").unwrap();
-        std::fs::hard_link(private.path().join("env"), &old_link).unwrap();
+        std::fs::hard_link(private.path.join("env"), &old_link).unwrap();
         private.write_owner_only_atomic("env", b"new").unwrap();
-        assert_eq!(std::fs::read(private.path().join("env")).unwrap(), b"new");
+        assert_eq!(std::fs::read(private.path.join("env")).unwrap(), b"new");
         assert_eq!(std::fs::read(old_link).unwrap(), b"old");
     }
 
