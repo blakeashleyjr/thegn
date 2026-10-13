@@ -1205,6 +1205,7 @@ impl PanelUi {
         self.tab = tab;
         self.row_mode = false;
         self.cursor = 0;
+        self.scroll = 0;
         self.ensure_open_valid();
         self.recall_width();
     }

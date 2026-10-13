@@ -1732,26 +1732,26 @@ fn panel_geom(chrome: &layout::ChromeLayout) -> (usize, usize) {
         .unwrap_or((layout::PANEL_COLS, 40))
 }
 
-/// The accordion immediately after `from` in the live order (no wrap) — the
-/// cursor flows into it when Down is pressed at the bottom of `from`. Every
-/// accordion is visited, including those with no actionable rows (you land on
-/// the header and the next Down flows onward). None at the last accordion.
+/// The next accordion in the active tab (no wrap) — the cursor flows into it
+/// when Down is pressed at the bottom of `from`. None at the tab's last accordion.
 fn next_section_in_order(
     from: crate::panel::Section,
     ui: &crate::panel::PanelUi,
 ) -> Option<crate::panel::Section> {
-    let idx = ui.order.iter().position(|&s| s == from)?;
-    ui.order.get(idx + 1).copied()
+    let sections = ui.tab_sections();
+    let idx = sections.iter().position(|&s| s == from)?;
+    sections.get(idx + 1).copied()
 }
 
-/// The accordion immediately before `from` in the live order (no wrap); the
-/// cursor flows into its LAST item when Up is pressed at the top of `from`.
+/// The previous accordion in the active tab (no wrap); Up flows into its LAST
+/// item when pressed at the top of `from`.
 fn prev_section_in_order(
     from: crate::panel::Section,
     ui: &crate::panel::PanelUi,
 ) -> Option<crate::panel::Section> {
-    let idx = ui.order.iter().position(|&s| s == from)?;
-    idx.checked_sub(1).and_then(|i| ui.order.get(i).copied())
+    let sections = ui.tab_sections();
+    let idx = sections.iter().position(|&s| s == from)?;
+    idx.checked_sub(1).and_then(|i| sections.get(i).copied())
 }
 
 /// A worktree group's working directory, falling back to the process cwd.
@@ -15228,6 +15228,35 @@ async fn event_loop<T: Terminal>(
                             dirty = true;
                             continue;
                         }
+                        let (pc, pr) = panel_geom(&chrome);
+                        if let Some(ext) = crate::panel::sections::scroll_extent(
+                            panel_ui.open,
+                            &model,
+                            &panel_ui,
+                            pc,
+                            pr,
+                        ) && ext.owns_nav
+                        {
+                            let (ticks, leftover) = drain_wheel_ticks(up, || {
+                                pending_input.pop_front().or_else(|| {
+                                    buf.terminal()
+                                        .poll_input(Some(std::time::Duration::ZERO))
+                                        .ok()
+                                        .flatten()
+                                })
+                            });
+                            if let Some(ev) = leftover {
+                                pending_input.push_front(ev);
+                            }
+                            let delta = ticks.saturating_mul(3);
+                            panel_ui.scroll = if up {
+                                panel_ui.scroll.min(ext.max).saturating_sub(delta)
+                            } else {
+                                panel_ui.scroll.saturating_add(delta).min(ext.max)
+                            };
+                            dirty = true;
+                            continue;
+                        }
                         // Row mode walks the open section's rows; section mode
                         // wheels through the accordion itself.
                         if panel_ui.row_mode {
@@ -19180,6 +19209,78 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                if forced_palette_action.is_none()
+                    && focus.panel()
+                    && let Some(ext) = crate::panel::sections::scroll_extent(
+                        panel_ui.open,
+                        &model,
+                        &panel_ui,
+                        panel_geom(&chrome).0,
+                        panel_geom(&chrome).1,
+                    )
+                {
+                    let (_, rows) = panel_geom(&chrome);
+                    let page = rows.saturating_sub(2).max(1);
+                    let step = match k.key {
+                        KeyCode::PageDown if k.modifiers.is_empty() => Some(page as isize),
+                        KeyCode::PageUp if k.modifiers.is_empty() => Some(-(page as isize)),
+                        KeyCode::Char('d') if k.modifiers == Modifiers::CTRL => {
+                            Some((page / 2).max(1) as isize)
+                        }
+                        KeyCode::Char('u') if k.modifiers == Modifiers::CTRL => {
+                            Some(-((page / 2).max(1) as isize))
+                        }
+                        _ => None,
+                    };
+                    let mut handled = step.is_some();
+                    if ext.owns_nav {
+                        match k.key {
+                            KeyCode::Home if k.modifiers.is_empty() => {
+                                panel_ui.scroll = 0;
+                                handled = true;
+                            }
+                            KeyCode::End if k.modifiers.is_empty() => {
+                                panel_ui.scroll = ext.max;
+                                handled = true;
+                            }
+                            KeyCode::Char('g') if k.modifiers.is_empty() => {
+                                panel_ui.scroll = 0;
+                                handled = true;
+                            }
+                            KeyCode::Char('G')
+                                if !k.modifiers.contains(Modifiers::CTRL)
+                                    && !k.modifiers.contains(Modifiers::ALT) =>
+                            {
+                                panel_ui.scroll = ext.max;
+                                handled = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(step) = step {
+                        let (repeat, leftover) = drain_key_repeats(&k, || {
+                            pending_input.pop_front().or_else(|| {
+                                buf.terminal()
+                                    .poll_input(Some(std::time::Duration::ZERO))
+                                    .ok()
+                                    .flatten()
+                            })
+                        });
+                        if let Some(ev) = leftover {
+                            pending_input.push_front(ev);
+                        }
+                        let delta = step.unsigned_abs().saturating_mul(repeat);
+                        panel_ui.scroll = if step < 0 {
+                            panel_ui.scroll.min(ext.max).saturating_sub(delta)
+                        } else {
+                            panel_ui.scroll.saturating_add(delta).min(ext.max)
+                        };
+                    }
+                    if handled {
+                        dirty = true;
+                        continue;
+                    }
+                }
                 // Enter on a git-family LIST (commits / branches / stash)
                 // drills into the row at cursor — even before j/k has entered
                 // row-mode (the panel starts in section-nav mode on focus, see
@@ -19378,8 +19479,8 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             PanelMsg::CursorDown | PanelMsg::CursorUp => {
-                                // j/k always navigate items; entering row mode
-                                // on the first keypress activates selection highlighting.
+                                // Enter row mode on the first j/k press; hitless
+                                // scroll bodies intercept this route below.
                                 panel_ui.row_mode = true;
                                 // One clamped step per QUEUED key: held-key
                                 // repeats are drained and applied in a single
@@ -19399,47 +19500,21 @@ async fn event_loop<T: Terminal>(
                                     // Front, not back: the leftover precedes whatever is still queued.
                                     pending_input.push_front(ev);
                                 }
-                                // Full-view scroll documents (the git log, the
-                                // cheatsheet): j/k move the viewport, not a row
-                                // cursor. Changes is EXCLUDED — at Full it renders
-                                // the lazygit git frame (a navigable FILES list +
-                                // staging main region), so its arrows drive the
-                                // list cursor / section flow like every other
-                                // git-family list (Commits/Branches/Stash).
-                                // Keys scrolls at BOTH expanded widths — its
-                                // Half view is the same hit-free chip column,
-                                // so without the scroll route `j` at Half left
-                                // the section with the overflow unreachable.
-                                if (panel_ui.width == layout::PanelWidth::Full
-                                    && matches!(panel_ui.open, Section::Pr | Section::Keys))
-                                    || (panel_ui.width == layout::PanelWidth::Half
-                                        && panel_ui.open == Section::Keys)
+                                // Hitless panel bodies own j/k at every supported
+                                // width; Stash detail leaves these keys to its list.
+                                let geom = panel_geom(&chrome);
+                                if let Some(ext) = crate::panel::sections::scroll_extent(
+                                    panel_ui.open,
+                                    &model,
+                                    &panel_ui,
+                                    geom.0,
+                                    geom.1,
+                                ) && ext.owns_nav
                                 {
-                                    let max = match panel_ui.open {
-                                        Section::Pr => panel_ui
-                                            .docs
-                                            .git
-                                            .as_ref()
-                                            .map(|d| d.log.len().saturating_sub(1))
-                                            .unwrap_or(0),
-                                        // Two balanced columns → height ≈ half
-                                        // the total group lines (clamped again
-                                        // at render).
-                                        _ => {
-                                            let lines: usize = panel_ui
-                                                .docs
-                                                .cfg_keys
-                                                .iter()
-                                                .map(|g| g.rows.len() + 2)
-                                                .sum::<usize>()
-                                                + 8;
-                                            lines.div_ceil(2).saturating_sub(1)
-                                        }
-                                    };
                                     panel_ui.scroll = if up {
-                                        panel_ui.scroll.saturating_sub(repeat)
+                                        panel_ui.scroll.min(ext.max).saturating_sub(repeat)
                                     } else {
-                                        (panel_ui.scroll + repeat).min(max)
+                                        panel_ui.scroll.saturating_add(repeat).min(ext.max)
                                     };
                                     dirty = true;
                                     continue;

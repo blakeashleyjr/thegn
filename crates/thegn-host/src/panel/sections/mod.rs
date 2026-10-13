@@ -659,7 +659,7 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
         }
         Section::Keys => vec![seg(g2(), "?")],
-        Section::Help => vec![seg(g2(), "F1")],
+        Section::Help => vec![seg(g2(), model.chord("help").to_string())],
         Section::Mine => {
             let rows = &model.panel.my_work;
             if rows.is_empty() {
@@ -927,6 +927,67 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Logs => logs::content(ctx),
         Section::Media => media::content(ctx),
         Section::Usage => usage::content(ctx),
+    }
+}
+
+/// The scroll bounds and navigation ownership for hitless panel bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollExtent {
+    pub max: usize,
+    pub owns_nav: bool,
+}
+
+/// Returns the viewport's maximum scroll and whether it owns j/k and g/G.
+pub fn scroll_extent(
+    section: Section,
+    model: &crate::chrome::FrameModel,
+    ui: &PanelUi,
+    cols: usize,
+    rows: usize,
+) -> Option<ScrollExtent> {
+    let ctx = SectionCtx {
+        model,
+        ui,
+        cols,
+        rows,
+    };
+    match section {
+        Section::Help => Some(ScrollExtent {
+            max: help::line_count(&ctx).saturating_sub(rows.saturating_sub(2)),
+            owns_nav: true,
+        }),
+        Section::Telemetry => Some(ScrollExtent {
+            max: telemetry::row_count(&ctx).saturating_sub(rows),
+            owns_nav: true,
+        }),
+        Section::Keys
+            if matches!(
+                ui.width,
+                crate::layout::PanelWidth::Half | crate::layout::PanelWidth::Full
+            ) =>
+        {
+            let lines: usize = ui
+                .docs
+                .cfg_keys
+                .iter()
+                .map(|g| g.rows.len() + 2)
+                .sum::<usize>()
+                + 8;
+            Some(ScrollExtent {
+                max: lines.div_ceil(2).saturating_sub(1),
+                owns_nav: true,
+            })
+        }
+        Section::Stash if ui.width == crate::layout::PanelWidth::Full => Some(ScrollExtent {
+            max: ui
+                .git
+                .stash_diff
+                .as_ref()
+                .map(|(_, text)| text.lines().count().saturating_sub(1))
+                .unwrap_or(0),
+            owns_nav: false,
+        }),
+        _ => None,
     }
 }
 
