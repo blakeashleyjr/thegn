@@ -13299,7 +13299,10 @@ async fn event_loop<T: Terminal>(
                 crate::panel::scope::mine_all(),
                 Some(waker.clone()),
             );
-        } else if let Some(path) =
+        } else if !crate::connectivity_gate::should_skip_refresh(
+            &crate::hydrate::RefreshKind::Issues,
+            thegn_core::connectivity::current(),
+        ) && let Some(path) =
             crate::hydrate_tracker::take_busy_retry(std::time::Instant::now())
             && path == active_tab_path(&session)
         {

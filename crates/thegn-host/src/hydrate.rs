@@ -2215,8 +2215,7 @@ fn clear_branch_failure(root: &Path) {
         .remove(root);
 }
 
-/// Apply a repo-wide branch refresh, preserving last-known-good shared cache
-/// contents on failure and throttling repeated failed subprocesses per repo.
+/// Resolve the visible load state for the demand-fetched branch list.
 pub(crate) fn branch_list_load(
     need_fetch: bool,
     fetched: Option<&Result<Vec<thegn_core::gitrefs::BranchInfo>, String>>,
@@ -2228,7 +2227,13 @@ pub(crate) fn branch_list_load(
     if has_cache || matches!(fetched, Some(Ok(_))) {
         DocLoad::Ready
     } else if let Some(Err(error)) = fetched {
-        DocLoad::Failed(error.clone())
+        DocLoad::Failed(
+            error
+                .lines()
+                .next()
+                .unwrap_or("branch list failed")
+                .to_string(),
+        )
     } else if !need_fetch && in_backoff {
         DocLoad::Failed("branch list unavailable; retrying".to_string())
     } else {
@@ -2236,6 +2241,8 @@ pub(crate) fn branch_list_load(
     }
 }
 
+/// Apply a repo-wide branch refresh, preserving last-known-good shared cache
+/// contents on failure and throttling repeated failed subprocesses per repo.
 fn apply_branch_refresh(
     root: Option<&Path>,
     need_fetch: bool,
