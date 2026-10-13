@@ -94,8 +94,11 @@ fn consider_candidate_with_forge(
         candidate.worktree, candidate.run_id, candidate.job_id, candidate.head_sha
     );
     let notify = |message: String| {
-        let _ =
-            db.put_notification_once("pr_queue_needs_human", &ref_id, &message, &entry.worktree);
+        if let Err(error) =
+            db.put_notification_once("pr_queue_needs_human", &ref_id, &message, &entry.worktree)
+        {
+            tracing::debug!(target: "thegn::ci_autofix", %error, "could not save CI autofix notification");
+        }
     };
 
     if entry.text.trim().is_empty() {
@@ -342,18 +345,32 @@ fn consider_candidate_with_forge(
         return;
     }
     let next_attempt = item.agent_attempts.saturating_add(1);
-    let _ = db.set_pr_agent_attempts(&item.key, next_attempt);
+    if let Err(error) = db.set_pr_agent_attempts(&item.key, next_attempt) {
+        tracing::warn!(target: "thegn::ci_autofix", %error, pr = item.number, "could not spend CI autofix attempt; agent dispatch refused");
+        notify(format!(
+            "CI autofix for PR #{} held: could not record the dispatch ({error})",
+            item.number
+        ));
+        return;
+    }
     let note = format!(
         "CI autofix dispatched ({next_attempt}/{})",
         pq.agent_max_attempts
     );
-    let _ = db.update_pr_status(
+    if let Err(error) = db.update_pr_status(
         &item.key,
         PrqStatus::AgentRunning.as_str(),
         Some("ci"),
         Some(&note),
         Some(entry.head_sha.as_str()),
-    );
+    ) {
+        tracing::warn!(target: "thegn::ci_autofix", %error, pr = item.number, attempt = next_attempt, "could not stamp CI autofix row running; agent dispatch refused");
+        notify(format!(
+            "CI autofix for PR #{} held: could not record the dispatch ({error}); attempt {next_attempt} remains spent",
+            item.number
+        ));
+        return;
+    }
     let exited_zero = crate::agent_run::run(&crate::agent_run::AgentTaskRun {
         kind: thegn_core::agent_task::TaskKind::PrCiFailure,
         worktree,
@@ -435,6 +452,269 @@ mod authorship_tests {
     use super::*;
     use crate::pr_authorship::tests::Fixture;
     use std::sync::atomic::Ordering;
+
+    struct Handoff {
+        db: thegn_core::db::Db,
+        db_path: std::path::PathBuf,
+        config: Config,
+        forge: crate::pr_authorship::tests::FakeForge,
+        entry: CiLogEntry,
+        sentinel: std::path::PathBuf,
+    }
+
+    fn handoff(fixture: &Fixture, mode: CiAutofixMode, head_sha: &str) -> Handoff {
+        let path = fixture.dir.path().to_str().unwrap();
+        let db_path = fixture.dir.path().join("ci.db");
+        let db = thegn_core::db::Db::open_at(&db_path).unwrap();
+        db.enqueue_bound_pr(
+            path,
+            7,
+            Some(path),
+            "fixture",
+            "main",
+            "github",
+            &fixture.pr.url,
+        )
+        .unwrap();
+        let sentinel = fixture.dir.path().join("agent-ran");
+        let mut config = Config::default();
+        config.ci.autofix.mode = mode;
+        config.pr_queue.enabled = true;
+        config.pr_queue.agent_command = format!("touch {}", sentinel.display());
+        let mut forge = fixture.forge(vec![fixture.proof.clone()]);
+        forge.pr.status_check_rollup = vec![
+            serde_json::from_value(serde_json::json!({"name":"test", "conclusion":"FAILURE"}))
+                .unwrap(),
+        ];
+        let entry = CiLogEntry {
+            worktree: path.into(),
+            head_sha: head_sha.into(),
+            text: "fixture failure".into(),
+            run_id: "run".into(),
+            job_id: "job".into(),
+            ..Default::default()
+        };
+        Handoff {
+            db,
+            db_path,
+            config,
+            forge,
+            entry,
+            sentinel,
+        }
+    }
+
+    fn consider(handoff: &Handoff, human_authorized: bool) {
+        consider_candidate_with_forge(
+            &handoff.config,
+            &handoff.db,
+            &handoff.entry,
+            human_authorized,
+            Some(&handoff.forge),
+        );
+    }
+
+    #[test]
+    fn off_mode_leaves_candidate_unclaimed_without_notifying_or_spending() {
+        let fixture = Fixture::new();
+        let handoff = handoff(&fixture, CiAutofixMode::Off, &fixture.pr.head_ref_oid);
+
+        consider(&handoff, false);
+
+        assert!(handoff.db.get_unread_notifications().unwrap().is_empty());
+        assert!(!handoff.sentinel.exists());
+        assert!(
+            handoff
+                .db
+                .claim_ci_autofix(&handoff.entry.candidate())
+                .unwrap()
+        );
+        assert_eq!(handoff.db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+    }
+
+    #[test]
+    fn stale_head_holds_auto_and_suggest_for_automatic_and_human_handoffs() {
+        for mode in [CiAutofixMode::Auto, CiAutofixMode::Suggest] {
+            for human_authorized in [false, true] {
+                let fixture = Fixture::new();
+                let handoff = handoff(&fixture, mode, "stale-head");
+
+                consider(&handoff, human_authorized);
+
+                assert!(!handoff.sentinel.exists());
+                assert_eq!(handoff.db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+                assert!(
+                    handoff
+                        .db
+                        .get_unread_notifications()
+                        .unwrap()
+                        .iter()
+                        .any(|notification| notification.message.contains("PR head changed"))
+                );
+                assert!(
+                    handoff
+                        .db
+                        .claim_ci_autofix(&handoff.entry.candidate())
+                        .unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exhausted_attempt_budget_notifies_without_dispatch() {
+        let fixture = Fixture::new();
+        let handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
+        let row = handoff.db.list_pr_queue().unwrap().remove(0);
+        handoff
+            .db
+            .set_pr_agent_attempts(&row.key, handoff.config.pr_queue.agent_max_attempts)
+            .unwrap();
+
+        consider(&handoff, false);
+
+        assert!(!handoff.sentinel.exists());
+        assert_eq!(
+            handoff.db.list_pr_queue().unwrap()[0].agent_attempts,
+            handoff.config.pr_queue.agent_max_attempts
+        );
+        assert!(
+            handoff
+                .db
+                .get_unread_notifications()
+                .unwrap()
+                .iter()
+                .any(|notification| notification.message.contains("budget is exhausted"))
+        );
+    }
+
+    #[test]
+    fn suggest_mode_notifies_without_claiming_or_spending_until_authorized() {
+        let fixture = Fixture::new();
+        let handoff = handoff(&fixture, CiAutofixMode::Suggest, &fixture.pr.head_ref_oid);
+
+        consider(&handoff, false);
+
+        assert!(!handoff.sentinel.exists());
+        assert_eq!(handoff.db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+        assert!(
+            handoff
+                .db
+                .claim_ci_autofix(&handoff.entry.candidate())
+                .unwrap()
+        );
+        assert!(
+            handoff
+                .db
+                .get_unread_notifications()
+                .unwrap()
+                .iter()
+                .any(|notification| notification
+                    .message
+                    .contains("ready for a PR-agent handoff"))
+        );
+    }
+
+    #[test]
+    fn authorized_auto_and_suggest_dispatch_once_and_restamp_the_row() {
+        for (mode, human_authorized) in
+            [(CiAutofixMode::Auto, false), (CiAutofixMode::Suggest, true)]
+        {
+            let fixture = Fixture::new();
+            let handoff = handoff(&fixture, mode, &fixture.pr.head_ref_oid);
+
+            consider(&handoff, human_authorized);
+
+            assert!(handoff.sentinel.exists(), "{mode:?}");
+            let row = handoff.db.list_pr_queue().unwrap().remove(0);
+            assert_eq!(row.agent_attempts, 1, "{mode:?}");
+            assert_eq!(row.status, PrqStatus::BlockedCi.as_str(), "{mode:?}");
+            std::fs::remove_file(&handoff.sentinel).unwrap();
+
+            consider(&handoff, human_authorized);
+
+            assert!(!handoff.sentinel.exists(), "duplicate ran for {mode:?}");
+            assert_eq!(handoff.db.list_pr_queue().unwrap()[0].agent_attempts, 1);
+        }
+    }
+
+    #[test]
+    fn repeated_refusal_keeps_one_unread_notification_for_candidate() {
+        let fixture = Fixture::new();
+        let handoff = handoff(&fixture, CiAutofixMode::Auto, "stale-head");
+
+        consider(&handoff, false);
+        consider(&handoff, false);
+
+        let notifications = handoff.db.get_unread_notifications().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(
+            notifications[0].source_ref,
+            format!(
+                "ci-autofix:{}:{}:{}:{}",
+                handoff.entry.worktree,
+                handoff.entry.run_id,
+                handoff.entry.job_id,
+                handoff.entry.head_sha
+            )
+        );
+    }
+
+    #[test]
+    fn failed_attempt_spend_prevents_ci_agent_spawn() {
+        let fixture = Fixture::new();
+        let handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
+        let conn = rusqlite::Connection::open(&handoff.db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER deny_attempts BEFORE UPDATE OF agent_attempts ON pr_queue BEGIN SELECT RAISE(ABORT, 'denied'); END;",
+        )
+        .unwrap();
+
+        consider(&handoff, false);
+
+        let row = handoff.db.list_pr_queue().unwrap().remove(0);
+        assert!(!handoff.sentinel.exists());
+        assert_eq!(row.agent_attempts, 0);
+        assert_ne!(row.status, PrqStatus::AgentRunning.as_str());
+        assert!(
+            handoff
+                .db
+                .get_unread_notifications()
+                .unwrap()
+                .iter()
+                .any(|notification| notification.message.contains("held")
+                    && notification
+                        .message
+                        .contains("could not record the dispatch"))
+        );
+    }
+
+    #[test]
+    fn failed_running_stamp_prevents_ci_agent_spawn_and_reports_spent_attempt() {
+        let fixture = Fixture::new();
+        let handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
+        let conn = rusqlite::Connection::open(&handoff.db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER deny_status BEFORE UPDATE OF status ON pr_queue BEGIN SELECT RAISE(ABORT, 'denied'); END;",
+        )
+        .unwrap();
+
+        consider(&handoff, false);
+
+        let row = handoff.db.list_pr_queue().unwrap().remove(0);
+        assert!(!handoff.sentinel.exists());
+        assert_eq!(row.agent_attempts, 1);
+        assert_ne!(row.status, PrqStatus::AgentRunning.as_str());
+        assert!(
+            handoff
+                .db
+                .get_unread_notifications()
+                .unwrap()
+                .iter()
+                .any(|notification| notification.message.contains("held")
+                    && notification.message.contains("attempt 1 remains spent"))
+        );
+    }
 
     #[test]
     fn completed_agent_does_not_rearm_a_settled_row_or_replace_its_head() {
