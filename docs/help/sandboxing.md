@@ -3,7 +3,7 @@ id: sandboxing
 title: Sandboxing
 parent: workflows
 order: 3
-contexts: [panel:sandbox, panel:environments]
+contexts: [panel:sandbox#inspecting, panel:environments]
 actions: [warm-pool-increment, warm-pool-decrement, toolchain-install]
 ---
 

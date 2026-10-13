@@ -92,7 +92,7 @@ pub fn keybindings_page(cfg: &thegn_core::config::Config) -> String {
 
     let mut out = String::from(
         "---\nid: keybindings\ntitle: Keybindings\norder: 35\ngenerated: true\n\
-         contexts: [panel:keys]\n---\n\n\
+         ---\n\n\
          # Keybindings\n\n\
          Your **effective** keymap: the built-in defaults, `[keybinds]` rebinds, \
          custom `[[actions]]`, and the keys each zone handles itself — exactly as \
