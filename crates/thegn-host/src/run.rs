@@ -24629,7 +24629,7 @@ async fn event_loop<T: Terminal>(
                     continue;
                 }
                 if gitui::paste_filter(
-                    &mut panel_ui.git,
+                    &mut panel_ui,
                     want_panel && chrome.panel.is_some(),
                     focus.panel(),
                     &s,
