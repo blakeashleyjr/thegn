@@ -377,6 +377,8 @@ fn remove_directory_contents(
         unsafe { libc::close(duplicate) };
         return Err(error);
     }
+    // SAFETY: stream is live; the dup shares the caller's file offset, so rewind.
+    unsafe { libc::rewinddir(stream) };
     let mut names = Vec::new();
     loop {
         // SAFETY: stream is a live DIR pointer owned until closedir below.
@@ -828,6 +830,42 @@ mod tests {
 
         assert!(!tree_path.exists());
         assert_eq!(std::fs::read(target.join("sentinel")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn remove_tree_rewinds_a_pinned_directory_at_eof() {
+        let root = private_root();
+        let tree_path = root.path().join("tree");
+        std::fs::create_dir(&tree_path).unwrap();
+        std::fs::write(tree_path.join("payload"), b"remove").unwrap();
+        let tree = Directory::open(&tree_path, Some(&tree_path)).unwrap();
+
+        // fdopendir takes ownership of the duplicate, and reading it to EOF
+        // advances the shared directory offset on tree's pinned descriptor.
+        // SAFETY: tree.fd() is live; dup returns a new owned descriptor.
+        let duplicate = unsafe { libc::dup(tree.fd()) };
+        assert!(duplicate >= 0);
+        // SAFETY: duplicate is a valid newly owned descriptor.
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            // SAFETY: fdopendir failed, so it did not consume duplicate.
+            unsafe { libc::close(duplicate) };
+            panic!("fdopendir failed: {}", io::Error::last_os_error());
+        }
+        let mut entries = 0;
+        loop {
+            // SAFETY: stream remains live until closedir below.
+            if unsafe { libc::readdir(stream) }.is_null() {
+                break;
+            }
+            entries += 1;
+        }
+        // SAFETY: stream is the unique DIR pointer returned by fdopendir.
+        assert_eq!(unsafe { libc::closedir(stream) }, 0);
+        assert!(entries >= 3, "directory entries should have been consumed");
+
+        tree.remove_tree().unwrap();
+        assert!(!tree_path.exists());
     }
 
     #[test]
