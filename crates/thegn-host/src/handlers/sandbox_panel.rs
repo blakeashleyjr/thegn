@@ -9,11 +9,11 @@ use crate::hydrate::RefreshKind;
 use crate::layout::PanelWidth;
 use crate::menu::{self, MenuChoice, MenuOverlay};
 
-pub(crate) fn visible_containers(
-    containers: &[ContainerInfo],
+pub(crate) fn visible_containers<'a>(
+    containers: &'a [ContainerInfo],
     active: &str,
     show_all: bool,
-) -> Vec<&ContainerInfo> {
+) -> Vec<&'a ContainerInfo> {
     if show_all {
         containers.iter().collect()
     } else {
