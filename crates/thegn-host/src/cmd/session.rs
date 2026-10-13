@@ -12,6 +12,7 @@ use thegn_core::config::Config;
 use thegn_core::db::{Db, ResumeDispatchConflict};
 use thegn_core::issue::{AgentDispatchStatus, DispatchRunPublishOutcome, NewDispatch};
 use thegn_core::outln;
+use thegn_core::pipeline_report::display_cell;
 use thegn_core::pipeline_resume;
 use thegn_core::pipeline_run;
 use thegn_core::store::NotificationStore;
@@ -792,6 +793,7 @@ fn stage_or_bail<'a>(
     name: &str,
 ) -> Result<&'a thegn_core::config_pipeline::PipelineStage> {
     cfg.pipeline.stage(name).ok_or_else(|| {
+        let name = display_cell(name);
         let names = cfg.pipeline.stage_names();
         if names.is_empty() {
             anyhow::anyhow!("no [[pipeline.stages]] named '{name}' — no stages are configured")
@@ -1740,6 +1742,21 @@ mod open_stage_tests {
         let msg = err.to_string();
         assert!(msg.contains("nosuchstage"), "names the typo: {msg}");
         assert!(msg.contains("code"), "lists the configured stages: {msg}");
+    }
+
+    #[test]
+    fn an_unknown_hostile_stage_name_is_safe_to_print() {
+        let err = stage_or_bail(&cfg_with_stage(), "x\x1b]0;pwn\x07\r\n").expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(
+            !msg.chars()
+                .any(|ch| matches!(ch, '\x1b' | '\x07' | '\r' | '\n')),
+            "{msg:?}"
+        );
+        assert!(
+            msg.contains('\u{fffd}'),
+            "hostile name should be visibly replaced: {msg:?}"
+        );
     }
 
     #[test]
