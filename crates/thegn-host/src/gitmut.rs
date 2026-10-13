@@ -484,7 +484,7 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
                         .collect::<Vec<_>>()
                 };
                 if body(&current) != body(&synth_diff) {
-                    anyhow::bail!("file changed while staging; refetched");
+                    anyhow::bail!("file changed while staging; review and stage again");
                 }
                 g.stage_lines(loc, &current, &selection_of(&indices))
             })();
@@ -902,8 +902,6 @@ mod tests {
 
     #[test]
     fn execute_stage_untracked_lines_intent_adds_then_stages_selected() {
-        use thegn_svc::git::{GitBackend, StageOps};
-
         let repo = tempfile::tempdir().unwrap();
         let dir = repo.path();
         git_out(dir, &["init", "-q", "-b", "main"]);
@@ -964,7 +962,7 @@ mod tests {
                 &loc,
                 false,
             ),
-            GitOpResult::Err(message) if message.contains("file changed while staging; refetched")
+            GitOpResult::Err(message) if message.contains("file changed while staging; review and stage again")
         ));
     }
 

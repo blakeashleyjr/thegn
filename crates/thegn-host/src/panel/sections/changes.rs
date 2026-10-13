@@ -115,8 +115,6 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows.push(if ui.impact_open {
         // On the footer row Enter collapses; on an entity row it opens the def.
         hint_row(&[("↵", "open/close"), ("j/k", "entity")])
-    } else if ui.chg_sel.is_none() {
-        hint_row(&[("↵", "stage lines"), ("space", "stage")])
     } else {
         hint_row(&[("↵", "stage lines"), ("space", "stage")])
     });

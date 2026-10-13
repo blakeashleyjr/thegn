@@ -144,11 +144,12 @@ pub fn plan_changes_drill(row: &crate::panel::ChangeRow) -> ChangesDrill {
 
 pub fn plan_stage_lines(
     staging: &StagingUi,
+    doc_pane: StagePane,
     path: String,
     diff: String,
     indices: Vec<(usize, usize)>,
 ) -> crate::gitmut::GitOp {
-    if staging.untracked && staging.pane == StagePane::Unstaged {
+    if staging.untracked && doc_pane == StagePane::Unstaged {
         crate::gitmut::GitOp::StageUntrackedLines {
             path,
             synth_diff: diff,
@@ -159,7 +160,7 @@ pub fn plan_stage_lines(
             path,
             diff,
             indices,
-            target: match staging.pane {
+            target: match doc_pane {
                 StagePane::Unstaged => crate::gitmut::StageTarget::Unstaged,
                 StagePane::Staged => crate::gitmut::StageTarget::Staged,
             },
@@ -202,10 +203,12 @@ pub fn stash_message_or_default(text: &str, branch: &str) -> String {
     }
 }
 
-pub fn commit_precheck(changes: &[crate::panel::ChangeRow]) -> Option<&'static str> {
-    (!changes
-        .iter()
-        .any(|row| row.stage == crate::panel::Stage::Staged))
+pub fn commit_precheck(data: &crate::panel::PanelData) -> Option<&'static str> {
+    (data.merge.is_none()
+        && data
+            .changes
+            .iter()
+            .all(|row| row.stage == crate::panel::Stage::Untracked))
     .then_some("nothing staged: space stages the file, a stages all")
 }
 
@@ -1620,7 +1623,8 @@ pub fn git_key_chg(
     ui: &crate::panel::PanelUi,
     model: &crate::chrome::FrameModel,
 ) -> Option<GitMsg> {
-    if ui.open == crate::panel::Section::Changes
+    if matches!(key, KeyCode::Enter)
+        && ui.open == crate::panel::Section::Changes
         && model
             .panel
             .changes
@@ -1723,6 +1727,10 @@ mod tests {
             git_key_chg(&KeyCode::Enter, Modifiers::NONE, &ui, &model),
             None
         );
+        assert_eq!(
+            git_key_chg(&KeyCode::Char(' '), Modifiers::NONE, &ui, &model),
+            Some(GitMsg::StageToggleFile)
+        );
     }
 
     #[test]
@@ -1742,13 +1750,39 @@ mod tests {
         let mut staging = StagingUi::new("new.txt");
         staging.untracked = true;
         assert!(matches!(
-            plan_stage_lines(&staging, "new.txt".into(), "diff".into(), vec![]),
+            plan_stage_lines(
+                &staging,
+                StagePane::Unstaged,
+                "new.txt".into(),
+                "diff".into(),
+                vec![]
+            ),
             crate::gitmut::GitOp::StageUntrackedLines { .. }
         ));
         staging.untracked = false;
         assert!(matches!(
-            plan_stage_lines(&staging, "tracked.txt".into(), "diff".into(), vec![]),
+            plan_stage_lines(
+                &staging,
+                StagePane::Unstaged,
+                "tracked.txt".into(),
+                "diff".into(),
+                vec![]
+            ),
             crate::gitmut::GitOp::StageLines { .. }
+        ));
+        staging.untracked = true;
+        assert!(matches!(
+            plan_stage_lines(
+                &staging,
+                StagePane::Staged,
+                "new.txt".into(),
+                "diff".into(),
+                vec![]
+            ),
+            crate::gitmut::GitOp::StageLines {
+                target: crate::gitmut::StageTarget::Staged,
+                ..
+            }
         ));
     }
 
@@ -1796,13 +1830,31 @@ mod tests {
 
     #[test]
     fn commit_precheck_refuses_with_nothing_staged() {
+        let mut data = crate::panel::PanelData {
+            changes: vec![change("f", crate::panel::Stage::Unstaged)],
+            ..Default::default()
+        };
         assert_eq!(
-            commit_precheck(&[change("f", crate::panel::Stage::Unstaged)]),
+            commit_precheck(&data),
             Some("nothing staged: space stages the file, a stages all")
         );
+        data.changes[0].stage = crate::panel::Stage::Staged;
+        assert_eq!(commit_precheck(&data), None);
+        data.changes[0].stage = crate::panel::Stage::Unstaged;
+        assert_eq!(commit_precheck(&data), None, "partially staged MM row");
+        let merge_data = crate::panel::PanelData {
+            merge: Some(crate::panel::MergeBanner {
+                label: "MERGING".into(),
+                onto: "main".into(),
+                unresolved: 0,
+                total: None,
+            }),
+            ..Default::default()
+        };
         assert_eq!(
-            commit_precheck(&[change("f", crate::panel::Stage::Staged)]),
-            None
+            commit_precheck(&merge_data),
+            None,
+            "merge with an empty resolved index diff"
         );
     }
 
