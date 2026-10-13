@@ -605,7 +605,10 @@ mod tests {
     fn every_painted_media_key_is_a_keyboard_key() {
         use termwiz::input::KeyCode;
 
-        let source = include_str!("media.rs");
+        let source = include_str!("media.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("media renderer has a production section");
         let mut rest = source;
         let mut found = 0;
         while let Some(pos) = rest.find("action(\"") {
