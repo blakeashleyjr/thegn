@@ -4197,3 +4197,114 @@ fn drain_wheel_ticks_stops_at_cap_and_leaves_rest_queued() {
     assert!(leftover.is_none());
     assert_eq!(q.len(), 6, "ticks past the cap stay queued");
 }
+
+#[test]
+fn panel_section_flow_stays_inside_the_active_tab() {
+    let mut ui = crate::panel::PanelUi {
+        tab: crate::panel::PanelTab::Help,
+        open: crate::panel::Section::Help,
+        ..Default::default()
+    };
+    assert_eq!(
+        prev_section_in_order(crate::panel::Section::Help, &ui),
+        None
+    );
+
+    ui.tab = crate::panel::PanelTab::Git;
+    let git_sections = ui.tab_sections();
+    let first_git = git_sections[0];
+    let last_git = *git_sections.last().expect("Git tab has sections");
+    assert_eq!(prev_section_in_order(first_git, &ui), None);
+    assert_eq!(next_section_in_order(last_git, &ui), None);
+}
+
+#[test]
+fn switching_panel_tabs_resets_scroll_to_the_top() {
+    let mut ui = crate::panel::PanelUi {
+        scroll: 7,
+        ..Default::default()
+    };
+    ui.switch_tab(crate::panel::PanelTab::Help);
+    assert_eq!(ui.scroll, 0);
+}
+
+#[test]
+fn scroll_step_handles_paging_keys_and_clamps_to_extent() {
+    use termwiz::input::{KeyCode, Modifiers};
+
+    let ext = crate::panel::sections::ScrollExtent {
+        max: 20,
+        owns_nav: true,
+    };
+    let step = crate::panel::sections::scroll_step;
+    assert_eq!(
+        step(ext, &KeyCode::PageDown, Modifiers::NONE, 10, 8),
+        Some(18)
+    );
+    assert_eq!(step(ext, &KeyCode::PageUp, Modifiers::NONE, 10, 8), Some(2));
+    assert_eq!(
+        step(ext, &KeyCode::Char('d'), Modifiers::CTRL, 10, 8),
+        Some(14)
+    );
+    assert_eq!(
+        step(ext, &KeyCode::Char('u'), Modifiers::CTRL, 10, 8),
+        Some(6)
+    );
+    assert_eq!(
+        step(ext, &KeyCode::Char('g'), Modifiers::NONE, 10, 8),
+        Some(0)
+    );
+    assert_eq!(
+        step(ext, &KeyCode::Char('G'), Modifiers::NONE, 10, 8),
+        Some(20)
+    );
+    assert_eq!(step(ext, &KeyCode::Home, Modifiers::NONE, 10, 8), Some(0));
+    assert_eq!(step(ext, &KeyCode::End, Modifiers::NONE, 10, 8), Some(20));
+    assert_eq!(
+        step(ext, &KeyCode::PageDown, Modifiers::NONE, 18, 8),
+        Some(20)
+    );
+    assert_eq!(step(ext, &KeyCode::PageUp, Modifiers::NONE, 2, 8), Some(0));
+    assert_eq!(
+        step(ext, &KeyCode::Char('j'), Modifiers::NONE, 20, 1),
+        Some(20)
+    );
+    assert_eq!(
+        step(ext, &KeyCode::Char('k'), Modifiers::NONE, 0, 1),
+        Some(0)
+    );
+    assert_eq!(
+        step(ext, &KeyCode::Char('j'), Modifiers::NONE, 10, 1),
+        Some(11)
+    );
+    assert_eq!(
+        step(ext, &KeyCode::Char('k'), Modifiers::NONE, 10, 1),
+        Some(9)
+    );
+
+    let stash_ext = crate::panel::sections::ScrollExtent {
+        max: 20,
+        owns_nav: false,
+    };
+    assert_eq!(
+        step(stash_ext, &KeyCode::PageDown, Modifiers::NONE, 10, 8),
+        Some(18)
+    );
+    assert_eq!(
+        step(stash_ext, &KeyCode::Char('G'), Modifiers::NONE, 10, 8),
+        None
+    );
+}
+
+#[test]
+fn section_scroll_falls_through_at_both_scroll_boundaries() {
+    let ext = crate::panel::sections::ScrollExtent {
+        max: 5,
+        owns_nav: true,
+    };
+    let can_move = crate::panel::sections::scroll_moves;
+    assert!(!can_move(ext, true, 0));
+    assert!(!can_move(ext, false, ext.max));
+    assert!(can_move(ext, true, 1));
+    assert!(can_move(ext, false, ext.max - 1));
+}
