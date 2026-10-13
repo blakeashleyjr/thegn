@@ -2,10 +2,10 @@
 
 ## ADDED Requirements
 
-### Requirement: A project feature can be enqueued across member repos as independent per-repo rows
+### Requirement: A program feature can be enqueued across member repos as independent per-repo rows
 
-thegn SHALL let a user enqueue a project feature in one action
-(`merge add --project <p> --feature <branch>`): the feature set is resolved
+thegn SHALL let a user enqueue a program feature in one action
+(`merge add --program <p> --feature <branch>`): the feature set is resolved
 and each member's branch is recorded in **that repo's own per-repo queue**
 as an ordinary independent row, with a per-member outcome report (queued /
 no such branch in this member / ineligible). Queues remain strictly
@@ -15,7 +15,7 @@ never presented as atomic.
 
 #### Scenario: Batched enqueue fans out per repo
 
-- **WHEN** `merge add --project shop --feature tg/x` is run and members
+- **WHEN** `merge add --program shop --feature tg/x` is run and members
   `api` and `web` have the branch while `shared-lib` does not
 - **THEN** `api`'s and `web`'s queues each gain an independent row for
   `tg/x`, `shared-lib` is reported as having no such branch, and no
@@ -23,7 +23,7 @@ never presented as atomic.
 
 #### Scenario: Draining stays per-repo
 
-- **WHEN** the queues are drained after a batched project enqueue and one
+- **WHEN** the queues are drained after a batched program enqueue and one
   member's branch is deferred on a conflict
 - **THEN** the other members' branches drain and land under their own
   repos' rules, unaffected by the deferred member
