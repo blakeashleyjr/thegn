@@ -4127,6 +4127,9 @@ idle_exit_secs = 1800
 # (Env kill-switch: THEGN_NO_DAEMON=1 force-disables daemon routing for one
 # run — test/bench harnesses that kill the compositor without a quit use it.)
 lease_grace_secs = 0
+# End a pane after this long of repeated attach-stream sequence gaps. 0 = never
+# end the pane; reconnect backoff still applies.
+stream_gap_window_secs = 600
 
 # `thegn serve`: pair remote thin clients (desktop/web/mobile) over a pairing
 # URL and let them attach through the scoped control API. Thegn's native TCP
