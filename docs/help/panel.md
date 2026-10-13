@@ -162,6 +162,9 @@ PgUp/PgDn and Ctrl-d/Ctrl-u scroll it. See [[git-and-diffs]].
 
 {{keys:stash}}
 
+Inside the git-family sections (changes/commits/branches/stash — not
+files), `?` shows that section's own key cheatsheet.
+
 ### files — the worktree tree
 
 The worktree's file tree; `/` filters it (directories stay while any
@@ -170,9 +173,6 @@ it in bat, `O` opens your editor, `y` reveals it in yazi. See
 [[git-and-diffs]].
 
 {{keys:files}}
-
-Inside the git-family sections (changes/commits/branches/stash — not
-files), `?` shows that section's own key cheatsheet.
 
 ## The work tab, section by section
 
@@ -225,12 +225,12 @@ failing sibling when there is one. History is behind the drill-in.
 
 {{keys:ci}}
 
-`↵` and `v` open the run's detail popup. `f` is available inside that popup,
-not as a panel key. The drill reads bounded, redacted
+`↵` and `v` open the run's detail popup. The **f** action is available
+inside that popup, not as a panel key. The drill reads bounded, redacted
 job-log tails from the CI cache first and labels their source, age, truncation,
 and redaction state while a missing or stale entry is fetched off-loop. In
-`suggest` mode, the same `f` action is available from the actionable notification
-when its evidence-ready message appears. The cache policy is controlled by
+`suggest` mode, the same **f** action is available from the actionable
+notification when its evidence-ready message appears. The cache policy is controlled by
 `[ci].log_cache_runs`, `log_tail_lines`, and `log_max_bytes`; `[ci.autofix]` is
 off by default and can suggest or safely hand a verified failure to the
 existing PR-queue agent. The action rechecks PR context, head, agent policy,
