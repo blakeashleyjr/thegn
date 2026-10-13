@@ -51,9 +51,28 @@ fn remove_scratch_worktree(repo_root: &Path, scratch: ScratchDirectory) {
         return;
     }
     let path = scratch.path().to_string_lossy().to_string();
-    if !util::git_ok(repo_root, &["worktree", "remove", "--force", &path]) {
+    let registration = match gate_runner::capture_scratch_registration(repo_root, scratch.path()) {
+        Ok(registration) => registration,
+        Err(error) => {
+            gate_runner::record_external_quarantine(
+                scratch.path(),
+                "scratch worktree registration unverifiable",
+            );
+            tracing::warn!(target: "thegn::integrate", path, %error, "scratch worktree registration unverifiable; preserving it");
+            return;
+        }
+    };
+    if let Err(error) = scratch.remove_tree() {
         gate_runner::record_external_quarantine(scratch.path(), "scratch worktree cleanup failed");
-        tracing::warn!(target: "thegn::integrate", path, "scratch worktree cleanup failed; preserving it for repair");
+        tracing::warn!(target: "thegn::integrate", path, %error, "scratch worktree cleanup failed; preserving it for repair");
+        return;
+    }
+    if let Err(error) = registration.remove() {
+        gate_runner::record_external_quarantine(
+            scratch.path(),
+            "scratch worktree registration cleanup failed",
+        );
+        tracing::warn!(target: "thegn::integrate", path, %error, "scratch worktree registration cleanup failed; preserving it for repair");
     }
 }
 
@@ -4374,6 +4393,105 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir_all(&moved).unwrap();
         git(&repo.dir, &["worktree", "prune"]);
+    }
+
+    #[test]
+    fn scratch_worktree_cleanup_removes_tree_and_registration_without_following_links() {
+        if !crate::platform::gate_path::verified_workspace_supported() {
+            return;
+        }
+        let repo = Repo::new("scratch-descriptor-cleanup");
+        let scratch = ScratchDirectory::create("tg-drivermerge-test-").unwrap();
+        let path = scratch.path().to_path_buf();
+        git(
+            &repo.dir,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                path.to_str().unwrap(),
+                "main",
+            ],
+        );
+        let victim = tempfile::Builder::new()
+            .prefix("tg-scratch-victim-")
+            .tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap())
+            .unwrap();
+        let victim_file = victim.path().join("sentinel");
+        std::fs::write(&victim_file, b"keep").unwrap();
+        crate::platform::gate_path::history_test_symlink(victim.path(), &path.join("victim-link"))
+            .unwrap();
+        let readonly = path.join("nested-readonly");
+        std::fs::create_dir(&readonly).unwrap();
+        std::fs::write(readonly.join("payload"), b"remove").unwrap();
+        let original_permissions = std::fs::metadata(&readonly).unwrap().permissions();
+        let mut readonly_permissions = original_permissions.clone();
+        readonly_permissions.set_readonly(true);
+        std::fs::set_permissions(&readonly, readonly_permissions).unwrap();
+        let gitfile = std::fs::read_to_string(path.join(".git")).unwrap();
+        let admin = PathBuf::from(gitfile.trim().strip_prefix("gitdir: ").unwrap());
+        let admin_name = admin.file_name().unwrap().to_owned();
+
+        remove_scratch_worktree(&repo.dir, scratch);
+
+        if readonly.exists() {
+            std::fs::set_permissions(&readonly, original_permissions).unwrap();
+        }
+        assert!(!path.exists(), "owned scratch tree should be removed");
+        assert!(victim.path().is_dir());
+        assert_eq!(std::fs::read(&victim_file).unwrap(), b"keep");
+        assert!(
+            !repo
+                .out(&["worktree", "list", "--porcelain"])
+                .contains(path.to_str().unwrap()),
+            "removed worktree must not remain registered"
+        );
+        assert!(!repo.dir.join(".git/worktrees").join(admin_name).exists());
+        assert!(
+            !gate_quarantines()
+                .iter()
+                .any(|(workspace, _)| workspace == &path)
+        );
+    }
+
+    #[test]
+    fn scratch_worktree_cleanup_refuses_a_mismatched_registration() {
+        if !crate::platform::gate_path::verified_workspace_supported() {
+            return;
+        }
+        let repo = Repo::new("scratch-registration-mismatch");
+        let scratch = ScratchDirectory::create("tg-drivermerge-test-").unwrap();
+        let path = scratch.path().to_path_buf();
+        git(
+            &repo.dir,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                path.to_str().unwrap(),
+                "main",
+            ],
+        );
+        let gitfile = std::fs::read_to_string(path.join(".git")).unwrap();
+        let admin = PathBuf::from(gitfile.trim().strip_prefix("gitdir: ").unwrap());
+        let backlink = admin.join("gitdir");
+        let original_backlink = std::fs::read_to_string(&backlink).unwrap();
+        std::fs::write(&backlink, "/unrelated/.git\n").unwrap();
+
+        remove_scratch_worktree(&repo.dir, scratch);
+
+        assert!(
+            path.is_dir(),
+            "unverifiable registration must preserve checkout"
+        );
+        assert!(gate_quarantines().iter().any(|(workspace, reason)| {
+            workspace == &path && reason.contains("registration unverifiable")
+        }));
+        std::fs::write(&backlink, original_backlink).unwrap();
+        git(
+            &repo.dir,
+            &["worktree", "remove", "--force", path.to_str().unwrap()],
+        );
     }
 
     #[test]
