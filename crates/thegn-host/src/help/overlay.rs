@@ -1314,10 +1314,10 @@ mod tests {
         let screen = Rect {
             x: 0,
             y: 0,
-            cols: 120,
+            cols: 180,
             rows: 34,
         };
-        let mut s = Surface::new(120, 34);
+        let mut s = Surface::new(180, 34);
         ov.render(&mut s, screen);
         let text = s.screen_chars_to_string();
         for want in ["scroll", "follow", "search", "panel", "close"] {
