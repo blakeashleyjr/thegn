@@ -51,20 +51,11 @@ pub(crate) struct TrackerCtx<'a> {
     pub pending_issue_link: &'a mut Option<(u64, String)>,
 }
 
-/// The issue under the Issues-section cursor, selected from the SAME
+/// The issue under the Issues-section cursor, selected from the same
 /// sorted+filtered view the panel renders. Returned owned so the (immutable)
-/// borrow of `ctx` is released before the caller mutates `ctx.model`. Indexing
-/// the raw, unsorted `tracker_issues` by `issues_cursor` targeted a *different*
-/// issue than the highlighted row (and ignored the active filter entirely).
+/// borrow of `ctx` is released before the caller mutates `ctx.model`.
 fn cursor_issue(ctx: &TrackerCtx) -> Option<thegn_core::issue::Issue> {
-    crate::panel::sections::issues::sorted_filtered_issues(
-        &ctx.model.panel,
-        &ctx.panel_ui.issues_filter,
-        ctx.panel_ui.issues_project_filter.as_deref(),
-    )
-    .into_iter()
-    .nth(ctx.panel_ui.issues_cursor)
-    .cloned()
+    crate::panel::sections::issues::issue_at_cursor(&ctx.model.panel, ctx.panel_ui).cloned()
 }
 
 /// Enter on the Issues section: toggle the worktree↔issue link for the

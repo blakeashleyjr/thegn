@@ -735,14 +735,13 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
     // Two-column layout: left=tree list, right=detail for selected node.
     let list_w = (ctx.cols / 2).clamp(24, 50);
     let detail_w = ctx.cols.saturating_sub(list_w + 2);
-    let _cursor_visible_pos = visible.iter().position(|&i| i == ts.cursor);
-
     // Build left column rows.
     let list_rows: Vec<Vec<crate::seg::Seg>> = visible
         .iter()
-        .map(|&node_idx| {
+        .enumerate()
+        .map(|(vis_pos, &node_idx)| {
             let node = &ts.nodes[node_idx];
-            let selected = node_idx == ts.cursor;
+            let selected = vis_pos == ts.cursor;
             match node.kind {
                 TestNodeKind::Group => {
                     let arrow = if selected { "▶ " } else { "  " };
@@ -841,9 +840,13 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
     // Merge list + detail into two-column rows.
     let combined = super::two_col(&list_rows, &detail_rows, list_w, 2);
     rows.extend(combined.into_iter().enumerate().map(|(i, l)| {
-        let node_idx = visible.get(i).copied().unwrap_or(usize::MAX);
-        let selected = node_idx == ts.cursor;
-        let row = PanelRow::plain(l).with_hit(PanelHit::Row(Section::Tests, node_idx));
+        let selected = i < visible.len() && i == ts.cursor;
+        let row = PanelRow::plain(l);
+        let row = if i < visible.len() {
+            row.with_hit(PanelHit::Row(Section::Tests, i))
+        } else {
+            row
+        };
         if selected {
             row.with_bg(Tok::SelAccent)
         } else {
@@ -851,7 +854,6 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
         }
     }));
 
-    // `cursor_visible_pos` is used for scroll tracking in a future change.
     rows.push(super::hint_row(&[
         ("r", "run"),
         ("F", "file"),
