@@ -286,16 +286,18 @@ fn clip_and_pad(segs: Vec<Seg>, cols: usize) -> Vec<Seg> {
     } else {
         cols
     };
-    let style = segs.last().cloned();
     let mut out: Vec<Seg> = Vec::new();
+    let mut ellipsis_style: Option<Seg> = None;
     let mut used = 0usize;
     for s in segs {
         if used >= target {
+            ellipsis_style = Some(s);
             break;
         }
         let w = s.text.width();
         if used + w <= target {
             used += w;
+            ellipsis_style = Some(s.clone());
             out.push(s);
         } else {
             let chunk = crate::seg::take_cols(&s.text, target - used);
@@ -303,11 +305,12 @@ fn clip_and_pad(segs: Vec<Seg>, cols: usize) -> Vec<Seg> {
                 used += chunk.width();
                 out.push(seg_like(&s, chunk));
             }
+            ellipsis_style = Some(s);
             break;
         }
     }
     if clipped && cols > 0 {
-        let ellipsis = style
+        let ellipsis = ellipsis_style
             .map(|s| seg_like(&s, "…"))
             .unwrap_or_else(|| seg(Tok::Slot(S::Text), "…"));
         if used < target {
@@ -849,6 +852,21 @@ mod tests {
             .unwrap();
         assert!(text.ends_with('…'), "{text:?}");
         assert_eq!(text.width(), 18);
+    }
+
+    #[test]
+    fn clipped_cell_ellipsis_keeps_the_style_of_the_cut_segment() {
+        let clipped = clip_and_pad(
+            vec![
+                seg(Tok::Slot(S::Dim), "codewords").bg(Tok::Slot(S::Raise)),
+                seg(Tok::Slot(S::Text), " trailing").bg(Tok::SelAccent),
+            ],
+            7,
+        );
+        let ellipsis = clipped.last().unwrap();
+        assert_eq!(ellipsis.text, "…");
+        assert_eq!(ellipsis.bg, Some(Tok::Slot(S::Raise)));
+        assert_eq!(clipped.iter().map(|seg| seg.text.width()).sum::<usize>(), 7);
     }
 
     #[test]
