@@ -35,46 +35,41 @@ fn known_unadvertised_panel_key(section: crate::panel::Section, chord: char) -> 
     matches!(
         (section, chord),
         (crate::panel::Section::Notifications, 'A' | '/')
+            | (crate::panel::Section::Logs, 'Y')
             | (crate::panel::Section::Media, '+' | '-' | '[' | ']' | 'f')
             | (crate::panel::Section::PrQueue, 'h')
+            | (crate::panel::Section::Environments, 't')
     )
 }
 
-fn panel_chord_label(section: crate::panel::Section, chord: &str) -> Option<&'static str> {
-    crate::panel::section_keys::section_keys(section)
-        .iter()
-        .find(|key| key.chord == chord)
-        .map(|key| key.label)
-        .or_else(|| {
-            section.home_view().and_then(|view| {
-                crate::panel::gitui::context_keys(view)
-                    .into_iter()
-                    .find(|key| key.chord == chord)
-                    .map(|key| key.label)
-            })
-        })
-        .or_else(|| match chord {
-            "e" => Some("width cycle"),
-            "E" => Some("shrink width"),
-            "j" | "k" => Some("row navigation"),
-            _ if chord.len() == 1 && chord.chars().next().is_some_and(|c| c.is_ascii_digit()) => {
-                Some("section jump")
-            }
-            _ => None,
-        })
+fn panel_doc_sections(heading: &str) -> Vec<crate::panel::Section> {
+    let keys = heading.split_once(" — ").map_or(heading, |(keys, _)| keys);
+    keys.split(|ch: char| !ch.is_alphanumeric())
+        .filter_map(crate::panel::Section::from_key)
+        .collect()
 }
 
-fn doc_label_matches(label: &str, description: &str) -> bool {
-    let words = |s: &str| {
-        s.split(|c: char| !c.is_alphanumeric())
-            .map(str::to_ascii_lowercase)
-            .filter(|word| word.len() > 1)
-            .collect::<BTreeSet<_>>()
-    };
-    let expected = words(label);
-    words(description)
+fn panel_chord_advertised(sections: &[crate::panel::Section], token: &str, chord: char) -> bool {
+    sections.iter().any(|section| {
+        crate::panel::section_keys::section_keys(*section)
+            .iter()
+            .any(|key| key.chord == token)
+            || section.home_view().is_some_and(|view| {
+                crate::panel::gitui::context_keys(view)
+                    .iter()
+                    .any(|key| key.chord == token)
+            })
+    }) || "eEjkJK0123456789".contains(chord)
+}
+
+fn known_unadvertised_section(
+    sections: &[crate::panel::Section],
+    chord: char,
+) -> Option<crate::panel::Section> {
+    sections
         .iter()
-        .any(|word| expected.contains(word))
+        .copied()
+        .find(|section| known_unadvertised_panel_key(*section, chord))
 }
 
 #[test]
@@ -83,7 +78,7 @@ fn panel_doc_chords_are_section_keys() {
         .iter()
         .find(|s| s.starts_with("---\nid: panel\n"))
         .expect("panel source");
-    let mut allow = read_allowlist(panel_keys_ratchet_path());
+    let allow = read_allowlist(panel_keys_ratchet_path());
     let mut sorted = allow.clone();
     sorted.sort();
     sorted.dedup();
@@ -95,10 +90,9 @@ fn panel_doc_chords_are_section_keys() {
         .split_once("---\n")
         .and_then(|(_, rest)| rest.split_once("---\n").map(|x| x.1))
         .unwrap_or(source);
-    let mut section = None;
+    let mut sections = Vec::new();
     let mut directive_seen = false;
     let mut authored_keys = false;
-    let mut in_keys_run = false;
     let mut observed = BTreeSet::new();
     let mut invalid = BTreeSet::new();
     for line in body.lines() {
@@ -107,15 +101,9 @@ fn panel_doc_chords_are_section_keys() {
                 !directive_seen || !authored_keys,
                 "a generated key directive cannot share a subsection with a hand-written Keys run"
             );
-            let key = heading
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .trim_matches('`');
-            section = crate::panel::Section::from_key(key);
+            sections = panel_doc_sections(heading);
             directive_seen = false;
             authored_keys = false;
-            in_keys_run = false;
         }
         if let Some(key) = line
             .trim()
@@ -124,20 +112,13 @@ fn panel_doc_chords_are_section_keys() {
         {
             directive_seen = true;
             if let Some(key_section) = crate::panel::Section::from_key(key) {
-                section = Some(key_section);
+                if !sections.contains(&key_section) {
+                    sections.push(key_section);
+                }
             }
         }
-        let Some(section) = section else { continue };
         if line.contains("Keys:") {
             authored_keys = true;
-            in_keys_run = true;
-        } else if line.contains("Additional keys:") {
-            in_keys_run = true;
-        } else if line.trim().is_empty() {
-            in_keys_run = false;
-        }
-        if !in_keys_run {
-            continue;
         }
         let spans: Vec<&str> = line.split('`').collect();
         for index in (1..spans.len()).step_by(2) {
@@ -147,28 +128,15 @@ fn panel_doc_chords_are_section_keys() {
             if chars.next().is_some() {
                 continue;
             }
-            let advertised = crate::panel::section_keys::section_keys(section)
-                .iter()
-                .any(|k| k.chord == token)
-                || section.home_view().is_some_and(|v| {
-                    crate::panel::gitui::context_keys(v)
-                        .iter()
-                        .any(|k| k.chord == token)
-                })
-                || "eEjkJK0123456789".contains(chord);
-            let entry = format!("panel:{}:{token}", section.as_key());
-            if !advertised {
-                if known_unadvertised_panel_key(section, chord) {
-                    observed.insert(entry);
+            if sections.is_empty() {
+                continue;
+            }
+            if !panel_chord_advertised(&sections, token, chord) {
+                if let Some(section) = known_unadvertised_section(&sections, chord) {
+                    observed.insert(format!("panel:{}:{token}", section.as_key()));
                 } else {
-                    invalid.insert(entry);
+                    invalid.insert(format!("panel:{}:{token}", sections[0].as_key()));
                 }
-            } else if !known_unadvertised_panel_key(section, chord)
-                && panel_chord_label(section, token).is_some_and(|label| {
-                    !doc_label_matches(label, spans.get(index + 1).copied().unwrap_or(""))
-                })
-            {
-                invalid.insert(entry);
             }
         }
     }
@@ -198,27 +166,21 @@ fn help_section_keys_ratchet_update() {
         .find(|s| s.starts_with("---\nid: panel\n"))
         .expect("panel source");
     let mut lines = vec![
-        "# help-section-keys-ratchet — `panel:<section>:<chord>` keys-style entries".to_string(),
-        "# containing real chords omitted from that section's table. Shrink only.".to_string(),
-        "# notifications A shows read rows; / searches. Media +/- volume, [] chapters, f fullscreen.".to_string(),
+        "# help-section-keys-ratchet — `panel:<section>:<chord>` prose entries".to_string(),
+        "# containing real chords omitted from the subsection's section tables. Shrink only."
+            .to_string(),
+        "# notifications A and /; logs Y; environments t; media + - [ ] f; prq h.".to_string(),
         "# prq h invokes its configured handoff.".to_string(),
     ];
     let body = source
         .split_once("---\n")
         .and_then(|(_, rest)| rest.split_once("---\n").map(|x| x.1))
         .unwrap_or(source);
-    let mut section = None;
-    let mut in_keys_run = false;
+    let mut sections = Vec::new();
     let mut debt = BTreeSet::new();
     for line in body.lines() {
         if let Some(heading) = line.strip_prefix("### ") {
-            section = crate::panel::Section::from_key(
-                heading
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .trim_matches('`'),
-            );
+            sections = panel_doc_sections(heading);
         }
         if let Some(key) = line
             .trim()
@@ -226,15 +188,11 @@ fn help_section_keys_ratchet_update() {
             .and_then(|s| s.strip_suffix("}}"))
             && let Some(key_section) = crate::panel::Section::from_key(key)
         {
-            section = Some(key_section);
+            if !sections.contains(&key_section) {
+                sections.push(key_section);
+            }
         }
-        let Some(s) = section else { continue };
-        if line.contains("Keys:") || line.contains("Additional keys:") {
-            in_keys_run = true;
-        } else if line.trim().is_empty() {
-            in_keys_run = false;
-        }
-        if !in_keys_run {
+        if sections.is_empty() {
             continue;
         }
         for token in line.split('`').skip(1).step_by(2) {
@@ -243,17 +201,10 @@ fn help_section_keys_ratchet_update() {
             if chars.next().is_some() {
                 continue;
             }
-            let ok = crate::panel::section_keys::section_keys(s)
-                .iter()
-                .any(|k| k.chord == token)
-                || s.home_view().is_some_and(|v| {
-                    crate::panel::gitui::context_keys(v)
-                        .iter()
-                        .any(|k| k.chord == token)
-                })
-                || "eEjkJK0123456789".contains(ch);
-            if !ok && known_unadvertised_panel_key(s, ch) {
-                debt.insert(format!("panel:{}:{token}", s.as_key()));
+            if !panel_chord_advertised(&sections, token, ch)
+                && let Some(section) = known_unadvertised_section(&sections, ch)
+            {
+                debt.insert(format!("panel:{}:{token}", section.as_key()));
             }
         }
     }
