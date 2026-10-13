@@ -163,6 +163,21 @@ pub fn collect(cfg: &Config) -> Vec<Binding> {
     // Panel sections: the row-mode action keys each section claims. `key: None`
     // rows are the shared accordion navigation, already listed once per zone.
     for section in crate::panel::SECTION_ORDER {
+        if let Some(view) = section.home_view() {
+            let mut seen = BTreeSet::new();
+            for key in crate::panel::gitui::context_keys(view) {
+                if !seen.insert(key.chord) {
+                    continue;
+                }
+                out.push(Binding {
+                    chords: vec![key.chord.to_string()],
+                    id: format!("panel:{}:{}", section.as_key(), key.chord),
+                    label: key.label.to_string(),
+                    zone: format!("panel:{}", section.as_key()),
+                    source: Source::ZoneTable,
+                });
+            }
+        }
         for sk in crate::panel::section_keys::section_keys(section) {
             let Some(c) = sk.key else { continue };
             out.push(Binding {
@@ -272,5 +287,13 @@ mod tests {
         let mut sorted = z.clone();
         sorted.dedup();
         assert_eq!(sorted, z, "zones are already grouped");
+    }
+
+    #[test]
+    fn git_context_keys_are_in_the_fold() {
+        let bindings = collect(&Config::default());
+        assert!(bindings.iter().any(|b| {
+            b.zone == "panel:commits" && b.label.to_ascii_lowercase().contains("squash")
+        }));
     }
 }

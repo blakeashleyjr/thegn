@@ -37,8 +37,9 @@ local player, without leaving the compositor. Hidden unless
   item, and painted transport controls use the same operations as the
   keyboard actions.
 - In the section, `space` toggles play/pause, `n`/`p` skip, `s` shuffles, and
-  `L` cycles repeat. Existing `media-*` actions remain palette-runnable and
-  bindable; no new action IDs were added.
+  `L` cycles repeat. `+`/`-` adjust volume, `[`/`]` skip chapters, `←`/`→`
+  seek, and `f` toggles fullscreen. Existing `media-*` actions remain
+  palette-runnable and bindable; no new action IDs were added.
 - Transport actions cover the usual surface — play/pause, next/previous,
   chapter skip, seek, volume, shuffle, loop, fullscreen — plus playlist
   and player pickers. All are palette-runnable, bindable in `[keybinds]`,
