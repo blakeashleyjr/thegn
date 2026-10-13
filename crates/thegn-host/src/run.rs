@@ -2412,7 +2412,6 @@ fn spawn_refs_fetch(
     line: u64,
     col: u32,
     label: String,
-    server: bool,
     root: std::path::PathBuf,
     lsp: std::sync::Arc<crate::lsp::LspInner>,
     tx: tokio_mpsc::Sender<SymbolsFetch>,
@@ -2422,9 +2421,11 @@ fn spawn_refs_fetch(
     tokio::task::spawn_blocking(move || {
         let _inflight = InflightGuard(busy);
         let mut rows = Vec::new();
+        let mut server = false;
         if let Some(key) = lsp.resolve_key(&file)
             && let Ok(client) = lsp.client(&root, &key)
         {
+            server = true;
             let uri = thegn_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
             if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
                 let _ = client.did_open(&uri, &text); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
@@ -7301,6 +7302,7 @@ async fn event_loop<T: Terminal>(
     let outline_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut refs_label = String::new();
     let mut refs_rows: Vec<crate::panel::SymbolRow> = Vec::new();
+    let mut refs_note = String::new();
     let mut refs_inflight = false;
     let refs_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // The hover/signature/code-action preview overlay (item 532): built off-loop
@@ -9132,6 +9134,7 @@ async fn event_loop<T: Terminal>(
             model.panel.symbols_note.clear();
             refs_label.clear();
             refs_rows.clear();
+            refs_note.clear();
             refs_inflight = false;
             refs_busy.store(false, std::sync::atomic::Ordering::Release);
             panel_ui.symbols_pick = None;
@@ -13664,13 +13667,13 @@ async fn event_loop<T: Terminal>(
                     }) {
                         refs_inflight = false;
                         refs_label = label.clone();
-                        model.panel.symbols_note = crate::panel::sections::symbols::refs_note(
+                        refs_note = crate::panel::sections::symbols::refs_note(
                             &label,
                             &file,
                             server,
                             rows.len(),
                         );
-                        model.status = model.panel.symbols_note.clone();
+                        model.status = refs_note.clone();
                         refs_rows = rows;
                     }
                 }
@@ -13690,6 +13693,9 @@ async fn event_loop<T: Terminal>(
         if chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Symbols {
             if panel_ui.symbols_show_refs {
                 let header = format!("refs: {refs_label}");
+                if crate::panel::sections::symbols::sync_refs_note(&mut model.panel, &refs_note) {
+                    dirty = true;
+                }
                 if model.panel.symbols != refs_rows || model.panel.symbols_file != header {
                     model.panel.symbols = refs_rows.clone();
                     model.panel.symbols_file = header;
@@ -13720,6 +13726,11 @@ async fn event_loop<T: Terminal>(
                     inflight: outline_inflight.as_ref(),
                     busy: outline_busy.load(std::sync::atomic::Ordering::Acquire),
                 };
+                let cached_for_target =
+                    crate::panel::sections::symbols::cached_outline_matches_target(
+                        outline_key.as_ref(),
+                        key.as_ref(),
+                    );
                 if crate::panel::sections::symbols::outline_fetch_needed(&demand)
                     && let Some(key) = key
                 {
@@ -13733,14 +13744,7 @@ async fn event_loop<T: Terminal>(
                         outline_busy.clone(),
                     );
                 }
-                let cached_for_target = key
-                    .as_ref()
-                    .is_some_and(|target| outline_key.as_ref() == Some(target));
-                let file = if target.is_some() {
-                    target.as_deref().unwrap_or_default()
-                } else {
-                    ""
-                };
+                let file = target.as_deref().unwrap_or_default();
                 let rows = if cached_for_target {
                     outline_syms.as_slice()
                 } else {
@@ -13750,13 +13754,6 @@ async fn event_loop<T: Terminal>(
                     model.panel.symbols = rows.to_vec();
                     model.panel.symbols_file = file.to_string();
                     dirty = true;
-                }
-                if target.is_none() {
-                    if !model.panel.symbols.is_empty() || !model.panel.symbols_file.is_empty() {
-                        model.panel.symbols.clear();
-                        model.panel.symbols_file.clear();
-                        dirty = true;
-                    }
                 }
             }
         }
@@ -21983,24 +21980,28 @@ async fn event_loop<T: Terminal>(
                                 refs_busy.store(true, std::sync::atomic::Ordering::Release);
                                 refs_label = s.name.clone();
                                 refs_rows.clear();
+                                refs_note.clear();
                                 model.panel.symbols_note.clear();
                                 panel_ui.symbols_show_refs = true;
                                 panel_ui.symbols_cursor = 0;
                                 panel_ui.cursor = 0;
                                 model.status = format!("Finding references to {}…", s.name);
-                                let server = lsp_supervisor.handle().resolve_key(&s.file).is_some();
-                                spawn_refs_fetch(
-                                    s.file,
-                                    s.line,
-                                    s.col,
-                                    s.name,
-                                    server,
-                                    active_tab_path(&session),
-                                    lsp_supervisor.handle(),
-                                    outline_tx.clone(),
-                                    waker.clone(),
-                                    refs_busy.clone(),
-                                );
+                                if let Some(root) = session
+                                    .active_group()
+                                    .map(|group| PathBuf::from(&group.path))
+                                {
+                                    spawn_refs_fetch(
+                                        s.file,
+                                        s.line,
+                                        s.col,
+                                        s.name,
+                                        root,
+                                        lsp_supervisor.handle(),
+                                        outline_tx.clone(),
+                                        waker.clone(),
+                                        refs_busy.clone(),
+                                    );
+                                }
                             } else if !panel_ui.symbols_show_refs
                                 && refs_busy.load(std::sync::atomic::Ordering::Acquire)
                             {
@@ -22014,7 +22015,13 @@ async fn event_loop<T: Terminal>(
                             true
                         }
                         (Section::Symbols, KeyCode::Char('f')) => {
-                            panel_ui.symbols_picker = !panel_ui.symbols_picker;
+                            if crate::panel::sections::symbols::picker_open(&panel_ui, &model.panel)
+                            {
+                                panel_ui.symbols_pick = None;
+                                panel_ui.symbols_picker = false;
+                            } else {
+                                panel_ui.symbols_picker = true;
+                            }
                             panel_ui.symbols_show_refs = false;
                             panel_ui.symbols_cursor = 0;
                             panel_ui.cursor = 0;

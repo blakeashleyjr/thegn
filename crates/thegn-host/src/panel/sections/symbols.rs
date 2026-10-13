@@ -128,6 +128,23 @@ pub(crate) fn refs_note(label: &str, file: &str, server: bool, n: usize) -> Stri
     }
 }
 
+pub(crate) fn sync_refs_note(panel: &mut super::super::PanelData, note: &str) -> bool {
+    if panel.symbols_note == note {
+        return false;
+    }
+    panel.symbols_note = note.to_string();
+    true
+}
+
+pub(crate) fn cached_outline_matches_target(
+    cached: Option<&OutlineKey>,
+    target: Option<&OutlineKey>,
+) -> bool {
+    cached.is_some_and(|cached| {
+        target.is_some_and(|target| cached.root == target.root && cached.file == target.file)
+    })
+}
+
 fn picker_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let changes = &ctx.model.panel.changes;
     let mut rows = if changes.is_empty() {
@@ -355,6 +372,21 @@ mod tests {
     }
 
     #[test]
+    fn cached_outline_stays_visible_for_same_root_and_file_during_refetch() {
+        let cached = outline_key(
+            PathBuf::from("/repo"),
+            "src/a.rs",
+            &[change("src/a.rs", 1, 0)],
+        );
+        let target = outline_key(
+            PathBuf::from("/repo"),
+            "src/a.rs",
+            &[change("src/a.rs", 2, 0)],
+        );
+        assert!(cached_outline_matches_target(Some(&cached), Some(&target)));
+    }
+
+    #[test]
     fn no_outline_fetch_while_panel_hidden() {
         let key = outline_key(PathBuf::from("/repo"), "src/a.rs", &[]);
         assert!(!outline_fetch_needed(&OutlineDemand {
@@ -402,6 +434,23 @@ mod tests {
         assert!(
             format!("{:?}", content(&make_ctx(&model, &ui))).contains("no language server for .rs")
         );
+    }
+
+    #[test]
+    fn refs_note_can_be_mirrored_after_model_replacement() {
+        let mut panel = crate::panel::PanelData::default();
+        assert!(sync_refs_note(
+            &mut panel,
+            "no references (no language server for .rs)"
+        ));
+        assert_eq!(
+            panel.symbols_note,
+            "no references (no language server for .rs)"
+        );
+        assert!(!sync_refs_note(
+            &mut panel,
+            "no references (no language server for .rs)"
+        ));
     }
 
     #[test]
