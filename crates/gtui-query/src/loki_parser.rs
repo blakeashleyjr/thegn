@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use gtui_core::datasource::QueryError;
 use gtui_core::frame::{Field, FieldType, Frame};
@@ -49,14 +49,15 @@ pub fn parse_loki_response(json: &str) -> Result<Vec<Frame>, QueryError> {
             data.result_type
         )));
     }
-    let result = data
-        .result
-        .as_array()
-        .ok_or_else(|| QueryError::Syntax("Loki streams result must be an array".to_string()))?;
-    let results = result
-        .iter()
+    let serde_json::Value::Array(items) = data.result else {
+        return Err(QueryError::Syntax(
+            "Loki streams result must be an array".to_string(),
+        ));
+    };
+    let results = items
+        .into_iter()
         .map(|item| {
-            serde_json::from_value::<LokiResult>(item.clone())
+            serde_json::from_value::<LokiResult>(item)
                 .map_err(|error| QueryError::Syntax(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -99,46 +100,57 @@ fn series_names(results: &[LokiResult]) -> Vec<String> {
                 .unwrap_or_default()
         })
         .collect();
+    let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, base) in bases.iter().enumerate() {
+        groups.entry(*base).or_default().push(index);
+    }
+    let mut distinguishing_by_base: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (base, indices) in &groups {
+        let mut stats: HashMap<&str, (&str, usize, bool)> = HashMap::new();
+        for index in indices {
+            for (key, value) in &results[*index].stream {
+                if !base.is_empty() && key == "filename" {
+                    continue;
+                }
+                let stat = stats
+                    .entry(key.as_str())
+                    .or_insert((value.as_str(), 0, false));
+                stat.1 += 1;
+                if stat.0 != value.as_str() {
+                    stat.2 = true;
+                }
+            }
+        }
+        let distinguishing = stats
+            .into_iter()
+            .filter_map(|(key, (_, present, differs))| {
+                (differs || present != indices.len()).then_some(key)
+            })
+            .collect();
+        distinguishing_by_base.insert(*base, distinguishing);
+    }
+
     let mut names = Vec::with_capacity(results.len());
     for (index, result) in results.iter().enumerate() {
         let base = bases[index];
-        let group: Vec<_> = results
-            .iter()
-            .enumerate()
-            .filter(|(other_index, _)| bases[*other_index] == base)
-            .collect();
+        let group = &groups[base];
+        let distinguishing = &distinguishing_by_base[base];
         let name = if !base.is_empty() && group.len() == 1 {
             base.to_string()
         } else if result.stream.is_empty() {
             format!("stream_{index}")
         } else {
-            let mut keys: Vec<_> = result
-                .stream
-                .keys()
-                .filter(|key| base.is_empty() || key.as_str() != "filename")
-                .collect();
-            keys.sort_unstable();
-            let distinguishing: Vec<_> = keys
-                .into_iter()
-                .filter(|key| {
-                    let mut values = HashSet::new();
-                    group.iter().for_each(|(_, other)| {
-                        values.insert(other.stream.get(*key));
-                    });
-                    values.len() > 1
-                })
-                .collect();
-            let keys = if distinguishing.is_empty() {
+            let mut keys: Vec<_> = if distinguishing.is_empty() {
                 if base.is_empty() {
-                    let mut keys: Vec<_> = result.stream.keys().collect();
-                    keys.sort_unstable();
-                    keys
+                    result.stream.keys().map(String::as_str).collect()
                 } else {
                     Vec::new()
                 }
             } else {
-                distinguishing
+                distinguishing.clone()
             };
+            keys.retain(|key| result.stream.contains_key(*key));
+            keys.sort_unstable();
             if !base.is_empty() && keys.is_empty() {
                 names.push(base.to_string());
                 continue;

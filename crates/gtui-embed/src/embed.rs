@@ -1150,7 +1150,12 @@ mod tests {
                 None,
             );
             assert!(
-                buf.content.iter().any(|cell| cell.fg == theme.color(token)),
+                if kind == "logs" {
+                    buf.cell((1, 1))
+                        .is_some_and(|cell| cell.fg == theme.color(token))
+                } else {
+                    buf.content.iter().any(|cell| cell.fg == theme.color(token))
+                },
                 "{kind} omitted {token:?}"
             );
             assert!(

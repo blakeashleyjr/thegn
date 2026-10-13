@@ -46,20 +46,22 @@ pub fn parse_prometheus_response(json: &str) -> Result<Vec<Frame>, QueryError> {
     let data = resp
         .data
         .ok_or_else(|| QueryError::Syntax("Missing data field".to_string()))?;
-    let result_type = data.result_type.as_str();
-    if !matches!(result_type, "matrix" | "vector") {
+    let result_type = data.result_type;
+    if !matches!(result_type.as_str(), "matrix" | "vector") {
         return Err(QueryError::Syntax(format!(
             "unsupported Prometheus resultType '{result_type}'"
         )));
     }
-    let result = data.result.as_array().ok_or_else(|| {
-        QueryError::Syntax(format!("Prometheus {result_type} result must be an array"))
-    })?;
-    let mut parsed = Vec::with_capacity(result.len());
-    for item in result {
-        let item: PromResult = serde_json::from_value(item.clone())
-            .map_err(|error| QueryError::Syntax(error.to_string()))?;
-        let shape_matches = match result_type {
+    let serde_json::Value::Array(items) = data.result else {
+        return Err(QueryError::Syntax(format!(
+            "Prometheus {result_type} result must be an array"
+        )));
+    };
+    let mut parsed = Vec::with_capacity(items.len());
+    for item in items {
+        let item: PromResult =
+            serde_json::from_value(item).map_err(|error| QueryError::Syntax(error.to_string()))?;
+        let shape_matches = match result_type.as_str() {
             "matrix" => item.values.is_some(),
             "vector" => item.value.is_some(),
             _ => false,
@@ -83,7 +85,7 @@ pub fn parse_prometheus_response(json: &str) -> Result<Vec<Frame>, QueryError> {
     );
     let mut frames = Vec::with_capacity(parsed.len());
     for (result, series_name) in parsed.into_iter().zip(names) {
-        let samples = match result_type {
+        let samples = match result_type.as_str() {
             "matrix" => result.values.unwrap_or_default(),
             "vector" => result.value.into_iter().collect(),
             _ => Vec::new(),
@@ -111,46 +113,59 @@ fn series_names<'a>(
         .iter()
         .map(|(base, _)| base.unwrap_or_default())
         .collect();
+    let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, base) in bases.iter().enumerate() {
+        groups.entry(*base).or_default().push(index);
+    }
+    let mut distinguishing_by_base: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (base, indices) in &groups {
+        let mut stats: HashMap<&str, (&str, usize, bool)> = HashMap::new();
+        for index in indices {
+            let labels = items[*index].1;
+            for (key, value) in labels {
+                if !base.is_empty() && key == "__name__" {
+                    continue;
+                }
+                let stat = stats
+                    .entry(key.as_str())
+                    .or_insert((value.as_str(), 0, false));
+                stat.1 += 1;
+                if stat.0 != value.as_str() {
+                    stat.2 = true;
+                }
+            }
+        }
+        let distinguishing = stats
+            .into_iter()
+            .filter_map(|(key, (_, present, differs))| {
+                (differs || present != indices.len()).then_some(key)
+            })
+            .collect();
+        distinguishing_by_base.insert(*base, distinguishing);
+    }
+
     let mut names = Vec::with_capacity(items.len());
     for (index, ((_, labels), base_value)) in items.iter().zip(&bases).enumerate() {
-        let group: Vec<_> = items
-            .iter()
-            .enumerate()
-            .filter(|(_, (other_base, _))| other_base.unwrap_or_default() == *base_value)
-            .collect();
-        let name = if !base_value.is_empty() && group.len() == 1 {
-            (*base_value).to_string()
-        } else if !base_value.is_empty() && labels.keys().all(|key| key.as_str() == "__name__") {
+        let group = &groups[base_value];
+        let distinguishing = &distinguishing_by_base[base_value];
+        let name = if !base_value.is_empty()
+            && (group.len() == 1 || labels.keys().all(|key| key.as_str() == "__name__"))
+        {
             (*base_value).to_string()
         } else if labels.is_empty() {
             format!("{fallback_prefix}_{index}")
         } else {
-            let mut keys: Vec<_> = labels
-                .keys()
-                .filter(|key| base_value.is_empty() || key.as_str() != "__name__")
-                .collect();
-            keys.sort_unstable();
-            let distinguishing: Vec<_> = keys
-                .into_iter()
-                .filter(|key| {
-                    let mut values = HashSet::new();
-                    group.iter().for_each(|(_, (_, other_labels))| {
-                        values.insert(other_labels.get(*key));
-                    });
-                    values.len() > 1
-                })
-                .collect();
-            let keys = if distinguishing.is_empty() {
+            let mut keys: Vec<_> = if distinguishing.is_empty() {
                 if !base_value.is_empty() {
                     Vec::new()
                 } else {
-                    let mut keys: Vec<_> = labels.keys().collect();
-                    keys.sort_unstable();
-                    keys
+                    labels.keys().map(String::as_str).collect()
                 }
             } else {
-                distinguishing
+                distinguishing.clone()
             };
+            keys.retain(|key| labels.contains_key(*key));
+            keys.sort_unstable();
             if !base_value.is_empty() && keys.is_empty() {
                 names.push((*base_value).to_string());
                 continue;
@@ -214,6 +229,8 @@ mod tests {
         let json = r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{"__name__":"up","job":"prometheus","instance":"localhost:9090"},"value":[1435781451.781,"1"]}]}}"#;
         let frames = parse_prometheus_response(json).unwrap();
         assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].fields.len(), 2);
+        assert_eq!(frames[0].fields[0].name, "time");
         assert_eq!(frames[0].fields[1].name, "up");
     }
 
@@ -231,10 +248,10 @@ mod tests {
         let frames = parse_prometheus_response(json).unwrap();
         assert_eq!(frames[0].fields[1].name, "up{job=\"a\"}");
         assert_eq!(frames[1].fields[1].name, "up{job=\"b\"}");
-        assert_eq!(
-            parse_prometheus_response(json).unwrap()[0].fields[1].name,
-            frames[0].fields[1].name
-        );
+        let second_json = r#"{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"instance":"x"},"values":[[2,"1"]]},{"metric":{"instance":"y"},"values":[[2,"1"]]}]}}"#;
+        let second_frames = parse_prometheus_response(second_json).unwrap();
+        assert_eq!(second_frames[0].fields[1].name, "{instance=\"x\"}");
+        assert_eq!(second_frames[1].fields[1].name, "{instance=\"y\"}");
     }
 
     #[test]

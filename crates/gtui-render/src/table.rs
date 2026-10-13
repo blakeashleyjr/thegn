@@ -33,7 +33,7 @@ impl TableRenderer {
                         Cow::Owned(s) => Cow::Owned(crate::clip_chars(&s, budget).to_string()),
                     })
                     .collect();
-                out_rows.push(Row::new(row_data).style(Style::default().fg(colors.text)));
+                out_rows.push(Row::new(row_data));
             }
         }
 
@@ -83,10 +83,7 @@ mod tests {
         let headers: Vec<String> = frame.fields.iter().map(|f| f.name.clone()).collect();
         let max_len = frame.fields.iter().map(|f| f.len()).max().unwrap_or(0);
         let rows: Vec<Row> = (0..max_len)
-            .map(|i| {
-                Row::new(frame.fields.iter().map(|f| f.cell(i)).collect::<Vec<_>>())
-                    .style(Style::default().fg(crate::RenderColors::default().text))
-            })
+            .map(|i| Row::new(frame.fields.iter().map(|f| f.cell(i)).collect::<Vec<_>>()))
             .collect();
         let widths: Vec<ratatui::layout::Constraint> = headers
             .iter()
