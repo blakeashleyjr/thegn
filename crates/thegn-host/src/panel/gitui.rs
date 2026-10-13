@@ -807,28 +807,6 @@ pub fn todo_move(todos: &mut Vec<TodoEntry>, cursor: usize, up: bool) -> usize {
     }
 }
 
-/// Build the pick-everything todo PURELY from the loaded commit list
-/// (newest-first), oldest first as `git rebase -i` expects; the base is the
-/// oldest commit's parent (`<sha>^`, or `--root` for a root commit).
-pub fn todo_from_commits(commits: &[crate::panel::CommitRow]) -> Option<(String, Vec<TodoEntry>)> {
-    let oldest = commits.last()?;
-    let base = if oldest.parents.is_empty() {
-        "--root".to_string()
-    } else {
-        format!("{}^", oldest.sha)
-    };
-    let todos: Vec<TodoEntry> = commits
-        .iter()
-        .rev()
-        .map(|c| TodoEntry {
-            action: TodoAction::Pick,
-            sha: c.short.clone(),
-            subject: c.subject.clone(),
-        })
-        .collect();
-    Some((base, todos))
-}
-
 /// Mirror an externally-driven rebase (started in a shell pane, say) into
 /// the flow state from the hydrated merge banner, and clear a finished one.
 /// Returns the status note to show when the rebase ended. The caller must
@@ -1630,9 +1608,6 @@ mod tests {
                 author: "Ada".into(),
                 date: 0,
                 refs: String::new(),
-                // The oldest (last) commit is a root commit when i == n-1
-                // only if the test wants it; default: every commit has a
-                // parent so `todo_from_commits` uses `<sha>^`.
                 parents: vec!["p".into()],
             })
             .collect()
@@ -1708,10 +1683,16 @@ mod tests {
 
     #[test]
     fn todo_reducers_retag_toggle_and_move() {
-        let (base, mut todos) = todo_from_commits(&commits(3)).unwrap();
-        // Oldest-first picks; base is the oldest sha + "^".
+        let mut todos: Vec<TodoEntry> = commits(3)
+            .into_iter()
+            .rev()
+            .map(|commit| TodoEntry {
+                action: TodoAction::Pick,
+                sha: commit.short,
+                subject: commit.subject,
+            })
+            .collect();
         assert_eq!(todos.len(), 3);
-        assert!(base.ends_with('^'));
         assert_eq!(todos[0].subject, "commit 2");
         assert!(todos.iter().all(|t| t.action == TodoAction::Pick));
 
@@ -1728,13 +1709,6 @@ mod tests {
         assert_eq!(todos[0].sha, sha);
         // Refused moves keep the cursor (already at the top).
         assert_eq!(todo_move(&mut todos, 0, true), 0);
-
-        // A root commit rebases from --root.
-        let mut root = commits(2);
-        root.last_mut().unwrap().parents.clear();
-        let (base, _) = todo_from_commits(&root).unwrap();
-        assert_eq!(base, "--root");
-        assert!(todo_from_commits(&[]).is_none());
     }
 
     #[test]

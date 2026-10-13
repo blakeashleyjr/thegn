@@ -793,6 +793,26 @@ mod tests {
         dir
     }
 
+    fn commit_file_via_execute(dir: &std::path::Path, loc: &GitLoc, content: &str, message: &str) {
+        std::fs::write(dir.join("f.txt"), content).unwrap();
+        assert!(matches!(
+            execute(GitOp::StageAll, loc, false),
+            GitOpResult::Ok(_)
+        ));
+        assert!(matches!(
+            execute(
+                GitOp::Commit {
+                    message: message.into(),
+                    no_verify: false,
+                    sign: Some(false),
+                },
+                loc,
+                false,
+            ),
+            GitOpResult::Ok(_)
+        ));
+    }
+
     #[test]
     fn execute_runs_a_commit_and_reports_errors_one_line() {
         let dir = tmp_repo("exec");
@@ -828,6 +848,192 @@ mod tests {
         }
         if let Err(error) = std::fs::remove_dir_all(&dir) {
             tracing::debug!(target: "thegn::gitmut::tests", %error, "failed to remove jj mutation test repo");
+        }
+    }
+
+    #[test]
+    fn execute_fixup_of_head_folds_and_finishes_the_rebase() {
+        let dir = tmp_repo("fixup-head");
+        let loc = GitLoc::Local(dir.clone());
+        commit_file_via_execute(&dir, &loc, "two\n", "c1");
+        let head = thegn_core::util::git_cmd(&dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_owned();
+        let tree_before = thegn_core::util::git_cmd(&dir)
+            .args(["rev-parse", "HEAD^{tree}"])
+            .output()
+            .unwrap();
+        assert!(tree_before.status.success());
+        let tree_before = String::from_utf8(tree_before.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+
+        assert!(matches!(
+            execute(
+                GitOp::Fixup {
+                    oldest: head.clone(),
+                    targets: vec![head],
+                },
+                &loc,
+                false,
+            ),
+            GitOpResult::Ok(_)
+        ));
+        let log = thegn_core::util::git_cmd(&dir)
+            .args(["rev-list", "--count", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(log.status.success());
+        assert_eq!(String::from_utf8(log.stdout).unwrap().trim(), "1");
+        let tree_after = thegn_core::util::git_cmd(&dir)
+            .args(["rev-parse", "HEAD^{tree}"])
+            .output()
+            .unwrap();
+        assert!(tree_after.status.success());
+        assert_eq!(
+            String::from_utf8(tree_after.stdout).unwrap().trim(),
+            tree_before
+        );
+        let git_dir = thegn_core::util::git_cmd(&dir)
+            .args(["rev-parse", "--git-path", "rebase-merge"])
+            .output()
+            .unwrap();
+        assert!(git_dir.status.success());
+        assert!(
+            !dir.join(String::from_utf8(git_dir.stdout).unwrap().trim())
+                .exists()
+        );
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::debug!(target: "thegn::gitmut::tests", %error, "failed to remove fixup test repo");
+        }
+    }
+
+    #[test]
+    fn execute_squash_of_head_folds_and_finishes_the_rebase() {
+        let dir = tmp_repo("squash-head");
+        let loc = GitLoc::Local(dir.clone());
+        commit_file_via_execute(&dir, &loc, "two\n", "c1");
+        let head = thegn_core::util::git_cmd(&dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_owned();
+        let tree_before = thegn_core::util::git_cmd(&dir)
+            .args(["rev-parse", "HEAD^{tree}"])
+            .output()
+            .unwrap();
+        assert!(tree_before.status.success());
+        let tree_before = String::from_utf8(tree_before.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+
+        assert!(matches!(
+            execute(
+                GitOp::Squash {
+                    oldest: head.clone(),
+                    targets: vec![head],
+                },
+                &loc,
+                false,
+            ),
+            GitOpResult::Ok(_)
+        ));
+        let count = thegn_core::util::git_cmd(&dir)
+            .args(["rev-list", "--count", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(count.status.success());
+        assert_eq!(String::from_utf8(count.stdout).unwrap().trim(), "1");
+        let tree_after = thegn_core::util::git_cmd(&dir)
+            .args(["rev-parse", "HEAD^{tree}"])
+            .output()
+            .unwrap();
+        assert!(tree_after.status.success());
+        assert_eq!(
+            String::from_utf8(tree_after.stdout).unwrap().trim(),
+            tree_before
+        );
+        let git_dir = thegn_core::util::git_cmd(&dir)
+            .args(["rev-parse", "--git-path", "rebase-merge"])
+            .output()
+            .unwrap();
+        assert!(git_dir.status.success());
+        assert!(
+            !dir.join(String::from_utf8(git_dir.stdout).unwrap().trim())
+                .exists()
+        );
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::debug!(target: "thegn::gitmut::tests", %error, "failed to remove squash test repo");
+        }
+    }
+
+    #[test]
+    fn execute_fixup_of_two_selected_commits_preserves_the_tree() {
+        let dir = tmp_repo("fixup-range");
+        let loc = GitLoc::Local(dir.clone());
+        commit_file_via_execute(&dir, &loc, "two\n", "c1");
+        commit_file_via_execute(&dir, &loc, "three\n", "c2");
+        let commits = thegn_core::util::git_cmd(&dir)
+            .args(["rev-list", "--reverse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(commits.status.success());
+        let commits = String::from_utf8(commits.stdout).unwrap();
+        let shas: Vec<String> = commits.lines().map(str::to_owned).collect();
+        assert_eq!(shas.len(), 3);
+        let tree_before = thegn_core::util::git_cmd(&dir)
+            .args(["rev-parse", "HEAD^{tree}"])
+            .output()
+            .unwrap();
+        assert!(tree_before.status.success());
+        let tree_before = String::from_utf8(tree_before.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+
+        assert!(matches!(
+            execute(
+                GitOp::Fixup {
+                    oldest: shas[1].clone(),
+                    targets: vec![shas[1].clone(), shas[2].clone()],
+                },
+                &loc,
+                false,
+            ),
+            GitOpResult::Ok(_)
+        ));
+        let count = thegn_core::util::git_cmd(&dir)
+            .args(["rev-list", "--count", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(count.status.success());
+        assert_eq!(String::from_utf8(count.stdout).unwrap().trim(), "1");
+        let tree_after = thegn_core::util::git_cmd(&dir)
+            .args(["rev-parse", "HEAD^{tree}"])
+            .output()
+            .unwrap();
+        assert!(tree_after.status.success());
+        assert_eq!(
+            String::from_utf8(tree_after.stdout).unwrap().trim(),
+            tree_before
+        );
+        let git_dir = thegn_core::util::git_cmd(&dir)
+            .args(["rev-parse", "--git-path", "rebase-merge"])
+            .output()
+            .unwrap();
+        assert!(git_dir.status.success());
+        assert!(
+            !dir.join(String::from_utf8(git_dir.stdout).unwrap().trim())
+                .exists()
+        );
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::debug!(target: "thegn::gitmut::tests", %error, "failed to remove range test repo");
         }
     }
 

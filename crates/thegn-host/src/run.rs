@@ -2926,6 +2926,11 @@ enum GitDoc {
     /// A paused rebase's live state, preserving read errors; `Ok(None)` means
     /// the pause vanished before the read landed.
     Rebase(std::result::Result<Option<thegn_svc::git::RebaseStatus>, String>),
+    /// A selected-commit interactive rebase plan, keyed by its base.
+    RebasePlan {
+        base: String,
+        result: std::result::Result<Vec<thegn_core::rebase_todo::TodoEntry>, String>,
+    },
     /// `git blame --porcelain` output parsed into per-line rows.
     Blame(Vec<crate::panel::BlameRow>),
     /// The selected stash's patch (`stash show -p -u`), keyed by index.
@@ -3115,6 +3120,34 @@ fn spawn_rebase_status_fetch(
             .map_err(|error| error.to_string());
         if tx.send((generation, GitDoc::Rebase(status))).is_ok() {
             let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        }
+    });
+}
+
+/// Plan an interactive rebase from the selected commit off the UI loop.
+fn spawn_rebase_plan_fetch(
+    generation: u64,
+    session: &crate::session::Session,
+    oldest: String,
+    base: String,
+    tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
+    waker: &TerminalWaker,
+) {
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        use thegn_svc::git::RebaseOps;
+        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+        let result = thegn_svc::git::CliGit
+            .rebase_todo_for(&loc, &oldest)
+            .map_err(|error| error.to_string());
+        if tx
+            .send((generation, GitDoc::RebasePlan { base, result }))
+            .is_ok()
+            && let Err(error) = wk.wake()
+        {
+            tracing::debug!(target: "thegn::git", %error, "could not wake loop for rebase plan");
         }
     });
 }
@@ -4245,12 +4278,23 @@ fn handle_git_msg(
         GitMsg::Squash | GitMsg::Fixup => {
             if let Some((oldest, targets)) = gitui::commit_selection(&panel_ui.git, &model.panel) {
                 panel_ui.git.sel_anchor = None;
-                let op = if msg == GitMsg::Squash {
-                    GitOp::Squash { oldest, targets }
+                if msg == GitMsg::Squash {
+                    confirm_git_op(
+                        ov,
+                        "squash?",
+                        format!("folds {} commit(s) into the commit below", targets.len()),
+                        true,
+                        GitOp::Squash { oldest, targets },
+                    );
                 } else {
-                    GitOp::Fixup { oldest, targets }
-                };
-                enqueue(panel_ui, model, op);
+                    confirm_git_op(
+                        ov,
+                        "fixup?",
+                        format!("folds {} commit(s) into the commit below", targets.len()),
+                        true,
+                        GitOp::Fixup { oldest, targets },
+                    );
+                }
             }
         }
         GitMsg::Drop => {
@@ -4353,15 +4397,32 @@ fn handle_git_msg(
             // it rather than clobbering the live flow with a fresh plan.
             if matches!(&panel_ui.git.flow, GitFlow::Rebase(r) if r.running) {
                 panel_ui.git.focus = GitView::RebaseTodo;
-            } else if let Some((base, todos)) = gitui::todo_from_commits(&model.panel.commits) {
-                panel_ui.git.flow = GitFlow::Rebase(gitui::RebaseUi {
-                    base,
-                    todos,
-                    ..Default::default()
-                });
-                panel_ui.git.focus = GitView::RebaseTodo;
+            } else if let Some((oldest, _)) = gitui::commit_selection(&panel_ui.git, &model.panel) {
+                if let Some(commit) = model
+                    .panel
+                    .commits
+                    .iter()
+                    .find(|commit| commit.sha == oldest)
+                {
+                    let base = if commit.parents.is_empty() {
+                        "--root".to_string()
+                    } else {
+                        format!("{}^", commit.sha)
+                    };
+                    spawn_rebase_plan_fetch(
+                        panel_ui.git.op_gen,
+                        wires.session,
+                        oldest,
+                        base,
+                        wires.doc_tx,
+                        wires.waker,
+                    );
+                    model.status = "planning interactive rebase…".into();
+                } else {
+                    model.status = "no commit selected".into();
+                }
             } else {
-                model.status = "no commits loaded".into();
+                model.status = "no commit selected".into();
             }
         }
         GitMsg::ConfirmRebase => {
@@ -10276,6 +10337,25 @@ async fn event_loop<T: Terminal>(
                     rebase_sync_inflight = false;
                     if let Some(error) = apply_rebase_doc(&mut panel_ui.git.flow, status) {
                         model.status = format!("Rebase status unavailable: {error}");
+                    }
+                }
+                GitDoc::RebasePlan { base, result } => {
+                    if !matches!(&panel_ui.git.flow, GitFlow::None) {
+                        tracing::debug!(target: "thegn::git", "dropping rebase plan because another git flow owns the editor");
+                    } else {
+                        match result {
+                            Ok(todos) => {
+                                panel_ui.git.flow = GitFlow::Rebase(gitui::RebaseUi {
+                                    base,
+                                    todos,
+                                    ..Default::default()
+                                });
+                                panel_ui.git.focus = GitView::RebaseTodo;
+                            }
+                            Err(error) => {
+                                model.status = format!("interactive rebase: {error}");
+                            }
+                        }
                     }
                 }
                 GitDoc::Blame(rows) => {
