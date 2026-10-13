@@ -206,6 +206,10 @@ pub struct TestPanelState {
     pub cursor: usize,
     pub scroll: usize,
     pub filter: String,
+    /// Whether the filter is currently being edited in the Tests panel.
+    pub filter_editing: bool,
+    /// Last applied run's worktree and captured output.
+    pub last_output: Option<(String, String)>,
     /// Manifest fingerprint recorded at the last discovery. Compared against a
     /// freshly-computed one to decide whether discovery can be skipped.
     pub fingerprint: String,
@@ -214,6 +218,45 @@ pub struct TestPanelState {
 }
 
 impl TestPanelState {
+    /// Return every failing test id in display-tree order, once per id.
+    pub fn failing_ids(&self) -> Vec<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.nodes
+            .iter()
+            .filter(|node| node.kind == TestNodeKind::Test && node.state == TestState::Fail)
+            .filter_map(|node| seen.insert(node.id.clone()).then(|| node.id.clone()))
+            .collect()
+    }
+
+    /// Apply one filter-editing operation. Returns whether state changed.
+    pub fn edit_filter(&mut self, edit: FilterEdit) -> bool {
+        match edit {
+            FilterEdit::Push(ch) => {
+                self.filter.push(ch);
+                self.cursor = 0;
+                true
+            }
+            FilterEdit::Pop => {
+                let changed = self.filter.pop().is_some();
+                if changed {
+                    self.cursor = 0;
+                }
+                changed
+            }
+            FilterEdit::Commit => {
+                let changed = self.filter_editing;
+                self.filter_editing = false;
+                changed
+            }
+            FilterEdit::Clear => {
+                let changed = self.filter_editing || !self.filter.is_empty();
+                self.filter_editing = false;
+                self.filter.clear();
+                changed
+            }
+        }
+    }
+
     /// Record a completed run at the head of the history (capped).
     pub fn push_history(&mut self, rec: TestRunRec) {
         self.history.insert(0, rec);
@@ -384,6 +427,14 @@ impl TestPanelState {
         self.stale = true;
         self.summary.stale = true;
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterEdit {
+    Push(char),
+    Pop,
+    Commit,
+    Clear,
 }
 
 pub fn test_name_of(test_id: &str) -> &str {
@@ -844,6 +895,43 @@ mod tests {
             .iter()
             .filter(|n| n.kind == TestNodeKind::Test)
             .collect()
+    }
+
+    #[test]
+    fn filter_edit_narrows_visible_nodes() {
+        let mut state = TestPanelState::default();
+        state.merge_results(&[
+            test_node("sec::first", TestState::Pass, None, None),
+            test_node("other::second", TestState::Pass, None, None),
+        ]);
+        state.cursor = 1;
+        state.filter_editing = true;
+
+        assert!(state.edit_filter(FilterEdit::Push('s')));
+        assert!(state.edit_filter(FilterEdit::Push('e')));
+        assert!(state.edit_filter(FilterEdit::Push('c')));
+        assert_eq!(state.cursor, 0);
+        assert_eq!(state.visible_indices().len(), 1);
+
+        assert!(state.edit_filter(FilterEdit::Clear));
+        assert!(state.filter.is_empty());
+        assert!(!state.filter_editing);
+        assert_eq!(state.visible_indices().len(), 2);
+    }
+
+    #[test]
+    fn failing_ids_lists_all_failures_once() {
+        let mut state = TestPanelState::default();
+        state.nodes = vec![
+            test_node("mod::a", TestState::Fail, None, None),
+            test_node("mod::a", TestState::Fail, None, None),
+            test_node("mod::b", TestState::Fail, None, None),
+            test_node("mod::pass", TestState::Pass, None, None),
+        ];
+        assert_eq!(
+            state.failing_ids(),
+            vec!["mod::a".to_string(), "mod::b".to_string()]
+        );
     }
 
     #[test]
