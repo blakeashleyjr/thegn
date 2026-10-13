@@ -2360,6 +2360,15 @@ fn branch_list_load_distinguishes_cache_fetch_failure_backoff_and_pending() {
         DocLoad::Failed("git unavailable".into())
     );
     assert_eq!(
+        branch_list_load(
+            true,
+            Some(&Err("git unavailable\nfatal: details".into())),
+            false,
+            false
+        ),
+        DocLoad::Failed("git unavailable".into())
+    );
+    assert_eq!(
         branch_list_load(false, None, false, true),
         DocLoad::Failed("branch list unavailable; retrying".into())
     );

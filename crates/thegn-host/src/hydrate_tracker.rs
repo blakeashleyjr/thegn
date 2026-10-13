@@ -63,6 +63,21 @@ fn tracker_failures() -> &'static Mutex<HashMap<String, String>> {
     FAILURES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn record_tracker_failure(cwd: &std::path::Path, message: &str, waker: Option<&TerminalWaker>) {
+    tracker_failures()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            cwd.to_string_lossy().into_owned(),
+            safe_report_text(message),
+        );
+    if let Some(w) = waker
+        && let Err(error) = w.wake()
+    {
+        tracing::debug!(target: "thegn::tracker", %error, "tracker failure waker pulse failed");
+    }
+}
+
 fn tracker_load(rows: Result<usize, ()>, failure: Option<&str>) -> crate::panel::gitui::DocLoad {
     use crate::panel::gitui::DocLoad;
 
@@ -252,6 +267,7 @@ fn run_once(request: RefreshRequest) {
     use thegn_svc::issue::IssueRouter;
 
     if !cwd.is_dir() {
+        record_tracker_failure(&cwd, "worktree unavailable", waker.as_ref());
         if let Some(report) = report.as_ref() {
             send_tracker_toast(
                 &report.tx,
@@ -282,6 +298,7 @@ fn run_once(request: RefreshRequest) {
         .enable_all()
         .build()
     else {
+        record_tracker_failure(&cwd, "could not start tracker runtime", waker.as_ref());
         if let Some(report) = report.as_ref() {
             send_tracker_toast(
                 &report.tx,
@@ -311,6 +328,7 @@ fn run_once(request: RefreshRequest) {
     let mut failures = Vec::new();
     let mut any_success = false;
     let Ok(db) = thegn_core::db::Db::open() else {
+        record_tracker_failure(&cwd, "could not open issue cache", waker.as_ref());
         if let Some(report) = report.as_ref() {
             send_refresh_report(report, &[], Some("could not open the issue cache"), false);
         }
@@ -634,7 +652,8 @@ pub(crate) fn populate_tracker(
 mod tests {
     use super::{
         BusyRetry, MAX_REPORT_ENTRY_CHARS, RefreshCoalescer, RefreshGuard, format_refresh_report,
-        prepare_tracker_toast_message, safe_report_text, tracker_load,
+        prepare_tracker_toast_message, record_tracker_failure, safe_report_text, tracker_failures,
+        tracker_load,
     };
 
     #[test]
@@ -650,6 +669,25 @@ mod tests {
         assert_eq!(
             tracker_load(Err(()), None),
             DocLoad::Failed("issue cache unreadable".into())
+        );
+    }
+
+    #[test]
+    fn early_tracker_failure_is_visible_to_panel_load_state() {
+        use crate::panel::gitui::DocLoad;
+        use std::path::Path;
+
+        let cwd = Path::new("/repo/early-tracker-failure-test");
+        record_tracker_failure(cwd, "could not open issue cache", None);
+        let message = tracker_failures()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&cwd.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert_eq!(
+            tracker_load(Ok(0), Some(&message)),
+            DocLoad::Failed("could not open issue cache".into())
         );
     }
 
