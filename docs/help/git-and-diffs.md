@@ -95,8 +95,9 @@ merge-queue fold's floor, jj colocation, and any custom merge drivers).
 In a repo colocated with [jujutsu](https://jj-vcs.github.io/) (a `.jj/`
 beside `.git/`), thegn stays out of the way rather than fighting it:
 worktree rows carry a jj marker, detached `HEAD` (jj's normal state) is
-not shown as an error, staging surfaces note that jj ignores the git
-index, and background `auto_fetch` skips the repo unless
+not shown as an error, successful staging and commit actions add a
+status-line note that jj ignores the git index, and background `auto_fetch`
+skips the repo unless
 `[git] auto_fetch_colocated = true`. Reads are unchanged; mutations are
 warned about, not blocked.
 
