@@ -833,15 +833,18 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
         }
         Section::Logs => {
-            // `log_tail` is kept warm on EVERY refresh; `log_lines` is only
-            // populated while the section is open — summarising the latter
-            // made the collapsed row read "off" forever.
-            let n = model.panel.log_tail.len();
+            let n = model.panel.log_lines_structured.len();
             let errors = model
                 .panel
-                .log_tail
+                .log_lines_structured
                 .iter()
-                .filter(|l| l.level == thegn_core::log_view::LogLevel::Error)
+                .filter(|l| {
+                    matches!(
+                        &l.level,
+                        thegn_core::log::parser::LogLevel::Error
+                            | thegn_core::log::parser::LogLevel::Fatal
+                    )
+                })
                 .count();
             if n == 0 {
                 vec![seg(g2(), "off")]
@@ -1529,16 +1532,6 @@ mod spec {
             kind: "network".into(),
             detail: "connect 1.2.3.4:443".into(),
         }];
-        m.panel.log_lines = vec![
-            thegn_core::log_view::parse_log_line(
-                "2026-06-05T12:00:00  INFO  thegn::db  connection opened",
-            )
-            .unwrap(),
-            thegn_core::log_view::parse_log_line(
-                "2026-06-05T12:00:01  ERROR thegn::host  fatal error",
-            )
-            .unwrap(),
-        ];
         m
     }
 
