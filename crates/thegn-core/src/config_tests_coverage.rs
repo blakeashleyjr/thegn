@@ -1088,6 +1088,7 @@ fn config_overlay_apply_sets_every_field() {
         loc_watch_invalidate_secs: Some(11),
         weather_enabled: Some(true),
         notifications_agent_attention_inbox: Some(true),
+        notifications_merge_queue_hold_desktop: Some(true),
         skills_enabled: Some(false),
         skills_user_dirs: Some(vec!["/skills".into()]),
         skills_exclude: Some(vec!["mq".into()]),
@@ -1171,6 +1172,7 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.loc.watch_invalidate_secs, 11);
     assert!(cfg.weather.enabled);
     assert!(cfg.notifications.agent_attention_inbox);
+    assert!(cfg.notifications.merge_queue_hold_desktop);
     assert!(!cfg.skills.enabled);
     assert_eq!(cfg.skills.user_dirs, vec!["/skills"]);
     assert_eq!(cfg.skills.exclude, vec!["mq"]);

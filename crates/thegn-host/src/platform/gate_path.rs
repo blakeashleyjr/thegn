@@ -1,4 +1,7 @@
-//! Descriptor-relative gate-state admission. No operation recursively removes.
+//! Descriptor-relative gate-state admission and no-follow recursive removal.
+//!
+//! `Directory::remove_tree` removes descendants through retained directory
+//! descriptors and unlinks the leaf through its retained parent descriptor.
 //!
 //! Pins and rechecks detect observed replacement; advisory locking is not a
 //! filesystem lease against an arbitrary hostile process with the same UID.
@@ -79,11 +82,20 @@ impl ScratchDirectory {
         Ok(())
     }
 
-    /// Remove an empty scratch directory by identity. A populated worktree is
-    /// retained for Git registration repair instead of recursively deleted.
+    /// Remove an empty scratch directory by identity on the add-failure path.
+    /// Populated worktrees are removed through `remove_tree`.
     pub(crate) fn remove_empty(self) -> io::Result<()> {
         self.verify()?;
         std::fs::remove_dir(self.path())
+    }
+
+    /// Remove a private tree using only descriptor-relative operations. The
+    /// leaf name is checked against its pinned identity immediately before
+    /// `unlinkat`; a concurrent same-UID swap at that final point can only
+    /// remove an empty replacement directory (`AT_REMOVEDIR`), never walk it.
+    pub(crate) fn remove_tree(&self) -> io::Result<()> {
+        self.verify()?;
+        self.0.remove_tree()
     }
 }
 
@@ -257,6 +269,68 @@ impl Directory {
         }
     }
 
+    /// Recursively unlink entries below the retained leaf fd without ever
+    /// following a symlink or resolving a descendant pathname.
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    pub(crate) fn remove_tree(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            use std::os::fd::AsRawFd;
+            use std::os::unix::ffi::OsStrExt;
+
+            self.verify()?;
+            if self.pins.len() < 2 {
+                return Err(refused("filesystem root cannot be removed"));
+            }
+            let root_meta = self.pins.last().unwrap().1.metadata()?;
+            // SAFETY: geteuid has no memory arguments.
+            let owner = unsafe { libc::geteuid() };
+            if root_meta.uid() != owner {
+                return Err(refused("directory removal root has a foreign owner"));
+            }
+            remove_directory_contents(self.fd(), root_meta.dev(), owner, 0)?;
+
+            let parent = &self.pins[self.pins.len() - 2].1;
+            let name = CString::new(self.path.file_name().unwrap().as_bytes())
+                .map_err(io::Error::other)?;
+            // SAFETY: a zeroed libc::stat is a valid output buffer for fstatat;
+            // parent remains pinned and name is one terminated component.
+            let mut current: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: current is writable and the descriptor/name are valid.
+            if unsafe {
+                libc::fstatat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    &mut current,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if current.st_dev != root_meta.dev() as libc::dev_t
+                || current.st_ino != root_meta.ino() as libc::ino_t
+            {
+                return Err(refused("directory removal leaf identity changed"));
+            }
+            // SAFETY: parent is pinned and name is a single leaf. REMOVEDIR
+            // cannot recursively traverse a replacement directory.
+            if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "verified directory removal is unsupported on this platform",
+            ))
+        }
+    }
+
     #[cfg(unix)]
     fn fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;
@@ -274,6 +348,138 @@ impl Directory {
                 .collect::<io::Result<_>>()?,
         })
     }
+}
+
+#[cfg(unix)]
+fn remove_directory_contents(
+    directory_fd: std::os::fd::RawFd,
+    root_device: u64,
+    owner: u32,
+    depth: usize,
+) -> io::Result<()> {
+    use std::ffi::{CStr, CString};
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    if depth > 256 {
+        return Err(refused("directory removal depth limit exceeded"));
+    }
+    // SAFETY: directory_fd is retained by the caller; dup creates an owned fd
+    // for fdopendir, which takes ownership of it on success.
+    let duplicate = unsafe { libc::dup(directory_fd) };
+    if duplicate < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: duplicate is a valid newly owned descriptor.
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: fdopendir failed, so ownership of duplicate was not consumed.
+        unsafe { libc::close(duplicate) };
+        return Err(error);
+    }
+    // SAFETY: stream is live; the dup shares the caller's file offset, so rewind.
+    unsafe { libc::rewinddir(stream) };
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: stream is a live DIR pointer owned until closedir below.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: readdir returns a NUL-terminated d_name in the live entry.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_bytes().to_vec());
+        }
+    }
+    // SAFETY: stream is the unique DIR pointer returned by fdopendir.
+    if unsafe { libc::closedir(stream) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    for bytes in names {
+        let name = CString::new(bytes).map_err(io::Error::other)?;
+        // SAFETY: a zeroed libc::stat is a valid output buffer for fstatat;
+        // directory_fd is pinned and name is one terminated component.
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: metadata is writable and arguments are valid.
+        if unsafe {
+            libc::fstatat(
+                directory_fd,
+                name.as_ptr(),
+                &mut metadata,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            if metadata.st_dev as u64 != root_device || metadata.st_uid != owner {
+                return Err(refused("directory removal found a mount or foreign owner"));
+            }
+            // SAFETY: parent is pinned; no-follow and directory-only flags
+            // prevent opening a symlink or non-directory.
+            let child_fd = unsafe {
+                libc::openat(
+                    directory_fd,
+                    name.as_ptr(),
+                    libc::O_RDONLY
+                        | libc::O_DIRECTORY
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC
+                        | libc::O_NONBLOCK,
+                )
+            };
+            if child_fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: openat returned a new owned descriptor.
+            let child = unsafe { std::fs::File::from_raw_fd(child_fd) };
+            let opened = child.metadata()?;
+            if opened.dev() != metadata.st_dev as u64
+                || opened.ino() != metadata.st_ino as u64
+                || opened.uid() != owner
+            {
+                return Err(refused("directory removal child identity changed"));
+            }
+            remove_directory_contents(child.as_raw_fd(), root_device, owner, depth + 1)?;
+            unlink_entry(directory_fd, &name, true)?;
+        } else {
+            // Files, symlinks and special files are unlinked as leaves; no
+            // open operation is performed on them.
+            unlink_entry(directory_fd, &name, false)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unlink_entry(
+    parent_fd: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+    directory: bool,
+) -> io::Result<()> {
+    let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
+    // SAFETY: parent descriptor is pinned and name is one terminated entry.
+    if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), flags) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if !matches!(error.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM)) {
+        return Err(error);
+    }
+    // The directory is only chmodded after its identity and owner were checked
+    // by the caller. This happens once per failed entry, then retries once.
+    // SAFETY: fchmod changes permissions on the already-open parent directory.
+    if unsafe { libc::fchmod(parent_fd, 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: same pinned parent and entry; one retry after permission repair.
+    if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), flags) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 impl Regular {
@@ -596,6 +802,88 @@ mod tests {
         std::fs::remove_dir(&path).unwrap();
         std::fs::rename(&displaced, &path).unwrap();
         scratch.remove_empty().unwrap();
+    }
+
+    #[test]
+    fn remove_tree_unlinks_without_following_symlinks_and_repairs_read_only_dirs() {
+        let root = private_root();
+        let tree_path = root.path().join("tree");
+        std::fs::create_dir(&tree_path).unwrap();
+        std::fs::set_permissions(&tree_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let tree = Directory::open(&tree_path, Some(&tree_path)).unwrap();
+        let nested = tree_path.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let readonly = nested.join("readonly");
+        std::fs::create_dir(&readonly).unwrap();
+        std::fs::write(readonly.join("payload"), b"owned").unwrap();
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let target = root.path().join("victim");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("sentinel"), b"keep").unwrap();
+        symlink(&target, tree_path.join("link")).unwrap();
+
+        let removal = tree.remove_tree();
+        if readonly.exists() {
+            std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        removal.unwrap();
+
+        assert!(!tree_path.exists());
+        assert_eq!(std::fs::read(target.join("sentinel")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn remove_tree_rewinds_a_pinned_directory_at_eof() {
+        let root = private_root();
+        let tree_path = root.path().join("tree");
+        std::fs::create_dir(&tree_path).unwrap();
+        std::fs::write(tree_path.join("payload"), b"remove").unwrap();
+        let tree = Directory::open(&tree_path, Some(&tree_path)).unwrap();
+
+        // fdopendir takes ownership of the duplicate, and reading it to EOF
+        // advances the shared directory offset on tree's pinned descriptor.
+        // SAFETY: tree.fd() is live; dup returns a new owned descriptor.
+        let duplicate = unsafe { libc::dup(tree.fd()) };
+        assert!(duplicate >= 0);
+        // SAFETY: duplicate is a valid newly owned descriptor.
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            // SAFETY: fdopendir failed, so it did not consume duplicate.
+            unsafe { libc::close(duplicate) };
+            panic!("fdopendir failed: {}", io::Error::last_os_error());
+        }
+        let mut entries = 0;
+        loop {
+            // SAFETY: stream remains live until closedir below.
+            if unsafe { libc::readdir(stream) }.is_null() {
+                break;
+            }
+            entries += 1;
+        }
+        // SAFETY: stream is the unique DIR pointer returned by fdopendir.
+        assert_eq!(unsafe { libc::closedir(stream) }, 0);
+        assert!(entries >= 3, "directory entries should have been consumed");
+
+        tree.remove_tree().unwrap();
+        assert!(!tree_path.exists());
+    }
+
+    #[test]
+    fn remove_tree_refuses_a_replaced_leaf_and_preserves_the_symlink_target() {
+        let root = private_root();
+        let path = root.path().join("tree");
+        std::fs::create_dir(&path).unwrap();
+        let tree = Directory::open(&path, Some(&path)).unwrap();
+        let displaced = root.path().join("tree-owned");
+        std::fs::rename(&path, &displaced).unwrap();
+        let victim = root.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("sentinel"), b"keep").unwrap();
+        symlink(&victim, &path).unwrap();
+
+        assert!(tree.remove_tree().is_err());
+        assert!(path.is_symlink());
+        assert_eq!(std::fs::read(victim.join("sentinel")).unwrap(), b"keep");
     }
 
     #[test]

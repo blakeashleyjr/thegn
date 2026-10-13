@@ -213,13 +213,6 @@
       ]
     },
     {
-      "issue": "THE-130",
-      "project": "Workspace Product & Observability",
-      "changes": [
-        "add-osc-attention-signaling"
-      ]
-    },
-    {
       "issue": "THE-132",
       "project": "Workspace Product & Observability",
       "changes": [

@@ -380,6 +380,8 @@ pub(crate) struct DaemonSource {
     pub worktree: Option<String>,
     /// Shared with the [`LazyDaemonSource`] that built this (see [`HistoryOnce`]).
     pub attached_once: HistoryOnce,
+    /// Shared with the pane's lazy source so gap streaks survive relay reconnects.
+    pub gap_tracker: GapTracker,
 }
 
 /// Whether THIS PANE has already been fed a session's screen.
@@ -400,6 +402,69 @@ pub(crate) struct DaemonSource {
 /// built per pane in `Panes::spawn_daemon_backed` and hands a clone to each
 /// short-lived [`DaemonSource`] it makes.
 pub(crate) type HistoryOnce = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+const GAP_BACKOFF_BASE: Duration = Duration::from_millis(500);
+const GAP_BACKOFF_CAP: Duration = Duration::from_secs(30);
+const GAP_STABLE_RESET: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GapStreak {
+    started: tokio::time::Instant,
+    resumed_at: tokio::time::Instant,
+    gaps: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GapDecision {
+    Backoff(Duration),
+    Unstable { gaps: u32, elapsed: Duration },
+}
+
+pub(crate) type GapStreakCell = std::sync::Arc<std::sync::Mutex<Option<GapStreak>>>;
+
+#[derive(Clone)]
+pub(crate) struct GapTracker {
+    window: Duration,
+    streak: GapStreakCell,
+}
+
+impl GapTracker {
+    fn new(window: Duration, streak: GapStreakCell) -> Self {
+        Self { window, streak }
+    }
+}
+
+fn on_sequence_gap(
+    streak: &mut Option<GapStreak>,
+    window: Duration,
+    now: tokio::time::Instant,
+) -> GapDecision {
+    let reset = streak.is_none_or(|current| {
+        now.saturating_duration_since(current.resumed_at) >= GAP_STABLE_RESET
+    });
+    if reset {
+        *streak = Some(GapStreak {
+            started: now,
+            resumed_at: now,
+            gaps: 0,
+        });
+    }
+    let current = streak.as_mut().expect("gap streak initialized");
+    current.gaps = current.gaps.saturating_add(1);
+    let elapsed = now.saturating_duration_since(current.started);
+    if !window.is_zero() && elapsed >= window {
+        return GapDecision::Unstable {
+            gaps: current.gaps,
+            elapsed,
+        };
+    }
+    let multiplier = 1u32 << current.gaps.saturating_sub(1).min(20);
+    let backoff = GAP_BACKOFF_BASE
+        .saturating_mul(multiplier)
+        .min(GAP_BACKOFF_CAP);
+    current.resumed_at = now + backoff;
+    GapDecision::Backoff(backoff)
+}
 
 /// Claim the history tail for this pane: true exactly once per cell.
 fn claim_history(once: &HistoryOnce) -> bool {
@@ -474,7 +539,7 @@ impl DaemonSource {
             .client
             .attach_opts(session, &client_id, rows, cols, false, include_history)
             .await?;
-        Ok(adapt(session.to_string(), stream))
+        Ok(adapt(session.to_string(), stream, self.gap_tracker.clone()))
     }
 }
 
@@ -551,7 +616,7 @@ fn exec_exit_code(code: Option<i32>) -> i32 {
 /// `Stdout` bytes (the snapshot is an ANSI repaint — the emulator applies it
 /// like any output), `SessionExit` becomes `Exit`, and stdin/resize/close map
 /// onto the attach control channel.
-fn adapt(session_id: String, stream: AttachStream) -> ExecSession {
+fn adapt(session_id: String, stream: AttachStream, gaps: GapTracker) -> ExecSession {
     let AttachStream {
         mut frames,
         control,
@@ -593,6 +658,50 @@ fn adapt(session_id: String, stream: AttachStream) -> ExecSession {
                     Some(_) => {} // Hello / feed frames: not pane bytes
                     None => {
                         match tokio::time::timeout(Duration::from_secs(1), &mut end_rx).await {
+                            Ok(Ok(StreamEnd::SequenceGap { expected, got })) => {
+                                let now = tokio::time::Instant::now();
+                                let decision = match gaps.streak.lock() {
+                                    Ok(mut streak) => on_sequence_gap(&mut streak, gaps.window, now),
+                                    Err(poisoned) => on_sequence_gap(
+                                        &mut poisoned.into_inner(),
+                                        gaps.window,
+                                        now,
+                                    ),
+                                };
+                                match decision {
+                                    GapDecision::Backoff(backoff) => {
+                                        tracing::debug!(target: "thegn::daemon", session = %session_id, expected, got, ?backoff, "pane attach sequence gap; backing off before reconnect");
+                                        let sleep = tokio::time::sleep(backoff);
+                                        tokio::pin!(sleep);
+                                        loop {
+                                            tokio::select! {
+                                                biased;
+                                                control_message = in_rx.recv() => match control_message {
+                                                    Some(ExecControl::Close) | None => {
+                                                        if let Err(error) = control.send(AttachControl::Close).await {
+                                                            tracing::debug!(target: "thegn::daemon", %error, "attach close could not be forwarded during sequence-gap backoff");
+                                                        }
+                                                        return;
+                                                    }
+                                                    Some(ExecControl::Stdin(_)) | Some(ExecControl::Resize { .. }) => {}
+                                                },
+                                                () = &mut sleep => break,
+                                            }
+                                        }
+                                    }
+                                    GapDecision::Unstable { gaps, elapsed } => {
+                                        tracing::warn!(target: "thegn::daemon", session = %session_id, expected, got, gaps, ?elapsed, "pane attach stream is unstable after repeated sequence gaps");
+                                        let diagnostic = format!("\r\n[pane stream unstable: {gaps} sequence gaps in {}s; session {session_id} is still running in the daemon (thegn session list)]\r\n", elapsed.as_secs());
+                                        if let Err(error) = out_tx.send(ExecFrame::Stdout(diagnostic.into_bytes())).await {
+                                            tracing::debug!(target: "thegn::daemon", %error, "pane stream instability diagnostic could not be delivered");
+                                        }
+                                        if let Err(error) = out_tx.send(ExecFrame::Exit(EXIT_STATUS_UNKNOWN)).await {
+                                            tracing::debug!(target: "thegn::daemon", %error, "pane stream instability exit could not be delivered");
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
                             Ok(Ok(end)) if end.reconnects() => {
                                 tracing::debug!(target: "thegn::daemon", session = %session_id, ?end, "pane attach stream ended");
                             }
@@ -705,6 +814,8 @@ pub(crate) struct LazyDaemonSource {
     /// This pane's history-tail cell — see [`HistoryOnce`]. One source is built
     /// per pane, so `Default` (unclaimed) is right for every new pane.
     pub attached_once: HistoryOnce,
+    /// Per-pane sequence-gap policy, shared with every short-lived source.
+    pub gap_streak: GapStreakCell,
     /// The endpoint pinned by this pane's first open/attach. An
     /// absence check must not discover/start a different daemon with an empty
     /// roster and mistake that for proof that the original shell disappeared.
@@ -733,6 +844,10 @@ impl LazyDaemonSource {
             // per-`DaemonSource` cell would read as "first attach" every time
             // and replay the tail on every reconnect.
             attached_once: std::sync::Arc::clone(&self.attached_once),
+            gap_tracker: GapTracker::new(
+                Duration::from_secs(self.cfg.stream_gap_window_secs),
+                std::sync::Arc::clone(&self.gap_streak),
+            ),
         })
     }
 
@@ -747,6 +862,10 @@ impl LazyDaemonSource {
             client,
             worktree: self.worktree.clone(),
             attached_once: self.attached_once.clone(),
+            gap_tracker: GapTracker::new(
+                Duration::from_secs(self.cfg.stream_gap_window_secs),
+                std::sync::Arc::clone(&self.gap_streak),
+            ),
         })
     }
 }
@@ -786,6 +905,10 @@ mod tests {
     use super::*;
     use thegn_core::control_wire::MAX_WIRE_PAYLOAD;
 
+    fn gap_tracker(window: Duration) -> GapTracker {
+        GapTracker::new(window, Default::default())
+    }
+
     fn attach_stream_with_end() -> (
         tokio_mpsc::Sender<EventFrame>,
         tokio::sync::oneshot::Sender<StreamEnd>,
@@ -803,6 +926,128 @@ mod tests {
                 end,
             },
         )
+    }
+
+    #[test]
+    fn sequence_gap_streak_backs_off_resets_and_obeys_window() {
+        let start = tokio::time::Instant::now();
+        let mut streak = None;
+        let mut expected = Vec::new();
+        for second in 0..9 {
+            let decision = on_sequence_gap(
+                &mut streak,
+                Duration::from_secs(600),
+                start + Duration::from_secs(second),
+            );
+            let GapDecision::Backoff(backoff) = decision else {
+                panic!("gap within the window should back off");
+            };
+            expected.push(backoff);
+        }
+        assert_eq!(
+            expected,
+            [
+                500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000
+            ]
+            .map(Duration::from_millis)
+        );
+
+        let resumed_at = streak.unwrap().resumed_at;
+        assert_eq!(
+            on_sequence_gap(
+                &mut streak,
+                Duration::from_secs(600),
+                resumed_at + Duration::from_secs(61),
+            ),
+            GapDecision::Backoff(Duration::from_millis(500))
+        );
+        assert_eq!(streak.unwrap().gaps, 1);
+
+        let mut window_streak = None;
+        let mut decision = GapDecision::Backoff(Duration::ZERO);
+        for second in 0..=600 {
+            decision = on_sequence_gap(
+                &mut window_streak,
+                Duration::from_secs(600),
+                start + Duration::from_secs(second),
+            );
+        }
+        assert_eq!(
+            decision,
+            GapDecision::Unstable {
+                gaps: 601,
+                elapsed: Duration::from_secs(600),
+            }
+        );
+
+        let mut unlimited_streak = None;
+        for second in 0..=900 {
+            assert!(matches!(
+                on_sequence_gap(
+                    &mut unlimited_streak,
+                    Duration::ZERO,
+                    start + Duration::from_secs(second),
+                ),
+                GapDecision::Backoff(_)
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sustained_sequence_gaps_end_the_pane_as_unstable() {
+        let tracker = gap_tracker(Duration::from_secs(1));
+        let (frame_tx, end_tx, stream) = attach_stream_with_end();
+        let mut session = adapt("session-1".into(), stream, tracker.clone());
+        end_tx
+            .send(StreamEnd::SequenceGap {
+                expected: 4,
+                got: 7,
+            })
+            .unwrap();
+        drop(frame_tx);
+        assert_eq!(session.frames.recv().await, None);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let (frame_tx, end_tx, stream) = attach_stream_with_end();
+        let mut session = adapt("session-1".into(), stream, tracker);
+        end_tx
+            .send(StreamEnd::SequenceGap {
+                expected: 8,
+                got: 12,
+            })
+            .unwrap();
+        drop(frame_tx);
+
+        let Some(ExecFrame::Stdout(bytes)) = session.frames.recv().await else {
+            panic!("unstable stream should emit a diagnostic");
+        };
+        assert!(
+            String::from_utf8(bytes)
+                .unwrap()
+                .contains("pane stream unstable")
+        );
+        assert_eq!(session.frames.recv().await, Some(ExecFrame::Exit(254)));
+        assert_eq!(session.frames.recv().await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_single_sequence_gap_backs_off_before_reconnecting() {
+        let before = tokio::time::Instant::now();
+        let (frame_tx, end_tx, stream) = attach_stream_with_end();
+        let mut session = adapt(
+            "session-1".into(),
+            stream,
+            gap_tracker(Duration::from_secs(600)),
+        );
+        end_tx
+            .send(StreamEnd::SequenceGap {
+                expected: 2,
+                got: 5,
+            })
+            .unwrap();
+        drop(frame_tx);
+        assert_eq!(session.frames.recv().await, None);
+        assert!(tokio::time::Instant::now().duration_since(before) >= GAP_BACKOFF_BASE);
     }
 
     #[tokio::test]
@@ -823,7 +1068,11 @@ mod tests {
 
         for (end, reason) in cases {
             let (frame_tx, end_tx, stream) = attach_stream_with_end();
-            let mut session = adapt("session-1".into(), stream);
+            let mut session = adapt(
+                "session-1".into(),
+                stream,
+                gap_tracker(Duration::from_secs(600)),
+            );
             end_tx.send(end).unwrap();
             drop(frame_tx);
 
@@ -850,7 +1099,11 @@ mod tests {
             StreamEnd::CleanClose,
         ] {
             let (frame_tx, end_tx, stream) = attach_stream_with_end();
-            let mut session = adapt("session-1".into(), stream);
+            let mut session = adapt(
+                "session-1".into(),
+                stream,
+                gap_tracker(Duration::from_secs(600)),
+            );
             end_tx.send(end).unwrap();
             drop(frame_tx);
             assert_eq!(
@@ -873,7 +1126,11 @@ mod tests {
             control,
             end: tokio::sync::oneshot::channel().1,
         };
-        let mut session = adapt("session-1".into(), stream);
+        let mut session = adapt(
+            "session-1".into(),
+            stream,
+            gap_tracker(Duration::from_secs(600)),
+        );
         for seq in 0..count {
             frame_tx
                 .send(EventFrame::PaneDelta {
@@ -1000,7 +1257,11 @@ mod tests {
             control: attach_control_tx,
             end: tokio::sync::oneshot::channel().1,
         };
-        let session = adapt("session-1".into(), stream);
+        let session = adapt(
+            "session-1".into(),
+            stream,
+            gap_tracker(Duration::from_secs(600)),
+        );
         let snapshot = || EventFrame::PaneSnapshot {
             session: "session-1".into(),
             seq: 0,
@@ -1036,7 +1297,11 @@ mod tests {
             control: attach_control_tx,
             end: tokio::sync::oneshot::channel().1,
         };
-        let mut session = adapt("session-1".into(), stream);
+        let mut session = adapt(
+            "session-1".into(),
+            stream,
+            gap_tracker(Duration::from_secs(600)),
+        );
         frame_tx
             .send(EventFrame::PaneSnapshot {
                 session: "session-2".into(),
@@ -1188,6 +1453,7 @@ mod tests {
                 cfg: DaemonConfig::default(),
                 worktree: None,
                 attached_once: Default::default(),
+                gap_streak: Default::default(),
                 last_client: std::sync::Mutex::new(Some(ControlClient::new(
                     ControlAddr::HttpOrigin {
                         origin: format!("http://{address}"),
@@ -1204,6 +1470,7 @@ mod tests {
             cfg: DaemonConfig::default(),
             worktree: None,
             attached_once: Default::default(),
+            gap_streak: Default::default(),
             last_client: Default::default(),
         };
         assert!(source.session_absent("live").await.is_err());

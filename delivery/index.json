@@ -217,15 +217,19 @@
     },
     {
       "change": "add-osc-attention-signaling",
-      "lifecycle": "proposed",
-      "disposition": "strategic-unstarted",
+      "lifecycle": "archived",
+      "disposition": "superseded-retire",
       "owners": [
         {
           "issue": "THE-130",
           "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "Bounded OSC and CLI attention signaling remain unstarted product work."
+      "summary": "Retired add-osc-attention-signaling: THE-68 delivered the OSC parsing and live-state hand; the targeted notify verb was dropped.",
+      "successors": [
+        "openspec/changes/archive/2026-09-09-fix-attention-signal-noise/"
+      ],
+      "archive_path": "openspec/changes/archive/2026-10-12-add-osc-attention-signaling/"
     },
     {
       "change": "add-package-manager-releases",

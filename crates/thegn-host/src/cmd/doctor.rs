@@ -711,6 +711,57 @@ fn providers_report(cfg: &Config) {
     }
 }
 
+/// Find hard-linked secret staging files that can retain replaced contents.
+fn secret_hard_link_notes(state_thegn: &std::path::Path) -> Vec<String> {
+    fn append_directory_notes(dir: &std::path::Path, notes: &mut Vec<String>) {
+        match thegn_core::fsperm::hard_linked_files(dir) {
+            Ok(files) => {
+                for (path, extra) in files {
+                    if let Some(note) = thegn_core::fsperm::hard_link_residue_note(&path, extra) {
+                        notes.push(note);
+                    }
+                }
+            }
+            Err(error) => notes.push(format!("could not inspect {}: {error}", dir.display())),
+        }
+    }
+
+    let mut notes = Vec::new();
+    append_directory_notes(&state_thegn.join("sandbox-env"), &mut notes);
+
+    let vpn_dir = state_thegn.join("vpn");
+    match std::fs::read_dir(&vpn_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) => {
+                        let dir = entry.path();
+                        match std::fs::symlink_metadata(&dir) {
+                            Ok(metadata)
+                                if metadata.file_type().is_dir()
+                                    && !metadata.file_type().is_symlink() =>
+                            {
+                                append_directory_notes(&dir, &mut notes);
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                notes.push(format!("could not inspect {}: {error}", dir.display()))
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        notes.push(format!("could not inspect {}: {error}", vpn_dir.display()))
+                    }
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => notes.push(format!("could not inspect {}: {error}", vpn_dir.display())),
+    }
+    notes.sort();
+    notes
+}
+
 /// The `Secrets` section: one probe row per backend kind (keyring/file/env,
 /// with `exec` reserved), then one presence-only line per configured secret
 /// field — its backend and `resolves`/`missing`, never a value (THE-66).
@@ -728,21 +779,24 @@ fn secrets_report(cfg: &Config) {
     let refs = thegn_core::secret_scan::secret_refs(cfg);
     if refs.is_empty() {
         outln!("  (no secret refs configured)");
-        return;
+    } else {
+        outln!("  configured refs (field → backend: presence, never a value):");
+        for f in &refs {
+            let present = if crate::secret::present(&f.reference) {
+                "resolves"
+            } else {
+                "missing"
+            };
+            outln!(
+                "  {:<44} {:<8} {}",
+                f.path,
+                f.reference.backend_kind(),
+                present
+            );
+        }
     }
-    outln!("  configured refs (field → backend: presence, never a value):");
-    for f in &refs {
-        let present = if crate::secret::present(&f.reference) {
-            "resolves"
-        } else {
-            "missing"
-        };
-        outln!(
-            "  {:<44} {:<8} {}",
-            f.path,
-            f.reference.backend_kind(),
-            present
-        );
+    for note in secret_hard_link_notes(&thegn_core::util::xdg_state_home().join("thegn")) {
+        outln!("  note: {note}");
     }
 }
 
@@ -4598,5 +4652,40 @@ args = ["--verbose"]
         assert_eq!(env_devshell(&cfg, &plain), "default");
         // The human report runs without panicking.
         provider_cache_report(&cfg);
+    }
+
+    fn hard_link_test_supported() -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("probe");
+        let linked = dir.path().join("probe-link");
+        std::fs::write(&source, b"probe").unwrap();
+        std::fs::hard_link(&source, &linked).unwrap();
+        thegn_core::fsperm::extra_hard_links(&std::fs::symlink_metadata(&source).unwrap()) > 0
+    }
+
+    #[test]
+    fn secret_hard_link_notes_find_sandbox_env_but_skip_single_link_vpn_files() {
+        if !hard_link_test_supported() {
+            return;
+        }
+        let state = tempfile::tempdir().unwrap();
+        let sandbox_env = state.path().join("sandbox-env");
+        std::fs::create_dir(&sandbox_env).unwrap();
+        let vpn_container = state.path().join("vpn/c1");
+        std::fs::create_dir_all(&vpn_container).unwrap();
+        let secret = sandbox_env.join("x.env");
+        std::fs::write(&secret, b"canary").unwrap();
+        std::fs::hard_link(&secret, state.path().join("outside")).unwrap();
+        std::fs::write(vpn_container.join("environment"), b"single").unwrap();
+
+        let notes = secret_hard_link_notes(state.path());
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("x.env"));
+        assert!(notes[0].contains("1 other hard link"));
+    }
+
+    #[test]
+    fn secret_hard_link_notes_are_empty_without_state_entries() {
+        assert!(secret_hard_link_notes(tempfile::tempdir().unwrap().path()).is_empty());
     }
 }

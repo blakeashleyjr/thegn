@@ -219,6 +219,56 @@ pub fn ensure_single_link_regular_file(meta: &std::fs::Metadata) -> std::io::Res
     Ok(())
 }
 
+/// Number of additional hard-link names for a regular file. Other file types
+/// and platforms without link counts report zero.
+pub fn extra_hard_links(meta: &std::fs::Metadata) -> u64 {
+    if !meta.is_file() {
+        return 0;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.nlink().saturating_sub(1)
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// Explain that replaced file contents may remain reachable through another
+/// hard-link name. The message contains only the path and link count.
+pub fn hard_link_residue_note(path: &Path, extra: u64) -> Option<String> {
+    (extra > 0).then(|| {
+        format!(
+            "{} has {extra} other hard link(s); the replaced contents stay readable through that link until it is removed",
+            path.display()
+        )
+    })
+}
+
+/// List regular files directly in `dir` that have additional hard-link names.
+/// Entry metadata is read without following symlinks.
+pub fn hard_linked_files(dir: &Path) -> std::io::Result<Vec<(PathBuf, u64)>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut linked = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        let extra = extra_hard_links(&metadata);
+        if extra > 0 {
+            linked.push((path, extra));
+        }
+    }
+    linked.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(linked)
+}
+
 /// Carry an existing config's permissions to its replacement while limiting
 /// the result to owner-only access. This keeps deliberate read-only configs
 /// read-only and drops group/other access on Unix.
@@ -470,6 +520,27 @@ impl PrivateDir {
                 }
                 return Err(error);
             }
+            use nix::fcntl::AtFlags;
+            use nix::sys::stat::{SFlag, fstatat};
+            match fstatat(&self.fd, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+                Ok(stat) => {
+                    let kind = SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT;
+                    if kind == SFlag::S_IFREG && stat.st_nlink > 1 {
+                        #[allow(
+                            clippy::unnecessary_cast,
+                            reason = "st_nlink is u16 on macOS, u64 on Linux"
+                        )]
+                        let extra = (stat.st_nlink as u64).saturating_sub(1);
+                        if let Some(note) = hard_link_residue_note(&self.path.join(name), extra) {
+                            tracing::warn!(target: "thegn::fsperm", path = %self.path.join(name).display(), "{note}");
+                        }
+                    }
+                }
+                Err(nix::errno::Errno::ENOENT) => {}
+                Err(error) => {
+                    tracing::debug!(%error, "unable to inspect replaced private file for hard links")
+                }
+            }
             if let Err(error) = renameat(&self.fd, temporary.as_str(), &self.fd, name) {
                 if let Err(cleanup_error) =
                     unlinkat(&self.fd, temporary.as_str(), UnlinkatFlags::NoRemoveDir)
@@ -657,6 +728,19 @@ pub fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()>
     ));
     write_owner_only_new(&temporary, bytes)?;
 
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let extra = extra_hard_links(&metadata);
+            if let Some(note) = hard_link_residue_note(path, extra) {
+                tracing::warn!(target: "thegn::fsperm", path = %path.display(), "{note}");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::debug!(%error, path = %path.display(), "unable to inspect replaced file for hard links")
+        }
+    }
+
     #[cfg(windows)]
     let publish = replace_file(&temporary, path);
     #[cfg(not(windows))]
@@ -791,6 +875,76 @@ Set-Acl -LiteralPath $path -AclObject $acl"#
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn extra_hard_links_counts_only_links_beyond_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(
+            extra_hard_links(&std::fs::symlink_metadata(&file).unwrap()),
+            0
+        );
+        assert_eq!(
+            extra_hard_links(&std::fs::symlink_metadata(dir.path()).unwrap()),
+            0
+        );
+        std::fs::hard_link(&file, dir.path().join("linked")).unwrap();
+        assert_eq!(
+            extra_hard_links(&std::fs::symlink_metadata(&file).unwrap()),
+            1
+        );
+    }
+
+    #[test]
+    fn hard_link_residue_note_only_describes_additional_links() {
+        assert_eq!(hard_link_residue_note(Path::new("secret.env"), 0), None);
+        let note = hard_link_residue_note(Path::new("secret.env"), 2).unwrap();
+        assert!(note.contains("2 other hard link"));
+        assert!(note.contains("secret.env"));
+    }
+
+    #[test]
+    fn hard_linked_files_lists_only_regular_files_with_external_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::write(&a, b"single").unwrap();
+        std::fs::write(&b, b"linked").unwrap();
+        std::fs::hard_link(&b, outside.path().join("outside")).unwrap();
+        std::os::unix::fs::symlink(&b, dir.path().join("d")).unwrap();
+        assert_eq!(hard_linked_files(dir.path()).unwrap(), vec![(b, 1)]);
+        assert!(
+            hard_linked_files(&dir.path().join("missing"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn private_atomic_replace_preserves_old_contents_through_other_hard_link() {
+        let anchor = tempfile::tempdir().unwrap();
+        let private = ensure_private_dir_beneath(anchor.path(), Path::new("p")).unwrap();
+        let old_link = anchor.path().join("outside");
+        private.write_owner_only_atomic("env", b"old").unwrap();
+        std::fs::hard_link(private.path.join("env"), &old_link).unwrap();
+        private.write_owner_only_atomic("env", b"new").unwrap();
+        assert_eq!(std::fs::read(private.path.join("env")).unwrap(), b"new");
+        assert_eq!(std::fs::read(old_link).unwrap(), b"old");
+    }
+
+    #[test]
+    fn path_atomic_replace_preserves_old_contents_through_other_hard_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env");
+        let old_link = dir.path().join("outside");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::hard_link(&path, &old_link).unwrap();
+        write_owner_only_atomic(&path, b"new").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"new");
+        assert_eq!(std::fs::read(old_link).unwrap(), b"old");
+    }
 
     #[test]
     fn private_dir_beneath_creates_owner_only_components() {

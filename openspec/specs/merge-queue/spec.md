@@ -75,8 +75,9 @@ clobbering uncommitted work.
 
 The merge gate SHALL stream stdout and stderr into independent fixed-capacity
 byte tails. `[merge_queue] gate_setup_timeout_secs` and `gate_timeout_secs`
-SHALL bound their respective commands; zero SHALL explicitly disable that
-deadline, and both defaults SHALL be zero. Setup failure, timeout, capture or
+SHALL bound their respective commands; `gate_setup_timeout_secs` SHALL default
+to zero and `gate_timeout_secs` to 3600 seconds; zero SHALL explicitly disable
+that deadline. Setup failure, timeout, capture or
 reader failure, and child reap failure SHALL be infrastructure holds, never a
 red verdict or a pass. The configured shell command and argv semantics SHALL
 remain unchanged. Cancellation SHALL retain child/group ownership through
