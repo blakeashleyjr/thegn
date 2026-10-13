@@ -3996,14 +3996,14 @@ fn handle_git_msg(
                     );
                 }
             }
-            GitView::Branches | GitView::Stash => {
-                if panel_ui.width == crate::layout::PanelWidth::Normal {
-                    panel_ui.width = crate::layout::PanelWidth::Half;
-                    panel_ui.git.widened_from = None;
-                    panel_ui.remember_width();
-                    panel_ui.scroll = 0;
-                    model.status = "widened for log/diff".into();
-                }
+            GitView::Branches | GitView::Stash
+                if panel_ui.width == crate::layout::PanelWidth::Normal =>
+            {
+                panel_ui.width = crate::layout::PanelWidth::Half;
+                panel_ui.git.widened_from = None;
+                panel_ui.remember_width();
+                panel_ui.scroll = 0;
+                model.status = "widened for log/diff".into();
             }
             _ => {}
         },

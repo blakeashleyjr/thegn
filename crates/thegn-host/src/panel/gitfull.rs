@@ -347,7 +347,10 @@ fn commit_graph_items(data: &PanelData, ui: &PanelUi, side_w: usize) -> Vec<(Vec
         .unwrap_or(1)
         .max(1);
     let indent = (1 + 1 + gutter + 1 + 7 + 1).min(side_w);
-    graph::rows(&data.commits, &layout, &marks, selected, side_w)
+    // `graph::rows` normally cuts its left column to the terminal width. The
+    // side list wraps items itself, so retain the full subject here and let
+    // `item_block` apply the actual side-column width.
+    graph::rows(&data.commits, &layout, &marks, selected, usize::MAX)
         .into_iter()
         .map(|line| {
             let segs = match line {
