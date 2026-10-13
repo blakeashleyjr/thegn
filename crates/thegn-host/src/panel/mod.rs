@@ -756,6 +756,8 @@ pub struct PanelData {
     pub file_tree: Vec<FileEntry>,
     /// Local branches with upstream/divergence + PR badges (branches section).
     pub branches: Vec<BranchRow>,
+    /// Load state for the demand-fetched local branch list.
+    pub branches_load: crate::panel::gitui::DocLoad,
     /// Structured recent commits (commits section + graph feed). Loaded from
     /// cache synchronously; refreshed by a background `git log` worker.
     pub commits: Vec<CommitRow>,
@@ -764,6 +766,8 @@ pub struct PanelData {
     pub commits_loading: bool,
     /// Stash entries (stash section).
     pub stashes: Vec<StashRow>,
+    /// Load state for the demand-fetched stash list.
+    pub stashes_load: crate::panel::gitui::DocLoad,
     /// Entity-level view of pending changes (semantic git layer, items 311/313/
     /// 317): per-file entity churn + impact. Built off-thread from `git diff
     /// HEAD`; feeds the changes-section impact line and the commit-message
@@ -777,6 +781,8 @@ pub struct PanelData {
     /// Whether any `[issues]` provider is configured for this repo. Distinguishes
     /// "off" (no provider) from "clear" (configured but currently empty).
     pub issues_configured: bool,
+    /// Whether the configured tracker cache has loaded, or why it failed.
+    pub tracker_load: crate::panel::gitui::DocLoad,
     /// Unified cross-repo "My Work" feed (the `Mine` section), loaded from the
     /// `my_work_cache` DB row. Spans every repo, not just the active worktree.
     pub my_work: Vec<thegn_core::work::WorkRow>,

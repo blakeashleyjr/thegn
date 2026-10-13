@@ -854,7 +854,14 @@ fn stash_region(data: &PanelData, ui: &PanelUi, avail: usize) -> Vec<PanelRow> {
         .get(GitView::Stash)
         .min(ix.len().saturating_sub(1));
     let Some(s) = ix.get(cur).map(|&s| &data.stashes[s]) else {
-        return vec![PanelRow::plain(Line::segs(vec![seg(g2(), "no stashes")]))];
+        let message = match &data.stashes_load {
+            crate::panel::gitui::DocLoad::Pending => "loading stashes…".to_string(),
+            crate::panel::gitui::DocLoad::Ready => "no stashes".to_string(),
+            crate::panel::gitui::DocLoad::Failed(error) => {
+                format!("stashes unavailable: {error}")
+            }
+        };
+        return vec![PanelRow::plain(Line::segs(vec![seg(g2(), message)]))];
     };
     let mut out = vec![
         PanelRow::plain(Line::segs(vec![

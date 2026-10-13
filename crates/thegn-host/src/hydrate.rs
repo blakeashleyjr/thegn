@@ -2217,6 +2217,25 @@ fn clear_branch_failure(root: &Path) {
 
 /// Apply a repo-wide branch refresh, preserving last-known-good shared cache
 /// contents on failure and throttling repeated failed subprocesses per repo.
+pub(crate) fn branch_list_load(
+    need_fetch: bool,
+    fetched: Option<&Result<Vec<thegn_core::gitrefs::BranchInfo>, String>>,
+    has_cache: bool,
+    in_backoff: bool,
+) -> crate::panel::gitui::DocLoad {
+    use crate::panel::gitui::DocLoad;
+
+    if has_cache || matches!(fetched, Some(Ok(_))) {
+        DocLoad::Ready
+    } else if let Some(Err(error)) = fetched {
+        DocLoad::Failed(error.clone())
+    } else if !need_fetch && in_backoff {
+        DocLoad::Failed("branch list unavailable; retrying".to_string())
+    } else {
+        DocLoad::Pending
+    }
+}
+
 fn apply_branch_refresh(
     root: Option<&Path>,
     need_fetch: bool,
@@ -2997,9 +3016,14 @@ pub(crate) fn build_panel(
         let h_stashes = want_stashes.then(|| {
             s.spawn(|| {
                 let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
-                crate::git_handle::get()
-                    .stash_list(&loc)
-                    .unwrap_or_default()
+                crate::git_handle::get().stash_list(&loc).map_err(|error| {
+                    error
+                        .to_string()
+                        .lines()
+                        .next()
+                        .unwrap_or("stash list failed")
+                        .to_string()
+                })
             })
         });
         // off-loop: build_panel only runs on hydration workers
@@ -3036,7 +3060,9 @@ pub(crate) fn build_panel(
             h_stash_count.join().unwrap(),
             h_log.map(|h| h.join().unwrap()).unwrap_or_default(),
             h_branches.map(|h| h.join().unwrap()),
-            h_stashes.map(|h| h.join().unwrap()).unwrap_or_default(),
+            h_stashes
+                .map(|h| h.join().unwrap())
+                .unwrap_or(Ok(Vec::new())),
             h_ls.and_then(|h| h.join().unwrap()),
             incoming_set,
         )
@@ -3066,6 +3092,12 @@ pub(crate) fn build_panel(
 
     // Resolve the branch list: a fresh fetch refreshes the shared repo cache;
     // otherwise reuse the warm entry populated by this (or a sibling) worktree.
+    let branches_load = branch_list_load(
+        need_branch_fetch,
+        fetched_branches.as_ref(),
+        cached_branches.is_some(),
+        failure_age.is_some(),
+    );
     let branches_raw = apply_branch_refresh(
         repo_root.as_deref(),
         need_branch_fetch,
@@ -3323,6 +3355,7 @@ pub(crate) fn build_panel(
         panel.open_prs_fetched_at = Some(fetched_at);
     }
     if want_branches {
+        panel.branches_load = branches_load;
         let badges = panel.open_prs.clone();
         let head_branch = panel.branch.clone();
         // Sibling holders feed only the OPEN branch list (merge/delete gating),
@@ -3409,15 +3442,24 @@ pub(crate) fn build_panel(
                 .collect();
     }
     if want_stashes {
-        panel.stashes = stashes_raw
-            .into_iter()
-            .map(|s| crate::panel::StashRow {
-                index: s.index,
-                sha: s.sha,
-                date: s.date,
-                message: s.message,
-            })
-            .collect();
+        match stashes_raw {
+            Ok(stashes) => {
+                panel.stashes = stashes
+                    .into_iter()
+                    .map(|s| crate::panel::StashRow {
+                        index: s.index,
+                        sha: s.sha,
+                        date: s.date,
+                        message: s.message,
+                    })
+                    .collect();
+                panel.stashes_load = crate::panel::gitui::DocLoad::Ready;
+            }
+            Err(error) => {
+                panel.stashes.clear();
+                panel.stashes_load = crate::panel::gitui::DocLoad::Failed(error);
+            }
+        }
     }
 
     // Tests section snapshot from the cache (summary + failures + history).

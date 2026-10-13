@@ -802,7 +802,11 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             if !model.panel.issues_configured {
                 vec![seg(g2(), "off")]
             } else if n == 0 {
-                vec![seg(g2(), "clear")]
+                match &model.panel.tracker_load {
+                    crate::panel::gitui::DocLoad::Pending => vec![seg(g2(), "…")],
+                    crate::panel::gitui::DocLoad::Ready => vec![seg(g2(), "clear")],
+                    crate::panel::gitui::DocLoad::Failed(_) => vec![seg(g2(), "failed")],
+                }
             } else if linked > 0 {
                 vec![
                     seg(hue(Hue::Amber), format!("◈{linked} ")),
