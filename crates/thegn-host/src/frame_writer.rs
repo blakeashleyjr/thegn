@@ -117,7 +117,7 @@ const FRAME_QUEUE_DEPTH: usize = 2;
 // are harmless when the terminal parser is already in ground state.
 const PARSER_RESET: &[u8] = b"\x18\x1b\\";
 const OOB_QUEUE_COUNT: usize = 128;
-const OOB_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const OOB_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 const WRITER_SHUTDOWN_BOUND: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_millis(30)
 } else {
@@ -1490,6 +1490,31 @@ mod tests {
 
         assert!(writer.try_submit_oob(vec![5]).is_ok());
         assert!(!writer.inner.oob_pressure_logged.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn refused_clipboard_copy_retries_after_oob_capacity_wake() {
+        let writer = test_writer();
+        for _ in 0..OOB_QUEUE_COUNT {
+            assert!(writer.try_submit_oob(vec![1]).is_ok());
+        }
+
+        let mut clipboard = crate::preview_retry::PendingClipboardOob::default();
+        let osc52 = crate::copymode::osc52("hi");
+        clipboard.offer(osc52.clone(), |bytes| writer.try_submit_oob(bytes));
+        assert!(clipboard.is_pending());
+        assert!(writer.inner.oob_retry.load(Ordering::SeqCst));
+
+        let active = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        let (errored, released, _) = write_message(&writer.inner, active, |_| Ok(()));
+        assert!(!errored);
+        assert!(released);
+        assert!(oob_capacity_wake_requested(&writer.inner, released));
+
+        clipboard.retry(|bytes| writer.try_submit_oob(bytes));
+        let q = writer.inner.q.lock().unwrap();
+        assert!(matches!(q.msgs.back(), Some(Msg::Oob(bytes)) if bytes == &osc52));
+        assert!(!clipboard.is_pending());
     }
 
     #[test]

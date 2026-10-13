@@ -6552,6 +6552,8 @@ async fn event_loop<T: Terminal>(
     let mut preview_gfx = crate::preview_gfx::PreviewGfx::new();
     let mut pending_preview_oob = crate::preview_retry::PendingPreviewOob::default();
     let mut pending_corner_oob = crate::preview_retry::PendingCornerOob::default();
+    let mut pending_clipboard_oob = crate::preview_retry::PendingClipboardOob::default();
+    let mut pending_ready_marker = crate::preview_retry::PendingReadyMarker::default();
     // The git mutation runner + the line-cursor document fetches (staging
     // diff, drilled-commit files, patch doc). Results are tagged with
     // `panel_ui.git.op_gen` so a worktree switch kills strays on arrival.
@@ -8292,7 +8294,9 @@ async fn event_loop<T: Terminal>(
                 }
                 SidebarOutcome::CopyText(text) => {
                     // OSC-52 to the outer terminal's clipboard (item 27).
-                    writer.submit_oob(crate::copymode::osc52(&text));
+                    pending_clipboard_oob.offer(crate::copymode::osc52(&text), |bytes| {
+                        writer.try_submit_oob(bytes)
+                    });
                     model.status = format!("Copied: {text}");
                     dirty = true;
                     continue;
@@ -8658,6 +8662,16 @@ async fn event_loop<T: Terminal>(
             && mouse_sel.is_none()
             && replay.is_none();
         pending_corner_oob.retry(corner_visible, |bytes| writer.try_submit_oob(bytes));
+        pending_clipboard_oob.retry(|bytes| writer.try_submit_oob(bytes));
+        if muse_ready
+            && pending_ready_marker.is_pending()
+            && !pending_preview_oob.is_pending()
+            && !pending_corner_oob.is_pending()
+            && !pending_clipboard_oob.is_pending()
+        {
+            let input_pending = crate::frame_write::pty_input_pending(buf, &mut pending_input);
+            pending_ready_marker.retry(input_pending, |bytes| writer.try_submit_oob(bytes));
+        }
         // Keep the drawer geometry that `compute_chrome` reserves in sync with
         // the live drawer state. When the reservation changes (any open/close
         // path — toggle, direct yazi, Esc, or a worktree switch restoring a
@@ -14585,7 +14599,21 @@ async fn event_loop<T: Terminal>(
             statusbar_dirty = false;
             sidebar_dirty = false;
             if muse_ready {
-                crate::frame_write::emit_muse_ready_marker(buf, &mut pending_input, &writer);
+                crate::frame_write::emit_muse_ready_marker(
+                    buf,
+                    &mut pending_input,
+                    &mut pending_ready_marker,
+                    |bytes| {
+                        if pending_preview_oob.is_pending()
+                            || pending_corner_oob.is_pending()
+                            || pending_clipboard_oob.is_pending()
+                        {
+                            Err(bytes)
+                        } else {
+                            writer.try_submit_oob(bytes)
+                        }
+                    },
+                );
             }
             tracing::debug!(
                 target: "thegn::frame",
@@ -15957,7 +15985,10 @@ async fn event_loop<T: Terminal>(
                                     // SSH); the native tool hits the local
                                     // clipboard directly for terminals that
                                     // ignore OSC52. Belt and braces.
-                                    writer.submit_oob(crate::copymode::osc52(&text));
+                                    pending_clipboard_oob
+                                        .offer(crate::copymode::osc52(&text), |bytes| {
+                                            writer.try_submit_oob(bytes)
+                                        });
                                     let copy_result = crate::clipboard::copy(&text);
                                     // Also land in the default register (persisted),
                                     // so `PasteRegister "` recalls it across restarts.
@@ -19744,7 +19775,10 @@ async fn event_loop<T: Terminal>(
                                                 .get(panel_ui.cursor)
                                                 .and_then(crate::share::ShareView::copy_value)
                                             {
-                                                writer.submit_oob(crate::copymode::osc52(&url));
+                                                pending_clipboard_oob
+                                                    .offer(crate::copymode::osc52(&url), |bytes| {
+                                                        writer.try_submit_oob(bytes)
+                                                    });
                                                 model.status = match crate::clipboard::copy(&url) {
                                                     Ok(()) => "Copying link to clipboard…".into(),
                                                     Err(error) => {
@@ -19759,7 +19793,10 @@ async fn event_loop<T: Terminal>(
                                                 forward_url_at(&model, panel_ui.cursor)
                                                     .map(str::to_owned)
                                             {
-                                                writer.submit_oob(crate::copymode::osc52(&url));
+                                                pending_clipboard_oob
+                                                    .offer(crate::copymode::osc52(&url), |bytes| {
+                                                        writer.try_submit_oob(bytes)
+                                                    });
                                                 model.status = match crate::clipboard::copy(&url) {
                                                     Ok(()) => "Copying link to clipboard…".into(),
                                                     Err(error) => {
@@ -19996,7 +20033,10 @@ async fn event_loop<T: Terminal>(
                                 .and_then(crate::panel::docs::copy_target_sha)
                             {
                                 Some(sha) => {
-                                    writer.submit_oob(crate::copymode::osc52(&sha));
+                                    pending_clipboard_oob
+                                        .offer(crate::copymode::osc52(&sha), |bytes| {
+                                            writer.try_submit_oob(bytes)
+                                        });
                                     model.status = format!("Copied {sha}");
                                 }
                                 None => model.status = "No commit data yet".into(),
@@ -20920,7 +20960,10 @@ async fn event_loop<T: Terminal>(
                             .map(|l| l.original.clone());
                             match line {
                                 Some(text) => {
-                                    writer.submit_oob(crate::copymode::osc52(&text));
+                                    pending_clipboard_oob
+                                        .offer(crate::copymode::osc52(&text), |bytes| {
+                                            writer.try_submit_oob(bytes)
+                                        });
                                     model.status = "Log line copied".into();
                                 }
                                 None => model.status = "No log line selected".into(),
@@ -20938,7 +20981,10 @@ async fn event_loop<T: Terminal>(
                                 model.status = "No matching log lines to copy".into();
                             } else {
                                 let text = lines.join("\n");
-                                writer.submit_oob(crate::copymode::osc52(&text));
+                                pending_clipboard_oob
+                                    .offer(crate::copymode::osc52(&text), |bytes| {
+                                        writer.try_submit_oob(bytes)
+                                    });
                                 model.status = format!("Copied {} log lines", lines.len());
                             }
                             true
@@ -23894,7 +23940,10 @@ async fn event_loop<T: Terminal>(
                                         .unwrap_or_else(|| crate::copymode::whole(emu));
                                     let text = crate::copymode::extract(emu, &sel);
                                     if !text.trim().is_empty() {
-                                        writer.submit_oob(crate::copymode::osc52(&text));
+                                        pending_clipboard_oob
+                                            .offer(crate::copymode::osc52(&text), |bytes| {
+                                                writer.try_submit_oob(bytes)
+                                            });
                                         let copy_result = crate::clipboard::copy(&text);
                                         store_yank(
                                             &mut registers,
