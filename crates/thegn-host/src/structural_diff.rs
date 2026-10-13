@@ -366,7 +366,8 @@ mod tests {
             return;
         }
         let result = capture_with("head -c 20000000 /dev/zero #", Duration::from_secs(10));
-        assert!(result.unwrap_err().to_string().contains("exceeded 8 MiB"));
+        let err = result.unwrap_err();
+        assert!(format!("{err:#}").contains("exceeded 8 MiB"), "{err:#}");
     }
 
     #[test]
@@ -380,9 +381,6 @@ mod tests {
 
     #[test]
     fn dft_environment_clamps_width_and_sets_background() {
-        if !shell_available() {
-            return;
-        }
         let opts = CaptureOpts {
             width: 5,
             light_bg: true,
