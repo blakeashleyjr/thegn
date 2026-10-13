@@ -5538,7 +5538,7 @@ fn open_test_target(
 enum TestRun {
     /// `r`: the selected test (whole suite when none is selected).
     Selected,
-    /// `f`: the first failing test (falls back to the selection).
+    /// `f`: every failing test (falls back to the selection when none fail).
     Failed,
     /// `R`: everything.
     All,
@@ -5557,6 +5557,8 @@ enum TestNarrow {
     None,
     /// `(filter_id, display_label)`
     Id(String, String),
+    /// `(filter_ids, display_label)`
+    Ids(Vec<String>, String),
     /// `(file_path, display_label)`
     Path(String, String),
 }
@@ -5570,7 +5572,7 @@ fn test_task_for_run(
     kind: TestRun,
     base: crate::panel::TestTask,
 ) -> crate::panel::TestTask {
-    use crate::panel::{TestNodeKind, TestState};
+    use crate::panel::TestNodeKind;
     let id_of = |n: Option<&crate::panel::TestNode>| match n {
         Some(n) => TestNarrow::Id(n.id.clone(), n.label.clone()),
         None => TestNarrow::None,
@@ -5578,10 +5580,6 @@ fn test_task_for_run(
     let selected = tests
         .selected_node()
         .filter(|n| n.kind == TestNodeKind::Test);
-    let failed = tests
-        .nodes
-        .iter()
-        .find(|n| n.kind == TestNodeKind::Test && n.state == TestState::Fail);
     // Path-native runners take a file path directly; everything else filters by
     // a test/group id substring, so File on those falls back to the module.
     let path_native = matches!(
@@ -5591,7 +5589,19 @@ fn test_task_for_run(
     let narrow = match kind {
         TestRun::All => TestNarrow::None,
         TestRun::Selected => id_of(selected),
-        TestRun::Failed => id_of(failed.or(selected)),
+        TestRun::Failed => {
+            let ids = tests.failing_ids();
+            match ids.len() {
+                0 => id_of(selected),
+                1 => id_of(tests.nodes.iter().find(|node| node.id == ids[0])),
+                count if count > 64 => {
+                    let mut task = base;
+                    task.name = format!("{} ({} failed: whole suite)", task.name, count);
+                    return task;
+                }
+                count => TestNarrow::Ids(ids, format!("{count} failed")),
+            }
+        }
         TestRun::Package => id_of(tests.selected_group()),
         TestRun::File => match tests.selected_path() {
             Some(p) if path_native => {
@@ -5621,6 +5631,44 @@ fn test_task_for_run(
                 // cargo-test, nextest, pytest, swift, vitest, jest, javascript:
                 // a trailing id token is a name/substring filter.
                 _ => task.command = format!("{} {}", task.command, test_shell_quote(&id)),
+            }
+            label
+        }
+        TestNarrow::Ids(ids, label) => {
+            match task.matcher.as_str() {
+                "go-test" => {
+                    let pattern = ids.join("|");
+                    task.command = format!("{} -run {}", task.command, test_shell_quote(&pattern));
+                }
+                "nix-flake" => {
+                    let attrs = ids
+                        .iter()
+                        .map(|id| test_shell_quote(&format!(".#checks.{}", id.replace("::", "."))))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    task.command = format!("nix build -L {attrs}");
+                }
+                "cargo-test" => {
+                    let separator = if task.command.contains(" -- ") {
+                        " "
+                    } else {
+                        " -- "
+                    };
+                    let filters = ids
+                        .iter()
+                        .map(|id| test_shell_quote(id))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    task.command = format!("{}{separator}{filters}", task.command);
+                }
+                _ => {
+                    let filters = ids
+                        .iter()
+                        .map(|id| test_shell_quote(id))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    task.command = format!("{} {filters}", task.command);
+                }
             }
             label
         }
@@ -10018,6 +10066,8 @@ async fn event_loop<T: Terminal>(
                 test_cache_load.is_pending(&active_tests_wt),
             ) {
                 run_test_cache::OutcomeDisposition::Apply => {
+                    panel_ui.tests.last_output =
+                        Some((outcome.worktree.clone(), outcome.stdout_stderr.clone()));
                     panel_ui.tests.running = false;
                     panel_ui.tests.summary.running = false;
                     panel_ui.tests.task = Some(outcome.task.clone());
@@ -18308,6 +18358,32 @@ async fn event_loop<T: Terminal>(
                         continue;
                     }
                 }
+                // Tests filter editing lives in TestPanelState so it survives
+                // the panel's normal UI refreshes.
+                if focus.panel()
+                    && panel_ui.open == crate::panel::Section::Tests
+                    && panel_ui.tests.filter_editing
+                {
+                    let edit = match k.key {
+                        KeyCode::Enter => Some(crate::panel::FilterEdit::Commit),
+                        key if crate::input::is_escape_key(&key) => {
+                            Some(crate::panel::FilterEdit::Clear)
+                        }
+                        KeyCode::Backspace => Some(crate::panel::FilterEdit::Pop),
+                        KeyCode::Char(c)
+                            if !k.modifiers.contains(Modifiers::CTRL)
+                                && !k.modifiers.contains(Modifiers::ALT) =>
+                        {
+                            Some(crate::panel::FilterEdit::Push(c))
+                        }
+                        _ => None,
+                    };
+                    if let Some(edit) = edit {
+                        panel_ui.tests.edit_filter(edit);
+                        dirty = true;
+                        continue;
+                    }
+                }
                 // Modal: when the replay overlay is open it captures all keys.
                 // It scrubs the focused pane's recording; keys never reach the
                 // live pane while open.
@@ -20650,6 +20726,52 @@ async fn event_loop<T: Terminal>(
                                 model.status = crate::task::dap_launch_descriptor(task, &node.id);
                             } else {
                                 model.status = "Select a test to prepare a debug launch".into();
+                            }
+                            true
+                        }
+                        (Section::Tests, KeyCode::Char('/')) => {
+                            if panel_ui.tests.filter.is_empty() {
+                                panel_ui.tests.cursor = 0;
+                            }
+                            panel_ui.tests.filter_editing = true;
+                            true
+                        }
+                        (Section::Tests, KeyCode::Char('O')) => {
+                            let active_wt = active_tab_path(&session);
+                            match (
+                                panel_ui.tests.last_output.as_ref(),
+                                panel_ui.tests.task.as_ref(),
+                            ) {
+                                (Some((worktree, output)), Some(task))
+                                    if worktree.as_str()
+                                        == active_wt.to_string_lossy().as_ref()
+                                        && !output.is_empty() =>
+                                {
+                                    let path = crate::handlers::task_output::task_output_dir()
+                                        .join(format!(
+                                            "{}.txt",
+                                            crate::handlers::task_output::safe_task_filename(
+                                                &format!("tests-{}", task.name)
+                                            )
+                                        ));
+                                    let write_path = path.clone();
+                                    let output = output.clone();
+                                    let tx = job_output_tx.clone();
+                                    let wake = waker.clone();
+                                    model.status = format!("Opening test output of {}…", task.name);
+                                    tokio::task::spawn_blocking(move || {
+                                        let result = std::fs::write(&write_path, output)
+                                            .map(|()| write_path)
+                                            .map_err(|error| error.to_string());
+                                        if let Err(error) = tx.send(result) {
+                                            tracing::debug!(target: "thegn::tasks", %error, "job output receiver is gone");
+                                        }
+                                        if let Err(error) = wake.wake() {
+                                            tracing::debug!(target: "thegn::tasks", %error, "job output wake failed");
+                                        }
+                                    });
+                                }
+                                _ => model.status = "No test output captured yet".into(),
                             }
                             true
                         }

@@ -4308,3 +4308,117 @@ fn section_scroll_falls_through_at_both_scroll_boundaries() {
     assert!(can_move(ext, true, 1));
     assert!(can_move(ext, false, ext.max - 1));
 }
+
+#[test]
+fn test_run_failed_covers_every_failure() {
+    use crate::panel::{TestNodeKind, TestState};
+
+    let mut state = tests_state(None, 3);
+    state.nodes = vec![
+        t_node("mod::a", "a", 0, TestNodeKind::Test, TestState::Fail, None),
+        t_node("mod::b", "b", 0, TestNodeKind::Test, TestState::Fail, None),
+        t_node("mod::c", "c", 0, TestNodeKind::Test, TestState::Fail, None),
+        t_node(
+            "mod::pass",
+            "pass",
+            0,
+            TestNodeKind::Test,
+            TestState::Pass,
+            None,
+        ),
+    ];
+
+    let nextest = test_task_for_run(
+        &state,
+        TestRun::Failed,
+        crate::panel::TestTask::new("nextest", "cargo nextest run", "nextest"),
+    );
+    for id in ["mod::a", "mod::b", "mod::c"] {
+        assert!(
+            nextest.command.contains(&format!("'{id}'")),
+            "{}",
+            nextest.command
+        );
+    }
+    assert!(nextest.name.contains("3 failed"));
+
+    let go = test_task_for_run(
+        &state,
+        TestRun::Failed,
+        crate::panel::TestTask::new("go", "go test ./...", "go-test"),
+    );
+    assert!(
+        go.command.ends_with("-run 'mod::a|mod::b|mod::c'"),
+        "{}",
+        go.command
+    );
+    assert_eq!(go.command.matches("-run").count(), 1);
+
+    let cargo = test_task_for_run(
+        &state,
+        TestRun::Failed,
+        crate::panel::TestTask::new("cargo", "cargo test", "cargo-test"),
+    );
+    assert!(cargo.command.contains(" -- "), "{}", cargo.command);
+    for id in ["mod::a", "mod::b", "mod::c"] {
+        assert!(
+            cargo.command.contains(&format!("'{id}'")),
+            "{}",
+            cargo.command
+        );
+    }
+}
+
+#[test]
+fn test_run_failed_single_and_none_unchanged() {
+    use crate::panel::{TestNodeKind, TestState};
+
+    let mut one_failure = tests_state(None, 0);
+    one_failure.nodes = vec![
+        t_node(
+            "mod::bad",
+            "bad",
+            0,
+            TestNodeKind::Test,
+            TestState::Fail,
+            None,
+        ),
+        t_node(
+            "mod::pass",
+            "pass",
+            0,
+            TestNodeKind::Test,
+            TestState::Pass,
+            None,
+        ),
+    ];
+    let base = crate::panel::TestTask::new("cargo test", "cargo test", "cargo-test");
+    let task = test_task_for_run(&one_failure, TestRun::Failed, base.clone());
+    assert_eq!(task.command, "cargo test 'mod::bad'");
+
+    let no_failures = tests_state(None, 1);
+    let task = test_task_for_run(&no_failures, TestRun::Failed, base);
+    assert_eq!(task.command, "cargo test 'mymod::test_a'");
+}
+
+#[test]
+fn test_run_failed_caps_to_whole_suite() {
+    use crate::panel::{TestNodeKind, TestState};
+
+    let mut state = tests_state(None, 0);
+    state.nodes = (0..65)
+        .map(|index| {
+            let id = format!("suite::case_{index}");
+            t_node(&id, &id, 0, TestNodeKind::Test, TestState::Fail, None)
+        })
+        .collect();
+    let base = crate::panel::TestTask::new("cargo test", "cargo test --workspace", "cargo-test");
+    let task = test_task_for_run(&state, TestRun::Failed, base.clone());
+
+    assert_eq!(task.command, base.command);
+    assert!(
+        task.name.contains("65 failed: whole suite"),
+        "{}",
+        task.name
+    );
+}

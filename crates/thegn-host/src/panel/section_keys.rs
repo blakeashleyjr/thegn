@@ -79,11 +79,11 @@ const PR: &[SectionKey] = &[
 ];
 const TESTS: &[SectionKey] = &[
     k('r', "r", "run"),
-    k('R', "R", "all"),
     k('f', "f", "failed"),
-    k('o', "o", "editor"),
-    k('b', "b", "peek"),
-    nav("↵", "open"),
+    k('R', "R", "all"),
+    k('O', "O", "output"),
+    k('/', "/", "filter"),
+    k('u', "u", "rediscover"),
 ];
 const CI: &[SectionKey] = &[
     nav("j/k", "row"),

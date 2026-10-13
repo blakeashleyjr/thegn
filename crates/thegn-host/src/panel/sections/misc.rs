@@ -676,11 +676,21 @@ pub(super) fn tests(ctx: &SectionCtx) -> Vec<PanelRow> {
             "no test runs yet",
         )]))),
     }
+    let filter = &ctx.ui.tests.filter;
+    if !filter.is_empty() || ctx.ui.tests.filter_editing {
+        let mut chip = vec![seg(g2(), format!("/ {filter}"))];
+        if ctx.ui.tests.filter_editing {
+            chip.push(seg(hue(Hue::Amber), "|"));
+        }
+        chip.push(seg(g2(), "  (Esc clears)"));
+        rows.push(PanelRow::plain(Line::segs(chip)));
+    }
     rows.push(PanelRow::blank());
     rows.push(hint_row(&[
         ("r", "run"),
         ("R", "all"),
-        ("f", "failed only"),
+        ("f", "failed"),
+        ("O", "output"),
     ]));
     rows
 }
@@ -716,6 +726,14 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
         header.push(seg(hue(Hue::Amber), "  stale"));
     }
     rows.push(PanelRow::plain(Line::segs(header)));
+    if !ts.filter.is_empty() || ts.filter_editing {
+        let mut filter = vec![seg(g2(), format!("/ {}", ts.filter))];
+        if ts.filter_editing {
+            filter.push(seg(hue(Hue::Amber), "|"));
+        }
+        filter.push(seg(g2(), "  (Esc clears)"));
+        rows.push(PanelRow::plain(Line::segs(filter)));
+    }
 
     if ts.nodes.is_empty() {
         rows.push(PanelRow::plain(Line::segs(vec![seg(
@@ -724,8 +742,19 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
         )])));
         rows.push(super::hint_row(&[
             ("r", "run"),
+            ("f", "failed"),
+            ("O", "output"),
             ("R", "all"),
-            ("f", "failed only"),
+            ("/", "filter"),
+        ]));
+        rows.push(super::hint_row(&[
+            ("F", "file"),
+            ("p", "pkg"),
+            ("d", "debug"),
+            ("o", "editor"),
+            ("b", "peek"),
+            ("↵", "open"),
+            ("u", "rediscover"),
         ]));
         return rows;
     }
@@ -856,9 +885,18 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
 
     rows.push(super::hint_row(&[
         ("r", "run"),
+        ("f", "failed"),
+        ("R", "all"),
+        ("O", "output"),
+        ("/", "filter"),
+        ("u", "rediscover"),
+    ]));
+    rows.push(super::hint_row(&[
         ("F", "file"),
         ("p", "pkg"),
-        ("R", "all"),
+        ("d", "debug"),
+        ("o", "editor"),
+        ("b", "peek"),
         ("↵", "open"),
     ]));
     rows
