@@ -369,21 +369,27 @@ pub fn build_panel(
         return build_full(model, ui, cols, rows, focused);
     }
 
-    // A drill detail view (commit files, staging, patch, blame, rebase todo)
-    // is only rendered by the git frame. Render it INTO the half-width panel —
+    // A git detail or cursor-follow home region is rendered by the git frame
+    // inside the half-width panel —
     // the center pane stays visible — instead of forcing the screen-filling
     // Full layout (which hides all chrome and feels like a trap). The accordion
     // list views keep the vertical skeleton below.
     if ui.width == crate::layout::PanelWidth::Half
         && ui.open.is_git_family()
-        && matches!(
+        && (matches!(
             ui.git.focus,
             super::gitui::GitView::Staging
                 | super::gitui::GitView::CommitFiles
                 | super::gitui::GitView::PatchBuilding
                 | super::gitui::GitView::Blame
                 | super::gitui::GitView::RebaseTodo
-        )
+        ) || (ui.open.home_view() == Some(ui.git.focus)
+            && matches!(
+                ui.git.focus,
+                super::gitui::GitView::Commits
+                    | super::gitui::GitView::Branches
+                    | super::gitui::GitView::Stash
+            )))
     {
         return super::gitfull::build_git_full(model, ui, cols, rows, focused);
     }
@@ -427,24 +433,28 @@ pub fn build_panel(
         if on {
             label = label.bold();
         }
-        // Each accordion is numbered; the number is its open shortcut within the tab.
-        let num = seg(
-            Tok::Slot(if on { S::Accent } else { S::Ghost2 }),
-            format!("{}", i + 1),
-        )
-        .bold();
-        let mut srow = PanelRow::plain(Line::split(
-            {
-                let mut l = vec![sp(1), num, sp(1), label];
-                l.push(sp(0));
-                l
-            },
-            {
-                let mut r = sections::summary(section, model);
-                r.push(sp(1));
-                r
-            },
-        ))
+        // Numbered accordions reserve a digit and separator. Sections past
+        // the tenth keep the label column compact and have no jump shortcut.
+        let digit = crate::panel::section_digit(i);
+        let mut left = vec![sp(1)];
+        if let Some(digit) = digit {
+            left.push(
+                seg(
+                    Tok::Slot(if on { S::Accent } else { S::Ghost2 }),
+                    digit.to_string(),
+                )
+                .bold(),
+            );
+            left.push(sp(1));
+        } else {
+            left.push(sp(1));
+        }
+        left.push(label);
+        let mut srow = PanelRow::plain(Line::split(left, {
+            let mut r = sections::summary(section, model);
+            r.push(sp(1));
+            r
+        }))
         .with_hit(PanelHit::OpenSection(section));
         if on {
             srow = srow.with_bg(Tok::Slot(S::Bg1));
@@ -533,9 +543,10 @@ fn rail_rows_and_spans(ui: &PanelUi, cols: usize) -> (Vec<PanelRow>, Vec<RailSpa
         .collect();
     for (i, section) in visible.iter().copied().enumerate() {
         let on = section == ui.open;
-        let num = format!("{}", i + 1);
+        let num = crate::panel::section_digit(i).map(|digit| digit.to_string());
         let label = section.label();
-        let entry_w = num.chars().count() + 1 + label.chars().count();
+        let entry_w =
+            num.as_ref().map_or(0, |number| number.chars().count() + 1) + label.chars().count();
         let sep_w = if x > 1 { 3 } else { 0 };
         if x + sep_w + entry_w > cols.saturating_sub(1) && x > 1 {
             rows.push(PanelRow::plain(Line::Segs(std::mem::take(&mut cur))));
@@ -550,14 +561,10 @@ fn rail_rows_and_spans(ui: &PanelUi, cols: usize) -> (Vec<PanelRow>, Vec<RailSpa
             cols: x..x + entry_w,
             section,
         });
-        cur.push(
-            seg(
-                Tok::Slot(if on { S::Accent } else { S::Ghost2 }),
-                num.clone(),
-            )
-            .bold(),
-        );
-        cur.push(sp(1));
+        if let Some(number) = num {
+            cur.push(seg(Tok::Slot(if on { S::Accent } else { S::Ghost2 }), number).bold());
+            cur.push(sp(1));
+        }
         let mut label_seg = seg(Tok::Slot(if on { S::Accent } else { S::Dim }), label);
         if on {
             label_seg = label_seg.bold();
@@ -699,17 +706,35 @@ pub fn section_rows(
     cols: usize,
     rows: usize,
 ) -> usize {
-    // At Full width the git-family sections are rendered by the lazygit frame
+    // At Full width, and at Half for the commit/branch/stash homes, git-family
+    // sections are rendered by the lazygit frame
     // (`gitfull::build_git_full`, see `build_panel`), NOT by
     // `sections::content` — counting the accordion renderer's hits here
     // reported 0 for Changes (whose accordion Full body has no hit rows), so
     // `j`/`k` left the section and every action targeted row 0. Count the same
     // display space the git frame renders and `gitui::source_at` consumes.
-    if ui.width == crate::layout::PanelWidth::Full
+    if (ui.width == crate::layout::PanelWidth::Full
+        || (ui.width == crate::layout::PanelWidth::Half
+            && matches!(
+                section,
+                crate::panel::Section::Commits
+                    | crate::panel::Section::Branches
+                    | crate::panel::Section::Stash
+            )
+            && ui.open.home_view() == section.home_view()
+            && Some(ui.git.focus) == section.home_view()))
         && section.is_git_family()
         && let Some(view) = section.home_view()
     {
         return super::gitui::display_map(&ui.git, view, &model.panel).len();
+    }
+    if ui.width == crate::layout::PanelWidth::Full
+        && let Some(count) = sections::list_len(
+            section,
+            &section_ctx(model, ui, cols, rows.saturating_sub(1), 4),
+        )
+    {
+        return count;
     }
     // Subtract 1 for the tab bar row in the row estimate.
     let ctx = section_ctx(model, ui, cols, rows.saturating_sub(1), 4);
@@ -1180,5 +1205,93 @@ mod tests {
             .find(|r| r.hit == Some(PanelHit::Row(Section::Changes, model.panel.changes.len())))
             .expect("impact footer row present");
         assert_eq!(footer.bg, Some(Tok::SelAccent));
+    }
+
+    #[test]
+    fn full_self_windowed_problem_count_uses_the_complete_list() {
+        let model = model_with(PanelData {
+            diagnostics: (0..2)
+                .map(|i| crate::panel::DiagnosticItem {
+                    file: format!("src/{i}.rs"),
+                    line: i,
+                    col: None,
+                    severity: crate::panel::Severity::Error,
+                    message: format!("{}-{i}", "long-detail".repeat(30)),
+                    source: "test".into(),
+                    code: None,
+                })
+                .collect(),
+            ..Default::default()
+        });
+        let ui = PanelUi {
+            width: crate::layout::PanelWidth::Full,
+            open: crate::panel::Section::Problems,
+            ..Default::default()
+        };
+        assert_eq!(
+            section_rows(crate::panel::Section::Problems, &model, &ui, 150, 30),
+            2
+        );
+    }
+
+    #[test]
+    fn normal_long_list_is_reachable_and_windowed() {
+        let model = model_with(PanelData {
+            diagnostics: (0..40)
+                .map(|i| crate::panel::DiagnosticItem {
+                    file: format!("src/{i}.rs"),
+                    line: i,
+                    col: None,
+                    severity: crate::panel::Severity::Error,
+                    message: format!("diagnostic-{i}"),
+                    source: "test".into(),
+                    code: None,
+                })
+                .collect(),
+            ..Default::default()
+        });
+        let ui = PanelUi {
+            width: crate::layout::PanelWidth::Normal,
+            tab: crate::panel::PanelTab::Work,
+            open: crate::panel::Section::Problems,
+            problems_cursor: 35,
+            cursor: 35,
+            row_mode: true,
+            order: vec![crate::panel::Section::Problems],
+            ..Default::default()
+        };
+        assert_eq!(
+            section_rows(crate::panel::Section::Problems, &model, &ui, 44, 15),
+            40
+        );
+        let frame = build_panel(&model, &ui, 44, 15, true);
+        let rendered = frame
+            .rows
+            .iter()
+            .map(|row| text_of(&row.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("diagnostic-35"), "{rendered}");
+        assert!(rendered.contains("↑"), "{rendered}");
+        assert!(rendered.contains("+"), "{rendered}");
+        assert!(rendered.contains("more"), "{rendered}");
+        assert!(frame.rows.len() <= 15);
+    }
+
+    #[test]
+    fn unnumbered_accordion_headers_keep_the_label_column_aligned() {
+        let model = model_with(PanelData::default());
+        let ui = PanelUi {
+            tab: crate::panel::PanelTab::Work,
+            open: Section::Symbols,
+            ..Default::default()
+        };
+        let frame = build_panel(&model, &ui, 44, 50, true);
+        let symbols = frame
+            .rows
+            .iter()
+            .find(|row| row.hit == Some(PanelHit::OpenSection(Section::Symbols)))
+            .expect("Symbols accordion header is rendered");
+        assert!(text_of(&symbols.line).starts_with("  symbols"));
     }
 }

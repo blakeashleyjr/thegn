@@ -193,11 +193,9 @@ popup staying open (on a needs-you row that quiets the worktree **and**
 retires its inbox rows); `a` clears all — the same total clear from every
 row — and closes the popup. Merge-queue rows act in place — `l` lands a gated-green branch, `r`
 retries a blocked one, `x` removes it, `m` jumps to the full Work ▸ Merge
-queue section. (In the panel's System ▸ Notifications section the keys are
-`x` mark read, `d` dismiss, `a` clear all — and `a` covers this repo's rows
-plus the host-global ones, counting a row tagged to the repo's own main
-checkout as this repo's, which it always displayed but never used to clear;
-`A`/`g` widens to every worktree.) Ephemeral confirmations
+queue section. (In the panel's System ▸ Notifications section, `a` asks for confirmation and
+clears the inbox; it ignores an active filter. The popup's `a` still clears
+without confirmation.) Ephemeral confirmations
 ("Landed") surface as transient toasts — the passing view of routed events
 that also land in this inbox — and direct acknowledgements ("Text copied")
 are toasts only.

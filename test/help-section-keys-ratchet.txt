@@ -1,0 +1,12 @@
+# help-section-keys-ratchet — `panel:<section>:<chord>` prose entries
+# containing real chords omitted from the subsection's section tables. Shrink only.
+# notifications A and /; logs Y; environments t; media + - [ ] f; PR queue h.
+panel:environments:t
+panel:logs:Y
+panel:media:+
+panel:media:-
+panel:media:[
+panel:media:]
+panel:media:f
+panel:notifications:/
+panel:notifications:A

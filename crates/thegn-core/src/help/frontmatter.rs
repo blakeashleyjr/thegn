@@ -96,7 +96,7 @@ pub fn valid_id(s: &str) -> bool {
 fn valid_token(s: &str) -> bool {
     !s.is_empty()
         && s.chars().all(|c| {
-            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.' | ':')
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.' | ':' | '#')
         })
 }
 
@@ -279,6 +279,13 @@ mod tests {
         assert_eq!(meta.actions, vec!["integrate", "merge-drain"]);
         assert!(!meta.generated);
         assert_eq!(body, "# Body\n");
+    }
+
+    #[test]
+    fn parses_context_anchor_tokens() {
+        let (meta, _) =
+            parse("---\nid: x\ntitle: X\ncontexts: [panel:merge#conflicts]\n---\n").unwrap();
+        assert_eq!(meta.contexts, vec!["panel:merge#conflicts"]);
     }
 
     #[test]

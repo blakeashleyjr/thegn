@@ -103,6 +103,7 @@ pub struct HelpRegistry {
     by_id: HashMap<String, usize>,
     toc: Vec<TocNode>,
     by_context: HashMap<String, String>,
+    anchors: HashMap<String, String>,
     /// Reverse link edges: page id → the ids of pages linking *to* it, in
     /// registration order and deduped. Built from the same walk that validates
     /// forward links, so it costs nothing extra.
@@ -168,25 +169,42 @@ impl HelpRegistry {
         }
 
         let mut by_context: HashMap<String, String> = HashMap::new();
+        let mut anchors: HashMap<String, String> = HashMap::new();
         for page in &pages {
-            for ctx in &page.meta.contexts {
-                if !known_contexts.contains(&ctx.as_str()) {
+            for claim in &page.meta.contexts {
+                let (ctx, anchor) = match claim.split_once('#') {
+                    Some((ctx, anchor)) if !ctx.is_empty() && !anchor.is_empty() => {
+                        (ctx, Some(anchor))
+                    }
+                    Some(_) => {
+                        errors.push(ValidationError::UnknownContext {
+                            page: page.meta.id.clone(),
+                            context: claim.clone(),
+                        });
+                        continue;
+                    }
+                    None => (claim.as_str(), None),
+                };
+                if !known_contexts.contains(&ctx) {
                     errors.push(ValidationError::UnknownContext {
                         page: page.meta.id.clone(),
-                        context: ctx.clone(),
+                        context: ctx.to_string(),
                     });
                     continue;
                 }
-                match by_context.entry(ctx.clone()) {
+                match by_context.entry(ctx.to_string()) {
                     std::collections::hash_map::Entry::Occupied(e) => {
                         errors.push(ValidationError::DuplicateContext {
-                            context: ctx.clone(),
+                            context: ctx.to_string(),
                             first: e.get().clone(),
                             second: page.meta.id.clone(),
                         });
                     }
                     std::collections::hash_map::Entry::Vacant(e) => {
                         e.insert(page.meta.id.clone());
+                        if let Some(anchor) = anchor {
+                            anchors.insert(ctx.to_string(), anchor.to_string());
+                        }
                     }
                 }
             }
@@ -202,6 +220,7 @@ impl HelpRegistry {
                 by_id,
                 toc,
                 by_context,
+                anchors,
                 backlinks,
             },
             errors,
@@ -234,6 +253,11 @@ impl HelpRegistry {
             .map(String::as_str)
             .or_else(|| self.by_id.contains_key("index").then_some("index"))
             .or_else(|| self.pages.first().map(|p| p.meta.id.as_str()))
+    }
+
+    /// Optional heading override for a context claim written as `ctx#anchor`.
+    pub fn anchor_for_context(&self, context_key: &str) -> Option<&str> {
+        self.anchors.get(context_key).map(String::as_str)
     }
 
     /// All (context key → page id) claims, for diagnostics and tests.
@@ -500,6 +524,28 @@ mod tests {
             Some("aa"),
             "first claim wins"
         );
+    }
+
+    #[test]
+    fn context_anchor_claims_index_the_bare_context() {
+        let index = page("index", "contexts: [panel:merge#conflicts]\n", "");
+        let (reg, errors) = HelpRegistry::build(&[&index], CONTEXTS);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(reg.page_for_context("panel:merge"), Some("index"));
+        assert_eq!(reg.anchor_for_context("panel:merge"), Some("conflicts"));
+        assert_eq!(reg.anchor_for_context("zone:center"), None);
+    }
+
+    #[test]
+    fn malformed_context_anchor_is_rejected() {
+        let index = page("index", "contexts: [panel:merge#]\n", "");
+        let (reg, errors) = HelpRegistry::build(&[&index], CONTEXTS);
+        assert_eq!(reg.page_for_context("panel:merge"), Some("index"));
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::UnknownContext { page, context }
+                if page == "index" && context == "panel:merge#"
+        )));
     }
 
     #[test]

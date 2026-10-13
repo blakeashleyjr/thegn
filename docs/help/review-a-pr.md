@@ -3,7 +3,7 @@ id: review-a-pr
 title: Review a PR
 parent: workflows
 order: 1
-contexts: [panel:pr, panel:ci]
+contexts: [panel:pr]
 actions: [pr-open, pr-create]
 ---
 
@@ -15,18 +15,20 @@ actions: [pr-open, pr-create]
    project, or the palette's `@` git mode to pick the branch. The
    worktree is isolated — your own work stays untouched.
 3. The right [[panel]]'s **work** tab tracks the branch's PR: state, CI
-   check rollup, review decision. The **git** tab's _changes_ section is
-   the diff; `e` widens it to full-screen, side by side. The full-screen diff
-   defaults to **Worktree** and keeps local/staging semantics. Press `Tab` to
-   switch to **PR review** when a matching snapshot is available; this source
-   shows the PR head diff, inline threads, outdated feedback, and top-level
-   comments. Stale, loading, unsupported, and absent snapshots are labeled
-   rather than attached to local lines.
-4. Act from the panel's _pr_ section: `A` approve, `c` comment, `M`
-   merge, `r` rerun failed checks, `o` open in the browser — or run `gh`
-   in the pane, or open the PR view for the conversation feed. The
-   palette's **PR — open in browser** action (`pr-open`) does the same
-   from anywhere, when the conversation outgrows a pane.
+   check rollup, review decision. The **git** tab's _changes_ section is the
+   diff; its `e` key cycles panel width. `Alt-/` opens the Worktree/PR-review
+   diff modal. In that modal, `Tab` switches source when a matching snapshot
+   is available; PR review shows the PR head diff, inline threads, outdated
+   feedback, and top-level comments. Stale, loading, unsupported, and absent
+   snapshots are labeled rather than attached to local lines.
+4. Act from the panel's _pr_ section: `A` approves and `o` opens the PR in
+   your browser. `M` opens a merge-method menu (squash is the default) and
+   lists blockers; `c` comments when a PR exists and asks
+   before creating one otherwise. `r` needs a PR. Enter opens the PR view;
+   Full shows its two-column page: header and checks beside threads and OPEN
+   PRS. Or run `gh` in the pane, or open the PR view for the conversation
+   feed. The palette's **PR — open in browser** action (`pr-open`) does the
+   same from anywhere, when the conversation outgrows a pane.
 5. Done? `Alt-X` removes the review worktree; the branch stays.
 
 ## Review feedback

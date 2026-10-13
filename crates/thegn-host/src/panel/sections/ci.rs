@@ -1,5 +1,5 @@
 //! The CI section (AV group): recent runs with a per-run state glyph + duration,
-//! expanding the latest run's jobs when the band is deep. Reads
+//! expanding the cursor run's jobs when the band is deep. Reads
 //! `model.panel.ci_runs` (populated from the `ci_runs_cache`). The full
 //! drilldown is the CLI (`thegn ci view <id>`); this is the at-a-glance
 //! "is the pipeline green?" rollup, the CI-provider analogue of the PR checks.
@@ -9,7 +9,9 @@ use thegn_core::theme::Hue;
 
 use crate::seg::{Line, Seg, seg};
 
-use super::{PanelHit, PanelRow, Section, SectionCtx, d, f, fmt_secs, g, g2, hint_row, hue};
+use super::{
+    PanelHit, PanelRow, Section, SectionCtx, d, f, fmt_secs, g, g2, hint_row, hue, list_detail,
+};
 
 /// A state's hued glyph (shared by run rows and job rows).
 pub(super) fn state_glyph(s: CiState) -> Seg {
@@ -69,8 +71,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     list(ctx)
 }
 
-/// Normal/Half: recent runs (a handful, or as many as fit when deep), expanding
-/// the latest run's jobs in the deep (Half) view.
+/// Normal/Half: recent runs, expanding the cursor run's jobs in the deep (Half) view.
 fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
     let data = &ctx.model.panel;
     let now = thegn_core::util::now();
@@ -81,7 +82,6 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
         )]))];
     }
     let mut rows: Vec<PanelRow> = Vec::new();
-    let limit = if ctx.deep() { ctx.rows.max(1) } else { 5 };
 
     // Summary row: current state (latest run per workflow), not history,
     // stamped with the cache's fetch age so stale data is visibly stale.
@@ -98,7 +98,7 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
     // up with `ui.cursor` and with `display_runs` — which the dispatch also
     // resolves through.
     let display = display_runs(data);
-    for (i, r) in display.iter().take(limit).enumerate() {
+    for (i, r) in display.iter().enumerate() {
         let dur = r
             .duration_secs(now)
             .map(fmt_secs)
@@ -112,9 +112,9 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
                 .with_hit(PanelHit::Row(Section::Ci, i)),
         );
     }
-    // Deep (Half): expand the newest displayed run's jobs.
+    // Deep (Half): expand the cursor run's jobs.
     if ctx.deep()
-        && let Some(latest) = display.first()
+        && let Some(latest) = display.get(ctx.ui.cursor)
     {
         for j in &latest.jobs {
             rows.push(PanelRow::plain(Line::segs(vec![
@@ -149,7 +149,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Full: the whole-band drilldown — a `CI RUNS` header, richer run rows (event +
-/// duration), then the latest run's jobs **with their steps**. Distinct from the
+/// duration), then the cursor run's jobs **with their steps**. Distinct from the
 /// Normal/Half list bodies (the panel's three-view contract).
 fn full(ctx: &SectionCtx) -> Vec<PanelRow> {
     let data = &ctx.model.panel;
@@ -163,71 +163,76 @@ fn full(ctx: &SectionCtx) -> Vec<PanelRow> {
             )])),
         ];
     }
-    let mut rows: Vec<PanelRow> = vec![];
-
-    // Summary row: current state (latest run per workflow), not history.
-    rows.push(PanelRow::plain(summary_line("CI RUNS ", data, now)));
+    let mut rows = vec![PanelRow::plain(summary_line("CI RUNS ", data, now))];
     if let Some(note) = &data.ci_note {
         rows.push(PanelRow::plain(Line::segs(vec![seg(
             hue(Hue::Amber),
             format!("⚠ {note}"),
         )])));
     }
-
-    // One row per workflow — the same set the summary counts (see `display_runs`).
     let display = display_runs(data);
-    for (i, r) in display.iter().take(ctx.rows.max(1)).enumerate() {
-        let dur = r
-            .duration_secs(now)
-            .map(fmt_secs)
-            .unwrap_or_else(|| "—".into());
-        let mut left = vec![state_glyph(r.state), seg(d(), format!(" {}", r.name))];
-        if !r.event.is_empty() {
-            left.push(seg(g(), format!("  {}", r.event)));
-        }
-        if !r.branch.is_empty() {
-            left.push(seg(g(), format!("  {}", r.branch)));
-        }
-        if !r.title.is_empty() {
-            left.push(seg(g2(), format!("  {}", truncate(&r.title, 40))));
-        }
-        rows.push(
-            PanelRow::plain(Line::split(left, vec![seg(g(), dur)]))
-                .with_hit(PanelHit::Row(Section::Ci, i)),
-        );
-    }
-
-    // Detailed view of the newest displayed run's jobs and steps
-    if let Some(latest) = display.first() {
-        if !latest.jobs.is_empty() {
-            rows.push(PanelRow::plain(Line::segs(vec![seg(g(), "")])));
-            rows.push(PanelRow::plain(Line::segs(vec![seg(
-                d(),
-                "LATEST RUN JOBS",
-            )])));
-        }
-        for j in &latest.jobs {
-            let dur = j
+    let list_w = 45_usize.min(ctx.cols / 2);
+    let list: Vec<(Vec<Seg>, Option<usize>)> = display
+        .iter()
+        .enumerate()
+        .map(|(i, run)| {
+            let dur = run
                 .duration_secs(now)
                 .map(fmt_secs)
                 .unwrap_or_else(|| "—".into());
-            rows.push(PanelRow::plain(Line::split(
-                vec![
-                    seg(g(), "  "),
-                    state_glyph(j.state),
-                    seg(d(), format!(" {}", j.name)),
-                ],
-                vec![seg(g(), dur)],
-            )));
-            for s in &j.steps {
-                rows.push(PanelRow::plain(Line::segs(vec![
+            let mut left = vec![
+                seg(
+                    if i == ctx.ui.cursor { g2() } else { g() },
+                    if i == ctx.ui.cursor { "▶ " } else { "  " },
+                ),
+                state_glyph(run.state),
+                seg(d(), format!(" {}", run.name)),
+            ];
+            if !run.event.is_empty() {
+                left.push(seg(g(), format!("  {}", run.event)));
+            }
+            if !run.branch.is_empty() {
+                left.push(seg(g(), format!("  {}", run.branch)));
+            }
+            if !run.title.is_empty() {
+                left.push(seg(g2(), format!("  {}", truncate(&run.title, 40))));
+            }
+            left.push(seg(g(), format!("  {dur}")));
+            (left, Some(i))
+        })
+        .collect();
+    let mut detail: Vec<Vec<Seg>> = Vec::new();
+    if let Some(run) = display.get(ctx.ui.cursor) {
+        if !run.jobs.is_empty() {
+            detail.push(vec![seg(d(), "RUN JOBS")]);
+        }
+        for job in &run.jobs {
+            let dur = job
+                .duration_secs(now)
+                .map(fmt_secs)
+                .unwrap_or_else(|| "—".into());
+            detail.push(vec![
+                seg(g(), "  "),
+                state_glyph(job.state),
+                seg(d(), format!(" {}  {dur}", job.name)),
+            ]);
+            for step in &job.steps {
+                detail.push(vec![
                     seg(g(), "      "),
-                    state_glyph(s.state),
-                    seg(f(), format!(" {}", s.name)),
-                ])));
+                    state_glyph(step.state),
+                    seg(f(), format!(" {}", step.name)),
+                ]);
             }
         }
     }
+    rows.extend(list_detail(
+        Section::Ci,
+        &list,
+        &detail,
+        ctx.ui.cursor,
+        list_w,
+        ctx.rows.saturating_sub(rows.len() + 1),
+    ));
     rows.push(ci_hint_row());
     rows
 }

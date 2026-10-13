@@ -28,6 +28,8 @@ pub struct HostSnapshot {
     pub id: String,
     /// Reach kind ("ssh"/"iroh"/"cloud"/"local").
     pub reach: String,
+    /// Resolved reach target (for SSH, the configured host and optional port).
+    pub target: String,
     /// Durable state tag ("unknown"/"runtime_ready"/"image_ready"/"ready"/
     /// "failed"); `""` when the host has no DB row yet (never provisioned).
     pub state: String,
@@ -145,6 +147,13 @@ pub fn host_snapshots(cfg: &Config, db: &Db) -> Vec<HostSnapshot> {
                 name: name.clone(),
                 id: id.as_str().to_string(),
                 reach: reach_kind(hc.reach).into(),
+                target: if hc.ssh.host.trim().is_empty() {
+                    reach_kind(hc.reach).into()
+                } else if hc.ssh.port == 0 || hc.ssh.port == 22 {
+                    hc.ssh.host.clone()
+                } else {
+                    format!("{}:{}", hc.ssh.host, hc.ssh.port)
+                },
                 state: row
                     .and_then(|r| r.state.durable_tag())
                     .unwrap_or_default()
@@ -294,6 +303,9 @@ pub(crate) fn drive_host(
     cfg: &Config,
     host_ui: &crate::host_flow::HostUiTx,
 ) -> String {
+    if !crate::channel_state::allows(thegn_core::channel::Feature::Providers) {
+        return format!("host {name}: hosts are dev-channel only (THEGN_CHANNEL=dev)");
+    }
     let Some(binding) = cfg.host_binding(name) else {
         return format!("host {name}: invalid [host.{name}] config");
     };
@@ -414,6 +426,7 @@ mod tests {
         assert_eq!(s.name, "box");
         assert_eq!(s.id, "host:box");
         assert_eq!(s.reach, "local");
+        assert_eq!(s.target, "local");
         assert_eq!(s.state, "");
         assert_eq!(s.glyph(), "○");
         assert_eq!(s.short_status(), "unprovisioned");
@@ -421,6 +434,17 @@ mod tests {
         assert!(s.consent.contains("will ask"), "{}", s.consent);
         // No [host.*] entries ⇒ no snapshots (and no DB reads worth making).
         assert!(host_snapshots(&Config::default(), &db).is_empty());
+    }
+
+    #[test]
+    fn snapshots_include_the_configured_ssh_reach_target() {
+        let mut cfg = cfg_with_host("box");
+        let host = cfg.host.get_mut("box").unwrap();
+        host.reach = HostReach::Ssh;
+        host.ssh.host = "builder.example".into();
+        host.ssh.port = 2222;
+        let db = Db::open_memory().unwrap();
+        assert_eq!(host_snapshots(&cfg, &db)[0].target, "builder.example:2222");
     }
 
     #[test]
