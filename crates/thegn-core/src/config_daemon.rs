@@ -144,9 +144,10 @@ impl Default for DaemonConfig {
 
 impl DaemonConfig {
     /// Resolve the control-socket path: the explicit `socket` override, else
-    /// `$XDG_RUNTIME_DIR/thegn/<state-endpoint-key>/daemon.sock`, else the
-    /// legacy `<state_dir>/run/daemon.sock`. The host daemon relocates this
-    /// fallback into a vetted private runtime directory when one is available.
+    /// `$XDG_RUNTIME_DIR/thegn/<state-endpoint-key>/daemon.sock`, else the pure
+    /// helper's `<state_dir>/run/daemon.sock` fallback. The host relocates that
+    /// fallback into a vetted private runtime directory, or a private `/tmp`
+    /// path, when possible; if neither can be secured, panes run in-process.
     /// Pure: env is injected.
     pub fn socket_path(&self, runtime_dir: Option<&str>, state_dir: &std::path::Path) -> PathBuf {
         if !self.socket.is_empty() {

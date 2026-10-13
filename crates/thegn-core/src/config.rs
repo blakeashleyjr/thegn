@@ -2679,8 +2679,8 @@ pub struct IdentityConfig {
     #[serde(skip_serializing_if = "IdentityGpg::is_empty")]
     pub gpg: IdentityGpg,
     /// Commit-signing binding (`[identities.<name>.signing]` → `gpg.format` +
-    /// `user.signingKey`). Resolves along the same identity scope chain, so a
-    /// worktree bound to this identity signs with this key (THE-66).
+    /// `user.signingKey`). This block is parsed and validated, but is not yet
+    /// applied to panes or git commands; runtime binding is tracked by THE-149.
     #[serde(skip_serializing_if = "IdentitySigning::is_empty")]
     pub signing: IdentitySigning,
     /// Per-provider agent account selection (`accounts = { claude = "washu" }`),
