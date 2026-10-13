@@ -320,6 +320,7 @@ mod tests {
     fn selected_row_has_sel_accent_bg() {
         let mut model = FrameModel::default();
         model.panel.symbols = vec![sym("fn", "a", 1, 0), sym("fn", "b", 2, 0)];
+        model.panel.symbols_file = "src/a.rs".into();
         let ui = PanelUi {
             symbols_cursor: 1,
             ..Default::default()
