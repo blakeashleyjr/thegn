@@ -63,3 +63,5 @@ and merge policy. Only an observed queue transition to `merged` closes the
 autopilot run; optional Done synchronization uses the configured tracker seam.
 Failures remain parked for a human with a bounded reason and do not trigger a
 second attempt automatically.
+With `[pr_queue]` off, opening a PR ends autopilot's involvement and frees its
+`max_concurrent` slot.
