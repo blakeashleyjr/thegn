@@ -407,6 +407,36 @@ impl Checkout {
     }
 }
 
+/// A validated Git worktree registration retained before its checkout tree is
+/// removed. The admin directory is deleted only after the caller removes the
+/// matching worktree through its retained directory identity.
+pub(super) struct ScratchRegistration {
+    admin: Directory,
+}
+
+impl ScratchRegistration {
+    pub(super) fn path(&self) -> &Path {
+        self.admin.path()
+    }
+
+    pub(super) fn remove(self) -> Result<()> {
+        self.admin.remove_tree()?;
+        Ok(())
+    }
+}
+
+pub(super) fn capture_scratch_registration(
+    repo_root: &Path,
+    worktree: &Path,
+) -> Result<ScratchRegistration> {
+    let repo_root = std::fs::canonicalize(repo_root)?;
+    let repository = Repository::capture(&repo_root)?;
+    let checkout = Checkout::capture(worktree, repository.common.path())?;
+    Ok(ScratchRegistration {
+        admin: checkout.admin,
+    })
+}
+
 struct Workspace {
     repo: Repository,
     common: Directory,
@@ -807,40 +837,30 @@ impl Workspace {
         self.checkout.verify(Some(&self.oid))
     }
 
-    // No `#[expect(clippy::disallowed_methods)]` here: the blocking child wait
-    // lives inside `gate_git_ok`, so this body only touches the filesystem.
+    // Cleanup is filesystem-only: descriptor-relative `remove_tree` calls
+    // remove the temporary checkout and registration without spawning a child.
     fn cleanup(&self) -> Result<()> {
         let Some(parent) = &self.temporary_parent else {
             return Ok(());
         };
         self.verify()?;
-        ensure!(
-            gate_git_ok(
-                self.repo.path(),
-                &[
-                    "-c",
-                    "core.fsmonitor=false",
-                    "worktree",
-                    "remove",
-                    "--force",
-                    self.checkout
-                        .worktree
-                        .path()
-                        .to_str()
-                        .context("gate path is not UTF-8")?
-                ]
-            ),
-            "temporary gate removal failed; state retained"
-        );
+        self.checkout
+            .worktree
+            .remove_tree()
+            .context("temporary gate removal failed; state retained")?;
+        self.checkout
+            .admin
+            .remove_tree()
+            .context("temporary gate registration removal failed; state retained")?;
         self.parent.verify()?;
         if self.target_private
             && let Some(target) = &self.target
         {
-            match std::fs::symlink_metadata(target) {
-                Ok(_) => std::fs::remove_dir_all(target).with_context(|| {
+            match Directory::open(target, None) {
+                Ok(target) => target.remove_tree().with_context(|| {
                     format!(
                         "temporary gate target cleanup failed at {}",
-                        target.display()
+                        target.path().display()
                     )
                 })?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

@@ -1404,6 +1404,24 @@ pub(crate) fn verify_v80_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v81: persist the share run that owns each resurrection row.
+pub(crate) fn migrate_v81(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "shares", "generation") {
+        conn.execute(
+            "ALTER TABLE shares ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v81_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "shares", "generation") {
+        bail!("schema v81 migration did not add shares.generation");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -2015,6 +2033,31 @@ mod tests {
         assert_eq!(rows[2].1, "needs_human");
         assert!(rows.iter().all(|row| row.3.is_none()));
         assert!(rows[0].2.as_deref().unwrap().contains("--pr 7"));
+    }
+
+    #[test]
+    fn v81_adds_share_generation_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE shares (
+                 worktree TEXT NOT NULL, local_port INTEGER NOT NULL,
+                 provider TEXT NOT NULL, public_url TEXT, state TEXT NOT NULL,
+                 created_at INTEGER NOT NULL, PRIMARY KEY(worktree,local_port));
+             INSERT INTO shares VALUES ('/wt/a',3000,'bore','https://share.test','up',1);",
+        )
+        .unwrap();
+        assert!(super::verify_v81_schema(&conn).is_err());
+        super::migrate_v81(&conn).unwrap();
+        super::migrate_v81(&conn).unwrap();
+        super::verify_v81_schema(&conn).unwrap();
+        let generation: i64 = conn
+            .query_row(
+                "SELECT generation FROM shares WHERE worktree='/wt/a' AND local_port=3000",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 0);
     }
 
     #[test]

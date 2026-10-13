@@ -18,10 +18,13 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Sequencer files and BISECT_LOG are tiny; cap remote/provider capture so a
 /// hostile or corrupted gitdir cannot stream unbounded data into host memory.
 const GIT_PATH_READ_LIMIT: usize = 8 * 1024 * 1024;
+/// Bound conditional git-path rewrites to the same wait used by svc mutations.
+const GIT_PATH_LOCK_WAIT: Duration = Duration::from_secs(120);
 static GIT_PATH_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -805,17 +808,36 @@ impl GitLoc {
     }
 
     /// Replace a gitdir file only while its exact current bytes still match
-    /// `expected`. The file must already exist.
+    /// `expected`. The file must already exist. This takes the bounded
+    /// git-mutation lock and callers must not already hold it. The lock
+    /// excludes other thegn writers only; git takes no lock on the todo, so an
+    /// external editor can still race between check and rename.
     pub fn write_git_path_if_unchanged(
         &self,
         rel: &str,
         expected: &[u8],
         bytes: &[u8],
     ) -> std::io::Result<()> {
+        self.write_git_path_if_unchanged_within(rel, expected, bytes, GIT_PATH_LOCK_WAIT)
+    }
+
+    fn write_git_path_if_unchanged_within(
+        &self,
+        rel: &str,
+        expected: &[u8],
+        bytes: &[u8],
+        wait: Duration,
+    ) -> std::io::Result<()> {
         let p = self
             .resolve_git_path(rel)
             .ok_or_else(|| std::io::Error::other(format!("cannot resolve git path {rel:?}")))?;
         if let GitLoc::Local(_) = self {
+            let _lock = crate::util::try_lock_git_mutations_within(Path::new(&self.path()), wait)
+                .map_err(|error| {
+                std::io::Error::other(format!(
+                    "refusing to rewrite git path {rel:?}: git-mutation lock unavailable: {error}"
+                ))
+            })?;
             let path = Path::new(&p);
             match std::fs::symlink_metadata(path) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -855,11 +877,28 @@ impl GitLoc {
         }
 
         let expected_len = expected.len();
-        let script = cas_git_path_write_script(&p, expected_len);
+        let common_dir = self
+            .git_out(&["rev-parse", "--git-common-dir"])
+            .ok_or_else(|| {
+                std::io::Error::other("cannot resolve git common dir for mutation lock")
+            })?;
+        let common_dir = Path::new(&common_dir);
+        let common_dir = if common_dir.is_absolute() {
+            common_dir.to_path_buf()
+        } else {
+            Path::new(&self.path()).join(common_dir)
+        };
+        let lock_path = common_dir
+            .join("thegn-git.lock")
+            .to_string_lossy()
+            .into_owned();
+        let wait_secs = wait.as_secs().max(1);
+        let script = cas_git_path_write_script(&p, expected_len, &lock_path, wait_secs);
         let mut cmd = match self {
-            GitLoc::Remote { ssh, .. } => {
-                self.ssh_command(ssh, cas_git_path_write_ssh_command(&p, expected_len))
-            }
+            GitLoc::Remote { ssh, .. } => self.ssh_command(
+                ssh,
+                cas_git_path_write_ssh_command(&p, expected_len, &lock_path, wait_secs),
+            ),
             GitLoc::Provider { control_prefix, .. } => {
                 self.provider_command(control_prefix, script)
             }
@@ -895,6 +934,14 @@ impl GitLoc {
         } else if status.code() == Some(42) {
             Err(std::io::Error::other(format!(
                 "git path {rel:?} changed on disk"
+            )))
+        } else if status.code() == Some(43) {
+            Err(std::io::Error::other(format!(
+                "timed out waiting for git-mutation lock for {rel:?}"
+            )))
+        } else if status.code() == Some(44) {
+            Err(std::io::Error::other(format!(
+                "git-mutation lock unavailable for {rel:?} on the remote (flock(1) missing or lock path unsafe)"
             )))
         } else {
             Err(std::io::Error::other(format!(
@@ -1031,10 +1078,16 @@ fn atomic_git_path_write_ssh_command(path: &str) -> String {
     format!("sh -c {}", util::sh_quote(&script))
 }
 
-fn cas_git_path_write_script(path: &str, expected_len: usize) -> String {
+fn cas_git_path_write_script(
+    path: &str,
+    expected_len: usize,
+    lock_path: &str,
+    wait_secs: u64,
+) -> String {
     let quoted = util::sh_quote(path);
+    let lock = util::sh_quote(lock_path);
     format!(
-        "set -C; umask 077; p={quoted}; e=\"$p.thegn-cas.$$\"; t=\"$p.thegn-tmp.$$\"; \
+        "set -C; umask 077; l={lock}; command -v flock >/dev/null 2>&1 || exit 44; [ ! -L \"$l\" ] || exit 44; exec 9>>\"$l\" || exit 44; [ ! -L \"$l\" ] && [ \"$l\" -ef /dev/fd/9 ] || exit 44; flock -w {wait_secs} 9 || exit 43; p={quoted}; e=\"$p.thegn-cas.$$\"; t=\"$p.thegn-tmp.$$\"; \
          [ ! -L \"$p\" ] && [ ! -d \"$p\" ] && [ -e \"$p\" ] || exit 1; \
          ce=0; ct=0; trap 'if [ \"$ce\" = 1 ]; then rm -f -- \"$e\"; fi; if [ \"$ct\" = 1 ]; then rm -f -- \"$t\"; fi' 0; \
          trap 'exit 1' HUP INT TERM; : > \"$e\" || exit 1; ce=1; : > \"$t\" || exit 1; ct=1; \
@@ -1046,8 +1099,13 @@ fn cas_git_path_write_script(path: &str, expected_len: usize) -> String {
     )
 }
 
-fn cas_git_path_write_ssh_command(path: &str, expected_len: usize) -> String {
-    let script = cas_git_path_write_script(path, expected_len);
+fn cas_git_path_write_ssh_command(
+    path: &str,
+    expected_len: usize,
+    lock_path: &str,
+    wait_secs: u64,
+) -> String {
+    let script = cas_git_path_write_script(path, expected_len, lock_path, wait_secs);
     format!("sh -c {}", util::sh_quote(&script))
 }
 
@@ -1210,8 +1268,13 @@ mod tests {
 
     #[test]
     fn ssh_cas_write_script_is_explicitly_run_by_posix_shell() {
-        let command = cas_git_path_write_ssh_command("/work tree/todo", 7);
-        let script = "set -C; umask 077; p='/work tree/todo'; e=\"$p.thegn-cas.$$\"; t=\"$p.thegn-tmp.$$\"; [ ! -L \"$p\" ] && [ ! -d \"$p\" ] && [ -e \"$p\" ] || exit 1; ce=0; ct=0; trap 'if [ \"$ce\" = 1 ]; then rm -f -- \"$e\"; fi; if [ \"$ct\" = 1 ]; then rm -f -- \"$t\"; fi' 0; trap 'exit 1' HUP INT TERM; : > \"$e\" || exit 1; ce=1; : > \"$t\" || exit 1; ct=1; set +C; dd bs=1 count=7 2>/dev/null > \"$e\" || exit 1; [ \"$(wc -c < \"$e\")\" -eq 7 ] || exit 1; cat > \"$t\" || exit 1; cmp -s -- \"$e\" \"$p\"; cmp_status=$?; if [ \"$cmp_status\" -eq 1 ]; then exit 42; fi; [ \"$cmp_status\" -eq 0 ] || exit 1; mv -f -- \"$t\" \"$p\"";
+        let command = cas_git_path_write_ssh_command(
+            "/work tree/todo",
+            7,
+            "/work tree/.git/thegn-git.lock",
+            120,
+        );
+        let script = "set -C; umask 077; l='/work tree/.git/thegn-git.lock'; command -v flock >/dev/null 2>&1 || exit 44; [ ! -L \"$l\" ] || exit 44; exec 9>>\"$l\" || exit 44; [ ! -L \"$l\" ] && [ \"$l\" -ef /dev/fd/9 ] || exit 44; flock -w 120 9 || exit 43; p='/work tree/todo'; e=\"$p.thegn-cas.$$\"; t=\"$p.thegn-tmp.$$\"; [ ! -L \"$p\" ] && [ ! -d \"$p\" ] && [ -e \"$p\" ] || exit 1; ce=0; ct=0; trap 'if [ \"$ce\" = 1 ]; then rm -f -- \"$e\"; fi; if [ \"$ct\" = 1 ]; then rm -f -- \"$t\"; fi' 0; trap 'exit 1' HUP INT TERM; : > \"$e\" || exit 1; ce=1; : > \"$t\" || exit 1; ct=1; set +C; dd bs=1 count=7 2>/dev/null > \"$e\" || exit 1; [ \"$(wc -c < \"$e\")\" -eq 7 ] || exit 1; cat > \"$t\" || exit 1; cmp -s -- \"$e\" \"$p\"; cmp_status=$?; if [ \"$cmp_status\" -eq 1 ]; then exit 42; fi; [ \"$cmp_status\" -eq 0 ] || exit 1; mv -f -- \"$t\" \"$p\"";
         assert_eq!(command, format!("sh -c {}", util::sh_quote(script)));
     }
 
@@ -1229,6 +1292,13 @@ mod tests {
         (dir, loc)
     }
 
+    fn flock_available() -> bool {
+        Command::new("sh")
+            .args(["-c", "command -v flock >/dev/null 2>&1"])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
     fn assert_no_cas_write_temps(gitdir: &Path) {
         let leftovers = std::fs::read_dir(gitdir)
             .unwrap()
@@ -1244,6 +1314,9 @@ mod tests {
 
     #[test]
     fn provider_conditional_write_replaces_only_matching_bytes_and_cleans_temps() {
+        if !flock_available() {
+            return;
+        }
         let (dir, loc) = provider_repo();
         let gitdir = dir.path().join(".git");
         let target = gitdir.join("cas-target");
@@ -1255,7 +1328,76 @@ mod tests {
     }
 
     #[test]
+    fn provider_conditional_write_waits_for_git_mutation_lock() {
+        if !flock_available() {
+            return;
+        }
+        let (dir, loc) = provider_repo();
+        let gitdir = dir.path().join(".git");
+        let target = gitdir.join("cas-target");
+        std::fs::write(&target, b"old").unwrap();
+        let held = util::try_lock_git_mutations(dir.path()).unwrap();
+        let error = loc
+            .write_git_path_if_unchanged_within(
+                "cas-target",
+                b"old",
+                b"new",
+                Duration::from_secs(1),
+            )
+            .expect_err("provider CAS must wait for the held mutation lock");
+        assert!(error.to_string().contains("git-mutation lock"), "{error}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert_no_cas_write_temps(&gitdir);
+        drop(held);
+
+        loc.write_git_path_if_unchanged_within(
+            "cas-target",
+            b"old",
+            b"new",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert_no_cas_write_temps(&gitdir);
+    }
+
+    #[test]
+    fn local_conditional_write_waits_for_git_mutation_lock() {
+        let (dir, _) = provider_repo();
+        let gitdir = dir.path().join(".git");
+        let target = gitdir.join("local-lock-target");
+        std::fs::write(&target, b"old").unwrap();
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+        let held = util::try_lock_git_mutations(dir.path()).unwrap();
+        let error = loc
+            .write_git_path_if_unchanged_within(
+                "local-lock-target",
+                b"old",
+                b"new",
+                Duration::from_secs(1),
+            )
+            .expect_err("local CAS must refuse under the held mutation lock");
+        assert!(error.to_string().contains("git-mutation lock"), "{error}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert_no_cas_write_temps(&gitdir);
+        drop(held);
+
+        loc.write_git_path_if_unchanged_within(
+            "local-lock-target",
+            b"old",
+            b"new",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert_no_cas_write_temps(&gitdir);
+    }
+
+    #[test]
     fn provider_conditional_write_rejects_stale_bytes_without_changes_or_temps() {
+        if !flock_available() {
+            return;
+        }
         let (dir, loc) = provider_repo();
         let gitdir = dir.path().join(".git");
         let target = gitdir.join("cas-target");
@@ -1270,6 +1412,9 @@ mod tests {
 
     #[test]
     fn provider_conditional_write_rejects_absent_and_symlink_targets() {
+        if !flock_available() {
+            return;
+        }
         let (dir, loc) = provider_repo();
         let gitdir = dir.path().join(".git");
         assert!(

@@ -107,6 +107,7 @@ pub trait WorktreeAuxStore {
         &self,
         worktree: &str,
         local_port: u16,
+        generation: u64,
         provider: &str,
         public_url: Option<&str>,
         state: &str,
@@ -115,7 +116,24 @@ pub trait WorktreeAuxStore {
     /// All persisted shares, newest first (restore + panel listing).
     fn list_shares(&self) -> Result<Vec<ShareRow>>;
 
-    /// Remove the share record for `(worktree, local_port)`.
+    /// Remove a share only when this run owns it (or it is a legacy generation-0 row).
+    fn delete_share_generation(
+        &self,
+        worktree: &str,
+        local_port: u16,
+        generation: u64,
+    ) -> Result<bool>;
+
+    /// Change a legacy/resurrected share's generation only if `from` still owns it.
+    fn rebind_share_generation(
+        &self,
+        worktree: &str,
+        local_port: u16,
+        from: u64,
+        to: u64,
+    ) -> Result<bool>;
+
+    /// Unconditionally remove a share record. Reserved for explicit CLI `share stop`.
     fn delete_share(&self, worktree: &str, local_port: u16) -> Result<()>;
 
     /// Insert or update the forward record for `(worktree, container_port)`.

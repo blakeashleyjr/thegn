@@ -879,7 +879,7 @@ Agent Telemetry Export (**R 690**)._
 - [ ] 253. Screen-phrase matching fallback
 - [ ] 254. OTEL ingestion (CC)
 - [ ] 255. Per-agent activity timeline
-- [x] 256. Needs-attention surfacing _(attention tiers + default Attention sort + reason hint + statusbar ✋ chip — openspec `add-sidebar-attention-sort`; authoritative OSC/CLI signals remain `add-osc-attention-signaling`)_
+- [x] 256. Needs-attention surfacing _(attention tiers + default Attention sort + reason hint + statusbar ✋ chip — openspec `add-sidebar-attention-sort`; authoritative OSC signals shipped as live state under THE-68; the targeted notify verb was retired (THE-130))_
 - [ ] 257. Transcript viewer
 - [ ] 258. Session replay
 - [ ] 655. Per-worktree status/checkpoint field — agent-writable free-text "what just happened / status / next step" string (set via a CLI verb, `--json`), surfaced in the sidebar (feeds B 28), statusbar, panel, and the attention queue; read-before-write to preserve context (Orca worktree-comment pattern)

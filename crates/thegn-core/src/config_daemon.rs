@@ -129,6 +129,10 @@ pub struct DaemonConfig {
     /// (or the machine restarts).
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub lease_grace_secs: u64,
+    /// End a pane after this long of repeated attach-stream sequence gaps;
+    /// `0` = never end it (the reconnect backoff still applies).
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
+    pub stream_gap_window_secs: u64,
 }
 
 impl Default for DaemonConfig {
@@ -138,6 +142,7 @@ impl Default for DaemonConfig {
             socket: String::new(),
             idle_exit_secs: 1800,
             lease_grace_secs: 0,
+            stream_gap_window_secs: 600,
         }
     }
 }
@@ -456,6 +461,15 @@ mod tests {
             d.lease_grace_secs, 0,
             "0 = never reap: a detached session lives until killed"
         );
+        assert_eq!(d.stream_gap_window_secs, 600);
+    }
+
+    #[test]
+    fn stream_gap_window_can_be_disabled() {
+        let config =
+            toml::from_str::<crate::config::Config>("[daemon]\nstream_gap_window_secs = 0\n")
+                .unwrap();
+        assert_eq!(config.daemon.stream_gap_window_secs, 0);
     }
 
     #[test]

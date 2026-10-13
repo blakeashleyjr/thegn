@@ -850,15 +850,15 @@ fn shares_upsert_list_and_delete() {
     assert!(db.list_shares().unwrap().is_empty());
 
     // Insert two shares on one worktree, plus one with no URL yet.
-    db.upsert_share("/wt/a", 3000, "bore", Some("http://bore.pub:1"), "up")
+    db.upsert_share("/wt/a", 3000, 1, "bore", Some("http://bore.pub:1"), "up")
         .unwrap();
-    db.upsert_share("/wt/a", 8080, "bore", None, "starting")
+    db.upsert_share("/wt/a", 8080, 2, "bore", None, "starting")
         .unwrap();
     let rows = db.list_shares().unwrap();
     assert_eq!(rows.len(), 2);
 
     // Upsert updates state + url in place (no duplicate row).
-    db.upsert_share("/wt/a", 8080, "bore", Some("http://bore.pub:2"), "up")
+    db.upsert_share("/wt/a", 8080, 3, "bore", Some("http://bore.pub:2"), "up")
         .unwrap();
     let rows = db.list_shares().unwrap();
     assert_eq!(rows.len(), 2);
@@ -869,11 +869,80 @@ fn shares_upsert_list_and_delete() {
     assert_eq!(updated.public_url.as_deref(), Some("http://bore.pub:2"));
     assert_eq!(updated.state, "up");
     assert_eq!(updated.provider, "bore");
+    assert_eq!(updated.generation, 3);
 
     db.delete_share("/wt/a", 3000).unwrap();
     let rows = db.list_shares().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].local_port, 8080);
+}
+
+#[test]
+fn share_delete_is_fenced_on_generation() {
+    let db = db();
+    db.upsert_share("/wt/a", 3000, 7, "bore", Some("https://share.test"), "up")
+        .unwrap();
+    assert!(!db.delete_share_generation("/wt/a", 3000, 6).unwrap());
+    assert_eq!(db.list_shares().unwrap()[0].generation, 7);
+    assert!(db.delete_share_generation("/wt/a", 3000, 7).unwrap());
+    assert!(db.list_shares().unwrap().is_empty());
+
+    db.upsert_share("/wt/a", 3000, 7, "bore", None, "up")
+        .unwrap();
+    db.upsert_share("/wt/a", 3000, 9, "tailscale", None, "up")
+        .unwrap();
+    let maxish = u64::MAX - 3;
+    db.upsert_share("/wt/b", 3000, maxish, "bore", None, "up")
+        .unwrap();
+    let rows = db.list_shares().unwrap();
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.worktree == "/wt/a")
+            .unwrap()
+            .generation,
+        9
+    );
+    let authoritative = rows.iter().find(|row| row.worktree == "/wt/a").unwrap();
+    assert_eq!(authoritative.provider, "tailscale");
+    assert_eq!(authoritative.public_url, None);
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.worktree == "/wt/b")
+            .unwrap()
+            .generation,
+        maxish
+    );
+
+    db.conn()
+        .execute(
+            "INSERT INTO shares(worktree,local_port,provider,public_url,state,created_at,generation)
+             VALUES('/wt/legacy',3000,'bore',NULL,'up',1,0)",
+            [],
+        )
+        .unwrap();
+    assert!(db.delete_share_generation("/wt/legacy", 3000, 888).unwrap());
+    assert!(!db.delete_share_generation("/wt/legacy", 3000, 888).unwrap());
+
+    assert!(!db.rebind_share_generation("/wt/a", 3000, 7, 11).unwrap());
+    assert_eq!(
+        db.list_shares()
+            .unwrap()
+            .iter()
+            .find(|row| row.worktree == "/wt/a")
+            .unwrap()
+            .generation,
+        9
+    );
+    assert!(db.rebind_share_generation("/wt/a", 3000, 9, 11).unwrap());
+    assert_eq!(
+        db.list_shares()
+            .unwrap()
+            .iter()
+            .find(|row| row.worktree == "/wt/a")
+            .unwrap()
+            .generation,
+        11
+    );
 }
 
 #[test]

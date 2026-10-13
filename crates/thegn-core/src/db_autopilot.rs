@@ -9,6 +9,7 @@ use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 
 const ACTIVE_STATES: &str = "('claimed','working','pr_opened','shepherding')";
+const SHEPHERDED_ACTIVE_STATES: &str = "('claimed','working','shepherding')";
 
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutopilotSummary> {
     Ok(AutopilotSummary {
@@ -39,12 +40,13 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutopilotSummary> {
 const SELECT: &str = "SELECT id,provider,account,issue_id,repo_root,worktree,branch,base_branch,state,attempt,dispatch_id,pr_number,pr_head,pr_url,created_at,updated_at,claimed_at,finished_at,last_reason FROM autopilot_runs";
 
 impl AutopilotStore for Db {
-    fn claim_autopilot(
+    fn claim_autopilot_slots(
         &self,
         key: &AutopilotIssueKey,
         repo_root: &str,
         max_concurrent: u32,
         max_attempts: u32,
+        pr_opened_holds_slot: bool,
         now: i64,
     ) -> Result<ClaimOutcome> {
         self.conn().execute_batch("BEGIN IMMEDIATE")?;
@@ -59,8 +61,13 @@ impl AutopilotStore for Db {
                     ClaimOutcome::AlreadyClaimed
                 });
             }
+            let active_states = if pr_opened_holds_slot {
+                ACTIVE_STATES
+            } else {
+                SHEPHERDED_ACTIVE_STATES
+            };
             let active: i64 = self.conn().query_row(
-                &format!("SELECT COUNT(*) FROM autopilot_runs WHERE repo_root=?1 AND state IN {ACTIVE_STATES}"),
+                &format!("SELECT COUNT(*) FROM autopilot_runs WHERE repo_root=?1 AND state IN {active_states}"),
                 [repo_root], |row| row.get(0))?;
             if active >= max_concurrent as i64 {
                 return Ok(ClaimOutcome::AtCapacity);
@@ -214,5 +221,137 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    fn claim_in_state(db: &Db, key: &AutopilotIssueKey, state: AutopilotState) {
+        let claimed = db.claim_autopilot(key, "/repo", 1, 1, 42).unwrap();
+        let id = match claimed {
+            ClaimOutcome::Claimed(row) => row.id,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            db.transition_autopilot(
+                id,
+                AutopilotState::Claimed,
+                AutopilotState::Working,
+                Some("started"),
+                None,
+                43,
+            )
+            .unwrap()
+        );
+        if state == AutopilotState::PrOpened || state == AutopilotState::Shepherding {
+            assert!(
+                db.transition_autopilot(
+                    id,
+                    AutopilotState::Working,
+                    AutopilotState::PrOpened,
+                    Some("opened"),
+                    Some(7),
+                    44,
+                )
+                .unwrap()
+            );
+        }
+        if state == AutopilotState::Shepherding {
+            assert!(
+                db.transition_autopilot(
+                    id,
+                    AutopilotState::PrOpened,
+                    AutopilotState::Shepherding,
+                    Some("queued"),
+                    Some(7),
+                    45,
+                )
+                .unwrap()
+            );
+        }
+        assert_eq!(db.get_autopilot_run(id).unwrap().unwrap().state, state);
+    }
+
+    #[test]
+    fn pr_opened_releases_slot_only_when_queue_is_disabled() {
+        let db = Db::open_memory().unwrap();
+        claim_in_state(
+            &db,
+            &AutopilotIssueKey::new("linear", "work", "THE-56"),
+            AutopilotState::PrOpened,
+        );
+        assert!(matches!(
+            db.claim_autopilot_slots(
+                &AutopilotIssueKey::new("linear", "work", "THE-57"),
+                "/repo",
+                1,
+                1,
+                false,
+                46,
+            )
+            .unwrap(),
+            ClaimOutcome::Claimed(_)
+        ));
+
+        let db = Db::open_memory().unwrap();
+        claim_in_state(
+            &db,
+            &AutopilotIssueKey::new("linear", "work", "THE-56"),
+            AutopilotState::PrOpened,
+        );
+        assert!(matches!(
+            db.claim_autopilot_slots(
+                &AutopilotIssueKey::new("linear", "work", "THE-57"),
+                "/repo",
+                1,
+                1,
+                true,
+                46,
+            )
+            .unwrap(),
+            ClaimOutcome::AtCapacity
+        ));
+
+        let db = Db::open_memory().unwrap();
+        claim_in_state(
+            &db,
+            &AutopilotIssueKey::new("linear", "work", "THE-56"),
+            AutopilotState::PrOpened,
+        );
+        assert!(matches!(
+            db.claim_autopilot(
+                &AutopilotIssueKey::new("linear", "work", "THE-57"),
+                "/repo",
+                1,
+                1,
+                46,
+            )
+            .unwrap(),
+            ClaimOutcome::AtCapacity
+        ));
+    }
+
+    #[test]
+    fn working_and_shepherding_runs_keep_slots_when_queue_is_disabled() {
+        for (issue_id, state) in [
+            ("THE-56", AutopilotState::Working),
+            ("THE-57", AutopilotState::Shepherding),
+        ] {
+            let db = Db::open_memory().unwrap();
+            claim_in_state(
+                &db,
+                &AutopilotIssueKey::new("linear", "work", issue_id),
+                state,
+            );
+            assert!(matches!(
+                db.claim_autopilot_slots(
+                    &AutopilotIssueKey::new("linear", "work", "THE-58"),
+                    "/repo",
+                    1,
+                    1,
+                    false,
+                    46,
+                )
+                .unwrap(),
+                ClaimOutcome::AtCapacity
+            ));
+        }
     }
 }

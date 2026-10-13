@@ -204,7 +204,8 @@ mod db_open_memo;
 /// v78: bounded pipeline leases and an expiry index.
 /// v79: canonical dispatch statuses and admission lookup indexes.
 /// v80: bind PR queue rows to the forge PR URL observed at enqueue.
-pub const SCHEMA_VERSION: i64 = 80;
+/// v81: shares.generation, the share run that owns the row (THE-340).
+pub const SCHEMA_VERSION: i64 = 81;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1547,6 +1548,7 @@ impl Db {
                     crate::db_migrate::verify_v78_schema(&conn)?;
                     crate::db_migrate::verify_v79_schema(&conn)?;
                     crate::db_migrate::verify_v80_schema(&conn)?;
+                    crate::db_migrate::verify_v81_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2211,6 +2213,7 @@ impl Db {
         crate::db_migrate::migrate_v78(&conn)?;
         crate::db_migrate::migrate_v79(&conn)?;
         crate::db_migrate::migrate_v80(&conn)?;
+        crate::db_migrate::migrate_v81(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2229,6 +2232,7 @@ impl Db {
             crate::db_migrate::verify_v78_schema(&conn)?;
             crate::db_migrate::verify_v79_schema(&conn)?;
             crate::db_migrate::verify_v80_schema(&conn)?;
+            crate::db_migrate::verify_v81_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can
@@ -2254,7 +2258,7 @@ impl Db {
         // live state in `session_attention`. Mark the unread ones read so the inbox
         // and the ⚑/✋ counts start clean instead of carrying months of backlog.
         // Gated on the pre-bump on-disk version so it runs exactly once; a deliberate
-        // `thegn notify push --urgency alert` raised after the upgrade is untouched.
+        // `thegn notify push --kind agent_attention` raised after the upgrade is untouched.
         // Best-effort: the DB is a cache, and a fresh DB matches zero rows.
         if ver < 57 {
             let _ = conn.execute(
@@ -2344,6 +2348,7 @@ impl Db {
             public_url: r.get(3)?,
             state: r.get(4)?,
             created_at: r.get(5)?,
+            generation: crate::db_aux::decode_share_generation(r.get(6)?),
         })
     }
 

@@ -101,43 +101,46 @@ pub(crate) fn emit_frame<T: Terminal>(
 pub(crate) fn emit_muse_ready_marker<T: Terminal>(
     buf: &mut BufferedTerminal<T>,
     pending_input: &mut VecDeque<InputEvent>,
-    writer: &crate::frame_writer::FrameWriter,
+    marker: &mut crate::preview_retry::PendingReadyMarker,
+    submit: impl FnMut(Vec<u8>) -> Result<(), Vec<u8>>,
 ) {
-    let has_pty_pending = {
-        let in_queue = pending_input.iter().any(|e| {
-            matches!(
-                e,
-                InputEvent::Key(_) | InputEvent::Mouse(_) | InputEvent::Paste(_)
-            )
-        });
-        if in_queue {
-            true
-        } else {
-            let mut found = false;
-            #[allow(clippy::while_let_loop)]
-            loop {
-                match buf.terminal().poll_input(Some(std::time::Duration::ZERO)) {
-                    Ok(Some(ev)) => {
-                        let is_pty = matches!(
-                            ev,
-                            InputEvent::Key(_) | InputEvent::Mouse(_) | InputEvent::Paste(_)
-                        );
-                        pending_input.push_back(ev);
-                        if is_pty {
-                            found = true;
-                            break;
-                        }
-                    }
-                    _ => break,
-                }
-            }
-            found
-        }
-    };
-    if !has_pty_pending {
+    if pty_input_pending(buf, pending_input) {
+        marker.cancel();
+    } else {
         // Through the writer FIFO, so the marker lands AFTER the frame whose
         // stability it certifies (never mid-frame).
-        writer.submit_oob(b"\x1b]5379;muse:ready\x07".to_vec());
+        marker.offer(submit);
+    }
+}
+
+pub(crate) fn pty_input_pending<T: Terminal>(
+    buf: &mut BufferedTerminal<T>,
+    pending_input: &mut VecDeque<InputEvent>,
+) -> bool {
+    let in_queue = pending_input.iter().any(|e| {
+        matches!(
+            e,
+            InputEvent::Key(_) | InputEvent::Mouse(_) | InputEvent::Paste(_)
+        )
+    });
+    if in_queue {
+        return true;
+    }
+    #[allow(clippy::while_let_loop)]
+    loop {
+        match buf.terminal().poll_input(Some(std::time::Duration::ZERO)) {
+            Ok(Some(ev)) => {
+                let is_pty = matches!(
+                    ev,
+                    InputEvent::Key(_) | InputEvent::Mouse(_) | InputEvent::Paste(_)
+                );
+                pending_input.push_back(ev);
+                if is_pty {
+                    return true;
+                }
+            }
+            _ => return false,
+        }
     }
 }
 

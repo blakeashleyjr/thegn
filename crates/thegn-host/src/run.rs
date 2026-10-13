@@ -1881,44 +1881,10 @@ fn request_preview_scan(
     );
 }
 
-type SharePersistJob = Box<dyn FnOnce(&thegn_core::db::Db) + Send>;
-
 /// Persist a share lifecycle event to the `shares` table (resurrection layer).
 fn persist_share_event(ev: &crate::share::ShareEvent) {
-    use crate::share::ShareEvent;
-    let write: Option<SharePersistJob> = match ev {
-        ShareEvent::Up {
-            worktree,
-            port,
-            provider,
-            url,
-            ..
-        } => {
-            let canonical = url.canonical();
-            let worktree = worktree.clone();
-            let port = *port;
-            let provider = (*provider).to_string();
-            Some(Box::new(move |db: &thegn_core::db::Db| {
-                if let Err(error) =
-                    db.upsert_share(&worktree, port, &provider, Some(&canonical), "up")
-                {
-                    tracing::debug!(target: "thegn::db", error = %error, "share persist failed");
-                }
-            }))
-        }
-        ShareEvent::Failed { worktree, port, .. } | ShareEvent::Down { worktree, port, .. } => {
-            let worktree = worktree.clone();
-            let port = *port;
-            Some(Box::new(move |db: &thegn_core::db::Db| {
-                if let Err(error) = db.delete_share(&worktree, port) {
-                    tracing::debug!(target: "thegn::db", error = %error, "share delete persist failed");
-                }
-            }))
-        }
-    };
-    if let Some(write) = write {
-        crate::db_task::persist(write);
-    }
+    let op = crate::share::share_persist_for(ev);
+    crate::db_task::persist(move |db| crate::share::apply_share_persist(db, op));
 }
 
 /// The active worktree's `(worktree_path, workspace_repo_path)`, or `None` when
@@ -6552,6 +6518,8 @@ async fn event_loop<T: Terminal>(
     let mut preview_gfx = crate::preview_gfx::PreviewGfx::new();
     let mut pending_preview_oob = crate::preview_retry::PendingPreviewOob::default();
     let mut pending_corner_oob = crate::preview_retry::PendingCornerOob::default();
+    let mut pending_clipboard_oob = crate::preview_retry::PendingClipboardOob::default();
+    let mut pending_ready_marker = crate::preview_retry::PendingReadyMarker::default();
     // The git mutation runner + the line-cursor document fetches (staging
     // diff, drilled-commit files, patch doc). Results are tagged with
     // `panel_ui.git.op_gen` so a worktree switch kills strays on arrival.
@@ -6921,7 +6889,7 @@ async fn event_loop<T: Terminal>(
     {
         for row in db.list_shares().unwrap_or_default() {
             if row.state == "up" {
-                let _ = share_supervisor.start(
+                match share_supervisor.start(
                     // best-effort: restore: a failed share restart is re-attempted on the next launch
                     &keymap.config().share,
                     &row.worktree,
@@ -6929,7 +6897,36 @@ async fn event_loop<T: Terminal>(
                     None, // restore re-resolves via `[share] provider`
                     &share_tx,
                     &waker,
-                );
+                ) {
+                    Ok(()) => {
+                        if let Some(generation) =
+                            share_supervisor.generation_of(&row.worktree, row.local_port)
+                        {
+                            let worktree = row.worktree.clone();
+                            let port = row.local_port;
+                            let previous_generation = row.generation;
+                            crate::db_task::persist(move |db| {
+                                match db.rebind_share_generation(
+                                    &worktree,
+                                    port,
+                                    previous_generation,
+                                    generation,
+                                ) {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        tracing::debug!(target: "thegn::db", %worktree, port, previous_generation, generation, "share resurrection generation rebind lost its compare-and-swap")
+                                    }
+                                    Err(error) => {
+                                        tracing::debug!(target: "thegn::db", %error, "share resurrection generation rebind failed")
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::share", %error, worktree = %row.worktree, port = row.local_port, "share resurrection start failed")
+                    }
+                }
             }
         }
     }
@@ -8292,7 +8289,9 @@ async fn event_loop<T: Terminal>(
                 }
                 SidebarOutcome::CopyText(text) => {
                     // OSC-52 to the outer terminal's clipboard (item 27).
-                    writer.submit_oob(crate::copymode::osc52(&text));
+                    pending_clipboard_oob.offer(crate::copymode::osc52(&text), |bytes| {
+                        writer.try_submit_oob(bytes)
+                    });
                     model.status = format!("Copied: {text}");
                     dirty = true;
                     continue;
@@ -8658,6 +8657,19 @@ async fn event_loop<T: Terminal>(
             && mouse_sel.is_none()
             && replay.is_none();
         pending_corner_oob.retry(corner_visible, |bytes| writer.try_submit_oob(bytes));
+        pending_clipboard_oob.retry(|bytes| writer.try_submit_oob(bytes));
+        if muse_ready
+            && pending_ready_marker.is_pending()
+            && !pending_preview_oob.is_pending()
+            && !pending_corner_oob.blocks_output(corner_visible)
+            && !pending_clipboard_oob.is_pending()
+            && !dirty
+            && !full_repaint
+            && dirty_panes.is_empty()
+        {
+            let input_pending = crate::frame_write::pty_input_pending(buf, &mut pending_input);
+            pending_ready_marker.retry(input_pending, |bytes| writer.try_submit_oob(bytes));
+        }
         // Keep the drawer geometry that `compute_chrome` reserves in sync with
         // the live drawer state. When the reservation changes (any open/close
         // path — toggle, direct yazi, Esc, or a worktree switch restoring a
@@ -14585,7 +14597,21 @@ async fn event_loop<T: Terminal>(
             statusbar_dirty = false;
             sidebar_dirty = false;
             if muse_ready {
-                crate::frame_write::emit_muse_ready_marker(buf, &mut pending_input, &writer);
+                crate::frame_write::emit_muse_ready_marker(
+                    buf,
+                    &mut pending_input,
+                    &mut pending_ready_marker,
+                    |bytes| {
+                        if pending_preview_oob.is_pending()
+                            || pending_corner_oob.blocks_output(false)
+                            || pending_clipboard_oob.is_pending()
+                        {
+                            Err(bytes)
+                        } else {
+                            writer.try_submit_oob(bytes)
+                        }
+                    },
+                );
             }
             tracing::debug!(
                 target: "thegn::frame",
@@ -15957,7 +15983,10 @@ async fn event_loop<T: Terminal>(
                                     // SSH); the native tool hits the local
                                     // clipboard directly for terminals that
                                     // ignore OSC52. Belt and braces.
-                                    writer.submit_oob(crate::copymode::osc52(&text));
+                                    pending_clipboard_oob
+                                        .offer(crate::copymode::osc52(&text), |bytes| {
+                                            writer.try_submit_oob(bytes)
+                                        });
                                     let copy_result = crate::clipboard::copy(&text);
                                     // Also land in the default register (persisted),
                                     // so `PasteRegister "` recalls it across restarts.
@@ -19744,7 +19773,10 @@ async fn event_loop<T: Terminal>(
                                                 .get(panel_ui.cursor)
                                                 .and_then(crate::share::ShareView::copy_value)
                                             {
-                                                writer.submit_oob(crate::copymode::osc52(&url));
+                                                pending_clipboard_oob
+                                                    .offer(crate::copymode::osc52(&url), |bytes| {
+                                                        writer.try_submit_oob(bytes)
+                                                    });
                                                 model.status = match crate::clipboard::copy(&url) {
                                                     Ok(()) => "Copying link to clipboard…".into(),
                                                     Err(error) => {
@@ -19759,7 +19791,10 @@ async fn event_loop<T: Terminal>(
                                                 forward_url_at(&model, panel_ui.cursor)
                                                     .map(str::to_owned)
                                             {
-                                                writer.submit_oob(crate::copymode::osc52(&url));
+                                                pending_clipboard_oob
+                                                    .offer(crate::copymode::osc52(&url), |bytes| {
+                                                        writer.try_submit_oob(bytes)
+                                                    });
                                                 model.status = match crate::clipboard::copy(&url) {
                                                     Ok(()) => "Copying link to clipboard…".into(),
                                                     Err(error) => {
@@ -19996,7 +20031,10 @@ async fn event_loop<T: Terminal>(
                                 .and_then(crate::panel::docs::copy_target_sha)
                             {
                                 Some(sha) => {
-                                    writer.submit_oob(crate::copymode::osc52(&sha));
+                                    pending_clipboard_oob
+                                        .offer(crate::copymode::osc52(&sha), |bytes| {
+                                            writer.try_submit_oob(bytes)
+                                        });
                                     model.status = format!("Copied {sha}");
                                 }
                                 None => model.status = "No commit data yet".into(),
@@ -20536,11 +20574,18 @@ async fn event_loop<T: Terminal>(
                                 Some((wt, port)) => {
                                     let stopped = share_supervisor.stop(&wt, Some(port));
                                     let did_stop = !stopped.is_empty();
-                                    let stopped_ports = stopped;
+                                    let stopped_runs = stopped;
                                     crate::db_task::persist(move |db| {
-                                        for port in stopped_ports {
-                                            if let Err(error) = db.delete_share(&wt, port) {
-                                                tracing::debug!(target: "thegn::db", %error, "stopped share cache delete failed");
+                                        for (port, generation) in stopped_runs {
+                                            match db.delete_share_generation(&wt, port, generation)
+                                            {
+                                                Ok(true) => {}
+                                                Ok(false) => {
+                                                    tracing::debug!(target: "thegn::db", %wt, port, generation, "stale stopped share delete left another generation intact")
+                                                }
+                                                Err(error) => {
+                                                    tracing::debug!(target: "thegn::db", %error, "stopped share cache delete failed")
+                                                }
                                             }
                                         }
                                     });
@@ -20920,7 +20965,10 @@ async fn event_loop<T: Terminal>(
                             .map(|l| l.original.clone());
                             match line {
                                 Some(text) => {
-                                    writer.submit_oob(crate::copymode::osc52(&text));
+                                    pending_clipboard_oob
+                                        .offer(crate::copymode::osc52(&text), |bytes| {
+                                            writer.try_submit_oob(bytes)
+                                        });
                                     model.status = "Log line copied".into();
                                 }
                                 None => model.status = "No log line selected".into(),
@@ -20938,7 +20986,10 @@ async fn event_loop<T: Terminal>(
                                 model.status = "No matching log lines to copy".into();
                             } else {
                                 let text = lines.join("\n");
-                                writer.submit_oob(crate::copymode::osc52(&text));
+                                pending_clipboard_oob
+                                    .offer(crate::copymode::osc52(&text), |bytes| {
+                                        writer.try_submit_oob(bytes)
+                                    });
                                 model.status = format!("Copied {} log lines", lines.len());
                             }
                             true
@@ -23894,7 +23945,10 @@ async fn event_loop<T: Terminal>(
                                         .unwrap_or_else(|| crate::copymode::whole(emu));
                                     let text = crate::copymode::extract(emu, &sel);
                                     if !text.trim().is_empty() {
-                                        writer.submit_oob(crate::copymode::osc52(&text));
+                                        pending_clipboard_oob
+                                            .offer(crate::copymode::osc52(&text), |bytes| {
+                                                writer.try_submit_oob(bytes)
+                                            });
                                         let copy_result = crate::clipboard::copy(&text);
                                         store_yank(
                                             &mut registers,
