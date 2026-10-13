@@ -3,7 +3,6 @@
 
 use crate::seg::{Line, Seg, seg, sp};
 use thegn_core::theme::Hue;
-use thegn_core::viz;
 
 use super::{
     PanelHit, PanelRow, Section, SectionCtx, ac, d, f, g, g2, g3, hint_row, hue, pr_state_hue,
@@ -380,7 +379,7 @@ fn full_pr(ctx: &SectionCtx) -> Vec<PanelRow> {
             .map(PanelRow::plain)
             .collect::<Vec<_>>();
         for (index, row) in right.iter().enumerate() {
-            if let Some(hit) = row.hit.clone()
+            if let Some(hit) = row.hit
                 && let Some(target) = combined.get_mut(index)
             {
                 target.hit = Some(hit);

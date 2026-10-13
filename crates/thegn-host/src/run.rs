@@ -402,11 +402,9 @@ fn kick_git_docs_fetch(
         let now = thegn_core::util::now();
         let epochs = git.commit_times(&loc, WEEKS).unwrap_or_default();
         let data = GitDocs {
-            heat: thegn_core::gitviz::heat_grid(&epochs, now, WEEKS),
             weekly: thegn_core::gitviz::weekly_counts(&epochs, now, WEEKS),
             log: git.log_graph(&loc, 40).unwrap_or_default(),
             total: epochs.len() as u32,
-            head_branch: git.current_branch(&loc).unwrap_or_default(),
         };
         if tx.send((generation, DocsPayload::Git(data))).is_ok() {
             let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path

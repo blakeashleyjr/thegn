@@ -4,7 +4,6 @@
 //! a Full view that owns the whole band (the former overlay layouts).
 
 use thegn_core::theme::Hue;
-use thegn_core::viz;
 
 use crate::chrome::S;
 use crate::seg::{self, Line, Seg, Tok, seg, sp};
@@ -192,14 +191,6 @@ fn rule() -> PanelRow {
     PanelRow::plain(Line::Fill {
         ch: '╌', fg: g3()
     })
-}
-
-/// The loading line for a body whose document fetch is still out.
-fn spinner_row(tick: u64, what: &str) -> PanelRow {
-    PanelRow::plain(Line::segs(vec![
-        seg(ac(), viz::spin(tick).to_string()),
-        seg(d(), format!(" loading {what}…")),
-    ]))
 }
 
 /// Compose two columns of seg rows into single lines: the left column is
@@ -1256,7 +1247,6 @@ mod spec {
     fn docs() -> PanelDocs {
         let mut docs = PanelDocs {
             git: Some(GitDocs {
-                heat: vec![[0, 1, 2, 3, 4, 0, 1]; 36],
                 weekly: vec![3; 36],
                 log: vec![thegn_svc::git::LogRow {
                     graph: "*".into(),
@@ -1265,7 +1255,6 @@ mod spec {
                     refs: "HEAD -> main".into(),
                 }],
                 total: 108,
-                head_branch: "main".into(),
             }),
             cfg_keys: crate::keyhint::cheatsheet_groups(&thegn_core::config::Config::default()),
             ..Default::default()
