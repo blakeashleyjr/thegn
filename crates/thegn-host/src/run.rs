@@ -3451,19 +3451,26 @@ pub(crate) fn begin_worktree_preset(
         return;
     }
     *create_gen += 1;
-    let candidate = thegn_core::worktree::candidate_name(cfg);
+    let (candidate, exact_branch) = match &name {
+        crate::keymap::NameSpec::Exact(branch) => (branch.clone(), true),
+        crate::keymap::NameSpec::Random | crate::keymap::NameSpec::Fixed(_) => {
+            (thegn_core::worktree::candidate_name(cfg), false)
+        }
+    };
     let env = wizard::ambient_env_name_live(cfg, &root);
     let sandbox = sandbox.unwrap_or_else(|| cfg.sandbox.default_backend.as_str().to_string());
     let agent = agent.unwrap_or_else(|| "shell".to_string());
     let name_choice = match name {
         crate::keymap::NameSpec::Random => wizard::NameChoice::Generated,
         crate::keymap::NameSpec::Fixed(tail) => wizard::NameChoice::Human(tail),
+        crate::keymap::NameSpec::Exact(_) => wizard::NameChoice::Exact,
     };
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
     let ctx = wizard::WorkerCtx {
         cfg: cfg.clone(),
         repo_root: root,
         candidate: candidate.clone(),
+        exact_branch,
         generation: *create_gen,
         db_path: None,
         base_override: base,
@@ -20297,16 +20304,21 @@ async fn event_loop<T: Terminal>(
                                                 .iter()
                                                 .map(|g| (g.path.clone(), g.active_tab))
                                                 .collect();
-                                            let active_root = thegn_core::repo::main_worktree(
-                                                &active_tab_path(&session),
-                                            );
-                                            match crate::panel::sections::git::pr_row_at(
+                                            let active_path = active_tab_path(&session);
+                                            let active_repo =
+                                                crate::handlers::take_me_there::active_repo_path(
+                                                    &active_path.to_string_lossy(),
+                                                    &model.sidebar_db_worktrees,
+                                                );
+                                            match crate::handlers::take_me_there::pr_row_at(
                                                 &model.panel,
                                                 panel_ui.width.is_expanded(),
                                                 panel_ui.cursor,
                                             ) {
                                                 Some(
-                                                    crate::panel::sections::git::PrRow::Thread(_),
+                                                    crate::handlers::take_me_there::PrRow::Thread(
+                                                        _,
+                                                    ),
                                                 ) => match crate::actions::open_pr_view(
                                                     &model,
                                                     &session,
@@ -20319,18 +20331,17 @@ async fn event_loop<T: Terminal>(
                                                     None => model.status = "No pull request".into(),
                                                 },
                                                 Some(
-                                                    crate::panel::sections::git::PrRow::OpenPr(p),
+                                                    crate::handlers::take_me_there::PrRow::OpenPr(
+                                                        p,
+                                                    ),
                                                 ) => {
                                                     let p = p.clone();
-                                                    let linked = active_root
-                                                        .as_ref()
-                                                        .and_then(|root| {
+                                                    let linked = active_repo
+                                                        .and_then(|repo| {
                                                             model.sidebar_db_worktrees.iter().find(
                                                                 |w| {
                                                                     w.branch == p.head_ref
-                                                                        && std::path::Path::new(
-                                                                            &w.repo_path,
-                                                                        ) == root
+                                                                        && w.repo_path == repo
                                                                 },
                                                             )
                                                         })
@@ -20341,9 +20352,32 @@ async fn event_loop<T: Terminal>(
                                                                 &model.sidebar_db_worktrees,
                                                             )
                                                         });
-                                                    if let Some(target) = linked { let hydrate = activate_row!(target); sb.focus_active_row(&mut model); model.status = format!("Jumped to {}", p.head_ref); if hydrate { kick_model_hydration!(); } }
-                                                    else if let Some((owner, repo)) = thegn_core::forge::model::owner_repo_from_url(&p.url) { pr_view = Some(crate::actions::open_pr_view_number(owner, repo, p.number, p.url.clone(), crate::actions::PrViewOpenCtx { session: &session, gen_ctr: &mut pr_view_gen, tx: &pr_view_tx, waker: &waker, refresh_tx: &refresh_tx })); }
-                                                    else { model.status = "Cannot identify this pull request".into(); }
+                                                    if let Some(target) = linked {
+                                                        let hydrate = activate_row!(target);
+                                                        sb.focus_active_row(&mut model);
+                                                        model.status = format!("Jumped to {}", p.head_ref);
+                                                        if hydrate {
+                                                            kick_model_hydration!();
+                                                        }
+                                                    } else if let Some((owner, repo)) =
+                                                        thegn_core::forge::model::owner_repo_from_url(&p.url)
+                                                    {
+                                                        pr_view = Some(crate::actions::open_pr_view_number(
+                                                            owner,
+                                                            repo,
+                                                            p.number,
+                                                            p.url.clone(),
+                                                            crate::actions::PrViewOpenCtx {
+                                                                session: &session,
+                                                                gen_ctr: &mut pr_view_gen,
+                                                                tx: &pr_view_tx,
+                                                                waker: &waker,
+                                                                refresh_tx: &refresh_tx,
+                                                            },
+                                                        ));
+                                                    } else {
+                                                        model.status = "Cannot identify this pull request".into();
+                                                    }
                                                 }
                                                 None => match crate::actions::open_pr_view(
                                                     &model,
@@ -20460,17 +20494,50 @@ async fn event_loop<T: Terminal>(
                                                 .collect();
                                             let active_path = active_tab_path(&session);
                                             let active_path_text = active_path.to_string_lossy();
-                                            let active_repo = model
-                                                .sidebar_db_worktrees
-                                                .iter()
-                                                .find(|w| w.path == active_path_text.as_ref())
-                                                .map(|w| w.repo_path.as_str());
+                                            let active_repo =
+                                                crate::handlers::take_me_there::active_repo_path(
+                                                    active_path_text.as_ref(),
+                                                    &model.sidebar_db_worktrees,
+                                                );
                                             if let Some(row) = rows.get(panel_ui.cursor) {
-                                                match crate::panel::sections::my_work::enter_target(row, &groups, &model.sidebar_db_worktrees, active_repo) {
-                                                    crate::panel::sections::my_work::EnterTarget::Jump(target) => { let hydrate = activate_row!(target); sb.focus_active_row(&mut model); model.status = format!("Jumped to {}", row.number); if hydrate { kick_model_hydration!(); } }
-                                                    crate::panel::sections::my_work::EnterTarget::PrView { owner, repo, number } => pr_view = Some(crate::actions::open_pr_view_number(owner, repo, number, row.url.clone(), crate::actions::PrViewOpenCtx { session: &session, gen_ctr: &mut pr_view_gen, tx: &pr_view_tx, waker: &waker, refresh_tx: &refresh_tx })),
-                                                    crate::panel::sections::my_work::EnterTarget::Browser(url) => model.status = crate::actions::open_status(open_url_detached(&url), || format!("Opened {} in browser", row.number)),
-                                                    crate::panel::sections::my_work::EnterTarget::Nothing => model.status = "Nothing to open for this row".into(),
+                                                match crate::panel::sections::my_work::enter_target(
+                                                    row,
+                                                    &groups,
+                                                    &model.sidebar_db_worktrees,
+                                                    active_repo,
+                                                ) {
+                                                    crate::panel::sections::my_work::EnterTarget::Jump(target) => {
+                                                        let hydrate = activate_row!(target);
+                                                        sb.focus_active_row(&mut model);
+                                                        model.status = format!("Jumped to {}", row.number);
+                                                        if hydrate {
+                                                            kick_model_hydration!();
+                                                        }
+                                                    }
+                                                    crate::panel::sections::my_work::EnterTarget::PrView { owner, repo, number } => {
+                                                        pr_view = Some(crate::actions::open_pr_view_number(
+                                                            owner,
+                                                            repo,
+                                                            number,
+                                                            row.url.clone(),
+                                                            crate::actions::PrViewOpenCtx {
+                                                                session: &session,
+                                                                gen_ctr: &mut pr_view_gen,
+                                                                tx: &pr_view_tx,
+                                                                waker: &waker,
+                                                                refresh_tx: &refresh_tx,
+                                                            },
+                                                        ));
+                                                    }
+                                                    crate::panel::sections::my_work::EnterTarget::Browser(url) => {
+                                                        model.status = crate::actions::open_status(
+                                                            open_url_detached(&url),
+                                                            || format!("Opened {} in browser", row.number),
+                                                        );
+                                                    }
+                                                    crate::panel::sections::my_work::EnterTarget::Nothing => {
+                                                        model.status = "Nothing to open for this row".into();
+                                                    }
                                                 }
                                             } else {
                                                 model.status = "No work row selected".into();
@@ -20983,20 +21050,22 @@ async fn event_loop<T: Terminal>(
                                 .iter()
                                 .map(|g| (g.path.clone(), g.active_tab))
                                 .collect();
-                            let root = thegn_core::repo::main_worktree(&active_tab_path(&session));
-                            match crate::panel::sections::git::pr_row_at(
+                            let active_path = active_tab_path(&session);
+                            let active_repo = crate::handlers::take_me_there::active_repo_path(
+                                &active_path.to_string_lossy(),
+                                &model.sidebar_db_worktrees,
+                            );
+                            match crate::handlers::take_me_there::pr_row_at(
                                 &model.panel,
                                 panel_ui.width.is_expanded(),
                                 panel_ui.cursor,
                             ) {
-                                Some(crate::panel::sections::git::PrRow::OpenPr(p)) => {
+                                Some(crate::handlers::take_me_there::PrRow::OpenPr(p)) => {
                                     let p = p.clone();
-                                    let linked = root
-                                        .as_ref()
-                                        .and_then(|root| {
+                                    let linked = active_repo
+                                        .and_then(|repo| {
                                             model.sidebar_db_worktrees.iter().find(|w| {
-                                                w.branch == p.head_ref
-                                                    && std::path::Path::new(&w.repo_path) == root
+                                                w.branch == p.head_ref && w.repo_path == repo
                                             })
                                         })
                                         .and_then(|w| {
@@ -21013,10 +21082,10 @@ async fn event_loop<T: Terminal>(
                                         if hydrate {
                                             kick_model_hydration!();
                                         }
-                                    } else if let Some(root) = root {
+                                    } else if let Some(root) = active_repo {
                                         crate::run::begin_worktree_preset(
-                                            root,
-                                            crate::keymap::NameSpec::Fixed(p.head_ref.clone()),
+                                            std::path::PathBuf::from(root),
+                                            crate::keymap::NameSpec::Exact(p.head_ref.clone()),
                                             None,
                                             None,
                                             Some(format!("origin/{}", p.head_ref)),

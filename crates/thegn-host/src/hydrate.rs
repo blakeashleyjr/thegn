@@ -4953,24 +4953,33 @@ pub(crate) fn spawn_my_work_refresh(
         // Repo-local links and roots are display/action metadata, sampled off
         // the event loop alongside the feed itself.
         if let Ok(db) = thegn_core::db::Db::open() {
-            match db.issue_link_worktrees() {
-                Ok(links) => {
-                    let mut newest = std::collections::HashMap::new();
-                    for (issue_id, path) in links {
-                        newest.entry(issue_id).or_insert(path);
-                    }
-                    for row in &mut rows {
-                        if let Some(path) = row.issue_id.as_ref().and_then(|id| newest.get(id)) {
-                            row.worktree_path = Some(path.clone());
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::debug!(target: "thegn::db", %error, "issue link lookup failed")
-                }
-            }
             match db.worktrees() {
                 Ok(worktrees) => {
+                    let live_paths: std::collections::HashSet<String> = worktrees
+                        .iter()
+                        .map(|worktree| worktree.worktree.clone())
+                        .collect();
+                    match db.issue_link_worktrees() {
+                        Ok(links) => {
+                            let mut newest = std::collections::HashMap::new();
+                            for (issue_id, path) in links
+                                .into_iter()
+                                .filter(|(_, path)| live_paths.contains(path))
+                            {
+                                newest.entry(issue_id).or_insert(path);
+                            }
+                            for row in &mut rows {
+                                if let Some(path) =
+                                    row.issue_id.as_ref().and_then(|id| newest.get(id))
+                                {
+                                    row.worktree_path = Some(path.clone());
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(target: "thegn::db", %error, "issue link lookup failed")
+                        }
+                    }
                     let roots: std::collections::HashMap<String, String> = worktrees
                         .into_iter()
                         .filter(|wt| Path::new(&wt.repo_root).is_dir())
@@ -5008,30 +5017,13 @@ pub(crate) fn spawn_my_work_refresh(
                                     Some((ws.repo_path, identity))
                                 })
                                 .collect();
-                        let github_issue_identity = |url: &str| {
-                            let rest = url
-                                .strip_prefix("https://")
-                                .or_else(|| url.strip_prefix("http://"))?;
-                            let (host, path) = rest.split_once('/')?;
-                            let parts: Vec<&str> = path.split('/').collect();
-                            if parts.len() < 4
-                                || parts[2] != "issues"
-                                || parts[3].parse::<u64>().is_err()
-                            {
-                                return None;
-                            }
-                            thegn_core::forge::model::repo_identity_from_remote_url(&format!(
-                                "https://{host}/{}/{}",
-                                parts[0], parts[1]
-                            ))
-                        };
                         for row in &mut rows {
                             let expected = match row.kind {
                                 WorkKind::Pr => {
                                     thegn_core::forge::model::repo_identity_from_pr_url(&row.url)
                                 }
                                 WorkKind::Issue if row.provider == "github" => {
-                                    github_issue_identity(&row.url)
+                                    thegn_core::forge::model::repo_identity_from_pr_url(&row.url)
                                 }
                                 _ => None,
                             };
