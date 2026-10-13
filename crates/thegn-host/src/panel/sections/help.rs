@@ -350,7 +350,7 @@ mod tests {
     fn scroll_for_anchor_round_trips_at_two_panel_widths() {
         let reg = crate::help::pages::build_registry(&Config::default()).0;
         let page = "panel";
-        for cols in [28, 64] {
+        for cols in [28usize, 64] {
             let width = cols.saturating_sub(1).max(8);
             let rendered = crate::help::render::render_page(
                 &crate::help::render::page_blocks(&reg, page),
