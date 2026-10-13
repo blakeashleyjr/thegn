@@ -271,7 +271,7 @@ mod tests {
                     "{context} on {page_id} has no heading and is not an accepted H1 fallback"
                 );
                 assert!(
-                    rendered.headings.first().is_some(),
+                    !rendered.headings.is_empty(),
                     "{page_id} has no H1 for the accepted fallback {context}"
                 );
             }
