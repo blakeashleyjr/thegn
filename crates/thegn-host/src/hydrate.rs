@@ -2685,13 +2685,9 @@ pub(crate) fn build_model(
         // Host-path identity, never `loc.path()`: a provider worktree's
         // in-sandbox path (`/workspace`) is shared by every provider worktree,
         // so both the container name and the audit-event key collided.
-        active_container_name: thegn_core::sandbox::container_name_with_profile(
+        active_container_name: thegn_core::sandbox::container_name_for_config_profile(
             &thegn_core::remote::GitLoc::worktree_cache_key(&cwd),
-            if hints.profile.is_empty() {
-                None
-            } else {
-                Some(&hints.profile)
-            },
+            &hints.profile,
         ),
         active_sandbox_backend,
         active_placement_kind,
