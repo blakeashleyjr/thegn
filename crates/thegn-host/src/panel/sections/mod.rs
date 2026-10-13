@@ -724,9 +724,10 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             // lifecycle events stays quiet — but it must not claim "inbox
             // zero" while the open list shows unread rows: those surface as a
             // dim low-priority count instead.
-            let alert = model.panel.alert_notifications;
-            let unread = model.panel.unread_notifications;
-            let raw_unread = model.panel.notifications.iter().filter(|n| !n.read).count();
+            let counts = model.panel.notification_counts();
+            let alert = counts.alert;
+            let unread = counts.alert + counts.notice;
+            let raw_unread = counts.info;
             if alert > 0 {
                 vec![seg(hue(Hue::Red), format!("⚑ {alert}"))]
             } else if unread > 0 {

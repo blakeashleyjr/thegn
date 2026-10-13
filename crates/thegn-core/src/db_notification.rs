@@ -92,7 +92,7 @@ impl NotificationStore for Db {
     fn get_unread_notifications(&self) -> Result<Vec<crate::notification::Notification>> {
         self.notifications_query(
             "SELECT id,kind,issue_id,message,created_at_ms,read,worktree_path \
-             FROM notifications WHERE read=0 ORDER BY created_at_ms DESC",
+             FROM notifications WHERE read=0 ORDER BY created_at_ms DESC, id DESC",
             usize::MAX,
         )
     }
@@ -104,7 +104,19 @@ impl NotificationStore for Db {
     ) -> Result<Vec<crate::notification::Notification>> {
         self.notifications_query(
             "SELECT id,kind,issue_id,message,created_at_ms,read,worktree_path \
-             FROM notifications ORDER BY created_at_ms DESC",
+             FROM notifications ORDER BY created_at_ms DESC, id DESC",
+            limit,
+        )
+    }
+
+    /// Inbox ordering keeps every unread row ahead of read history.
+    fn get_inbox_notifications(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::notification::Notification>> {
+        self.notifications_query(
+            "SELECT id,kind,issue_id,message,created_at_ms,read,worktree_path \
+             FROM notifications ORDER BY read ASC, created_at_ms DESC, id DESC",
             limit,
         )
     }
@@ -710,6 +722,69 @@ fn map_dispatch_base(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::issue::Ag
 mod tests {
     use super::*;
     use crate::store::NotificationStore;
+
+    #[test]
+    fn equal_timestamps_list_newest_id_first() {
+        let db = Db::open_memory().unwrap();
+        for i in 0..5 {
+            db.put_notification("assigned", &format!("THE-{i}"), "row", "")
+                .unwrap();
+        }
+        db.conn()
+            .execute("UPDATE notifications SET created_at_ms=1000", [])
+            .unwrap();
+
+        for rows in [
+            db.get_all_notifications(100).unwrap(),
+            db.get_unread_notifications().unwrap(),
+        ] {
+            assert!(rows.windows(2).all(|pair| pair[0].id > pair[1].id));
+        }
+    }
+
+    #[test]
+    fn inbox_query_puts_unread_first() {
+        let db = Db::open_memory().unwrap();
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            ids.push(
+                db.put_notification("assigned", &format!("U-{i}"), "u", "")
+                    .unwrap(),
+            );
+        }
+        for i in 0..5 {
+            ids.push(
+                db.put_notification("assigned", &format!("R-{i}"), "r", "")
+                    .unwrap(),
+            );
+        }
+        for (index, id) in ids.iter().enumerate() {
+            db.conn()
+                .execute(
+                    "UPDATE notifications SET created_at_ms=?1, read=?2 WHERE id=?3",
+                    rusqlite::params![
+                        if index < 3 {
+                            index as i64 + 1
+                        } else {
+                            index as i64 + 97
+                        },
+                        if index >= 3 { 1i64 } else { 0i64 },
+                        id
+                    ],
+                )
+                .unwrap();
+        }
+
+        let rows = db.get_inbox_notifications(4).unwrap();
+        assert_eq!(rows.len(), 4);
+        assert!(rows[..3].iter().all(|row| !row.read));
+        assert_eq!(rows[3].id, ids[7]);
+        assert!(
+            rows.windows(2)
+                .take(2)
+                .all(|pair| pair[0].created_at_ms > pair[1].created_at_ms)
+        );
+    }
 
     #[test]
     fn dispatch_roster_matches_typed_fields_without_loading_text_bodies() {

@@ -17444,6 +17444,32 @@ async fn event_loop<T: Terminal>(
                                 continue;
                             }
                             if let menu::MenuChoice::Confirm {
+                                tag: "notifications-clear-all",
+                                ..
+                            } = &choice
+                            {
+                                crate::handlers::attention::mark_all_read(
+                                    &mut model,
+                                    &refresh_tx,
+                                    &waker,
+                                );
+                                hydration_gen += 1;
+                                crate::hydrate::spawn_model_hydration(
+                                    model_tx.clone(),
+                                    hydration_gen,
+                                    session.clone_for_hydrate(),
+                                    Some(waker.clone()),
+                                    crate::hydrate::HydrateHints {
+                                        open: panel_ui.open,
+                                        expanded: panel_ui.width.is_expanded(),
+                                        ..Default::default()
+                                    },
+                                    None,
+                                );
+                                dirty = true;
+                                continue;
+                            }
+                            if let menu::MenuChoice::Confirm {
                                 tag: "env-remove",
                                 arg,
                             } = &choice
@@ -20716,32 +20742,17 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
-                        // `a` clears all — the one clear-all key shared with the
-                        // unified overlay, and routed through the same handler so
-                        // it means the same thing. Crucially that also ACKS the
-                        // live needs-you signals: a CI failure is derived from the
-                        // PR/CI cache rather than an inbox row, so marking
-                        // notifications read alone left the `✋` badge lit and it
-                        // reappeared on the next hydration pass.
+                        // `a` asks for confirmation before clearing the inbox
+                        // and acknowledging live needs-you signals.
                         (Section::Notifications, KeyCode::Char('a')) => {
-                            crate::handlers::attention::mark_all_read(
-                                &mut model,
-                                &refresh_tx,
-                                &waker,
-                            );
-                            hydration_gen += 1;
-                            crate::hydrate::spawn_model_hydration(
-                                model_tx.clone(),
-                                hydration_gen,
-                                session.clone_for_hydrate(),
-                                Some(waker.clone()),
-                                crate::hydrate::HydrateHints {
-                                    open: panel_ui.open,
-                                    expanded: panel_ui.width.is_expanded(),
-                                    ..Default::default()
-                                },
-                                None,
-                            );
+                            match crate::handlers::attention::clear_all_confirm(
+                                &model,
+                                crate::panel::scope::system_all(),
+                                !panel_ui.notifications_filter.is_empty(),
+                            ) {
+                                Some(menu) => active_menu = Some(menu),
+                                None => model.status = "inbox already clear".into(),
+                            }
                             true
                         }
                         (Section::Notifications, KeyCode::Char('d')) => {
