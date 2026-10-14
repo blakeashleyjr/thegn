@@ -1896,8 +1896,8 @@ mod tests {
         );
         let head = test_git_out(&repo, &["rev-parse", "HEAD"]);
         assert!(
-            test_git_cmd(remote.path())
-                .args(["update-ref", "refs/heads/feature/login", &head])
+            test_git_cmd(&repo)
+                .args(["push", "-q", "origin", "HEAD:refs/heads/feature/login"])
                 .status()
                 .unwrap()
                 .success()
