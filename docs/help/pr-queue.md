@@ -3,7 +3,7 @@ id: pr-queue
 title: PR queue
 parent: workflows
 order: 3
-contexts: [panel:prq]
+contexts: [panel:prq#watching]
 actions: [open-pr-queue, pr-queue-add, pr-queue-refresh, pr-review-task-handle]
 ---
 
@@ -159,6 +159,6 @@ in the notifications inbox.
 
 In the section: `a` add · `x` remove · `r` re-watch a settled row after forge
 verification ·
-`h` handle a queued review task · `c` clear · `D` refresh now · `o` open in a
-browser. CLI equivalents for queue rows are
+`h` handle a queued review task · `c` clear after a second press · `D` refresh
+now · `o` open in a browser. CLI equivalents for queue rows are
 `thegn pr queue add|rm|clear|drain|list|status`, all with `--json`.

@@ -103,9 +103,9 @@ else. A week is how long you have to notice.
 - **Sweep merged** (palette, or `thegn merge sweep`) collects everything
   already past its grace period, now. `--force` ignores the remaining
   time and clears the lot.
-- The _merge_ section's **`c`** does the same for that repo: it clears the
-  landed rows and sweeps their worktrees together. Under `expire` a landed
-  row _is_ the grace-period clock, so clearing one without its worktree
+- The _merge_ section's **`c`** does the same for that repo after a second
+  press: it clears the landed rows and sweeps their worktrees together. Under
+  `expire` a landed row _is_ the grace-period clock, so clearing one without its worktree
   would strand the worktree in _Merged_ with nothing left to collect it.
 - A merged worktree you have gone back to and **edited is never swept**,
   forced or not. Commit or discard the changes and it becomes eligible

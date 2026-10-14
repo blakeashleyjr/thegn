@@ -188,7 +188,7 @@ mod tests {
                 page: "git-and-diffs".to_string(),
                 reg: Some(Arc::clone(&reg)),
             },
-            scroll: 8,
+            scroll: 6,
             ..Default::default()
         };
         let ctx = crate::panel::sections::SectionCtx {
@@ -199,6 +199,13 @@ mod tests {
         };
         crate::panel::sections::help::content(&ctx);
         let panel_anchor = crate::panel::sections::help::anchor_at(&ui).unwrap();
+        assert_eq!(
+            panel_anchor,
+            HelpAnchor {
+                heading: 0,
+                offset: 6,
+            }
+        );
         let focus = crate::focus::FocusState {
             zone: crate::focus::Zone::Panel,
             ..Default::default()
@@ -256,16 +263,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{context} on {page_id} has no section heading"));
                 assert!(ordinal > 0, "{context} resolves to the page H1");
             } else if heading.is_none() {
-                const ACCEPTED_H1_FALLBACKS: &[&str] = &[
-                    "panel:changes",
-                    "panel:commits",
-                    "panel:branches",
-                    "panel:stash",
-                    "panel:files",
-                    "panel:sandbox",
-                    "panel:prq",
-                    "panel:keys",
-                ];
+                const ACCEPTED_H1_FALLBACKS: &[&str] = &[];
                 assert!(
                     ACCEPTED_H1_FALLBACKS.contains(&context.as_str()),
                     "{context} on {page_id} has no heading and is not an accepted H1 fallback"
