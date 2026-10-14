@@ -80,7 +80,8 @@ fn run_in(spec: &SandboxSpec, cmd: &str) -> String {
     String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr)
 }
 
-// G1: configured hostname rules remain labelled, and OCI never receives --dns.
+// G1: configured hostname rules remain labelled; the unit test
+// `no_dns_flag_in_oci_create_opts` covers the OCI create options directly.
 #[test]
 fn g1_hostname_rules_do_not_inject_dns_flag() {
     if skip() {
@@ -96,15 +97,14 @@ fn g1_hostname_rules_do_not_inject_dns_flag() {
             .unwrap()
             .contains("DNS-name rules only")
     );
-    let argv = enter_argv(&spec, "true").expect("valid volume names");
-    assert!(!argv.iter().any(|arg| arg == "--dns"), "{argv:?}");
     ensure(&spec).expect("ensure failed");
     let out = run_in(&spec, "true");
     force_rm(name);
     assert!(out.is_empty(), "true should produce no output: {out}");
 }
 
-// G3: allow lists also remain warnings and never add an OCI DNS override.
+// G3: allow lists also remain warnings; the unit test
+// `no_dns_flag_in_oci_create_opts` covers the OCI create options directly.
 #[test]
 fn g3_allow_list_does_not_inject_dns_flag() {
     if skip() {
@@ -115,8 +115,6 @@ fn g3_allow_list_does_not_inject_dns_flag() {
     let mut spec = spec_with_network_block(name, vec![]);
     spec.network_allow = vec!["api.example.com".into()];
     assert!(hostname_rules_note(&spec).is_some());
-    let argv = enter_argv(&spec, "true").expect("valid volume names");
-    assert!(!argv.iter().any(|arg| arg == "--dns"), "{argv:?}");
     ensure(&spec).expect("ensure failed");
     let out = run_in(&spec, "true");
     force_rm(name);
@@ -135,6 +133,7 @@ fn g2_universal_block_runs_offline() {
     }
     let name = "thegn-e2e-g2";
     force_rm(name);
+    std::fs::create_dir_all("/tmp/tg-e2e-net").expect("create Podman worktree bind source");
     let cfg = SandboxConfig {
         enabled: true,
         backend: SandboxBackend::Podman,
@@ -163,7 +162,8 @@ fn g2_universal_block_runs_offline() {
     );
 }
 
-// G4: no hostname rules means no DNS override, and the container still launches.
+// G4: empty hostname rules still launch; the unit test
+// `no_dns_flag_in_oci_create_opts` covers the OCI create options directly.
 #[test]
 fn g4_empty_rules_launch_without_dns_override() {
     if skip() {
@@ -172,8 +172,6 @@ fn g4_empty_rules_launch_without_dns_override() {
     let name = "thegn-e2e-g4";
     force_rm(name);
     let spec = spec_with_network_block(name, vec![]);
-    let argv = enter_argv(&spec, "true").expect("valid volume names");
-    assert!(!argv.iter().any(|arg| arg == "--dns"), "{argv:?}");
     ensure(&spec).expect("ensure failed");
     let out = run_in(&spec, "true");
     force_rm(name);

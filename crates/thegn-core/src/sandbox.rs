@@ -1103,6 +1103,7 @@ fn resolve_placed_with(
     if backend == Backend::None && placement.is_local() {
         return None;
     }
+    let universal_deny = lower_universal_deny(Network::Nat, &cfg.network_block) == Network::None;
 
     let image = {
         let t = cfg.image.trim();
@@ -1455,7 +1456,10 @@ fn resolve_placed_with(
         devenv_path: util::which_path("devenv"),
         name: name.to_string(),
         vpn: {
-            if cfg.vpn.is_enabled() && cfg.network == Network::Host && !profile.forces_no_network()
+            if cfg.vpn.is_enabled()
+                && cfg.network == Network::Host
+                && !profile.forces_no_network()
+                && !universal_deny
             {
                 msg::warn(
                     "sandbox: [sandbox] network=host conflicts with a VPN tunnel \
@@ -1463,7 +1467,11 @@ fn resolve_placed_with(
                      will join the tunnel instead of sharing the host network.",
                 );
             }
-            build_vpn_spec(&cfg.vpn, name, profile)
+            if universal_deny {
+                None
+            } else {
+                build_vpn_spec(&cfg.vpn, name, profile)
+            }
         },
         oci_host: (!cfg.oci_host.trim().is_empty()).then(|| cfg.oci_host.trim().to_string()),
         oci_runtime: (!cfg.oci_runtime.trim().is_empty())

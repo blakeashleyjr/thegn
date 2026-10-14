@@ -3628,7 +3628,10 @@ fn network_rules_line(sb: &thegn_core::config::SandboxConfig, backend: Backend) 
     if sb.network_allow.is_empty() && sb.network_block.is_empty() {
         return None;
     }
-    if sb.network_block.iter().any(|rule| rule.trim() == "*") {
+    if thegn_core::sandbox::lower_universal_deny(sb.network, &sb.network_block)
+        == thegn_core::config::Network::None
+        && sb.network != thegn_core::config::Network::None
+    {
         return Some("network_block contains `*` — launches are offline (network = none)".into());
     }
     thegn_core::sandbox::hostname_rules_note_for(

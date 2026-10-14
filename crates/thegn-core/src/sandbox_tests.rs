@@ -3341,3 +3341,54 @@ fn refuse_policy_refuses_hostname_rules() {
     });
     assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &placement_spec).is_none());
 }
+
+#[test]
+fn universal_block_suppresses_vpn_sidecar() {
+    let cfg = crate::config::SandboxConfig {
+        enabled: true,
+        backend: crate::config::SandboxBackend::None,
+        network: Network::Nat,
+        network_block: vec!["*".into()],
+        vpn: {
+            let mut vpn = vpn_cfg(VpnProviderKind::Tailscale);
+            vpn.mode = VpnMode::Proxy;
+            vpn
+        },
+        isolation_floor: crate::config::IsolationFloor::Off,
+        on_floor_miss: crate::config::OnFloorMiss::Degrade,
+        ..Default::default()
+    };
+    let loc = crate::remote::GitLoc::from_db("/wt/x", None);
+    let resolved = resolve_placed_exact(
+        &cfg,
+        &loc,
+        "test",
+        SandboxProfile::Hardened,
+        Placement::Ssh(SshPlacement::plain(
+            "host".into(),
+            22,
+            false,
+            TransportKind::Ssh,
+        )),
+    )
+    .expect("explicit remote host backend should resolve without probing");
+    assert_eq!(resolved.network, Network::None);
+    assert!(
+        resolved.vpn.is_none(),
+        "universal deny must suppress VPN egress"
+    );
+
+    let mut oci = spec(Backend::Podman);
+    oci.network = resolved.network;
+    oci.vpn = resolved.vpn;
+    let opts = oci_create_opts(&oci).expect("valid volume names");
+    assert!(
+        opts.windows(2)
+            .any(|pair| pair[0] == "--network" && pair[1] == "none"),
+        "{opts:?}"
+    );
+    assert!(
+        !opts.iter().any(|arg| arg.starts_with("container:")),
+        "{opts:?}"
+    );
+}
