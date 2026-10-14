@@ -310,7 +310,8 @@ fn consider_candidate_with_forge(
     };
     let template = agent.as_deref().expect("agent checked above");
     let item = crate::pr_driver::PrItem::from(&item);
-    let log = Some(entry.text.as_str());
+    let log_text = thegn_core::ci_log::redact(&entry.text);
+    let log = Some(log_text.as_str());
     let Some((vars, prompt)) = crate::pr_driver::compose_with_log(
         &pq,
         thegn_core::agent_task::TaskKind::PrCiFailure,
@@ -1067,5 +1068,35 @@ mod authorship_tests {
                     .any(|notification| notification.message.contains("THE-235"))
             );
         }
+    }
+
+    fn handoff_with_prompt_capture(
+        fixture: &Fixture,
+        head_sha: &str,
+    ) -> (Handoff, std::path::PathBuf) {
+        let mut handoff = handoff(fixture, CiAutofixMode::Auto, head_sha);
+        let prompt_path = fixture.dir.path().join("prompt");
+        handoff.config.pr_queue.agent_command = format!(
+            "printf '%s' \"$THEGN_TASK_PROMPT\" > {}",
+            prompt_path.display()
+        );
+        let begin = format!("-----{} PRIVATE KEY-----", "BEGIN");
+        let end = format!("-----{} PRIVATE KEY-----", "END");
+        handoff.entry.text = format!("{begin}\nSYNTHETIC_PEM_BODY\n{end}\ntoken=SYNTHETIC_TOKEN\n");
+        (handoff, prompt_path)
+    }
+
+    #[test]
+    fn ci_prompt_carries_only_redacted_log_text() {
+        let fixture = Fixture::new();
+        let (handoff, prompt_path) =
+            handoff_with_prompt_capture(&fixture, &fixture.pr.head_ref_oid);
+
+        consider(&handoff, false);
+
+        let prompt = std::fs::read_to_string(prompt_path).unwrap();
+        assert!(prompt.contains(thegn_core::ci_log::REDACTION_MARKER));
+        assert!(!prompt.contains("SYNTHETIC_PEM_BODY"));
+        assert!(!prompt.contains("SYNTHETIC_TOKEN"));
     }
 }

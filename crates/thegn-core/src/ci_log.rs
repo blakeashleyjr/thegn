@@ -415,4 +415,34 @@ mod tests {
         b.head_sha = "b".into();
         assert!(!same_candidate(&a, &b));
     }
+
+    #[test]
+    fn constructor_bounds_hold_when_redaction_expands_input() {
+        let input = (0..HARD_MAX_LOG_LINES)
+            .map(|line| {
+                if line + 1 == HARD_MAX_LOG_LINES {
+                    "token=a padding_padding_padding_padding latest\n".to_string()
+                } else {
+                    "token=a padding_padding_padding_padding\n".to_string()
+                }
+            })
+            .collect::<String>();
+        let entry = CiLogEntry::new(
+            "/wt",
+            "run",
+            "job",
+            "test",
+            &input,
+            HARD_MAX_LOG_LINES,
+            HARD_MAX_LOG_BYTES,
+            1,
+        );
+
+        assert!(entry.truncated);
+        assert!(entry.redacted);
+        assert!(entry.text.len() <= HARD_MAX_LOG_BYTES);
+        assert!(entry.text.lines().count() <= HARD_MAX_LOG_LINES);
+        assert!(!entry.text.contains("token=a"));
+        assert!(entry.text.ends_with("latest\n"));
+    }
 }
