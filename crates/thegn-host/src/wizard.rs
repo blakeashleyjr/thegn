@@ -1748,6 +1748,10 @@ mod tests {
         command
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "hermetic test git: blocking output is fine in a unit test"
+    )]
     fn test_git_out(dir: &Path, args: &[&str]) -> String {
         let output = test_git_cmd(dir).args(args).output().unwrap();
         assert!(output.status.success(), "git {:?} failed", args);
