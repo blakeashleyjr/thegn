@@ -32,6 +32,9 @@ use tokio::sync::mpsc as tokio_mpsc;
 use crate::hydrate::RefreshKind;
 use crate::integrate::{self, AttemptOutcome, FoldReport};
 use crate::merge_driver::{self, DriveOutcome, QueueItem};
+use crate::merge_notify::{
+    done_notifications, hold_already_unread, hold_signature, step_notification,
+};
 use crate::toast::Toasts;
 
 pub(crate) type DriveTx = tokio_mpsc::UnboundedSender<DriveMsg>;
@@ -416,7 +419,13 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                                     && let Some((kind, message)) =
                                         step_notification(status, &branch, &detail)
                                 {
-                                    notify_queue_hold(ctx, kind, &worktree, message);
+                                    notify_queue_hold(
+                                        ctx,
+                                        kind,
+                                        &worktree,
+                                        hold_signature(status, &branch),
+                                        message,
+                                    );
                                 }
                             }
                             MqStatus::Queued
@@ -484,7 +493,7 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                         "persistence_failed"
                     };
                     if ctx.notify_state.latch_queue_hold(&key, Some(state)) {
-                        notify_queue_hold(ctx, kind, "", message);
+                        notify_queue_hold(ctx, kind, "", None, message);
                     }
                 }
                 let (msg, success) = drive_summary(&out);
@@ -542,83 +551,6 @@ fn step_reaction(status: MqStatus) -> StepReaction {
             StepReaction::Transient
         }
     }
-}
-
-/// Build the inbox/desktop notification for statuses that warrant one.
-/// Hold notifications expose only a bounded one-line headline.
-fn step_notification(
-    status: MqStatus,
-    branch: &str,
-    detail: &str,
-) -> Option<(NotificationKind, String)> {
-    match status {
-        MqStatus::Landed => Some((
-            NotificationKind::QueueLanded,
-            format!("merge queue: {branch} landed"),
-        )),
-        MqStatus::Ready => Some((
-            NotificationKind::QueueReady,
-            format!("merge queue: {branch} ready to land"),
-        )),
-        MqStatus::NeedsHuman => Some((
-            NotificationKind::QueueNeedsHuman,
-            format!("merge queue: {branch} needs a human — {detail}"),
-        )),
-        MqStatus::GateError | MqStatus::AgentBlocked => {
-            let headline = bounded_headline(detail);
-            Some((
-                NotificationKind::QueueNeedsHuman,
-                format!(
-                    "merge queue: {branch} held (environment/policy, not a code verdict): {headline}"
-                ),
-            ))
-        }
-        MqStatus::Deferred => Some((
-            NotificationKind::QueueHeld,
-            format!(
-                "merge queue: {branch} deferred (not landed): {}",
-                bounded_headline(detail)
-            ),
-        )),
-        MqStatus::GateFailed => Some((
-            NotificationKind::QueueHeld,
-            format!(
-                "merge queue: {branch} gate failed (red build): {}",
-                bounded_headline(detail)
-            ),
-        )),
-        MqStatus::Queued | MqStatus::Folding | MqStatus::Verifying | MqStatus::AgentRunning => None,
-    }
-}
-
-fn bounded_headline(detail: &str) -> String {
-    let headline = detail.lines().next().unwrap_or_default();
-    thegn_core::notification_render::truncate_chars(headline, 200, "…")
-}
-
-fn done_notifications(
-    out: &crate::merge_driver::DriveOutcome,
-) -> Vec<(NotificationKind, String, String)> {
-    let mut notifications = Vec::new();
-    for failure in &out.bookkeeping_failed {
-        let error = bounded_headline(&failure.error);
-        notifications.push((
-            NotificationKind::QueueNeedsHuman,
-            format!("bookkeeping:{}:{}", failure.target, failure.new_oid),
-            format!(
-                "merge queue: {} landed on {} ({}→{}) but bookkeeping failed: {}; run `thegn merge drain` to reconcile",
-                failure.branch, failure.target, failure.old_oid, failure.new_oid, error
-            ),
-        ));
-    }
-    for line in &out.persistence_errors {
-        notifications.push((
-            NotificationKind::QueueNeedsHuman,
-            format!("persistence:{line}"),
-            format!("merge queue state write failed: {}", bounded_headline(line)),
-        ));
-    }
-    notifications
 }
 
 /// Patch (or insert) the panel's queue row for `worktree` so a drive step
@@ -762,7 +694,13 @@ fn notify_queue(ctx: &mut DrainCtx, kind: NotificationKind, worktree: &str, mess
 
 /// Route hold/bookkeeping notifications to the inbox by default. Desktop sinks
 /// remain available behind the explicit queue-hold setting.
-fn notify_queue_hold(ctx: &mut DrainCtx, kind: NotificationKind, worktree: &str, message: String) {
+fn notify_queue_hold(
+    ctx: &mut DrainCtx,
+    kind: NotificationKind,
+    worktree: &str,
+    signature: Option<String>,
+    message: String,
+) {
     if ctx.notify_state.merge_queue_hold_desktop() {
         notify_queue(ctx, kind, worktree, message);
         return;
@@ -778,6 +716,17 @@ fn notify_queue_hold(ctx: &mut DrainCtx, kind: NotificationKind, worktree: &str,
     let wt = worktree.to_string();
     tokio::task::spawn_blocking(move || match Db::open() {
         Ok(db) if dec.record => {
+            if let Some(signature) = signature.as_deref() {
+                match hold_already_unread(&db, kind, &wt, signature) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(error) => tracing::debug!(
+                        target: "thegn::merge",
+                        %error,
+                        "could not check unread merge queue hold; recording notice"
+                    ),
+                }
+            }
             if let Err(error) = crate::automation_events::insert_routed(
                 &db,
                 &kind_name,
@@ -786,7 +735,7 @@ fn notify_queue_hold(ctx: &mut DrainCtx, kind: NotificationKind, worktree: &str,
                 &wt,
                 Default::default(),
                 &dec,
-                false,
+                signature.is_none(),
             ) {
                 tracing::debug!(target: "thegn::merge", %error, "could not record merge queue hold notification");
             }
