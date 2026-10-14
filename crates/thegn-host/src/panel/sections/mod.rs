@@ -20,7 +20,7 @@ mod git;
 pub(crate) mod help;
 mod hosts;
 pub(crate) mod issues;
-mod keys;
+pub(crate) mod keys;
 pub(crate) mod logs;
 mod media;
 mod merge_queue;
