@@ -779,6 +779,9 @@ pub fn prepare_sandbox_env(
                     dropped.join(", ")
                 ));
             }
+            if let Some(note) = thegn_core::sandbox::hostname_rules_note(&spec) {
+                warnings.push(note);
+            }
             // Keep the final validation adjacent to the effects it protects:
             // VPN attachment and container ensure/exec are reached only after
             // the fully composed spec has passed the admission gate.

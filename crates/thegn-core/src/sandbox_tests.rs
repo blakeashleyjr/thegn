@@ -174,7 +174,7 @@ fn build_vpn_spec_carries_knobs_and_optional_image() {
 fn oci_opts_join_vpn_sidecar_netns_and_suppress_dns_ports() {
     let mut s = spec(Backend::Podman);
     s.network = Network::Nat;
-    s.network_allow = vec!["example.com".into()]; // would normally add --dns
+    s.network_allow = vec!["example.com".into()]; // hostname rules do not add runtime DNS flags
     s.ports = vec!["8080:8080".into()]; // would normally add -p
     s.vpn = build_vpn_spec(
         &vpn_cfg(VpnProviderKind::Tailscale),
@@ -455,6 +455,7 @@ fn refusal_constructor_preserves_each_class_and_field() {
         RefusalClass::SystemdMountPath,
         RefusalClass::ComposeTarget,
         RefusalClass::ComposeServiceMissing,
+        RefusalClass::HostnamePolicy,
     ] {
         let error = refusal(
             &spec,
@@ -3190,4 +3191,153 @@ fn systemd_launch_refuses_mount_paths_systemd_would_misparse() {
             .iter()
             .any(|arg| arg.starts_with("InaccessiblePaths="))
     );
+}
+
+#[test]
+fn universal_block_lowers_to_network_none() {
+    assert_eq!(
+        lower_universal_deny(Network::Nat, &["*".into()]),
+        Network::None
+    );
+    assert_eq!(
+        lower_universal_deny(Network::Nat, &[" * ".into()]),
+        Network::None
+    );
+    assert_eq!(
+        lower_universal_deny(Network::Host, &["x.test".into()]),
+        Network::Host
+    );
+
+    let cfg = crate::config::SandboxConfig {
+        enabled: true,
+        backend: crate::config::SandboxBackend::Bwrap,
+        network_block: vec!["*".into()],
+        isolation_floor: crate::config::IsolationFloor::Off,
+        on_floor_miss: crate::config::OnFloorMiss::Degrade,
+        ..Default::default()
+    };
+    let loc = crate::remote::GitLoc::from_db("/wt/x", None);
+    if let Some(resolved) = resolve(&cfg, &loc, "test") {
+        assert_eq!(resolved.network, Network::None);
+    }
+}
+
+#[test]
+fn hostname_rules_note_names_backend_on_every_local_backend() {
+    for backend in [
+        Backend::Bwrap,
+        Backend::Systemd,
+        Backend::Podman,
+        Backend::PodmanRootful,
+        Backend::Docker,
+        Backend::Apple,
+    ] {
+        let mut s = spec(backend);
+        s.network_allow = vec!["example.com".into()];
+        let note = hostname_rules_note(&s).expect("active allow-list should be reported");
+        assert!(note.contains(backend.label()), "{note}");
+        assert!(note.contains("DNS-name rules only"), "{note}");
+
+        s.network = Network::Host;
+        s.network_allow.clear();
+        s.network_block = vec!["example.com".into()];
+        assert!(hostname_rules_note(&s).is_some());
+
+        s.network = Network::None;
+        assert!(hostname_rules_note(&s).is_none());
+        s.network = Network::Nat;
+        s.network_block.clear();
+        assert!(hostname_rules_note(&s).is_none());
+    }
+
+    let mut provider = spec(Backend::Podman);
+    provider.network_block = vec!["example.com".into()];
+    provider.placement = Placement::Provider(crate::placement::ProviderPlacement {
+        provider: "test".into(),
+        id: "sandbox".into(),
+        interactive_prefix: vec![],
+        control_prefix: vec![],
+        up_command: vec![],
+        down_command: vec![],
+    });
+    assert!(hostname_rules_note(&provider).is_none());
+}
+
+#[test]
+fn no_dns_flag_in_oci_create_opts() {
+    let mut s = spec(Backend::Podman);
+    s.network = Network::Nat;
+    s.network_block = vec!["x.test".into()];
+    let opts = oci_create_opts(&s).expect("valid volume names");
+    assert!(!opts.iter().any(|arg| arg == "--dns"), "{opts:?}");
+}
+
+#[test]
+fn default_hostname_policy_warns_not_refuses() {
+    assert_eq!(HOSTNAME_RULES, HostnameRulesPolicy::WarnDnsOnly);
+    let mut s = spec(Backend::Bwrap);
+    s.network_allow = vec!["example.com".into()];
+    assert!(!matches!(
+        enter_argv(&s, "sh"),
+        Err(EnterError::Refused(Refusal {
+            class: RefusalClass::HostnamePolicy,
+            ..
+        }))
+    ));
+}
+
+#[test]
+fn refuse_policy_refuses_hostname_rules() {
+    for backend in [
+        Backend::Bwrap,
+        Backend::Systemd,
+        Backend::Podman,
+        Backend::PodmanRootful,
+        Backend::Docker,
+        Backend::Apple,
+    ] {
+        let mut s = spec(backend);
+        s.network_block = vec!["example.com".into()];
+        let message = hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &s)
+            .expect("active local hostname rules should refuse");
+        assert!(message.contains("network = \"none\""), "{message}");
+        s.network = Network::Host;
+        assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &s).is_some());
+        s.network = Network::None;
+        assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &s).is_none());
+        s.network = Network::Nat;
+        assert!(hostname_policy_refusal_with(HostnameRulesPolicy::WarnDnsOnly, &s).is_none());
+    }
+
+    let mut remote = spec(Backend::Bwrap);
+    remote.network_allow = vec!["example.com".into()];
+    remote.placement = Placement::Ssh(SshPlacement::plain(
+        "host".into(),
+        22,
+        false,
+        TransportKind::Ssh,
+    ));
+    assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &remote).is_some());
+
+    let mut placement_spec = spec(Backend::Podman);
+    placement_spec.network_allow = vec!["example.com".into()];
+    placement_spec.placement = Placement::Provider(crate::placement::ProviderPlacement {
+        provider: "test".into(),
+        id: "sandbox".into(),
+        interactive_prefix: vec![],
+        control_prefix: vec![],
+        up_command: vec![],
+        down_command: vec![],
+    });
+    assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &placement_spec).is_none());
+    placement_spec.placement = Placement::K8s(crate::placement::K8sPlacement {
+        kubectl: "kubectl".into(),
+        context: None,
+        namespace: None,
+        pod: "test".into(),
+        container: None,
+        pod_template: None,
+        image: None,
+    });
+    assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &placement_spec).is_none());
 }
