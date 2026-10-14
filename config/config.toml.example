@@ -2780,9 +2780,13 @@ compiler_cache = "off"
 # Extra bind mounts beyond what file_access provides.
 # Formats: "host_path"              → rw at same path inside container
 #          "host_path:ro"           → read-only at same path
+#          "host_path:rw"           → rw at same path (explicit suffix)
 #          "host_path:dest"         → rw at dest inside container
 #          "host_path:dest:ro"      → read-only at dest
+#          "host_path:dest:rw"      → rw at dest inside container
 #          "host_path:dest:cache"   → read-write cache (shown in sandbox summary)
+# Malformed entries (relative dest, unknown suffix, empty field) are ignored
+# with a warning; `thegn config validate` lists them.
 # ~ is expanded to $HOME.
 # This is also the extension point for extra writable carve-outs under the
 # read-only $HOME: a read-write DIRECTORY under $HOME (e.g. "~/.gnupg") is kept
