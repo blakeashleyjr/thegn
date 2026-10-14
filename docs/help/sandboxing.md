@@ -401,13 +401,17 @@ tunes keepalives, timeouts, and retry backoff for flaky links.
 The panel's **system → sandbox** section shows the live state for the
 focused worktree: the backend, image, mounts, DNS filtering, and the
 container's status and cpu/mem/net when one exists; the wider views add
-the activity timeline. Containers thegn did not create are listed
-read-only: `s` and `r` are refused with a status, while `l` opens a live
-logs pane (`<runtime> logs --tail 200 -f`). `s` and `r` on thegn-owned
-containers ask first. `g` widens to every container; it scopes the full
-table too, and Half-width `g` rows are selectable. When sandboxing is off,
-a one-line banner says so. Stop and restart work runs off the UI loop and
-reports its outcome as a toast.
+the activity timeline. Containers not proven to belong to this profile are
+listed read-only: ownership requires this profile's expected container name
+(or its recognized `-tgvpn`/`-tgagent` companion) for a known worktree, on
+that worktree's launch backend. A user's `thegn-foo`, another profile's
+container, or the same name in the other Podman store is foreign; a new
+container may appear foreign until the next refresh. `s` and `r` are refused
+with a status for foreign containers, while `l` opens a live logs pane
+(`<runtime> logs --tail 200 -f`). Actions on owned containers ask first.
+`g` widens to every container; it scopes the full table too, and Half-width
+`g` rows are selectable. When sandboxing is off, a one-line banner says so.
+Stop and restart work runs off the UI loop and reports its outcome as a toast.
 
 The machine-global view is the system monitor's **Containers** tab
 ([[system-monitor]]), which lists every backend's containers with live
@@ -415,8 +419,12 @@ stats and lifecycle actions on the thegn-owned ones.
 
 ## Cleanup
 
-thegn only ever manages containers it created (the `thegn-` name family and
-`thegn.managed`-labelled images/volumes); foreign containers are read-only.
+Panel and monitor actions apply only to containers proven to belong to this
+profile for a known worktree on the backend that launched it; similarly
+named containers from a user or another profile, or another Podman store,
+are foreign and read-only.
+That ownership check governs panel and monitor actions; cleanup commands are
+described below.
 Cleanup is always explicit — thegn never prunes on a schedule.
 
 - `thegn sandbox gc` runs the startup orphan sweep on demand: it removes thegn
