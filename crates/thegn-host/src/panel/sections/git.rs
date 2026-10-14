@@ -176,6 +176,16 @@ fn log_issues_velocity(ctx: &SectionCtx) -> Vec<PanelRow> {
     if deep {
         rows.push(PanelRow::blank());
         match &ctx.ui.docs.git {
+            Some(docs) if docs.error.is_some() => {
+                let reason = docs.error.as_deref().unwrap_or_default();
+                rows.push(PanelRow::plain(Line::split(
+                    vec![seg(g2(), "VELOCITY").bold()],
+                    vec![seg(
+                        hue(Hue::Amber),
+                        format!("history unavailable: {reason}"),
+                    )],
+                )));
+            }
             Some(docs) if !docs.weekly.is_empty() => {
                 let tail: Vec<u32> = docs.weekly.iter().rev().take(12).rev().copied().collect();
                 rows.push(PanelRow::plain(Line::split(
@@ -541,5 +551,70 @@ mod pr_row_tests {
             crate::handlers::take_me_there::pr_row_at(&model.panel, false, 1),
             Some(crate::handlers::take_me_there::PrRow::OpenPr(pr)) if pr.number == 42
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chrome::FrameModel;
+    use crate::layout::PanelWidth;
+    use crate::panel::docs::GitDocs;
+    use crate::panel::{PanelUi, Section};
+
+    fn render_velocity(docs: GitDocs) -> String {
+        let model = FrameModel::default();
+        let mut ui = PanelUi::default();
+        ui.open = Section::Pr;
+        ui.width = PanelWidth::Half;
+        ui.docs.git = Some(docs);
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 75,
+            rows: 32,
+        };
+        log_issues_velocity(&ctx)
+            .iter()
+            .map(|row| match &row.line {
+                Line::Blank | Line::Fill { .. } => String::new(),
+                Line::Segs(segs) => segs.iter().map(|seg| seg.text.as_str()).collect(),
+                Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
+                    l.iter().chain(r).map(|seg| seg.text.as_str()).collect()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn failed_git_docs_render_unavailable_instead_of_zero_commits() {
+        let failed = GitDocs {
+            weekly: vec![0; 36],
+            log: Vec::new(),
+            total: 0,
+            error: Some("commit calendar: git failed".into()),
+        };
+        let rendered = render_velocity(failed);
+
+        assert!(
+            rendered.contains("history unavailable"),
+            "rendered: {rendered}"
+        );
+        assert!(!rendered.contains("0 commits"), "rendered: {rendered}");
+    }
+
+    #[test]
+    fn successful_git_docs_still_render_the_velocity_strip() {
+        let successful = GitDocs {
+            weekly: vec![3; 36],
+            log: Vec::new(),
+            total: 108,
+            error: None,
+        };
+        let rendered = render_velocity(successful);
+
+        assert!(rendered.contains("commits/wk"), "rendered: {rendered}");
+        assert!(rendered.contains("108 commits"), "rendered: {rendered}");
     }
 }
