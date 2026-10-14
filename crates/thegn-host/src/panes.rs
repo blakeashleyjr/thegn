@@ -185,13 +185,13 @@ pub(crate) fn pane_shell_argv(
     (exe, args)
 }
 
-/// Build a host [`crate::agent::LaunchSpec`] for a terminal connection (local
-/// shell / ssh / mosh). Terminals never run inside a sandbox — a terminal is a
-/// host process that itself reaches out (ssh/mosh) — so this is the single spec
-/// builder shared by every terminal spawn, all of which run OFF-THREAD (the
-/// lazy materialize in `handlers::materialize` and the run-loop prewarm
-/// worker, both on `spawn_blocking`): `sandbox_wrap_shell` below opens SQLite
-/// and shells out to git, so this must not be called on the event loop.
+/// Build a [`crate::agent::LaunchSpec`] for a terminal connection (local shell /
+/// ssh / mosh). Requested local sandbox backends are admitted against the
+/// isolation floor after resolution, including host fallbacks. This is the
+/// single spec builder shared by every terminal spawn, all of which run
+/// OFF-THREAD (the lazy materialize in `handlers::materialize` and the run-loop
+/// prewarm worker, both on `spawn_blocking`): `sandbox_wrap_shell` below opens
+/// SQLite and shells out to git, so this must not be called on the event loop.
 pub(crate) fn terminal_launch_spec(
     cfg: &thegn_core::config::Config,
     connection: &str,
@@ -209,17 +209,29 @@ pub(crate) fn terminal_launch_spec(
     // every caller of this builder runs off-thread.
     let backend = sandbox_backend.trim();
     if connection.is_empty() && !backend.is_empty() && backend != "host" && backend != "none" {
-        let wrapped = match sandbox_wrap_shell(cfg, backend, &argv) {
+        let (wrapped, isolation) = match sandbox_wrap_shell(cfg, backend, &argv) {
             Err(error) => return Err(error.context("sandbox entry refused")),
             Ok(Some(wrapped)) => wrapped,
             Ok(None) => {
+                let mut warnings = vec![format!(
+                    "terminal: requested sandbox `{backend}` is unavailable here — opened a host shell \
+                     (install/start it, or choose `host` for this terminal)"
+                )];
+                thegn_core::msg::warn(&warnings[0]);
+                admit_terminal(
+                    &cfg.sandbox,
+                    backend,
+                    TerminalOutcome::HostFallback,
+                    &mut warnings,
+                )
+                .map_err(|error| error.context("sandbox entry refused"))?;
                 return Ok(crate::agent::LaunchSpec {
                     argv: cap_local_shell(connection, argv),
                     cwd: None,
                     env: vec![],
                     backend: "host".to_string(),
-                    warnings: vec![],
-                    degraded: false,
+                    warnings,
+                    degraded: true,
                     remote: false,
                 });
             }
@@ -231,13 +243,21 @@ pub(crate) fn terminal_launch_spec(
         // what made a bare `sh -lc` claim to be rootless podman.
         let truth = thegn_core::sandbox_truth::reconcile(backend, &wrapped);
         if !truth.degraded {
+            let mut warnings = Vec::new();
+            admit_terminal(
+                &cfg.sandbox,
+                backend,
+                TerminalOutcome::Wrapped(isolation),
+                &mut warnings,
+            )
+            .map_err(|error| error.context("sandbox entry refused"))?;
             return Ok(crate::agent::LaunchSpec {
                 argv: wrapped,
                 cwd: None,
                 env: vec![],
                 backend: truth.label,
-                warnings: vec![],
-                degraded: false,
+                degraded: !warnings.is_empty(),
+                warnings,
                 remote: false,
             });
         }
@@ -250,18 +270,26 @@ pub(crate) fn terminal_launch_spec(
                 cfg.sandbox.profile.as_str()
             );
         }
-        // Containment was asked for and not delivered: fall through to the plain
-        // host shell, labelled `host`, carrying the reason so the pane can say so.
         if let Some(w) = truth.warning.as_deref() {
             thegn_core::msg::warn(w);
         }
+        let mut warnings = truth.warning.into_iter().collect::<Vec<_>>();
+        admit_terminal(
+            &cfg.sandbox,
+            backend,
+            TerminalOutcome::DegradedToHost,
+            &mut warnings,
+        )
+        .map_err(|error| error.context("sandbox entry refused"))?;
+        // Containment was asked for and not delivered: fall through to the plain
+        // host shell, labelled `host`, carrying the reason so the pane can say so.
         return Ok(crate::agent::LaunchSpec {
             // Uncontained, but still capped — see `cap_local_shell`.
             argv: cap_local_shell(connection, argv),
             cwd: None,
             env: vec![],
-            backend: truth.label,
-            warnings: truth.warning.into_iter().collect(),
+            backend: "host".to_string(),
+            warnings,
             degraded: true,
             remote: false,
         });
@@ -276,6 +304,29 @@ pub(crate) fn terminal_launch_spec(
         // An ssh/mosh terminal runs on the remote end, not as a local host shell.
         remote: !connection.is_empty(),
     })
+}
+
+#[derive(Clone, Copy)]
+enum TerminalOutcome {
+    HostFallback,
+    Wrapped(thegn_core::capabilities::IsolationClass),
+    DegradedToHost,
+}
+
+fn admit_terminal(
+    sb: &thegn_core::config::SandboxConfig,
+    requested: &str,
+    outcome: TerminalOutcome,
+    warnings: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let actual = match outcome {
+        TerminalOutcome::HostFallback | TerminalOutcome::DegradedToHost => {
+            thegn_core::capabilities::IsolationClass::HostProcess
+        }
+        TerminalOutcome::Wrapped(class) => class,
+    };
+    crate::sandbox_admission::admit(sb, actual, "terminal", warnings)
+        .map_err(|error| error.context(format!("requested terminal sandbox `{requested}`")))
 }
 
 /// Apply the resource ceiling to a terminal pane that is running **uncontained**
@@ -300,11 +351,12 @@ fn cap_local_shell(connection: &str, argv: Vec<String>) -> Vec<String> {
 /// Build the sandbox-wrapping argv for a local terminal shell: force the chosen
 /// `backend` into a [`thegn_core::sandbox::SandboxSpec`] anchored at `$HOME`
 /// and `exec` the shell inside it (via
-/// [`thegn_core::sandbox::enter_argv`]). Returns `Ok(None)` — so the caller
-/// falls back to a plain host shell — when the backend name is unknown or the
-/// spec can't be built (e.g. sandboxing disabled); invalid volume input is an
-/// error and becomes a visible refusal at the caller. No provisioning happens here, but
-/// this is NOT loop-safe: `GitLoc::for_worktree` opens + reads SQLite (up to
+/// [`thegn_core::sandbox::enter_argv`]). Returns `Ok(None)` when the backend
+/// name is unknown or the spec can't be built (e.g. sandboxing disabled); the
+/// caller labels and admits that host fallback against the isolation floor.
+/// Invalid volume input is an error and becomes a visible refusal at the caller.
+/// No provisioning happens here, but this is NOT loop-safe:
+/// `GitLoc::for_worktree` opens + reads SQLite (up to
 /// the 5s busy-timeout under a writer), `resolve_placed` shells out to
 /// `git rev-parse`, and backend availability probing can run
 /// `sudo -n podman version` — run it off-thread (`handlers::materialize` /
@@ -313,14 +365,16 @@ fn sandbox_wrap_shell(
     cfg: &thegn_core::config::Config,
     backend: &str,
     shell_argv: &[String],
-) -> anyhow::Result<Option<Vec<String>>> {
+) -> anyhow::Result<Option<(Vec<String>, thegn_core::capabilities::IsolationClass)>> {
     // Invalid configured sources remain a refusal even when HOME or the
     // requested backend is unavailable; neither may produce a host fallback.
     thegn_core::sandbox::admit_volume_sources(cfg.sandbox.volumes.keys().map(String::as_str))?;
     // THE-215: a sealed profile never degrades to a host shell. Every
     // "no sandbox" outcome below becomes a visible refusal instead.
     let sealed = cfg.sandbox.profile.hides_home();
-    let refuse = |why: &str| -> anyhow::Result<Option<Vec<String>>> {
+    let refuse = |why: &str| -> anyhow::Result<
+        Option<(Vec<String>, thegn_core::capabilities::IsolationClass)>,
+    > {
         anyhow::bail!(
             "profile `{}` requires a sandbox that hides $HOME, but {why}; refusing a host shell",
             cfg.sandbox.profile.as_str()
@@ -369,7 +423,11 @@ fn sandbox_wrap_shell(
     // `enter_argv` execs `inner` as the pane's foreground program; the shell
     // argv (path + login flags) is the interactive shell that owns the pane.
     let inner = shell_words_join(shell_argv);
-    Ok(Some(thegn_core::sandbox::enter_argv(&spec, &inner)?))
+    let isolation = spec.capabilities().isolation;
+    Ok(Some((
+        thegn_core::sandbox::enter_argv(&spec, &inner)?,
+        isolation,
+    )))
 }
 
 /// Join a shell argv into a single command string for `sh -lc` execution,
@@ -1553,6 +1611,7 @@ mod tests {
         // sandbox backends happen to be installed on the host.
         let mut cfg = thegn_core::config::Config::default();
         cfg.sandbox.enabled = true;
+        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::Off;
         let spec = terminal_launch_spec(&cfg, "", "bwrap").expect("valid volume names");
         assert!(!spec.argv.is_empty());
         // When bwrap is the runtime that actually resolved, it must front the
@@ -2070,5 +2129,107 @@ mod tests {
             .and_then(|stem| stem.to_str())
             .unwrap_or("");
         assert_eq!(panes.table.get(&id).unwrap().program(), expected);
+    }
+
+    #[test]
+    fn terminal_unknown_backend_with_fail_floor_refuses() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
+
+        let error = terminal_launch_spec(&cfg, "", "nonsense-backend")
+            .expect_err("host fallback must fail the shared-kernel floor");
+        assert!(format!("{error:#}").contains("shared-kernel"));
+    }
+
+    #[test]
+    fn terminal_unknown_backend_with_degrade_floor_is_labelled_degraded() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Degrade;
+
+        let spec = terminal_launch_spec(&cfg, "", "nonsense-backend")
+            .expect("degrade policy keeps the host fallback");
+        assert_eq!(spec.backend, "host");
+        assert!(spec.degraded);
+        assert!(spec.warnings.len() >= 2);
+    }
+
+    #[test]
+    fn terminal_unknown_backend_without_floor_is_not_silent() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::Off;
+        cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
+
+        let spec = terminal_launch_spec(&cfg, "", "nonsense-backend")
+            .expect("off floor keeps the host fallback");
+        assert_eq!(spec.backend, "host");
+        assert!(spec.degraded);
+        assert_eq!(spec.warnings.len(), 1);
+        assert!(spec.warnings[0].contains("nonsense-backend"));
+    }
+
+    #[test]
+    fn admit_terminal_refuses_weaker_wrapped_class_under_fail() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
+        let mut warnings = Vec::new();
+        assert!(
+            admit_terminal(
+                &cfg.sandbox,
+                "bwrap",
+                TerminalOutcome::Wrapped(thegn_core::capabilities::IsolationClass::HostProcess),
+                &mut warnings,
+            )
+            .is_err()
+        );
+
+        let mut warnings = Vec::new();
+        assert!(
+            admit_terminal(
+                &cfg.sandbox,
+                "podman",
+                TerminalOutcome::Wrapped(thegn_core::capabilities::IsolationClass::SharedKernel),
+                &mut warnings,
+            )
+            .is_ok()
+        );
+        assert!(warnings.is_empty());
+
+        cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Degrade;
+        let mut warnings = Vec::new();
+        assert!(
+            admit_terminal(
+                &cfg.sandbox,
+                "bwrap",
+                TerminalOutcome::Wrapped(thegn_core::capabilities::IsolationClass::HostProcess),
+                &mut warnings,
+            )
+            .is_ok()
+        );
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn terminal_explicit_host_and_ssh_unchanged_under_fail_floor() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
+
+        for backend in ["", "host", "none"] {
+            let spec = terminal_launch_spec(&cfg, "", backend)
+                .expect("explicit host choice bypasses terminal admission");
+            assert_eq!(spec.backend, "host");
+            assert!(!spec.degraded);
+            assert!(spec.warnings.is_empty());
+        }
+
+        let remote = terminal_launch_spec(&cfg, "ssh user@h", "bwrap")
+            .expect("remote transport bypasses local terminal admission");
+        assert_eq!(remote.argv[0], "ssh");
+        assert_eq!(remote.backend, "host");
+        assert!(!remote.degraded);
+        assert!(remote.warnings.is_empty());
     }
 }
