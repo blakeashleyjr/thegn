@@ -2332,3 +2332,48 @@ fn warm_hydration_of_local_rows_spawns_no_git_subprocess() {
         "an un-bridged remote row is never read from hydration"
     );
 }
+
+#[test]
+fn branch_list_load_distinguishes_cache_fetch_failure_backoff_and_pending() {
+    use crate::hydrate::branch_list_load;
+    use crate::panel::gitui::DocLoad;
+    use thegn_core::gitrefs::BranchInfo;
+
+    let branch = BranchInfo {
+        name: "main".into(),
+        is_head: true,
+        upstream: None,
+        ahead: 0,
+        behind: 0,
+        upstream_gone: false,
+        sha: String::new(),
+        date: 0,
+        subject: String::new(),
+    };
+    assert_eq!(branch_list_load(false, None, true, false), DocLoad::Ready);
+    assert_eq!(
+        branch_list_load(false, Some(&Ok(vec![branch])), false, false),
+        DocLoad::Ready
+    );
+    assert_eq!(
+        branch_list_load(true, Some(&Err("git unavailable".into())), false, false),
+        DocLoad::Failed("git unavailable".into())
+    );
+    assert_eq!(
+        branch_list_load(
+            true,
+            Some(&Err("git unavailable\nfatal: details".into())),
+            false,
+            false
+        ),
+        DocLoad::Failed("git unavailable".into())
+    );
+    assert_eq!(
+        branch_list_load(false, None, false, true),
+        DocLoad::Failed("branch list unavailable; retrying".into())
+    );
+    assert_eq!(
+        branch_list_load(false, None, false, false),
+        DocLoad::Pending
+    );
+}

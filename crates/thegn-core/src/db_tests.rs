@@ -5846,3 +5846,16 @@ fn two_state_dirs_in_one_process_get_distinct_shared_identities() {
         "the failed lookup was cached, so the real identity is unreachable"
     );
 }
+
+#[test]
+fn issue_link_worktrees_lists_every_link() {
+    let db = Db::open_memory().unwrap();
+    db.link_issue("/wt/one", "linear:ABC-1").unwrap();
+    db.link_issue("/wt/two", "linear:ABC-1").unwrap();
+    db.link_issue("/wt/three", "github:acme/2").unwrap();
+    let links = db.issue_link_worktrees().unwrap();
+    assert_eq!(links.len(), 3);
+    assert!(links.contains(&("linear:ABC-1".into(), "/wt/one".into())));
+    assert!(links.contains(&("linear:ABC-1".into(), "/wt/two".into())));
+    assert!(links.contains(&("github:acme/2".into(), "/wt/three".into())));
+}

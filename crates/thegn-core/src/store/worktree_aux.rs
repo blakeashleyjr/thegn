@@ -328,6 +328,9 @@ pub trait WorktreeAuxStore {
     /// All issue ids linked to a worktree, newest first.
     fn linked_issues(&self, worktree_path: &str) -> Result<Vec<String>>;
 
+    /// Every issue/worktree association, newest links first.
+    fn issue_link_worktrees(&self) -> Result<Vec<(String, String)>>;
+
     /// Record a reset target we are about to create, pruning each worktree's
     /// mark set to the freshest 100 (the undo planner only reads ~100 reflog
     /// entries anyway).

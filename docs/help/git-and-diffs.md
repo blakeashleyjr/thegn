@@ -13,33 +13,55 @@ The [[panel]]'s **git** tab is a lazygit-style set of sections for the
 focused worktree; `Alt-g` opens the real lazygit in a pane when you want
 the full tool.
 
-- **changes** — the working diff. `↵` on a file inlines its hunks
-  (binary and mode-only changes say so instead of a diff); `space`
-  stages; `e` widens to the full-screen lazygit-style git frame, where
-  `↵` drills into **staging** (line-level stage/unstage).
-- **commits** — the branch's log; pick a commit to operate on. `E` edits
-  (interactive rebase stopping at the commit) — bare `e` is always the panel
-  width cycle. Rebase `s` (squash), `f` (fixup), and `d` (drop) ask for
-  confirmation first; `i` plans from the selected commit and refuses merge
-  ranges.
-- **branches** — local branches: check out, create, delete; open-PR
-  badges ride each row. In the wide frame the main region shows the
-  **selected** branch's own recent commits (HEAD's while it loads).
-- **stash** — stash list: apply, pop, drop; `↵` shows the stash's real
-  diff (`git stash show -p -u`, untracked files included) in the main
-  region.
-- **files** — the worktree's file tree; `/` filters it (directories stay
-  while any descendant matches; Esc clears), `↵` previews a file inline,
-  `o` pages it in bat, `O` opens your editor, `y` reveals it in yazi.
+## The git sections
+
+### changes — the working diff
+
+`↵` on a file opens its inline hunks; binary and mode-only changes say so
+instead of showing a diff. `space` stages; `e` widens to the full-screen
+git frame, where `↵` opens line-level staging. In changes and the commit-files
+drill, `b` opens blame when available; untracked and added files are refused,
+and other unavailable blame states are reported.
+
+### commits — branch history
+
+At Half and Full width, the detail region follows the cursor and shows the
+commit through `git show`, read-only. `↵` opens the commit's files with the
+selected file's diff shown read-only. Mark lines with `space` to start a
+custom patch; `W` diffs the selection against the mark. Merge commits show
+their diff against the first parent. If there are no changed files, the view
+says so; if commit files cannot be read, it reports that state. `E` edits
+(interactive rebase stopping at the commit); bare `e` is always the panel
+width cycle. Rebase `s` (squash), `f` (fixup), and `d` (drop) ask for
+confirmation first; `i` plans from the selected commit and refuses merge
+ranges.
+
+### branches
+
+Branches are local: check out, create, and delete them; open-PR badges ride
+each row. At Normal width, `↵` widens to Half. The selected branch's recent
+commits appear at Half and Full width.
+
+### stash
+
+Apply, pop, and drop stash entries. At Normal width, `↵` widens to Half to
+show the stash diff, including untracked files. It appears and can be scrolled
+at both Half and Full widths.
+
+### files
+
+The worktree's file tree; `/` filters it (directories stay while any
+descendant matches; Esc clears), `↵` previews a file inline, `o` pages it
+in bat, `O` opens your editor, `y` reveals it in yazi.
 
 Inside the git-family sections (changes/commits/branches/stash — not
-files), `?` shows that section's own key cheatsheet. A drill's temporary
-auto-widen retracts when Esc leaves the last drill; shrinking to resting
-width leaves the drill open, and Esc returns to the view that opened it. Marks, ranges, and
-flows follow lazygit conventions. An action key that needs a wider view
-**widens the panel and performs the action** in one press (the status
-crumb says so); drill detail views at the half width carry a breadcrumb
-(`changes › staging · esc back`) so the way back is always visible.
+files), `?` shows that section's own key cheatsheet only after entering row
+mode. A drill's temporary auto-widen retracts when Esc leaves the last drill;
+shrinking to resting width returns to the section's home view. Marks, ranges,
+and flows follow lazygit conventions. An action key that needs a wider view
+**widens the panel and performs the action** in one press (the status crumb
+says so); drill detail views at the half width carry a breadcrumb (`changes
+› staging · esc back`) so the way back is always visible.
 
 ## Submodule pointers
 

@@ -756,6 +756,8 @@ pub struct PanelData {
     pub file_tree: Vec<FileEntry>,
     /// Local branches with upstream/divergence + PR badges (branches section).
     pub branches: Vec<BranchRow>,
+    /// Load state for the demand-fetched local branch list.
+    pub branches_load: crate::panel::gitui::DocLoad,
     /// Structured recent commits (commits section + graph feed). Loaded from
     /// cache synchronously; refreshed by a background `git log` worker.
     pub commits: Vec<CommitRow>,
@@ -764,6 +766,8 @@ pub struct PanelData {
     pub commits_loading: bool,
     /// Stash entries (stash section).
     pub stashes: Vec<StashRow>,
+    /// Load state for the demand-fetched stash list.
+    pub stashes_load: crate::panel::gitui::DocLoad,
     /// Entity-level view of pending changes (semantic git layer, items 311/313/
     /// 317): per-file entity churn + impact. Built off-thread from `git diff
     /// HEAD`; feeds the changes-section impact line and the commit-message
@@ -777,6 +781,8 @@ pub struct PanelData {
     /// Whether any `[issues]` provider is configured for this repo. Distinguishes
     /// "off" (no provider) from "clear" (configured but currently empty).
     pub issues_configured: bool,
+    /// Whether the configured tracker cache has loaded, or why it failed.
+    pub tracker_load: crate::panel::gitui::DocLoad,
     /// Unified cross-repo "My Work" feed (the `Mine` section), loaded from the
     /// `my_work_cache` DB row. Spans every repo, not just the active worktree.
     pub my_work: Vec<thegn_core::work::WorkRow>,
@@ -805,15 +811,15 @@ pub struct PanelData {
     /// counts use. Empty ⇒ fall back to `default_priority` (headless tests).
     pub notification_priority:
         std::collections::BTreeMap<&'static str, thegn_core::notification::Priority>,
-    /// Last 500 lines of thegn.log, parsed. Empty when THEGN_LOG is unset.
-    pub log_lines: Vec<thegn_core::log_view::LogLine>,
     /// A bounded tail of parsed thegn.log — the last ~400 lines *plus* the most
     /// recent preceding ERROR lines (see `log_view::error_inclusive_tail`), so the
-    /// error-gated notification drilldown is never empty. Kept on *every* refresh
-    /// (unlike `log_lines`, which is section-gated), without new blocking I/O.
+    /// error-gated notification drilldown is never empty. Kept on *every* refresh,
+    /// without new blocking I/O.
     pub log_tail: Vec<thegn_core::log_view::LogLine>,
     /// Structured logs for the tg-log feature.
     pub log_lines_structured: Vec<thegn_core::log::parser::ParsedLog>,
+    /// Sequence number of the first row in the bounded structured-log ring.
+    pub log_first_seq: u64,
     /// Configured + auto-discovered task specs for the Tasks section.
     pub task_specs: Vec<thegn_core::config::Task>,
     /// Last-run record per task name (keyed by `Task::name`).
@@ -824,6 +830,8 @@ pub struct PanelData {
     /// `file` is the repo-relative path the outline was computed for ("" = none).
     pub symbols_file: String,
     pub symbols: Vec<SymbolRow>,
+    /// Message for the last completed references request, including no-LSP.
+    pub symbols_note: String,
     /// Per-`[host.*]` display snapshots (hosts-as-resources): built off-loop
     /// from the config + DB by hydration, live-merged on the loop from
     /// `HostRuntime` after each drain. Feeds the `Hosts` section, the sidebar
@@ -1165,6 +1173,10 @@ pub struct PanelUi {
     /// When true, the Symbols section shows find-references results for the last
     /// selected symbol instead of the file outline (`r` toggles on, `o`/esc off).
     pub symbols_show_refs: bool,
+    /// The Symbols body is listing changed files for an explicit pick.
+    pub symbols_picker: bool,
+    /// Explicit file chosen with `f`; takes precedence over the focused editor.
+    pub symbols_pick: Option<String>,
     /// Row cursor within the Tasks section's list.
     pub tasks_cursor: usize,
     /// Active free-text filter query for the Issues section (`/` mode).
@@ -1173,6 +1185,8 @@ pub struct PanelUi {
     pub issues_project_filter: Option<String>,
     /// Row cursor within the Notifications section's list.
     pub notifications_cursor: usize,
+    /// Expanded notification id in the compact inbox views.
+    pub notifications_expanded: Option<i64>,
     /// When true, the Notifications section shows already-read items too (`A` toggle).
     pub notifications_show_read: bool,
     /// Active free-text filter query for the Notifications section (`/` mode).
@@ -1187,7 +1201,7 @@ pub struct PanelUi {
     pub logs_filter_editing: bool,
     /// Level gate: `None` = all levels; `Some(L)` shows lines at L and above.
     pub logs_level: Option<thegn_core::log_view::LogLevel>,
-    /// When true, the cursor auto-jumps to the newest line on each hydration.
+    /// When true, the cursor auto-jumps to the newest line on each arrival.
     pub logs_tail: bool,
     /// Active free-text filter query for the Files section's tree (`/` mode).
     pub files_filter: String,
@@ -1221,10 +1235,13 @@ impl Default for PanelUi {
             problems_cursor: 0,
             symbols_cursor: 0,
             symbols_show_refs: false,
+            symbols_picker: false,
+            symbols_pick: None,
             tasks_cursor: 0,
             issues_filter: String::new(),
             issues_project_filter: None,
             notifications_cursor: 0,
+            notifications_expanded: None,
             notifications_show_read: false,
             notifications_filter: String::new(),
             notifications_filter_editing: false,

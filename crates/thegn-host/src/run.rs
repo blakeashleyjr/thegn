@@ -2347,11 +2347,14 @@ struct PanelDocsWiring<'a> {
 /// symbol), delivered to the loop on the outline channel.
 enum SymbolsFetch {
     Outline {
-        file: String,
+        key: crate::panel::sections::symbols::OutlineKey,
         rows: Vec<crate::panel::SymbolRow>,
     },
     Refs {
+        root: PathBuf,
         label: String,
+        file: String,
+        server: bool,
         rows: Vec<crate::panel::SymbolRow>,
     },
 }
@@ -2371,8 +2374,7 @@ impl Drop for InflightGuard {
 /// the language server when one is available, the tree-sitter entity parser
 /// otherwise. Sends a `SymbolsFetch::Outline` and pulses the waker.
 fn spawn_outline_fetch(
-    file: String,
-    root: std::path::PathBuf,
+    key: crate::panel::sections::symbols::OutlineKey,
     lsp: std::sync::Arc<crate::lsp::LspInner>,
     tx: tokio_mpsc::Sender<SymbolsFetch>,
     waker: TerminalWaker,
@@ -2381,6 +2383,8 @@ fn spawn_outline_fetch(
     use thegn_core::semantic::Lang;
     tokio::task::spawn_blocking(move || {
         let _inflight = InflightGuard(busy);
+        let root = key.root.clone();
+        let file = key.file.clone();
         // A provider exists if the file resolves to a registered server (LSP
         // tier) OR to a tree-sitter grammar. A registry-only language (no
         // grammar) still gets its LSP outline; a file that resolves to neither
@@ -2394,7 +2398,7 @@ fn spawn_outline_fetch(
         } else {
             Vec::new()
         };
-        let _ = tx.try_send(SymbolsFetch::Outline { file, rows }); // best-effort: bounded replaceable result; a full queue drops stale work
+        let _ = tx.try_send(SymbolsFetch::Outline { key, rows }); // best-effort: bounded replaceable result; a full queue drops stale work
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
@@ -2417,9 +2421,11 @@ fn spawn_refs_fetch(
     tokio::task::spawn_blocking(move || {
         let _inflight = InflightGuard(busy);
         let mut rows = Vec::new();
+        let mut server = false;
         if let Some(key) = lsp.resolve_key(&file)
             && let Ok(client) = lsp.client(&root, &key)
         {
+            server = true;
             let uri = thegn_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
             if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
                 let _ = client.did_open(&uri, &text); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
@@ -2449,7 +2455,13 @@ fn spawn_refs_fetch(
                     .collect();
             }
         }
-        let _ = tx.try_send(SymbolsFetch::Refs { label, rows }); // best-effort: bounded replaceable result; a full queue drops stale work
+        let _ = tx.try_send(SymbolsFetch::Refs {
+            root,
+            label,
+            file,
+            server,
+            rows,
+        }); // best-effort: bounded replaceable result; a full queue drops stale work
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
@@ -3092,6 +3104,7 @@ fn spawn_stage_doc_fetch(
     session: &crate::session::Session,
     path: String,
     pane: StagePane,
+    untracked: bool,
     tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
     waker: &TerminalWaker,
 ) {
@@ -3102,9 +3115,10 @@ fn spawn_stage_doc_fetch(
         use thegn_svc::git::GitBackend;
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
         let git = thegn_svc::git::CliGit;
-        let diff = match pane {
-            StagePane::Unstaged => git.unstaged_diff(&loc, &path),
-            StagePane::Staged => git.staged_diff(&loc, &path),
+        let diff = match (pane, untracked) {
+            (StagePane::Unstaged, true) => git.untracked_diff(&loc, &path),
+            (StagePane::Unstaged, false) => git.unstaged_diff(&loc, &path),
+            (StagePane::Staged, _) => git.staged_diff(&loc, &path),
         }
         .unwrap_or_default();
         let doc = crate::panel::staging::build(&path, &diff);
@@ -3451,19 +3465,26 @@ pub(crate) fn begin_worktree_preset(
         return;
     }
     *create_gen += 1;
-    let candidate = thegn_core::worktree::candidate_name(cfg);
+    let (candidate, exact_branch) = match &name {
+        crate::keymap::NameSpec::Exact(branch) => (branch.clone(), true),
+        crate::keymap::NameSpec::Random | crate::keymap::NameSpec::Fixed(_) => {
+            (thegn_core::worktree::candidate_name(cfg), false)
+        }
+    };
     let env = wizard::ambient_env_name_live(cfg, &root);
     let sandbox = sandbox.unwrap_or_else(|| cfg.sandbox.default_backend.as_str().to_string());
     let agent = agent.unwrap_or_else(|| "shell".to_string());
     let name_choice = match name {
         crate::keymap::NameSpec::Random => wizard::NameChoice::Generated,
         crate::keymap::NameSpec::Fixed(tail) => wizard::NameChoice::Human(tail),
+        crate::keymap::NameSpec::Exact(_) => wizard::NameChoice::Exact,
     };
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
     let ctx = wizard::WorkerCtx {
         cfg: cfg.clone(),
         repo_root: root,
         candidate: candidate.clone(),
+        exact_branch,
         generation: *create_gen,
         db_path: None,
         base_override: base,
@@ -3780,6 +3801,29 @@ fn commit_message_prefill(panel: &crate::panel::PanelData) -> String {
         .unwrap_or_default()
 }
 
+/// Widen a resting panel after entering a drill view. Returns whether the
+/// geometry needs to be recomputed.
+fn widen_for_drill(panel_ui: &mut crate::panel::PanelUi) -> bool {
+    if panel_ui.width == crate::layout::PanelWidth::Normal
+        && matches!(
+            panel_ui.git.focus,
+            gitui::GitView::CommitFiles
+                | gitui::GitView::Staging
+                | gitui::GitView::PatchBuilding
+                | gitui::GitView::Blame
+                | gitui::GitView::RebaseTodo
+        )
+    {
+        panel_ui.width = crate::layout::PanelWidth::Half;
+        if panel_ui.git.widened_from.is_none() {
+            panel_ui.git.widened_from = Some(crate::layout::PanelWidth::Normal);
+        }
+        true
+    } else {
+        false
+    }
+}
+
 fn handle_git_msg(
     msg: GitMsg,
     panel_ui: &mut crate::panel::PanelUi,
@@ -3838,14 +3882,15 @@ fn handle_git_msg(
                     };
                     s.cursor = 0;
                     s.anchor = None;
-                    (s.path.clone(), s.pane)
+                    (s.path.clone(), s.pane, s.untracked)
                 });
-                if let Some((path, pane)) = kicked {
+                if let Some((path, pane, untracked)) = kicked {
                     spawn_stage_doc_fetch(
                         panel_ui.git.op_gen,
                         wires.session,
                         path,
                         pane,
+                        untracked,
                         wires.doc_tx,
                         wires.waker,
                     );
@@ -3869,31 +3914,23 @@ fn handle_git_msg(
         GitMsg::Drill => match panel_ui.git.focus {
             GitView::Files => {
                 if let Some(row) = sel_change(panel_ui, model) {
-                    if row.submodule.is_some() {
-                        model.status = "submodule pointers are atomic".into();
-                        return GitAfter::None;
-                    }
-                    // Conflict files: open in the editor so the user can
-                    // resolve the markers, then stage the file normally.
-                    if row.stage == crate::panel::Stage::Conflict {
-                        return GitAfter::OpenEditor(row.path);
-                    }
-                    // An untracked file has no diff to line-stage: record it
-                    // with intent-to-add first (`git add -N`), which turns
-                    // its whole content into stageable Add lines.
-                    if row.stage == crate::panel::Stage::Untracked {
-                        enqueue(
-                            panel_ui,
-                            model,
-                            GitOp::IntentToAdd {
-                                path: row.path.clone(),
-                            },
-                        );
-                    }
-                    let mut s = gitui::StagingUi::new(&row.path);
-                    if row.stage == crate::panel::Stage::Staged {
-                        s.pane = StagePane::Staged;
-                    }
+                    let (path, pane, untracked) = match gitui::plan_changes_drill(&row) {
+                        gitui::ChangesDrill::Atomic => {
+                            model.status = "submodule pointers are atomic".into();
+                            return GitAfter::None;
+                        }
+                        gitui::ChangesDrill::OpenEditor(path) => {
+                            return GitAfter::OpenEditor(path);
+                        }
+                        gitui::ChangesDrill::Staging {
+                            path,
+                            pane,
+                            untracked,
+                        } => (path, pane, untracked),
+                    };
+                    let mut s = gitui::StagingUi::new(&path);
+                    s.pane = pane;
+                    s.untracked = untracked;
                     let pane = s.pane;
                     panel_ui.git.stage_doc = None;
                     panel_ui.git.staging = Some(s);
@@ -3901,8 +3938,9 @@ fn handle_git_msg(
                     spawn_stage_doc_fetch(
                         panel_ui.git.op_gen,
                         wires.session,
-                        row.path,
+                        path,
                         pane,
+                        untracked,
                         wires.doc_tx,
                         wires.waker,
                     );
@@ -4080,13 +4118,17 @@ fn handle_git_msg(
                     .zip(panel_ui.git.stage_doc.as_ref())
                     .map(|(s, d)| {
                         let indices = gitui::sel_pairs(&d.doc, s.selection());
-                        (indices, d.path.clone(), d.diff.clone(), d.pane)
+                        (indices, d.path.clone(), d.diff.clone(), s.clone(), d.pane)
                     });
                 match op {
-                    Some((indices, _, _, _)) if indices.is_empty() => {
+                    Some((indices, _, _, _, _)) if indices.is_empty() => {
                         model.status = "nothing stageable selected".into();
                     }
-                    Some((indices, path, diff, pane)) => {
+                    Some((indices, path, diff, staging, doc_pane)) => {
+                        if staging.pane != doc_pane {
+                            model.status = "loading…".into();
+                            return GitAfter::None;
+                        }
                         if let Some(s) = panel_ui.git.staging.as_mut() {
                             s.anchor = None;
                         }
@@ -4095,20 +4137,8 @@ fn handle_git_msg(
                             model.status = reason;
                             return GitAfter::None;
                         }
-                        let target = match pane {
-                            StagePane::Unstaged => crate::gitmut::StageTarget::Unstaged,
-                            StagePane::Staged => crate::gitmut::StageTarget::Staged,
-                        };
-                        enqueue(
-                            panel_ui,
-                            model,
-                            GitOp::StageLines {
-                                path,
-                                diff,
-                                indices,
-                                target,
-                            },
-                        );
+                        let op = gitui::plan_stage_lines(&staging, doc_pane, path, diff, indices);
+                        enqueue(panel_ui, model, op);
                     }
                     None => {}
                 }
@@ -4176,6 +4206,15 @@ fn handle_git_msg(
         }
         GitMsg::DiscardLines => {
             if panel_ui.git.focus == GitView::Staging {
+                if let Some(reason) = panel_ui
+                    .git
+                    .staging
+                    .as_ref()
+                    .and_then(gitui::line_discard_refusal)
+                {
+                    model.status = reason.into();
+                    return GitAfter::None;
+                }
                 let op = panel_ui
                     .git
                     .staging
@@ -4214,6 +4253,15 @@ fn handle_git_msg(
             // Item 602: one-key discard of the whole hunk under the cursor
             // (select-hunk + discard, fused), with a mandatory confirm.
             if panel_ui.git.focus == GitView::Staging {
+                if let Some(reason) = panel_ui
+                    .git
+                    .staging
+                    .as_ref()
+                    .and_then(gitui::line_discard_refusal)
+                {
+                    model.status = reason.into();
+                    return GitAfter::None;
+                }
                 let cur = panel_ui.git.staging.as_ref().map_or(0, |s| s.cursor);
                 let op = panel_ui.git.stage_doc.as_ref().map(|d| {
                     (
@@ -4307,6 +4355,10 @@ fn handle_git_msg(
         }
         // ---- commits ---------------------------------------------------------
         GitMsg::Commit => {
+            if let Some(reason) = gitui::commit_precheck(&model.panel) {
+                model.status = reason.into();
+                return GitAfter::None;
+            }
             // Prefill with the entity-derived structural message (item 317),
             // computed off-thread on the panel model. Editable; empty when there
             // are no entity-level changes.
@@ -4719,7 +4771,13 @@ fn handle_git_msg(
         // ---- stash --------------------------------------------------------
         GitMsg::StashPush => {
             *ov.input = Some((
-                menu::InputOverlay::new("stash message", ""),
+                menu::InputOverlay::new(
+                    format!(
+                        "stash message (empty = {})",
+                        gitui::stash_message_or_default("", &model.panel.branch)
+                    ),
+                    "",
+                ),
                 GitInputKind::StashPush,
             ));
         }
@@ -5104,9 +5162,8 @@ fn handle_git_input_submit(
             }
         }
         GitInputKind::StashPush => {
-            if !require(model) {
-                enqueue(panel_ui, model, GitOp::StashPush { message: text });
-            }
+            let message = gitui::stash_message_or_default(&text, &model.panel.branch);
+            enqueue(panel_ui, model, GitOp::StashPush { message });
         }
         GitInputKind::PatchSplit { sha, patch } => {
             if !require(model) {
@@ -7284,12 +7341,13 @@ async fn event_loop<T: Terminal>(
     // symbol/reference result is capped at 1 MiB, so eight pending results stay
     // within the same order of budget as the diagnostics queue.
     let (outline_tx, mut outline_rx) = tokio_mpsc::channel::<SymbolsFetch>(8);
-    let mut outline_file = String::new();
+    let mut outline_key: Option<crate::panel::sections::symbols::OutlineKey> = None;
     let mut outline_syms: Vec<crate::panel::SymbolRow> = Vec::new();
-    let mut outline_inflight: Option<String> = None;
+    let mut outline_inflight: Option<crate::panel::sections::symbols::OutlineKey> = None;
     let outline_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut refs_label = String::new();
     let mut refs_rows: Vec<crate::panel::SymbolRow> = Vec::new();
+    let mut refs_note = String::new();
     let mut refs_inflight = false;
     let refs_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // The hover/signature/code-action preview overlay (item 532): built off-loop
@@ -9112,6 +9170,21 @@ async fn event_loop<T: Terminal>(
             hunk_inflight.clear();
             submodule_preview_inflight.clear();
             submodule_scans.reset();
+            outline_key = None;
+            outline_syms.clear();
+            outline_inflight = None;
+            outline_busy.store(false, std::sync::atomic::Ordering::Release);
+            model.panel.symbols.clear();
+            model.panel.symbols_file.clear();
+            model.panel.symbols_note.clear();
+            refs_label.clear();
+            refs_rows.clear();
+            refs_note.clear();
+            refs_inflight = false;
+            refs_busy.store(false, std::sync::atomic::Ordering::Release);
+            panel_ui.symbols_pick = None;
+            panel_ui.symbols_picker = false;
+            panel_ui.symbols_show_refs = false;
             // NOTE: `materialize_inflight` deliberately PERSISTS across switches now
             // (a provisioning worktree keeps provisioning in the background); its
             // entries self-clear when each spec lands. `model.load_steps` is derived
@@ -10405,12 +10478,16 @@ async fn event_loop<T: Terminal>(
                     }
                     // A landed stage/discard moves lines between panes:
                     // refetch the staging doc the cursor is parked on.
-                    if let Some(s) = &panel_ui.git.staging {
+                    if let Some(s) = panel_ui.git.staging.as_mut() {
+                        if s.untracked {
+                            s.untracked = false;
+                        }
                         spawn_stage_doc_fetch(
                             panel_ui.git.op_gen,
                             &session,
                             s.path.clone(),
                             s.pane,
+                            false,
                             &gitdoc_tx,
                             &waker,
                         );
@@ -10953,6 +11030,28 @@ async fn event_loop<T: Terminal>(
             if next_model.panel != model.panel {
                 panel_ui.hunks.clear();
                 hunk_inflight.clear();
+                if let Some(path) = panel_ui.git.staging.as_ref().map(|s| s.path.clone())
+                    && let Some(untracked) = gitui::staging_refetch(
+                        &path,
+                        &model.panel.changes,
+                        &next_model.panel.changes,
+                    )
+                {
+                    if let Some(staging) = panel_ui.git.staging.as_mut() {
+                        staging.untracked = untracked;
+                    }
+                    if let Some(staging) = panel_ui.git.staging.as_ref() {
+                        spawn_stage_doc_fetch(
+                            panel_ui.git.op_gen,
+                            &session,
+                            staging.path.clone(),
+                            staging.pane,
+                            staging.untracked,
+                            &gitdoc_tx,
+                            &waker,
+                        );
+                    }
+                }
                 // Re-anchor the expanded-row selection by PATH: `chg_sel` is a
                 // positional index, and staging/unstaging re-sorts the list
                 // (staged group first), so keeping the raw index silently
@@ -11033,6 +11132,7 @@ async fn event_loop<T: Terminal>(
             // retains the non-`lsp:` task entries we preserve here.)
             let task_last_runs = std::mem::take(&mut model.panel.task_last_runs);
             let log_lines_structured = std::mem::take(&mut model.panel.log_lines_structured);
+            let log_first_seq = model.panel.log_first_seq;
             let task_diagnostics = std::mem::take(&mut model.panel.diagnostics);
             // Optimistic sidebar regroup/reorder carry-over: the reorder/file
             // handlers mutate `sidebar_db_worktrees`/`sidebar_db_folders` on
@@ -11104,6 +11204,7 @@ async fn event_loop<T: Terminal>(
             model.sidebar_window_titles = window_titles;
             model.panel.task_last_runs = task_last_runs;
             model.panel.log_lines_structured = log_lines_structured;
+            model.panel.log_first_seq = log_first_seq;
             model.panel.diagnostics = task_diagnostics;
             if let Some((wts, folders, terms, workspaces)) = optimistic_lists {
                 model.sidebar_db_worktrees = wts;
@@ -11112,6 +11213,11 @@ async fn event_loop<T: Terminal>(
                 model.sidebar_workspaces = workspaces;
             }
             model.containers = containers;
+            crate::handlers::sandbox_panel::stamp_ownership(
+                &mut model.containers,
+                &model.sidebar_db_worktrees,
+                &current_config.profile,
+            );
             model.containers_listed = containers_listed;
             model.container_health =
                 container_health_for(&model.active_container_name, &model.containers);
@@ -11251,12 +11357,9 @@ async fn event_loop<T: Terminal>(
             model.weather_cfg = current_config.weather.clone();
             let ws = (!session.id.is_empty()).then_some(session.id.as_str());
             model.pins = supervisor.chips(&current_config, ws);
-            // Tail mode: auto-jump to the newest visible log line.
-            if panel_ui.open == crate::panel::Section::Logs && panel_ui.logs_tail {
-                let count =
-                    crate::panel::sections::logs::visible_lines(&model.panel, &panel_ui).count();
-                panel_ui.logs_cursor = count.saturating_sub(1);
-                panel_ui.cursor = panel_ui.logs_cursor;
+            if panel_ui.open == crate::panel::Section::Logs || panel_ui.logs_tail {
+                let log_anchor = crate::panel::sections::logs::cursor_seq(&model.panel, &panel_ui);
+                crate::panel::sections::logs::repin(&model.panel, &mut panel_ui, log_anchor);
             }
             // Clamp the accordion cursor to the fresh model's row count and
             // re-mirror the per-section cursors. A mutation that shrank the
@@ -11690,7 +11793,12 @@ async fn event_loop<T: Terminal>(
         // Container list from the demand-tiered ticker — replaces the old inline call
         // inside model hydration so `podman ps` never blocks the hydrate path.
         while let Ok(refresh) = container_rx.try_recv() {
-            let containers = refresh.containers;
+            let mut containers = refresh.containers;
+            crate::handlers::sandbox_panel::stamp_ownership(
+                &mut containers,
+                &model.sidebar_db_worktrees,
+                &current_config.profile,
+            );
             // The aggregate footprint arrives only on the gated slow-cadence
             // ticks (Containers tab open); `None` means "no update", so the
             // model keeps the last value rather than blanking the header.
@@ -13299,6 +13407,18 @@ async fn event_loop<T: Terminal>(
                 crate::panel::scope::mine_all(),
                 Some(waker.clone()),
             );
+        } else if !crate::connectivity_gate::should_skip_refresh(
+            &crate::hydrate::RefreshKind::Issues,
+            thegn_core::connectivity::current(),
+        ) && let Some(path) =
+            crate::hydrate_tracker::take_busy_retry(std::time::Instant::now())
+            && path == active_tab_path(&session)
+        {
+            crate::hydrate_tracker::spawn_issue_cache_refresh(
+                path,
+                current_config.clone(),
+                Some(waker.clone()),
+            );
         }
         // One PR-queue pass at a time: the inflight flag is the same mutual
         // exclusion the `D` key and the palette action use, so a slow pass never
@@ -13610,19 +13730,44 @@ async fn event_loop<T: Terminal>(
         while let Ok(msg) = outline_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Outline);
             match msg {
-                SymbolsFetch::Outline { file, rows } => {
-                    outline_busy.store(false, std::sync::atomic::Ordering::Release);
-                    if outline_inflight.as_deref() == Some(file.as_str()) {
+                SymbolsFetch::Outline { key, rows } => {
+                    if outline_inflight.as_ref() == Some(&key) {
                         outline_inflight = None;
                     }
-                    outline_file = file;
-                    outline_syms = rows;
+                    let current_root = session
+                        .active_group()
+                        .map(|group| PathBuf::from(&group.path));
+                    if current_root.as_deref().is_some_and(|root| {
+                        crate::panel::sections::symbols::accept_outline(root, &key)
+                    }) {
+                        outline_key = Some(key);
+                        outline_syms = rows;
+                    }
                 }
-                SymbolsFetch::Refs { label, rows } => {
-                    refs_busy.store(false, std::sync::atomic::Ordering::Release);
-                    refs_inflight = false;
-                    refs_label = label;
-                    refs_rows = rows;
+                SymbolsFetch::Refs {
+                    root,
+                    label,
+                    file,
+                    server,
+                    rows,
+                } => {
+                    let current_root = session
+                        .active_group()
+                        .map(|group| PathBuf::from(&group.path));
+                    if current_root.as_deref().is_some_and(|current| {
+                        crate::panel::sections::symbols::accept_refs(current, &root)
+                    }) {
+                        refs_inflight = false;
+                        refs_label = label.clone();
+                        refs_note = crate::panel::sections::symbols::refs_note(
+                            &label,
+                            &file,
+                            server,
+                            rows.len(),
+                        );
+                        model.status = refs_note.clone();
+                        refs_rows = rows;
+                    }
                 }
             }
             dirty = true;
@@ -13637,43 +13782,69 @@ async fn event_loop<T: Terminal>(
         }
         // Derive the displayed list each frame from the active view, (re)fetching
         // the outline when its target file is stale.
-        if panel_ui.open == crate::panel::Section::Symbols {
+        if chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Symbols {
             if panel_ui.symbols_show_refs {
                 let header = format!("refs: {refs_label}");
+                if crate::panel::sections::symbols::sync_refs_note(&mut model.panel, &refs_note) {
+                    dirty = true;
+                }
                 if model.panel.symbols != refs_rows || model.panel.symbols_file != header {
                     model.panel.symbols = refs_rows.clone();
                     model.panel.symbols_file = header;
                     dirty = true;
                 }
             } else {
-                // Target the selected (or first) changed file. A momentarily
-                // empty `changes` (a hydration tick in flight) must NOT clear a
-                // populated outline — keep the last one until a new file is
-                // actually selected, so the outline doesn't flicker.
-                let target = panel_ui
-                    .chg_sel
-                    .and_then(|i| model.panel.changes.get(i))
-                    .or_else(|| model.panel.changes.first())
-                    .map(|c| c.path.clone());
-                if let Some(target) = &target
-                    && *target != outline_file
-                    && (outline_inflight.as_deref() != Some(target.as_str())
-                        || !outline_busy.load(std::sync::atomic::Ordering::Acquire))
+                let root = session
+                    .active_group()
+                    .map(|group| PathBuf::from(&group.path));
+                let editor_file = root.as_ref().and_then(|root| {
+                    panes
+                        .editor_file(focused_pane_id(&session))
+                        .and_then(|path| Path::new(path).strip_prefix(root).ok())
+                        .map(|path| path.to_string_lossy().into_owned())
+                });
+                let target = crate::panel::sections::symbols::symbols_target(
+                    panel_ui.symbols_pick.as_deref(),
+                    editor_file.as_deref(),
+                );
+                let key = root.zip(target.as_deref()).map(|(root, target)| {
+                    crate::panel::sections::symbols::outline_key(root, target, &model.panel.changes)
+                });
+                let demand = crate::panel::sections::symbols::OutlineDemand {
+                    visible: chrome.panel.is_some(),
+                    show_refs: panel_ui.symbols_show_refs,
+                    target: key.as_ref(),
+                    cached: outline_key.as_ref(),
+                    inflight: outline_inflight.as_ref(),
+                    busy: outline_busy.load(std::sync::atomic::Ordering::Acquire),
+                };
+                let cached_for_target =
+                    crate::panel::sections::symbols::cached_outline_matches_target(
+                        outline_key.as_ref(),
+                        key.as_ref(),
+                    );
+                if crate::panel::sections::symbols::outline_fetch_needed(&demand)
+                    && let Some(key) = key
                 {
-                    outline_inflight = Some(target.clone());
+                    outline_inflight = Some(key.clone());
                     outline_busy.store(true, std::sync::atomic::Ordering::Release);
                     spawn_outline_fetch(
-                        target.clone(),
-                        active_tab_path(&session),
+                        key,
                         lsp_supervisor.handle(),
                         outline_tx.clone(),
                         waker.clone(),
                         outline_busy.clone(),
                     );
                 }
-                if model.panel.symbols != outline_syms || model.panel.symbols_file != outline_file {
-                    model.panel.symbols = outline_syms.clone();
-                    model.panel.symbols_file = outline_file.clone();
+                let file = target.as_deref().unwrap_or_default();
+                let rows = if cached_for_target {
+                    outline_syms.as_slice()
+                } else {
+                    &[]
+                };
+                if model.panel.symbols.as_slice() != rows || model.panel.symbols_file != file {
+                    model.panel.symbols = rows.to_vec();
+                    model.panel.symbols_file = file.to_string();
                     dirty = true;
                 }
             }
@@ -13687,11 +13858,22 @@ async fn event_loop<T: Terminal>(
             if !slice.is_empty() {
                 loop_perf.tick(crate::perf::WakeSource::Other);
                 // Avoid the render -> own-log -> tail -> render feedback loop.
+                let track_cursor =
+                    panel_ui.open == crate::panel::Section::Logs || panel_ui.logs_tail;
+                let anchor = if track_cursor {
+                    crate::panel::sections::logs::cursor_seq(&model.panel, &panel_ui)
+                } else {
+                    None
+                };
                 dirty |= crate::loop_policy::apply_log_slice(
                     &mut model.panel.log_lines_structured,
+                    &mut model.panel.log_first_seq,
                     slice,
                     want_panel && panel_ui.open == crate::panel::Section::Logs,
                 );
+                if track_cursor {
+                    crate::panel::sections::logs::repin(&model.panel, &mut panel_ui, anchor);
+                }
             }
             logs_ingress.has_pending()
         };
@@ -16304,19 +16486,69 @@ async fn event_loop<T: Terminal>(
                                             },
                                         );
                                     } else {
-                                        crate::handlers::panel_changes::toggle_change_selection(
-                                            i,
-                                            visible,
-                                            &mut panel_ui,
-                                            &model,
-                                            &session,
-                                            &mut hunk_inflight,
-                                            &hunk_tx,
-                                            &mut submodule_preview_inflight,
-                                            &submodule_preview_tx,
-                                            &waker,
-                                            hydration_gen,
-                                        );
+                                        let submodule = model
+                                            .panel
+                                            .changes
+                                            .get(i)
+                                            .is_some_and(|row| row.submodule.is_some());
+                                        if i == visible || submodule {
+                                            crate::handlers::panel_changes::toggle_change_selection(
+                                                i,
+                                                visible,
+                                                &mut panel_ui,
+                                                &model,
+                                                &session,
+                                                &mut hunk_inflight,
+                                                &hunk_tx,
+                                                &mut submodule_preview_inflight,
+                                                &submodule_preview_tx,
+                                                &waker,
+                                                hydration_gen,
+                                            );
+                                        } else {
+                                            panel_ui.cursor = i;
+                                            panel_ui.row_mode = true;
+                                            panel_ui.sync_section_cursors();
+                                            let wires = GitWires {
+                                                session: &session,
+                                                cfg: keymap.config(),
+                                                op_tx: &gitop_tx,
+                                                doc_tx: &gitdoc_tx,
+                                                waker: &waker,
+                                            };
+                                            let mut ov = GitOverlays {
+                                                menu: &mut active_menu,
+                                                input: &mut git_input,
+                                                confirm_op: &mut pending_confirm_op,
+                                                custom_cmds: &mut custom_menu_cmds,
+                                            };
+                                            if let GitAfter::OpenEditor(path) = handle_git_msg(
+                                                GitMsg::Drill,
+                                                &mut panel_ui,
+                                                &mut model,
+                                                &wires,
+                                                &mut ov,
+                                            ) {
+                                                let cwd = active_cwd(&session);
+                                                if open_editor(
+                                                    &mut session,
+                                                    &mut panes,
+                                                    keymap.config(),
+                                                    &path,
+                                                    None,
+                                                    cwd.as_deref(),
+                                                    chrome.center,
+                                                    None,
+                                                ) {
+                                                    focus.zone = crate::focus::Zone::Center;
+                                                }
+                                                refresh_tab_model(&mut model, &session, &mut sb);
+                                                need_relayout = true;
+                                            }
+                                            if widen_for_drill(&mut panel_ui) {
+                                                need_relayout = true;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -19923,24 +20155,18 @@ async fn event_loop<T: Terminal>(
                         continue;
                     }
                 }
-                // Enter on a git-family LIST (commits / branches / stash)
+                // Enter on a git-family LIST
                 // drills into the row at cursor — even before j/k has entered
                 // row-mode (the panel starts in section-nav mode on focus, see
                 // `row_mode = false` on panel entry). Without this the first
                 // Enter is swallowed: `git_key` owns `Drill` but is gated on
                 // `row_mode`, and the accordion's `Select` has no action for
                 // these sections, so nothing happens until a second press.
-                // Changes/Pr keep their own `Select` behaviour (diff preview /
-                // open-thread), so they're deliberately excluded.
+                // Pr keeps its own `Select` behaviour (open-thread).
                 if focus.panel()
                     && !panel_ui.row_mode
                     && matches!(k.key, KeyCode::Enter)
-                    && matches!(
-                        panel_ui.open,
-                        crate::panel::Section::Commits
-                            | crate::panel::Section::Branches
-                            | crate::panel::Section::Stash
-                    )
+                    && gitui::enter_enters_row_mode(panel_ui.open)
                 {
                     panel_ui.row_mode = true;
                 }
@@ -20024,27 +20250,7 @@ async fn event_loop<T: Terminal>(
                             need_relayout = true;
                         }
                     }
-                    // Drilling enters a detail view (commit files, staging,
-                    // patch, blame, rebase todo) that the accordion list layout
-                    // doesn't render. Widen a resting Normal panel to Half so
-                    // the drill is visible — Half renders the git frame beside
-                    // the center pane (build_panel), NOT the screen-filling Full
-                    // layout. An already-Half/Full panel is left as the user set
-                    // it.
-                    if panel_ui.width == crate::layout::PanelWidth::Normal
-                        && matches!(
-                            panel_ui.git.focus,
-                            gitui::GitView::CommitFiles
-                                | gitui::GitView::Staging
-                                | gitui::GitView::PatchBuilding
-                                | gitui::GitView::Blame
-                                | gitui::GitView::RebaseTodo
-                        )
-                    {
-                        panel_ui.width = crate::layout::PanelWidth::Half;
-                        if panel_ui.git.widened_from.is_none() {
-                            panel_ui.git.widened_from = Some(crate::layout::PanelWidth::Normal);
-                        }
+                    if widen_for_drill(&mut panel_ui) {
                         need_relayout = true;
                     }
                     if let Some(width) = panel_ui.git.retract_width() {
@@ -20117,6 +20323,12 @@ async fn event_loop<T: Terminal>(
                         match msg {
                             // Handled above; kept to keep the match exhaustive.
                             PanelMsg::Open(_) | PanelMsg::NextSection | PanelMsg::PrevSection => {}
+                            PanelMsg::LeaveRows
+                                if panel_ui.open == crate::panel::Section::Symbols
+                                    && panel_ui.symbols_show_refs =>
+                            {
+                                crate::panel::sections::symbols::leave_refs(&mut panel_ui);
+                            }
                             PanelMsg::LeaveRows => {
                                 // Esc peels one layer at a time: expanded change
                                 // preview → row mode → section mode → leave the
@@ -20147,6 +20359,14 @@ async fn event_loop<T: Terminal>(
                                 // repeats are drained and applied in a single
                                 // render pass (no backlog inertia).
                                 let up = msg == PanelMsg::CursorUp;
+                                if up
+                                    && panel_ui.open == crate::panel::Section::Logs
+                                    && panel_ui.logs_tail
+                                    && panel_ui.cursor > 0
+                                {
+                                    panel_ui.logs_tail = false;
+                                    model.status = "Logs: tail paused (a resumes)".into();
+                                }
                                 let (repeat, leftover) = drain_key_repeats(&k, || {
                                     // Queue first: an event requeued earlier is OLDER than anything
                                     // still in the terminal, and coalescing past it would reorder input.
@@ -20252,6 +20472,17 @@ async fn event_loop<T: Terminal>(
                                     panel_ui.cursor = 0;
                                 }
                                 panel_ui.sync_section_cursors();
+                                crate::handlers::panel_changes::follow_change_cursor(
+                                    &mut panel_ui,
+                                    &model,
+                                    &session,
+                                    &mut hunk_inflight,
+                                    &hunk_tx,
+                                    &mut submodule_preview_inflight,
+                                    &submodule_preview_tx,
+                                    &waker,
+                                    hydration_gen,
+                                );
                             }
                             PanelMsg::Select => {
                                 if let Some(reason) = panel_ui.off_reason(panel_ui.open) {
@@ -20292,18 +20523,97 @@ async fn event_loop<T: Terminal>(
                                             );
                                         }
                                         Section::Pr => {
-                                            // Enter opens the full-screen in-app PR
-                                            // workflow view; `o` still opens the browser.
-                                            match crate::actions::open_pr_view(
-                                                &model,
-                                                &session,
-                                                &mut pr_view_gen,
-                                                &pr_view_tx,
-                                                &waker,
-                                                &refresh_tx,
+                                            let groups: Vec<(String, usize)> = session
+                                                .worktrees
+                                                .iter()
+                                                .map(|g| (g.path.clone(), g.active_tab))
+                                                .collect();
+                                            let active_path = active_tab_path(&session);
+                                            let active_repo =
+                                                crate::handlers::take_me_there::active_repo_path(
+                                                    &active_path.to_string_lossy(),
+                                                    &model.sidebar_db_worktrees,
+                                                );
+                                            match crate::handlers::take_me_there::pr_row_at(
+                                                &model.panel,
+                                                panel_ui.width.is_expanded(),
+                                                panel_ui.cursor,
                                             ) {
-                                                Some(v) => pr_view = Some(v),
-                                                None => model.status = "No pull request".into(),
+                                                Some(
+                                                    crate::handlers::take_me_there::PrRow::Thread(
+                                                        _,
+                                                    ),
+                                                ) => match crate::actions::open_pr_view(
+                                                    &model,
+                                                    &session,
+                                                    &mut pr_view_gen,
+                                                    &pr_view_tx,
+                                                    &waker,
+                                                    &refresh_tx,
+                                                ) {
+                                                    Some(v) => pr_view = Some(v),
+                                                    None => model.status = "No pull request".into(),
+                                                },
+                                                Some(
+                                                    crate::handlers::take_me_there::PrRow::OpenPr(
+                                                        p,
+                                                    ),
+                                                ) => {
+                                                    let p = p.clone();
+                                                    let linked = active_repo
+                                                        .and_then(|repo| {
+                                                            model.sidebar_db_worktrees.iter().find(
+                                                                |w| {
+                                                                    w.branch == p.head_ref
+                                                                        && w.repo_path == repo
+                                                                },
+                                                            )
+                                                        })
+                                                        .and_then(|w| {
+                                                            crate::nav::worktree_row_target(
+                                                                &w.path,
+                                                                &groups,
+                                                                &model.sidebar_db_worktrees,
+                                                            )
+                                                        });
+                                                    if let Some(target) = linked {
+                                                        let hydrate = activate_row!(target);
+                                                        sb.focus_active_row(&mut model);
+                                                        model.status = format!("Jumped to {}", p.head_ref);
+                                                        if hydrate {
+                                                            kick_model_hydration!();
+                                                        }
+                                                    } else if let Some((owner, repo)) =
+                                                        thegn_core::forge::model::owner_repo_from_url(&p.url)
+                                                    {
+                                                        pr_view = Some(crate::actions::open_pr_view_number(
+                                                            owner,
+                                                            repo,
+                                                            p.number,
+                                                            p.url.clone(),
+                                                            crate::actions::PrViewOpenCtx {
+                                                                session: &session,
+                                                                gen_ctr: &mut pr_view_gen,
+                                                                tx: &pr_view_tx,
+                                                                waker: &waker,
+                                                                refresh_tx: &refresh_tx,
+                                                            },
+                                                        ));
+                                                    } else {
+                                                        model.status = "Cannot identify this pull request".into();
+                                                    }
+                                                }
+                                                None => match crate::actions::open_pr_view(
+                                                    &model,
+                                                    &session,
+                                                    &mut pr_view_gen,
+                                                    &pr_view_tx,
+                                                    &waker,
+                                                    &refresh_tx,
+                                                ) {
+                                                    Some(v) => pr_view = Some(v),
+                                                    None => model.status = "No pull request".into(),
+                                                },
                                             }
                                         }
                                         Section::Tests => {
@@ -20397,20 +20707,64 @@ async fn event_loop<T: Terminal>(
                                         // arrives with the GitMsg dispatch layer.
                                         Section::Commits | Section::Branches | Section::Stash => {}
                                         Section::Mine => {
-                                            // Enter opens the cursor row in the browser.
-                                            // (Worktree-jump / branch-from-issue arrive
-                                            // with the binding layer.)
                                             let rows =
                                                 crate::panel::sections::my_work::ordered_rows(
                                                     &model.panel,
                                                 );
-                                            if let Some(row) = rows.get(panel_ui.cursor)
-                                                && !row.url.is_empty()
-                                            {
-                                                model.status = crate::actions::open_status(
-                                                    open_url_detached(&row.url),
-                                                    || format!("Opened {} in browser", row.number),
+                                            let groups: Vec<(String, usize)> = session
+                                                .worktrees
+                                                .iter()
+                                                .map(|g| (g.path.clone(), g.active_tab))
+                                                .collect();
+                                            let active_path = active_tab_path(&session);
+                                            let active_path_text = active_path.to_string_lossy();
+                                            let active_repo =
+                                                crate::handlers::take_me_there::active_repo_path(
+                                                    active_path_text.as_ref(),
+                                                    &model.sidebar_db_worktrees,
                                                 );
+                                            if let Some(row) = rows.get(panel_ui.cursor) {
+                                                match crate::panel::sections::my_work::enter_target(
+                                                    row,
+                                                    &groups,
+                                                    &model.sidebar_db_worktrees,
+                                                    active_repo,
+                                                ) {
+                                                    crate::panel::sections::my_work::EnterTarget::Jump(target) => {
+                                                        let hydrate = activate_row!(target);
+                                                        sb.focus_active_row(&mut model);
+                                                        model.status = format!("Jumped to {}", row.number);
+                                                        if hydrate {
+                                                            kick_model_hydration!();
+                                                        }
+                                                    }
+                                                    crate::panel::sections::my_work::EnterTarget::PrView { owner, repo, number } => {
+                                                        pr_view = Some(crate::actions::open_pr_view_number(
+                                                            owner,
+                                                            repo,
+                                                            number,
+                                                            row.url.clone(),
+                                                            crate::actions::PrViewOpenCtx {
+                                                                session: &session,
+                                                                gen_ctr: &mut pr_view_gen,
+                                                                tx: &pr_view_tx,
+                                                                waker: &waker,
+                                                                refresh_tx: &refresh_tx,
+                                                            },
+                                                        ));
+                                                    }
+                                                    crate::panel::sections::my_work::EnterTarget::Browser(url) => {
+                                                        model.status = crate::actions::open_status(
+                                                            open_url_detached(&url),
+                                                            || format!("Opened {} in browser", row.number),
+                                                        );
+                                                    }
+                                                    crate::panel::sections::my_work::EnterTarget::Nothing => {
+                                                        model.status = "Nothing to open for this row".into();
+                                                    }
+                                                }
+                                            } else {
+                                                model.status = "No work row selected".into();
                                             }
                                         }
                                         Section::Issues => {
@@ -20433,21 +20787,47 @@ async fn event_loop<T: Terminal>(
                                                 },
                                             );
                                         }
-                                        // Enter widens the panel to half so the
-                                        // full notification is readable — the
-                                        // resting width truncates it. It
-                                        // deliberately does NOT mark the
-                                        // notification read (that's `x`) or
-                                        // navigate away: reading shouldn't
-                                        // dismiss it.
-                                        Section::Notifications
-                                            if !model.panel.notifications.is_empty()
-                                                && panel_ui.width
-                                                    == crate::layout::PanelWidth::Normal =>
-                                        {
-                                            panel_ui.width = crate::layout::PanelWidth::Half;
-                                            panel_ui.remember_width();
-                                            need_relayout = true;
+                                        Section::Notifications => {
+                                            let selected = crate::panel::sections::notifications::visible_indices(&model.panel, &panel_ui).get(panel_ui.notifications_cursor).and_then(|&i| model.panel.notifications.get(i)).cloned();
+                                            if let Some(notification) = selected {
+                                                let groups: Vec<(String, usize)> = session
+                                                    .worktrees
+                                                    .iter()
+                                                    .map(|g| (g.path.clone(), g.active_tab))
+                                                    .collect();
+                                                let target = crate::handlers::take_me_there::notification_target(&notification, &groups, &model.sidebar_db_worktrees);
+                                                let mark_read = !matches!(&target, crate::handlers::take_me_there::NotificationTarget::Nothing);
+                                                match target {
+                                                    crate::handlers::take_me_there::NotificationTarget::Jump(target) => { let hydrate = activate_row!(target); sb.focus_active_row(&mut model); model.status = format!("Jumped to {}", notification.worktree_path); if hydrate { kick_model_hydration!(); } }
+                                                    crate::handlers::take_me_there::NotificationTarget::Browser(url) => model.status = crate::actions::open_status(open_url_detached(&url), || format!("Opened {} in browser", notification.source_ref)),
+                                                    crate::handlers::take_me_there::NotificationTarget::Nothing => model.status = "nothing to jump to — space expands".into(),
+                                                }
+                                                if mark_read && !notification.read {
+                                                    let id = notification.id;
+                                                    crate::db_task::persist(move |db| {
+                                                        if let Err(error) =
+                                                            db.mark_notification_read(id)
+                                                        {
+                                                            tracing::debug!(target:"thegn::db", %error, "notification read update failed");
+                                                        }
+                                                    });
+                                                    hydration_gen += 1;
+                                                    crate::hydrate::spawn_model_hydration(
+                                                        model_tx.clone(),
+                                                        hydration_gen,
+                                                        session.clone_for_hydrate(),
+                                                        Some(waker.clone()),
+                                                        crate::hydrate::HydrateHints {
+                                                            open: panel_ui.open,
+                                                            expanded: panel_ui.width.is_expanded(),
+                                                            ..Default::default()
+                                                        },
+                                                        None,
+                                                    );
+                                                }
+                                            } else {
+                                                model.status = "No notification selected".into();
+                                            }
                                         }
                                         Section::Jobs => {
                                             // Enter on a task row runs the selected task.
@@ -20540,14 +20920,29 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Symbols => {
-                                            // Go to definition: open the selected
-                                            // symbol in the editor at file:line.
-                                            if let Some(s) = model
+                                            if crate::panel::sections::symbols::picker_open(
+                                                &panel_ui,
+                                                &model.panel,
+                                            ) {
+                                                if let Some(change) =
+                                                    model.panel.changes.get(panel_ui.cursor)
+                                                {
+                                                    panel_ui.symbols_pick =
+                                                        Some(change.path.clone());
+                                                    panel_ui.symbols_picker = false;
+                                                    panel_ui.symbols_cursor = 0;
+                                                    panel_ui.cursor = 0;
+                                                    model.panel.symbols.clear();
+                                                    model.panel.symbols_file.clear();
+                                                }
+                                            } else if let Some(s) = model
                                                 .panel
                                                 .symbols
                                                 .get(panel_ui.symbols_cursor)
                                                 .cloned()
                                             {
+                                                // Go to definition: open the selected
+                                                // symbol in the editor at file:line.
                                                 let cwd = active_cwd(&session);
                                                 if open_editor(
                                                     &mut session,
@@ -20700,27 +21095,24 @@ async fn event_loop<T: Terminal>(
                                             );
                                         }
                                         Section::Across => {
-                                            // Jump to the excerpt's worktree
-                                            // (the aggregation's whole point:
-                                            // see it here, land there).
-                                            let target = model
+                                            if let Some(e) = model
                                                 .panel
                                                 .across
                                                 .jump_target(panel_ui.cursor)
-                                                .cloned();
-                                            if let Some(e) = target {
-                                                let tab = model
-                                                    .sidebar_rows
+                                                .cloned()
+                                            {
+                                                let groups: Vec<(String, usize)> = session
+                                                    .worktrees
                                                     .iter()
-                                                    .find(|r| {
-                                                        r.kind == crate::sidebar::RowKind::Worktree
-                                                            && r.worktree_path.as_deref()
-                                                                == Some(e.worktree.as_str())
-                                                    })
-                                                    .and_then(|r| r.tab_target.clone());
-                                                match tab {
-                                                    Some(t) => {
-                                                        let hydrate = activate_row!(t);
+                                                    .map(|g| (g.path.clone(), g.active_tab))
+                                                    .collect();
+                                                match crate::nav::worktree_row_target(
+                                                    &e.worktree,
+                                                    &groups,
+                                                    &model.sidebar_db_worktrees,
+                                                ) {
+                                                    Some(target) => {
+                                                        let hydrate = activate_row!(target);
                                                         sb.focus_active_row(&mut model);
                                                         model.status = format!(
                                                             "Jumped to {}",
@@ -20732,9 +21124,9 @@ async fn event_loop<T: Terminal>(
                                                     }
                                                     None => {
                                                         model.status = format!(
-                                                            "{} has no open tab in this session",
+                                                            "{} is not a registered worktree",
                                                             e.worktree_label
-                                                        );
+                                                        )
                                                     }
                                                 }
                                             }
@@ -20747,8 +21139,27 @@ async fn event_loop<T: Terminal>(
                                                 &panel_ui,
                                             );
                                         }
-                                        // Read-only / no-Enter-action sections
-                                        // (MergeQueue, Logs, …).
+                                        Section::PrQueue | Section::MergeQueue => {
+                                            for _ in 0..2 {
+                                                if panel_ui.width == crate::layout::PanelWidth::Full
+                                                {
+                                                    break;
+                                                }
+                                                toggle_panel_expand(
+                                                    &mut panel_ui,
+                                                    &mut hydration_gen,
+                                                    &model_tx,
+                                                    &session,
+                                                    &waker,
+                                                    PanelDocsWiring {
+                                                        generation: docs_gen,
+                                                        tx: &docs_tx,
+                                                    },
+                                                );
+                                                need_relayout = true;
+                                            }
+                                        }
+                                        // Read-only / no-Enter-action sections (Logs, …).
                                         _ => {}
                                     }
                                 } // match panel_ui.open + else
@@ -20871,6 +21282,68 @@ async fn event_loop<T: Terminal>(
                                     pr_view_tx: &pr_view_tx,
                                 },
                             )
+                        }
+                        (Section::Pr, KeyCode::Char('w')) => {
+                            let groups: Vec<(String, usize)> = session
+                                .worktrees
+                                .iter()
+                                .map(|g| (g.path.clone(), g.active_tab))
+                                .collect();
+                            let active_path = active_tab_path(&session);
+                            let active_repo = crate::handlers::take_me_there::active_repo_path(
+                                &active_path.to_string_lossy(),
+                                &model.sidebar_db_worktrees,
+                            );
+                            match crate::handlers::take_me_there::pr_row_at(
+                                &model.panel,
+                                panel_ui.width.is_expanded(),
+                                panel_ui.cursor,
+                            ) {
+                                Some(crate::handlers::take_me_there::PrRow::OpenPr(p)) => {
+                                    let p = p.clone();
+                                    let linked = active_repo
+                                        .and_then(|repo| {
+                                            model.sidebar_db_worktrees.iter().find(|w| {
+                                                w.branch == p.head_ref && w.repo_path == repo
+                                            })
+                                        })
+                                        .and_then(|w| {
+                                            crate::nav::worktree_row_target(
+                                                &w.path,
+                                                &groups,
+                                                &model.sidebar_db_worktrees,
+                                            )
+                                        });
+                                    if let Some(target) = linked {
+                                        let hydrate = activate_row!(target);
+                                        sb.focus_active_row(&mut model);
+                                        model.status = format!("Jumped to {}", p.head_ref);
+                                        if hydrate {
+                                            kick_model_hydration!();
+                                        }
+                                    } else if let Some(root) = active_repo {
+                                        crate::run::begin_worktree_preset(
+                                            std::path::PathBuf::from(root),
+                                            crate::keymap::NameSpec::Exact(p.head_ref.clone()),
+                                            None,
+                                            None,
+                                            Some(format!("origin/{}", p.head_ref)),
+                                            keymap.config(),
+                                            &mut create_gen,
+                                            &create_tx,
+                                            &waker,
+                                            &mut inflight,
+                                            &mut wizard_ui,
+                                            &mut model,
+                                        );
+                                    } else {
+                                        model.status =
+                                            "No local repository for this pull request".into();
+                                    }
+                                }
+                                _ => model.status = "w: select an OPEN PRS row".into(),
+                            }
+                            true
                         }
                         // -- tests: run / discover (capped, single-flight) ---
                         (Section::Tests, KeyCode::Char(c @ ('r' | 'R' | 'f' | 'F' | 'p'))) => {
@@ -21667,6 +22140,46 @@ async fn event_loop<T: Terminal>(
                             panel_ui.cursor = 0;
                             true
                         }
+                        (Section::Notifications, KeyCode::Char(' ')) => {
+                            if panel_ui.width == crate::layout::PanelWidth::Full {
+                                model.status = "detail is shown at Full".into();
+                            } else {
+                                let id = crate::panel::sections::notifications::visible_indices(
+                                    &model.panel,
+                                    &panel_ui,
+                                )
+                                .get(panel_ui.notifications_cursor)
+                                .and_then(|&i| model.panel.notifications.get(i))
+                                .map(|n| n.id);
+                                panel_ui.notifications_expanded =
+                                    id.filter(|id| Some(*id) != panel_ui.notifications_expanded);
+                                need_relayout = true;
+                            }
+                            true
+                        }
+                        (Section::Notifications, KeyCode::Char('o')) => {
+                            if let Some(source) =
+                                crate::panel::sections::notifications::visible_indices(
+                                    &model.panel,
+                                    &panel_ui,
+                                )
+                                .get(panel_ui.notifications_cursor)
+                                .and_then(|&i| model.panel.notifications.get(i))
+                                .map(|n| n.source_ref.clone())
+                            {
+                                if source.starts_with("http://") || source.starts_with("https://") {
+                                    model.status = crate::actions::open_status(
+                                        open_url_detached(&source),
+                                        || format!("Opened {source} in browser"),
+                                    );
+                                } else {
+                                    model.status = format!("{source} is not a link");
+                                }
+                            } else {
+                                model.status = "No notification selected".into();
+                            }
+                            true
+                        }
                         // Toggle the System tab between this repo (default) and
                         // platform-wide: notifications + containers + logs from
                         // every worktree/host. Rehydrate so the scoped
@@ -21774,6 +22287,13 @@ async fn event_loop<T: Terminal>(
                         }
                         (Section::Logs, KeyCode::Char('a')) => {
                             panel_ui.logs_tail = !panel_ui.logs_tail;
+                            if panel_ui.logs_tail {
+                                crate::panel::sections::logs::repin(
+                                    &model.panel,
+                                    &mut panel_ui,
+                                    None,
+                                );
+                            }
                             model.status = if panel_ui.logs_tail {
                                 "Logs: tail mode on".into()
                             } else {
@@ -21798,7 +22318,10 @@ async fn event_loop<T: Terminal>(
                                         .offer(crate::copymode::osc52(&text), |bytes| {
                                             writer.try_submit_oob(bytes)
                                         });
-                                    model.status = "Log line copied".into();
+                                    model.status = crate::panel::sections::logs::copy_status(
+                                        1,
+                                        crate::clipboard::copy(&text),
+                                    );
                                 }
                                 None => model.status = "No log line selected".into(),
                             }
@@ -21819,7 +22342,10 @@ async fn event_loop<T: Terminal>(
                                     .offer(crate::copymode::osc52(&text), |bytes| {
                                         writer.try_submit_oob(bytes)
                                     });
-                                model.status = format!("Copied {} log lines", lines.len());
+                                model.status = crate::panel::sections::logs::copy_status(
+                                    lines.len(),
+                                    crate::clipboard::copy(&text),
+                                );
                             }
                             true
                         }
@@ -21880,21 +22406,28 @@ async fn event_loop<T: Terminal>(
                                 refs_busy.store(true, std::sync::atomic::Ordering::Release);
                                 refs_label = s.name.clone();
                                 refs_rows.clear();
+                                refs_note.clear();
+                                model.panel.symbols_note.clear();
                                 panel_ui.symbols_show_refs = true;
                                 panel_ui.symbols_cursor = 0;
                                 panel_ui.cursor = 0;
                                 model.status = format!("Finding references to {}…", s.name);
-                                spawn_refs_fetch(
-                                    s.file,
-                                    s.line,
-                                    s.col,
-                                    s.name,
-                                    active_tab_path(&session),
-                                    lsp_supervisor.handle(),
-                                    outline_tx.clone(),
-                                    waker.clone(),
-                                    refs_busy.clone(),
-                                );
+                                if let Some(root) = session
+                                    .active_group()
+                                    .map(|group| PathBuf::from(&group.path))
+                                {
+                                    spawn_refs_fetch(
+                                        s.file,
+                                        s.line,
+                                        s.col,
+                                        s.name,
+                                        root,
+                                        lsp_supervisor.handle(),
+                                        outline_tx.clone(),
+                                        waker.clone(),
+                                        refs_busy.clone(),
+                                    );
+                                }
                             } else if !panel_ui.symbols_show_refs
                                 && refs_busy.load(std::sync::atomic::Ordering::Acquire)
                             {
@@ -21904,6 +22437,17 @@ async fn event_loop<T: Terminal>(
                             true
                         }
                         (Section::Symbols, KeyCode::Char('o')) => {
+                            crate::panel::sections::symbols::leave_refs(&mut panel_ui);
+                            true
+                        }
+                        (Section::Symbols, KeyCode::Char('f')) => {
+                            if crate::panel::sections::symbols::picker_open(&panel_ui, &model.panel)
+                            {
+                                panel_ui.symbols_pick = None;
+                                panel_ui.symbols_picker = false;
+                            } else {
+                                panel_ui.symbols_picker = true;
+                            }
                             panel_ui.symbols_show_refs = false;
                             panel_ui.symbols_cursor = 0;
                             panel_ui.cursor = 0;
@@ -21930,6 +22474,8 @@ async fn event_loop<T: Terminal>(
                                     waker.clone(),
                                     hover_busy.clone(),
                                 );
+                            } else if !current_config.lsp.hover {
+                                model.status = "Hover is off: set [lsp] hover = true".into();
                             } else if current_config.lsp.hover
                                 && hover_busy.load(std::sync::atomic::Ordering::Acquire)
                             {
@@ -21941,10 +22487,7 @@ async fn event_loop<T: Terminal>(
                         (Section::Symbols, key)
                             if crate::input::is_escape_key(&key) && panel_ui.symbols_show_refs =>
                         {
-                            // First Esc in references mode returns to the outline.
-                            panel_ui.symbols_show_refs = false;
-                            panel_ui.symbols_cursor = 0;
-                            panel_ui.cursor = 0;
+                            crate::panel::sections::symbols::leave_refs(&mut panel_ui);
                             true
                         }
                         // -- ci (AV group): drill in (v), open (o), re-run failed/all (r/R),

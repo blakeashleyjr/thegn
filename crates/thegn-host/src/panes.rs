@@ -412,6 +412,8 @@ pub(crate) struct Panes {
     /// pane exits within the threshold it's counted as a crash even if it wrote
     /// output (bwrap prints an error message before dying).
     spawn_times: std::collections::HashMap<u32, std::time::Instant>,
+    /// Repo file last opened by the UI in each editor pane (absolute path).
+    editor_files: std::collections::HashMap<u32, String>,
     /// Pane id -> `agent_dispatches` row id for a pane the UI launched as a
     /// tracker dispatch's agent (THE-733). The daemon session id is announced
     /// asynchronously, so the row cannot be stamped at spawn; the pane's exit
@@ -446,6 +448,7 @@ impl Panes {
             tx,
             waker: None,
             spawn_times: std::collections::HashMap::new(),
+            editor_files: std::collections::HashMap::new(),
             dispatch_panes: std::collections::HashMap::new(),
             rt: tokio::runtime::Handle::try_current().ok(),
             replay_cfg: None,
@@ -482,6 +485,7 @@ impl Panes {
             tx,
             waker: Some(waker),
             spawn_times: std::collections::HashMap::new(),
+            editor_files: std::collections::HashMap::new(),
             dispatch_panes: std::collections::HashMap::new(),
             rt: tokio::runtime::Handle::try_current().ok(),
             replay_cfg: None,
@@ -496,6 +500,21 @@ impl Panes {
     /// reload.
     pub(crate) fn set_replay_config(&mut self, cfg: thegn_core::config::ReplayConfig) {
         self.replay_cfg = if cfg.enabled { Some(cfg) } else { None };
+    }
+
+    pub(crate) fn note_editor_file(&mut self, id: u32, path: String) {
+        self.editor_files
+            .retain(|pane_id, _| self.table.contains_key(pane_id));
+        if self.table.contains_key(&id) {
+            self.editor_files.insert(id, path);
+        }
+    }
+
+    pub(crate) fn editor_file(&self, id: u32) -> Option<&str> {
+        self.table
+            .contains_key(&id)
+            .then(|| self.editor_files.get(&id).map(String::as_str))
+            .flatten()
     }
 
     /// Install the `[daemon]` config: when enabled, subsequently spawned local
@@ -1354,6 +1373,19 @@ mod tests {
             worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app")],
             active: 0,
         }
+    }
+
+    #[test]
+    fn editor_file_is_forgotten_with_its_pane() {
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+        let mut panes = Panes::new(tx);
+        panes.insert_test_pane(7);
+        panes.note_editor_file(7, "/repo/src/main.rs".into());
+        assert_eq!(panes.editor_file(7), Some("/repo/src/main.rs"));
+        panes.table.remove(&7);
+        assert_eq!(panes.editor_file(7), None);
+        panes.note_editor_file(8, "/repo/src/other.rs".into());
+        assert!(panes.editor_files.is_empty());
     }
 
     #[test]

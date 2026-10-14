@@ -2215,6 +2215,32 @@ fn clear_branch_failure(root: &Path) {
         .remove(root);
 }
 
+/// Resolve the visible load state for the demand-fetched branch list.
+pub(crate) fn branch_list_load(
+    need_fetch: bool,
+    fetched: Option<&Result<Vec<thegn_core::gitrefs::BranchInfo>, String>>,
+    has_cache: bool,
+    in_backoff: bool,
+) -> crate::panel::gitui::DocLoad {
+    use crate::panel::gitui::DocLoad;
+
+    if has_cache || matches!(fetched, Some(Ok(_))) {
+        DocLoad::Ready
+    } else if let Some(Err(error)) = fetched {
+        DocLoad::Failed(
+            error
+                .lines()
+                .next()
+                .unwrap_or("branch list failed")
+                .to_string(),
+        )
+    } else if !need_fetch && in_backoff {
+        DocLoad::Failed("branch list unavailable; retrying".to_string())
+    } else {
+        DocLoad::Pending
+    }
+}
+
 /// Apply a repo-wide branch refresh, preserving last-known-good shared cache
 /// contents on failure and throttling repeated failed subprocesses per repo.
 fn apply_branch_refresh(
@@ -2685,13 +2711,9 @@ pub(crate) fn build_model(
         // Host-path identity, never `loc.path()`: a provider worktree's
         // in-sandbox path (`/workspace`) is shared by every provider worktree,
         // so both the container name and the audit-event key collided.
-        active_container_name: thegn_core::sandbox::container_name_with_profile(
+        active_container_name: thegn_core::sandbox::container_name_for_config_profile(
             &thegn_core::remote::GitLoc::worktree_cache_key(&cwd),
-            if hints.profile.is_empty() {
-                None
-            } else {
-                Some(&hints.profile)
-            },
+            &hints.profile,
         ),
         active_sandbox_backend,
         active_placement_kind,
@@ -2997,9 +3019,14 @@ pub(crate) fn build_panel(
         let h_stashes = want_stashes.then(|| {
             s.spawn(|| {
                 let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
-                crate::git_handle::get()
-                    .stash_list(&loc)
-                    .unwrap_or_default()
+                crate::git_handle::get().stash_list(&loc).map_err(|error| {
+                    error
+                        .to_string()
+                        .lines()
+                        .next()
+                        .unwrap_or("stash list failed")
+                        .to_string()
+                })
             })
         });
         // off-loop: build_panel only runs on hydration workers
@@ -3036,7 +3063,9 @@ pub(crate) fn build_panel(
             h_stash_count.join().unwrap(),
             h_log.map(|h| h.join().unwrap()).unwrap_or_default(),
             h_branches.map(|h| h.join().unwrap()),
-            h_stashes.map(|h| h.join().unwrap()).unwrap_or_default(),
+            h_stashes
+                .map(|h| h.join().unwrap())
+                .unwrap_or(Ok(Vec::new())),
             h_ls.and_then(|h| h.join().unwrap()),
             incoming_set,
         )
@@ -3066,6 +3095,12 @@ pub(crate) fn build_panel(
 
     // Resolve the branch list: a fresh fetch refreshes the shared repo cache;
     // otherwise reuse the warm entry populated by this (or a sibling) worktree.
+    let branches_load = branch_list_load(
+        need_branch_fetch,
+        fetched_branches.as_ref(),
+        cached_branches.is_some(),
+        failure_age.is_some(),
+    );
     let branches_raw = apply_branch_refresh(
         repo_root.as_deref(),
         need_branch_fetch,
@@ -3323,6 +3358,7 @@ pub(crate) fn build_panel(
         panel.open_prs_fetched_at = Some(fetched_at);
     }
     if want_branches {
+        panel.branches_load = branches_load;
         let badges = panel.open_prs.clone();
         let head_branch = panel.branch.clone();
         // Sibling holders feed only the OPEN branch list (merge/delete gating),
@@ -3409,15 +3445,24 @@ pub(crate) fn build_panel(
                 .collect();
     }
     if want_stashes {
-        panel.stashes = stashes_raw
-            .into_iter()
-            .map(|s| crate::panel::StashRow {
-                index: s.index,
-                sha: s.sha,
-                date: s.date,
-                message: s.message,
-            })
-            .collect();
+        match stashes_raw {
+            Ok(stashes) => {
+                panel.stashes = stashes
+                    .into_iter()
+                    .map(|s| crate::panel::StashRow {
+                        index: s.index,
+                        sha: s.sha,
+                        date: s.date,
+                        message: s.message,
+                    })
+                    .collect();
+                panel.stashes_load = crate::panel::gitui::DocLoad::Ready;
+            }
+            Err(error) => {
+                panel.stashes.clear();
+                panel.stashes_load = crate::panel::gitui::DocLoad::Failed(error);
+            }
+        }
     }
 
     // Tests section snapshot from the cache (summary + failures + history).
@@ -3508,13 +3553,8 @@ pub(crate) fn build_panel(
         // corrupt row; parse just this window.
         let tail_lines = read_log_tail_lines(&log_path, cur_len, LOG_TAIL_BYTES);
 
-        if hints.open == crate::panel::Section::Logs {
-            let start = tail_lines.len().saturating_sub(500);
-            panel.log_lines = tail_lines[start..].to_vec();
-        }
-
-        // Always keep a bounded tail (unlike section-gated `log_lines`) so the
-        // notification → log drilldown modal has data without new blocking I/O.
+        // Always keep a bounded tail so the notification → log drilldown modal
+        // has data without new blocking I/O.
         // The drilldown opens error-gated, and errors are sparse, so a plain last-N
         // slice usually held none of them ("no matching log lines"). Fold the recent
         // ERRORs back in — see `error_inclusive_tail`. Built from the same bounded
@@ -3636,10 +3676,10 @@ fn parse_review_task_notification(
     Some((thread_id.to_string(), path, line))
 }
 
-/// Size of the fixed END-of-file read used to build the Logs section tail +
-/// drilldown payload. 256 KB is thousands of log lines — far more than the
-/// 500-line `log_lines` / 400-line `log_tail` windows ever show — while bounding
-/// the per-pass read regardless of the file's (up to 5 MB) size.
+/// Size of the fixed END-of-file read used to build the Logs drilldown payload.
+/// 256 KB is thousands of log lines — far more than the 400-line `log_tail`
+/// window ever shows — while bounding the per-pass read regardless of the
+/// file's (up to 5 MB) size.
 const LOG_TAIL_BYTES: u64 = 256 * 1024;
 
 /// Process-global incremental log-scan state: `(last_scanned_len, error_total)`.
@@ -4734,6 +4774,7 @@ fn pr_search_row(
         issue_id: None,
         branch_hint: None,
         worktree_path: None,
+        repo_root: None,
     }
 }
 
@@ -4873,6 +4914,7 @@ pub(crate) fn spawn_my_work_refresh(
                         issue_id: Some(i.id),
                         branch_hint: i.branch_hint,
                         worktree_path: None,
+                        repo_root: None,
                     });
                 }
             }
@@ -4945,6 +4987,109 @@ pub(crate) fn spawn_my_work_refresh(
                     },
                     ..Default::default()
                 });
+            }
+        }
+
+        // Repo-local links and roots are display/action metadata, sampled off
+        // the event loop alongside the feed itself.
+        if let Ok(db) = thegn_core::db::Db::open() {
+            match db.worktrees() {
+                Ok(worktrees) => {
+                    let live_paths: std::collections::HashSet<String> = worktrees
+                        .iter()
+                        .map(|worktree| worktree.worktree.clone())
+                        .collect();
+                    match db.issue_link_worktrees() {
+                        Ok(links) => {
+                            let mut newest = std::collections::HashMap::new();
+                            for (issue_id, path) in links
+                                .into_iter()
+                                .filter(|(_, path)| live_paths.contains(path))
+                            {
+                                newest.entry(issue_id).or_insert(path);
+                            }
+                            for row in &mut rows {
+                                if let Some(path) =
+                                    row.issue_id.as_ref().and_then(|id| newest.get(id))
+                                {
+                                    row.worktree_path = Some(path.clone());
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(target: "thegn::db", %error, "issue link lookup failed")
+                        }
+                    }
+                    let roots: std::collections::HashMap<String, String> = worktrees
+                        .into_iter()
+                        .filter(|wt| Path::new(&wt.repo_root).is_dir())
+                        .map(|wt| (wt.worktree, wt.repo_root))
+                        .collect();
+                    for row in &mut rows {
+                        if let Some(root) =
+                            row.worktree_path.as_ref().and_then(|path| roots.get(path))
+                        {
+                            row.repo_root = Some(root.clone());
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(target: "thegn::db", %error, "worktree repo lookup failed")
+                }
+            }
+            if all {
+                match db.workspaces() {
+                    Ok(workspaces) => {
+                        let local: Vec<(String, thegn_core::forge::model::ForgeRepoIdentity)> =
+                            workspaces
+                                .into_iter()
+                                .filter(|ws| ws.kind == "repo" && Path::new(&ws.repo_path).is_dir())
+                                .filter_map(|ws| {
+                                    let origin = thegn_core::remote::GitLoc::for_worktree(
+                                        Path::new(&ws.repo_path),
+                                    )
+                                    .origin_url()
+                                    .unwrap_or_default();
+                                    let identity =
+                                        thegn_core::forge::model::repo_identity_from_remote_url(
+                                            &origin,
+                                        )?;
+                                    Some((ws.repo_path, identity))
+                                })
+                                .collect();
+                        for row in &mut rows {
+                            let expected = match row.kind {
+                                WorkKind::Pr => {
+                                    thegn_core::forge::model::repo_identity_from_pr_url(&row.url)
+                                }
+                                WorkKind::Issue if row.provider == "github" => {
+                                    thegn_core::forge::model::repo_identity_from_pr_url(&row.url)
+                                }
+                                _ => None,
+                            };
+                            if row.repo_root.is_none()
+                                && let Some(expected) = expected
+                            {
+                                let mut matches = local
+                                    .iter()
+                                    .filter(|(_, identity)| identity.matches(&expected));
+                                if let Some((path, _)) = matches.next()
+                                    && matches.next().is_none()
+                                {
+                                    row.repo_root = Some(path.clone());
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::db", %error, "workspace lookup failed")
+                    }
+                }
+            }
+        }
+        if !all {
+            for row in &mut rows {
+                row.repo_root = Some(repo_root.to_string_lossy().into_owned());
             }
         }
 

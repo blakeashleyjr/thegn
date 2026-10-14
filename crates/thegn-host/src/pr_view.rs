@@ -192,6 +192,8 @@ enum ConvRow {
 /// The full-screen PR view. Identity + checks are snapshotted from the panel
 /// cache at open; `conversation`/`diff` load asynchronously.
 pub struct PrView {
+    /// Current-branch views can write; explicit-number views are read-only.
+    pub target: thegn_core::forge::PrRef,
     // identity (snapshot at open)
     pub number: u64,
     pub url: String,
@@ -243,6 +245,7 @@ impl PrView {
         let (owner, repo) =
             thegn_core::forge::model::owner_repo_from_url(&pr.url).unwrap_or_default();
         PrView {
+            target: thegn_core::forge::PrRef::Current,
             number: pr.number,
             url: pr.url.clone(),
             owner,
@@ -257,6 +260,39 @@ impl PrView {
             mergeable: mergeable.to_string(),
             merge_state: merge_state.to_string(),
             checks: checks.to_vec(),
+            conversation: None,
+            diff: None,
+            review: None,
+            generation: 0,
+            tab: PrTab::Overview,
+            sel: 0,
+            scroll: std::cell::Cell::new(0),
+            open_file: None,
+            include_resolved: false,
+            thread_sel: 0,
+            pending_handoff: None,
+            composer: None,
+            status: None,
+        }
+    }
+
+    pub fn for_number(owner: String, repo: String, number: u64, url: String) -> Self {
+        PrView {
+            target: thegn_core::forge::PrRef::Number(number),
+            number,
+            url,
+            owner,
+            repo,
+            head_sha: String::new(),
+            title: format!("Pull request #{number}"),
+            state: String::new(),
+            is_draft: false,
+            branch: String::new(),
+            base: String::new(),
+            review_decision: None,
+            mergeable: String::new(),
+            merge_state: String::new(),
+            checks: Vec::new(),
             conversation: None,
             diff: None,
             review: None,
@@ -1417,6 +1453,11 @@ impl PrView {
     }
 }
 
+pub(crate) fn pr_view_write_refusal(view: &PrView) -> Option<&'static str> {
+    (view.target != thegn_core::forge::PrRef::Current)
+        .then_some("read-only: open the PR's worktree (w) to act")
+}
+
 // --- free helpers ----------------------------------------------------------
 
 fn submodule_diff(f: &DiffFile) -> thegn_core::submodule::SubmoduleDiff {
@@ -1537,6 +1578,20 @@ mod tests {
         assert_eq!(v.repo, "widget");
         assert_eq!(v.head_sha, "deadbeef");
         assert_eq!(v.tab, PrTab::Overview);
+    }
+
+    #[test]
+    fn by_number_view_refuses_writes() {
+        assert_eq!(
+            pr_view_write_refusal(&PrView::for_number(
+                "acme".into(),
+                "widget".into(),
+                42,
+                "https://github.com/acme/widget/pull/42".into()
+            )),
+            Some("read-only: open the PR's worktree (w) to act")
+        );
+        assert_eq!(pr_view_write_refusal(&sample()), None);
     }
 
     #[test]
