@@ -2764,6 +2764,140 @@ mod tests {
         assert!(svc.sessions.lock().await.is_empty());
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_sessions_leaves_no_session_process_or_pty_fd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::Builder::new()
+            .prefix("thegn-daemon-shutdown-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("private shutdown fixture directory");
+        let (svc, _events) = service(0);
+        let ptmx_count = || -> usize {
+            if !std::path::Path::new("/proc/self/fd").exists() {
+                return 0;
+            }
+            std::fs::read_dir("/proc/self/fd")
+                .expect("read fd directory")
+                .map(|entry| match entry {
+                    Ok(entry) => match std::fs::read_link(entry.path()) {
+                        Ok(target) if target == std::path::Path::new("/dev/ptmx") => 1,
+                        Ok(_) | Err(_) => 0,
+                    },
+                    Err(_) => 0,
+                })
+                .sum()
+        };
+        let baseline_ptmx = ptmx_count();
+        let sh = thegn_core::util::which_path("sh").unwrap_or_else(|| "/bin/sh".into());
+        let spawned = super::fork::spawn_session(
+            &svc,
+            super::fork::SpawnRequest {
+                id: "shutdown-reap".into(),
+                argv: vec![
+                    sh,
+                    "-c".into(),
+                    "trap '' TERM; (trap '' TERM; exec sleep 60) & echo $! > gc.pid; echo $$ > c.pid; wait".into(),
+                ],
+                cwd: Some(temp.path().to_string_lossy().into_owned()),
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+                worktree: None,
+                program: "sh".into(),
+                recipe: None,
+                forked_from: None,
+                handoff: None,
+            },
+        )
+        .await
+        .expect("spawn real daemon session");
+        assert_eq!(spawned.id, "shutdown-reap");
+
+        let child_pid_file = temp.path().join("c.pid");
+        let grandchild_pid_file = temp.path().join("gc.pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while (!child_pid_file.exists() || !grandchild_pid_file.exists())
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            child_pid_file.exists(),
+            "session shell did not publish its pid"
+        );
+        assert!(
+            grandchild_pid_file.exists(),
+            "session grandchild did not publish its pid"
+        );
+        let child_pid: i64 = std::fs::read_to_string(child_pid_file)
+            .expect("read session shell pid")
+            .trim()
+            .parse()
+            .expect("numeric session shell pid");
+        let grandchild_pid: i64 = std::fs::read_to_string(grandchild_pid_file)
+            .expect("read session grandchild pid")
+            .trim()
+            .parse()
+            .expect("numeric session grandchild pid");
+        assert!(crate::platform::pid_alive(child_pid));
+        assert!(crate::platform::pid_alive(grandchild_pid));
+
+        svc.shutdown_sessions().await;
+
+        assert!(
+            svc.sessions.lock().await.is_empty(),
+            "session table must drain"
+        );
+        assert!(
+            svc.actor_tasks.lock().await.is_empty(),
+            "actor tasks must join"
+        );
+        assert!(
+            awaited_process_death(child_pid).await,
+            "session shell {child_pid} remained alive after shutdown"
+        );
+        assert!(
+            awaited_process_death(grandchild_pid).await,
+            "session grandchild {grandchild_pid} remained alive after shutdown"
+        );
+        if std::path::Path::new("/proc/self/fd").exists() {
+            assert_eq!(
+                ptmx_count(),
+                baseline_ptmx,
+                "PTY master fd leaked after shutdown"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    async fn awaited_process_death(pid: i64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if !crate::platform::pid_alive(pid) || process_is_zombie(pid) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        !crate::platform::pid_alive(pid) || process_is_zombie(pid)
+    }
+
+    #[cfg(unix)]
+    fn process_is_zombie(pid: i64) -> bool {
+        let stat_path = std::path::PathBuf::from(format!("/proc/{pid}/stat"));
+        if !stat_path.exists() {
+            return false;
+        }
+        let Ok(stat) = std::fs::read_to_string(stat_path) else {
+            return false;
+        };
+        stat.rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().next())
+            == Some("Z")
+    }
+
     #[test]
     fn concurrent_creates_of_one_name_get_distinct_branches_and_release_on_drop() {
         let root = std::path::Path::new("/repo/reservation-test");
