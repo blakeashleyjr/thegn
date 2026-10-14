@@ -273,6 +273,7 @@ pub(super) fn list_detail(
 /// Full visible cursor-list length for sections that window inside their body.
 pub(super) fn list_len(section: Section, ctx: &SectionCtx) -> Option<usize> {
     match section {
+        Section::Files => Some(misc::files_len(ctx)),
         Section::Problems => Some(ctx.model.panel.diagnostics.len()),
         Section::Jobs => Some(ctx.model.panel.task_specs.len()),
         Section::Issues => Some(issues::sorted_issues(ctx).len()),

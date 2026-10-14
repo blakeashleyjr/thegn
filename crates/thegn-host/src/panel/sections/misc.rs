@@ -20,6 +20,13 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
     let (model, deep, full) = (ctx.model, ctx.deep(), ctx.full());
     let data = &model.panel;
+    let fallback_dir_changes;
+    let dir_changes = if data.dir_changes.is_empty() && !data.changes.is_empty() {
+        fallback_dir_changes = crate::panel::dir_change_counts(&data.changes);
+        &fallback_dir_changes
+    } else {
+        &data.dir_changes
+    };
     let mut rows: Vec<PanelRow> = Vec::new();
 
     // Source: the tree hydration pre-built off-loop when available; fall back
@@ -77,11 +84,7 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
             let collapsed = ctx.ui.files_collapsed.contains(&e.path);
             let chevron = if collapsed { "▸ " } else { "▾ " };
             // Count changed files under this dir for an inline badge.
-            let changed_under = data
-                .changes
-                .iter()
-                .filter(|c| c.path.starts_with(&format!("{}/", e.path)))
-                .count();
+            let changed_under = dir_changes.get(&e.path).map_or(0, |c| c.files);
             let dir_fg = if changed_under > 0 { d() } else { f() };
             let mut l = vec![
                 sp(indent),
@@ -92,11 +95,9 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
                 l.push(seg(g(), format!("  {changed_under}✎")));
             }
             if full && !collapsed {
-                let (a, del) = data
-                    .changes
-                    .iter()
-                    .filter(|c| c.path.starts_with(&format!("{}/", e.path)))
-                    .fold((0u32, 0u32), |(a, d), c| (a + c.added, d + c.deleted));
+                let (a, del) = dir_changes
+                    .get(&e.path)
+                    .map_or((0, 0), |c| (c.added, c.deleted));
                 if a > 0 || del > 0 {
                     l.push(seg(g(), "  Σ "));
                     l.push(seg(hue(Hue::Green), format!("+{a}")));
@@ -156,6 +157,30 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
         )));
     }
     rows
+}
+
+/// Number of actionable Files rows without rendering or allocating the rows.
+pub(super) fn files_len(ctx: &SectionCtx) -> usize {
+    if ctx.ui.file_preview.is_some() {
+        return 0;
+    }
+    let data = &ctx.model.panel;
+    let fallback_tree;
+    let tree = if !data.file_tree.is_empty() {
+        &data.file_tree
+    } else if !data.changes.is_empty() {
+        let paths: Vec<String> = data
+            .changes
+            .iter()
+            .map(|change| change.path.clone())
+            .collect();
+        fallback_tree = crate::panel::build_file_tree(&paths);
+        &fallback_tree
+    } else {
+        return 0;
+    };
+    crate::panel::file_tree_visible_filtered(tree, &ctx.ui.files_collapsed, &ctx.ui.files_filter)
+        .len()
 }
 
 /// Render the inline file preview (full pane): a header (path + status + close

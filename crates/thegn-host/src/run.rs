@@ -2965,8 +2965,8 @@ enum GitDoc {
         key: gitui::CommitDetailKey,
         result: std::result::Result<String, String>,
     },
-    /// The selected stash's patch (`stash show -p -u`), keyed by index.
-    StashDiff(usize, String),
+    /// The selected stash's patch (`stash show -p -u`), keyed by SHA.
+    StashDiff(String, String),
     /// The selected branch's log, keyed by branch name.
     BranchLog(String, Vec<crate::panel::CommitRow>),
 }
@@ -3041,7 +3041,7 @@ fn load_loop_startup_prefs(
 fn spawn_stash_diff_fetch(
     generation: u64,
     session: &crate::session::Session,
-    index: usize,
+    sha: String,
     tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
     waker: &TerminalWaker,
 ) {
@@ -3052,12 +3052,9 @@ fn spawn_stash_diff_fetch(
         use thegn_svc::git::StashOps;
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
         let text = thegn_svc::git::CliGit
-            .stash_show(&loc, index)
+            .stash_show(&loc, &sha)
             .unwrap_or_else(|e| format!("stash diff failed: {e}"));
-        if tx
-            .send((generation, GitDoc::StashDiff(index, text)))
-            .is_ok()
-        {
+        if tx.send((generation, GitDoc::StashDiff(sha, text))).is_ok() {
             let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
@@ -4689,14 +4686,36 @@ fn handle_git_msg(
             }
         },
         // ---- branches ---------------------------------------------------
-        GitMsg::Pull => enqueue(panel_ui, model, GitOp::Pull),
-        GitMsg::Push => enqueue(
-            panel_ui,
-            model,
-            GitOp::Push {
-                force: thegn_svc::git::ForceMode::None,
-            },
-        ),
+        GitMsg::NewBranch => {
+            *ov.input = Some((
+                menu::InputOverlay::new("new branch name", ""),
+                GitInputKind::BranchCreate,
+            ));
+        }
+        GitMsg::Pull => {
+            if let Some(message) =
+                gitui::head_only_refusal(&model.panel, sel_branch(panel_ui, model).as_ref(), "pull")
+            {
+                model.status = message;
+            } else {
+                enqueue(panel_ui, model, GitOp::Pull);
+            }
+        }
+        GitMsg::Push => {
+            if let Some(message) =
+                gitui::head_only_refusal(&model.panel, sel_branch(panel_ui, model).as_ref(), "push")
+            {
+                model.status = message;
+            } else {
+                enqueue(
+                    panel_ui,
+                    model,
+                    GitOp::Push {
+                        force: thegn_svc::git::ForceMode::None,
+                    },
+                );
+            }
+        }
         GitMsg::FastForward => {
             if let Some(b) = sel_branch(panel_ui, model) {
                 enqueue(
@@ -6807,7 +6826,7 @@ async fn event_loop<T: Terminal>(
     // Demand-driven git-doc fetches for the stash/branches main regions:
     // `(op_gen, key)` of the read that's out, so the per-frame demand check
     // re-kicks on selection change or worktree switch but never duplicates.
-    let mut stash_diff_inflight: Option<(u64, usize)> = None;
+    let mut stash_diff_inflight: Option<(u64, String)> = None;
     let mut branch_log_inflight: Option<(u64, String)> = None;
     let mut commit_show_inflight: Option<(u64, gitui::CommitDetailKey)> = None;
     let mut commit_file_inflight: Option<(u64, String, String)> = None;
@@ -10740,9 +10759,9 @@ async fn event_loop<T: Terminal>(
                         tracing::debug!(target: "thegn::git", sha = %key.sha, "dropping stale commit detail result");
                     }
                 }
-                GitDoc::StashDiff(index, text) => {
+                GitDoc::StashDiff(sha, text) => {
                     stash_diff_inflight = None;
-                    panel_ui.git.stash_diff = Some((index, text));
+                    panel_ui.git.stash_diff = Some((sha, text));
                 }
                 GitDoc::BranchLog(name, rows) => {
                     branch_log_inflight = None;
@@ -14355,17 +14374,12 @@ async fn event_loop<T: Terminal>(
             if dirty && want_panel && panel_ui.width.is_expanded() {
                 let opgen = panel_ui.git.op_gen;
                 if panel_ui.git.focus == GitView::Stash
-                    && let Some(idx) =
-                        crate::panel::gitfull::selected_stash(&panel_ui, &model.panel)
-                    && panel_ui
-                        .git
-                        .stash_diff
-                        .as_ref()
-                        .is_none_or(|(i, _)| *i != idx)
-                    && stash_diff_inflight != Some((opgen, idx))
+                    && let Some(sha) =
+                        crate::panel::gitfull::stash_diff_wanted(&panel_ui, &model.panel)
+                    && stash_diff_inflight != Some((opgen, sha.clone()))
                 {
-                    stash_diff_inflight = Some((opgen, idx));
-                    spawn_stash_diff_fetch(opgen, &session, idx, &gitdoc_tx, &waker);
+                    stash_diff_inflight = Some((opgen, sha.clone()));
+                    spawn_stash_diff_fetch(opgen, &session, sha, &gitdoc_tx, &waker);
                 }
                 if panel_ui.git.focus == GitView::Branches
                     && let Some(name) =
