@@ -1873,7 +1873,7 @@ mod tests {
         reason = "Git fixture commands are confined to a temporary repository"
     )]
     fn exact_branch_creation_tracks_the_requested_remote_branch() {
-        let _env = crate::testenv::EnvVarGuard::set(&[
+        let env = crate::testenv::EnvVarGuard::set(&[
             ("GIT_CONFIG_GLOBAL", "/dev/null"),
             ("GIT_TERMINAL_PROMPT", "0"),
         ]);
@@ -1910,6 +1910,9 @@ mod tests {
                 .success()
         );
         let state = tempfile::tempdir().unwrap();
+        // drive_worker_with_name takes the same process-wide env lock, so release
+        // ours first or the nested guard deadlocks.
+        drop(env);
         let events = drive_worker_with_name(
             test_cfg(),
             &repo,
