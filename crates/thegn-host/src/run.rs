@@ -14098,24 +14098,17 @@ async fn event_loop<T: Terminal>(
         if let Some(group) = session.active_group()
             && group.kind == crate::session::GroupKind::Branch
             && !group.path.is_empty()
-            && model.active_placement_kind.is_none()
-            && let Some(backend) =
-                thegn_core::sandbox::Backend::parse(&model.active_sandbox_backend)
+            && crate::preview::probe_allowed(
+                &model.active_sandbox_backend,
+                model.active_placement_kind.as_deref(),
+                current_config.sandbox.enabled,
+                current_config.sandbox.network,
+                preview_supervisor.has_live_pane_evidence(&group.path),
+            )
         {
-            let network = current_config.sandbox.network;
-            let host_shared = backend == thegn_core::sandbox::Backend::None
-                || network == thegn_core::config::Network::Host
-                || (network != thegn_core::config::Network::None
-                    && thegn_core::sandbox_matrix::row(
-                        backend,
-                        thegn_core::sandbox_backend::host_os(),
-                    )
-                    .net == thegn_core::sandbox_matrix::NetIsolation::WhenSealed);
-            if host_shared {
-                let requests = preview_supervisor.probe_requests(&group.path);
-                if !requests.is_empty() {
-                    crate::preview_watch::spawn_probe(requests, probe_tx.clone(), waker.clone());
-                }
+            let requests = preview_supervisor.probe_requests(&group.path);
+            if !requests.is_empty() {
+                crate::preview_watch::spawn_probe(requests, probe_tx.clone(), waker.clone());
             }
         }
 
@@ -17908,8 +17901,19 @@ async fn event_loop<T: Terminal>(
                                                     && preview_supervisor.watch(&wt, port)
                                                 {
                                                     model.preview = preview_supervisor.view(&wt);
-                                                    model.status =
-                                                        format!("Watching preview :{port}");
+                                                    model.status = model.preview.as_ref().map_or_else(
+                                                        || format!("Watching :{port}"),
+                                                        |preview| {
+                                                            if preview.port == port {
+                                                                format!("Watching preview :{port}")
+                                                            } else {
+                                                                format!(
+                                                                    "Watching :{port}; preview shows :{}",
+                                                                    preview.port
+                                                                )
+                                                            }
+                                                        },
+                                                    );
                                                 } else if session.active_group().is_some() {
                                                     model.status = format!(
                                                         "Preview :{port} is already watched"
@@ -21067,10 +21071,13 @@ async fn event_loop<T: Terminal>(
                                         Section::Forward => {
                                             // Enter copies the focused preview/forward URL.
                                             if panel_ui.cursor == 0
-                                                && let Some(preview) = &model.preview
+                                                && let Some((worktree, port)) =
+                                                    model.preview.as_ref().map(|preview| {
+                                                        (preview.worktree.clone(), preview.port)
+                                                    })
                                             {
-                                                preview_supervisor
-                                                    .rearm_port(&preview.worktree, preview.port);
+                                                preview_supervisor.rearm_port(&worktree, port);
+                                                model.preview = preview_supervisor.view(&worktree);
                                             }
                                             if let Some(url) =
                                                 forward_url_at(&model, panel_ui.cursor)
@@ -22001,9 +22008,13 @@ async fn event_loop<T: Terminal>(
                         // -- forward: open the focused preview in the browser --
                         (Section::Forward, KeyCode::Char('o')) => {
                             if panel_ui.cursor == 0
-                                && let Some(preview) = &model.preview
+                                && let Some((worktree, port)) = model
+                                    .preview
+                                    .as_ref()
+                                    .map(|preview| (preview.worktree.clone(), preview.port))
                             {
-                                preview_supervisor.rearm_port(&preview.worktree, preview.port);
+                                preview_supervisor.rearm_port(&worktree, port);
+                                model.preview = preview_supervisor.view(&worktree);
                             }
                             if let Some(url) =
                                 forward_url_at(&model, panel_ui.cursor).map(str::to_owned)
@@ -22145,11 +22156,13 @@ async fn event_loop<T: Terminal>(
                                     let stopped = forward_supervisor.stop(&worktree, port);
                                     if stopped {
                                         preview_supervisor.provider_down(&worktree, port);
+                                        let preview_worktree = worktree.clone();
                                         crate::db_task::persist(move |db| {
                                             if let Err(error) = db.delete_forward(&worktree, port) {
                                                 tracing::debug!(target: "thegn::db", %error, "forward delete persist failed");
                                             }
                                         });
+                                        model.preview = preview_supervisor.view(&preview_worktree);
                                         model.forwards =
                                             current_forward_views(&forward_supervisor, &session);
                                         model.status = format!(

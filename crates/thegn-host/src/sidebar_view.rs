@@ -2018,14 +2018,7 @@ fn compose_row_lines(
                         (Tok::Hue(theme::Hue::Amber), gl.dot_hollow)
                     }
                 };
-                right.push(seg(
-                    tone,
-                    format!(
-                        "{marker}:{} {}",
-                        preview.port,
-                        thegn_core::preview::status_label(preview.status, preview.source)
-                    ),
-                ));
+                right.push(seg(tone, format!("{marker}:{}", preview.port)));
             }
             // Compact open-PR chip (⬡ N) — the full `PR #N` moves to the detail
             // line. Spaced like the ⚠ chip: ⬡ renders over-wide in most fonts
