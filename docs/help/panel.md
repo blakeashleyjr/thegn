@@ -137,9 +137,9 @@ mode-only changes say so instead of showing hunks. `↵` on a file opens
 line-level **staging** at every width; at Normal width it widens to Half,
 and Esc retracts that drill. At Half, the inline preview follows the cursor.
 `space` stages, and `e` cycles panel width. Untracked files preview as all
-additions and are intent-added (`add -N`) only on the first stage. Discard
-is refused in the STAGED pane and for untracked files; use `space` to unstage
-instead.
+additions and are intent-added (`add -N`) only on the first stage. In staging,
+line discard is refused in the STAGED pane (unstage with `space`) and on an
+untracked file (`d` on its Changes row deletes the file).
 
 {{keys:changes}}
 
@@ -353,8 +353,7 @@ for confirmation and ignores an active filter. `g` toggles scope between
 this repo and every worktree. The popup's `a` also asks for confirmation;
 see [[bars]].
 
-Additional keys: `A` shows read rows · `/` searches the inbox · **o** opens
-the source link.
+Additional keys: `A` shows read rows · `/` searches the inbox.
 
 An agent's `OSC 9` / `OSC 777` "I need you" is not a row here: it is live
 state, shown as the sidebar dot and the `✋` chip and cleared when you
