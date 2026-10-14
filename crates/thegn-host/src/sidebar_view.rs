@@ -2008,6 +2008,9 @@ fn compose_row_lines(
                     thegn_core::preview::PreviewStatus::Up => {
                         (Tok::Hue(theme::Hue::Green), gl.dot_filled)
                     }
+                    thegn_core::preview::PreviewStatus::Seen => {
+                        (Tok::Hue(theme::Hue::Amber), gl.dot_hollow)
+                    }
                     thegn_core::preview::PreviewStatus::Down => {
                         (Tok::Hue(theme::Hue::Red), gl.cross)
                     }
@@ -2015,7 +2018,14 @@ fn compose_row_lines(
                         (Tok::Hue(theme::Hue::Amber), gl.dot_hollow)
                     }
                 };
-                right.push(seg(tone, format!("{marker}:{}", preview.port)));
+                right.push(seg(
+                    tone,
+                    format!(
+                        "{marker}:{} {}",
+                        preview.port,
+                        thegn_core::preview::status_label(preview.status, preview.source)
+                    ),
+                ));
             }
             // Compact open-PR chip (⬡ N) — the full `PR #N` moves to the detail
             // line. Spaced like the ⚠ chip: ⬡ renders over-wide in most fonts

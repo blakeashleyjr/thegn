@@ -188,6 +188,8 @@ const FORWARD: &[SectionKey] = &[
     nav("j/k", "row"),
     k('o', "o", "open in browser"),
     nav("↵", "copy url"),
+    k('n', "n", "watch port"),
+    k('x', "x", "remove"),
 ];
 const HOSTS: &[SectionKey] = &[
     k('n', "n", "new"),
@@ -225,6 +227,7 @@ const SHARE: &[SectionKey] = &[
     nav("↵", "copy url"),
     k('o', "o", "browser"),
     k('x', "x", "stop"),
+    k('n', "n", "share port"),
 ];
 const ROW_ONLY: &[SectionKey] = &[nav("j/k", "row")];
 const HELP: &[SectionKey] = &[nav("j/k", "scroll")];
