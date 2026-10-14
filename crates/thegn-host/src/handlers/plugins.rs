@@ -229,10 +229,7 @@ fn build_entry(st: LoadedState) -> PluginEntry {
             .iter()
             .any(|c| c.extension_point == ExtensionPoint::IssueProvider)
             .then(|| {
-                thegn_svc::plugin::ProviderBridge::new(
-                    w.clone(),
-                    std::time::Duration::from_secs(st.plugin.spec.timeout_secs.max(1)),
-                )
+                thegn_svc::plugin::ProviderBridge::new(w.clone(), st.plugin.spec.run_timeout())
             })
     });
     PluginEntry {
@@ -402,9 +399,17 @@ pub(crate) fn invoke_palette_action(
             None => Some(format!("Plugin {plugin} is not running (restarting)")),
         },
         PluginMode::OneShot => {
-            host?.run_one_shot(entry.plugin.clone());
-            Some(format!("Plugin {plugin}: running {contribution}"))
+            let started = host?.run_one_shot(entry.plugin.clone());
+            Some(one_shot_status(plugin, contribution, started))
         }
+    }
+}
+
+fn one_shot_status(plugin: &str, contribution: &str, started: bool) -> String {
+    if started {
+        format!("Plugin {plugin}: running {contribution}")
+    } else {
+        format!("Plugin {plugin}: {contribution} is already running")
     }
 }
 
@@ -528,9 +533,7 @@ pub(crate) fn drain(
                         {
                             entry.bridge = Some(thegn_svc::plugin::ProviderBridge::new(
                                 w.clone(),
-                                std::time::Duration::from_secs(
-                                    entry.plugin.spec.timeout_secs.max(1),
-                                ),
+                                entry.plugin.spec.run_timeout(),
                             ));
                         }
                         entry.writer = Some(w);
@@ -1897,6 +1900,10 @@ mod tests {
 
     #[test]
     fn palette_actions_list_and_route_to_their_owner() {
+        assert_eq!(
+            one_shot_status("one-shot", "one-shot.hello", false),
+            "Plugin one-shot: one-shot.hello is already running"
+        );
         let mut state = state_with(vec![spec(
             "acts",
             vec![contribution(

@@ -330,6 +330,11 @@ impl PluginMode {
 fn default_timeout_secs() -> u64 {
     30
 }
+
+/// Maximum wall-clock duration for one plugin run. Larger manifest values are
+/// clamped to this limit with a warning; the serialized manifest is unchanged.
+pub const MAX_PLUGIN_TIMEOUT_SECS: u64 = 600;
+
 fn default_true() -> bool {
     true
 }
@@ -352,7 +357,7 @@ pub struct PluginSpec {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// Per-call (one-shot: per-run) wall-clock cap before the process group
-    /// is killed.
+    /// is killed, clamped to [`MAX_PLUGIN_TIMEOUT_SECS`] seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
     /// Host-capability scopes this plugin holds for `host.call` — the same
@@ -368,6 +373,11 @@ pub struct PluginSpec {
 }
 
 impl PluginSpec {
+    /// The admitted wall-clock limit for one plugin run.
+    pub fn run_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs.clamp(1, MAX_PLUGIN_TIMEOUT_SECS))
+    }
+
     /// The scope set a `host.call` is checked against.
     pub fn scope_set(&self) -> crate::control::ScopeSet {
         crate::control::ScopeSet::of(&self.scopes)
@@ -3227,5 +3237,33 @@ timeout_secs = 5
             error,
             PluginApiError::UnsupportedExtensionPoint(ref point) if point == "IssueProvider"
         ));
+    }
+}
+
+#[cfg(test)]
+mod run_timeout_tests {
+    use super::*;
+
+    fn spec_with_timeout(timeout_secs: u64) -> PluginSpec {
+        let mut spec: PluginSpec =
+            toml::from_str(include_str!("../../../examples/plugins/hello/plugin.toml")).unwrap();
+        spec.timeout_secs = timeout_secs;
+        spec
+    }
+
+    #[test]
+    fn run_timeout_clamps_to_ceiling_and_floor() {
+        assert_eq!(
+            spec_with_timeout(0).run_timeout(),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            spec_with_timeout(30).run_timeout(),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            spec_with_timeout(u64::MAX).run_timeout(),
+            std::time::Duration::from_secs(MAX_PLUGIN_TIMEOUT_SECS)
+        );
     }
 }
