@@ -885,6 +885,8 @@ pub enum NameSpec {
     Random,
     /// Use this literal tail (the configured branch prefix is prepended).
     Fixed(String),
+    /// Use this complete branch ref as-is, without a prefix or slugification.
+    Exact(String),
 }
 
 /// Where a `new-pane` composite splits the focused pane.
