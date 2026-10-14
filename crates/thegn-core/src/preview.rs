@@ -501,58 +501,55 @@ pub fn parse_pane_port_hints(input: &str) -> Vec<PortHint> {
 /// byte terminates it.
 pub fn parse_pane_port_hints_wrapped(input: &str, cols: Option<u16>) -> Vec<PortHint> {
     let clean = sanitize_port_hint_text(input);
-    let chars: Vec<char> = clean.chars().collect();
+    let mut chars = clean.chars().peekable();
     let mut joined = String::with_capacity(clean.len());
     let mut width = 0usize;
-    let mut index = 0usize;
-    while index < chars.len() {
-        let ch = chars[index];
-        if ch == '\r' && chars.get(index + 1) == Some(&'\n') {
+    while let Some(ch) = chars.next() {
+        if ch == '\r' && chars.peek() == Some(&'\n') {
             if cols.is_some_and(|columns| width == columns as usize) {
-                index += 2;
+                chars.next();
                 width = 0;
                 continue;
             }
             joined.push('\r');
             joined.push('\n');
-            index += 2;
+            chars.next();
             width = 0;
             continue;
         }
         if ch == '\n' {
             if cols.is_some_and(|columns| width == columns as usize) {
-                index += 1;
                 width = 0;
                 continue;
             }
             joined.push(ch);
-            index += 1;
             width = 0;
             continue;
         }
         if ch == '\r' {
             let previous = joined.chars().next_back();
-            let next = chars.get(index + 1).copied();
+            let next = chars.peek().copied();
             if previous.is_some_and(|value| !value.is_whitespace())
                 && next.is_some_and(|value| !value.is_whitespace())
             {
-                index += 1;
                 continue;
             }
+            joined.push(ch);
+            width = 0;
+            continue;
         }
-        if ch == ' ' && chars.get(index + 1) == Some(&'\r') {
+        if ch == ' ' && chars.peek() == Some(&'\r') {
             let previous = joined.chars().next_back();
-            let next = chars.get(index + 2).copied();
+            let next = chars.clone().nth(1);
             if previous.is_some_and(|value| !value.is_whitespace())
                 && next.is_some_and(|value| !value.is_whitespace())
             {
-                index += 2;
+                chars.next();
                 continue;
             }
         }
         joined.push(ch);
         width += UnicodeWidthChar::width(ch).unwrap_or(0);
-        index += 1;
     }
     parse_explicit_hints(&joined, PortHintSource::PaneOutput, true, false)
 }
@@ -878,6 +875,23 @@ mod tests {
                 .map(|hint| hint.port)
                 .collect::<Vec<_>>(),
             vec![87]
+        );
+        assert_eq!(
+            parse_pane_port_hints_wrapped("12345678localhost:87\n65/\n", Some(20))
+                .iter()
+                .map(|hint| hint.port)
+                .collect::<Vec<_>>(),
+            vec![8765]
+        );
+        assert_eq!(
+            parse_pane_port_hints_wrapped(
+                "12345678901234567890\r12345678localhost:87\n65/\n",
+                Some(20)
+            )
+            .iter()
+            .map(|hint| hint.port)
+            .collect::<Vec<_>>(),
+            vec![8765]
         );
     }
 

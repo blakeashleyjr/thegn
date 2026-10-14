@@ -193,7 +193,9 @@ impl PreviewSupervisor {
         before != self.view(&scan.worktree)
     }
 
-    /// Feed one pane's bounded output tail to the pure core parser. Returns
+    /// Feed one pane's bounded output tail to the pure core parser. Pane facts
+    /// persist after their URL scrolls out of the tail and are removed only
+    /// when a longer digit-prefix hint from that pane supersedes them. Returns
     /// true only when the selected render projection changed.
     pub(crate) fn pane_output(
         &mut self,
@@ -234,10 +236,15 @@ impl PreviewSupervisor {
             })
             .map(|((_, port), _)| *port)
             .collect();
-        for port in old_ports
-            .into_iter()
-            .filter(|port| !new_ports.contains(port))
-        {
+        // Keep pane facts after their URL scrolls out of the bounded tail. A
+        // new hint only supersedes an old one when it extends that old port's
+        // digits (for example, an echoed `:87` becoming `:8765`).
+        for port in old_ports.into_iter().filter(|old| {
+            !new_ports.contains(old)
+                && new_ports
+                    .iter()
+                    .any(|new| new != old && new.to_string().starts_with(&old.to_string()))
+        }) {
             if let Some(candidate) = self.candidates.get_mut(&(worktree.to_string(), port)) {
                 candidate.panes.remove(&pane_id);
                 Self::rearm(candidate);
@@ -376,6 +383,8 @@ impl PreviewSupervisor {
     }
 
     pub(crate) fn apply_probe(&mut self, result: ProbeResult) -> bool {
+        let worktree = result.request.worktree.clone();
+        let before_view = self.view(&worktree);
         let Some(candidate) = self
             .candidates
             .get_mut(&(result.request.worktree.clone(), result.request.port))
@@ -385,11 +394,18 @@ impl PreviewSupervisor {
         if candidate.generation != result.request.generation {
             return false;
         }
-        let before = candidate.probe_ok;
         candidate.probe_inflight = false;
         candidate.probe_spent = true;
         candidate.probe_ok = result.ok;
-        before != candidate.probe_ok
+        before_view != self.view(&worktree)
+    }
+
+    pub(crate) fn has_live_pane_evidence(&self, worktree: &str) -> bool {
+        self.candidates
+            .iter()
+            .any(|((candidate_worktree, _), candidate)| {
+                candidate_worktree == worktree && !candidate.panes.is_empty()
+            })
     }
 
     /// Record PTY EOF/child exit and transition its targets to `down` when no
@@ -504,6 +520,34 @@ impl From<&PreviewTarget> for PreviewView {
             status: target.status,
         }
     }
+}
+
+/// Whether this local worktree's pane can be reached through host loopback.
+/// An empty observed backend is the ordinary never-sandboxed host case when
+/// sandboxing is disabled; with sandboxing enabled it is trusted only after a
+/// pane has produced live output. Remote placements and unknown backend names
+/// stay fail-closed.
+pub(crate) fn probe_allowed(
+    label: &str,
+    placement: Option<&str>,
+    sandbox_enabled: bool,
+    network: thegn_core::config::Network,
+    live_pane_evidence: bool,
+) -> bool {
+    if placement.is_some() {
+        return false;
+    }
+    let Some(backend) = thegn_core::sandbox::Backend::parse(label) else {
+        return label.is_empty() && (!sandbox_enabled || live_pane_evidence);
+    };
+    backend == thegn_core::sandbox::Backend::None
+        || (network != thegn_core::config::Network::None
+            && (network == thegn_core::config::Network::Host
+                || thegn_core::sandbox_matrix::row(
+                    backend,
+                    thegn_core::sandbox_backend::host_os(),
+                )
+                .net == thegn_core::sandbox_matrix::NetIsolation::WhenSealed))
 }
 
 #[cfg(test)]
@@ -636,6 +680,71 @@ mod tests {
             ok: true
         }));
         assert_eq!(sup.view("/repo").unwrap().status, PreviewStatus::Up);
+    }
+
+    #[test]
+    fn probe_reachability_is_fail_closed_for_remote_and_isolated_targets() {
+        use thegn_core::config::Network;
+
+        assert!(probe_allowed("", None, false, Network::Host, false));
+        assert!(probe_allowed("", None, true, Network::Host, true));
+        assert!(!probe_allowed("", None, true, Network::Host, false));
+        assert!(!probe_allowed(
+            "podman-rootless",
+            None,
+            true,
+            Network::Host,
+            true
+        ));
+        assert!(!probe_allowed("", Some("ssh"), false, Network::Host, true));
+        assert!(!probe_allowed("bwrap", None, true, Network::None, true));
+    }
+
+    #[test]
+    fn evicted_pane_url_remains_the_preview_target() {
+        let mut sup = PreviewSupervisor::new();
+        sup.set_enabled(true);
+        assert!(sup.pane_output(17, "/repo", None, b"http://localhost:5173/\n", Some(80)));
+        let logs = vec![b'x'; DIAGNOSTIC_TAIL_BYTES + 128];
+        sup.pane_output(17, "/repo", None, &logs, Some(80));
+        assert_eq!(sup.view("/repo").unwrap().port, 5173);
+    }
+
+    #[test]
+    fn failed_reprobe_changes_up_view_back_to_seen() {
+        let mut sup = PreviewSupervisor::new();
+        sup.set_enabled(true);
+        sup.pane_output(22, "/repo", None, b"http://localhost:8765/\n", Some(80));
+        let request = sup.probe_requests("/repo").pop().unwrap();
+        assert!(sup.apply_probe(ProbeResult { request, ok: true }));
+        let up_view = sup.view("/repo").unwrap();
+        assert_eq!(up_view.status, PreviewStatus::Up);
+
+        sup.rearm_port("/repo", 8765);
+        let request = sup.probe_requests("/repo").pop().unwrap();
+        assert!(!sup.apply_probe(ProbeResult { request, ok: false }));
+        let seen_view = sup.view("/repo").unwrap();
+        assert_eq!(seen_view.status, PreviewStatus::Seen);
+        assert_ne!(up_view, seen_view);
+    }
+
+    #[test]
+    fn probe_change_result_tracks_the_visible_projection() {
+        let mut sup = PreviewSupervisor::new();
+        sup.set_enabled(true);
+        sup.provider_up("/repo", 8765, "http://localhost:9876".into());
+        let before = sup.view("/repo").unwrap();
+        let generation = sup.candidates[&(String::from("/repo"), 8765)].generation;
+        assert!(!sup.apply_probe(ProbeResult {
+            request: ProbeRequest {
+                worktree: "/repo".into(),
+                port: 8765,
+                host: "localhost".into(),
+                generation,
+            },
+            ok: true,
+        }));
+        assert_eq!(sup.view("/repo").unwrap(), before);
     }
 
     #[test]
