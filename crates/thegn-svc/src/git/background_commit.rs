@@ -3,9 +3,13 @@
 //! Commit messages still need stdin, so merely redirecting stdin to `/dev/null`
 //! is not an option. This runner closes the message pipe before waiting and
 //! removes every prompt surface. On Unix, a timeout kills the isolated process
-//! group; other platforms kill and reap the direct child. It is intentionally
-//! not used for general Git writes: remote fetch/push operations must not
-//! inherit this local-commit deadline.
+//! group; other platforms kill and reap the direct child. It kills only the
+//! commit's own process group. Signer descendants that escape it with `setsid`
+//! or double-forking (for example, an autostarted `gpg-agent`) are intentionally
+//! left alive: killing those user-owned agents would break them (THE-382 owner
+//! decision, 2026-10-12). Windows process-tree containment is tracked by
+//! THE-251. This runner is intentionally not used for general Git writes:
+//! remote fetch/push operations must not inherit this local-commit deadline.
 
 use anyhow::Result;
 use std::io::{Read, Write};
@@ -471,6 +475,18 @@ fn kill_process_tree(pid: u32) {
 
 #[cfg(not(unix))]
 fn kill_process_tree(_pid: u32) {}
+
+#[cfg(test)]
+mod public_api_tests {
+    #[test]
+    fn background_commit_failure_is_reexported() {
+        let failure = crate::git::BackgroundCommitFailure::MessageTooLarge { len: 2, limit: 1 };
+        assert!(matches!(
+            failure,
+            crate::git::BackgroundCommitFailure::MessageTooLarge { len: 2, limit: 1 }
+        ));
+    }
+}
 
 #[cfg(all(test, unix))]
 mod unix_tests {
