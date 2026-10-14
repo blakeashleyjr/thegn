@@ -948,10 +948,18 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             if let Some(preview) = &model.preview {
                 let tone = match preview.status {
                     thegn_core::preview::PreviewStatus::Up => hue(Hue::Green),
+                    thegn_core::preview::PreviewStatus::Seen => hue(Hue::Amber),
                     thegn_core::preview::PreviewStatus::Down => hue(Hue::Red),
                     thegn_core::preview::PreviewStatus::Unknown => hue(Hue::Amber),
                 };
-                vec![seg(tone, format!(":{} {}", preview.port, preview.status))]
+                vec![seg(
+                    tone,
+                    format!(
+                        ":{} {}",
+                        preview.port,
+                        thegn_core::preview::status_label(preview.status, preview.source)
+                    ),
+                )]
             } else if !model.forwards.is_empty() {
                 vec![seg(
                     hue(Hue::Teal),
