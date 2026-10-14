@@ -493,6 +493,7 @@ where
             message: v.msg,
             original,
             worktree: wt,
+            target: Some(meta.target().to_string()),
         });
     }
 }
