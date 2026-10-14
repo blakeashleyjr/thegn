@@ -311,7 +311,7 @@ pub fn validate_diagnostics_with_policy(
                     diagnostics.push(ValidationDiagnostic {
                         severity: ValidationSeverity::Warning,
                         message: format!(
-                            "workspace.{slug}.sandbox_mounts[{index}] `{mount}`: {error} — the entry is ignored"
+                            "project.{slug}.sandbox_mounts[{index}] `{mount}`: {error} — the entry is ignored"
                         ),
                     });
                 }
@@ -1812,14 +1812,14 @@ sidebar_workspace_sort = "attention"
 
     #[test]
     fn malformed_workspace_sandbox_mount_is_a_warning() {
-        let body = "[workspace.repo]\nsandbox_mounts = [\"/a:relative\"]\n";
+        let body = "[project.repo]\nsandbox_mounts = [\"/a:relative\"]\n";
         let diagnostics = validate_diagnostics(body);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].severity, ValidationSeverity::Warning);
         assert!(
             diagnostics[0]
                 .message
-                .contains("workspace.repo.sandbox_mounts[0]")
+                .contains("project.repo.sandbox_mounts[0]")
         );
         assert!(diagnostics[0].message.contains("relative"));
         assert!(validate_str(body).is_empty());

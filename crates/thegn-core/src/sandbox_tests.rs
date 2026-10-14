@@ -1,5 +1,5 @@
 use super::*;
-use crate::sandbox_mounts::host_toolchain_mounts;
+use crate::sandbox_mounts::{host_toolchain_mounts, parse_mount};
 
 #[test]
 fn ambient_container_listing_runs_ps_only_for_present_backends() {

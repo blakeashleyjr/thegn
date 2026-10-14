@@ -699,9 +699,6 @@ pub(crate) fn parse_mount_checked(spec: &str) -> Result<Mount, MountSpecError> {
     if parts.iter().any(|part| part.is_empty()) {
         return Err(MountSpecError::EmptySegment);
     }
-    if parts.len() > 3 {
-        return Err(MountSpecError::TooManyFields);
-    }
     let expand = |path: &str| crate::util::expand_tilde(path);
     let host = expand(parts[0]);
     if !std::path::Path::new(&host).is_absolute() {
@@ -2053,7 +2050,7 @@ mod tests {
     fn sealed_dropped_skips_malformed() {
         let home = private_tempdir();
         let malformed_denied_host = format!("{}:relative", home.path().join(".ssh").display());
-        let specs = vec![malformed_denied_host];
+        let specs = [malformed_denied_host];
         assert!(sealed_dropped_cfg_mounts(&specs, home.path()).is_empty());
     }
 }
