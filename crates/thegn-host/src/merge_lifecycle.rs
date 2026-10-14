@@ -43,11 +43,34 @@ pub(crate) enum CleanupOutcome {
     },
 }
 
-/// Paths identified by the off-loop vanished-tab probe. The compositor applies
+/// One group identity identified by the off-loop vanished-tab probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VanishedGroup {
+    pub path: String,
+    pub epoch: u64,
+}
+
+/// Groups identified by the off-loop vanished-tab probe. The compositor applies
 /// this result without re-checking disk or SQLite.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VanishedTabs {
-    pub paths: Vec<String>,
+    pub groups: Vec<VanishedGroup>,
+}
+
+impl VanishedTabs {
+    /// Keep only sampled group generations that still exist in the live session.
+    pub(crate) fn still_current(&self, session: &crate::session::Session) -> Vec<VanishedGroup> {
+        self.groups
+            .iter()
+            .filter(|sampled| {
+                session
+                    .worktrees
+                    .iter()
+                    .any(|current| current.path == sampled.path && current.epoch == sampled.epoch)
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 static RECONCILIATION_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -661,12 +684,16 @@ pub(crate) fn spawn_reconcile_removed_tabs(
     if RECONCILIATION_IN_FLIGHT.swap(true, Ordering::AcqRel) {
         return;
     }
-    let paths: Vec<String> = session
+    let groups: Vec<VanishedGroup> = session
         .worktrees
         .iter()
         .filter(|g| !g.path.is_empty())
-        .map(|g| g.path.clone())
+        .map(|g| VanishedGroup {
+            path: g.path.clone(),
+            epoch: g.epoch,
+        })
         .collect();
+    let paths: Vec<String> = groups.iter().map(|g| g.path.clone()).collect();
     let spawned = std::thread::Builder::new()
         .name("thegn-vanished-tab-reconcile".into())
         .spawn(move || {
@@ -695,10 +722,14 @@ pub(crate) fn spawn_reconcile_removed_tabs(
                     }
                 }
             }
-            if !gone.is_empty() {
+            let vanished: Vec<VanishedGroup> = groups
+                .into_iter()
+                .filter(|group| gone.iter().any(|path| path == &group.path))
+                .collect();
+            if !vanished.is_empty() {
                 crate::worktree_lifecycle::send_refresh(
                     crate::hydrate::RefreshKind::VanishedTabs(Box::new(VanishedTabs {
-                        paths: gone,
+                        groups: vanished,
                     })),
                     waker,
                 );
@@ -718,10 +749,10 @@ pub(crate) fn spawn_reconcile_removed_tabs(
 pub(crate) fn apply_vanished_tabs(
     session: &mut crate::session::Session,
     panes: &mut crate::panes::Panes,
-    paths: &[String],
+    groups: &[VanishedGroup],
     landing: &crate::handlers::worktree_delete::Landing,
 ) -> bool {
-    let gone = vanished_group_indices(session, paths);
+    let gone = vanished_group_indices(session, groups);
     if gone.is_empty() {
         return false;
     }
@@ -754,12 +785,19 @@ pub(crate) fn apply_vanished_tabs(
 /// Select only groups named by the worker's completion. Keeping this as a
 /// pure seam makes it impossible for loop-side reconciliation to silently
 /// reintroduce a disk or SQLite probe.
-fn vanished_group_indices(session: &crate::session::Session, paths: &[String]) -> Vec<usize> {
+fn vanished_group_indices(
+    session: &crate::session::Session,
+    groups: &[VanishedGroup],
+) -> Vec<usize> {
     session
         .worktrees
         .iter()
         .enumerate()
-        .filter(|(_, g)| paths.iter().any(|path| path == &g.path))
+        .filter(|(_, g)| {
+            groups
+                .iter()
+                .any(|group| group.path == g.path && group.epoch == g.epoch)
+        })
         .map(|(i, _)| i)
         .collect()
 }
@@ -1010,10 +1048,122 @@ mod tests {
             active: 0,
         };
         assert_eq!(
-            vanished_group_indices(&session, &["/repo-feature".into()]),
+            vanished_group_indices(
+                &session,
+                &[VanishedGroup {
+                    path: "/repo-feature".into(),
+                    epoch: session.worktrees[1].epoch,
+                }],
+            ),
             vec![1]
         );
         assert!(vanished_group_indices(&session, &[]).is_empty());
+    }
+
+    fn vanished_test_panes() -> crate::panes::Panes {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        crate::panes::Panes::new(tx)
+    }
+
+    #[test]
+    fn stale_vanish_result_spares_a_group_reopened_at_the_same_path() {
+        let sampled = crate::session::WorktreeGroup::new(
+            "repo/feature",
+            crate::session::GroupKind::Branch,
+            "/r/feat",
+        );
+        let result = VanishedTabs {
+            groups: vec![VanishedGroup {
+                path: sampled.path.clone(),
+                epoch: sampled.epoch,
+            }],
+        };
+        let mut session = crate::session::Session {
+            id: "s".into(),
+            worktrees: vec![sampled],
+            active: 0,
+        };
+        session.worktrees.clear();
+        let replacement = crate::session::WorktreeGroup::new(
+            "repo/feature",
+            crate::session::GroupKind::Branch,
+            "/r/feat",
+        );
+        let replacement_epoch = replacement.epoch;
+        session.worktrees.push(replacement);
+
+        assert!(result.still_current(&session).is_empty());
+        assert!(!apply_vanished_tabs(
+            &mut session,
+            &mut vanished_test_panes(),
+            &result.groups,
+            &crate::handlers::worktree_delete::Landing::default(),
+        ));
+        assert_eq!(session.worktrees.len(), 1);
+        assert_eq!(session.worktrees[0].epoch, replacement_epoch);
+    }
+
+    #[test]
+    fn vanish_result_removes_only_the_sampled_epoch() {
+        let sampled = crate::session::WorktreeGroup::new(
+            "repo/feature",
+            crate::session::GroupKind::Branch,
+            "/r/feat",
+        );
+        let result = VanishedTabs {
+            groups: vec![VanishedGroup {
+                path: sampled.path.clone(),
+                epoch: sampled.epoch,
+            }],
+        };
+        let replacement = crate::session::WorktreeGroup::new(
+            "repo/feature-replacement",
+            crate::session::GroupKind::Branch,
+            "/r/feat",
+        );
+        let replacement_epoch = replacement.epoch;
+        let mut session = crate::session::Session {
+            id: "s".into(),
+            worktrees: vec![sampled, replacement],
+            active: 0,
+        };
+
+        assert!(apply_vanished_tabs(
+            &mut session,
+            &mut vanished_test_panes(),
+            &result.groups,
+            &crate::handlers::worktree_delete::Landing::default(),
+        ));
+        assert_eq!(session.worktrees.len(), 1);
+        assert_eq!(session.worktrees[0].epoch, replacement_epoch);
+    }
+
+    #[test]
+    fn vanish_result_still_removes_the_sampled_group() {
+        let sampled = crate::session::WorktreeGroup::new(
+            "repo/feature",
+            crate::session::GroupKind::Branch,
+            "/r/feat",
+        );
+        let result = VanishedTabs {
+            groups: vec![VanishedGroup {
+                path: sampled.path.clone(),
+                epoch: sampled.epoch,
+            }],
+        };
+        let mut session = crate::session::Session {
+            id: "s".into(),
+            worktrees: vec![sampled],
+            active: 0,
+        };
+
+        assert!(apply_vanished_tabs(
+            &mut session,
+            &mut vanished_test_panes(),
+            &result.groups,
+            &crate::handlers::worktree_delete::Landing::default(),
+        ));
+        assert!(session.worktrees.is_empty());
     }
 
     #[test]
