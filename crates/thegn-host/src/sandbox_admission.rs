@@ -1,7 +1,7 @@
 //! Final launch admission, including bare host/remote outcomes after fallback.
 
 use thegn_core::capabilities::IsolationClass;
-use thegn_core::config::{IsolationFloor, OnFloorMiss, SandboxConfig};
+use thegn_core::config::SandboxConfig;
 use thegn_core::sandbox_floor::{FloorDecision, decide};
 
 /// Check what the launch will actually enter. Candidate selection can remember
@@ -28,6 +28,7 @@ pub(crate) fn admit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::config::{IsolationFloor, OnFloorMiss};
 
     #[test]
     fn fail_refusal_names_opt_outs() {

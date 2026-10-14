@@ -150,6 +150,10 @@ fn shell_chain(cfg: &Config) -> Vec<String> {
 fn sandbox_json(cfg: &Config) -> serde_json::Value {
     let report = local_backend_report(cfg);
     let (backend, actual) = effective_first_ready(cfg, &report);
+    sandbox_json_with(cfg, backend, actual)
+}
+
+fn sandbox_json_with(cfg: &Config, backend: Backend, actual: IsolationClass) -> serde_json::Value {
     let chain: Vec<serde_json::Value> = shell_chain(cfg)
         .iter()
         .map(|name| {
@@ -3670,7 +3674,7 @@ fn floor_report(cfg: &Config) {
     );
 }
 
-/// Resolve the backend and class the local shell would actually enter.
+/// The local support report for the shell chain (empty when the sandbox is disabled).
 fn local_backend_report(cfg: &Config) -> Vec<thegn_core::sandbox_support::BackendSupport> {
     if !cfg.sandbox.enabled {
         return Vec::new();
@@ -3704,7 +3708,7 @@ fn effective_first_ready(
 fn containment_line(containment: thegn_core::sandbox_floor::Containment) -> String {
     use thegn_core::sandbox_floor::Containment;
     match containment {
-        Containment::Uncontained => "  containment   NOT CONTAINED — sandbox is enabled but this launch would run at host-process; install/start podman, docker or bwrap (see `thegn doctor`)".to_string(),
+        Containment::Uncontained => "  containment   NOT CONTAINED — sandbox is enabled but this host would launch at host-process (no runtime in the chain is ready); install/start podman, docker or bwrap (see the backend table above)".to_string(),
         Containment::Disabled => "  containment   none — [sandbox] enabled = false: panes run on the host".to_string(),
         Containment::Contained(class) => format!("  containment   contained at `{}`", class.as_str()),
         Containment::ProviderManaged => "  containment   provider-managed (unverified by thegn)".to_string(),
@@ -4430,7 +4434,10 @@ mod tests {
         assert_eq!(j["portable_dotfiles_only"], true);
         assert!(j["env_overrides"].is_object());
         // sandbox_json embeds it too.
-        assert_eq!(sandbox_json(&cfg)["home"]["strategy"], "portable");
+        assert_eq!(
+            sandbox_json_with(&cfg, Backend::None, IsolationClass::HostProcess)["home"]["strategy"],
+            "portable"
+        );
     }
 
     #[test]
@@ -4664,7 +4671,11 @@ args = ["--verbose"]
 
     #[test]
     fn sandbox_json_is_well_formed() {
-        let v = sandbox_json(&Config::default());
+        let v = sandbox_json_with(
+            &Config::default(),
+            Backend::None,
+            IsolationClass::HostProcess,
+        );
         assert!(v.get("enabled").is_some());
         assert!(v.get("candidates").unwrap().is_array());
         assert!(v.get("shell_profile").unwrap().get("policy").is_some());
@@ -4812,10 +4823,14 @@ args = ["--verbose"]
             },
             ..Config::default()
         };
-        let value = sandbox_json(&cfg);
+        let value = sandbox_json_with(&cfg, Backend::None, IsolationClass::HostProcess);
         assert_eq!(value["containment"], "not-contained");
         assert!(!value["file_access_enforced"].as_bool().unwrap());
         assert!(value["containment"].is_string());
         assert!(value["file_access_enforced"].is_boolean());
+
+        let contained = sandbox_json_with(&cfg, Backend::Bwrap, IsolationClass::SharedKernel);
+        assert_eq!(contained["containment"], "contained:shared-kernel");
+        assert!(contained["file_access_enforced"].as_bool().unwrap());
     }
 }
