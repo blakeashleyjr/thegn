@@ -6,7 +6,7 @@
 //!   Full   (150 cols): left list + right detail panel side-by-side.
 
 use thegn_core::notification::{Notification, NotificationKind};
-use thegn_core::pipeline_report::display_cell;
+use thegn_core::pipeline_report::{display_cell, display_clip};
 use unicode_width::UnicodeWidthStr;
 
 use crate::seg::{Line, Seg, seg, sp};
@@ -28,15 +28,6 @@ fn kind_gh(k: NotificationKind) -> (&'static str, crate::seg::Tok) {
 
 fn kind_hue(k: NotificationKind) -> crate::seg::Tok {
     kind_gh(k).1
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    let s = display_cell(s);
-    if s.chars().count() <= max {
-        return s;
-    }
-    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{}…", cut.trim_end())
 }
 
 /// Wrap a sanitized notification message without splitting ordinary words or
@@ -182,8 +173,8 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             .cols
             .saturating_sub(1 + 1 + 12 + 1 + 1 + ago.len().max(2));
         let expanded = ctx.ui.notifications_expanded == Some(n.id);
-        let msg = truncate(&n.message, msg_budget.max(4));
-        let src = truncate(&n.source_ref, 12);
+        let msg = display_clip(&n.message, msg_budget.max(4));
+        let src = display_clip(&n.source_ref, 12);
 
         // Read items dim to `faint` (still legible) so they read as handled
         // without becoming the grey-on-grey that `ghost*` text would.
@@ -281,11 +272,11 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
 
     for (i, n) in items.iter().enumerate() {
         let ago = thegn_core::util::age(n.created_at_ms);
-        let src = truncate(&n.source_ref, 14);
+        let src = display_clip(&n.source_ref, 14);
         let msg_budget = ctx
             .cols
             .saturating_sub(kind_gh(n.kind).0.len() + 1 + src.len() + 3 + ago.len() + 1);
-        let msg = truncate(&n.message, msg_budget.max(4));
+        let msg = display_clip(&n.message, msg_budget.max(4));
         let wt_base = n
             .worktree_path
             .rsplit('/')
@@ -456,7 +447,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             let ago = thegn_core::util::age(n.created_at_ms);
             let sel_mark = if i == cursor { "▶ " } else { "  " };
             let src_w = list_w.saturating_sub(4 + ago.len() + 1).max(4);
-            let src = truncate(&n.source_ref, src_w);
+            let src = display_clip(&n.source_ref, src_w);
             let (glyph_tok, src_tok) = if n.read {
                 (f(), f())
             } else {
@@ -513,7 +504,7 @@ fn notification_detail_segs(n: &Notification, w: usize) -> Vec<Vec<Seg>> {
     out.push(vec![
         seg(kind_hue(n.kind), kind_gh(n.kind).0),
         seg(g(), "  "),
-        seg(t(), truncate(&n.source_ref, w.saturating_sub(4))).bold(),
+        seg(t(), display_clip(&n.source_ref, w.saturating_sub(4))).bold(),
     ]);
 
     // Kind label + read state
@@ -530,7 +521,7 @@ fn notification_detail_segs(n: &Notification, w: usize) -> Vec<Vec<Seg>> {
     if !n.worktree_path.is_empty() {
         out.push(vec![
             seg(f(), "worktree  "),
-            seg(g(), truncate(&n.worktree_path, w.saturating_sub(10))),
+            seg(g(), display_clip(&n.worktree_path, w.saturating_sub(10))),
         ]);
     }
 
@@ -573,10 +564,13 @@ mod tests {
 
     #[test]
     fn truncate_adds_ellipsis() {
-        assert_eq!(truncate("hello world", 8), "hello w…");
-        assert_eq!(truncate("short", 10), "short");
-        assert_eq!(truncate("ab", 1), "…");
-        assert_eq!(truncate("ok\r\nforged\u{202e}\u{200b}", 40), "ok��forged��");
+        assert_eq!(display_clip("hello world", 8), "hello w…");
+        assert_eq!(display_clip("short", 10), "short");
+        assert_eq!(display_clip("ab", 1), "…");
+        assert_eq!(
+            display_clip("ok\r\nforged\u{202e}\u{200b}", 40),
+            "ok��forged��"
+        );
     }
 
     #[test]

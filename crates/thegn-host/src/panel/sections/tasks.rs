@@ -7,6 +7,7 @@
 //!   Full   (150 cols): left list + right output/detail
 
 use thegn_core::config::TaskKind;
+use thegn_core::pipeline_report::{display_cell, display_clip};
 
 use crate::seg::{Line, Seg, seg, sp};
 
@@ -104,7 +105,7 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         let mut segs = vec![
             seg(kind_hue(&task.kind), glyph),
             seg(g3(), " "),
-            seg(if i == cursor { t() } else { d() }, name),
+            seg(if i == cursor { t() } else { d() }, display_cell(name)),
             seg(g3(), " "),
         ];
         segs.extend(status_segs(run));
@@ -156,9 +157,12 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         let line1 = Line::segs(vec![
             seg(kind_hue(&task.kind), glyph),
             seg(g3(), " "),
-            seg(if i == cursor { t() } else { d() }, &task.name),
+            seg(
+                if i == cursor { t() } else { d() },
+                display_cell(&task.name),
+            ),
             seg(g3(), " · "),
-            seg(g2(), cmd),
+            seg(g2(), display_cell(cmd)),
         ]);
 
         let mut line2_segs = vec![sp(2)];
@@ -255,7 +259,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
                 seg(if i == cursor { t() } else { g() }, sel),
                 seg(kind_hue(&task.kind), kind_glyph(&task.kind)),
                 seg(g3(), " "),
-                seg(if i == cursor { t() } else { d() }, name),
+                seg(if i == cursor { t() } else { d() }, display_cell(name)),
                 seg(g3(), " "),
             ];
             s.extend(status_segs(run));
@@ -301,7 +305,7 @@ fn task_detail_segs(
     out.push(vec![
         seg(kind_hue(&task.kind), kind_glyph(&task.kind)),
         seg(g(), "  "),
-        seg(t(), &task.name).bold(),
+        seg(t(), display_cell(&task.name)).bold(),
     ]);
 
     // Command
@@ -312,14 +316,17 @@ fn task_detail_segs(
     };
     out.push(vec![
         seg(g2(), "cmd  "),
-        seg(g(), truncate(&cmd_display, w.saturating_sub(5))),
+        seg(
+            g(),
+            display_clip(&display_cell(&cmd_display), w.saturating_sub(5)),
+        ),
     ]);
 
     // Cwd
     if let Some(cwd) = &task.cwd {
         out.push(vec![
             seg(g2(), "cwd  "),
-            seg(g(), truncate(cwd, w.saturating_sub(5))),
+            seg(g(), display_clip(&display_cell(cwd), w.saturating_sub(5))),
         ]);
     }
 
@@ -344,19 +351,11 @@ fn task_detail_segs(
         out.push(vec![seg(g3(), "─── output ───────────────────────────")]);
         let lines: Vec<&str> = r.output_tail.lines().collect();
         for line in lines.iter().skip(lines.len().saturating_sub(8)) {
-            out.push(vec![seg(g2(), truncate(line, w))]);
+            out.push(vec![seg(g2(), display_clip(line, w))]);
         }
     }
 
     out
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{}…", cut.trim_end())
 }
 
 #[cfg(test)]
@@ -436,5 +435,27 @@ mod tests {
         assert_eq!(fmt_ms(500), "500ms");
         assert_eq!(fmt_ms(1_500), "1.5s");
         assert_eq!(fmt_ms(90_000), "1m30s");
+    }
+
+    #[test]
+    fn hostile_task_detail_fields_render_without_terminal_controls() {
+        let task = thegn_core::config::Task {
+            name: "\u{1b}]0;pwn\u{7}日本語".repeat(12),
+            command: "echo \u{202e}日本語".into(),
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+            kind: TaskKind::Build,
+            matcher: None,
+            scope: None,
+        };
+        let lines = task_detail_segs(&task, None, 40);
+        assert!(
+            lines.iter().flatten().all(|segment| segment
+                .text
+                .chars()
+                .all(|c| !c.is_control() && !thegn_core::pipeline_report::is_format_control(c))),
+            "{lines:?}"
+        );
     }
 }

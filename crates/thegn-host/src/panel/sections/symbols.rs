@@ -10,18 +10,11 @@
 //!   Full  (150): breadcrumb header + the same list
 
 use std::path::PathBuf;
+use thegn_core::pipeline_report::{display_cell, display_clip};
 
 use crate::seg::{Line, seg};
 
 use super::{PanelHit, PanelRow, Section, SectionCtx, d, g2, g3, hint_row, rule, t};
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{}…", cut.trim_end())
-}
 
 pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     let data = &ctx.model.panel;
@@ -30,7 +23,10 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
     if ctx.ui.symbols_show_refs && data.symbols.is_empty() && !data.symbols_note.is_empty() {
         return vec![
-            PanelRow::plain(Line::segs(vec![seg(g2(), data.symbols_note.clone())])),
+            PanelRow::plain(Line::segs(vec![seg(
+                g2(),
+                display_cell(&data.symbols_note),
+            )])),
             hint_row(&[("o", "outline"), ("f", "pick file"), ("j/k", "select")]),
         ];
     }
@@ -157,7 +153,7 @@ fn picker_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             .iter()
             .enumerate()
             .map(|(index, change)| {
-                PanelRow::plain(Line::segs(vec![seg(g2(), change.path.clone())]))
+                PanelRow::plain(Line::segs(vec![seg(g2(), display_cell(&change.path))]))
                     .with_hit(PanelHit::Row(Section::Symbols, index))
             })
             .collect()
@@ -179,7 +175,10 @@ fn empty_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     };
     let mut rows = vec![PanelRow::plain(Line::segs(vec![seg(g2(), msg)]))];
     if ctx.full() && !file.is_empty() {
-        rows.push(PanelRow::plain(Line::segs(vec![seg(g3(), file.clone())])));
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            g3(),
+            display_cell(file),
+        )])));
     }
     rows.push(hint_row(&[
         ("↵", "go to def"),
@@ -208,14 +207,14 @@ fn list_view(ctx: &SectionCtx, half: bool) -> Vec<PanelRow> {
 
         let left = vec![
             seg(g3(), indent.clone()),
-            seg(g2(), format!("{} ", s.kind)),
+            seg(g2(), format!("{} ", display_cell(&s.kind))),
             seg(
                 name_col,
-                truncate(&s.name, ctx.cols.saturating_sub(indent.len() + 12)),
+                display_clip(&s.name, ctx.cols.saturating_sub(indent.len() + 12)),
             ),
         ];
         let line = if half {
-            Line::split(left, vec![seg(g2(), location)])
+            Line::split(left, vec![seg(g2(), display_cell(&location))])
         } else {
             Line::segs(left)
         };
@@ -243,7 +242,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let file = &ctx.model.panel.symbols_file;
     let mut rows = vec![
         PanelRow::plain(Line::segs(vec![seg(d(), "OUTLINE")])),
-        PanelRow::plain(Line::segs(vec![seg(g3(), file.clone())])),
+        PanelRow::plain(Line::segs(vec![seg(g3(), display_cell(file))])),
         rule(),
     ];
     rows.extend(list_view(ctx, true));
@@ -471,6 +470,40 @@ mod tests {
         assert_eq!(
             symbols_target(Some("src/picked.rs"), Some("src/editor.rs")),
             Some("src/picked.rs".into())
+        );
+    }
+
+    #[test]
+    fn hostile_symbol_fields_render_without_terminal_controls() {
+        let mut model = FrameModel::default();
+        model.panel.symbols = vec![sym(
+            "fn\u{202e}",
+            "\u{1b}]0;pwn\u{7}日本語".repeat(12).as_str(),
+            1,
+            0,
+        )];
+        model.panel.symbols_file = "src/\u{202e}a.rs".into();
+        let ui = PanelUi::default();
+        let rows = content(&make_ctx(&model, &ui));
+        let text = rows
+            .iter()
+            .flat_map(|row| match &row.line {
+                crate::seg::Line::Segs(segs) => {
+                    segs.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>()
+                }
+                crate::seg::Line::Split { l, r } => {
+                    l.iter().chain(r).map(|seg| seg.text.as_str()).collect()
+                }
+                crate::seg::Line::SplitMinLeft { l, r, .. } => {
+                    l.iter().chain(r).map(|seg| seg.text.as_str()).collect()
+                }
+                crate::seg::Line::Blank | crate::seg::Line::Fill { .. } => Vec::new(),
+            })
+            .collect::<String>();
+        assert!(
+            text.chars()
+                .all(|c| !c.is_control() && !thegn_core::pipeline_report::is_format_control(c)),
+            "{text:?}"
         );
     }
 }
