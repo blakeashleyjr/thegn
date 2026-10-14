@@ -13369,6 +13369,18 @@ async fn event_loop<T: Terminal>(
                 crate::panel::scope::mine_all(),
                 Some(waker.clone()),
             );
+        } else if !crate::connectivity_gate::should_skip_refresh(
+            &crate::hydrate::RefreshKind::Issues,
+            thegn_core::connectivity::current(),
+        ) && let Some(path) =
+            crate::hydrate_tracker::take_busy_retry(std::time::Instant::now())
+            && path == active_tab_path(&session)
+        {
+            crate::hydrate_tracker::spawn_issue_cache_refresh(
+                path,
+                current_config.clone(),
+                Some(waker.clone()),
+            );
         }
         // One PR-queue pass at a time: the inflight flag is the same mutual
         // exclusion the `D` key and the palette action use, so a slow pass never

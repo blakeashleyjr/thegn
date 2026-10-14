@@ -8,6 +8,7 @@
 use thegn_core::issue::{Issue, IssuePriority, IssueStatus};
 use thegn_core::theme::Hue;
 
+use crate::panel::gitui::DocLoad;
 use crate::seg::{Line, Seg, seg, sp};
 
 use super::{
@@ -134,7 +135,11 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let issues = sorted_issues(ctx);
 
     if issues.is_empty() {
-        return empty_rows(ctx.model.panel.issues_configured);
+        return empty_rows(
+            ctx.model.panel.issues_configured,
+            &ctx.model.panel.tracker_load,
+            !ctx.model.panel.tracker_issues.is_empty(),
+        );
     }
 
     let mut rows = Vec::new();
@@ -203,7 +208,11 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let issues = sorted_issues(ctx);
 
     if issues.is_empty() {
-        return empty_rows(ctx.model.panel.issues_configured);
+        return empty_rows(
+            ctx.model.panel.issues_configured,
+            &ctx.model.panel.tracker_load,
+            !ctx.model.panel.tracker_issues.is_empty(),
+        );
     }
 
     let mut rows = Vec::new();
@@ -305,7 +314,11 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let provider_label = if !data.issues_configured {
         "no issue tracker configured".to_string()
     } else if data.tracker_issues.is_empty() {
-        "no open issues".to_string()
+        match &data.tracker_load {
+            DocLoad::Pending => "loading issues…".to_string(),
+            DocLoad::Ready => "no open issues".to_string(),
+            DocLoad::Failed(error) => format!("issue tracker unavailable: {error}"),
+        }
     } else {
         // Distinct providers, in first-seen order, so an aggregated Linear+Jira
         // list reads as "⬡ ⬢ linear+jira" rather than just the first one.
@@ -339,7 +352,11 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows.push(rule());
 
     if issues.is_empty() {
-        rows.extend(empty_rows(data.issues_configured));
+        rows.extend(empty_rows(
+            data.issues_configured,
+            &data.tracker_load,
+            !data.tracker_issues.is_empty(),
+        ));
         return rows;
     }
 
@@ -474,13 +491,18 @@ fn issue_detail_segs(issue: &Issue, links: &[String], w: usize) -> Vec<Vec<Seg>>
 
 // ---- empty state ------------------------------------------------------------
 
-fn empty_rows(configured: bool) -> Vec<PanelRow> {
+fn empty_rows(configured: bool, load: &DocLoad, has_rows: bool) -> Vec<PanelRow> {
     if configured {
-        // A provider is set up; the queue is simply empty right now.
-        return vec![PanelRow::plain(Line::segs(vec![seg(
-            g2(),
-            "no open issues".to_string(),
-        )]))];
+        let message = if has_rows {
+            "no open issues".to_string()
+        } else {
+            match load {
+                DocLoad::Pending => "loading issues…".to_string(),
+                DocLoad::Ready => "no open issues".to_string(),
+                DocLoad::Failed(error) => format!("issue tracker unavailable: {error}"),
+            }
+        };
+        return vec![PanelRow::plain(Line::segs(vec![seg(g2(), message)]))];
     }
     // No tracker configured — say so, and point at how to enable it.
     vec![
@@ -640,5 +662,84 @@ mod tests {
             .collect();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].hit, Some(PanelHit::Row(Section::Issues, 1)));
+    }
+
+    #[test]
+    fn issues_empty_states_distinguish_pending_ready_failed() {
+        use crate::panel::gitui::DocLoad;
+
+        for (width, cols) in [
+            (crate::layout::PanelWidth::Normal, 39),
+            (crate::layout::PanelWidth::Half, 75),
+            (crate::layout::PanelWidth::Full, 150),
+        ] {
+            let render = |load| {
+                let model = crate::chrome::FrameModel {
+                    panel: crate::panel::PanelData {
+                        issues_configured: true,
+                        tracker_load: load,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let ui = crate::panel::PanelUi {
+                    open: Section::Issues,
+                    width,
+                    ..Default::default()
+                };
+                let ctx = SectionCtx {
+                    model: &model,
+                    ui: &ui,
+                    cols,
+                    rows: 20,
+                };
+                content(&ctx)
+                    .iter()
+                    .flat_map(|row| match &row.line {
+                        Line::Segs(segs) => {
+                            segs.iter().map(|s| s.text.as_str()).collect::<Vec<_>>()
+                        }
+                        Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => l
+                            .iter()
+                            .chain(r)
+                            .map(|s| s.text.as_str())
+                            .collect::<Vec<_>>(),
+                        Line::Blank | Line::Fill { .. } => Vec::new(),
+                    })
+                    .collect::<String>()
+            };
+            let pending = render(DocLoad::Pending);
+            let ready = render(DocLoad::Ready);
+            let failed = render(DocLoad::Failed("offline".into()));
+            assert_ne!(pending, ready, "{width:?}");
+            assert_ne!(pending, failed, "{width:?}");
+            assert_ne!(ready, failed, "{width:?}");
+            assert!(pending.contains("loading issues"), "{pending}");
+            assert!(ready.contains("no open issues"), "{ready}");
+            assert!(failed.contains("offline"), "{failed}");
+        }
+    }
+
+    #[test]
+    fn issues_summary_distinguishes_pending_failed_and_clear() {
+        use crate::panel::gitui::DocLoad;
+
+        let render = |tracker_load| {
+            let model = crate::chrome::FrameModel {
+                panel: crate::panel::PanelData {
+                    issues_configured: true,
+                    tracker_load,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            crate::panel::sections::summary(Section::Issues, &model)
+                .iter()
+                .map(|seg| seg.text.as_str())
+                .collect::<String>()
+        };
+        assert_eq!(render(DocLoad::Pending), "…");
+        assert_eq!(render(DocLoad::Failed("offline".into())), "failed");
+        assert_eq!(render(DocLoad::Ready), "clear");
     }
 }
