@@ -159,7 +159,11 @@ reading here, so — like Processes — it runs **only while this tab is open**;
 close it and the ambient refresh drops back to the cheap listing. The disk
 total refreshes on a slower cadence than the stats.
 
-Actions apply only to **thegn's own** containers (foreign ones are read-only):
+Actions apply only to containers proven to belong to this profile for a
+known worktree on that worktree's launch backend (including recognized
+`-tgvpn`/`-tgagent` companions). A user's `thegn-foo`, another profile's
+container, or the same name in another Podman store is foreign and read-only.
+A new container may appear foreign until the next refresh.
 
 - `↵` opens a shell inside the container in a new pane.
 - `o` tails its logs live in a new pane.
