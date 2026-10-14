@@ -6,7 +6,9 @@
 //!   Full   (150 cols): left list + right detail panel side-by-side.
 
 use thegn_core::issue::{Issue, IssuePriority, IssueStatus};
+use thegn_core::pipeline_report::{display_cell, display_clip};
 use thegn_core::theme::Hue;
+use unicode_width::UnicodeWidthStr;
 
 use crate::panel::gitui::DocLoad;
 use crate::seg::{Line, Seg, seg, sp};
@@ -44,14 +46,6 @@ fn provider_sigil(provider: &str) -> &'static str {
         "jira" => "⬢",
         _ => "○",
     }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{}…", cut.trim_end())
 }
 
 // ---- sorted + filtered issue list ------------------------------------------
@@ -159,14 +153,15 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         };
         let link_mark = if linked { "◈ " } else { "" };
         // Budget: 1 glyph + 1 space + number + 1 space + title
-        let number_part = &issue.number;
+        let number_part = display_cell(&issue.number);
+        let number_width = UnicodeWidthStr::width(number_part.as_str());
         let budget = cols
             .saturating_sub(1) // glyph
             .saturating_sub(1) // space
-            .saturating_sub(number_part.len())
+            .saturating_sub(number_width)
             .saturating_sub(1) // space
             .saturating_sub(link_mark.len());
-        let title = truncate(&issue.title, budget);
+        let title = display_clip(&issue.title, budget);
 
         let row = PanelRow::plain(Line::segs(vec![
             seg(
@@ -225,8 +220,9 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
 
         // Line 1: status glyph (⊘ if blocked) + number + title
         let blocked = !issue.blocked_by.is_empty();
-        let title_budget = cols.saturating_sub(issue.number.len() + 3);
-        let title = truncate(&issue.title, title_budget);
+        let number = display_clip(&issue.number, cols.saturating_sub(3));
+        let title_budget = cols.saturating_sub(UnicodeWidthStr::width(number.as_str()) + 3);
+        let title = display_clip(&issue.title, title_budget);
         let linked_str = if linked { " ◈" } else { "" };
 
         let line1 = Line::segs(vec![
@@ -243,7 +239,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
                 },
             ),
             seg(g(), " "),
-            seg(d(), issue.number.clone()),
+            seg(d(), number),
             seg(g2(), linked_str.to_string()),
             seg(g(), " "),
             seg(t(), title),
@@ -263,13 +259,13 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
                 .labels
                 .iter()
                 .take(3)
-                .cloned()
+                .map(|label| display_cell(label))
                 .collect::<Vec<_>>()
                 .join(" · ");
             meta.push(seg(f(), labels_str));
         }
         if let Some(assignee) = issue.assignees.first() {
-            let a_str = format!("  @{}", truncate(assignee, 16));
+            let a_str = format!("  @{}", display_clip(assignee, 16));
             meta.push(seg(g2(), a_str));
         }
         let line2 = Line::segs(meta);
@@ -347,7 +343,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
 
     rows.push(PanelRow::plain(Line::segs(vec![
         seg(d(), "ISSUES".to_string()),
-        seg(g2(), format!("  {provider_label}")),
+        seg(g2(), format!("  {}", display_cell(&provider_label))),
     ])));
     rows.push(rule());
 
@@ -372,18 +368,19 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             let linked = data.tracker_links.contains(&issue.id);
             let sel_mark = if i == cursor { "▶ " } else { "  " };
             let link_mark = if linked { "◈" } else { " " };
-            let num_w = 10.min(issue.number.len() + 1);
+            let number = display_clip(&issue.number, 10);
+            let num_w = UnicodeWidthStr::width(number.as_str()) + 1;
             let title_w = list_w.saturating_sub(2 + num_w + 1 + 1);
             (
                 vec![
                     seg(if i == cursor { t() } else { g() }, sel_mark.to_string()),
                     seg(status_hue(issue.status), issue.status.glyph().to_string()),
                     seg(g(), " "),
-                    seg(d(), issue.number.clone()),
+                    seg(d(), number),
                     seg(g(), " "),
                     seg(
                         if i == cursor { t() } else { g2() },
-                        truncate(&issue.title, title_w),
+                        display_clip(&issue.title, title_w),
                     ),
                     seg(g2(), format!(" {link_mark}")),
                 ],
@@ -424,7 +421,7 @@ fn issue_detail_segs(issue: &Issue, links: &[String], w: usize) -> Vec<Vec<Seg>>
     let mut out: Vec<Vec<Seg>> = Vec::new();
 
     // Title (bold)
-    out.push(vec![seg(t(), truncate(&issue.title, w)).bold()]);
+    out.push(vec![seg(t(), display_clip(&issue.title, w)).bold()]);
 
     // Status + priority row
     out.push(vec![
@@ -440,7 +437,7 @@ fn issue_detail_segs(issue: &Issue, links: &[String], w: usize) -> Vec<Vec<Seg>>
     if !issue.assignees.is_empty() {
         out.push(vec![
             seg(g2(), "by ".to_string()),
-            seg(d(), issue.assignees.join(", ")),
+            seg(d(), display_cell(&issue.assignees.join(", "))),
         ]);
     }
 
@@ -452,7 +449,7 @@ fn issue_detail_segs(issue: &Issue, links: &[String], w: usize) -> Vec<Vec<Seg>>
                 .labels
                 .iter()
                 .take(5)
-                .cloned()
+                .map(|label| display_cell(label))
                 .collect::<Vec<_>>()
                 .join("  "),
         )]);
@@ -462,7 +459,7 @@ fn issue_detail_segs(issue: &Issue, links: &[String], w: usize) -> Vec<Vec<Seg>>
     if let Some(branch) = &issue.branch_hint {
         out.push(vec![
             seg(g2(), "branch  ".to_string()),
-            seg(f(), truncate(branch, w.saturating_sub(8))),
+            seg(f(), display_clip(branch, w.saturating_sub(8))),
         ]);
     }
 
@@ -478,7 +475,7 @@ fn issue_detail_segs(issue: &Issue, links: &[String], w: usize) -> Vec<Vec<Seg>>
     if let Some(body) = &issue.body {
         out.push(vec![seg(g3(), "─".repeat(w.min(40)))]);
         for line in body.lines().take(3) {
-            out.push(vec![seg(g(), truncate(line, w))]);
+            out.push(vec![seg(g(), display_clip(line, w))]);
         }
         let remaining = body.lines().count().saturating_sub(3);
         if remaining > 0 {
@@ -741,5 +738,48 @@ mod tests {
         assert_eq!(render(DocLoad::Pending), "…");
         assert_eq!(render(DocLoad::Failed("offline".into())), "failed");
         assert_eq!(render(DocLoad::Ready), "clear");
+    }
+
+    #[test]
+    fn hostile_issue_fields_render_without_terminal_controls() {
+        let mut hostile = issue(
+            "APP-\u{1b}[31m1",
+            IssuePriority::High,
+            IssueStatus::Todo,
+            "",
+        );
+        hostile.title = "\u{1b}]0;pwn\u{7}日本語".repeat(12);
+        hostile.labels = vec!["label\u{202e}".into()];
+        hostile.assignees = vec!["user\u{200b}".into()];
+        let model = crate::chrome::FrameModel {
+            panel: panel_with(vec![hostile]),
+            ..Default::default()
+        };
+        let ui = crate::panel::PanelUi {
+            open: Section::Issues,
+            ..Default::default()
+        };
+        let rows = content(&SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 60,
+            rows: 20,
+        });
+        let text = rows
+            .iter()
+            .flat_map(|row| match &row.line {
+                Line::Segs(segs) => segs.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>(),
+                Line::Split { l, r } => l.iter().chain(r).map(|seg| seg.text.as_str()).collect(),
+                Line::SplitMinLeft { l, r, .. } => {
+                    l.iter().chain(r).map(|seg| seg.text.as_str()).collect()
+                }
+                Line::Blank | Line::Fill { .. } => Vec::new(),
+            })
+            .collect::<String>();
+        assert!(
+            text.chars()
+                .all(|c| !c.is_control() && !thegn_core::pipeline_report::is_format_control(c)),
+            "{text:?}"
+        );
     }
 }

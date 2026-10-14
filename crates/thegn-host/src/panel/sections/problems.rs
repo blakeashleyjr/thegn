@@ -6,6 +6,7 @@
 //!   Full   (150 cols): left list + right detail (full message, source, code)
 
 use crate::seg::{Line, Seg, seg, sp};
+use thegn_core::pipeline_report::{display_cell, display_clip};
 
 use super::{
     PanelHit, PanelRow, Section, SectionCtx, d, g, g2, g3, hint_row, hue, list_detail, rule, t,
@@ -20,14 +21,6 @@ fn severity_glyph(s: Severity) -> (&'static str, Tok) {
         Severity::Info => ("·", hue(Hue::Blue)),
         Severity::Hint => ("→", g2()),
     }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{}…", cut.trim_end())
 }
 
 // ── main entry point ──────────────────────────────────────────────────────────
@@ -92,7 +85,7 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     for (i, d_item) in diags.iter().enumerate() {
         let (glyph, glyph_col) = severity_glyph(d_item.severity);
         let msg_w = ctx.cols.saturating_sub(glyph.len() + 2);
-        let msg = truncate(&d_item.message, msg_w);
+        let msg = display_clip(&d_item.message, msg_w);
         let selected = i == cursor;
 
         let row_segs = vec![
@@ -132,7 +125,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         let msg_w = ctx
             .cols
             .saturating_sub(glyph.len() + 2 + location.len() + 2);
-        let msg = truncate(&d_item.message, msg_w);
+        let msg = display_clip(&d_item.message, msg_w);
         let selected = i == cursor;
 
         let row = PanelRow::plain(Line::split(
@@ -141,7 +134,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
                 seg(g3(), " "),
                 seg(if selected { t() } else { d() }, msg),
             ],
-            vec![seg(g2(), location)],
+            vec![seg(g2(), display_cell(&location))],
         ))
         .with_hit(PanelHit::Row(Section::Problems, i));
         let row = if selected {
@@ -194,7 +187,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             let (glyph, glyph_col) = severity_glyph(d_item.severity);
             let sel = if i == cursor { "▶ " } else { "  " };
             let name_w = list_w.saturating_sub(sel.len() + glyph.len() + 1);
-            let label = truncate(&d_item.message, name_w);
+            let label = display_clip(&d_item.message, name_w);
             (
                 vec![
                     seg(if i == cursor { t() } else { g() }, sel),
@@ -235,7 +228,7 @@ fn diag_detail_segs(d_item: &crate::panel::DiagnosticItem, w: usize) -> Vec<Vec<
     out.push(vec![
         seg(glyph_col, glyph),
         seg(g(), "  "),
-        seg(t(), &d_item.source).bold(),
+        seg(t(), display_cell(&d_item.source)).bold(),
     ]);
 
     // Full message (may wrap across lines)
@@ -248,9 +241,9 @@ fn diag_detail_segs(d_item: &crate::panel::DiagnosticItem, w: usize) -> Vec<Vec<
     {
         let s: String = chunk.iter().collect();
         if i == 0 {
-            out.push(vec![seg(t(), s)]);
+            out.push(vec![seg(t(), display_cell(&s))]);
         } else {
-            out.push(vec![sp(2), seg(d(), s)]);
+            out.push(vec![sp(2), seg(d(), display_cell(&s))]);
         }
     }
 
@@ -261,12 +254,12 @@ fn diag_detail_segs(d_item: &crate::panel::DiagnosticItem, w: usize) -> Vec<Vec<
     };
     out.push(vec![
         seg(g2(), "at  "),
-        seg(g(), truncate(&loc, w.saturating_sub(4))),
+        seg(g(), display_clip(&loc, w.saturating_sub(4))),
     ]);
 
     // Code (if present)
     if let Some(code) = &d_item.code {
-        out.push(vec![seg(g2(), "code "), seg(g(), code.clone())]);
+        out.push(vec![seg(g2(), "code "), seg(g(), display_cell(code))]);
     }
 
     out
@@ -348,6 +341,38 @@ mod tests {
             rows[1].bg == Some(crate::seg::Tok::SelAccent),
             "row 1 bg: {:?}",
             rows[1].bg
+        );
+    }
+
+    #[test]
+    fn hostile_diagnostic_fields_render_without_terminal_controls() {
+        let mut model = FrameModel::default();
+        model.panel.diagnostics = vec![make_diag(
+            Severity::Error,
+            "\u{1b}]0;pwn\u{7}日本語".repeat(12).as_str(),
+            "src/\u{202e}main.rs",
+        )];
+        let ui = PanelUi::default();
+        let rows = content(&make_ctx(&model, &ui, 39, 20));
+        let text = rows
+            .iter()
+            .flat_map(|row| match &row.line {
+                crate::seg::Line::Segs(segs) => {
+                    segs.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>()
+                }
+                crate::seg::Line::Split { l, r } => {
+                    l.iter().chain(r).map(|seg| seg.text.as_str()).collect()
+                }
+                crate::seg::Line::SplitMinLeft { l, r, .. } => {
+                    l.iter().chain(r).map(|seg| seg.text.as_str()).collect()
+                }
+                crate::seg::Line::Blank | crate::seg::Line::Fill { .. } => Vec::new(),
+            })
+            .collect::<String>();
+        assert!(
+            text.chars()
+                .all(|c| !c.is_control() && !thegn_core::pipeline_report::is_format_control(c)),
+            "{text:?}"
         );
     }
 }
