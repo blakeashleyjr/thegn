@@ -28,16 +28,16 @@ pub enum Action {
     },
 }
 
-pub fn run(_cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
+pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
     match action {
-        Action::List => list(),
+        Action::List => list(&cfg.theme.preset),
         Action::Set { name } => set(&name, &config_path),
         Action::Import { file, name } => import(&file, name.as_deref()),
     }
 }
 
-fn list() -> Result<()> {
-    let users = read_user_themes();
+fn list(active: &str) -> Result<()> {
+    let users = read_user_themes(Some(active));
     for name in PRESETS {
         if let Some(pal) = theme::preset(name) {
             print_preview(name, &pal);
@@ -65,7 +65,7 @@ fn print_preview(name: &str, pal: &theme::Palette) {
 
 fn set(name: &str, config_path: &Path) -> Result<()> {
     let known = PRESETS.contains(&name)
-        || read_user_themes()
+        || read_user_themes(Some(name))
             .iter()
             .any(|theme| theme.meta.name == name);
     if known {
@@ -106,9 +106,9 @@ fn report_contrast_warnings(theme: &UserTheme) {
     }
 }
 
-fn read_user_themes() -> Vec<UserTheme> {
+fn read_user_themes(active: Option<&str>) -> Vec<UserTheme> {
     let dir = util::xdg_config_home().join("thegn/themes");
-    let (themes, warnings) = crate::theme_store::scan_dir(&dir);
+    let (themes, warnings) = crate::theme_store::scan_dir(&dir, active);
     for warning in warnings {
         msg::warn(&warning);
     }

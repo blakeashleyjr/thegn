@@ -4,7 +4,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -59,19 +59,32 @@ pub(crate) struct ThemeStore {
     request: Option<mpsc::Sender<Work>>,
     results: tokio_mpsc::UnboundedReceiver<ThemeStoreResult>,
     shutdown: Arc<AtomicBool>,
+    active: Arc<Mutex<String>>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl ThemeStore {
-    pub(crate) fn spawn(waker: TerminalWaker, config_path: PathBuf) -> Self {
+    pub(crate) fn spawn(waker: TerminalWaker, config_path: PathBuf, active_preset: &str) -> Self {
         let themes_dir = thegn_core::util::xdg_config_home().join("thegn/themes");
-        Self::start(Some(waker), themes_dir, config_path)
+        Self::start(
+            Some(waker),
+            themes_dir,
+            config_path,
+            active_preset.to_owned(),
+        )
     }
 
-    fn start(waker: Option<TerminalWaker>, themes_dir: PathBuf, config_path: PathBuf) -> Self {
+    fn start(
+        waker: Option<TerminalWaker>,
+        themes_dir: PathBuf,
+        config_path: PathBuf,
+        active_preset: String,
+    ) -> Self {
         let (request, request_rx) = mpsc::channel();
         let (result_tx, results) = tokio_mpsc::unbounded_channel();
         let shutdown = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(Mutex::new(active_preset));
+        let worker_active = Arc::clone(&active);
         let watcher_tx = request.clone();
         let worker_shutdown = Arc::clone(&shutdown);
         let worker = std::thread::Builder::new()
@@ -86,9 +99,10 @@ impl ThemeStore {
                     config_path,
                     watcher_tx,
                     worker_shutdown,
+                    worker_active,
                 )
             });
-        Self::from_worker_spawn(worker, request, results, shutdown)
+        Self::from_worker_spawn(worker, request, results, shutdown, active)
     }
 
     fn from_worker_spawn(
@@ -96,13 +110,14 @@ impl ThemeStore {
         request: mpsc::Sender<Work>,
         results: tokio_mpsc::UnboundedReceiver<ThemeStoreResult>,
         shutdown: Arc<AtomicBool>,
+        active: Arc<Mutex<String>>,
     ) -> Self {
         match worker {
-            Ok(worker) => Self::new_running(request, results, shutdown, worker),
+            Ok(worker) => Self::new_running(request, results, shutdown, active, worker),
             Err(error) => {
                 tracing::warn!(target: "thegn::theme", error = %error, "theme store worker unavailable");
                 drop(request);
-                Self::new_degraded(results, shutdown)
+                Self::new_degraded(results, shutdown, active)
             }
         }
     }
@@ -111,12 +126,14 @@ impl ThemeStore {
         request: mpsc::Sender<Work>,
         results: tokio_mpsc::UnboundedReceiver<ThemeStoreResult>,
         shutdown: Arc<AtomicBool>,
+        active: Arc<Mutex<String>>,
         worker: JoinHandle<()>,
     ) -> Self {
         Self {
             request: Some(request),
             results,
             shutdown,
+            active,
             worker: Some(worker),
         }
     }
@@ -124,11 +141,13 @@ impl ThemeStore {
     fn new_degraded(
         results: tokio_mpsc::UnboundedReceiver<ThemeStoreResult>,
         shutdown: Arc<AtomicBool>,
+        active: Arc<Mutex<String>>,
     ) -> Self {
         Self {
             request: None,
             results,
             shutdown,
+            active,
             worker: None,
         }
     }
@@ -151,11 +170,23 @@ impl ThemeStore {
         theme: UserTheme,
         overrides: Option<Box<ThemeOverrides>>,
     ) -> Result<(), String> {
+        self.set_active(&preset);
         self.send(Request::Apply {
             preset,
             theme,
             overrides,
         })
+    }
+
+    pub(crate) fn set_active(&self, preset: &str) {
+        match self.active.lock() {
+            Ok(mut active) => *active = preset.to_owned(),
+            Err(error) => tracing::warn!(
+                target: "thegn::theme",
+                error = %error,
+                "active theme selection unavailable; catalog scans will not pin a theme"
+            ),
+        }
     }
 
     pub(crate) fn try_recv(&mut self) -> Option<ThemeStoreResult> {
@@ -213,6 +244,7 @@ fn worker(
     config_path: PathBuf,
     watcher_tx: mpsc::Sender<Work>,
     shutdown: Arc<AtomicBool>,
+    active: Arc<Mutex<String>>,
 ) {
     if let Err(error) = std::fs::create_dir_all(&themes_dir) {
         tracing::warn!(target: "thegn::theme", error = %error, "theme directory unavailable");
@@ -244,7 +276,7 @@ fn worker(
         tracing::warn!(target: "thegn::theme", error = %error, "theme directory watch unavailable");
     }
 
-    publish_catalog(&themes_dir, &result_tx, waker.as_ref());
+    publish_catalog(&themes_dir, &result_tx, waker.as_ref(), &active);
     'run: while let Ok(work) = request_rx.recv() {
         if shutdown.load(Ordering::Acquire) {
             finish_shutdown(
@@ -303,7 +335,7 @@ fn worker(
                     );
                     break 'run;
                 }
-                publish_catalog(&themes_dir, &result_tx, waker.as_ref());
+                publish_catalog(&themes_dir, &result_tx, waker.as_ref(), &active);
                 let mut deferred = deferred.into_iter();
                 while let Some(request) = deferred.next() {
                     if shutdown.load(Ordering::Acquire) {
@@ -325,6 +357,7 @@ fn worker(
                         &config_path,
                         &result_tx,
                         waker.as_ref(),
+                        Some(&active),
                     );
                 }
             }
@@ -334,6 +367,7 @@ fn worker(
                 &config_path,
                 &result_tx,
                 waker.as_ref(),
+                Some(&active),
             ),
             Work::Shutdown => {
                 finish_shutdown(
@@ -396,6 +430,7 @@ fn process_shutdown_work(
         config_path,
         result_tx,
         waker,
+        None,
     );
 }
 
@@ -405,12 +440,17 @@ fn process_request(
     config_path: &Path,
     result_tx: &tokio_mpsc::UnboundedSender<ThemeStoreResult>,
     waker: Option<&TerminalWaker>,
+    active: Option<&Mutex<String>>,
 ) {
     let Work::Request(request) = work else {
         return;
     };
     match *request {
-        Request::Scan => publish_catalog(themes_dir, result_tx, waker),
+        Request::Scan => {
+            if let Some(active) = active {
+                publish_catalog(themes_dir, result_tx, waker, active);
+            }
+        }
         Request::Import(path) => {
             let result = read_bounded(&path).and_then(|bytes| {
                 thegn_core::theme_import::import_gogh(&bytes).map_err(|e| e.to_string())
@@ -437,8 +477,20 @@ fn publish_catalog(
     dir: &Path,
     tx: &tokio_mpsc::UnboundedSender<ThemeStoreResult>,
     waker: Option<&TerminalWaker>,
+    active: &Mutex<String>,
 ) {
-    let (themes, warnings) = scan_dir(dir);
+    let preset = match active.lock() {
+        Ok(preset) => Some(preset.clone()),
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::theme",
+                error = %error,
+                "active theme selection unavailable; catalog scan will not pin a theme"
+            );
+            None
+        }
+    };
+    let (themes, warnings) = scan_dir(dir, preset.as_deref());
     publish(tx, waker, ThemeStoreResult::Catalog { themes, warnings });
 }
 
@@ -453,14 +505,23 @@ fn publish(
     }
 }
 
-pub(crate) fn scan_dir(dir: &Path) -> (Vec<UserTheme>, Vec<String>) {
+pub(crate) fn scan_dir(dir: &Path, active: Option<&str>) -> (Vec<UserTheme>, Vec<String>) {
     let mut themes = Vec::new();
     let mut warnings = Vec::new();
     if let Err(e) = std::fs::create_dir_all(dir) {
         warnings.push(format!("theme directory unavailable: {e}"));
         return (themes, warnings);
     }
-    let paths = bounded_theme_paths(dir, &mut warnings);
+    let pinned = active.and_then(|name| {
+        let slug = thegn_core::util::slugify(name);
+        (!slug.is_empty()
+            && slug.len() <= 80
+            && !thegn_core::theme::PRESETS
+                .iter()
+                .any(|preset| thegn_core::util::slugify(preset) == slug))
+        .then(|| format!("{slug}.toml"))
+    });
+    let paths = bounded_theme_paths(dir, pinned.as_deref(), &mut warnings);
     let mut exact = HashMap::<String, usize>::new();
     let mut normalized = HashMap::<String, usize>::new();
     for path in paths {
@@ -529,7 +590,11 @@ pub(crate) fn scan_dir(dir: &Path) -> (Vec<UserTheme>, Vec<String>) {
     (themes, warnings)
 }
 
-fn bounded_theme_paths(dir: &Path, warnings: &mut Vec<String>) -> Vec<PathBuf> {
+fn bounded_theme_paths(
+    dir: &Path,
+    pinned: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) => {
@@ -542,6 +607,7 @@ fn bounded_theme_paths(dir: &Path, warnings: &mut Vec<String>) -> Vec<PathBuf> {
     // examining every name makes the result independent of filesystem order
     // and prevents unrelated junk from consuming the theme-file allowance.
     let mut paths = BinaryHeap::with_capacity(MAX_THEME_FILES + 1);
+    let mut pinned_path = None;
     let mut theme_file_count = 0usize;
     for entry in entries {
         let entry = match entry {
@@ -566,6 +632,10 @@ fn bounded_theme_paths(dir: &Path, warnings: &mut Vec<String>) -> Vec<PathBuf> {
             continue;
         }
         theme_file_count += 1;
+        if entry.file_name().to_str() == pinned {
+            pinned_path = Some(path);
+            continue;
+        }
         if paths.len() < MAX_THEME_FILES {
             paths.push(path);
         } else if paths.peek().is_some_and(|largest| path < *largest) {
@@ -574,11 +644,20 @@ fn bounded_theme_paths(dir: &Path, warnings: &mut Vec<String>) -> Vec<PathBuf> {
         }
     }
     if theme_file_count > MAX_THEME_FILES {
+        let pin_note = pinned_path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .map(|name| format!(" plus the selected theme `{name}`"))
+            .unwrap_or_default();
         warnings.push(format!(
-            "theme directory contains {theme_file_count} theme files; loading the first {MAX_THEME_FILES} by name"
+            "theme directory contains {theme_file_count} theme files; loading the first {MAX_THEME_FILES} by name{pin_note}"
         ));
     }
     let mut paths = paths.into_vec();
+    if let Some(path) = pinned_path {
+        paths.push(path);
+    }
     paths.sort();
     paths
 }
@@ -830,6 +909,12 @@ mod tests {
         path
     }
 
+    fn private_temp_dir() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(temp.path()).unwrap();
+        temp
+    }
+
     fn theme(name: &str) -> UserTheme {
         let cfg = thegn_core::config::Config::default();
         UserTheme::from_palette(name, &cfg.palette())
@@ -897,6 +982,7 @@ mod tests {
                 config_path,
                 watcher_tx,
                 worker_shutdown,
+                Arc::new(Mutex::new(String::new())),
             );
         });
         request_tx.send(Work::Changed).unwrap();
@@ -940,7 +1026,7 @@ mod tests {
             theme(thegn_core::theme::PRESETS[0]).to_toml().unwrap(),
         )
         .unwrap();
-        let (_, warnings) = scan_dir(&dir);
+        let (_, warnings) = scan_dir(&dir, None);
         assert!(warnings.iter().any(|warning| {
             warning.contains(path.to_string_lossy().as_ref())
                 && warning.contains(thegn_core::theme::PRESETS[0])
@@ -970,7 +1056,7 @@ mod tests {
         let duplicate = theme("shared").to_toml().unwrap();
         std::fs::write(dir.join("shared.toml"), &duplicate).unwrap();
         std::fs::write(dir.join("other.toml"), &duplicate).unwrap();
-        let (themes, warnings) = scan_dir(&dir);
+        let (themes, warnings) = scan_dir(&dir, None);
         assert!(themes.is_empty(), "ambiguous theme must not enter catalog");
         assert!(
             warnings
@@ -993,7 +1079,7 @@ mod tests {
             let path = dir.join(filename);
             std::fs::write(path, candidate.to_toml().unwrap()).unwrap();
         }
-        let (themes, warnings) = scan_dir(&dir);
+        let (themes, warnings) = scan_dir(&dir, None);
         assert!(themes.is_empty(), "normalized duplicates must not resolve");
         assert!(
             warnings
@@ -1047,7 +1133,7 @@ mod tests {
         )
         .unwrap();
 
-        let (themes, warnings) = scan_dir(&dir);
+        let (themes, warnings) = scan_dir(&dir, None);
         assert_eq!(
             themes
                 .iter()
@@ -1057,6 +1143,87 @@ mod tests {
         );
         assert!(warnings.is_empty(), "{warnings:?}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn catalog_cap_never_hides_the_selected_theme() {
+        let temp = private_temp_dir();
+        let dir = temp.path().join("themes");
+        std::fs::create_dir_all(&dir).unwrap();
+        for index in 0..=256 {
+            let candidate = theme(&format!("t{index:03}"));
+            std::fs::write(
+                dir.join(format!("t{index:03}.toml")),
+                candidate.to_toml().unwrap(),
+            )
+            .unwrap();
+        }
+        let selected = theme("zz-selected");
+        std::fs::write(dir.join("zz-selected.toml"), selected.to_toml().unwrap()).unwrap();
+
+        let (themes, warnings) = scan_dir(&dir, Some("zz-selected"));
+        assert_eq!(themes.len(), 257);
+        assert!(themes.iter().any(|item| item.meta.name == "zz-selected"));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("zz-selected.toml"))
+        );
+
+        let (themes, _) = scan_dir(&dir, None);
+        assert!(!themes.iter().any(|item| item.meta.name == "zz-selected"));
+    }
+
+    #[test]
+    fn pinned_theme_still_obeys_identity_checks() {
+        let temp = private_temp_dir();
+        let dir = temp.path().join("themes");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("zz-selected.toml"),
+            theme("different-name").to_toml().unwrap(),
+        )
+        .unwrap();
+
+        let (themes, warnings) = scan_dir(&dir, Some("zz-selected"));
+        assert!(themes.is_empty());
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("filename does not match") && warning.contains("zz-selected.toml")
+        }));
+    }
+
+    #[test]
+    fn store_scan_uses_the_active_preset() {
+        let temp = private_temp_dir();
+        let themes = temp.path().join("themes");
+        std::fs::create_dir_all(&themes).unwrap();
+        for index in 0..=256 {
+            let candidate = theme(&format!("t{index:03}"));
+            std::fs::write(
+                themes.join(format!("t{index:03}.toml")),
+                candidate.to_toml().unwrap(),
+            )
+            .unwrap();
+        }
+        let selected = theme("zz-selected");
+        std::fs::write(themes.join("zz-selected.toml"), selected.to_toml().unwrap()).unwrap();
+        let mut store = ThemeStore::start(
+            None,
+            themes,
+            temp.path().join("config.toml"),
+            "zz-selected".into(),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (catalog, _) = runtime.block_on(store.initial_catalog());
+        assert!(catalog.iter().any(|item| item.meta.name == "zz-selected"));
+
+        store.set_active("t000");
+        store.scan().unwrap();
+        let (catalog, _) = runtime.block_on(store.initial_catalog());
+        assert!(catalog.len() >= 256);
+        assert!(catalog.iter().any(|item| item.meta.name == "t000"));
     }
 
     #[test]
@@ -1139,6 +1306,7 @@ mod tests {
             request: Some(request),
             results,
             shutdown: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(Mutex::new(String::new())),
             worker: None,
         };
 
@@ -1164,7 +1332,7 @@ mod tests {
         let dir = temp_dir("drop-joins");
         for cycle in 0..8 {
             let themes = dir.join(format!("themes-{cycle}"));
-            let store = ThemeStore::start(None, themes, dir.join("config.toml"));
+            let store = ThemeStore::start(None, themes, dir.join("config.toml"), String::new());
             let probe = store.request.clone().unwrap();
             drop_with_timeout(store);
             // The worker owns the only receiver; a failed send proves it exited.
@@ -1177,7 +1345,7 @@ mod tests {
     fn shutdown_discards_a_large_watcher_backlog() {
         let dir = temp_dir("drop-backlog");
         let themes = dir.join("themes");
-        let store = ThemeStore::start(None, themes, dir.join("config.toml"));
+        let store = ThemeStore::start(None, themes, dir.join("config.toml"), String::new());
         for _ in 0..50_000 {
             store.request.as_ref().unwrap().send(Work::Changed).unwrap();
         }
@@ -1189,7 +1357,7 @@ mod tests {
     fn accepted_save_is_written_before_shutdown_returns() {
         let dir = temp_dir("drop-save");
         let themes = dir.join("themes");
-        let store = ThemeStore::start(None, themes.clone(), dir.join("config.toml"));
+        let store = ThemeStore::start(None, themes.clone(), dir.join("config.toml"), String::new());
         store.save(theme("saved-at-shutdown")).unwrap();
         drop_with_timeout(store);
         assert!(themes.join("saved-at-shutdown.toml").is_file());
@@ -1206,6 +1374,7 @@ mod tests {
             request,
             results,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(String::new())),
         );
         assert_eq!(
             store.save(theme("unavailable")).unwrap_err(),
