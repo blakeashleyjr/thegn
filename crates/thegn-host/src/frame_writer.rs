@@ -234,6 +234,7 @@ impl FrameWriter {
 
     /// Submit order-preserving passthrough bytes. Queue pressure drops this
     /// message with a warning; it never makes the compositor fatal.
+    #[cfg(test)]
     pub(crate) fn submit_oob(&self, bytes: Vec<u8>) {
         if let Err(bytes) = self.try_submit_oob(bytes) {
             if self.inner.oob_pressure_logged.swap(true, Ordering::SeqCst) {
