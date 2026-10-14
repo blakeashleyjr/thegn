@@ -18848,6 +18848,39 @@ async fn event_loop<T: Terminal>(
                         continue;
                     }
                 }
+                // Keys filter editing mirrors Logs, including Esc-clears.
+                if focus.panel()
+                    && panel_ui.open == crate::panel::Section::Keys
+                    && panel_ui.keys_filter_editing
+                {
+                    let mut consumed = true;
+                    match k.key {
+                        KeyCode::Enter => {
+                            panel_ui.keys_filter_editing = false;
+                        }
+                        key if crate::input::is_escape_key(&key) => {
+                            panel_ui.keys_filter_editing = false;
+                            panel_ui.keys_filter.clear();
+                            panel_ui.scroll = 0;
+                        }
+                        KeyCode::Backspace => {
+                            panel_ui.keys_filter.pop();
+                            panel_ui.scroll = 0;
+                        }
+                        KeyCode::Char(c)
+                            if !k.modifiers.contains(Modifiers::CTRL)
+                                && !k.modifiers.contains(Modifiers::ALT) =>
+                        {
+                            panel_ui.keys_filter.push(c);
+                            panel_ui.scroll = 0;
+                        }
+                        _ => consumed = false,
+                    }
+                    if consumed {
+                        dirty = true;
+                        continue;
+                    }
+                }
                 // Files filter editing: intercept printable keys and routing.
                 if focus.panel()
                     && panel_ui.open == crate::panel::Section::Files
@@ -21139,6 +21172,20 @@ async fn event_loop<T: Terminal>(
                                                 &panel_ui,
                                             );
                                         }
+                                        Section::Keys => {
+                                            if let Some(row) =
+                                                crate::panel::sections::keys::top_row(&panel_ui)
+                                            {
+                                                let bindings =
+                                                    crate::keymap_merge::collect(keymap.config());
+                                                model.status =
+                                                    crate::panel::sections::keys::where_bound(
+                                                        &row, &bindings,
+                                                    );
+                                            } else {
+                                                model.status = "No key row in view".into();
+                                            }
+                                        }
                                         Section::PrQueue | Section::MergeQueue => {
                                             for _ in 0..2 {
                                                 if panel_ui.width == crate::layout::PanelWidth::Full
@@ -22269,6 +22316,11 @@ async fn event_loop<T: Terminal>(
                                 panel_ui.logs_cursor = 0;
                                 panel_ui.cursor = 0;
                             }
+                            true
+                        }
+                        (Section::Keys, KeyCode::Char('/')) => {
+                            panel_ui.keys_filter_editing = true;
+                            panel_ui.scroll = 0;
                             true
                         }
                         (Section::Logs, KeyCode::Char('l')) => {
