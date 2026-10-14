@@ -50,6 +50,15 @@ pub(crate) fn pick_backend_with(
     placement: &Placement,
     mode: Fallthrough,
 ) -> Option<Backend> {
+    pick_backend_with_notice(cfg, placement, mode, on_missing)
+}
+
+fn pick_backend_with_notice(
+    cfg: &SandboxConfig,
+    placement: &Placement,
+    mode: Fallthrough,
+    mut missing: impl FnMut(&SandboxConfig, &str),
+) -> Option<Backend> {
     let suitable = |b: Backend| backend_suitable(b, placement);
     let unsuitable_reason = |b: Backend| -> &'static str {
         if cfg!(windows) && b.is_oci() && b != Backend::Wsl {
@@ -107,12 +116,14 @@ pub(crate) fn pick_backend_with(
                 if mode == Fallthrough::Exact {
                     return None;
                 }
-                on_missing(
+                missing(
                     cfg,
                     &format!(
                         "sandbox backend '{}' unavailable{}; trying the chain",
                         cfg.backend,
-                        if suitable(b) {
+                        if b == Backend::WinAppContainer {
+                            " (reserved: not implemented — set [sandbox] backend to another backend, e.g. \"jobobject\" or a container runtime)"
+                        } else if suitable(b) {
                             ""
                         } else {
                             unsuitable_reason(b)
@@ -135,7 +146,7 @@ pub(crate) fn pick_backend_with(
                 return None;
             }
             if !is_win_native {
-                on_missing(
+                missing(
                     cfg,
                     &host_fallback_msg(cfg, placement, "sandbox: no container backend available"),
                 );
@@ -158,7 +169,7 @@ pub(crate) fn pick_backend_with(
     if !placement.is_local() && saw_unreachable {
         return None;
     }
-    on_missing(
+    missing(
         cfg,
         &host_fallback_msg(cfg, placement, "sandbox: no usable backend in chain"),
     );
@@ -927,6 +938,34 @@ mod tests {
         // Unverified runtimes keep the old PATH behaviour rather than a guess.
         assert_eq!(liveness_argv(Backend::Smol), None);
         assert_eq!(liveness_argv(Backend::Wsl), None);
+    }
+
+    #[test]
+    fn explicit_appcontainer_miss_explains_the_reserved_backend() {
+        let cfg = SandboxConfig {
+            backend: crate::config::SandboxBackend::WinAppContainer,
+            backend_chain: vec!["host".into()],
+            ..SandboxConfig::default()
+        };
+        let mut notices = Vec::new();
+        let selected =
+            pick_backend_with_notice(&cfg, &Placement::Local, Fallthrough::Chain, |_, message| {
+                notices.push(message.to_string())
+            });
+
+        assert_eq!(selected, Some(Backend::None));
+        assert!(
+            notices
+                .iter()
+                .any(|message| message.contains("reserved: not implemented")),
+            "explicit miss notice should explain AppContainer is reserved: {notices:?}"
+        );
+        assert!(
+            notices.iter().any(|message| {
+                message.contains("set [sandbox] backend") && message.contains("jobobject")
+            }),
+            "explicit miss notice should say how to change the backend: {notices:?}"
+        );
     }
 
     #[test]
