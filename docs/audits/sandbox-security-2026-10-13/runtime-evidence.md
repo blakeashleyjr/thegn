@@ -22,13 +22,13 @@ These are core-launch/runtime probes, not a UI/pane/autopilot/hook end-to-end su
 
 ## Filesystem observations
 
-| Actual launch | Home/sibling/SSH canary | Synthetic GPG key | Linked worktree and shared Git | Cache | Host `/dev/shm` canary |
-| --- | --- | --- | --- | --- | --- |
-| Default bwrap hardened | Readable; writes refused | Home path read-only; `/rw/key` readable and writable | Readable/writable; shared `.git/config` read-only | Readable/writable | Hidden |
-| Explicit-mount bwrap hardened | Readable; writes refused | Readable/writable | Same | Same | Hidden |
-| Explicit-mount systemd hardened | Readable; writes refused | Readable/writable | Same | Same | Readable/writable |
-| Minimal-mount Podman hardened | Readable; writes refused | Readable/writable | Same | Same | Hidden |
-| bwrap/systemd/Podman sealed | Ambient home/sibling/credential files hidden | Hidden | Worktree/shared Git remain writable; shared config remains read-only | Still writable | Systemd readable/writable; bwrap/Podman hidden |
+| Actual launch                   | Home/sibling/SSH canary                      | Synthetic GPG key                                    | Linked worktree and shared Git                                       | Cache             | Host `/dev/shm` canary                         |
+| ------------------------------- | -------------------------------------------- | ---------------------------------------------------- | -------------------------------------------------------------------- | ----------------- | ---------------------------------------------- |
+| Default bwrap hardened          | Readable; writes refused                     | Home path read-only; `/rw/key` readable and writable | Readable/writable; shared `.git/config` read-only                    | Readable/writable | Hidden                                         |
+| Explicit-mount bwrap hardened   | Readable; writes refused                     | Readable/writable                                    | Same                                                                 | Same              | Hidden                                         |
+| Explicit-mount systemd hardened | Readable; writes refused                     | Readable/writable                                    | Same                                                                 | Same              | Readable/writable                              |
+| Minimal-mount Podman hardened   | Readable; writes refused                     | Readable/writable                                    | Same                                                                 | Same              | Hidden                                         |
+| bwrap/systemd/Podman sealed     | Ambient home/sibling/credential files hidden | Hidden                                               | Worktree/shared Git remain writable; shared config remains read-only | Still writable    | Systemd readable/writable; bwrap/Podman hidden |
 
 The shared Git canary was inside the primary repository's `.git`, not a standalone sandbox repository. Mount protection of `.git/config` does not isolate objects, refs, per-worktree metadata, or hooks in the writable shared parent. These probes tested file read/write access, not an actual malicious ref/hook change.
 
@@ -38,15 +38,15 @@ The mount parser accepts `:ro` and `:cache`; `:rw` is not a recognized suffix. T
 
 ## Network observations
 
-| Control | Actual outcome |
-| --- | --- |
-| bwrap hardened, NAT, `network_block=["*"]` | Controlled direct-IP TCP and alternate UDP DNS both succeed; no DNS filter is inserted. |
-| bwrap/systemd fresh `network=none` | Controlled TCP fails; UDP DNS cannot reach the responder. |
-| bwrap/systemd sealed, requested NAT | Resolved network is `None`; controlled endpoints cannot be reached. |
-| Podman minimal-mount hardened, NAT | Controlled local gateway TCP and alternate UDP DNS succeed. |
-| Fresh Podman minimal-mount `network=none` or sealed | TCP/UDP return network-unreachable; sealed resolves to `None`. |
-| Podman hostname filter configured | Actual create fails: `127.0.0.1:<ephemeral-port> is not an ip address`. The runtime expects a DNS IP, not the host proxy's IP-and-port string. |
-| Retained Podman NAT container; later `spec.network=None` | `ensure=ok`; same container ID and `pasta` network remain; TCP and alternate DNS still succeed. |
+| Control                                                  | Actual outcome                                                                                                                                 |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| bwrap hardened, NAT, `network_block=["*"]`               | Controlled direct-IP TCP and alternate UDP DNS both succeed; no DNS filter is inserted.                                                        |
+| bwrap/systemd fresh `network=none`                       | Controlled TCP fails; UDP DNS cannot reach the responder.                                                                                      |
+| bwrap/systemd sealed, requested NAT                      | Resolved network is `None`; controlled endpoints cannot be reached.                                                                            |
+| Podman minimal-mount hardened, NAT                       | Controlled local gateway TCP and alternate UDP DNS succeed.                                                                                    |
+| Fresh Podman minimal-mount `network=none` or sealed      | TCP/UDP return network-unreachable; sealed resolves to `None`.                                                                                 |
+| Podman hostname filter configured                        | Actual create fails: `127.0.0.1:<ephemeral-port> is not an ip address`. The runtime expects a DNS IP, not the host proxy's IP-and-port string. |
+| Retained Podman NAT container; later `spec.network=None` | `ensure=ok`; same container ID and `pasta` network remain; TCP and alternate DNS still succeed.                                                |
 
 The reuse result is repeated across a fresh helper process and an actual restart of the same audit-owned container. Mounts/home label satisfy `container_status`, so network changes are not validated before reuse. This demonstrates the stale effective policy independently of source-only command reasoning. See `sandbox.rs` `judge_inspect`, `container_status`, and `ensure` around lines 1916, 2015, and 2087.
 

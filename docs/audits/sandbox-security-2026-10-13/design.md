@@ -49,11 +49,11 @@ The diagram shows the proposed custody model; no such broker is implemented yet.
 
 ## Compare the implementation directions
 
-| Direction | Fit | Cost and remaining work | Decision |
-| --- | --- | --- | --- |
-| Harden existing backends | Preserves existing panes, host toolchains, placement and installation footprint. Native bwrap and OCI can support offline private-copy execution. | Thegn must implement packet enforcement/proxy mediation, policy lifecycle, per-workspace state, backend admission, credential scoping and reliable audit; reconcile every launcher. Systemd, WSL and Windows cannot be treated as equivalent. | Necessary immediate repairs and offline option; do not build another DNS-based destination boundary. |
-| Use OpenShell as the policy runtime | A documented connection boundary, filesystem policy, provider mediation and runtime lifecycle reduce Thegn's enforcement responsibilities. | Adds a gateway, supported Linux guest/kernel requirements, versioned protocol and deployment concerns. Transfer semantics do not provide Thegn's patch review, conflicts or transactional sync. | Candidate runtime, subject to local conformance and persistence tests. |
-| External runtime + Thegn workspace/UI | Thegn keeps durable private Git state and consistent user behavior while delegating enforcement through a measured adapter. | Needs a precise adapter contract and durable storage admission. Thegn still owns all host command/trust paths and the transfer attack surface. | **Recommended target**, with native offline adapters and explicit weaker modes. |
+| Direction                             | Fit                                                                                                                                               | Cost and remaining work                                                                                                                                                                                                                       | Decision                                                                                             |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Harden existing backends              | Preserves existing panes, host toolchains, placement and installation footprint. Native bwrap and OCI can support offline private-copy execution. | Thegn must implement packet enforcement/proxy mediation, policy lifecycle, per-workspace state, backend admission, credential scoping and reliable audit; reconcile every launcher. Systemd, WSL and Windows cannot be treated as equivalent. | Necessary immediate repairs and offline option; do not build another DNS-based destination boundary. |
+| Use OpenShell as the policy runtime   | A documented connection boundary, filesystem policy, provider mediation and runtime lifecycle reduce Thegn's enforcement responsibilities.        | Adds a gateway, supported Linux guest/kernel requirements, versioned protocol and deployment concerns. Transfer semantics do not provide Thegn's patch review, conflicts or transactional sync.                                               | Candidate runtime, subject to local conformance and persistence tests.                               |
+| External runtime + Thegn workspace/UI | Thegn keeps durable private Git state and consistent user behavior while delegating enforcement through a measured adapter.                       | Needs a precise adapter contract and durable storage admission. Thegn still owns all host command/trust paths and the transfer attack surface.                                                                                                | **Recommended target**, with native offline adapters and explicit weaker modes.                      |
 
 The current external-runtime comparison, version constraints and citations are
 in [external-runtime-fit.md](external-runtime-fit.md). OpenShell has not been
@@ -63,11 +63,11 @@ evaluation, but does not establish a tested security boundary for Thegn.
 
 ## Three independent workspace choices
 
-| Proposed `workspace.mode` | Files and Git identity | User behavior and exposure |
-| --- | --- | --- |
-| `private-copy` (default for new untrusted work) | Durable independent Git repository and file tree. No source checkout or source Git metadata mounted. | Changes stay private until explicit review and sync. Sandbox commits/refs never land on the host. |
-| `git-worktree` | A separate linked Git worktree; source repository common Git metadata remains shared. | File edits stay in that worktree, but refs, objects, hooks and other common metadata can affect sibling work. Lower integrity isolation. |
-| `live-mount` | Existing selected host tree mounted at its actual path, with existing common Git mounts. | Edits immediately affect host files. Lower filesystem isolation; no explicit-sync guarantee. |
+| Proposed `workspace.mode`                       | Files and Git identity                                                                               | User behavior and exposure                                                                                                               |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `private-copy` (default for new untrusted work) | Durable independent Git repository and file tree. No source checkout or source Git metadata mounted. | Changes stay private until explicit review and sync. Sandbox commits/refs never land on the host.                                        |
+| `git-worktree`                                  | A separate linked Git worktree; source repository common Git metadata remains shared.                | File edits stay in that worktree, but refs, objects, hooks and other common metadata can affect sibling work. Lower integrity isolation. |
+| `live-mount`                                    | Existing selected host tree mounted at its actual path, with existing common Git mounts.             | Edits immediately affect host files. Lower filesystem isolation; no explicit-sync guarantee.                                             |
 
 Workspace mode and execution backend are separate decisions. A private copy
 run as a host process still lacks confinement. A container running a live mount
@@ -242,13 +242,13 @@ powerful grants, never implicit consequences of a toolchain preset.
 
 Proposed user-level choices:
 
-| Preset | Effective allowed destinations |
-| --- | --- |
-| `offline` (default) | No connections beyond sandbox-local loopback. No external DNS. |
-| `agent` | Only exact user-selected model API/proxy endpoints and required authentication endpoints. |
-| `development` | `agent` plus user-selected package registries, artifact/CDN endpoints and forge reads; scoped by protocol/port. |
-| `custom` | A user-owned explicit endpoint policy. |
-| `unrestricted` | Explicit broad egress grant, with host/LAN/metadata still separate permissions. |
+| Preset              | Effective allowed destinations                                                                                  |
+| ------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `offline` (default) | No connections beyond sandbox-local loopback. No external DNS.                                                  |
+| `agent`             | Only exact user-selected model API/proxy endpoints and required authentication endpoints.                       |
+| `development`       | `agent` plus user-selected package registries, artifact/CDN endpoints and forge reads; scoped by protocol/port. |
+| `custom`            | A user-owned explicit endpoint policy.                                                                          |
+| `unrestricted`      | Explicit broad egress grant, with host/LAN/metadata still separate permissions.                                 |
 
 The settings UI needs one global preset selector, account selection, and a
 destination editor showing effective host/protocol/port rules. Named presets
@@ -281,15 +281,15 @@ SNI/HTTP authority must agree when enforcing hostname rules. Proxies on allowed
 endpoints and DNS labels can still be exfiltration channels; narrow endpoint
 access is permission to send data there, not proof of safe payloads.
 
-| Current backend | Offline control now | Destination presets now | Future secure adapter requirement |
-| --- | --- | --- | --- |
-| Podman/rootful Podman/Docker | `--network none`, subject to retained-container flaw | DNS helper is insufficient; refuse secure destination-policy claims | Fresh/attested container spec; proxy-only routes or packet enforcement; private persistent storage. |
-| bwrap (Linux) | `--unshare-net` | Unsupported; shares host net otherwise | Offline support can qualify first; explicit namespace broker for endpoints. |
-| systemd (Linux) | `PrivateNetwork=yes` | Unsupported by current generator | Correct filesystem boundary plus private storage; destination broker or refuse. |
-| Apple container (macOS) | Generator requests `--network none`; Apple runtime enforcement unverified here | DNS helper attempt is insufficient | Qualify guest network enforcement before advertising secure launch. |
-| WSL, host, native Windows job/AppContainer labels | No demonstrated network deny from current generator | Unsupported | Refuse secure policies; expose only explicit weaker execution until actual boundary exists. |
-| Remote OCI | Backend flags can be constructed remotely | Local DNS helper is not a remote enforcement point | Policy/runtime admission on the actual remote execution host. |
-| Provider/native exec | Provider-owned; Thegn does not enforce declared controls | Unknown/unsupported without provider proof | Provider adapter must attest enforceable controls and durable storage, or refuse. |
+| Current backend                                   | Offline control now                                                            | Destination presets now                                             | Future secure adapter requirement                                                                   |
+| ------------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| Podman/rootful Podman/Docker                      | `--network none`, subject to retained-container flaw                           | DNS helper is insufficient; refuse secure destination-policy claims | Fresh/attested container spec; proxy-only routes or packet enforcement; private persistent storage. |
+| bwrap (Linux)                                     | `--unshare-net`                                                                | Unsupported; shares host net otherwise                              | Offline support can qualify first; explicit namespace broker for endpoints.                         |
+| systemd (Linux)                                   | `PrivateNetwork=yes`                                                           | Unsupported by current generator                                    | Correct filesystem boundary plus private storage; destination broker or refuse.                     |
+| Apple container (macOS)                           | Generator requests `--network none`; Apple runtime enforcement unverified here | DNS helper attempt is insufficient                                  | Qualify guest network enforcement before advertising secure launch.                                 |
+| WSL, host, native Windows job/AppContainer labels | No demonstrated network deny from current generator                            | Unsupported                                                         | Refuse secure policies; expose only explicit weaker execution until actual boundary exists.         |
+| Remote OCI                                        | Backend flags can be constructed remotely                                      | Local DNS helper is not a remote enforcement point                  | Policy/runtime admission on the actual remote execution host.                                       |
+| Provider/native exec                              | Provider-owned; Thegn does not enforce declared controls                       | Unknown/unsupported without provider proof                          | Provider adapter must attest enforceable controls and durable storage, or refuse.                   |
 
 These are source-derived capabilities; runtime coverage is separately recorded
 in [runtime-evidence.md](runtime-evidence.md). Secure requests must never turn
