@@ -1548,6 +1548,20 @@ fn test_identify_orphans_empty_inputs() {
 }
 
 #[test]
+fn oci_create_opts_carry_this_profiles_owner_label() {
+    let expected = crate::sandbox_manage::owner_label_arg();
+    let podman = oci_create_opts(&spec(Backend::Podman)).unwrap();
+    assert!(
+        podman
+            .windows(2)
+            .any(|pair| pair == ["--label", expected.as_str()])
+    );
+
+    let apple = oci_create_opts(&spec(Backend::Apple)).unwrap();
+    assert!(!apple.iter().any(|arg| arg.starts_with("thegn.owner=")));
+}
+
+#[test]
 fn test_run_gc_noop_when_no_backend_available() {
     let state = tempfile::tempdir().unwrap();
     let state_home = state.path().to_string_lossy().into_owned();

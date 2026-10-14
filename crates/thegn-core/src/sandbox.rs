@@ -3215,6 +3215,7 @@ fn oci_create_opts_with_remote_stdin_secrets(
     // their `thegn-` name, which is what management uses for them anyway.
     if spec.backend != Backend::Apple {
         v.extend(["--label".into(), crate::sandbox_manage::OWNED_LABEL.into()]);
+        v.extend(["--label".into(), crate::sandbox_manage::owner_label_arg()]);
         v.extend([
             "--label".into(),
             format!("{SEAL_LABEL}={}", u8::from(spec.seal_home.is_some())),
@@ -3831,6 +3832,7 @@ pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> V
 /// `wsl` is deliberately absent: its command shape is unverified, and this feeds
 /// a **force-remove**. A wrong guess here deletes someone's container, so it
 /// waits for someone who can check it against the real runtime.
+/// Smol and Apple are list-only until their label-filter semantics are verified.
 pub(crate) fn gc_list_argv(backend: Backend) -> Option<Vec<&'static str>> {
     match backend {
         Backend::Podman | Backend::PodmanRootful | Backend::Docker | Backend::Smol => {
@@ -3870,16 +3872,36 @@ pub(crate) fn parse_container_list(backend: Backend, stdout: &str) -> Vec<String
 /// separate container store, so the rootless pass never sees it) on Linux and
 /// **apple** on macOS — where each leaked container also pins its own Linux VM.
 pub fn run_gc(db_worktrees: &[String]) -> Vec<String> {
-    run_gc_detailed(db_worktrees)
+    let report = run_gc_detailed(db_worktrees);
+    let unverified_count = report
+        .unverified
+        .iter()
+        .map(|(_, names)| names.len())
+        .sum::<usize>();
+    if unverified_count > 0 {
+        tracing::info!(
+            target: "thegn::sandbox",
+            count = unverified_count,
+            "orphan GC kept unverified containers; run `thegn sandbox gc` to list them"
+        );
+    }
+    report
+        .removed
         .into_iter()
-        .flat_map(|(_, v)| v)
+        .flat_map(|(_, names)| names)
         .collect()
 }
 
-/// [`run_gc`] with the removals grouped by backend, for the on-demand
-/// `thegn sandbox gc` report ("removed N on `<backend>`"). The startup sweep
-/// uses the flattened [`run_gc`]; both share this loop.
-pub fn run_gc_detailed(db_worktrees: &[String]) -> Vec<(&'static str, Vec<String>)> {
+/// [`run_gc`] results grouped by backend for the on-demand `thegn sandbox gc`
+/// report. Only this profile's labelled orphans are removed; unverified
+/// orphan-looking names are returned for the user to review. The startup sweep
+/// uses the flattened removals and logs the unverified count.
+pub struct GcReport {
+    pub removed: Vec<(&'static str, Vec<String>)>,
+    pub unverified: Vec<(&'static str, Vec<String>)>,
+}
+
+pub fn run_gc_detailed(db_worktrees: &[String]) -> GcReport {
     let state_home = util::xdg_state_home();
     sweep_stale_env_files_in(
         &state_home,
@@ -3887,7 +3909,8 @@ pub fn run_gc_detailed(db_worktrees: &[String]) -> Vec<(&'static str, Vec<String
         SystemTime::now(),
         SECRET_ENV_FILE_MAX_AGE,
     );
-    let mut out = Vec::new();
+    let mut removed_report = Vec::new();
+    let mut unverified_report = Vec::new();
     for backend in Backend::all_oci() {
         let Some(list) = gc_list_argv(backend) else {
             continue;
@@ -3912,19 +3935,48 @@ pub fn run_gc_detailed(db_worktrees: &[String]) -> Vec<(&'static str, Vec<String
         }
 
         let containers = parse_container_list(backend, &stdout);
+        let identity = crate::sandbox_manage::owner_identity();
+        let mine = crate::sandbox_manage::gc_owned_list_argv(backend, &identity).and_then(|argv| {
+            let mut command = backend_prefix(backend);
+            command.extend(argv);
+            output_with_timeout(&command, PROBE_TIMEOUT)
+                .filter(|(ok, _)| *ok)
+                .map(|(_, stdout)| parse_container_list(backend, &stdout))
+        });
+        let labelled = crate::sandbox_manage::gc_labelled_list_argv(backend).and_then(|argv| {
+            let mut command = backend_prefix(backend);
+            command.extend(argv);
+            output_with_timeout(&command, PROBE_TIMEOUT)
+                .filter(|(ok, _)| *ok)
+                .map(|(_, stdout)| parse_container_list(backend, &stdout))
+        });
+        let plan = crate::sandbox_manage::plan_gc(
+            db_worktrees,
+            &containers,
+            if labelled.is_some() {
+                mine.as_deref()
+            } else {
+                None
+            },
+            labelled.as_deref(),
+        );
 
-        let mut removed = Vec::new();
-        for orphan in identify_orphans(db_worktrees, &containers) {
+        for orphan in &plan.remove {
             let mut rm = backend_prefix(backend);
             rm.extend(["rm".into(), "-f".into(), orphan.clone()]);
             let _ = status_with_timeout(&rm, PROBE_TIMEOUT); // best-effort: teardown: orphan container rm -f is best-effort
-            removed.push(orphan);
         }
-        if !removed.is_empty() {
-            out.push((backend.label(), removed));
+        if !plan.remove.is_empty() {
+            removed_report.push((backend.label(), plan.remove));
+        }
+        if !plan.unverified.is_empty() {
+            unverified_report.push((backend.label(), plan.unverified));
         }
     }
-    out
+    GcReport {
+        removed: removed_report,
+        unverified: unverified_report,
+    }
 }
 
 /// Which owned resource kinds a prune touches. Default = all three.
