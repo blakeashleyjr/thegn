@@ -96,16 +96,30 @@ fn gc() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("worktrees query failed, refusing to sweep: {e}"))?;
     let worktrees: Vec<String> = rows.into_iter().map(|r| r.worktree).collect();
     let report = sandbox::run_gc_detailed(&worktrees);
-    if report.is_empty() {
+    if report.removed.is_empty() && report.unverified.is_empty() {
         outln!("sandbox gc: no orphan containers to remove");
         return Ok(());
     }
     let mut total = 0;
-    for (backend, removed) in &report {
+    for (backend, removed) in &report.removed {
         total += removed.len();
         outln!("  {backend}: {} — {}", removed.len(), removed.join(", "));
     }
     outln!("sandbox gc: removed {total} orphan container(s)");
+    if !report.unverified.is_empty() {
+        for (backend, names) in &report.unverified {
+            outln!(
+                "  {backend}: kept {} unverified — {}",
+                names.len(),
+                names.join(", ")
+            );
+        }
+        outln!(concat!(
+            "not removed: no thegn owner label for this profile ",
+            "(older thegn, another profile or user, or another tool). ",
+            "If one is yours and unused, remove it with your runtime's `rm -f <name>`."
+        ));
+    }
     Ok(())
 }
 

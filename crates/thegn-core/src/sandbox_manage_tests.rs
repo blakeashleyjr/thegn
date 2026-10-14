@@ -361,3 +361,127 @@ fn owned_label_constants_are_stable() {
     assert_eq!(ControlOp::Stop.label(), "stop");
     assert_eq!(ControlOp::Remove.label(), "remove");
 }
+
+#[test]
+fn plan_gc_never_removes_unlabelled_or_foreign() {
+    let active = vec!["/wt/live".to_string()];
+    let own_dead = "thegn-dead".to_string();
+    let foreign_dead = "thegn-other-dead".to_string();
+    let unlabelled = "thegn-foo".to_string();
+    let live_own = "thegn-live".to_string();
+    let all = vec![
+        own_dead.clone(),
+        foreign_dead.clone(),
+        unlabelled.clone(),
+        live_own.clone(),
+    ];
+    let mine = vec![own_dead.clone(), live_own];
+    let labelled = vec![own_dead.clone(), "thegn-other-dead".to_string()];
+
+    let plan = plan_gc(&active, &all, Some(&mine), Some(&labelled));
+
+    assert_eq!(plan.remove, vec![own_dead]);
+    assert_eq!(plan.unverified, vec![unlabelled]);
+    assert!(!plan.remove.contains(&foreign_dead));
+}
+
+#[test]
+fn plan_gc_without_owner_listing_removes_nothing() {
+    let active = vec!["/wt/live".to_string()];
+    let all = vec!["thegn-dead".to_string(), "thegn-live".to_string()];
+
+    let plan = plan_gc(&active, &all, None, None);
+
+    assert!(plan.remove.is_empty());
+    assert_eq!(plan.unverified, vec!["thegn-dead"]);
+}
+
+#[test]
+fn plan_gc_remove_is_subset_of_full_listing() {
+    let active = Vec::new();
+    let all = vec!["thegn-present".to_string()];
+    let mine = vec!["thegn-present".to_string(), "thegn-absent".to_string()];
+
+    let plan = plan_gc(&active, &all, Some(&mine), Some(&mine));
+
+    assert_eq!(plan.remove, vec!["thegn-present"]);
+}
+
+#[test]
+fn owner_identity_is_stable_and_distinct() {
+    use std::path::Path;
+
+    let profile_root = Path::new("/tmp/thegn-root");
+    let state_home = Path::new("/tmp/thegn-state");
+    let identity = owner_identity_for("default", profile_root, state_home);
+    assert_eq!(
+        identity,
+        owner_identity_for("default", profile_root, state_home)
+    );
+    assert!(identity.starts_with("default."));
+    let (profile, hash) = identity.split_once('.').unwrap();
+    assert_eq!(profile, "default");
+    assert_eq!(hash.len(), 16);
+    assert!(
+        hash.bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    );
+    assert_ne!(
+        identity,
+        owner_identity_for("other", profile_root, state_home)
+    );
+    assert_ne!(
+        identity,
+        owner_identity_for("default", Path::new("/tmp/other-root"), state_home)
+    );
+    assert_ne!(
+        identity,
+        owner_identity_for("default", profile_root, Path::new("/tmp/other-state"))
+    );
+    assert!(owner_identity_for("", profile_root, state_home).starts_with("default."));
+    assert!(owner_identity_for("!!!", profile_root, state_home).starts_with("default."));
+    assert!(owner_identity_for("My Profile", profile_root, state_home).starts_with("my-profile."));
+}
+
+#[test]
+fn gc_owner_argv_only_for_filter_verified_backends() {
+    let identity = owner_identity_for(
+        "default",
+        std::path::Path::new("/tmp/thegn-root"),
+        std::path::Path::new("/tmp/thegn-state"),
+    );
+    let expected = vec![
+        "ps".to_string(),
+        "-a".to_string(),
+        "--filter".to_string(),
+        format!("label=thegn.owner={identity}"),
+        "--format".to_string(),
+        "{{.Names}}".to_string(),
+    ];
+    for backend in [Backend::Podman, Backend::PodmanRootful, Backend::Docker] {
+        assert_eq!(
+            gc_owned_list_argv(backend, &identity),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            gc_labelled_list_argv(backend),
+            Some(vec![
+                "ps".into(),
+                "-a".into(),
+                "--filter".into(),
+                "label=thegn.owner".into(),
+                "--format".into(),
+                "{{.Names}}".into(),
+            ])
+        );
+    }
+    for backend in [Backend::Apple, Backend::Smol, Backend::Bwrap, Backend::None] {
+        assert_eq!(gc_owned_list_argv(backend, &identity), None);
+        assert_eq!(gc_labelled_list_argv(backend), None);
+    }
+}
+
+#[test]
+fn owner_label_arg_has_the_key() {
+    assert!(owner_label_arg().starts_with("thegn.owner="));
+}
