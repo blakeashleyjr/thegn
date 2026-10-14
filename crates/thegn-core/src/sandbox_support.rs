@@ -168,13 +168,12 @@ pub fn support_report(
 ///
 /// Suppressed for `Unsupported`, which is the stronger and completely different
 /// statement: that backend cannot run on this OS however it is configured, so
-/// whether thegn's verbs for it were ever tested is irrelevant. Printing both
-/// would put two unrelated reasons under one row and bury the one that decides
-/// it — `wsl` on a Mac is not a verification problem.
+/// whether thegn's verbs for it were ever tested is irrelevant. AppContainer is
+/// the exception: it is reserved on every OS, and the reserved reason must
+/// remain visible even when its state is `Unsupported`.
 pub fn caveat_for(backend: Backend, state: BackendState) -> Option<String> {
     if backend == Backend::WinAppContainer {
-        return (state != BackendState::Unsupported)
-            .then(|| "reserved: not implemented — thegn would launch a plain host shell".into());
+        return Some("reserved: not implemented — thegn would launch a plain host shell".into());
     }
     (!backend.verified() && state != BackendState::Unsupported).then(|| {
         format!(
@@ -297,8 +296,12 @@ mod tests {
             // bury the reason that actually applies.
             assert_eq!(caveat_for(b, BackendState::Unsupported), None, "{b:?}");
         }
+        assert_eq!(
+            classify(Backend::WinAppContainer, &Placement::Local, HostOs::Windows),
+            BackendState::Unsupported
+        );
         let appcontainer =
-            caveat_for(Backend::WinAppContainer, BackendState::NotInstalled).unwrap_or_default();
+            caveat_for(Backend::WinAppContainer, BackendState::Unsupported).unwrap_or_default();
         assert!(appcontainer.contains("reserved"), "{appcontainer}");
         assert!(appcontainer.contains("plain host shell"), "{appcontainer}");
         assert!(!appcontainer.contains("PATH"), "{appcontainer}");
