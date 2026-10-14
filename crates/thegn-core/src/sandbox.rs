@@ -601,6 +601,7 @@ pub enum RefusalClass {
     SystemdMountPath,
     ComposeTarget,
     ComposeServiceMissing,
+    HostnamePolicy,
 }
 
 /// Structured, safe context for a refused sandbox launch.
@@ -701,6 +702,9 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
     if let Some(message) = compose_policy_refusal(spec) {
         return Err(refusal(spec, RefusalClass::ComposePolicy, None, message));
     }
+    if let Some(message) = hostname_policy_refusal_with(HOSTNAME_RULES, spec) {
+        return Err(refusal(spec, RefusalClass::HostnamePolicy, None, message));
+    }
     let mut view = if !spec.backend.is_oci() && spec.compose.is_some() {
         let mut owned = spec.clone();
         owned.compose = None;
@@ -785,6 +789,73 @@ fn compose_cannot_enforce(spec: &SandboxSpec) -> bool {
         || spec.limits.cpu.is_some()
         || spec.limits.memory.is_some()
         || spec.vpn.is_some()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostnameRulesPolicy {
+    WarnDnsOnly,
+    Refuse,
+}
+
+/// SD-3 (THE-799): flip to `Refuse` for the audit design; one line.
+pub const HOSTNAME_RULES: HostnameRulesPolicy = HostnameRulesPolicy::WarnDnsOnly;
+
+pub fn lower_universal_deny(network: Network, block: &[String]) -> Network {
+    if block.iter().any(|rule| rule.trim() == "*") {
+        Network::None
+    } else {
+        network
+    }
+}
+
+pub fn hostname_rules_active(network: Network, allow: &[String], block: &[String]) -> bool {
+    network != Network::None && (!allow.is_empty() || !block.is_empty())
+}
+
+pub fn hostname_rules_note_for(
+    network: Network,
+    allow: &[String],
+    block: &[String],
+    backend: Backend,
+    placement: &Placement,
+) -> Option<String> {
+    if !hostname_rules_active(network, allow, block) {
+        return None;
+    }
+    // Provider placements lower these rules to provider egress policy (THE-534).
+    if matches!(placement, Placement::Provider(_)) {
+        return None;
+    }
+    Some(format!(
+        "sandbox {}: network_allow/network_block are DNS-name rules only — not an egress boundary, and not \
+         applied by this backend (direct IPs and other resolvers bypass them); set `network = \"none\"` \
+         to deny egress, or remove the lists",
+        backend.label()
+    ))
+}
+
+pub fn hostname_rules_note(spec: &SandboxSpec) -> Option<String> {
+    hostname_rules_note_for(
+        spec.network,
+        &spec.network_allow,
+        &spec.network_block,
+        spec.backend,
+        &spec.placement,
+    )
+}
+
+fn hostname_policy_refusal_with(policy: HostnameRulesPolicy, spec: &SandboxSpec) -> Option<String> {
+    if policy == HostnameRulesPolicy::WarnDnsOnly
+        || !hostname_rules_active(spec.network, &spec.network_allow, &spec.network_block)
+        || matches!(spec.placement, Placement::Provider(_) | Placement::K8s(_))
+    {
+        return None;
+    }
+    Some(format!(
+        "`network_allow`/`network_block` are DNS-name rules, which are not an egress boundary and are not \
+         enforced by the `{}` backend; set `network = \"none\"` or remove the lists",
+        spec.backend.label()
+    ))
 }
 
 /// The portable Thegn named-volume lexical policy. A source must begin with
@@ -1342,11 +1413,14 @@ fn resolve_placed_with(
             .collect(),
         // A profile with a no-network floor (sealed) overrides the configured
         // network mode; otherwise the worktree's `[sandbox] network` stands.
-        network: if profile.forces_no_network() {
-            Network::None
-        } else {
-            cfg.network
-        },
+        network: lower_universal_deny(
+            if profile.forces_no_network() {
+                Network::None
+            } else {
+                cfg.network
+            },
+            &cfg.network_block,
+        ),
         network_allow: cfg.network_allow.clone(),
         network_block: cfg.network_block.clone(),
         read_only_root: profile.read_only_root(),
@@ -3277,24 +3351,6 @@ fn oci_create_opts_with_remote_stdin_secrets(
             "--device".into(),
             "/dev/net/tun".into(),
         ]);
-    }
-    // DNS-based domain filtering: start the proxy on first use and point the
-    // container at it. Skip when network is None (DNS unreachable anyway), when
-    // a VPN sidecar owns DNS (`--dns` is illegal on a container-netns join), or
-    // when no filtering is configured.
-    if spec.network != Network::None
-        && vpn_join.is_none()
-        && (!spec.network_allow.is_empty() || !spec.network_block.is_empty())
-        && spec.placement.is_local()
-    {
-        let policy = crate::dns_filter::DnsPolicy {
-            allow: spec.network_allow.clone(),
-            block: spec.network_block.clone(),
-            upstream: None,
-        };
-        if let Some(port) = crate::dns_filter::get_or_start(policy) {
-            v.extend(["--dns".into(), format!("127.0.0.1:{port}")]);
-        }
     }
     for m in &spec.mounts {
         // Never bind-mount the host's DNS/hosts files into an OCI container:

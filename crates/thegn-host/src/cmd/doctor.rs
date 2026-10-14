@@ -3554,6 +3554,7 @@ fn enforcement_matrix_report(cfg: &Config) {
     }
     floor_report(cfg);
     home_report(cfg);
+    network_rules_report(cfg);
 }
 
 /// The `$HOME` confidentiality line (THE-215): whether the host `$HOME` is hidden,
@@ -3604,6 +3605,40 @@ fn home_report(cfg: &Config) {
             outln!("                dropped mount {p} (reaches a protected $HOME path)");
         }
     }
+}
+
+fn network_rules_report(cfg: &Config) {
+    if cfg.sandbox.network_allow.is_empty() && cfg.sandbox.network_block.is_empty() {
+        return;
+    }
+    let report = thegn_core::sandbox_support::support_report(
+        &shell_chain(cfg),
+        &Placement::Local,
+        cfg_oci_runtime(cfg),
+    );
+    let backend = thegn_core::sandbox_support::first_ready(&report)
+        .map(|r| r.backend)
+        .unwrap_or(Backend::None);
+    if let Some(line) = network_rules_line(&cfg.sandbox, backend) {
+        outln!("  network rules {line}");
+    }
+}
+
+fn network_rules_line(sb: &thegn_core::config::SandboxConfig, backend: Backend) -> Option<String> {
+    if sb.network_allow.is_empty() && sb.network_block.is_empty() {
+        return None;
+    }
+    if sb.network_block.iter().any(|rule| rule.trim() == "*") {
+        return Some("network_block contains `*` — launches are offline (network = none)".into());
+    }
+    thegn_core::sandbox::hostname_rules_note_for(
+        sb.network,
+        &sb.network_allow,
+        &sb.network_block,
+        backend,
+        &Placement::Local,
+    )
+    .map(|note| note.trim_start_matches("sandbox ").to_string())
 }
 
 /// The isolation floor line: the demanded minimum, the miss policy, and whether
@@ -4687,5 +4722,31 @@ args = ["--verbose"]
     #[test]
     fn secret_hard_link_notes_are_empty_without_state_entries() {
         assert!(secret_hard_link_notes(tempfile::tempdir().unwrap().path()).is_empty());
+    }
+
+    #[test]
+    fn network_rules_line_says_dns_only_and_offline() {
+        let blocked = thegn_core::config::SandboxConfig {
+            network_block: vec!["*".into()],
+            ..Default::default()
+        };
+        let offline = network_rules_line(&blocked, Backend::Bwrap).unwrap();
+        assert!(offline.contains("network_block contains `*`"));
+        assert!(offline.contains("offline (network = none)"));
+
+        let allowed = thegn_core::config::SandboxConfig {
+            network_allow: vec!["example.com".into()],
+            ..Default::default()
+        };
+        let note = network_rules_line(&allowed, Backend::Bwrap).unwrap();
+        assert!(note.contains("DNS-name rules only"));
+        assert!(note.contains("not applied by this backend"));
+        assert!(
+            network_rules_line(
+                &thegn_core::config::SandboxConfig::default(),
+                Backend::Bwrap
+            )
+            .is_none()
+        );
     }
 }

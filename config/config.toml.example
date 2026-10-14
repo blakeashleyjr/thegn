@@ -1517,8 +1517,8 @@ command = "git diff"
 #
 # [zone.clientA]
 # env_bundles   = ["clientA-secrets"]           # bundles bound at the zone scope
-# network_allow = ["*.clienta.com", "github.com"]  # egress CEILING (members narrow within)
-# network_block = ["telemetry.example.com"]     # appended to every member (deny wins)
+# network_allow = ["*.clienta.com", "github.com"]  # DNS-name rules only (not an egress boundary)
+# network_block = ["telemetry.example.com"]     # DNS-name rules only; `*` makes launches offline
 # sandbox_floor = "hardened"                     # members may only be >= this hardening
 # placement_floor = "dedicated"                  # placement-mode FLOOR for members: a
 #                                                #   member's requested mode may only be
@@ -2737,9 +2737,10 @@ network = "nat"
 # ports = ["3000:3000", "8080:8080"]
 ports = []
 
-# Outbound hostname policy, enforced via a per-container DNS interceptor.
-# Allow-only these hostnames (empty = allow all); the block list wins when a
-# hostname matches both.
+# Outbound hostname rules apply to DNS lookups only. They are not an egress
+# boundary and are not applied by local backends. Set network = "none" to deny
+# egress; remove the lists to stop reporting DNS-name rules. A block entry "*"
+# lowers the sandbox to network = "none" (offline).
 network_allow = []
 network_block = []
 # Log all outbound DNS queries and connection attempts to the audit table.
