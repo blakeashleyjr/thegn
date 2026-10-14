@@ -363,8 +363,14 @@ impl Backend {
     /// invent them: guessing is how the Apple backend ended up emitting
     /// `container pull` and `container image exists`, neither of which exists.
     /// When someone does that, flip this and add a `liveness_argv` arm.
+    ///
+    /// `winappcontainer` is also unverified: it is reserved, has no token, ACL,
+    /// or network implementation, and currently launches a plain host shell.
     pub fn verified(self) -> bool {
-        !matches!(self, Backend::Smol | Backend::Wsl)
+        !matches!(
+            self,
+            Backend::Smol | Backend::Wsl | Backend::WinAppContainer
+        )
     }
 
     /// The OCI runtimes worth probing for a container on this host (WSL is

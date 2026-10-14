@@ -91,9 +91,11 @@ fn all_backends() -> Vec<Backend> {
     ]
 }
 
-/// Argv inspection cannot see native-Windows containment (it happens in the
-/// spawn syscall), so those two are excluded from the round trip and pinned
-/// separately in [`windows_native_is_taken_at_its_word`].
+/// Argv inspection cannot see Job Object containment (it happens in the spawn
+/// syscall), and AppContainer is reserved and launches a host shell, so both
+/// are excluded from the round trip and pinned separately in
+/// [`jobobject_is_taken_at_its_word`] and
+/// [`appcontainer_request_on_plain_shell_is_degraded`].
 fn argv_visible(b: Backend) -> bool {
     !matches!(b, Backend::WinAppContainer | Backend::WinJobObject)
 }
@@ -310,14 +312,23 @@ fn falling_back_to_a_different_container_is_still_reported() {
 }
 
 #[test]
-fn windows_native_is_taken_at_its_word() {
-    // Documented limit: their isolation is invisible to argv inspection, so
+fn jobobject_is_taken_at_its_word() {
+    // Documented limit: its isolation is invisible to argv inspection, so
     // reconcile trusts the request rather than reporting a false "host".
-    for b in [Backend::WinAppContainer, Backend::WinJobObject] {
-        let argv = enter_argv(&spec(b), "zsh").expect("valid volume names");
-        assert_eq!(observed(&argv), Backend::None, "argv cannot show it");
-        let t = reconcile(b.label(), &argv);
-        assert_eq!(t.label, b.label());
-        assert!(!t.degraded);
-    }
+    let argv = enter_argv(&spec(Backend::WinJobObject), "zsh").expect("valid volume names");
+    assert_eq!(observed(&argv), Backend::None, "argv cannot show it");
+    let t = reconcile(Backend::WinJobObject.label(), &argv);
+    assert_eq!(t.label, Backend::WinJobObject.label());
+    assert!(!t.degraded);
+}
+
+#[test]
+fn appcontainer_request_on_plain_shell_is_degraded() {
+    let argv = enter_argv(&spec(Backend::WinAppContainer), "zsh").expect("valid volume names");
+    let truth = reconcile("appcontainer", &argv);
+    assert_eq!(truth.label, "host");
+    assert!(truth.degraded);
+    assert!(truth.warning.is_some_and(|warning| {
+        warning.contains("appcontainer") && warning.contains("reserved")
+    }));
 }
