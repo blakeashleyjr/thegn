@@ -21,9 +21,9 @@ Binary and mode-only changes say so instead of showing hunks. `↵` on a file
 opens line-level staging at every width; at Normal width it widens to Half,
 and Esc retracts that drill. At Half, the inline preview follows the cursor.
 `space` stages, and `e` cycles panel width. Untracked files preview as all
-additions and are intent-added (`add -N`) only on the first stage. Discard is
-refused in the STAGED pane and for untracked files; use `space` to unstage
-instead.
+additions and are intent-added (`add -N`) only on the first stage. In staging,
+line discard is refused in the STAGED pane (unstage with `space`) and on an
+untracked file (`d` on its Changes row deletes the file).
 In changes and the commit-files drill, `b` opens blame when available;
 untracked and added files are refused, and other unavailable blame states are
 reported. An empty stash message becomes `WIP on <branch>`. A commit with

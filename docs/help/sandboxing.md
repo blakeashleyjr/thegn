@@ -420,11 +420,9 @@ stats and lifecycle actions on the thegn-owned ones.
 ## Cleanup
 
 Panel and monitor actions apply only to containers proven to belong to this
-profile for a known worktree on the backend that launched it; similarly
-named containers from a user or another profile, or another Podman store,
-are foreign and read-only.
-That ownership check governs panel and monitor actions; cleanup commands are
-described below.
+profile for a known worktree on its launch backend; cleanup recognizes the
+`thegn-` name family and `thegn.managed`-labelled images and volumes. Cleanup
+commands below use their own rule:
 Cleanup is always explicit — thegn never prunes on a schedule.
 
 - `thegn sandbox gc` runs the startup orphan sweep on demand: it removes thegn
