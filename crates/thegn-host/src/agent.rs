@@ -199,10 +199,11 @@ impl std::error::Error for DevcontainerLaunchRefused {}
 impl std::fmt::Display for SandboxHalt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let allow = if self.ask {
-            "choose \"run on host\", or explicitly set the sandbox backend to `none`"
+            "choose \"run on host\", or explicitly set the sandbox backend to `none` (with an isolation floor set also set `isolation_floor = \"off\"`), or install/start a container runtime (`thegn doctor` shows which)"
         } else {
             "explicitly select host execution (`backend = \"none\"`, or list \"host\" in \
-             `backend_chain`) or fix the sandbox"
+             `backend_chain`; with an isolation floor set also set `isolation_floor = \"off\"`), \
+             or install/start a container runtime (`thegn doctor` shows which)"
         };
         write!(
             f,
@@ -738,7 +739,7 @@ pub fn prepare_sandbox_env(
                         // remember the miss and try a stronger candidate — only if
                         // none meets the floor does the end-of-loop halt fire.
                         if explicit_choice {
-                            anyhow::bail!("{} for {worktree}", m.message());
+                            anyhow::bail!("{} for {worktree}", m.refusal());
                         }
                         floor_miss = Some(m);
                         continue;
@@ -868,7 +869,7 @@ pub fn prepare_sandbox_env(
         return Err(SandboxHalt {
             env_name: env_name.clone(),
             placement: placement_label.clone(),
-            reason: m.message(),
+            reason: m.refusal(),
             ask,
             dormant: None,
         }
