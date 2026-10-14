@@ -1826,6 +1826,11 @@ mod tests {
         );
         let head = branch_menu("main", true);
         assert_eq!(hotkeys(&head), vec!['f', 'p', 'l', 'u', 'r']);
+        assert!(
+            head.items()
+                .iter()
+                .any(|item| item.choice == MenuChoice::BranchForcePush && item.danger)
+        );
     }
 
     #[test]
