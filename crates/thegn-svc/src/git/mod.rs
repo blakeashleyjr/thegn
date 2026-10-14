@@ -566,6 +566,28 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
         run(loc, &args)
     }
 
+    /// A synthesized all-add diff for an untracked worktree file. Unlike
+    /// `unstaged_diff`, this is read-only and leaves the index untouched.
+    fn untracked_diff(&self, loc: &GitLoc, path: &str) -> Result<String> {
+        let args = [
+            "-c",
+            "diff.noprefix=false",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-index",
+            "-U3",
+            "--",
+            "/dev/null",
+            path,
+        ];
+        let (status, out) = run_status(loc, &args)?;
+        match status {
+            0 | 1 => Ok(out),
+            _ => anyhow::bail!("git diff --no-index failed (exit {status})"),
+        }
+    }
+
     /// A commit's patch (optionally narrowed to one path), sanitized for
     /// `git apply` round-trips — the custom-patch builder's feed.
     fn commit_diff(&self, loc: &GitLoc, sha: &str, path: Option<&str>) -> Result<String> {

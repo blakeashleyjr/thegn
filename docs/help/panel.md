@@ -17,6 +17,7 @@ contexts:
     panel:logs,
     panel:hosts,
     panel:telemetry,
+    panel:keys#share-forward-media-telemetry-keys,
   ]
 actions: [focus-panel, toggle-panel]
 ---
@@ -32,12 +33,14 @@ accordion — four tabs, one open section at a time:
   attention), the branch's PR + the repo's open PRs, CI runs, the merge
   queue, the PR queue, issues, problems, jobs, tests, symbols
 - **system** — notifications, logs, sandbox, hosts, environments, shares,
-  port forwards, telemetry, media, usage, keys
-- **help** — this documentation, docked (the twin of the `F1` overlay)
+  port forwards, telemetry, keys, media, usage
+- **help** — this documentation, docked (a scrollable reader alongside the
+  `F1` overlay)
 
 ## Keys
 
-- `Tab` / `Shift-Tab` — cycle tabs; `1`–`9`, `0` jump to the tab's first ten sections
+- `Tab` / `Shift-Tab` — cycle tabs; `1`–`9`, `0` jump to the tab's first ten
+  sections; later sections have no number
 - `j k` / `↑↓` — move through rows; Help, Telemetry, and Keys scroll their
   body. At a section's edge, `j k` flow into the next section, stopping at
   the tab's first/last section.
@@ -47,12 +50,15 @@ accordion — four tabs, one open section at a time:
   except in git **commits**, where it edits/rewords.
 - `F1` — open the full help overlay; git-family sections also show their
   own gitui cheatsheet on `?`
+- Long lists show `↑N above` and `+N more` at every width. At Full width,
+  the list sits beside a detail column pinned to the cursor row.
 
 The status bar shows each section's keys. [[keybindings]] lists the complete
 keymap, including section tables under `Panel · <section>` headings.
 
-`[panel] sections` reorders the accordion or hides sections you never
-use; the built-in order is the default.
+`[panel] sections` reorders the accordion or hides sections you never use;
+the built-in order is the default. Naming a gated section there shows its
+off banner when its feature is unavailable.
 
 ## What each section shows
 
@@ -68,19 +74,19 @@ use; the built-in order is the default.
 
 **work**
 
-| Section    | Shows                                                                 |
-| ---------- | --------------------------------------------------------------------- |
-| `mine`     | one feed of everything assigned to you: issues, review requests, PRs  |
-| `across`   | failing CI for the active project (`a` widens), grouped by worktree   |
-| `pr`       | PR state, CI check rollup, review decision for this branch            |
-| `ci`       | run history and per-run state across providers                        |
-| `merge`    | the local merge queue — per-branch land/defer status                  |
-| `prq`      | the PR queue — queued pull requests on the forge and what blocks them |
-| `issues`   | tracker issues                                                        |
-| `problems` | compiler, linter, and test diagnostics                                |
-| `jobs`     | configured shell jobs (build, test, run)                              |
-| `tests`    | test results and the pass/fail rollup                                 |
-| `symbols`  | the LSP / tree-sitter outline for the selected file                   |
+| Section    | Shows                                                                |
+| ---------- | -------------------------------------------------------------------- |
+| `mine`     | one feed of everything assigned to you: issues, review requests, PRs |
+| `across`   | failing CI for the active project (`a` widens), grouped by worktree  |
+| `pr`       | PR state, CI check rollup, review decision for this branch           |
+| `ci`       | run history and per-run state across providers                       |
+| `merge`    | the local merge queue — per-branch land/defer status                 |
+| `prq`      | PR queue (hidden until `[pr_queue] enabled = true`)                  |
+| `issues`   | tracker issues                                                       |
+| `problems` | compiler, linter, and test diagnostics                               |
+| `jobs`     | configured shell jobs (build, test, run)                             |
+| `tests`    | test results and the pass/fail rollup                                |
+| `symbols`  | the LSP / tree-sitter outline for the selected file                  |
 
 **system**
 
@@ -94,12 +100,13 @@ use; the built-in order is the default.
 | `share`         | ports this worktree exposes — see [[share-and-forward]]                   |
 | `forward`       | auto port forwards to host loopback                                       |
 | `telemetry`     | live frame/loop counters for the running UI                               |
+| `keys`          | first chord per action plus panel keys; [[keybindings]] has the full list |
 | `media`         | now-playing and transport — see [[media]]                                 |
 | `usage`         | AI-account rate-limit usage — see [[ai-usage]]                            |
-| `keys`          | first chord per action plus panel keys; [[keybindings]] has the full list |
 
-`hosts` and `environments` are **dev-channel only**; see
-[[release-channels]].
+On the stable channel, `hosts` and `environments` are hidden unless named in
+`[panel] sections`; when named, each shows a one-line off banner and has no
+live keys. They are available on the dev channel; see [[release-channels]].
 
 The merge queue drives the local fold-actor, and the PR queue shepherds
 pull requests on the forge — see [[merge-queue]] and [[pr-queue]] for
@@ -138,8 +145,12 @@ through difftastic. See [[git-and-diffs]].
 
 ### commits — branch history
 
-The branch's log; pick a commit to operate on. `E` edits (interactive
-rebase stopping at the commit); bare `e` is always the panel width cycle.
+At Half and Full width, the detail region follows the cursor and shows the
+commit as a read-only `git show` view. `↵` opens that commit's files with the
+selected file's diff shown read-only. Mark lines with `space` to start a
+custom patch; `W` diffs the selection against the mark. `E` edits
+(interactive rebase stopping at the commit); bare `e` is always the panel
+width cycle.
 
 {{keys:commits}}
 
@@ -148,6 +159,8 @@ See [[git-and-diffs]].
 ### branches — local branches
 
 Local branches: check out, create, delete; open-PR badges ride each row.
+At Normal width, `↵` widens to Half; the selected branch's recent commits
+appear at Half and Full width.
 
 {{keys:branches}}
 
@@ -155,8 +168,9 @@ See [[git-and-diffs]].
 
 ### stash — stash list
 
-Stash list: apply, pop, drop; `↵` shows the stash diff. At Full width,
-PgUp/PgDn and Ctrl-d/Ctrl-u scroll it. See [[git-and-diffs]].
+At Normal width, `↵` widens to Half. The stash diff appears and scrolls at
+Half and Full width, including untracked files. Apply, pop, and drop remain
+available from the stash list. See [[git-and-diffs]].
 
 {{keys:stash}}
 
@@ -216,10 +230,10 @@ See [[review-a-pr]] for the full workflow.
 
 ### ci — pipeline state and cached logs
 
-One row per workflow, judged by its most recent run — the same set the
-header counts, so the `✓/✗` numbers always match the rows. Fan-out
-workflows (several sibling runs from one trigger) are represented by a
-failing sibling when there is one. History is behind the drill-in.
+Every run is listed. The header counts the latest run per workflow, so the
+`✓/✗` numbers match the current-state summary. Fan-out workflows (several
+sibling runs from one trigger) use a failing sibling for the summary when
+there is one. At Half and Full width, the detail follows the highlighted run.
 
 {{keys:ci}}
 
@@ -233,11 +247,14 @@ notification when its evidence-ready message appears. The cache policy is contro
 off by default and can suggest or safely hand a verified failure to the
 existing PR-queue agent. The action rechecks PR context, head, agent policy,
 and attempt budget off-loop, and fails closed if any check no longer holds.
+In the section and in its popup, **r** reruns failed jobs, **R** reruns all
+jobs, and **c** cancels after a second press.
 
 ### merge — the local merge queue
 
 The fold-actor's per-branch land/defer status. Scoped to the active
-project by default; `g` widens to every project.
+project by default; `g` widens to every project. `c` sweeps landed rows
+after a second press.
 
 {{keys:merge}}
 
@@ -246,14 +263,16 @@ See [[merge-queue]].
 ### prq — the PR queue
 
 The queued pull requests on the forge and what blocks each one — the
-merge queue's counterpart for a **shared** repo. Off by default; turn
-it on with `[pr_queue] enabled = true`.
+merge queue's counterpart for a **shared** repo. Hidden until
+`[pr_queue] enabled = true`; listing it in `[panel] sections` while disabled
+shows a one-line off banner with no live keys.
 
 {{keys:prq}}
 
 The CLI equivalents are `thegn pr queue …`. See [[pr-queue]].
 
-Additional keys: `h` invokes the configured handoff for a selected queued PR.
+`c` clears the queue after a second press. The `h` key invokes the configured
+handoff for a selected queued PR.
 
 ### issues — the repo's tracker
 
@@ -280,6 +299,11 @@ again to restart it. `s` stops only the selected job.
 
 **tests** is the test-runner view.
 
+`f` reruns every failing test; `R` reruns the whole suite; `O` opens the
+last run's output; `/` filters results (Enter commits the filter; Esc clears
+it while editing); `u` rediscovers tests. The view also offers file and
+package selection, debug launch, editor opening, and output peeking.
+
 {{keys:tests}}
 
 ### symbols — outline & references
@@ -296,13 +320,14 @@ first, tree-sitter fallback).
 The inbox. In row mode, `x` marks the row read and `d` **deletes** it. `/` searches
 every unread row; a committed filter stays visible. The header counts alert,
 unread, low-priority, and shown rows. The inbox retains every unread row and
-the newest 50 read rows.
+the newest 50 read rows. At Half width the highlighted row shows its whole
+message; Full width puts it in the detail column.
 
 {{keys:notifications}}
 
 `a` clears the inbox and acknowledges live "needs you" signals. It asks
 for confirmation and ignores an active filter. `g` toggles scope between
-this repo and every worktree. The popup's `a` does not ask for confirmation;
+this repo and every worktree. The popup's `a` also asks for confirmation;
 see [[bars]].
 
 Additional keys: `A` shows read rows · `/` searches the inbox.
@@ -336,6 +361,9 @@ forgets cached state. **environments** lists `[env.*]`: `↵` (re)binds the
 env to this worktree, `t` tests provider env tokens only, `n` adds, `x`
 removes (confirmed).
 The environment currently bound to the worktree carries a visible bound marker.
+
+At Full width, hosts shows the host list beside the highlighted host's
+details, including its SSH/reach target.
 
 {{keys:sandbox}}
 
@@ -386,6 +414,8 @@ thresholds colour it with the same gauge and overlay.
 ## The help tab
 
 **help** shows this documentation in the docked panel. `j`/`k`, `↑`/`↓`,
-PgUp/PgDn, `g`/`G`, and the wheel scroll the body; `Tab` switches panel
-tabs. Use `F1` to open the full help overlay. No config; the content itself
-is described in [[help]].
+PgUp/PgDn, `g`/`G`, and the wheel scroll the body. `↵` or `F1` opens the
+overlay at the same page and position; the overlay's `o` docks that page at
+the same position. The docked page and position persist across restarts.
+`Tab` switches panel tabs. No config; the content itself is described in
+[[help]].

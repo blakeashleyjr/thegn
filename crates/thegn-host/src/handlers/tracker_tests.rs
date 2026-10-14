@@ -55,3 +55,37 @@ fn panel_router_applies_repo_issue_restrictions() {
     assert!(!router.is_configured());
     assert!(old_global_only_router.is_configured());
 }
+
+#[test]
+fn branch_root_uses_the_rows_repo_under_all_repos() {
+    let row = thegn_core::work::WorkRow {
+        issue_id: Some("linear:1".into()),
+        repo_root: Some("/repo/foreign".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        branch_root(&row, true, Some(std::path::Path::new("/repo/current"))).unwrap(),
+        std::path::PathBuf::from("/repo/foreign")
+    );
+}
+
+#[test]
+fn branch_root_refuses_a_non_local_repo() {
+    let row = thegn_core::work::WorkRow {
+        issue_id: Some("linear:1".into()),
+        ..Default::default()
+    };
+    assert!(branch_root(&row, true, Some(std::path::Path::new("/repo/current"))).is_err());
+}
+
+#[test]
+fn branch_root_refuses_non_issue_rows() {
+    let row = thegn_core::work::WorkRow {
+        kind: thegn_core::work::WorkKind::Pr,
+        ..Default::default()
+    };
+    assert_eq!(
+        branch_root(&row, false, Some(std::path::Path::new("/repo"))).unwrap_err(),
+        "b branches from an issue row"
+    );
+}

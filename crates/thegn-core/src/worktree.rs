@@ -702,6 +702,10 @@ pub fn add_checked_with_state(
     }
     let branch_preexisted = branch_exists(root, branch);
     let out = util::git_cmd(root)
+        // Worktree creation runs on a worker, but Git must still fail fast if
+        // a remote credential helper would otherwise prompt for input.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
         .args(["worktree", "add", "--quiet", "-b", branch])
         .arg(path)
         .arg(base)

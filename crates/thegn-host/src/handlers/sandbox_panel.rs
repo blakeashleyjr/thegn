@@ -3,11 +3,25 @@
 use termwiz::terminal::TerminalWaker;
 use thegn_core::config::SandboxConfig;
 use thegn_core::remote::GitLoc;
-use thegn_core::sandbox::{Backend, ContainerInfo};
+use thegn_core::sandbox::{Backend, ContainerInfo, OwnedContainers};
 
 use crate::hydrate::RefreshKind;
 use crate::layout::PanelWidth;
 use crate::menu::{self, MenuChoice, MenuOverlay};
+
+pub(crate) fn stamp_ownership(
+    containers: &mut [ContainerInfo],
+    worktrees: &[crate::sidebar::DbWorktree],
+    profile: &str,
+) {
+    OwnedContainers::new(
+        profile,
+        worktrees
+            .iter()
+            .map(|worktree| (worktree.path.as_str(), worktree.sandbox_backend.as_deref())),
+    )
+    .stamp(containers);
+}
 
 pub(crate) fn visible_containers<'a>(
     containers: &'a [ContainerInfo],
@@ -74,7 +88,7 @@ pub(crate) fn key(
     }
     if !container.ours {
         return SandboxKey::Refused(format!(
-            "{} is not a thegn container — read-only here (use {} directly)",
+            "{} was not created by this thegn profile — read-only here (use {} directly)",
             container.name, container.backend
         ));
     }
@@ -136,7 +150,7 @@ pub(crate) fn resolve_choice(
     };
     if !container.ours {
         return Some(Err(format!(
-            "{} is not a thegn container — read-only here (use {} directly)",
+            "{} was not created by this thegn profile — read-only here (use {} directly)",
             container.name, container.backend
         )));
     }
@@ -217,6 +231,49 @@ mod tests {
             container("thegn-repo-home", true, "podman"),
             container("postgres-dev", false, "docker"),
         ]
+    }
+
+    #[test]
+    fn user_named_thegn_container_is_refused() {
+        let worktree = crate::sidebar::DbWorktree {
+            slug: "repo".into(),
+            branch: "feat".into(),
+            repo_path: "/repo".into(),
+            tab_name: "repo/feat".into(),
+            path: "/wt/feat".into(),
+            folder_id: None,
+            sandbox_backend: Some("podman".into()),
+            env_name: None,
+            env_degraded: false,
+        };
+        let config_profile = "vim";
+        let own =
+            thegn_core::sandbox::container_name_for_config_profile("/wt/feat", config_profile);
+        let mut containers = vec![
+            container("thegn-foo", true, "podman"),
+            container(&own, true, "podman"),
+        ];
+        stamp_ownership(&mut containers, &[worktree], config_profile);
+
+        assert!(!containers[1].ours);
+        for action in ['s', 'r'] {
+            assert!(matches!(
+                key(action, &containers, &own, true, PanelWidth::Full, 1),
+                SandboxKey::Refused(message)
+                    if message.contains("thegn-foo")
+                        && message.contains("was not created by this thegn profile")
+            ));
+        }
+        assert!(matches!(
+            key('s', &containers, &own, true, PanelWidth::Full, 0),
+            SandboxKey::Confirm(_)
+        ));
+
+        let choice = MenuChoice::Confirm {
+            tag: "sandbox-stop",
+            arg: "podman\u{1f}thegn-foo".into(),
+        };
+        assert!(resolve_choice(&choice, &containers).is_some_and(|result| result.is_err()));
     }
 
     #[test]

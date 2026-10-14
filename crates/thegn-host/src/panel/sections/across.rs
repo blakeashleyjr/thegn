@@ -4,8 +4,8 @@
 //! workspace's, under the `a` toggle): failing CI — and, as those producers
 //! land, dirty files / content matches — grouped by worktree with per-row
 //! source labels. Each excerpt row carries a `PanelHit::Row(Across, i)`;
-//! Enter resolves it via `Aggregation::jump_target` and switches to that
-//! worktree's tab.
+//! Enter resolves it via `Aggregation::jump_target` and activates its open tab
+//! or registered worktree.
 
 use thegn_core::aggregate::{AggRow, Aggregation, ExcerptKind};
 use thegn_core::theme::Hue;

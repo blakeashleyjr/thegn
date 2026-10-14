@@ -7,6 +7,25 @@
 
 use std::path::Path;
 
+/// Resolve a worktree path against the session and hydrated sidebar registry.
+/// This is deliberately pure so panel dispatch never needs a DB read.
+pub(crate) fn worktree_row_target(
+    path: &str,
+    groups: &[(String, usize)],
+    sidebar_db_worktrees: &[crate::sidebar::DbWorktree],
+) -> Option<crate::sidebar::RowTarget> {
+    if let Some((i, (_, active_tab))) = groups.iter().enumerate().find(|(_, (p, _))| p == path) {
+        return Some(crate::sidebar::RowTarget::Tab(i, *active_tab));
+    }
+    sidebar_db_worktrees
+        .iter()
+        .find(|wt| wt.path == path)
+        .map(|wt| crate::sidebar::RowTarget::Workspace {
+            repo_path: wt.repo_path.clone(),
+            group: Some(wt.tab_name.clone()),
+        })
+}
+
 /// Where a resolved worktree root lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConnectTarget {
@@ -89,6 +108,34 @@ mod tests {
             )],
             vec!["/ws/repo-a".into(), "/ws/repo-b".into()],
         )
+    }
+
+    #[test]
+    fn worktree_row_target_prefers_open_tab_then_registered_worktree() {
+        let groups = vec![("/wt/open".into(), 2)];
+        let wt = crate::sidebar::DbWorktree {
+            slug: "repo".into(),
+            branch: "feat".into(),
+            repo_path: "/repo".into(),
+            tab_name: "repo/feat".into(),
+            path: "/wt/open".into(),
+            folder_id: None,
+            sandbox_backend: None,
+            env_name: None,
+            env_degraded: false,
+        };
+        assert_eq!(
+            worktree_row_target("/wt/open", &groups, std::slice::from_ref(&wt)),
+            Some(crate::sidebar::RowTarget::Tab(0, 2))
+        );
+        assert_eq!(
+            worktree_row_target("/wt/open", &[], std::slice::from_ref(&wt)),
+            Some(crate::sidebar::RowTarget::Workspace {
+                repo_path: "/repo".into(),
+                group: Some("repo/feat".into())
+            })
+        );
+        assert_eq!(worktree_row_target("/wt/cold", &[], &[wt]), None);
     }
 
     #[test]

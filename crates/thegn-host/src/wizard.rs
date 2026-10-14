@@ -89,6 +89,7 @@ pub struct WizardChoices {
 pub enum NameChoice {
     Generated,
     Human(String),
+    Exact,
 }
 
 /// The CONFIG-layer default execution-environment (host) name (repo `.thegn.*`
@@ -1090,6 +1091,8 @@ pub struct WorkerCtx {
     pub repo_root: PathBuf,
     /// Full branch-name candidate (prefix included) from the wizard prefill.
     pub candidate: String,
+    /// Keep `candidate` as the branch ref, without deduping or renaming it.
+    pub exact_branch: bool,
     pub generation: u64,
     /// Test seam: `Some(path)` opens the DB there instead of the default
     /// state dir (this shell often runs inside a live thegn).
@@ -1217,7 +1220,11 @@ pub fn run_worker(
         fail(CreateStep::ResolveBase, error);
         return;
     }
-    let mut branch = worktree::dedupe(&ctx.candidate, &taken);
+    let mut branch = if ctx.exact_branch {
+        ctx.candidate.clone()
+    } else {
+        worktree::dedupe(&ctx.candidate, &taken)
+    };
     send(CreateEvent::Preflight {
         generation,
         suggested: branch.clone(),
@@ -1423,6 +1430,9 @@ pub fn run_worker(
                     }
                 }
             }
+        }
+        NameChoice::Exact => {
+            step(CreateStep::FinalizeName, StepState::Skipped, None);
         }
     }
 
@@ -1723,9 +1733,29 @@ mod tests {
             &["config", "commit.gpgsign", "false"],
             &["commit", "--allow-empty", "-q", "-m", "init"],
         ] {
-            assert!(util::git_cmd(&dir).args(args).status().unwrap().success());
+            assert!(test_git_cmd(&dir).args(args).status().unwrap().success());
         }
         dir
+    }
+
+    fn test_git_cmd(dir: &Path) -> std::process::Command {
+        let mut command = util::git_cmd(dir);
+        command
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0");
+        command
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "hermetic test git: blocking output is fine in a unit test"
+    )]
+    fn test_git_out(dir: &Path, args: &[&str]) -> String {
+        let output = test_git_cmd(dir).args(args).output().unwrap();
+        assert!(output.status.success(), "git {:?} failed", args);
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
     /// Run the worker synchronously with the wizard decisions pre-queued
@@ -1748,6 +1778,18 @@ mod tests {
         cmds: Vec<WizardCmd>,
         db_path: &Path,
     ) -> Vec<CreateEvent> {
+        drive_worker_with_name(cfg, repo, candidate, false, None, cmds, db_path)
+    }
+
+    fn drive_worker_with_name(
+        cfg: Config,
+        repo: &Path,
+        candidate: &str,
+        exact_branch: bool,
+        base_override: Option<String>,
+        cmds: Vec<WizardCmd>,
+        db_path: &Path,
+    ) -> Vec<CreateEvent> {
         let state_home = repo.join("state");
         let state_home = state_home.to_string_lossy().into_owned();
         let _env = crate::testenv::EnvVarGuard::set(&[
@@ -1765,9 +1807,10 @@ mod tests {
                 cfg,
                 repo_root: repo.to_path_buf(),
                 candidate: candidate.into(),
+                exact_branch,
                 generation: 7,
                 db_path: Some(db_path.to_path_buf()),
-                base_override: None,
+                base_override,
             },
             cmd_rx,
             ev_tx,
@@ -1826,6 +1869,84 @@ mod tests {
         assert!(!choices.env.is_empty());
         assert!(!choices.sandbox.is_empty());
         assert!(!choices.agent.is_empty());
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Git fixture commands are confined to a temporary repository"
+    )]
+    fn exact_branch_creation_tracks_the_requested_remote_branch() {
+        let env = crate::testenv::EnvVarGuard::set(&[
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+        ]);
+        let repo = temp_repo("exact-branch");
+        let remote = tempfile::tempdir().unwrap();
+        assert!(
+            test_git_cmd(remote.path())
+                .args(["init", "--bare", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            test_git_cmd(&repo)
+                .args(["remote", "add", "origin"])
+                .arg(format!("file://{}", remote.path().display()))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let head = test_git_out(&repo, &["rev-parse", "HEAD"]);
+        assert!(
+            test_git_cmd(&repo)
+                .args(["push", "-q", "origin", "HEAD:refs/heads/feature/login"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            test_git_cmd(&repo)
+                .args(["update-ref", "refs/remotes/origin/feature/login", &head])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let state = tempfile::tempdir().unwrap();
+        // drive_worker_with_name takes the same process-wide env lock, so release
+        // ours first or the nested guard deadlocks.
+        drop(env);
+        let events = drive_worker_with_name(
+            test_cfg(),
+            &repo,
+            "feature/login",
+            true,
+            Some("origin/feature/login".into()),
+            vec![WizardCmd::Submit(WizardChoices {
+                name: NameChoice::Exact,
+                env: "default".into(),
+                sandbox: "host".into(),
+                agent: "shell".into(),
+            })],
+            &state.path().join("state.sqlite"),
+        );
+        let created = expect_done(&events);
+        assert_eq!(created.branch, "feature/login");
+        assert_eq!(
+            test_git_out(
+                Path::new(&created.path),
+                &["config", "branch.feature/login.remote"],
+            ),
+            "origin"
+        );
+        assert_eq!(
+            test_git_out(
+                Path::new(&created.path),
+                &["config", "branch.feature/login.merge"],
+            ),
+            "refs/heads/feature/login"
+        );
     }
 
     #[test]

@@ -934,6 +934,15 @@ impl WorktreeAuxStore for Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Every issue/worktree association, newest links first.
+    fn issue_link_worktrees(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT issue_id,worktree_path FROM issue_links ORDER BY linked_at DESC")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     // --- reflog-undo bookkeeping (which resets are OURS, per worktree) ------
     /// Record a reset target we are about to create, pruning each worktree's
     /// mark set to the freshest 100 (the undo planner only reads ~100 reflog

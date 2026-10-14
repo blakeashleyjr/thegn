@@ -156,6 +156,7 @@ fn gap_marker(count: u64) -> ParsedLog {
         original: message.clone(),
         message,
         worktree: None,
+        target: None,
     }
 }
 
