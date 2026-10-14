@@ -361,9 +361,12 @@ pub struct PrivateDir {
     fd: std::os::fd::OwnedFd,
 }
 
+const PRIVATE_TEMP_PREFIX: &str = ".secret.tmp-";
+
 impl PrivateDir {
-    /// Remove stale entries with the requested extension while keeping every
-    /// metadata lookup and unlink anchored to this directory's held handle.
+    /// Remove stale entries with the requested extension and private temporary
+    /// residue while keeping metadata lookup and unlink anchored to this
+    /// directory's held handle. The returned count includes removed residue.
     /// Symlinks are always removed, directories and special files are kept,
     /// and regular files are removed only once they reach `max_age`.
     pub fn remove_stale_files(
@@ -396,10 +399,14 @@ impl PrivateDir {
                     continue;
                 }
             };
-            if Path::new(&name)
-                .extension()
-                .and_then(std::ffi::OsStr::to_str)
-                != Some(extension)
+            let private_residue = name
+                .to_str()
+                .is_some_and(|name| name.starts_with(PRIVATE_TEMP_PREFIX));
+            if !private_residue
+                && Path::new(&name)
+                    .extension()
+                    .and_then(std::ffi::OsStr::to_str)
+                    != Some(extension)
             {
                 continue;
             }
@@ -490,7 +497,10 @@ impl PrivateDir {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_nanos())
                 .unwrap_or(0);
-            let temporary = format!(".secret.tmp-{}-{nanos}-{nonce}", std::process::id());
+            let temporary = format!(
+                "{PRIVATE_TEMP_PREFIX}{}-{nanos}-{nonce}",
+                std::process::id()
+            );
             let fd = openat(
                 &self.fd,
                 temporary.as_str(),
@@ -1406,5 +1416,136 @@ mod tests {
         let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         let _ = std::fs::remove_dir_all(&d); // best-effort: test cleanup: scratch removal must never fail the test
+    }
+
+    #[test]
+    fn private_dir_stale_sweep_removes_old_crash_residue_but_keeps_fresh() {
+        let anchor = tempfile::tempdir().unwrap();
+        let dir = ensure_private_dir_beneath(anchor.path(), Path::new("private")).unwrap();
+        let residue = dir.path.join(".secret.tmp-1-2-3");
+        let unrelated = dir.path.join("keep.txt");
+        std::fs::write(&residue, b"temporary secret").unwrap();
+        std::fs::set_permissions(&residue, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        assert_eq!(
+            dir.remove_stale_files(
+                "env",
+                std::time::SystemTime::now(),
+                std::time::Duration::from_secs(60 * 60),
+            ),
+            0
+        );
+        assert!(residue.exists(), "fresh crash residue must remain");
+        assert!(unrelated.exists());
+
+        assert_eq!(
+            dir.remove_stale_files(
+                "env",
+                std::time::SystemTime::now() + std::time::Duration::from_secs(2 * 60 * 60),
+                std::time::Duration::from_secs(60 * 60),
+            ),
+            1
+        );
+        assert!(!residue.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn private_dir_stale_sweep_keeps_fifo_and_directory_residue() {
+        let anchor = tempfile::tempdir().unwrap();
+        let dir = ensure_private_dir_beneath(anchor.path(), Path::new("private")).unwrap();
+        let residue_fifo = dir.path.join(".secret.tmp-9-9-9");
+        let env_fifo = dir.path.join("pipe.env");
+        let env_directory = dir.path.join("nested.env");
+        nix::unistd::mkfifo(
+            &residue_fifo,
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .unwrap();
+        nix::unistd::mkfifo(&env_fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        std::fs::create_dir(&env_directory).unwrap();
+
+        assert_eq!(
+            dir.remove_stale_files(
+                "env",
+                std::time::SystemTime::now(),
+                std::time::Duration::ZERO
+            ),
+            0
+        );
+        assert!(residue_fifo.exists());
+        assert!(env_fifo.exists());
+        assert!(env_directory.is_dir());
+    }
+
+    #[test]
+    fn private_dir_concurrent_writers_never_tear_or_leak() {
+        let anchor = tempfile::tempdir().unwrap();
+        let dir = ensure_private_dir_beneath(anchor.path(), Path::new("private")).unwrap();
+        let destination = dir.path.join("secret.env");
+        let writing = std::sync::atomic::AtomicBool::new(true);
+
+        std::thread::scope(|scope| {
+            let dir = &dir;
+            let destination = &destination;
+            let writing = &writing;
+            let reader = scope.spawn(|| {
+                while writing.load(std::sync::atomic::Ordering::Acquire) {
+                    match std::fs::read(destination) {
+                        Ok(bytes) => {
+                            assert_eq!(bytes.len(), 64 * 1024);
+                            assert!(bytes.iter().all(|byte| *byte == bytes[0]));
+                            assert!((b'A'..=b'D').contains(&bytes[0]));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => panic!("unable to read published secret: {error}"),
+                    }
+                }
+            });
+            let mut writers = Vec::new();
+            for writer in 0..4 {
+                let payload = vec![b'A' + writer; 64 * 1024];
+                writers.push(scope.spawn(move || {
+                    for _ in 0..50 {
+                        dir.write_owner_only_atomic("secret.env", &payload).unwrap();
+                    }
+                }));
+            }
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            writing.store(false, std::sync::atomic::Ordering::Release);
+            reader.join().unwrap();
+        });
+
+        let content = std::fs::read(&destination).unwrap();
+        assert_eq!(content.len(), 64 * 1024);
+        assert!(content.iter().all(|byte| *byte == content[0]));
+        assert!((b'A'..=b'D').contains(&content[0]));
+        assert_eq!(std::fs::read_dir(&dir.path).unwrap().count(), 1);
+        assert_eq!(mode_bits(&destination).unwrap(), Some(0o600));
+    }
+
+    #[test]
+    fn path_atomic_write_replaces_fifo_and_symlink_leaves_without_following() {
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let fifo = parent.path().join("secret");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        write_owner_only_atomic(&fifo, b"from fifo replacement").unwrap();
+        assert_eq!(std::fs::read(&fifo).unwrap(), b"from fifo replacement");
+        assert!(std::fs::metadata(&fifo).unwrap().is_file());
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
+
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        std::fs::remove_file(&fifo).unwrap();
+        std::os::unix::fs::symlink(&victim, &fifo).unwrap();
+        write_owner_only_atomic(&fifo, b"from symlink replacement").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert_eq!(std::fs::read(&fifo).unwrap(), b"from symlink replacement");
+        assert!(std::fs::metadata(&fifo).unwrap().is_file());
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
     }
 }
