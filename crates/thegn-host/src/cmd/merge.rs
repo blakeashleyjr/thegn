@@ -755,8 +755,9 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             return Err(error);
         }
     }
+    let mut steps = Vec::new();
     let out = merge_driver::drive_queue(mq, cfg, &root, &db, items, |step: &DriveStep| {
-        if json {
+        if !crate::merge_notify::collect_step(&mut steps, step, json) {
             return;
         }
         // Only the settled transitions are worth a CLI line; folding/agent_running
@@ -770,6 +771,7 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             None => outln!("  ? {} unknown queue status '{}'", step.branch, step.status),
         }
     });
+    crate::merge_notify::record_cli_drain(cfg, &db, &steps, &out);
 
     // push mode: converge by pushing the advanced target to origin. Done before
     // emitting JSON so its result can ride inside the single document.
