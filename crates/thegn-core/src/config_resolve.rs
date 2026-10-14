@@ -1459,6 +1459,7 @@ fn repo_hint_weakens(
                         &hinted.limits.cpu_total,
                         parse_cpu_millis,
                     )
+                    || (base.limits.cpu_total.is_none() && hinted.limits.cpu_total.is_some())
                     || !limit_is_not_raised(
                         &base.limits.memory_total,
                         &hinted.limits.memory_total,
@@ -1597,6 +1598,7 @@ pub fn resolve_environment(
     };
     let env = resolve_named(name.clone());
     let env = if source == EnvPick::RepoHint
+        && Some(&name) != pick(&default_env).as_ref()
         && cfg.env.contains_key(&name)
         && let Some(key) = repo_hint_weakens(&base, &env.sandbox, env.placement.is_local())
     {
@@ -2823,6 +2825,27 @@ mod tests {
     }
 
     #[test]
+    fn repo_hint_matching_default_env_is_user_selected() {
+        let (repo, cfg) = repo_env_fixture(
+            r#"
+                [sandbox]
+                default_env = "hostdev"
+                profile = "sealed"
+                isolation_floor = "shared-kernel"
+                on_floor_miss = "fail"
+                backend_chain = ["podman"]
+                [env.hostdev.sandbox]
+                profile = "open"
+            "#,
+            "hostdev",
+        );
+        let (env, resolved) = resolve_fixture(repo.path(), &cfg, None);
+        assert_eq!(env.name, "hostdev");
+        assert_eq!(env.sandbox.profile, crate::config::SandboxProfile::Open);
+        assert!(!resolved.events.iter().any(|event| event.key == "env"));
+    }
+
+    #[test]
     fn repo_hint_weakens_each_dimension() {
         let defaults = SandboxConfig::default();
         let base = sandbox_with_overlay(
@@ -2849,6 +2872,8 @@ mod tests {
             ("mounts = ['/tmp:/tmp:rw']", "sandbox.mounts"),
             ("env_passthrough = ['SECRET']", "sandbox.env_passthrough"),
             ("limits.cpu = '4'", "sandbox.limits"),
+            ("limits.cpu_total = '64'", "sandbox.limits"),
+            ("limits.cpu = 'lots'", "sandbox.limits"),
             ("image = 'custom'", "sandbox.image"),
             ("init_script = 'true'", "sandbox.init_script"),
             ("compose = 'compose.yml'", "sandbox.compose"),
@@ -2868,6 +2893,11 @@ mod tests {
                 "{source}"
             );
         }
+        let no_limits = sandbox_with_overlay(&base, "limits = {}");
+        assert_eq!(
+            repo_hint_weakens(&base, &no_limits, true),
+            Some("sandbox.limits")
+        );
         assert_eq!(repo_hint_weakens(&base, &base, false), Some("placement"));
         let neutral = sandbox_with_overlay(
             &base,
