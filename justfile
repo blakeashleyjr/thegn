@@ -784,7 +784,7 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test: contract-ratchets test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup
+test: contract-ratchets test-live test-heredoc-guard test-build-metadata test-the429 test-action-pins test-apply-backend test-nix-metadata test-nextest-setup test-packaging
     cargo nextest run --workspace
 
 # Doctest pass. Split out of `test` (and therefore off pre-push) because it is
@@ -1195,6 +1195,11 @@ test-action-pins:
 # Pure; no Cargo.
 test-nextest-setup:
     python3 -B test/nextest_setup_test.py
+
+# THE-421/THE-424: release admission policy (.github/workflows) and
+# packaging/release.py archive-limit regressions. Pure Python; no Cargo/network.
+test-packaging:
+    python3 -B -m unittest discover -s packaging/tests -p 'test_*.py'
 
 # Read-only checkout-hook regression; intentionally runs before the Rust suite
 # and uses only throwaway repositories, isolated Git config, and XDG state.
