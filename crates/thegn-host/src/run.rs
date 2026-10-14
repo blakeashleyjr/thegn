@@ -678,7 +678,11 @@ pub async fn main(
     // Start the bounded catalog scan as soon as config identifies the selected
     // preset. It overlaps the remaining startup work and is awaited only at
     // the palette chokepoint, so filesystem I/O never runs on this thread.
-    let mut theme_store = crate::theme_store::ThemeStore::spawn(waker.clone(), config_path.clone());
+    let mut theme_store = crate::theme_store::ThemeStore::spawn(
+        waker.clone(),
+        config_path.clone(),
+        &cfg.theme.preset,
+    );
     crate::forge_handle::install(&cfg);
     // Same install as `main.rs`'s subcommand path — the interactive launch does
     // not go through `run_subcommand`, and the tracker panel (`hydrate_tracker`)
@@ -12652,6 +12656,20 @@ async fn event_loop<T: Terminal>(
                     crate::chrome::set_palette(
                         new_cfg.palette_with_user_themes(&new_cfg.theme.preset, &theme_users),
                     );
+                    if new_cfg.theme.preset != current_config.theme.preset {
+                        theme_store.set_active(&new_cfg.theme.preset);
+                        if !theme_users
+                            .iter()
+                            .any(|theme| theme.meta.name == new_cfg.theme.preset)
+                            && let Err(error) = theme_store.scan()
+                        {
+                            tracing::debug!(
+                                target: "thegn::theme",
+                                %error,
+                                "could not rescan themes after config reload"
+                            );
+                        }
+                    }
                     if let Some(builder) = theme_builder.as_mut() {
                         builder.config_reloaded(&new_cfg);
                         crate::chrome::set_palette(builder.candidate().clone());
