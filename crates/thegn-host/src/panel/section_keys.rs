@@ -180,6 +180,7 @@ const SYMBOLS: &[SectionKey] = &[
     k('r', "r", "refs"),
     k('h', "h", "hover"),
     k('o', "o", "outline"),
+    k('f', "f", "pick file"),
     nav("j/k", "select"),
 ];
 const PROBLEMS: &[SectionKey] = &[nav("↵", "open"), nav("j/k", "select")];

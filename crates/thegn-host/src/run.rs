@@ -2347,11 +2347,14 @@ struct PanelDocsWiring<'a> {
 /// symbol), delivered to the loop on the outline channel.
 enum SymbolsFetch {
     Outline {
-        file: String,
+        key: crate::panel::sections::symbols::OutlineKey,
         rows: Vec<crate::panel::SymbolRow>,
     },
     Refs {
+        root: PathBuf,
         label: String,
+        file: String,
+        server: bool,
         rows: Vec<crate::panel::SymbolRow>,
     },
 }
@@ -2371,8 +2374,7 @@ impl Drop for InflightGuard {
 /// the language server when one is available, the tree-sitter entity parser
 /// otherwise. Sends a `SymbolsFetch::Outline` and pulses the waker.
 fn spawn_outline_fetch(
-    file: String,
-    root: std::path::PathBuf,
+    key: crate::panel::sections::symbols::OutlineKey,
     lsp: std::sync::Arc<crate::lsp::LspInner>,
     tx: tokio_mpsc::Sender<SymbolsFetch>,
     waker: TerminalWaker,
@@ -2381,6 +2383,8 @@ fn spawn_outline_fetch(
     use thegn_core::semantic::Lang;
     tokio::task::spawn_blocking(move || {
         let _inflight = InflightGuard(busy);
+        let root = key.root.clone();
+        let file = key.file.clone();
         // A provider exists if the file resolves to a registered server (LSP
         // tier) OR to a tree-sitter grammar. A registry-only language (no
         // grammar) still gets its LSP outline; a file that resolves to neither
@@ -2394,7 +2398,7 @@ fn spawn_outline_fetch(
         } else {
             Vec::new()
         };
-        let _ = tx.try_send(SymbolsFetch::Outline { file, rows }); // best-effort: bounded replaceable result; a full queue drops stale work
+        let _ = tx.try_send(SymbolsFetch::Outline { key, rows }); // best-effort: bounded replaceable result; a full queue drops stale work
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
@@ -2417,9 +2421,11 @@ fn spawn_refs_fetch(
     tokio::task::spawn_blocking(move || {
         let _inflight = InflightGuard(busy);
         let mut rows = Vec::new();
+        let mut server = false;
         if let Some(key) = lsp.resolve_key(&file)
             && let Ok(client) = lsp.client(&root, &key)
         {
+            server = true;
             let uri = thegn_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
             if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
                 let _ = client.did_open(&uri, &text); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
@@ -2449,7 +2455,13 @@ fn spawn_refs_fetch(
                     .collect();
             }
         }
-        let _ = tx.try_send(SymbolsFetch::Refs { label, rows }); // best-effort: bounded replaceable result; a full queue drops stale work
+        let _ = tx.try_send(SymbolsFetch::Refs {
+            root,
+            label,
+            file,
+            server,
+            rows,
+        }); // best-effort: bounded replaceable result; a full queue drops stale work
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
@@ -7329,12 +7341,13 @@ async fn event_loop<T: Terminal>(
     // symbol/reference result is capped at 1 MiB, so eight pending results stay
     // within the same order of budget as the diagnostics queue.
     let (outline_tx, mut outline_rx) = tokio_mpsc::channel::<SymbolsFetch>(8);
-    let mut outline_file = String::new();
+    let mut outline_key: Option<crate::panel::sections::symbols::OutlineKey> = None;
     let mut outline_syms: Vec<crate::panel::SymbolRow> = Vec::new();
-    let mut outline_inflight: Option<String> = None;
+    let mut outline_inflight: Option<crate::panel::sections::symbols::OutlineKey> = None;
     let outline_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut refs_label = String::new();
     let mut refs_rows: Vec<crate::panel::SymbolRow> = Vec::new();
+    let mut refs_note = String::new();
     let mut refs_inflight = false;
     let refs_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // The hover/signature/code-action preview overlay (item 532): built off-loop
@@ -9157,6 +9170,21 @@ async fn event_loop<T: Terminal>(
             hunk_inflight.clear();
             submodule_preview_inflight.clear();
             submodule_scans.reset();
+            outline_key = None;
+            outline_syms.clear();
+            outline_inflight = None;
+            outline_busy.store(false, std::sync::atomic::Ordering::Release);
+            model.panel.symbols.clear();
+            model.panel.symbols_file.clear();
+            model.panel.symbols_note.clear();
+            refs_label.clear();
+            refs_rows.clear();
+            refs_note.clear();
+            refs_inflight = false;
+            refs_busy.store(false, std::sync::atomic::Ordering::Release);
+            panel_ui.symbols_pick = None;
+            panel_ui.symbols_picker = false;
+            panel_ui.symbols_show_refs = false;
             // NOTE: `materialize_inflight` deliberately PERSISTS across switches now
             // (a provisioning worktree keeps provisioning in the background); its
             // entries self-clear when each spec lands. `model.load_steps` is derived
@@ -13692,19 +13720,44 @@ async fn event_loop<T: Terminal>(
         while let Ok(msg) = outline_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Outline);
             match msg {
-                SymbolsFetch::Outline { file, rows } => {
-                    outline_busy.store(false, std::sync::atomic::Ordering::Release);
-                    if outline_inflight.as_deref() == Some(file.as_str()) {
+                SymbolsFetch::Outline { key, rows } => {
+                    if outline_inflight.as_ref() == Some(&key) {
                         outline_inflight = None;
                     }
-                    outline_file = file;
-                    outline_syms = rows;
+                    let current_root = session
+                        .active_group()
+                        .map(|group| PathBuf::from(&group.path));
+                    if current_root.as_deref().is_some_and(|root| {
+                        crate::panel::sections::symbols::accept_outline(root, &key)
+                    }) {
+                        outline_key = Some(key);
+                        outline_syms = rows;
+                    }
                 }
-                SymbolsFetch::Refs { label, rows } => {
-                    refs_busy.store(false, std::sync::atomic::Ordering::Release);
-                    refs_inflight = false;
-                    refs_label = label;
-                    refs_rows = rows;
+                SymbolsFetch::Refs {
+                    root,
+                    label,
+                    file,
+                    server,
+                    rows,
+                } => {
+                    let current_root = session
+                        .active_group()
+                        .map(|group| PathBuf::from(&group.path));
+                    if current_root.as_deref().is_some_and(|current| {
+                        crate::panel::sections::symbols::accept_refs(current, &root)
+                    }) {
+                        refs_inflight = false;
+                        refs_label = label.clone();
+                        refs_note = crate::panel::sections::symbols::refs_note(
+                            &label,
+                            &file,
+                            server,
+                            rows.len(),
+                        );
+                        model.status = refs_note.clone();
+                        refs_rows = rows;
+                    }
                 }
             }
             dirty = true;
@@ -13719,43 +13772,69 @@ async fn event_loop<T: Terminal>(
         }
         // Derive the displayed list each frame from the active view, (re)fetching
         // the outline when its target file is stale.
-        if panel_ui.open == crate::panel::Section::Symbols {
+        if chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Symbols {
             if panel_ui.symbols_show_refs {
                 let header = format!("refs: {refs_label}");
+                if crate::panel::sections::symbols::sync_refs_note(&mut model.panel, &refs_note) {
+                    dirty = true;
+                }
                 if model.panel.symbols != refs_rows || model.panel.symbols_file != header {
                     model.panel.symbols = refs_rows.clone();
                     model.panel.symbols_file = header;
                     dirty = true;
                 }
             } else {
-                // Target the selected (or first) changed file. A momentarily
-                // empty `changes` (a hydration tick in flight) must NOT clear a
-                // populated outline — keep the last one until a new file is
-                // actually selected, so the outline doesn't flicker.
-                let target = panel_ui
-                    .chg_sel
-                    .and_then(|i| model.panel.changes.get(i))
-                    .or_else(|| model.panel.changes.first())
-                    .map(|c| c.path.clone());
-                if let Some(target) = &target
-                    && *target != outline_file
-                    && (outline_inflight.as_deref() != Some(target.as_str())
-                        || !outline_busy.load(std::sync::atomic::Ordering::Acquire))
+                let root = session
+                    .active_group()
+                    .map(|group| PathBuf::from(&group.path));
+                let editor_file = root.as_ref().and_then(|root| {
+                    panes
+                        .editor_file(focused_pane_id(&session))
+                        .and_then(|path| Path::new(path).strip_prefix(root).ok())
+                        .map(|path| path.to_string_lossy().into_owned())
+                });
+                let target = crate::panel::sections::symbols::symbols_target(
+                    panel_ui.symbols_pick.as_deref(),
+                    editor_file.as_deref(),
+                );
+                let key = root.zip(target.as_deref()).map(|(root, target)| {
+                    crate::panel::sections::symbols::outline_key(root, target, &model.panel.changes)
+                });
+                let demand = crate::panel::sections::symbols::OutlineDemand {
+                    visible: chrome.panel.is_some(),
+                    show_refs: panel_ui.symbols_show_refs,
+                    target: key.as_ref(),
+                    cached: outline_key.as_ref(),
+                    inflight: outline_inflight.as_ref(),
+                    busy: outline_busy.load(std::sync::atomic::Ordering::Acquire),
+                };
+                let cached_for_target =
+                    crate::panel::sections::symbols::cached_outline_matches_target(
+                        outline_key.as_ref(),
+                        key.as_ref(),
+                    );
+                if crate::panel::sections::symbols::outline_fetch_needed(&demand)
+                    && let Some(key) = key
                 {
-                    outline_inflight = Some(target.clone());
+                    outline_inflight = Some(key.clone());
                     outline_busy.store(true, std::sync::atomic::Ordering::Release);
                     spawn_outline_fetch(
-                        target.clone(),
-                        active_tab_path(&session),
+                        key,
                         lsp_supervisor.handle(),
                         outline_tx.clone(),
                         waker.clone(),
                         outline_busy.clone(),
                     );
                 }
-                if model.panel.symbols != outline_syms || model.panel.symbols_file != outline_file {
-                    model.panel.symbols = outline_syms.clone();
-                    model.panel.symbols_file = outline_file.clone();
+                let file = target.as_deref().unwrap_or_default();
+                let rows = if cached_for_target {
+                    outline_syms.as_slice()
+                } else {
+                    &[]
+                };
+                if model.panel.symbols.as_slice() != rows || model.panel.symbols_file != file {
+                    model.panel.symbols = rows.to_vec();
+                    model.panel.symbols_file = file.to_string();
                     dirty = true;
                 }
             }
@@ -20234,6 +20313,12 @@ async fn event_loop<T: Terminal>(
                         match msg {
                             // Handled above; kept to keep the match exhaustive.
                             PanelMsg::Open(_) | PanelMsg::NextSection | PanelMsg::PrevSection => {}
+                            PanelMsg::LeaveRows
+                                if panel_ui.open == crate::panel::Section::Symbols
+                                    && panel_ui.symbols_show_refs =>
+                            {
+                                crate::panel::sections::symbols::leave_refs(&mut panel_ui);
+                            }
                             PanelMsg::LeaveRows => {
                                 // Esc peels one layer at a time: expanded change
                                 // preview → row mode → section mode → leave the
@@ -20825,14 +20910,29 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Symbols => {
-                                            // Go to definition: open the selected
-                                            // symbol in the editor at file:line.
-                                            if let Some(s) = model
+                                            if crate::panel::sections::symbols::picker_open(
+                                                &panel_ui,
+                                                &model.panel,
+                                            ) {
+                                                if let Some(change) =
+                                                    model.panel.changes.get(panel_ui.cursor)
+                                                {
+                                                    panel_ui.symbols_pick =
+                                                        Some(change.path.clone());
+                                                    panel_ui.symbols_picker = false;
+                                                    panel_ui.symbols_cursor = 0;
+                                                    panel_ui.cursor = 0;
+                                                    model.panel.symbols.clear();
+                                                    model.panel.symbols_file.clear();
+                                                }
+                                            } else if let Some(s) = model
                                                 .panel
                                                 .symbols
                                                 .get(panel_ui.symbols_cursor)
                                                 .cloned()
                                             {
+                                                // Go to definition: open the selected
+                                                // symbol in the editor at file:line.
                                                 let cwd = active_cwd(&session);
                                                 if open_editor(
                                                     &mut session,
@@ -22296,21 +22396,28 @@ async fn event_loop<T: Terminal>(
                                 refs_busy.store(true, std::sync::atomic::Ordering::Release);
                                 refs_label = s.name.clone();
                                 refs_rows.clear();
+                                refs_note.clear();
+                                model.panel.symbols_note.clear();
                                 panel_ui.symbols_show_refs = true;
                                 panel_ui.symbols_cursor = 0;
                                 panel_ui.cursor = 0;
                                 model.status = format!("Finding references to {}…", s.name);
-                                spawn_refs_fetch(
-                                    s.file,
-                                    s.line,
-                                    s.col,
-                                    s.name,
-                                    active_tab_path(&session),
-                                    lsp_supervisor.handle(),
-                                    outline_tx.clone(),
-                                    waker.clone(),
-                                    refs_busy.clone(),
-                                );
+                                if let Some(root) = session
+                                    .active_group()
+                                    .map(|group| PathBuf::from(&group.path))
+                                {
+                                    spawn_refs_fetch(
+                                        s.file,
+                                        s.line,
+                                        s.col,
+                                        s.name,
+                                        root,
+                                        lsp_supervisor.handle(),
+                                        outline_tx.clone(),
+                                        waker.clone(),
+                                        refs_busy.clone(),
+                                    );
+                                }
                             } else if !panel_ui.symbols_show_refs
                                 && refs_busy.load(std::sync::atomic::Ordering::Acquire)
                             {
@@ -22320,6 +22427,17 @@ async fn event_loop<T: Terminal>(
                             true
                         }
                         (Section::Symbols, KeyCode::Char('o')) => {
+                            crate::panel::sections::symbols::leave_refs(&mut panel_ui);
+                            true
+                        }
+                        (Section::Symbols, KeyCode::Char('f')) => {
+                            if crate::panel::sections::symbols::picker_open(&panel_ui, &model.panel)
+                            {
+                                panel_ui.symbols_pick = None;
+                                panel_ui.symbols_picker = false;
+                            } else {
+                                panel_ui.symbols_picker = true;
+                            }
                             panel_ui.symbols_show_refs = false;
                             panel_ui.symbols_cursor = 0;
                             panel_ui.cursor = 0;
@@ -22346,6 +22464,8 @@ async fn event_loop<T: Terminal>(
                                     waker.clone(),
                                     hover_busy.clone(),
                                 );
+                            } else if !current_config.lsp.hover {
+                                model.status = "Hover is off: set [lsp] hover = true".into();
                             } else if current_config.lsp.hover
                                 && hover_busy.load(std::sync::atomic::Ordering::Acquire)
                             {
@@ -22357,10 +22477,7 @@ async fn event_loop<T: Terminal>(
                         (Section::Symbols, key)
                             if crate::input::is_escape_key(&key) && panel_ui.symbols_show_refs =>
                         {
-                            // First Esc in references mode returns to the outline.
-                            panel_ui.symbols_show_refs = false;
-                            panel_ui.symbols_cursor = 0;
-                            panel_ui.cursor = 0;
+                            crate::panel::sections::symbols::leave_refs(&mut panel_ui);
                             true
                         }
                         // -- ci (AV group): drill in (v), open (o), re-run failed/all (r/R),
