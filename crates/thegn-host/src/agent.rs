@@ -501,15 +501,7 @@ pub fn prepare_sandbox_env(
         warnings.push(format!("{env_name} not configured; running on the host"));
         degraded_from_provider = true;
     }
-    let profile_slug = cfg.profile.trim();
-    let base_cname = sandbox::container_name_with_profile(
-        worktree,
-        if profile_slug.is_empty() {
-            None
-        } else {
-            Some(profile_slug)
-        },
-    );
+    let base_cname = sandbox::container_name_for_config_profile(worktree, &cfg.profile);
     let hardening = sb.profile;
     let cname = base_cname;
     // Bring the execution placement up (k8s pod / provider sandbox) BEFORE

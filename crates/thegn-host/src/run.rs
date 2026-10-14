@@ -11213,6 +11213,11 @@ async fn event_loop<T: Terminal>(
                 model.sidebar_workspaces = workspaces;
             }
             model.containers = containers;
+            crate::handlers::sandbox_panel::stamp_ownership(
+                &mut model.containers,
+                &model.sidebar_db_worktrees,
+                &current_config.profile,
+            );
             model.containers_listed = containers_listed;
             model.container_health =
                 container_health_for(&model.active_container_name, &model.containers);
@@ -11788,7 +11793,12 @@ async fn event_loop<T: Terminal>(
         // Container list from the demand-tiered ticker — replaces the old inline call
         // inside model hydration so `podman ps` never blocks the hydrate path.
         while let Ok(refresh) = container_rx.try_recv() {
-            let containers = refresh.containers;
+            let mut containers = refresh.containers;
+            crate::handlers::sandbox_panel::stamp_ownership(
+                &mut containers,
+                &model.sidebar_db_worktrees,
+                &current_config.profile,
+            );
             // The aggregate footprint arrives only on the gated slow-cadence
             // ticks (Containers tab open); `None` means "no update", so the
             // model keeps the last value rather than blanking the header.

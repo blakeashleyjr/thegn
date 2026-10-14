@@ -1670,6 +1670,89 @@ fn container_name_with_profile_adds_slug() {
 }
 
 #[test]
+fn config_profile_container_name_matches_create_site_normalization() {
+    assert_eq!(
+        container_name_for_config_profile("/wt/feat", " vim "),
+        container_name_with_profile("/wt/feat", Some("vim"))
+    );
+    assert_eq!(
+        container_name_for_config_profile("/wt/feat", "   "),
+        container_name("/wt/feat")
+    );
+}
+
+#[test]
+fn owned_containers_need_the_exact_profile_name() {
+    let worktree = OwnedContainers::new("default", [("/wt/feat", Some("podman"))]);
+    let plain = container_name("/wt/feat");
+    assert!(worktree.owns(&plain, "podman"));
+    assert!(!worktree.owns("thegn-foo", "podman"));
+    assert!(!worktree.owns(
+        &container_name_with_profile("/wt/feat", Some("work")),
+        "podman"
+    ));
+    assert!(worktree.owns(&vpn_sidecar_name(&plain), "podman"));
+    assert!(worktree.owns(&agent_container_name(&plain), "podman"));
+
+    let named_profile = OwnedContainers::new("work", [("/wt/feat", Some("podman"))]);
+    assert!(named_profile.owns(
+        &container_name_with_profile("/wt/feat", Some("work")),
+        "podman"
+    ));
+    assert!(!named_profile.owns(&plain, "podman"));
+}
+
+#[test]
+fn owned_containers_bind_the_backend_and_fail_closed() {
+    let rootless = OwnedContainers::new("default", [("/wt/feat", Some("podman"))]);
+    let name = container_name("/wt/feat");
+    assert!(rootless.owns(&name, "podman"));
+    assert!(!rootless.owns(&name, "podman-rootful"));
+    assert!(!rootless.owns(&name, "docker"));
+    assert!(!rootless.owns(&name, "unknown-runtime"));
+
+    let rootful = OwnedContainers::new("default", [("/wt/feat", Some("podman-rootful"))]);
+    assert!(rootful.owns(&name, "podman-rootful"));
+    assert!(!rootful.owns(&name, "podman"));
+
+    for observed in [None, Some("bwrap"), Some("host"), Some("future-runtime")] {
+        let unproven = OwnedContainers::new("default", [("/wt/feat", observed)]);
+        assert!(!unproven.owns(&name, "podman"));
+    }
+}
+
+#[test]
+fn stamp_only_lowers_ours() {
+    let own = container_name("/wt/feat");
+    let mut rows = parse_podman_ps(&format!(
+        r#"[
+          {{"Names": ["thegn-foo"], "Image": "alpine", "Status": "Up"}},
+          {{"Names": ["{own}"], "Image": "alpine", "Status": "Up"}},
+          {{"Names": ["registry"], "Image": "registry:2", "Status": "Up"}}
+        ]"#
+    ));
+    rows.push(ContainerInfo {
+        image: "hand-built foreign".into(),
+        ours: false,
+        ..container_info(own.clone(), "alpine".into(), "Up".into(), "podman")
+    });
+    let owned = OwnedContainers::new("default", [("/wt/feat", Some("podman"))]);
+    owned.stamp(&mut rows);
+
+    assert_eq!(rows[0].name, own);
+    assert!(rows[0].ours);
+    let registry = rows.iter().find(|row| row.name == "registry").unwrap();
+    assert!(!registry.ours);
+    let prefix_collision = rows.iter().find(|row| row.name == "thegn-foo").unwrap();
+    assert!(!prefix_collision.ours);
+    let preexisting_foreign = rows
+        .iter()
+        .find(|row| row.image == "hand-built foreign")
+        .unwrap();
+    assert!(!preexisting_foreign.ours);
+}
+
+#[test]
 fn sandbox_profile_baselines() {
     assert!(!SandboxProfile::Open.read_only_root());
     assert!(SandboxProfile::Hardened.read_only_root());
