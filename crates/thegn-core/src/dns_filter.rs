@@ -1,16 +1,15 @@
-//! Per-container DNS interceptor for outbound network filtering.
+//! Bounded, per-policy DNS name filters for callers that point a resolver at them.
 //!
-//! When `network_allow` or `network_block` is configured, thegn starts a
-//! lightweight UDP DNS proxy on a loopback port and points per-container DNS at
-//! it via `--dns 127.0.0.1:<port>`. The proxy:
+//! Each distinct policy gets a lightweight UDP DNS proxy on a loopback port.
+//! The proxy:
 //!
-//! - Forwards queries for allow-listed names to the system resolver.
+//! - Forwards queries for allowed names to the configured resolver.
 //! - Returns NXDOMAIN for block-listed names (block-list checked first).
 //! - When the allow list is empty, allows all names not on the block-list.
 //! - Logs every query in a ring-buffer that callers drain via [`drain_events`].
 //!
-//! The server is a lazy singleton: created the first time a sandbox needs it,
-//! reused by subsequent containers in the same process.
+//! This is a DNS-name filter only, not an egress boundary: direct IPs and
+//! alternate resolvers bypass it. Instances are reused per policy and capped.
 //!
 //! No tokio — this crate is substrate-agnostic; std threads + UdpSocket suffice.
 
@@ -24,6 +23,8 @@ pub struct DnsEvent {
     pub name: String,
     /// `true` = forwarded to resolver, `false` = blocked (NXDOMAIN returned).
     pub allowed: bool,
+    /// Stable identifier of the policy that handled this query.
+    pub policy: u64,
 }
 
 /// Policy for the DNS filter.
@@ -41,19 +42,49 @@ pub struct DnsPolicy {
 
 impl DnsPolicy {
     pub fn allows(&self, name: &str) -> bool {
-        let name = name.trim_end_matches('.');
-        if self.block.iter().any(|b| name_matches(name, b)) {
+        let name = norm(name);
+        if self.block.iter().any(|pattern| {
+            let Some(pattern) = norm(pattern) else {
+                return false;
+            };
+            matches_normalized(name.as_deref(), &pattern)
+        }) {
             return false;
         }
         if self.allow.is_empty() {
             return true;
         }
-        self.allow.iter().any(|a| name_matches(name, a))
+        self.allow.iter().any(|pattern| {
+            let Some(pattern) = norm(pattern) else {
+                return false;
+            };
+            matches_normalized(name.as_deref(), &pattern)
+        })
     }
 }
 
 pub(crate) fn name_matches(name: &str, pattern: &str) -> bool {
-    let pattern = pattern.trim_end_matches('.');
+    let Some(pattern) = norm(pattern) else {
+        return false;
+    };
+    matches_normalized(norm(name).as_deref(), &pattern)
+}
+
+fn norm(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let without_dot = trimmed.strip_suffix('.').unwrap_or(trimmed);
+    if without_dot.is_empty()
+        || without_dot.chars().any(char::is_whitespace)
+        || without_dot.split('.').any(str::is_empty)
+    {
+        return None;
+    }
+    let mut normalized = without_dot.to_string();
+    normalized.make_ascii_lowercase();
+    Some(normalized)
+}
+
+fn matches_normalized(name: Option<&str>, pattern: &str) -> bool {
     // Universal block: `*` matches every name. Used by the config-resolution
     // engine to encode a repo overlay's "deny-all egress" request (an empty
     // `network_allow` at the repo layer) as `network_block += ["*"]` — a
@@ -61,6 +92,9 @@ pub(crate) fn name_matches(name: &str, pattern: &str) -> bool {
     if pattern == "*" {
         return true;
     }
+    let Some(name) = name else {
+        return false;
+    };
     if let Some(suffix) = pattern.strip_prefix("*.") {
         // Wildcard matches only strict subdomains: *.example.com matches
         // foo.example.com but NOT example.com itself.
@@ -77,29 +111,123 @@ struct DnsFilter {
 }
 
 const MAX_RING: usize = 512;
+const MAX_INSTANCES: usize = 16;
 
-static INSTANCE: OnceLock<Mutex<Option<DnsFilter>>> = OnceLock::new();
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct PolicyKey {
+    allow: Vec<String>,
+    block: Vec<String>,
+    upstream: Option<SocketAddr>,
+}
 
-/// Start (or reuse) the DNS filter. Returns the loopback port callers should
-/// pass as `--dns 127.0.0.1:<port>`. Returns `None` if binding fails.
+impl From<&DnsPolicy> for PolicyKey {
+    fn from(policy: &DnsPolicy) -> Self {
+        fn canonical_patterns(patterns: &[String]) -> Vec<String> {
+            let mut result: Vec<String> = patterns
+                .iter()
+                .map(|pattern| {
+                    norm(pattern).unwrap_or_else(|| {
+                        let mut malformed = pattern.clone();
+                        malformed.make_ascii_lowercase();
+                        malformed
+                    })
+                })
+                .collect();
+            result.sort();
+            result.dedup();
+            result
+        }
+
+        Self {
+            allow: canonical_patterns(&policy.allow),
+            block: canonical_patterns(&policy.block),
+            upstream: policy.upstream,
+        }
+    }
+}
+
+impl PolicyKey {
+    fn stable_id(&self) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64;
+        fn write(hash: &mut u64, bytes: &[u8]) {
+            for byte in bytes {
+                *hash ^= u64::from(*byte);
+                *hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+        fn write_list(hash: &mut u64, tag: u8, values: &[String]) {
+            write(hash, &[tag]);
+            write(hash, &(values.len() as u64).to_be_bytes());
+            for value in values {
+                write(hash, &(value.len() as u64).to_be_bytes());
+                write(hash, value.as_bytes());
+            }
+        }
+
+        write_list(&mut hash, 0, &self.allow);
+        write_list(&mut hash, 1, &self.block);
+        match self.upstream {
+            Some(upstream) => {
+                write(&mut hash, &[1]);
+                write(&mut hash, upstream.to_string().as_bytes());
+            }
+            None => write(&mut hash, &[0]),
+        }
+        hash
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Plan {
+    Reuse(usize),
+    Start,
+    Full,
+}
+
+fn find_or_plan(keys: &[&PolicyKey], key: &PolicyKey, cap: usize) -> Plan {
+    if let Some(index) = keys.iter().position(|existing| *existing == key) {
+        Plan::Reuse(index)
+    } else if keys.len() >= cap {
+        Plan::Full
+    } else {
+        Plan::Start
+    }
+}
+
+static INSTANCES: OnceLock<Mutex<Vec<(PolicyKey, DnsFilter)>>> = OnceLock::new();
+
+/// Returns the loopback port of the instance for this policy.
+/// Returns `None` if binding fails or the instance cap is reached.
 pub fn get_or_start(policy: DnsPolicy) -> Option<u16> {
-    let cell = INSTANCE.get_or_init(|| Mutex::new(None));
+    let cell = INSTANCES.get_or_init(|| Mutex::new(Vec::new()));
     let mut guard = cell.lock().ok()?;
-    if let Some(f) = guard.as_ref() {
-        return Some(f.port);
+    let key = PolicyKey::from(&policy);
+    let keys: Vec<&PolicyKey> = guard.iter().map(|(existing, _)| existing).collect();
+    match find_or_plan(&keys, &key, MAX_INSTANCES) {
+        Plan::Reuse(index) => return Some(guard[index].1.port),
+        Plan::Full => {
+            tracing::warn!(
+                target: "thegn::dns",
+                cap = MAX_INSTANCES,
+                "DNS filter instance limit reached; reduce distinct DNS policies or restart the process"
+            );
+            return None;
+        }
+        Plan::Start => {}
     }
     let sock = UdpSocket::bind("127.0.0.1:0").ok()?;
     let port = sock.local_addr().ok()?.port();
     let events: Arc<Mutex<Vec<DnsEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    start_server(sock, policy, Arc::clone(&events));
-    *guard = Some(DnsFilter { port, events });
+    let policy_id = key.stable_id();
+    start_server(sock, policy, Arc::clone(&events), policy_id);
+    guard.push((key, DnsFilter { port, events }));
     Some(port)
 }
 
 /// Drain all buffered DNS events. Returns an empty vec if the filter hasn't
 /// been started or the mutex is poisoned.
 pub fn drain_events() -> Vec<DnsEvent> {
-    let cell = match INSTANCE.get() {
+    let cell = match INSTANCES.get() {
         Some(c) => c,
         None => return vec![],
     };
@@ -107,20 +235,24 @@ pub fn drain_events() -> Vec<DnsEvent> {
         Ok(g) => g,
         Err(_) => return vec![],
     };
-    match guard.as_ref() {
-        None => vec![],
-        Some(f) => {
-            let mut ring = f.events.lock().unwrap_or_else(|e| e.into_inner());
-            std::mem::take(&mut *ring)
-        }
+    let mut drained = Vec::new();
+    for (_, filter) in guard.iter() {
+        let mut ring = filter.events.lock().unwrap_or_else(|e| e.into_inner());
+        drained.append(&mut *ring);
     }
+    drained
 }
 
 // ---------------------------------------------------------------------------
 // Internal proxy
 // ---------------------------------------------------------------------------
 
-fn start_server(sock: UdpSocket, policy: DnsPolicy, events: Arc<Mutex<Vec<DnsEvent>>>) {
+fn start_server(
+    sock: UdpSocket,
+    policy: DnsPolicy,
+    events: Arc<Mutex<Vec<DnsEvent>>>,
+    policy_id: u64,
+) {
     sock.set_read_timeout(Some(Duration::from_millis(500))).ok(); // best-effort: timeout hint: the default blocking read is fine if the hint fails
     // best-effort: if the listener thread cannot spawn, the sandbox's DNS
     // queries fail fast (the socket drops with us) — surfaced, not silent.
@@ -145,6 +277,7 @@ fn start_server(sock: UdpSocket, policy: DnsPolicy, events: Arc<Mutex<Vec<DnsEve
                     ring.push(DnsEvent {
                         name: name.clone(),
                         allowed,
+                        policy: policy_id,
                     });
                 }
 
@@ -375,6 +508,201 @@ mod tests {
     }
 
     #[test]
+    fn block_is_case_insensitive() {
+        let policy = DnsPolicy {
+            allow: vec![],
+            block: vec!["blocked.test".into()],
+            upstream: None,
+        };
+        assert!(!policy.allows("BLOCKED.TEST"));
+        assert!(!policy.allows("Blocked.Test."));
+        assert!(!policy.allows("sub.BLOCKED.test"));
+    }
+
+    #[test]
+    fn pattern_case_is_normalised() {
+        let policy = DnsPolicy {
+            allow: vec![],
+            block: vec!["Blocked.TEST.".into()],
+            upstream: None,
+        };
+        assert!(!policy.allows("blocked.test"));
+    }
+
+    #[test]
+    fn allows_normalizes_subdomain_and_wildcard_pattern_case() {
+        let suffix = DnsPolicy {
+            allow: vec![],
+            block: vec!["Blocked.TEST".into()],
+            upstream: None,
+        };
+        assert!(!suffix.allows("sub.blocked.test."));
+        let wildcard = DnsPolicy {
+            allow: vec![],
+            block: vec!["*.Example.COM.".into()],
+            upstream: None,
+        };
+        assert!(!wildcard.allows("a.example.com"));
+        let universal = DnsPolicy {
+            allow: vec![],
+            block: vec!["*".into()],
+            upstream: None,
+        };
+        assert!(!universal.allows("any."));
+    }
+
+    #[test]
+    fn wildcard_and_universal_case_insensitive() {
+        let wildcard = DnsPolicy {
+            allow: vec![],
+            block: vec!["*.Example.COM".into()],
+            upstream: None,
+        };
+        assert!(!wildcard.allows("a.example.com."));
+        assert!(name_matches("A.Example.COM.", "*.example.com"));
+        let universal = DnsPolicy {
+            allow: vec![],
+            block: vec!["*".into()],
+            upstream: None,
+        };
+        assert!(!universal.allows("ANY."));
+        assert!(name_matches("ANY.", "*"));
+    }
+
+    #[test]
+    fn mixed_case_matches_exact_subdomain_and_wildcard_patterns() {
+        for (name, pattern) in [
+            ("BLOCKED.TEST", "blocked.test"),
+            ("BLOCKED.TEST.", "blocked.test."),
+            ("sub.BLOCKED.TEST", "blocked.test"),
+            ("sub.BLOCKED.TEST.", "blocked.test."),
+            ("a.Example.COM", "*.example.com"),
+            ("a.Example.COM.", "*.example.com."),
+            ("ANY", "*"),
+            ("ANY.", "*."),
+            ("blocked.test", "Blocked.Test"),
+            ("blocked.test.", "Blocked.Test."),
+            ("sub.blocked.test", "Blocked.Test"),
+            ("sub.blocked.test.", "Blocked.Test."),
+            ("a.example.com", "*.Example.COM"),
+            ("a.example.com.", "*.Example.COM."),
+            ("anything", "*"),
+            ("anything.", "*."),
+        ] {
+            assert!(name_matches(name, pattern), "{name:?} against {pattern:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_patterns_never_match() {
+        for pattern in ["", "a..b", "a b", "."] {
+            assert!(!name_matches("a.b", pattern), "pattern {pattern:?}");
+            let policy = DnsPolicy {
+                allow: vec![],
+                block: vec![pattern.into()],
+                upstream: None,
+            };
+            assert!(policy.allows("a.b"), "malformed block {pattern:?}");
+        }
+        assert!(name_matches("", "*"));
+        assert!(!name_matches("a..b", "a.b"));
+    }
+
+    #[test]
+    fn norm_trims_whitespace_and_one_trailing_dot() {
+        assert_eq!(norm("  A.Test.  "), Some("a.test".into()));
+        assert_eq!(norm("a.."), None);
+        assert_eq!(norm("a\tb"), None);
+    }
+
+    #[test]
+    fn policy_key_is_order_and_case_insensitive() {
+        let first = DnsPolicy {
+            allow: vec!["A.test".into(), "b.test.".into(), "A.test".into()],
+            block: vec!["BLOCK.test".into()],
+            upstream: None,
+        };
+        let second = DnsPolicy {
+            allow: vec!["b.TEST".into(), "a.TEST.".into()],
+            block: vec!["block.test.".into()],
+            upstream: None,
+        };
+        assert_eq!(PolicyKey::from(&first), PolicyKey::from(&second));
+    }
+
+    #[test]
+    fn policy_key_distinguishes_upstream() {
+        let first = PolicyKey::from(&DnsPolicy {
+            allow: vec![],
+            block: vec![],
+            upstream: Some("127.0.0.1:53".parse().unwrap()),
+        });
+        let second = PolicyKey::from(&DnsPolicy {
+            allow: vec![],
+            block: vec![],
+            upstream: Some("127.0.0.1:54".parse().unwrap()),
+        });
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn malformed_policy_entries_keep_distinct_canonical_identity() {
+        let first = PolicyKey::from(&DnsPolicy {
+            allow: vec!["A..B".into()],
+            block: vec![],
+            upstream: None,
+        });
+        let second = PolicyKey::from(&DnsPolicy {
+            allow: vec!["a b".into()],
+            block: vec![],
+            upstream: None,
+        });
+        assert_ne!(first, second);
+        assert_eq!(first.allow, vec!["a..b"]);
+    }
+
+    #[test]
+    fn find_or_plan_reuses_equal_key_starts_new_and_caps() {
+        let key = PolicyKey::from(&DnsPolicy {
+            allow: vec!["one.test".into()],
+            block: vec![],
+            upstream: None,
+        });
+        let other = PolicyKey::from(&DnsPolicy {
+            allow: vec!["two.test".into()],
+            block: vec![],
+            upstream: None,
+        });
+        assert_eq!(find_or_plan(&[&key], &key, 1), Plan::Reuse(0));
+        assert_eq!(find_or_plan(&[&key], &other, 2), Plan::Start);
+        assert_eq!(find_or_plan(&[&key], &other, 1), Plan::Full);
+    }
+
+    #[test]
+    fn policy_id_is_stable() {
+        let key = PolicyKey::from(&DnsPolicy {
+            allow: vec!["stable.test".into()],
+            block: vec!["blocked.test".into()],
+            upstream: Some("127.0.0.1:53".parse().unwrap()),
+        });
+        let first = key.stable_id();
+        let second = key.stable_id();
+        let other = PolicyKey::from(&DnsPolicy {
+            allow: vec!["stable.test".into()],
+            block: vec!["blocked.test".into()],
+            upstream: Some("127.0.0.1:54".parse().unwrap()),
+        });
+        assert_eq!(first, second);
+        assert_ne!(first, other.stable_id());
+        let without_upstream = PolicyKey::from(&DnsPolicy {
+            allow: vec![],
+            block: vec![],
+            upstream: None,
+        });
+        assert_ne!(without_upstream.stable_id(), first);
+    }
+
+    #[test]
     fn policy_trims_trailing_dot_on_query() {
         let p = DnsPolicy {
             allow: vec!["example.com".into()],
@@ -470,7 +798,7 @@ mod tests {
             block: vec![],
             upstream: Some(upstream_addr),
         };
-        start_server(sock, policy, Arc::new(Mutex::new(Vec::new())));
+        start_server(sock, policy, Arc::new(Mutex::new(Vec::new())), 0);
 
         // Send an allowed query to the filter; it should forward to our upstream
         // and relay the canned response back.
@@ -531,23 +859,32 @@ mod tests {
     }
 
     #[test]
-    fn server_end_to_end_singleton_and_events() {
-        // Exercises get_or_start (cold + warm), the running server thread
-        // (blocked + allowed branches, ring-buffer logging) and drain_events.
+    fn server_end_to_end_policy_reuse_and_events() {
+        // Exercises get_or_start, the running server thread, and drain_events.
+        let upstream = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let response = std::thread::spawn(move || {
+            let mut query = [0u8; 512];
+            let (length, source) = upstream.recv_from(&mut query).unwrap();
+            query[2] = 0x81;
+            query[3] = 0x80;
+            upstream.send_to(&query[..length], source).unwrap();
+        });
         let policy = DnsPolicy {
             allow: vec![],
             block: vec!["blocked.example".into()],
-            upstream: None,
+            upstream: Some(upstream_addr),
         };
+        let policy_id = PolicyKey::from(&policy).stable_id();
         let port = get_or_start(policy).expect("should bind a loopback port");
 
-        // Calling again returns the same warm port (the early-return branch).
+        // An equal policy returns the same port.
         let port2 = get_or_start(DnsPolicy {
-            allow: vec!["ignored".into()],
-            block: vec![],
-            upstream: None,
+            allow: vec![],
+            block: vec!["blocked.example".into()],
+            upstream: Some(upstream_addr),
         })
-        .expect("warm port");
+        .expect("equal policy port");
         assert_eq!(port, port2);
 
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -572,6 +909,7 @@ mod tests {
         client.send_to(&q_allowed, server_addr).unwrap();
         let (n2, _) = recv_from_retry(&client, &mut buf).unwrap();
         assert!(n2 >= 4);
+        response.join().unwrap();
 
         // A malformed packet (too short to extract a name) is still handled: the
         // name comes back empty and the server replies rather than crashing.
@@ -587,6 +925,13 @@ mod tests {
                 .iter()
                 .any(|e| e.name == "blocked.example" && !e.allowed),
             "blocked event marked disallowed"
+        );
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.name == "blocked.example")
+                .all(|event| event.policy == policy_id),
+            "events carry the handling policy id"
         );
 
         // A second drain returns nothing (the ring was emptied).
