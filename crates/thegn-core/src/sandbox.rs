@@ -1914,9 +1914,13 @@ pub fn health_check(spec: &SandboxSpec) -> bool {
     if !spec.backend.is_oci() {
         return true;
     }
-    // Verify both liveness AND that all required bind-mounts are present.
-    let (running, mounts_ok) = container_status(spec);
-    running && mounts_ok
+    // Judge the same resolved view that ensure used to create the container.
+    launchable(spec)
+        .map(|view| {
+            let (running, reusable) = container_status(&view);
+            running && reusable
+        })
+        .unwrap_or(false)
 }
 
 /// Check whether the named container is running AND has all the bind-mounts
@@ -1953,6 +1957,12 @@ fn emits_nix_bind(spec: &SandboxSpec) -> bool {
 /// profile, so reuse must compare it or a `hardened` container (ro `$HOME`,
 /// `~/.gnupg` rw) would be reused by a later `sealed` launch.
 const SEAL_LABEL: &str = "thegn.seal_home";
+const POLICY_LABEL: &str = "thegn.policy";
+
+fn expected_policy(spec: &SandboxSpec) -> String {
+    let sealed = sealed_view(spec);
+    crate::sandbox_policy_fp::policy_fingerprint(&sealed, vpn_sidecar_join(&sealed).is_some())
+}
 
 /// Whether a running container's bind sources satisfy the spec. Non-sealed: the
 /// required set must be a subset (historic behaviour). Sealed: the live set must
@@ -1976,15 +1986,16 @@ fn mounts_match(
 }
 
 /// Judge `inspect` output in thegn's probe format: line 1 `RUNNING` (or empty),
-/// line 2 the [`SEAL_LABEL`] value (empty when absent), then one bind source per
-/// line. Returns `(running, reusable)`. Reusable also requires the seal label to
-/// match the spec: `1` for sealed, absent-or-`0` for non-sealed; an absent label
-/// on a sealed spec means a pre-label container and is recreated.
+/// line 2 the [`SEAL_LABEL`] value, line 3 the [`POLICY_LABEL`] value (empty
+/// when absent), then one bind source per line. Returns `(running, reusable)`.
+/// Reuse requires the seal and policy labels to match and the mounts to pass;
+/// an absent policy label identifies a legacy container and forces recreation.
 fn judge_inspect(
     stdout: &str,
     required: &std::collections::HashSet<&str>,
     sealed: bool,
     nix_expected: bool,
+    expected_fp: &str,
 ) -> (bool, bool) {
     let mut lines = stdout.lines();
     if lines.next() != Some("RUNNING") {
@@ -1992,10 +2003,11 @@ fn judge_inspect(
     }
     let label = lines.next().unwrap_or("").trim();
     let label_ok = if sealed { label == "1" } else { label != "1" };
+    let policy = lines.next().unwrap_or("").trim();
     let active: std::collections::HashSet<&str> = lines.filter(|l| !l.is_empty()).collect();
     (
         true,
-        label_ok && mounts_match(required, &active, sealed, nix_expected),
+        label_ok && policy == expected_fp && mounts_match(required, &active, sealed, nix_expected),
     )
 }
 
@@ -2079,9 +2091,12 @@ pub(crate) fn remove_container(spec: &SandboxSpec) {
     let _ = run_control_owned(spec, &rm, PROBE_TIMEOUT);
 }
 
+/// Return `(running, reusable)` after checking the policy label and mounts.
+/// Apple retains its mount-only check because its CLI has no verified label.
 fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     let sealed = spec.seal_home.is_some();
     let nix_expected = emits_nix_bind(spec);
+    let expected_fp = expected_policy(spec);
     let required: std::collections::HashSet<&str> = spec
         .mounts
         .iter()
@@ -2092,7 +2107,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     // Emit "RUNNING" if actually running (not "created"/"exited"), then one
     // bind-mount source per line. A container in "created" state passes inspect
     // but cannot accept exec sessions — we must not treat it as healthy.
-    let fmt = "{{if .State.Running}}RUNNING{{end}}\n{{index .Config.Labels \"thegn.seal_home\"}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
+    let fmt = "{{if .State.Running}}RUNNING{{end}}\n{{index .Config.Labels \"thegn.seal_home\"}}\n{{index .Config.Labels \"thegn.policy\"}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
     let mut argv = oci_prefix(spec);
     // For remote worktrees the transport wraps the argv; for local we call
     // podman/docker directly. run_control_t_owned gives us the timeout but
@@ -2110,6 +2125,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
                 return (false, false); // container doesn't exist
             }
             let req: Vec<&str> = required.iter().copied().collect();
+            // Apple has no verified policy label; mount-only reuse is a THE-513 residual.
             return parse_apple_inspect_sealed(&stdout, &req, sealed, nix_expected);
         }
         argv.extend([
@@ -2127,7 +2143,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
             return (false, false); // container doesn't exist
         }
         // First line must be "RUNNING" — "CREATED" / "EXITED" / missing → not usable.
-        judge_inspect(&stdout, &required, sealed, nix_expected)
+        judge_inspect(&stdout, &required, sealed, nix_expected, &expected_fp)
     } else {
         // Remote: run the same inspect command over SSH to verify mounts.
         let mut remote_argv = oci_prefix(spec);
@@ -2141,7 +2157,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
         let Some((_, stdout)) = output_control_owned(spec, &remote_argv, PROBE_TIMEOUT) else {
             return (false, false);
         };
-        judge_inspect(&stdout, &required, sealed, nix_expected)
+        judge_inspect(&stdout, &required, sealed, nix_expected, &expected_fp)
     }
 }
 
@@ -2169,16 +2185,15 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
 
     let rt = spec.backend.binary();
 
-    // Single inspect call: are we running, and do the mounts match?
+    // Single inspect call: are we running, and do policy and mounts match?
     let (running, mounts_ok) = container_status(spec);
     if running {
         if mounts_ok {
             return Ok(()); // already running with the correct mounts
         }
-        // Stale mounts (e.g. host_toolchain_mounts() added /nix/store after
-        // an upgrade) — force-remove and fall through to recreate.
+        // Stale policy or mounts — force-remove and fall through to recreate.
         msg::warn(&format!(
-            "sandbox: container '{}' has stale mounts (config changed); recreating",
+            "sandbox: container '{}' policy or mounts changed (config changed); recreating",
             spec.name
         ));
         remove_container(spec);
@@ -3218,6 +3233,10 @@ fn oci_create_opts_with_remote_stdin_secrets(
         v.extend([
             "--label".into(),
             format!("{SEAL_LABEL}={}", u8::from(spec.seal_home.is_some())),
+        ]);
+        v.extend([
+            "--label".into(),
+            format!("{POLICY_LABEL}={}", expected_policy(spec)),
         ]);
     }
     // Run under a specific OCI runtime (gVisor's `runsc`, libkrun's `krun`, …)
