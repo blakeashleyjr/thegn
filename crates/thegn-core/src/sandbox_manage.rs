@@ -30,7 +30,7 @@
 //! in a
 //! witness, so no action can target them.
 
-use crate::sandbox::{Backend, CONTAINER_PREFIX};
+use crate::sandbox::{Backend, CONTAINER_PREFIX, identify_orphans};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 

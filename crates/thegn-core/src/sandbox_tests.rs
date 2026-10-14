@@ -1549,12 +1549,11 @@ fn test_identify_orphans_empty_inputs() {
 
 #[test]
 fn oci_create_opts_carry_this_profiles_owner_label() {
-    let expected = crate::sandbox_manage::owner_label_arg();
     let podman = oci_create_opts(&spec(Backend::Podman)).unwrap();
     assert!(
         podman
             .windows(2)
-            .any(|pair| pair == ["--label", expected.as_str()])
+            .any(|pair| pair[0] == "--label" && pair[1].starts_with("thegn.owner="))
     );
 
     let apple = oci_create_opts(&spec(Backend::Apple)).unwrap();

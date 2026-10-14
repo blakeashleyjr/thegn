@@ -365,35 +365,42 @@ fn owned_label_constants_are_stable() {
 #[test]
 fn plan_gc_never_removes_unlabelled_or_foreign() {
     let active = vec!["/wt/live".to_string()];
-    let own_dead = "thegn-dead".to_string();
+    let own_dead = crate::sandbox::container_name("/wt/dead");
     let foreign_dead = "thegn-other-dead".to_string();
     let unlabelled = "thegn-foo".to_string();
-    let live_own = "thegn-live".to_string();
+    let live_own = crate::sandbox::container_name("/wt/live");
     let all = vec![
         own_dead.clone(),
         foreign_dead.clone(),
         unlabelled.clone(),
         live_own.clone(),
     ];
-    let mine = vec![own_dead.clone(), live_own];
+    let mine = vec![own_dead.clone(), live_own.clone()];
     let labelled = vec![own_dead.clone(), "thegn-other-dead".to_string()];
 
     let plan = plan_gc(&active, &all, Some(&mine), Some(&labelled));
 
     assert_eq!(plan.remove, vec![own_dead]);
     assert_eq!(plan.unverified, vec![unlabelled]);
+    assert!(!plan.remove.contains(&live_own));
     assert!(!plan.remove.contains(&foreign_dead));
 }
 
 #[test]
 fn plan_gc_without_owner_listing_removes_nothing() {
     let active = vec!["/wt/live".to_string()];
-    let all = vec!["thegn-dead".to_string(), "thegn-live".to_string()];
+    let all = vec![
+        crate::sandbox::container_name("/wt/dead"),
+        crate::sandbox::container_name("/wt/live"),
+    ];
 
     let plan = plan_gc(&active, &all, None, None);
 
     assert!(plan.remove.is_empty());
-    assert_eq!(plan.unverified, vec!["thegn-dead"]);
+    assert_eq!(
+        plan.unverified,
+        vec![crate::sandbox::container_name("/wt/dead")]
+    );
 }
 
 #[test]

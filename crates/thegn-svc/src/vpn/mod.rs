@@ -28,6 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use thegn_core::config::{VpnDnsMode, VpnMode, VpnProviderKind};
 use thegn_core::sandbox::{VpnParams, VpnSpec};
+use thegn_core::sandbox_manage::{OWNED_LABEL, owner_label_arg};
 use thegn_core::secretref::{BareAs, SecretRef};
 
 /// How to invoke the container CLI for the sidecar — the same runtime the
@@ -770,6 +771,8 @@ fn sidecar_run_args(
         "--name".into(),
         plan.container.clone(),
     ];
+    args.extend(["--label".into(), OWNED_LABEL.into()]);
+    args.extend(["--label".into(), owner_label_arg()]);
     args.extend(plan.run_flags.iter().cloned());
     if let Some(path) = env_file {
         args.push("--env-file".into());
