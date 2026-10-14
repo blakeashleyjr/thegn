@@ -626,10 +626,14 @@ fn available_probe(placement: &Placement, backend: Backend) -> RuntimeProbe {
             RuntimeProbe::Absent
         }
     };
-    // Win-native backends are OS APIs, not binaries on PATH — their presence is
-    // the OS itself, so answer from the platform on both sides of the seam
-    // (never a PATH probe, which would look for an executable that never exists).
-    if backend == Backend::WinAppContainer || backend == Backend::WinJobObject {
+    // AppContainer is reserved: no token/ACL/network implementation exists
+    // (THE-802), so it is unavailable regardless of OS or placement.
+    if backend == Backend::WinAppContainer {
+        return RuntimeProbe::Absent;
+    }
+    // Job Objects are OS APIs, not binaries on PATH — their presence is the OS
+    // itself, so answer from the platform (never a PATH probe).
+    if backend == Backend::WinJobObject {
         return if placement.is_local() {
             from_bool(cfg!(windows))
         } else {
@@ -674,6 +678,22 @@ mod tests {
 
     fn empty_cache() -> AvailCache {
         std::sync::Mutex::new(std::collections::HashMap::new())
+    }
+
+    #[test]
+    fn appcontainer_probe_is_absent_everywhere() {
+        assert_eq!(
+            available_probe(&Placement::Local, Backend::WinAppContainer),
+            RuntimeProbe::Absent
+        );
+        assert_eq!(
+            available_probe(&Placement::Local, Backend::WinJobObject),
+            if cfg!(windows) {
+                RuntimeProbe::Present
+            } else {
+                RuntimeProbe::Absent
+            }
+        );
     }
 
     #[test]
