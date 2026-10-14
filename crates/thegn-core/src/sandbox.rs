@@ -26,7 +26,7 @@ use crate::remote::GitLoc;
 use crate::sandbox_events::EventsCap;
 use crate::sandbox_mounts::{
     auto_cache_mounts, default_writable_carveouts, host_toolchain_mounts_ro_home, keep_cfg_mount,
-    parse_mount,
+    parse_mount_checked,
 };
 use crate::{msg, util};
 use std::path::PathBuf;
@@ -992,7 +992,7 @@ pub fn resolve_placed_exact(
 }
 
 /// Warn once per path when a USER-authored `[sandbox] mounts` entry is dropped.
-/// Built-in defaults (`~/.gnupg:rw` …) are listed by `thegn doctor` instead.
+/// Built-in defaults are listed by `thegn doctor` instead.
 fn warn_dropped_mount_once(raw: &str, host: &str, reason: &str) {
     use std::sync::{Mutex, OnceLock};
     if SandboxConfig::default().mounts.iter().any(|d| d == raw) {
@@ -1202,10 +1202,16 @@ fn resolve_placed_with(
     }
 
     for m in &cfg.mounts {
-        let parsed = parse_mount(m);
+        let parsed = match parse_mount_checked(m) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                warn_dropped_mount_once(m, m, &format!("malformed mount: {error}"));
+                continue;
+            }
+        };
         // THE-215: a sealed launch never honors a mount (host path or dest,
         // canonicalized) that reaches the credential deny list — this covers the
-        // DEFAULT `~/.gnupg:rw` as much as a user entry. Drop and name the path.
+        // configured mount as much as a user entry. Drop and name the path.
         if let Some(home) = &seal_home
             && !home.is_empty()
             && crate::sandbox_mounts::sealed_denies_mount(&parsed, std::path::Path::new(home))

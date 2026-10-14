@@ -4413,7 +4413,7 @@ impl Default for SandboxConfig {
             // the sandbox's promise. Re-add `mounts = ["/run/user", …]`
             // explicitly if a pane genuinely needs the session bus / agent /
             // wayland / audio sockets. `thegn doctor` flags it when you do.
-            mounts: vec!["~/.gitconfig:ro".into(), "~/.gnupg:rw".into()],
+            mounts: vec!["~/.gitconfig:ro".into()], // THE-807/SD-1: add "~/.gnupg:rw" if needed.
             init_script: String::new(),
             prepare: Vec::new(),
             warm_direnv: WarmDirenv::Off,

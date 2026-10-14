@@ -295,6 +295,28 @@ pub fn validate_diagnostics_with_policy(
         message,
     }));
     if let Ok(cfg) = toml::from_str::<Config>(&normalized.body) {
+        for (index, mount) in cfg.sandbox.mounts.iter().enumerate() {
+            if let Err(error) = crate::sandbox_mounts::parse_mount_checked(mount) {
+                diagnostics.push(ValidationDiagnostic {
+                    severity: ValidationSeverity::Warning,
+                    message: format!(
+                        "sandbox.mounts[{index}] `{mount}`: {error} — the entry is ignored"
+                    ),
+                });
+            }
+        }
+        for (slug, workspace) in &cfg.workspace {
+            for (index, mount) in workspace.sandbox_mounts.iter().enumerate() {
+                if let Err(error) = crate::sandbox_mounts::parse_mount_checked(mount) {
+                    diagnostics.push(ValidationDiagnostic {
+                        severity: ValidationSeverity::Warning,
+                        message: format!(
+                            "workspace.{slug}.sandbox_mounts[{index}] `{mount}`: {error} — the entry is ignored"
+                        ),
+                    });
+                }
+            }
+        }
         if let Some(message) = cfg.sandbox.warm_direnv.deprecation_warning() {
             diagnostics.push(ValidationDiagnostic {
                 severity: ValidationSeverity::Warning,
@@ -1775,6 +1797,37 @@ sidebar_workspace_sort = "attention"
         let syntax = validate_diagnostics("x = =");
         assert_eq!(syntax.len(), 1);
         assert_eq!(syntax[0].severity, ValidationSeverity::Error);
+    }
+
+    #[test]
+    fn malformed_sandbox_mount_is_a_warning() {
+        let body = "[sandbox]\nmounts = [\"/a:/b:bogus\"]\n";
+        let diagnostics = validate_diagnostics(body);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].severity, ValidationSeverity::Warning);
+        assert!(diagnostics[0].message.contains("mounts[0]"));
+        assert!(diagnostics[0].message.contains("bogus"));
+        assert!(validate_str(body).is_empty());
+    }
+
+    #[test]
+    fn malformed_workspace_sandbox_mount_is_a_warning() {
+        let body = "[workspace.repo]\nsandbox_mounts = [\"/a:relative\"]\n";
+        let diagnostics = validate_diagnostics(body);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].severity, ValidationSeverity::Warning);
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("workspace.repo.sandbox_mounts[0]")
+        );
+        assert!(diagnostics[0].message.contains("relative"));
+        assert!(validate_str(body).is_empty());
+    }
+
+    #[test]
+    fn rw_suffix_mount_is_valid() {
+        assert!(validate_diagnostics("[sandbox]\nmounts = [\"/a:/b:rw\"]\n").is_empty());
     }
 
     /// Walker matching == `from_str_validated` matching by construction: both
