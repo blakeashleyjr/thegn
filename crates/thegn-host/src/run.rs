@@ -11097,6 +11097,7 @@ async fn event_loop<T: Terminal>(
             // retains the non-`lsp:` task entries we preserve here.)
             let task_last_runs = std::mem::take(&mut model.panel.task_last_runs);
             let log_lines_structured = std::mem::take(&mut model.panel.log_lines_structured);
+            let log_first_seq = model.panel.log_first_seq;
             let task_diagnostics = std::mem::take(&mut model.panel.diagnostics);
             // Optimistic sidebar regroup/reorder carry-over: the reorder/file
             // handlers mutate `sidebar_db_worktrees`/`sidebar_db_folders` on
@@ -11168,6 +11169,7 @@ async fn event_loop<T: Terminal>(
             model.sidebar_window_titles = window_titles;
             model.panel.task_last_runs = task_last_runs;
             model.panel.log_lines_structured = log_lines_structured;
+            model.panel.log_first_seq = log_first_seq;
             model.panel.diagnostics = task_diagnostics;
             if let Some((wts, folders, terms, workspaces)) = optimistic_lists {
                 model.sidebar_db_worktrees = wts;
@@ -11315,12 +11317,9 @@ async fn event_loop<T: Terminal>(
             model.weather_cfg = current_config.weather.clone();
             let ws = (!session.id.is_empty()).then_some(session.id.as_str());
             model.pins = supervisor.chips(&current_config, ws);
-            // Tail mode: auto-jump to the newest visible log line.
-            if panel_ui.open == crate::panel::Section::Logs && panel_ui.logs_tail {
-                let count =
-                    crate::panel::sections::logs::visible_lines(&model.panel, &panel_ui).count();
-                panel_ui.logs_cursor = count.saturating_sub(1);
-                panel_ui.cursor = panel_ui.logs_cursor;
+            if panel_ui.open == crate::panel::Section::Logs || panel_ui.logs_tail {
+                let log_anchor = crate::panel::sections::logs::cursor_seq(&model.panel, &panel_ui);
+                crate::panel::sections::logs::repin(&model.panel, &mut panel_ui, log_anchor);
             }
             // Clamp the accordion cursor to the fresh model's row count and
             // re-mirror the per-section cursors. A mutation that shrank the
@@ -13751,11 +13750,22 @@ async fn event_loop<T: Terminal>(
             if !slice.is_empty() {
                 loop_perf.tick(crate::perf::WakeSource::Other);
                 // Avoid the render -> own-log -> tail -> render feedback loop.
+                let track_cursor =
+                    panel_ui.open == crate::panel::Section::Logs || panel_ui.logs_tail;
+                let anchor = if track_cursor {
+                    crate::panel::sections::logs::cursor_seq(&model.panel, &panel_ui)
+                } else {
+                    None
+                };
                 dirty |= crate::loop_policy::apply_log_slice(
                     &mut model.panel.log_lines_structured,
+                    &mut model.panel.log_first_seq,
                     slice,
                     want_panel && panel_ui.open == crate::panel::Section::Logs,
                 );
+                if track_cursor {
+                    crate::panel::sections::logs::repin(&model.panel, &mut panel_ui, anchor);
+                }
             }
             logs_ingress.has_pending()
         };
@@ -20235,6 +20245,14 @@ async fn event_loop<T: Terminal>(
                                 // repeats are drained and applied in a single
                                 // render pass (no backlog inertia).
                                 let up = msg == PanelMsg::CursorUp;
+                                if up
+                                    && panel_ui.open == crate::panel::Section::Logs
+                                    && panel_ui.logs_tail
+                                    && panel_ui.cursor > 0
+                                {
+                                    panel_ui.logs_tail = false;
+                                    model.status = "Logs: tail paused (a resumes)".into();
+                                }
                                 let (repeat, leftover) = drain_key_repeats(&k, || {
                                     // Queue first: an event requeued earlier is OLDER than anything
                                     // still in the terminal, and coalescing past it would reorder input.
@@ -21873,6 +21891,13 @@ async fn event_loop<T: Terminal>(
                         }
                         (Section::Logs, KeyCode::Char('a')) => {
                             panel_ui.logs_tail = !panel_ui.logs_tail;
+                            if panel_ui.logs_tail {
+                                crate::panel::sections::logs::repin(
+                                    &model.panel,
+                                    &mut panel_ui,
+                                    None,
+                                );
+                            }
                             model.status = if panel_ui.logs_tail {
                                 "Logs: tail mode on".into()
                             } else {
@@ -21897,7 +21922,10 @@ async fn event_loop<T: Terminal>(
                                         .offer(crate::copymode::osc52(&text), |bytes| {
                                             writer.try_submit_oob(bytes)
                                         });
-                                    model.status = "Log line copied".into();
+                                    model.status = crate::panel::sections::logs::copy_status(
+                                        1,
+                                        crate::clipboard::copy(&text),
+                                    );
                                 }
                                 None => model.status = "No log line selected".into(),
                             }
@@ -21918,7 +21946,10 @@ async fn event_loop<T: Terminal>(
                                     .offer(crate::copymode::osc52(&text), |bytes| {
                                         writer.try_submit_oob(bytes)
                                     });
-                                model.status = format!("Copied {} log lines", lines.len());
+                                model.status = crate::panel::sections::logs::copy_status(
+                                    lines.len(),
+                                    crate::clipboard::copy(&text),
+                                );
                             }
                             true
                         }

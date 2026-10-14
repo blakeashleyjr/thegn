@@ -43,6 +43,8 @@ pub struct ParsedLog {
     /// The Logs panel filters on this: by default it shows this-worktree + global
     /// lines and hides ones tagged with a *different* worktree.
     pub worktree: Option<String>,
+    /// Tracing target (`target` in JSON or the Brand text field).
+    pub target: Option<String>,
 }
 
 pub fn parse_log(line: &str) -> ParsedLog {
@@ -52,6 +54,9 @@ pub fn parse_log(line: &str) -> ParsedLog {
     if let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(line) {
         let level = extract_level(&mut map).unwrap_or(LogLevel::Info);
         let worktree = extract_worktree(&mut map);
+        let target = map
+            .remove("target")
+            .and_then(|v| v.as_str().map(str::to_string));
         let message = extract_message(&mut map).unwrap_or_default();
         let timestamp = extract_timestamp(&mut map).unwrap_or_else(|| Local::now().to_rfc3339());
 
@@ -61,6 +66,7 @@ pub fn parse_log(line: &str) -> ParsedLog {
             message,
             original,
             worktree,
+            target,
         };
     }
 
@@ -70,6 +76,8 @@ pub fn parse_log(line: &str) -> ParsedLog {
     // with parse-time `now`.
     let parts: Vec<&str> = line.split_whitespace().collect();
 
+    let is_brand = parts.len() >= 3 && normalize_text_timestamp(parts[0]).is_some();
+    let target = is_brand.then(|| parts[2].to_string());
     let (timestamp, level, message) = if parts.len() >= 3 {
         // Use parts[0] as the timestamp when it parses as an ISO instant (the
         // Brand file format), else fall back to wall-clock now. parts[1] is the
@@ -91,6 +99,7 @@ pub fn parse_log(line: &str) -> ParsedLog {
         message,
         original,
         worktree,
+        target,
     }
 }
 
@@ -192,6 +201,7 @@ mod spec {
         let p = parse_log("2026-07-03T10:00:00  WARN  thegn::provision  wt=tg-solid-glen  boom");
         assert_eq!(p.level, LogLevel::Warn);
         assert_eq!(p.worktree.as_deref(), Some("tg-solid-glen"));
+        assert_eq!(p.target.as_deref(), Some("thegn::provision"));
         // The wt token is lifted out of the visible message.
         assert!(
             !p.message.contains("wt="),
@@ -214,6 +224,26 @@ mod spec {
         assert_eq!(p.level, LogLevel::Error);
         assert_eq!(p.worktree.as_deref(), Some("app-feat"));
         assert_eq!(p.message, "exploded");
+    }
+
+    #[test]
+    fn text_line_carries_target() {
+        let p = parse_log("2026-06-05T12:00:00  DEBUG thegn::db  connected");
+        assert_eq!(p.target.as_deref(), Some("thegn::db"));
+        assert_eq!(p.message, "thegn::db connected");
+    }
+
+    #[test]
+    fn json_line_carries_target() {
+        let p = parse_log(r#"{"level":"info","target":"thegn::db","msg":"connected"}"#);
+        assert_eq!(p.target.as_deref(), Some("thegn::db"));
+        assert_eq!(p.message, "connected");
+    }
+
+    #[test]
+    fn non_brand_text_has_no_target() {
+        let p = parse_log("nonts WARN thegn::db connected");
+        assert_eq!(p.target, None);
     }
 
     #[test]
