@@ -5,14 +5,16 @@
 # Module-level guards cover known writers; this run-wide setup also isolates
 # tests that use production defaults without an explicit per-test environment
 # guard. Nextest has no teardown script, so setup removes isolated state dirs
-# older than a day before creating a fresh one.
+# older than a day before creating a fresh one. The sweep is best-effort because
+# another process may delete /tmp entries mid-scan (THE-789); only creating the
+# fresh directory can fail setup.
 experimental = ["setup-scripts"]
 
 [scripts.setup.isolate-state]
 command = [
   "sh",
   "-c",
-  "find \"${TMPDIR:-/tmp}\" -maxdepth 1 -name 'thegn-nextest-state.*' -mmin +1440 -exec rm -rf {} + && d=$(mktemp -d \"${TMPDIR:-/tmp}/thegn-nextest-state.XXXXXX\") && printf 'XDG_STATE_HOME=%s\\n' \"$d\" >> \"$NEXTEST_ENV\"",
+  "{ find \"${TMPDIR:-/tmp}\" -maxdepth 1 -name 'thegn-nextest-state.*' -mmin +1440 -exec rm -rf {} + 2>/dev/null || true; }; d=$(mktemp -d \"${TMPDIR:-/tmp}/thegn-nextest-state.XXXXXX\") && printf 'XDG_STATE_HOME=%s\\n' \"$d\" >> \"$NEXTEST_ENV\"",
 ]
 
 [[profile.default.scripts]]
