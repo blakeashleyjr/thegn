@@ -862,13 +862,17 @@ mod tests {
     fn server_end_to_end_policy_reuse_and_events() {
         // Exercises get_or_start, the running server thread, and drain_events.
         let upstream = UdpSocket::bind("127.0.0.1:0").unwrap();
+        upstream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
         let response = std::thread::spawn(move || {
             let mut query = [0u8; 512];
-            let (length, source) = upstream.recv_from(&mut query).unwrap();
+            let (length, source) = upstream.recv_from(&mut query)?;
             query[2] = 0x81;
             query[3] = 0x80;
-            upstream.send_to(&query[..length], source).unwrap();
+            upstream.send_to(&query[..length], source)?;
+            Ok::<(), std::io::Error>(())
         });
         let policy = DnsPolicy {
             allow: vec![],
@@ -902,14 +906,13 @@ mod tests {
         assert_eq!(&buf[..2], &[0x11, 0x11], "id echoed back");
         assert_eq!(buf[3] & 0x0F, 3, "blocked name returns NXDOMAIN");
 
-        // Allowed name → server forwards to the real resolver. We don't assert on
-        // the payload (network may be unavailable; could be a real answer or a
-        // SERVFAIL), only that the server replies and logs the event.
+        // Allowed name → server forwards to the test-owned loopback resolver.
         let q_allowed = build_query(0x2222, "allowed.example");
         client.send_to(&q_allowed, server_addr).unwrap();
         let (n2, _) = recv_from_retry(&client, &mut buf).unwrap();
         assert!(n2 >= 4);
-        response.join().unwrap();
+        assert_eq!(buf[3] & 0x0F, 0, "loopback upstream answers with NOERROR");
+        response.join().unwrap().unwrap();
 
         // A malformed packet (too short to extract a name) is still handled: the
         // name comes back empty and the server replies rather than crashing.
