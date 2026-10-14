@@ -212,6 +212,18 @@ fn a3_distinct_policies_get_distinct_servers() {
     );
     let response = query(p1, "b.test").expect("no response from b.test policy");
     assert_eq!(rcode(&response), 3, "the b.test policy must block b.test");
+    let response = query(canonical, "b.test").expect("no response from canonical policy");
+    assert_eq!(
+        rcode(&response),
+        0,
+        "the canonical policy must allow b.test"
+    );
+    let response = query(p1, "evil.test").expect("no response from b.test policy");
+    assert_eq!(
+        rcode(&response),
+        0,
+        "the b.test policy must allow evil.test"
+    );
     let response = query(canonical, "evil.test").expect("no response from canonical policy");
     assert_eq!(
         rcode(&response),
@@ -240,6 +252,12 @@ fn a6_deny_all_after_allow_list_is_honoured() {
     assert_ne!(allow_port, deny_port);
     let response = query(deny_port, "allowed.test").expect("no response from deny-all policy");
     assert_eq!(rcode(&response), 3, "deny-all policy must return NXDOMAIN");
+    let response = query(allow_port, "allowed.test").expect("no response from allow-list policy");
+    assert_eq!(
+        rcode(&response),
+        0,
+        "allow-list policy must allow allowed.test"
+    );
 }
 
 // ── A4: multiple queries → events captured per query ────────────────────────
@@ -284,11 +302,7 @@ fn a5_allowed_domain_not_nxdomain() {
     // QR bit (byte 2 bit 7) should be set (it's a response).
     let qr_set = resp.get(2).copied().unwrap_or(0) & 0x80 != 0;
     assert!(qr_set, "expected a DNS response (QR bit set)");
-    // rcode may be 0 (NOERROR) or something other than NXDOMAIN if the
-    // domain exists — either way, it was forwarded (not immediately blocked).
+    // The test-owned loopback upstream answers with RCODE 0.
     let rc = rcode(&resp);
-    assert_ne!(
-        rc, 3,
-        "allowed domain should not get NXDOMAIN; got rcode={rc}"
-    );
+    assert_eq!(rc, 0, "loopback upstream should answer with NOERROR");
 }
