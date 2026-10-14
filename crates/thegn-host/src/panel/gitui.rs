@@ -74,6 +74,9 @@ pub struct StagingUi {
     /// Range anchor (`v` / shift+↓); selection = min..=max(anchor, cursor).
     pub anchor: Option<usize>,
     pub scroll: usize,
+    /// The current diff was synthesized from an untracked worktree file.
+    /// Its first stage must establish intent-to-add inside the mutation.
+    pub untracked: bool,
 }
 
 impl StagingUi {
@@ -84,6 +87,7 @@ impl StagingUi {
             cursor: 0,
             anchor: None,
             scroll: 0,
+            untracked: false,
         }
     }
 
@@ -94,6 +98,118 @@ impl StagingUi {
             None => self.cursor..=self.cursor,
         }
     }
+}
+
+/// Sections whose first Enter enters row mode so its file-level key table can
+/// handle the same activation as subsequent Enters.
+pub fn enter_enters_row_mode(s: crate::panel::Section) -> bool {
+    matches!(
+        s,
+        crate::panel::Section::Commits
+            | crate::panel::Section::Branches
+            | crate::panel::Section::Stash
+            | crate::panel::Section::Changes
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangesDrill {
+    OpenEditor(String),
+    Atomic,
+    Staging {
+        path: String,
+        pane: StagePane,
+        untracked: bool,
+    },
+}
+
+/// Plan the Changes-row drill without causing a git mutation.
+pub fn plan_changes_drill(row: &crate::panel::ChangeRow) -> ChangesDrill {
+    if row.submodule.is_some() {
+        ChangesDrill::Atomic
+    } else if row.stage == crate::panel::Stage::Conflict {
+        ChangesDrill::OpenEditor(row.path.clone())
+    } else {
+        ChangesDrill::Staging {
+            path: row.path.clone(),
+            pane: if row.stage == crate::panel::Stage::Staged {
+                StagePane::Staged
+            } else {
+                StagePane::Unstaged
+            },
+            untracked: row.stage == crate::panel::Stage::Untracked,
+        }
+    }
+}
+
+pub fn plan_stage_lines(
+    staging: &StagingUi,
+    doc_pane: StagePane,
+    path: String,
+    diff: String,
+    indices: Vec<(usize, usize)>,
+) -> crate::gitmut::GitOp {
+    if staging.untracked && doc_pane == StagePane::Unstaged {
+        crate::gitmut::GitOp::StageUntrackedLines {
+            path,
+            synth_diff: diff,
+            indices,
+        }
+    } else {
+        crate::gitmut::GitOp::StageLines {
+            path,
+            diff,
+            indices,
+            target: match doc_pane {
+                StagePane::Unstaged => crate::gitmut::StageTarget::Unstaged,
+                StagePane::Staged => crate::gitmut::StageTarget::Staged,
+            },
+        }
+    }
+}
+
+pub fn line_discard_refusal(staging: &StagingUi) -> Option<&'static str> {
+    if staging.pane == StagePane::Staged {
+        Some("unstage with space")
+    } else if staging.untracked {
+        Some("untracked file: d on the Changes row deletes it")
+    } else {
+        None
+    }
+}
+
+pub fn staging_refetch(
+    path: &str,
+    old: &[crate::panel::ChangeRow],
+    new: &[crate::panel::ChangeRow],
+) -> Option<bool> {
+    let old_row = old.iter().find(|row| row.path == path);
+    let new_row = new.iter().find(|row| row.path == path);
+    if old_row == new_row {
+        return None;
+    }
+    Some(new_row.is_some_and(|row| row.stage == crate::panel::Stage::Untracked))
+}
+
+pub fn stash_message_or_default(text: &str, branch: &str) -> String {
+    if text.trim().is_empty() {
+        if branch.is_empty() {
+            "WIP".into()
+        } else {
+            format!("WIP on {branch}")
+        }
+    } else {
+        text.to_string()
+    }
+}
+
+pub fn commit_precheck(data: &crate::panel::PanelData) -> Option<&'static str> {
+    (data.merge.is_none()
+        && data
+            .changes
+            .iter()
+            .all(|row| row.stage == crate::panel::Stage::Untracked))
+    .then_some("nothing staged: space stages the file, a stages all")
 }
 
 /// Interactive-rebase TODO editor state.
@@ -1507,6 +1623,18 @@ pub fn git_key_chg(
     ui: &crate::panel::PanelUi,
     model: &crate::chrome::FrameModel,
 ) -> Option<GitMsg> {
+    if matches!(key, KeyCode::Enter)
+        && ui.open == crate::panel::Section::Changes
+        && model
+            .panel
+            .changes
+            .get(ui.cursor)
+            .is_some_and(|row| row.submodule.is_some())
+        && ui.cursor
+            < crate::panel::visible_change_files(&model.panel, ui.width != PanelWidth::Normal)
+    {
+        return None;
+    }
     // Suppress ONLY when footer/entity rows can actually exist (the renderer
     // emits them solely when `entities` is populated). The bare row-count
     // check also fired on a CLEAN tree (`0 >= 0`) and on a stale cursor,
@@ -1535,6 +1663,230 @@ mod tests {
         };
         ui.git.focus = view;
         ui
+    }
+
+    fn change(path: &str, stage: crate::panel::Stage) -> crate::panel::ChangeRow {
+        crate::panel::ChangeRow {
+            path: path.into(),
+            name: path.into(),
+            stage,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn changes_enter_is_staging_in_section_and_row_mode() {
+        use crate::panel::Section;
+        for width in [PanelWidth::Normal, PanelWidth::Half, PanelWidth::Full] {
+            let mut ui = ui_at(GitView::Files, width);
+            ui.open = Section::Changes;
+            ui.row_mode = false;
+            assert!(enter_enters_row_mode(Section::Changes));
+            assert_eq!(
+                git_key_chg(
+                    &KeyCode::Enter,
+                    Modifiers::NONE,
+                    &ui,
+                    &crate::chrome::FrameModel::default(),
+                ),
+                None
+            );
+            ui.row_mode = true;
+            assert!(matches!(
+                git_key_chg(
+                    &KeyCode::Enter,
+                    Modifiers::NONE,
+                    &ui,
+                    &crate::chrome::FrameModel::default(),
+                ),
+                Some(GitMsg::Drill | GitMsg::WidthBlocked(_, _))
+            ));
+        }
+    }
+
+    #[test]
+    fn submodule_row_releases_enter() {
+        let mut model = crate::chrome::FrameModel::default();
+        model.panel.changes.push(crate::panel::ChangeRow {
+            path: "sub".into(),
+            submodule: Some(crate::panel::SubmoduleChange {
+                diff: thegn_core::submodule::SubmoduleDiff {
+                    path: "sub".into(),
+                    old_sha: "old".into(),
+                    new_sha: "new".into(),
+                    kind: thegn_core::submodule::SubmoduleDiffKind::Changed,
+                },
+                state: None,
+                summary: None,
+            }),
+            ..Default::default()
+        });
+        let mut ui = ui_at(GitView::Files, PanelWidth::Half);
+        ui.open = crate::panel::Section::Changes;
+        assert_eq!(
+            git_key_chg(&KeyCode::Enter, Modifiers::NONE, &ui, &model),
+            None
+        );
+        assert_eq!(
+            git_key_chg(&KeyCode::Char(' '), Modifiers::NONE, &ui, &model),
+            Some(GitMsg::StageToggleFile)
+        );
+    }
+
+    #[test]
+    fn untracked_drill_plans_staging_without_intent_to_add() {
+        assert_eq!(
+            plan_changes_drill(&change("new.txt", crate::panel::Stage::Untracked)),
+            ChangesDrill::Staging {
+                path: "new.txt".into(),
+                pane: StagePane::Unstaged,
+                untracked: true,
+            }
+        );
+    }
+
+    #[test]
+    fn untracked_stage_plans_lazy_intent_to_add() {
+        let mut staging = StagingUi::new("new.txt");
+        staging.untracked = true;
+        assert!(matches!(
+            plan_stage_lines(
+                &staging,
+                StagePane::Unstaged,
+                "new.txt".into(),
+                "diff".into(),
+                vec![]
+            ),
+            crate::gitmut::GitOp::StageUntrackedLines { .. }
+        ));
+        staging.untracked = false;
+        assert!(matches!(
+            plan_stage_lines(
+                &staging,
+                StagePane::Unstaged,
+                "tracked.txt".into(),
+                "diff".into(),
+                vec![]
+            ),
+            crate::gitmut::GitOp::StageLines { .. }
+        ));
+        staging.untracked = true;
+        assert!(matches!(
+            plan_stage_lines(
+                &staging,
+                StagePane::Staged,
+                "new.txt".into(),
+                "diff".into(),
+                vec![]
+            ),
+            crate::gitmut::GitOp::StageLines {
+                target: crate::gitmut::StageTarget::Staged,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn staged_pane_refuses_line_discard() {
+        let mut staging = StagingUi::new("f");
+        staging.pane = StagePane::Staged;
+        assert_eq!(line_discard_refusal(&staging), Some("unstage with space"));
+        staging.pane = StagePane::Unstaged;
+        staging.untracked = true;
+        assert_eq!(
+            line_discard_refusal(&staging),
+            Some("untracked file: d on the Changes row deletes it")
+        );
+    }
+
+    #[test]
+    fn staging_refetch_detects_count_stage_and_absence() {
+        let old = change("f", crate::panel::Stage::Unstaged);
+        let mut changed = old.clone();
+        changed.added = 1;
+        assert_eq!(
+            staging_refetch("f", std::slice::from_ref(&old), &[changed]),
+            Some(false)
+        );
+        let staged = change("f", crate::panel::Stage::Untracked);
+        assert_eq!(
+            staging_refetch("f", std::slice::from_ref(&old), &[staged]),
+            Some(true)
+        );
+        assert_eq!(
+            staging_refetch("f", std::slice::from_ref(&old), &[]),
+            Some(false)
+        );
+        assert_eq!(
+            staging_refetch(
+                "f",
+                std::slice::from_ref(&old),
+                &[old.clone(), change("other", crate::panel::Stage::Unstaged),]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn stash_message_defaults_to_wip_on_branch() {
+        assert_eq!(stash_message_or_default("", "main"), "WIP on main");
+        assert_eq!(stash_message_or_default("note", "main"), "note");
+        assert_eq!(stash_message_or_default("  ", ""), "WIP");
+    }
+
+    #[test]
+    fn commit_precheck_refuses_with_nothing_staged() {
+        let mut data = crate::panel::PanelData {
+            changes: vec![
+                change("new-a", crate::panel::Stage::Untracked),
+                change("new-b", crate::panel::Stage::Untracked),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            commit_precheck(&data),
+            Some("nothing staged: space stages the file, a stages all")
+        );
+        data.changes[0].stage = crate::panel::Stage::Staged;
+        assert_eq!(commit_precheck(&data), None);
+        let mut partially_staged = crate::panel::PanelData {
+            changes: vec![
+                crate::panel::ChangeRow {
+                    status: "MM".into(),
+                    ..change("modified", crate::panel::Stage::Unstaged)
+                },
+                crate::panel::ChangeRow {
+                    status: "AM".into(),
+                    ..change("added", crate::panel::Stage::Unstaged)
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            commit_precheck(&partially_staged),
+            None,
+            "partially staged MM/AM rows are allowed"
+        );
+        partially_staged.changes.clear();
+        assert_eq!(
+            commit_precheck(&partially_staged),
+            Some("nothing staged: space stages the file, a stages all"),
+            "empty changes list"
+        );
+        let merge_data = crate::panel::PanelData {
+            merge: Some(crate::panel::MergeBanner {
+                label: "MERGING".into(),
+                onto: "main".into(),
+                unresolved: 0,
+                total: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            commit_precheck(&merge_data),
+            None,
+            "merge with an empty resolved index diff"
+        );
     }
 
     #[test]

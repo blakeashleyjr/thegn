@@ -3092,6 +3092,7 @@ fn spawn_stage_doc_fetch(
     session: &crate::session::Session,
     path: String,
     pane: StagePane,
+    untracked: bool,
     tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
     waker: &TerminalWaker,
 ) {
@@ -3102,9 +3103,10 @@ fn spawn_stage_doc_fetch(
         use thegn_svc::git::GitBackend;
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
         let git = thegn_svc::git::CliGit;
-        let diff = match pane {
-            StagePane::Unstaged => git.unstaged_diff(&loc, &path),
-            StagePane::Staged => git.staged_diff(&loc, &path),
+        let diff = match (pane, untracked) {
+            (StagePane::Unstaged, true) => git.untracked_diff(&loc, &path),
+            (StagePane::Unstaged, false) => git.unstaged_diff(&loc, &path),
+            (StagePane::Staged, _) => git.staged_diff(&loc, &path),
         }
         .unwrap_or_default();
         let doc = crate::panel::staging::build(&path, &diff);
@@ -3780,6 +3782,29 @@ fn commit_message_prefill(panel: &crate::panel::PanelData) -> String {
         .unwrap_or_default()
 }
 
+/// Widen a resting panel after entering a drill view. Returns whether the
+/// geometry needs to be recomputed.
+fn widen_for_drill(panel_ui: &mut crate::panel::PanelUi) -> bool {
+    if panel_ui.width == crate::layout::PanelWidth::Normal
+        && matches!(
+            panel_ui.git.focus,
+            gitui::GitView::CommitFiles
+                | gitui::GitView::Staging
+                | gitui::GitView::PatchBuilding
+                | gitui::GitView::Blame
+                | gitui::GitView::RebaseTodo
+        )
+    {
+        panel_ui.width = crate::layout::PanelWidth::Half;
+        if panel_ui.git.widened_from.is_none() {
+            panel_ui.git.widened_from = Some(crate::layout::PanelWidth::Normal);
+        }
+        true
+    } else {
+        false
+    }
+}
+
 fn handle_git_msg(
     msg: GitMsg,
     panel_ui: &mut crate::panel::PanelUi,
@@ -3838,14 +3863,15 @@ fn handle_git_msg(
                     };
                     s.cursor = 0;
                     s.anchor = None;
-                    (s.path.clone(), s.pane)
+                    (s.path.clone(), s.pane, s.untracked)
                 });
-                if let Some((path, pane)) = kicked {
+                if let Some((path, pane, untracked)) = kicked {
                     spawn_stage_doc_fetch(
                         panel_ui.git.op_gen,
                         wires.session,
                         path,
                         pane,
+                        untracked,
                         wires.doc_tx,
                         wires.waker,
                     );
@@ -3869,31 +3895,23 @@ fn handle_git_msg(
         GitMsg::Drill => match panel_ui.git.focus {
             GitView::Files => {
                 if let Some(row) = sel_change(panel_ui, model) {
-                    if row.submodule.is_some() {
-                        model.status = "submodule pointers are atomic".into();
-                        return GitAfter::None;
-                    }
-                    // Conflict files: open in the editor so the user can
-                    // resolve the markers, then stage the file normally.
-                    if row.stage == crate::panel::Stage::Conflict {
-                        return GitAfter::OpenEditor(row.path);
-                    }
-                    // An untracked file has no diff to line-stage: record it
-                    // with intent-to-add first (`git add -N`), which turns
-                    // its whole content into stageable Add lines.
-                    if row.stage == crate::panel::Stage::Untracked {
-                        enqueue(
-                            panel_ui,
-                            model,
-                            GitOp::IntentToAdd {
-                                path: row.path.clone(),
-                            },
-                        );
-                    }
-                    let mut s = gitui::StagingUi::new(&row.path);
-                    if row.stage == crate::panel::Stage::Staged {
-                        s.pane = StagePane::Staged;
-                    }
+                    let (path, pane, untracked) = match gitui::plan_changes_drill(&row) {
+                        gitui::ChangesDrill::Atomic => {
+                            model.status = "submodule pointers are atomic".into();
+                            return GitAfter::None;
+                        }
+                        gitui::ChangesDrill::OpenEditor(path) => {
+                            return GitAfter::OpenEditor(path);
+                        }
+                        gitui::ChangesDrill::Staging {
+                            path,
+                            pane,
+                            untracked,
+                        } => (path, pane, untracked),
+                    };
+                    let mut s = gitui::StagingUi::new(&path);
+                    s.pane = pane;
+                    s.untracked = untracked;
                     let pane = s.pane;
                     panel_ui.git.stage_doc = None;
                     panel_ui.git.staging = Some(s);
@@ -3901,8 +3919,9 @@ fn handle_git_msg(
                     spawn_stage_doc_fetch(
                         panel_ui.git.op_gen,
                         wires.session,
-                        row.path,
+                        path,
                         pane,
+                        untracked,
                         wires.doc_tx,
                         wires.waker,
                     );
@@ -4080,13 +4099,17 @@ fn handle_git_msg(
                     .zip(panel_ui.git.stage_doc.as_ref())
                     .map(|(s, d)| {
                         let indices = gitui::sel_pairs(&d.doc, s.selection());
-                        (indices, d.path.clone(), d.diff.clone(), d.pane)
+                        (indices, d.path.clone(), d.diff.clone(), s.clone(), d.pane)
                     });
                 match op {
-                    Some((indices, _, _, _)) if indices.is_empty() => {
+                    Some((indices, _, _, _, _)) if indices.is_empty() => {
                         model.status = "nothing stageable selected".into();
                     }
-                    Some((indices, path, diff, pane)) => {
+                    Some((indices, path, diff, staging, doc_pane)) => {
+                        if staging.pane != doc_pane {
+                            model.status = "loading…".into();
+                            return GitAfter::None;
+                        }
                         if let Some(s) = panel_ui.git.staging.as_mut() {
                             s.anchor = None;
                         }
@@ -4095,20 +4118,8 @@ fn handle_git_msg(
                             model.status = reason;
                             return GitAfter::None;
                         }
-                        let target = match pane {
-                            StagePane::Unstaged => crate::gitmut::StageTarget::Unstaged,
-                            StagePane::Staged => crate::gitmut::StageTarget::Staged,
-                        };
-                        enqueue(
-                            panel_ui,
-                            model,
-                            GitOp::StageLines {
-                                path,
-                                diff,
-                                indices,
-                                target,
-                            },
-                        );
+                        let op = gitui::plan_stage_lines(&staging, doc_pane, path, diff, indices);
+                        enqueue(panel_ui, model, op);
                     }
                     None => {}
                 }
@@ -4176,6 +4187,15 @@ fn handle_git_msg(
         }
         GitMsg::DiscardLines => {
             if panel_ui.git.focus == GitView::Staging {
+                if let Some(reason) = panel_ui
+                    .git
+                    .staging
+                    .as_ref()
+                    .and_then(gitui::line_discard_refusal)
+                {
+                    model.status = reason.into();
+                    return GitAfter::None;
+                }
                 let op = panel_ui
                     .git
                     .staging
@@ -4214,6 +4234,15 @@ fn handle_git_msg(
             // Item 602: one-key discard of the whole hunk under the cursor
             // (select-hunk + discard, fused), with a mandatory confirm.
             if panel_ui.git.focus == GitView::Staging {
+                if let Some(reason) = panel_ui
+                    .git
+                    .staging
+                    .as_ref()
+                    .and_then(gitui::line_discard_refusal)
+                {
+                    model.status = reason.into();
+                    return GitAfter::None;
+                }
                 let cur = panel_ui.git.staging.as_ref().map_or(0, |s| s.cursor);
                 let op = panel_ui.git.stage_doc.as_ref().map(|d| {
                     (
@@ -4307,6 +4336,10 @@ fn handle_git_msg(
         }
         // ---- commits ---------------------------------------------------------
         GitMsg::Commit => {
+            if let Some(reason) = gitui::commit_precheck(&model.panel) {
+                model.status = reason.into();
+                return GitAfter::None;
+            }
             // Prefill with the entity-derived structural message (item 317),
             // computed off-thread on the panel model. Editable; empty when there
             // are no entity-level changes.
@@ -4719,7 +4752,13 @@ fn handle_git_msg(
         // ---- stash --------------------------------------------------------
         GitMsg::StashPush => {
             *ov.input = Some((
-                menu::InputOverlay::new("stash message", ""),
+                menu::InputOverlay::new(
+                    format!(
+                        "stash message (empty = {})",
+                        gitui::stash_message_or_default("", &model.panel.branch)
+                    ),
+                    "",
+                ),
                 GitInputKind::StashPush,
             ));
         }
@@ -5104,9 +5143,8 @@ fn handle_git_input_submit(
             }
         }
         GitInputKind::StashPush => {
-            if !require(model) {
-                enqueue(panel_ui, model, GitOp::StashPush { message: text });
-            }
+            let message = gitui::stash_message_or_default(&text, &model.panel.branch);
+            enqueue(panel_ui, model, GitOp::StashPush { message });
         }
         GitInputKind::PatchSplit { sha, patch } => {
             if !require(model) {
@@ -10405,12 +10443,16 @@ async fn event_loop<T: Terminal>(
                     }
                     // A landed stage/discard moves lines between panes:
                     // refetch the staging doc the cursor is parked on.
-                    if let Some(s) = &panel_ui.git.staging {
+                    if let Some(s) = panel_ui.git.staging.as_mut() {
+                        if s.untracked {
+                            s.untracked = false;
+                        }
                         spawn_stage_doc_fetch(
                             panel_ui.git.op_gen,
                             &session,
                             s.path.clone(),
                             s.pane,
+                            false,
                             &gitdoc_tx,
                             &waker,
                         );
@@ -10953,6 +10995,28 @@ async fn event_loop<T: Terminal>(
             if next_model.panel != model.panel {
                 panel_ui.hunks.clear();
                 hunk_inflight.clear();
+                if let Some(path) = panel_ui.git.staging.as_ref().map(|s| s.path.clone())
+                    && let Some(untracked) = gitui::staging_refetch(
+                        &path,
+                        &model.panel.changes,
+                        &next_model.panel.changes,
+                    )
+                {
+                    if let Some(staging) = panel_ui.git.staging.as_mut() {
+                        staging.untracked = untracked;
+                    }
+                    if let Some(staging) = panel_ui.git.staging.as_ref() {
+                        spawn_stage_doc_fetch(
+                            panel_ui.git.op_gen,
+                            &session,
+                            staging.path.clone(),
+                            staging.pane,
+                            staging.untracked,
+                            &gitdoc_tx,
+                            &waker,
+                        );
+                    }
+                }
                 // Re-anchor the expanded-row selection by PATH: `chg_sel` is a
                 // positional index, and staging/unstaging re-sorts the list
                 // (staged group first), so keeping the raw index silently
@@ -16304,19 +16368,69 @@ async fn event_loop<T: Terminal>(
                                             },
                                         );
                                     } else {
-                                        crate::handlers::panel_changes::toggle_change_selection(
-                                            i,
-                                            visible,
-                                            &mut panel_ui,
-                                            &model,
-                                            &session,
-                                            &mut hunk_inflight,
-                                            &hunk_tx,
-                                            &mut submodule_preview_inflight,
-                                            &submodule_preview_tx,
-                                            &waker,
-                                            hydration_gen,
-                                        );
+                                        let submodule = model
+                                            .panel
+                                            .changes
+                                            .get(i)
+                                            .is_some_and(|row| row.submodule.is_some());
+                                        if i == visible || submodule {
+                                            crate::handlers::panel_changes::toggle_change_selection(
+                                                i,
+                                                visible,
+                                                &mut panel_ui,
+                                                &model,
+                                                &session,
+                                                &mut hunk_inflight,
+                                                &hunk_tx,
+                                                &mut submodule_preview_inflight,
+                                                &submodule_preview_tx,
+                                                &waker,
+                                                hydration_gen,
+                                            );
+                                        } else {
+                                            panel_ui.cursor = i;
+                                            panel_ui.row_mode = true;
+                                            panel_ui.sync_section_cursors();
+                                            let wires = GitWires {
+                                                session: &session,
+                                                cfg: keymap.config(),
+                                                op_tx: &gitop_tx,
+                                                doc_tx: &gitdoc_tx,
+                                                waker: &waker,
+                                            };
+                                            let mut ov = GitOverlays {
+                                                menu: &mut active_menu,
+                                                input: &mut git_input,
+                                                confirm_op: &mut pending_confirm_op,
+                                                custom_cmds: &mut custom_menu_cmds,
+                                            };
+                                            if let GitAfter::OpenEditor(path) = handle_git_msg(
+                                                GitMsg::Drill,
+                                                &mut panel_ui,
+                                                &mut model,
+                                                &wires,
+                                                &mut ov,
+                                            ) {
+                                                let cwd = active_cwd(&session);
+                                                if open_editor(
+                                                    &mut session,
+                                                    &mut panes,
+                                                    keymap.config(),
+                                                    &path,
+                                                    None,
+                                                    cwd.as_deref(),
+                                                    chrome.center,
+                                                    None,
+                                                ) {
+                                                    focus.zone = crate::focus::Zone::Center;
+                                                }
+                                                refresh_tab_model(&mut model, &session, &mut sb);
+                                                need_relayout = true;
+                                            }
+                                            if widen_for_drill(&mut panel_ui) {
+                                                need_relayout = true;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -19923,24 +20037,18 @@ async fn event_loop<T: Terminal>(
                         continue;
                     }
                 }
-                // Enter on a git-family LIST (commits / branches / stash)
+                // Enter on a git-family LIST
                 // drills into the row at cursor — even before j/k has entered
                 // row-mode (the panel starts in section-nav mode on focus, see
                 // `row_mode = false` on panel entry). Without this the first
                 // Enter is swallowed: `git_key` owns `Drill` but is gated on
                 // `row_mode`, and the accordion's `Select` has no action for
                 // these sections, so nothing happens until a second press.
-                // Changes/Pr keep their own `Select` behaviour (diff preview /
-                // open-thread), so they're deliberately excluded.
+                // Pr keeps its own `Select` behaviour (open-thread).
                 if focus.panel()
                     && !panel_ui.row_mode
                     && matches!(k.key, KeyCode::Enter)
-                    && matches!(
-                        panel_ui.open,
-                        crate::panel::Section::Commits
-                            | crate::panel::Section::Branches
-                            | crate::panel::Section::Stash
-                    )
+                    && gitui::enter_enters_row_mode(panel_ui.open)
                 {
                     panel_ui.row_mode = true;
                 }
@@ -20024,27 +20132,7 @@ async fn event_loop<T: Terminal>(
                             need_relayout = true;
                         }
                     }
-                    // Drilling enters a detail view (commit files, staging,
-                    // patch, blame, rebase todo) that the accordion list layout
-                    // doesn't render. Widen a resting Normal panel to Half so
-                    // the drill is visible — Half renders the git frame beside
-                    // the center pane (build_panel), NOT the screen-filling Full
-                    // layout. An already-Half/Full panel is left as the user set
-                    // it.
-                    if panel_ui.width == crate::layout::PanelWidth::Normal
-                        && matches!(
-                            panel_ui.git.focus,
-                            gitui::GitView::CommitFiles
-                                | gitui::GitView::Staging
-                                | gitui::GitView::PatchBuilding
-                                | gitui::GitView::Blame
-                                | gitui::GitView::RebaseTodo
-                        )
-                    {
-                        panel_ui.width = crate::layout::PanelWidth::Half;
-                        if panel_ui.git.widened_from.is_none() {
-                            panel_ui.git.widened_from = Some(crate::layout::PanelWidth::Normal);
-                        }
+                    if widen_for_drill(&mut panel_ui) {
                         need_relayout = true;
                     }
                     if let Some(width) = panel_ui.git.retract_width() {
@@ -20252,6 +20340,17 @@ async fn event_loop<T: Terminal>(
                                     panel_ui.cursor = 0;
                                 }
                                 panel_ui.sync_section_cursors();
+                                crate::handlers::panel_changes::follow_change_cursor(
+                                    &mut panel_ui,
+                                    &model,
+                                    &session,
+                                    &mut hunk_inflight,
+                                    &hunk_tx,
+                                    &mut submodule_preview_inflight,
+                                    &submodule_preview_tx,
+                                    &waker,
+                                    hydration_gen,
+                                );
                             }
                             PanelMsg::Select => {
                                 if let Some(reason) = panel_ui.off_reason(panel_ui.open) {
