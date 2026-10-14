@@ -38,11 +38,14 @@ pub fn spawn_dispatch_sample(
         let sample = crate::monitor_pipeline::RosterSample {
             generation,
             at_ms,
-            result: rows.map(|rows| crate::monitor_pipeline::DispatchRoster {
-                rows,
-                stage_order,
-                stale: None,
-            }),
+            result: rows.map(
+                |(rows, truncated)| crate::monitor_pipeline::DispatchRoster {
+                    rows,
+                    truncated,
+                    stage_order,
+                    stale: None,
+                },
+            ),
         };
         if tx
             .send(crate::hydrate::RefreshKind::Dispatches(Box::new(sample)))
@@ -58,8 +61,14 @@ pub fn spawn_dispatch_sample(
     });
 }
 
-fn read_roster(db: &thegn_core::db::Db) -> Result<Vec<thegn_core::issue::AgentDispatch>, String> {
-    db.list_dispatch_roster().map_err(|e| format!("read: {e}"))
+fn read_roster(
+    db: &thegn_core::db::Db,
+) -> Result<(Vec<thegn_core::issue::AgentDispatch>, bool), String> {
+    db.list_dispatch_roster_window(
+        thegn_core::db::Db::ROSTER_ACTIVE_LIMIT,
+        thegn_core::db::Db::ROSTER_HISTORY_LIMIT,
+    )
+    .map_err(|e| format!("read: {e}"))
 }
 
 /// Resolve a board-row jump into a sidebar row target.
@@ -231,7 +240,8 @@ mod tests {
         db.stamp_dispatch_note(id, "note body").unwrap();
 
         let full = db.list_dispatches().unwrap();
-        let roster = read_roster(&db).unwrap();
+        let (roster, truncated) = read_roster(&db).unwrap();
+        assert!(!truncated);
         assert_eq!(roster.len(), 1);
         assert_eq!(roster[0].id, full[0].id);
         assert_eq!(roster[0].status, full[0].status);
@@ -240,5 +250,35 @@ mod tests {
         assert!(roster[0].report.is_none());
         assert_eq!(full[0].note.as_deref(), Some("note body"));
         assert_eq!(full[0].report.as_deref(), Some("report body"));
+    }
+
+    #[test]
+    fn board_roster_read_reports_history_truncation() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        for index in 0..thegn_core::db::Db::ROSTER_HISTORY_LIMIT + 1 {
+            let id = db
+                .put_agent_dispatch(thegn_core::issue::NewDispatch {
+                    issue_id: "THE-259",
+                    worktree_path: "/wt/finished",
+                    agent_name: "codex",
+                    stage: Some("code"),
+                    parent_id: None,
+                    session_id: None,
+                    artifact_path: None,
+                    chunk_path: None,
+                })
+                .unwrap();
+            db.update_dispatch_status(id, thegn_core::issue::AgentDispatchStatus::Done)
+                .unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE agent_dispatches SET dispatched_at_ms=?1 WHERE id=?2",
+                    [index as i64, id],
+                )
+                .unwrap();
+        }
+        let (rows, truncated) = read_roster(&db).unwrap();
+        assert!(truncated);
+        assert_eq!(rows.len(), thegn_core::db::Db::ROSTER_HISTORY_LIMIT);
     }
 }

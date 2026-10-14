@@ -251,7 +251,24 @@ pub(crate) fn collect_attention(
     //
     // Deliberately NOT the board's feed: the board samples only while its tab
     // is live, and the sidebar tag must stay honest with the tab closed.
-    let roster = db.list_dispatch_roster().unwrap_or_default();
+    let roster_read = db.list_dispatch_roster_window(
+        thegn_core::db::Db::ROSTER_ACTIVE_LIMIT,
+        thegn_core::db::Db::ROSTER_HISTORY_LIMIT,
+    );
+    let roster_read_succeeded = roster_read.is_ok();
+    let (roster, truncated) = roster_read.unwrap_or_default();
+    static TRUNCATION_WARNED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if truncated && !TRUNCATION_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            target: "thegn::pipeline",
+            active_limit = thegn_core::db::Db::ROSTER_ACTIVE_LIMIT,
+            history_limit = thegn_core::db::Db::ROSTER_HISTORY_LIMIT,
+            "pipeline roster truncated; older finished lanes are hidden from the sidebar"
+        );
+    } else if roster_read_succeeded && !truncated {
+        TRUNCATION_WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     // Tell a shut board its roster moved — the only way a dispatch written by
     // another process reaches a tab that is hidden until a row exists. One hash
     // over rows already in memory; no extra I/O, no wake source.
@@ -903,6 +920,81 @@ mod tests {
         collect_attention(&session, &db, &mut status);
         assert!(
             status.attention_ranks["/wt/z-session-home"] < status.attention_ranks["/wt/a-ordinary"]
+        );
+    }
+
+    #[test]
+    fn capped_history_keeps_an_old_waiting_human_stage_visible() {
+        use thegn_core::issue::{AgentDispatchStatus as S, NewDispatch};
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree("app/blocked", "/repo", "/wt/blocked", "blocked", None, None)
+            .unwrap();
+        let waiting = db
+            .put_agent_dispatch(NewDispatch {
+                issue_id: "THE-259",
+                worktree_path: "/wt/blocked",
+                agent_name: "codex",
+                stage: Some("review"),
+                parent_id: None,
+                session_id: None,
+                artifact_path: None,
+                chunk_path: None,
+            })
+            .unwrap();
+        db.update_dispatch_status(waiting, S::WaitingHuman).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET dispatched_at_ms=1 WHERE id=?1",
+                [waiting],
+            )
+            .unwrap();
+        for index in 0..thegn_core::db::Db::ROSTER_HISTORY_LIMIT + 5 {
+            let id = db
+                .put_agent_dispatch(NewDispatch {
+                    issue_id: "THE-259",
+                    worktree_path: "/wt/finished",
+                    agent_name: "codex",
+                    stage: Some("code"),
+                    parent_id: None,
+                    session_id: None,
+                    artifact_path: None,
+                    chunk_path: None,
+                })
+                .unwrap();
+            db.update_dispatch_status(id, S::Done).unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE agent_dispatches SET dispatched_at_ms=?1 WHERE id=?2",
+                    [index as i64 + 10, id],
+                )
+                .unwrap();
+        }
+        let (window, truncated) = db
+            .list_dispatch_roster_window(
+                thegn_core::db::Db::ROSTER_ACTIVE_LIMIT,
+                thegn_core::db::Db::ROSTER_HISTORY_LIMIT,
+            )
+            .unwrap();
+        assert!(truncated);
+        assert_eq!(window.len(), thegn_core::db::Db::ROSTER_HISTORY_LIMIT + 1);
+        assert!(window.iter().any(|row| row.id == waiting));
+
+        let session = session_with(&[("app/blocked", "/wt/blocked")]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+        order_memo().lock().unwrap().clear();
+        collect_attention(&session, &db, &mut status);
+
+        assert_eq!(
+            status
+                .pipeline_stages
+                .get("/wt/blocked")
+                .map(String::as_str),
+            Some("review")
+        );
+        assert_eq!(
+            status.attention["/wt/blocked"].reason,
+            thegn_core::attention::AttentionReason::AgentNeedsInput
         );
     }
 }
