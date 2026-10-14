@@ -1027,9 +1027,7 @@ pub fn dir_change_counts(changes: &[ChangeRow]) -> std::collections::HashMap<Str
                 path.push('/');
             }
             path.push_str(part);
-            let count = counts
-                .entry(path.clone())
-                .or_insert_with(DirChange::default);
+            let count = counts.entry(path.clone()).or_default();
             count.files += 1;
             count.added += change.added;
             count.deleted += change.deleted;

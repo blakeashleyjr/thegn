@@ -241,7 +241,7 @@ fn status_rows(model: &FrameModel, ui: &PanelUi, _focused: bool) -> Vec<PanelRow
         right.push(seg(g2(), format!("{} changed", data.changes.len())));
         right.push(sp(1));
     }
-    let mut l = vec![sp(1), sp(2), seg(d(), "STATUS")];
+    let mut l = vec![sp(3), seg(d(), "STATUS")];
     l.extend(flow_chips(&ui.git.flow, data.merge.is_some()));
     if let Some(snapshot) = &data.review_snapshot {
         let unresolved = snapshot
