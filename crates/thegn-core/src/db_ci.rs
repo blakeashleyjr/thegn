@@ -126,3 +126,82 @@ impl Db {
         Ok(inserted == 1)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ci_log::{HARD_MAX_LOG_BYTES, HARD_MAX_LOG_LINES, REDACTION_MARKER};
+    use crate::store::CacheStore;
+
+    fn raw_entry(text: String) -> CiLogEntry {
+        let mut entry = CiLogEntry::new("/wt/ci", "run", "job", "tests", "ordinary\n", 20, 1024, 1);
+        entry.text = text;
+        entry
+    }
+
+    #[test]
+    fn store_redacts_raw_entries_that_bypassed_the_constructor() {
+        let db = Db::open_memory().unwrap();
+        let begin = format!("-----{} PRIVATE KEY-----", "BEGIN");
+        let end = format!("-----{} PRIVATE KEY-----", "END");
+        let gh_token = format!("ghp_{}", "7".repeat(36));
+        let body = "SYNTHETIC_PEM_BODY";
+        let entry = raw_entry(format!(
+            "{begin}\n{body}\n{end}\ntoken=SYNTHETIC_TOKEN\n{gh_token}\n"
+        ));
+
+        db.put_ci_log(&entry).unwrap();
+        let stored = db.get_ci_log("/wt/ci", "run", "job").unwrap().unwrap();
+        let listed = db.list_ci_logs("/wt/ci").unwrap().remove(0);
+        for row in [stored, listed] {
+            assert!(!row.text.contains(body));
+            assert!(!row.text.contains("SYNTHETIC_TOKEN"));
+            assert!(!row.text.contains(&gh_token));
+            assert!(row.text.contains(REDACTION_MARKER));
+            assert!(row.redacted);
+        }
+    }
+
+    #[test]
+    fn store_enforces_hard_bounds_at_maximum_ingestion() {
+        let db = Db::open_memory().unwrap();
+        let line_input = (0..HARD_MAX_LOG_LINES + 10)
+            .map(|line| format!("line-{line}\n"))
+            .collect::<String>();
+        let mut lines = raw_entry(line_input);
+        lines.run_id = "many-lines".into();
+        db.put_ci_log(&lines).unwrap();
+        let stored_lines = db
+            .get_ci_log("/wt/ci", "many-lines", "job")
+            .unwrap()
+            .unwrap();
+        assert!(stored_lines.truncated);
+        assert!(stored_lines.text.lines().count() <= HARD_MAX_LOG_LINES);
+        assert!(
+            stored_lines
+                .text
+                .ends_with(&format!("line-{}\n", HARD_MAX_LOG_LINES + 9))
+        );
+
+        let expanded_input = (0..HARD_MAX_LOG_LINES)
+            .map(|line| {
+                if line + 1 == HARD_MAX_LOG_LINES {
+                    "token=a padding_padding_padding_padding latest\n".to_string()
+                } else {
+                    "token=a padding_padding_padding_padding\n".to_string()
+                }
+            })
+            .collect::<String>();
+        let mut bytes = raw_entry(expanded_input);
+        bytes.run_id = "expanded-bytes".into();
+        db.put_ci_log(&bytes).unwrap();
+        let stored_bytes = db
+            .get_ci_log("/wt/ci", "expanded-bytes", "job")
+            .unwrap()
+            .unwrap();
+        assert!(stored_bytes.truncated);
+        assert!(stored_bytes.text.len() <= HARD_MAX_LOG_BYTES);
+        assert!(stored_bytes.text.lines().count() <= HARD_MAX_LOG_LINES);
+        assert!(stored_bytes.text.ends_with("latest\n"));
+    }
+}
