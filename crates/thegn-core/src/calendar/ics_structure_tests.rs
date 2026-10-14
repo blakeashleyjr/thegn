@@ -432,3 +432,60 @@ fn structural_diagnostic_overflow_remains_document_failure() {
     assert_eq!(report.overflow(), 1);
     assert!(report.is_document_failure());
 }
+
+#[test]
+fn mixed_feed_reports_invalid_rdate_and_keeps_valid_event() {
+    let input = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:good\nDTSTART;VALUE=DATE:20261012\nRRULE:FREQ=DAILY;COUNT=2\nEND:VEVENT\nBEGIN:VEVENT\nUID:bad\nDTSTART;VALUE=DATE:20261012\nRRULE:FREQ=DAILY;COUNT=2\nRDATE:20261015T090000Z\nEND:VEVENT\nEND:VCALENDAR";
+    let (events, report) = parse_report(input);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].uid, "good");
+    assert!(
+        report
+            .diagnostics()
+            .contains(&IcsDiagnostic::InvalidRecurrenceValue(
+                super::super::recur::RecurValueError {
+                    property: super::super::recur::RecurProperty::Rdate,
+                    index: 0,
+                    defect: super::super::recur::RecurValueDefect::ShapeMismatch,
+                }
+            ))
+    );
+    assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
+    assert!(!report.is_document_failure());
+    assert_legacy_matches(input, &events);
+}
+
+#[test]
+fn invalid_recurrence_value_reports_member_index() {
+    let input = one_event(
+        "UID:indexed\nDTSTART;VALUE=DATE:20261012\nRRULE:FREQ=DAILY\nRDATE;VALUE=DATE:20261014\nRDATE:20261016T090000Z",
+    );
+    let (events, report) = parse_report(&input);
+    assert!(events.is_empty());
+    assert!(
+        report
+            .diagnostics()
+            .contains(&IcsDiagnostic::InvalidRecurrenceValue(
+                super::super::recur::RecurValueError {
+                    property: super::super::recur::RecurProperty::Rdate,
+                    index: 1,
+                    defect: super::super::recur::RecurValueDefect::ShapeMismatch,
+                }
+            ))
+    );
+    assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
+    assert_legacy_matches(&input, &events);
+}
+
+#[test]
+fn recurrence_value_diagnostic_carries_no_feed_text() {
+    let input = one_event(
+        "UID:private-feed-identity\nDTSTART;VALUE=DATE:20261012\nRRULE:FREQ=DAILY\nRDATE:20261015T090000Z",
+    );
+    let (events, report) = parse_report(&input);
+    let diagnostics = format!("{:?}", report.diagnostics());
+    assert!(diagnostics.contains("InvalidRecurrenceValue"));
+    assert!(!diagnostics.contains("20261015T090000Z"));
+    assert!(!diagnostics.contains("private-feed-identity"));
+    assert_legacy_matches(&input, &events);
+}
