@@ -81,6 +81,9 @@ pub struct WorkRow {
     /// The worktree this row is already linked to, if any (jump target).
     #[serde(default)]
     pub worktree_path: Option<String>,
+    /// Local workspace root used to branch this row in the correct repo.
+    #[serde(default)]
+    pub repo_root: Option<String>,
 }
 
 impl WorkRow {
@@ -227,10 +230,18 @@ mod spec {
             issue_id: None,
             branch_hint: None,
             worktree_path: Some("/tmp/wt".into()),
+            repo_root: Some("/tmp/repo".into()),
         };
         let json = serde_json::to_string(&row).unwrap();
         let back: WorkRow = serde_json::from_str(&json).unwrap();
         assert_eq!(row, back);
+    }
+
+    #[test]
+    fn work_row_without_repo_root_parses() {
+        let json = r#"{"group":"assigned","kind":"issue","provider":"linear","number":"ABC-1","title":"Issue","repo":"","url":"","urgency":0,"issue_id":null,"branch_hint":null,"worktree_path":null}"#;
+        let row: WorkRow = serde_json::from_str(json).unwrap();
+        assert_eq!(row.repo_root, None);
     }
 
     #[test]

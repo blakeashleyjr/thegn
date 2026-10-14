@@ -8,6 +8,7 @@
 //! loop and only clone what the off-thread work needs.
 
 use std::path::Path;
+use std::path::PathBuf;
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::store::{NotificationStore, WorkspaceStore, WorktreeAuxStore};
@@ -111,6 +112,18 @@ pub(crate) fn toggle_link(ctx: &mut TrackerCtx) {
 /// worktree-create preset and links the new worktree to the issue on
 /// completion (via `pending_issue_link` → [`on_worktree_created`]).
 pub(crate) fn branch_from_issue(ctx: &mut TrackerCtx) {
+    let mine = ctx.panel_ui.open == crate::panel::Section::Mine;
+    let active_root = ctx
+        .session
+        .active_group()
+        .map(|g| g.path.clone())
+        .filter(|p| !p.is_empty())
+        .and_then(|p| thegn_core::repo::main_worktree(Path::new(&p)))
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| thegn_core::repo::main_worktree(&p))
+        });
     let fields: Option<(String, String, String, Option<String>)> =
         if ctx.panel_ui.open == crate::panel::Section::Mine {
             let rows = crate::panel::sections::my_work::ordered_rows(&ctx.model.panel);
@@ -129,39 +142,69 @@ pub(crate) fn branch_from_issue(ctx: &mut TrackerCtx) {
                 )
             })
         };
+    if mine
+        && crate::panel::sections::my_work::ordered_rows(&ctx.model.panel)
+            .get(ctx.panel_ui.cursor)
+            .is_some_and(|r| r.kind != thegn_core::work::WorkKind::Issue || r.issue_id.is_none())
+    {
+        ctx.model.status = "b branches from an issue row".into();
+        return;
+    }
     if let Some((issue_id, number, title, hint)) = fields {
-        let root = ctx
-            .session
-            .active_group()
-            .map(|g| g.path.clone())
-            .filter(|p| !p.is_empty())
-            .and_then(|p| thegn_core::repo::main_worktree(Path::new(&p)))
-            .or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .and_then(|c| thegn_core::repo::main_worktree(&c))
-            });
-        if let Some(root) = root {
-            let tail = issue_branch_tail(&number, &title, hint.as_deref());
-            crate::run::begin_worktree_preset(
-                root,
-                crate::keymap::NameSpec::Fixed(tail),
-                None,
-                None,
-                None,
-                ctx.cfg,
-                ctx.create_gen,
-                ctx.create_tx,
-                ctx.waker,
-                ctx.inflight,
-                ctx.wizard_ui,
-                ctx.model,
-            );
-            *ctx.pending_issue_link = Some((*ctx.create_gen, issue_id));
-            ctx.model.status = format!("Branching worktree for {number}…");
+        let root_result = if mine {
+            let row = crate::panel::sections::my_work::ordered_rows(&ctx.model.panel)
+                .get(ctx.panel_ui.cursor)
+                .cloned();
+            row.as_ref()
+                .map(|r| branch_root(r, crate::panel::scope::mine_all(), active_root.as_deref()))
+                .unwrap_or_else(|| Err("b branches from an issue row".into()))
         } else {
-            ctx.model.status = "branch-from-issue: not inside a git repository".into();
+            active_root.ok_or_else(|| "branch-from-issue: not inside a git repository".to_string())
+        };
+        match root_result {
+            Ok(root) => {
+                let tail = issue_branch_tail(&number, &title, hint.as_deref());
+                crate::run::begin_worktree_preset(
+                    root,
+                    crate::keymap::NameSpec::Fixed(tail),
+                    None,
+                    None,
+                    None,
+                    ctx.cfg,
+                    ctx.create_gen,
+                    ctx.create_tx,
+                    ctx.waker,
+                    ctx.inflight,
+                    ctx.wizard_ui,
+                    ctx.model,
+                );
+                *ctx.pending_issue_link = Some((*ctx.create_gen, issue_id));
+                ctx.model.status = format!("Branching worktree for {number}…");
+            }
+            Err(error) => ctx.model.status = error,
         }
+    } else if mine {
+        ctx.model.status = "b branches from an issue row".into();
+    }
+}
+
+pub(crate) fn branch_root(
+    row: &thegn_core::work::WorkRow,
+    mine_all: bool,
+    active_root: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if row.kind != thegn_core::work::WorkKind::Issue || row.issue_id.is_none() {
+        return Err("b branches from an issue row".into());
+    }
+    if mine_all {
+        row.repo_root.as_deref().map(PathBuf::from).ok_or_else(|| {
+            "no local checkout for this issue's repo — switch to it and use this-repo scope (a)"
+                .into()
+        })
+    } else {
+        active_root
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "branch-from-issue: not inside a git repository".into())
     }
 }
 

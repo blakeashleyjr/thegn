@@ -59,6 +59,7 @@ pub(crate) fn begin_worktree_wizard(
         cfg: cfg.clone(),
         repo_root: root,
         candidate: w.candidate(),
+        exact_branch: false,
         generation: *create_gen,
         db_path: None,
         base_override,

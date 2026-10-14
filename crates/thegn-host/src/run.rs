@@ -3453,19 +3453,26 @@ pub(crate) fn begin_worktree_preset(
         return;
     }
     *create_gen += 1;
-    let candidate = thegn_core::worktree::candidate_name(cfg);
+    let (candidate, exact_branch) = match &name {
+        crate::keymap::NameSpec::Exact(branch) => (branch.clone(), true),
+        crate::keymap::NameSpec::Random | crate::keymap::NameSpec::Fixed(_) => {
+            (thegn_core::worktree::candidate_name(cfg), false)
+        }
+    };
     let env = wizard::ambient_env_name_live(cfg, &root);
     let sandbox = sandbox.unwrap_or_else(|| cfg.sandbox.default_backend.as_str().to_string());
     let agent = agent.unwrap_or_else(|| "shell".to_string());
     let name_choice = match name {
         crate::keymap::NameSpec::Random => wizard::NameChoice::Generated,
         crate::keymap::NameSpec::Fixed(tail) => wizard::NameChoice::Human(tail),
+        crate::keymap::NameSpec::Exact(_) => wizard::NameChoice::Exact,
     };
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
     let ctx = wizard::WorkerCtx {
         cfg: cfg.clone(),
         repo_root: root,
         candidate: candidate.clone(),
+        exact_branch,
         generation: *create_gen,
         db_path: None,
         base_override: base,
@@ -20409,18 +20416,97 @@ async fn event_loop<T: Terminal>(
                                             );
                                         }
                                         Section::Pr => {
-                                            // Enter opens the full-screen in-app PR
-                                            // workflow view; `o` still opens the browser.
-                                            match crate::actions::open_pr_view(
-                                                &model,
-                                                &session,
-                                                &mut pr_view_gen,
-                                                &pr_view_tx,
-                                                &waker,
-                                                &refresh_tx,
+                                            let groups: Vec<(String, usize)> = session
+                                                .worktrees
+                                                .iter()
+                                                .map(|g| (g.path.clone(), g.active_tab))
+                                                .collect();
+                                            let active_path = active_tab_path(&session);
+                                            let active_repo =
+                                                crate::handlers::take_me_there::active_repo_path(
+                                                    &active_path.to_string_lossy(),
+                                                    &model.sidebar_db_worktrees,
+                                                );
+                                            match crate::handlers::take_me_there::pr_row_at(
+                                                &model.panel,
+                                                panel_ui.width.is_expanded(),
+                                                panel_ui.cursor,
                                             ) {
-                                                Some(v) => pr_view = Some(v),
-                                                None => model.status = "No pull request".into(),
+                                                Some(
+                                                    crate::handlers::take_me_there::PrRow::Thread(
+                                                        _,
+                                                    ),
+                                                ) => match crate::actions::open_pr_view(
+                                                    &model,
+                                                    &session,
+                                                    &mut pr_view_gen,
+                                                    &pr_view_tx,
+                                                    &waker,
+                                                    &refresh_tx,
+                                                ) {
+                                                    Some(v) => pr_view = Some(v),
+                                                    None => model.status = "No pull request".into(),
+                                                },
+                                                Some(
+                                                    crate::handlers::take_me_there::PrRow::OpenPr(
+                                                        p,
+                                                    ),
+                                                ) => {
+                                                    let p = p.clone();
+                                                    let linked = active_repo
+                                                        .and_then(|repo| {
+                                                            model.sidebar_db_worktrees.iter().find(
+                                                                |w| {
+                                                                    w.branch == p.head_ref
+                                                                        && w.repo_path == repo
+                                                                },
+                                                            )
+                                                        })
+                                                        .and_then(|w| {
+                                                            crate::nav::worktree_row_target(
+                                                                &w.path,
+                                                                &groups,
+                                                                &model.sidebar_db_worktrees,
+                                                            )
+                                                        });
+                                                    if let Some(target) = linked {
+                                                        let hydrate = activate_row!(target);
+                                                        sb.focus_active_row(&mut model);
+                                                        model.status = format!("Jumped to {}", p.head_ref);
+                                                        if hydrate {
+                                                            kick_model_hydration!();
+                                                        }
+                                                    } else if let Some((owner, repo)) =
+                                                        thegn_core::forge::model::owner_repo_from_url(&p.url)
+                                                    {
+                                                        pr_view = Some(crate::actions::open_pr_view_number(
+                                                            owner,
+                                                            repo,
+                                                            p.number,
+                                                            p.url.clone(),
+                                                            crate::actions::PrViewOpenCtx {
+                                                                session: &session,
+                                                                gen_ctr: &mut pr_view_gen,
+                                                                tx: &pr_view_tx,
+                                                                waker: &waker,
+                                                                refresh_tx: &refresh_tx,
+                                                            },
+                                                        ));
+                                                    } else {
+                                                        model.status = "Cannot identify this pull request".into();
+                                                    }
+                                                }
+                                                None => match crate::actions::open_pr_view(
+                                                    &model,
+                                                    &session,
+                                                    &mut pr_view_gen,
+                                                    &pr_view_tx,
+                                                    &waker,
+                                                    &refresh_tx,
+                                                ) {
+                                                    Some(v) => pr_view = Some(v),
+                                                    None => model.status = "No pull request".into(),
+                                                },
                                             }
                                         }
                                         Section::Tests => {
@@ -20514,20 +20600,64 @@ async fn event_loop<T: Terminal>(
                                         // arrives with the GitMsg dispatch layer.
                                         Section::Commits | Section::Branches | Section::Stash => {}
                                         Section::Mine => {
-                                            // Enter opens the cursor row in the browser.
-                                            // (Worktree-jump / branch-from-issue arrive
-                                            // with the binding layer.)
                                             let rows =
                                                 crate::panel::sections::my_work::ordered_rows(
                                                     &model.panel,
                                                 );
-                                            if let Some(row) = rows.get(panel_ui.cursor)
-                                                && !row.url.is_empty()
-                                            {
-                                                model.status = crate::actions::open_status(
-                                                    open_url_detached(&row.url),
-                                                    || format!("Opened {} in browser", row.number),
+                                            let groups: Vec<(String, usize)> = session
+                                                .worktrees
+                                                .iter()
+                                                .map(|g| (g.path.clone(), g.active_tab))
+                                                .collect();
+                                            let active_path = active_tab_path(&session);
+                                            let active_path_text = active_path.to_string_lossy();
+                                            let active_repo =
+                                                crate::handlers::take_me_there::active_repo_path(
+                                                    active_path_text.as_ref(),
+                                                    &model.sidebar_db_worktrees,
                                                 );
+                                            if let Some(row) = rows.get(panel_ui.cursor) {
+                                                match crate::panel::sections::my_work::enter_target(
+                                                    row,
+                                                    &groups,
+                                                    &model.sidebar_db_worktrees,
+                                                    active_repo,
+                                                ) {
+                                                    crate::panel::sections::my_work::EnterTarget::Jump(target) => {
+                                                        let hydrate = activate_row!(target);
+                                                        sb.focus_active_row(&mut model);
+                                                        model.status = format!("Jumped to {}", row.number);
+                                                        if hydrate {
+                                                            kick_model_hydration!();
+                                                        }
+                                                    }
+                                                    crate::panel::sections::my_work::EnterTarget::PrView { owner, repo, number } => {
+                                                        pr_view = Some(crate::actions::open_pr_view_number(
+                                                            owner,
+                                                            repo,
+                                                            number,
+                                                            row.url.clone(),
+                                                            crate::actions::PrViewOpenCtx {
+                                                                session: &session,
+                                                                gen_ctr: &mut pr_view_gen,
+                                                                tx: &pr_view_tx,
+                                                                waker: &waker,
+                                                                refresh_tx: &refresh_tx,
+                                                            },
+                                                        ));
+                                                    }
+                                                    crate::panel::sections::my_work::EnterTarget::Browser(url) => {
+                                                        model.status = crate::actions::open_status(
+                                                            open_url_detached(&url),
+                                                            || format!("Opened {} in browser", row.number),
+                                                        );
+                                                    }
+                                                    crate::panel::sections::my_work::EnterTarget::Nothing => {
+                                                        model.status = "Nothing to open for this row".into();
+                                                    }
+                                                }
+                                            } else {
+                                                model.status = "No work row selected".into();
                                             }
                                         }
                                         Section::Issues => {
@@ -20550,21 +20680,47 @@ async fn event_loop<T: Terminal>(
                                                 },
                                             );
                                         }
-                                        // Enter widens the panel to half so the
-                                        // full notification is readable — the
-                                        // resting width truncates it. It
-                                        // deliberately does NOT mark the
-                                        // notification read (that's `x`) or
-                                        // navigate away: reading shouldn't
-                                        // dismiss it.
-                                        Section::Notifications
-                                            if !model.panel.notifications.is_empty()
-                                                && panel_ui.width
-                                                    == crate::layout::PanelWidth::Normal =>
-                                        {
-                                            panel_ui.width = crate::layout::PanelWidth::Half;
-                                            panel_ui.remember_width();
-                                            need_relayout = true;
+                                        Section::Notifications => {
+                                            let selected = crate::panel::sections::notifications::visible_indices(&model.panel, &panel_ui).get(panel_ui.notifications_cursor).and_then(|&i| model.panel.notifications.get(i)).cloned();
+                                            if let Some(notification) = selected {
+                                                let groups: Vec<(String, usize)> = session
+                                                    .worktrees
+                                                    .iter()
+                                                    .map(|g| (g.path.clone(), g.active_tab))
+                                                    .collect();
+                                                let target = crate::handlers::take_me_there::notification_target(&notification, &groups, &model.sidebar_db_worktrees);
+                                                let mark_read = !matches!(&target, crate::handlers::take_me_there::NotificationTarget::Nothing);
+                                                match target {
+                                                    crate::handlers::take_me_there::NotificationTarget::Jump(target) => { let hydrate = activate_row!(target); sb.focus_active_row(&mut model); model.status = format!("Jumped to {}", notification.worktree_path); if hydrate { kick_model_hydration!(); } }
+                                                    crate::handlers::take_me_there::NotificationTarget::Browser(url) => model.status = crate::actions::open_status(open_url_detached(&url), || format!("Opened {} in browser", notification.source_ref)),
+                                                    crate::handlers::take_me_there::NotificationTarget::Nothing => model.status = "nothing to jump to — space expands".into(),
+                                                }
+                                                if mark_read && !notification.read {
+                                                    let id = notification.id;
+                                                    crate::db_task::persist(move |db| {
+                                                        if let Err(error) =
+                                                            db.mark_notification_read(id)
+                                                        {
+                                                            tracing::debug!(target:"thegn::db", %error, "notification read update failed");
+                                                        }
+                                                    });
+                                                    hydration_gen += 1;
+                                                    crate::hydrate::spawn_model_hydration(
+                                                        model_tx.clone(),
+                                                        hydration_gen,
+                                                        session.clone_for_hydrate(),
+                                                        Some(waker.clone()),
+                                                        crate::hydrate::HydrateHints {
+                                                            open: panel_ui.open,
+                                                            expanded: panel_ui.width.is_expanded(),
+                                                            ..Default::default()
+                                                        },
+                                                        None,
+                                                    );
+                                                }
+                                            } else {
+                                                model.status = "No notification selected".into();
+                                            }
                                         }
                                         Section::Jobs => {
                                             // Enter on a task row runs the selected task.
@@ -20817,27 +20973,24 @@ async fn event_loop<T: Terminal>(
                                             );
                                         }
                                         Section::Across => {
-                                            // Jump to the excerpt's worktree
-                                            // (the aggregation's whole point:
-                                            // see it here, land there).
-                                            let target = model
+                                            if let Some(e) = model
                                                 .panel
                                                 .across
                                                 .jump_target(panel_ui.cursor)
-                                                .cloned();
-                                            if let Some(e) = target {
-                                                let tab = model
-                                                    .sidebar_rows
+                                                .cloned()
+                                            {
+                                                let groups: Vec<(String, usize)> = session
+                                                    .worktrees
                                                     .iter()
-                                                    .find(|r| {
-                                                        r.kind == crate::sidebar::RowKind::Worktree
-                                                            && r.worktree_path.as_deref()
-                                                                == Some(e.worktree.as_str())
-                                                    })
-                                                    .and_then(|r| r.tab_target.clone());
-                                                match tab {
-                                                    Some(t) => {
-                                                        let hydrate = activate_row!(t);
+                                                    .map(|g| (g.path.clone(), g.active_tab))
+                                                    .collect();
+                                                match crate::nav::worktree_row_target(
+                                                    &e.worktree,
+                                                    &groups,
+                                                    &model.sidebar_db_worktrees,
+                                                ) {
+                                                    Some(target) => {
+                                                        let hydrate = activate_row!(target);
                                                         sb.focus_active_row(&mut model);
                                                         model.status = format!(
                                                             "Jumped to {}",
@@ -20849,9 +21002,9 @@ async fn event_loop<T: Terminal>(
                                                     }
                                                     None => {
                                                         model.status = format!(
-                                                            "{} has no open tab in this session",
+                                                            "{} is not a registered worktree",
                                                             e.worktree_label
-                                                        );
+                                                        )
                                                     }
                                                 }
                                             }
@@ -20864,8 +21017,27 @@ async fn event_loop<T: Terminal>(
                                                 &panel_ui,
                                             );
                                         }
-                                        // Read-only / no-Enter-action sections
-                                        // (MergeQueue, Logs, …).
+                                        Section::PrQueue | Section::MergeQueue => {
+                                            for _ in 0..2 {
+                                                if panel_ui.width == crate::layout::PanelWidth::Full
+                                                {
+                                                    break;
+                                                }
+                                                toggle_panel_expand(
+                                                    &mut panel_ui,
+                                                    &mut hydration_gen,
+                                                    &model_tx,
+                                                    &session,
+                                                    &waker,
+                                                    PanelDocsWiring {
+                                                        generation: docs_gen,
+                                                        tx: &docs_tx,
+                                                    },
+                                                );
+                                                need_relayout = true;
+                                            }
+                                        }
+                                        // Read-only / no-Enter-action sections (Logs, …).
                                         _ => {}
                                     }
                                 } // match panel_ui.open + else
@@ -20988,6 +21160,68 @@ async fn event_loop<T: Terminal>(
                                     pr_view_tx: &pr_view_tx,
                                 },
                             )
+                        }
+                        (Section::Pr, KeyCode::Char('w')) => {
+                            let groups: Vec<(String, usize)> = session
+                                .worktrees
+                                .iter()
+                                .map(|g| (g.path.clone(), g.active_tab))
+                                .collect();
+                            let active_path = active_tab_path(&session);
+                            let active_repo = crate::handlers::take_me_there::active_repo_path(
+                                &active_path.to_string_lossy(),
+                                &model.sidebar_db_worktrees,
+                            );
+                            match crate::handlers::take_me_there::pr_row_at(
+                                &model.panel,
+                                panel_ui.width.is_expanded(),
+                                panel_ui.cursor,
+                            ) {
+                                Some(crate::handlers::take_me_there::PrRow::OpenPr(p)) => {
+                                    let p = p.clone();
+                                    let linked = active_repo
+                                        .and_then(|repo| {
+                                            model.sidebar_db_worktrees.iter().find(|w| {
+                                                w.branch == p.head_ref && w.repo_path == repo
+                                            })
+                                        })
+                                        .and_then(|w| {
+                                            crate::nav::worktree_row_target(
+                                                &w.path,
+                                                &groups,
+                                                &model.sidebar_db_worktrees,
+                                            )
+                                        });
+                                    if let Some(target) = linked {
+                                        let hydrate = activate_row!(target);
+                                        sb.focus_active_row(&mut model);
+                                        model.status = format!("Jumped to {}", p.head_ref);
+                                        if hydrate {
+                                            kick_model_hydration!();
+                                        }
+                                    } else if let Some(root) = active_repo {
+                                        crate::run::begin_worktree_preset(
+                                            std::path::PathBuf::from(root),
+                                            crate::keymap::NameSpec::Exact(p.head_ref.clone()),
+                                            None,
+                                            None,
+                                            Some(format!("origin/{}", p.head_ref)),
+                                            keymap.config(),
+                                            &mut create_gen,
+                                            &create_tx,
+                                            &waker,
+                                            &mut inflight,
+                                            &mut wizard_ui,
+                                            &mut model,
+                                        );
+                                    } else {
+                                        model.status =
+                                            "No local repository for this pull request".into();
+                                    }
+                                }
+                                _ => model.status = "w: select an OPEN PRS row".into(),
+                            }
+                            true
                         }
                         // -- tests: run / discover (capped, single-flight) ---
                         (Section::Tests, KeyCode::Char(c @ ('r' | 'R' | 'f' | 'F' | 'p'))) => {
@@ -21782,6 +22016,46 @@ async fn event_loop<T: Terminal>(
                             panel_ui.notifications_show_read = !panel_ui.notifications_show_read;
                             panel_ui.notifications_cursor = 0;
                             panel_ui.cursor = 0;
+                            true
+                        }
+                        (Section::Notifications, KeyCode::Char(' ')) => {
+                            if panel_ui.width == crate::layout::PanelWidth::Full {
+                                model.status = "detail is shown at Full".into();
+                            } else {
+                                let id = crate::panel::sections::notifications::visible_indices(
+                                    &model.panel,
+                                    &panel_ui,
+                                )
+                                .get(panel_ui.notifications_cursor)
+                                .and_then(|&i| model.panel.notifications.get(i))
+                                .map(|n| n.id);
+                                panel_ui.notifications_expanded =
+                                    id.filter(|id| Some(*id) != panel_ui.notifications_expanded);
+                                need_relayout = true;
+                            }
+                            true
+                        }
+                        (Section::Notifications, KeyCode::Char('o')) => {
+                            if let Some(source) =
+                                crate::panel::sections::notifications::visible_indices(
+                                    &model.panel,
+                                    &panel_ui,
+                                )
+                                .get(panel_ui.notifications_cursor)
+                                .and_then(|&i| model.panel.notifications.get(i))
+                                .map(|n| n.source_ref.clone())
+                            {
+                                if source.starts_with("http://") || source.starts_with("https://") {
+                                    model.status = crate::actions::open_status(
+                                        open_url_detached(&source),
+                                        || format!("Opened {source} in browser"),
+                                    );
+                                } else {
+                                    model.status = format!("{source} is not a link");
+                                }
+                            } else {
+                                model.status = "No notification selected".into();
+                            }
                             true
                         }
                         // Toggle the System tab between this repo (default) and

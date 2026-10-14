@@ -1173,6 +1173,8 @@ pub struct PanelUi {
     pub issues_project_filter: Option<String>,
     /// Row cursor within the Notifications section's list.
     pub notifications_cursor: usize,
+    /// Expanded notification id in the compact inbox views.
+    pub notifications_expanded: Option<i64>,
     /// When true, the Notifications section shows already-read items too (`A` toggle).
     pub notifications_show_read: bool,
     /// Active free-text filter query for the Notifications section (`/` mode).
@@ -1225,6 +1227,7 @@ impl Default for PanelUi {
             issues_filter: String::new(),
             issues_project_filter: None,
             notifications_cursor: 0,
+            notifications_expanded: None,
             notifications_show_read: false,
             notifications_filter: String::new(),
             notifications_filter_editing: false,

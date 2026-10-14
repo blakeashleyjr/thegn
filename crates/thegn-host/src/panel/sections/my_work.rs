@@ -10,6 +10,50 @@ use thegn_core::work::{WorkGroup, WorkKind, WorkRow};
 
 use crate::seg::{Line, seg, sp};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EnterTarget {
+    Jump(crate::sidebar::RowTarget),
+    PrView {
+        owner: String,
+        repo: String,
+        number: u64,
+    },
+    Browser(String),
+    Nothing,
+}
+
+pub(crate) fn enter_target(
+    row: &WorkRow,
+    groups: &[(String, usize)],
+    db: &[crate::sidebar::DbWorktree],
+    active_repo_path: Option<&str>,
+) -> EnterTarget {
+    if let Some(path) = row.worktree_path.as_deref()
+        && let Some(target) = crate::nav::worktree_row_target(path, groups, db)
+    {
+        return EnterTarget::Jump(target);
+    }
+    if row.kind == WorkKind::Pr
+        && row
+            .repo_root
+            .as_deref()
+            .is_some_and(|root| Some(root) == active_repo_path)
+        && let Some((owner, repo)) = thegn_core::forge::model::owner_repo_from_url(&row.url)
+        && let Ok(number) = row.number.trim_start_matches('#').parse::<u64>()
+    {
+        return EnterTarget::PrView {
+            owner,
+            repo,
+            number,
+        };
+    }
+    if !row.url.is_empty() {
+        EnterTarget::Browser(row.url.clone())
+    } else {
+        EnterTarget::Nothing
+    }
+}
+
 use super::{PanelHit, PanelRow, Section, SectionCtx, d, f, g, g2, hint_row, hue, rule, t};
 
 fn provider_sigil(provider: &str) -> &'static str {
@@ -128,7 +172,7 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
 
     out.push(hint_row(&[
-        ("↵", "open"),
+        ("↵", "go"),
         ("b", "branch"),
         ("o", "browser"),
         ("a", if all { "this repo" } else { "all repos" }),
@@ -279,6 +323,52 @@ mod spec {
         assert!(
             text.contains('\u{fffd}'),
             "hostile cells are visibly replaced: {text:?}"
+        );
+    }
+
+    #[test]
+    fn mine_enter_on_a_linked_row_jumps() {
+        let row = WorkRow {
+            worktree_path: Some("/wt".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            enter_target(&row, &[("/wt".into(), 1)], &[], None),
+            EnterTarget::Jump(crate::sidebar::RowTarget::Tab(0, 1))
+        );
+    }
+
+    #[test]
+    fn mine_enter_on_a_same_repo_pr_opens_the_pr_view() {
+        let row = WorkRow {
+            kind: WorkKind::Pr,
+            repo_root: Some("/repo".into()),
+            number: "#12".into(),
+            url: "https://github.com/acme/widget/pull/12".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            enter_target(&row, &[], &[], Some("/repo")),
+            EnterTarget::PrView {
+                owner: "acme".into(),
+                repo: "widget".into(),
+                number: 12
+            }
+        );
+    }
+
+    #[test]
+    fn mine_enter_on_a_foreign_pr_opens_the_browser() {
+        let row = WorkRow {
+            kind: WorkKind::Pr,
+            repo_root: Some("/other".into()),
+            number: "#12".into(),
+            url: "https://github.com/acme/widget/pull/12".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            enter_target(&row, &[], &[], Some("/repo")),
+            EnterTarget::Browser(row.url)
         );
     }
 }
