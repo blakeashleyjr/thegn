@@ -21173,17 +21173,31 @@ async fn event_loop<T: Terminal>(
                                             );
                                         }
                                         Section::Keys => {
-                                            if let Some(row) =
-                                                crate::panel::sections::keys::top_row(&panel_ui)
-                                            {
-                                                let bindings =
-                                                    crate::keymap_merge::collect(keymap.config());
+                                            if !panel_ui.width.is_expanded() {
                                                 model.status =
-                                                    crate::panel::sections::keys::where_bound(
-                                                        &row, &bindings,
-                                                    );
+                                                    "widen the panel (e) to look up a binding"
+                                                        .into();
                                             } else {
-                                                model.status = "No key row in view".into();
+                                                let (cols, rows) = panel_geom(&chrome);
+                                                let viewport =
+                                                    crate::panel::sections::scroll_viewport(
+                                                        &model, &panel_ui, cols, rows,
+                                                    );
+                                                if let Some(row) =
+                                                    crate::panel::sections::keys::top_row(
+                                                        &panel_ui, viewport,
+                                                    )
+                                                {
+                                                    let bindings = crate::keymap_merge::collect(
+                                                        keymap.config(),
+                                                    );
+                                                    model.status =
+                                                        crate::panel::sections::keys::where_bound(
+                                                            &row, &bindings,
+                                                        );
+                                                } else {
+                                                    model.status = "No key row in view".into();
+                                                }
                                             }
                                         }
                                         Section::PrQueue | Section::MergeQueue => {

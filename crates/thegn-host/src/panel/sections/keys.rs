@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use crate::panel::{PanelUi, SECTION_ORDER, Section, SectionCtx};
 use crate::seg::{Line, Seg, Tok, seg, sp};
 
-use super::{PanelRow, d, f, g2, g3, hint_row, t, two_col};
+use super::{PanelRow, d, g2, g3, hint_row, t, two_col};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyOrigin {
@@ -183,24 +183,32 @@ fn half_lines(ui: &PanelUi, groups: &[KeyGroup]) -> Vec<Line> {
     lines
 }
 
+fn split_full_groups(groups: &[KeyGroup]) -> (Vec<KeyGroup>, Vec<KeyGroup>) {
+    let total: usize = groups.iter().map(|group| group.rows.len() + 2).sum();
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    let mut left_len = 0;
+    for group in groups {
+        let group_len = group.rows.len() + 2;
+        if left_len + group_len <= total.div_ceil(2) || left.is_empty() {
+            left_len += group_len;
+            left.push(group.clone());
+        } else {
+            right.push(group.clone());
+        }
+    }
+    (left, right)
+}
+
 fn full_lines(ui: &PanelUi, groups: &[KeyGroup], cols: usize) -> Vec<Line> {
     let mut lines = filter_bar(ui).map_or_else(Vec::new, |row| vec![row.line]);
     if groups.is_empty() {
         lines.extend(no_matches(ui));
         return lines;
     }
-
-    let total: usize = groups.iter().map(|group| group.rows.len() + 2).sum();
-    let mut left = Vec::new();
-    let mut right = Vec::new();
-    for group in groups {
-        let group = group_lines(group);
-        if left.len() + group.len() <= total.div_ceil(2) || left.is_empty() {
-            left.extend(group);
-        } else {
-            right.extend(group);
-        }
-    }
+    let (left_groups, right_groups) = split_full_groups(groups);
+    let left: Vec<Line> = left_groups.iter().flat_map(group_lines).collect();
+    let right: Vec<Line> = right_groups.iter().flat_map(group_lines).collect();
     let to_segs = |lines: Vec<Line>| -> Vec<Vec<Seg>> {
         lines
             .into_iter()
@@ -215,9 +223,9 @@ fn full_lines(ui: &PanelUi, groups: &[KeyGroup], cols: usize) -> Vec<Line> {
     lines
 }
 
-fn visible_groups(ctx: &SectionCtx) -> Vec<KeyGroup> {
-    let mut groups = groups(ctx.ui);
-    if ctx.ui.keys_filter.is_empty() && ctx.ui.width == crate::layout::PanelWidth::Normal {
+fn visible_groups(ui: &PanelUi, width: crate::layout::PanelWidth) -> Vec<KeyGroup> {
+    let mut groups = groups(ui);
+    if ui.keys_filter.is_empty() && width == crate::layout::PanelWidth::Normal {
         groups.retain(|group| group.title == "Panel");
     }
     groups
@@ -269,7 +277,7 @@ fn full(ctx: &SectionCtx, groups: &[KeyGroup]) -> Vec<PanelRow> {
 }
 
 pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
-    let groups = visible_groups(ctx);
+    let groups = visible_groups(ctx.ui, ctx.ui.width);
     if ctx.full() {
         full(ctx, &groups)
     } else if ctx.deep() {
@@ -281,7 +289,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
 
 /// Number of unscrolled content lines rendered by the scrollable Keys views.
 pub(crate) fn line_count(ctx: &SectionCtx) -> usize {
-    let groups = visible_groups(ctx);
+    let groups = visible_groups(ctx.ui, ctx.ui.width);
     if ctx.full() {
         full_lines(ctx.ui, &groups, ctx.cols).len()
     } else {
@@ -289,12 +297,64 @@ pub(crate) fn line_count(ctx: &SectionCtx) -> usize {
     }
 }
 
-/// Find the first filtered key row at or below the current line scroll.
-pub(crate) fn top_row(ui: &PanelUi) -> Option<KeyRow> {
-    groups(ui)
-        .into_iter()
-        .flat_map(|group| group.rows)
-        .nth(ui.scroll)
+fn half_line_rows(ui: &PanelUi, groups: &[KeyGroup]) -> Vec<Option<KeyRow>> {
+    let mut rows = Vec::new();
+    if filter_bar(ui).is_some() {
+        rows.push(None);
+    }
+    if groups.is_empty() {
+        rows.extend(no_matches(ui).into_iter().map(|_| None));
+        return rows;
+    }
+    for group in groups {
+        rows.push(None);
+        rows.extend(group.rows.iter().cloned().map(Some));
+        rows.push(None);
+    }
+    rows
+}
+
+fn full_line_rows(ui: &PanelUi, groups: &[KeyGroup]) -> Vec<Option<KeyRow>> {
+    let mut rows = Vec::new();
+    if filter_bar(ui).is_some() {
+        rows.push(None);
+    }
+    if groups.is_empty() {
+        rows.extend(no_matches(ui).into_iter().map(|_| None));
+        return rows;
+    }
+    let (left_groups, right_groups) = split_full_groups(groups);
+    let mut left: Vec<Option<KeyRow>> = left_groups
+        .iter()
+        .flat_map(|group| {
+            std::iter::once(None)
+                .chain(group.rows.iter().cloned().map(Some))
+                .chain(std::iter::once(None))
+        })
+        .collect();
+    let right_len: usize = right_groups.iter().map(|group| group.rows.len() + 2).sum();
+    left.resize(left.len().max(right_len), None);
+    rows.extend(left);
+    rows
+}
+
+/// Find the first visible key row at or below the current line scroll.
+pub(crate) fn top_row(ui: &PanelUi, viewport: usize) -> Option<KeyRow> {
+    let groups = visible_groups(ui, ui.width);
+    let rows = if ui.width == crate::layout::PanelWidth::Full {
+        full_line_rows(ui, &groups)
+    } else {
+        half_line_rows(ui, &groups)
+    };
+    let visible = if ui.width == crate::layout::PanelWidth::Full {
+        viewport.saturating_sub(2)
+    } else {
+        viewport
+    };
+    let max = rows.len().saturating_sub(visible);
+    rows.into_iter()
+        .skip(ui.scroll.min(max))
+        .find_map(|row| row)
 }
 
 /// Explain the source of a displayed binding without performing any I/O.
@@ -421,6 +481,25 @@ mod tests {
     }
 
     #[test]
+    fn half_top_row_tracks_rendered_line_offset() {
+        let ui = PanelUi {
+            width: PanelWidth::Half,
+            ..test_ui()
+        };
+        let groups = visible_groups(&ui, ui.width);
+        let expected = groups[1].rows[0].clone();
+        let target_line = groups[0].rows.len() + 3;
+        assert_eq!(
+            half_line_rows(&ui, &groups)[target_line],
+            Some(expected.clone())
+        );
+        let mut ui = ui;
+        ui.scroll = target_line;
+
+        assert_eq!(top_row(&ui, 1), Some(expected));
+    }
+
+    #[test]
     fn line_count_matches_render_at_half_and_full_width() {
         for width in [PanelWidth::Half, PanelWidth::Full] {
             let mut ui = test_ui();
@@ -441,6 +520,49 @@ mod tests {
             };
             let expected = line_count(&ctx);
             assert_eq!(actual, expected, "{width:?}");
+        }
+    }
+
+    #[test]
+    fn unfiltered_scroll_extent_reaches_the_end_at_half_and_full_width() {
+        let model = crate::chrome::FrameModel::default();
+        for width in [PanelWidth::Half, PanelWidth::Full] {
+            let mut ui = PanelUi { width, ..test_ui() };
+            let cols = 80;
+            let rows = 20;
+            let extent =
+                crate::panel::sections::scroll_extent(Section::Keys, &model, &ui, cols, rows)
+                    .expect("expanded Keys view owns scrolling");
+            let viewport = crate::panel::sections::scroll_viewport(&model, &ui, cols, rows);
+            let visible = if width == PanelWidth::Full {
+                viewport.saturating_sub(2)
+            } else {
+                viewport
+            };
+            assert!(visible > 0, "test geometry has visible body rows");
+            ui.scroll = extent.max;
+            let rendered = content(&SectionCtx {
+                model: &model,
+                ui: &ui,
+                cols: cols - 2,
+                rows: viewport,
+            });
+            let lines = if width == PanelWidth::Full {
+                full_line_rows(&ui, &visible_groups(&ui, width))
+            } else {
+                half_line_rows(&ui, &visible_groups(&ui, width))
+            };
+            assert_eq!(extent.max + visible, lines.len(), "{width:?}");
+            let last_visible = lines[extent.max..]
+                .iter()
+                .take(visible)
+                .rev()
+                .find_map(Option::as_ref)
+                .expect("the scroll tail contains a key row");
+            assert!(
+                format!("{rendered:?}").contains(&last_visible.label),
+                "{width:?}"
+            );
         }
     }
 }
