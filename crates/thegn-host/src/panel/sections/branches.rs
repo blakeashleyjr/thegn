@@ -4,6 +4,7 @@
 use thegn_core::theme::Hue;
 use thegn_core::util::age;
 
+use crate::panel::gitui::DocLoad;
 use crate::panel::gitui::GitView;
 use crate::seg::{Line, Seg, seg, sp};
 
@@ -27,7 +28,12 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         rows.push(fr);
     }
     if data.branches.is_empty() {
-        rows.push(PanelRow::plain(Line::segs(vec![seg(g(), "no branches")])));
+        let message = match &data.branches_load {
+            DocLoad::Pending => "loading branches…".to_string(),
+            DocLoad::Ready => "no branches".to_string(),
+            DocLoad::Failed(error) => format!("branches unavailable: {error}"),
+        };
+        rows.push(PanelRow::plain(Line::segs(vec![seg(g(), message)])));
         return rows;
     }
     let indices = super::filtered_indices(ui, GitView::Branches, data.branches.len(), |i| {
@@ -80,4 +86,55 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         rows.push(super::context_hint_row(GitView::Branches));
     }
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::content;
+    use crate::chrome::FrameModel;
+    use crate::layout::PanelWidth;
+    use crate::panel::gitui::DocLoad;
+    use crate::panel::sections::{Section, SectionCtx};
+
+    #[test]
+    fn branches_pending_ready_failed_render_distinctly() {
+        let render = |load| {
+            let model = FrameModel {
+                panel: crate::panel::PanelData {
+                    branches_load: load,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let ui = crate::panel::PanelUi {
+                open: Section::Branches,
+                width: PanelWidth::Normal,
+                ..Default::default()
+            };
+            let ctx = SectionCtx {
+                model: &model,
+                ui: &ui,
+                cols: 39,
+                rows: 10,
+            };
+            content(&ctx)
+                .iter()
+                .flat_map(|row| match &row.line {
+                    crate::seg::Line::Segs(segs) => {
+                        segs.iter().map(|s| s.text.as_str()).collect::<Vec<_>>()
+                    }
+                    _ => Vec::new(),
+                })
+                .collect::<String>()
+        };
+        let pending = render(DocLoad::Pending);
+        let ready = render(DocLoad::Ready);
+        let failed = render(DocLoad::Failed("git unavailable".into()));
+        assert_ne!(pending, ready);
+        assert_ne!(pending, failed);
+        assert_ne!(ready, failed);
+        assert!(pending.contains("loading branches"), "{pending}");
+        assert!(ready.contains("no branches"), "{ready}");
+        assert!(failed.contains("git unavailable"), "{failed}");
+    }
 }

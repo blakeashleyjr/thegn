@@ -488,6 +488,7 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                     }
                 }
                 let (msg, success) = drive_summary(&out);
+                ctx.model.status = msg.clone();
                 if success {
                     ctx.toasts.success(msg, now);
                 } else {
@@ -508,6 +509,7 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
             }
             DriveMsg::Failed(e) => {
                 *ctx.fold_inflight = false;
+                ctx.model.status = format!("Merge queue: {e}");
                 ctx.toasts.info_ttl(
                     format!("Merge queue: {e}"),
                     now,
@@ -1928,6 +1930,57 @@ mod tests {
             },
         );
         assert_eq!(model.status, note);
+    }
+
+    #[test]
+    fn drive_failed_and_done_resolve_status() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let cfg = Config::default();
+        let notify = crate::notify::NotifyState::new(
+            cfg.notifications.clone(),
+            String::new(),
+            waker.clone(),
+        );
+        let event_bus = thegn_core::event_bus::EventBus::new();
+        let session = crate::session::Session::default();
+
+        let status_after = |message| {
+            let mut model = crate::chrome::FrameModel::default();
+            let mut toasts = Toasts::default();
+            let mut fold_inflight = false;
+            let mut want_model_refresh = false;
+            let mut dirty = false;
+            let mut loop_perf = crate::perf::LoopPerf::new();
+            let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+            tx.send(message).unwrap();
+            drain_drive_msgs(
+                &mut rx,
+                &mut DrainCtx {
+                    model: &mut model,
+                    toasts: &mut toasts,
+                    notify_state: &notify,
+                    event_bus: &event_bus,
+                    fold_inflight: &mut fold_inflight,
+                    want_model_refresh: &mut want_model_refresh,
+                    dirty: &mut dirty,
+                    loop_perf: &mut loop_perf,
+                    session: &session,
+                    waker: &waker,
+                },
+            );
+            model.status
+        };
+
+        assert_eq!(status_after(DriveMsg::Failed("x".into())), "Merge queue: x");
+        let outcome = DriveOutcome::default();
+        assert_eq!(
+            status_after(DriveMsg::Done(outcome.clone())),
+            drive_summary(&outcome).0
+        );
     }
 
     #[test]
