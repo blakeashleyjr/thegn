@@ -164,7 +164,8 @@ configured it reports `default`), `Alt-Shift-R` marks everything read
 (`attention-next`). While do-not-disturb or a non-default mode is on, a
 `● dnd` / `◉ <mode>` chip appears at the head of the badge cluster.
 Activating the CI badge opens a **CI runs** popup (`↵` view, `o` open, `r`
-rerun, `c` cancel); the palette's `open-ci` action opens the Work ▸ CI
+reruns failed jobs, `R` reruns all jobs, `c` cancels after a second press); the
+palette's `open-ci` action opens the Work ▸ CI
 panel section instead.
 
 There is **one attention chip**. `✋ N` counts what needs you: worktrees at
@@ -193,9 +194,9 @@ popup staying open (on a needs-you row that quiets the worktree **and**
 retires its inbox rows); `a` clears all — the same total clear from every
 row — and closes the popup. Merge-queue rows act in place — `l` lands a gated-green branch, `r`
 retries a blocked one, `x` removes it, `m` jumps to the full Work ▸ Merge
-queue section. (In the panel's System ▸ Notifications section, `a` asks for confirmation and
-clears the inbox; it ignores an active filter. The popup's `a` still clears
-without confirmation.) Ephemeral confirmations
+queue section. (In the panel's System ▸ Notifications section and in this
+popup, `a` asks for confirmation before clearing. In the panel it ignores an
+active filter. `Alt-Shift-R` still marks everything read immediately.) Ephemeral confirmations
 ("Landed") surface as transient toasts — the passing view of routed events
 that also land in this inbox — and direct acknowledgements ("Text copied")
 are toasts only.
@@ -217,7 +218,8 @@ view to all worktrees, and again to narrow back.
 `Alt-Shift-R` — is the clear. It marks the notifications the current scope shows read (this
 repo's + host-global rows by default; every repo's only under the `g`
 all-worktrees view) **and** acknowledges the live needs-you signals,
-including the worktree you're currently on. That second
+including the worktree you're currently on. In the unified popup, `a` asks for
+confirmation first; `Alt-Shift-R` still clears immediately. That second
 half matters: "CI failed", "PR has conflicts" and "changes requested" are
 derived from the PR/CI caches rather than from an inbox row, so marking
 notifications read alone would leave the `✋` chip lit and it would reappear
