@@ -689,7 +689,9 @@ mod tests {
         assert!(probe_allowed("", None, false, Network::Host, false));
         assert!(probe_allowed("", None, true, Network::Host, true));
         assert!(!probe_allowed("", None, true, Network::Host, false));
-        assert!(!probe_allowed(
+        // OCI Network::Host maps to `--network host`, which shares the host
+        // loopback namespace even for the rootless Podman backend.
+        assert!(probe_allowed(
             "podman-rootless",
             None,
             true,

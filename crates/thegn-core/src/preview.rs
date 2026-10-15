@@ -863,21 +863,21 @@ mod tests {
     #[test]
     fn cols_exact_wrap_is_joined() {
         assert_eq!(
-            parse_pane_port_hints_wrapped("12345678localhost:87\r\n65/\n", Some(20))
+            parse_pane_port_hints_wrapped("1234567 localhost:87\r\n65/\n", Some(20))
                 .iter()
                 .map(|hint| hint.port)
                 .collect::<Vec<_>>(),
             vec![8765]
         );
         assert_eq!(
-            parse_pane_port_hints_wrapped("1234567localhost:87\r\n65/\n", Some(20))
+            parse_pane_port_hints_wrapped("123456 localhost:87\r\n65/\n", Some(20))
                 .iter()
                 .map(|hint| hint.port)
                 .collect::<Vec<_>>(),
             vec![87]
         );
         assert_eq!(
-            parse_pane_port_hints_wrapped("12345678localhost:87\n65/\n", Some(20))
+            parse_pane_port_hints_wrapped("1234567 localhost:87\n65/\n", Some(20))
                 .iter()
                 .map(|hint| hint.port)
                 .collect::<Vec<_>>(),
@@ -885,7 +885,7 @@ mod tests {
         );
         assert_eq!(
             parse_pane_port_hints_wrapped(
-                "12345678901234567890\r12345678localhost:87\n65/\n",
+                "12345678901234567890\r1234567 localhost:87\n65/\n",
                 Some(20)
             )
             .iter()
