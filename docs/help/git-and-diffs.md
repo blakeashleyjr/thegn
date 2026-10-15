@@ -41,9 +41,10 @@ says so; if commit files cannot be read, it reports that state. `E` edits
 (interactive rebase stopping at the commit); bare `e` is always the panel
 width cycle. Rebase `s` (squash), `f` (fixup), and `d` (drop) ask for
 confirmation first; `i` plans from the selected commit and refuses merge
-ranges. `B` marks the selected commit as a rebase base; press it again to
-clear the mark. With a mark, `i` plans the commits after it up to HEAD and
-refuses if the mark is HEAD, is not an ancestor, or is gone (press `B` to
+ranges. `B` marks the selected commit as a rebase base; press `B` on the
+marked commit to clear it, or on another commit to move the mark. With a mark,
+`i` plans the commits after it up to HEAD and refuses if the mark is HEAD, is
+not an ancestor, or is gone (press `B` to
 re-mark). Without a mark, `i` plans from the selected commit.
 
 ### branches
