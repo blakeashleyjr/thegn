@@ -17,6 +17,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::IpAddr;
@@ -486,12 +487,16 @@ const BORE_PUBLIC: &str = "bore.pub";
 
 fn plan_bore(spec: &ShareSpec, b: &BoreConfig) -> SharePlan {
     let secret = expand_env_ref(&b.secret);
+    let mut env = vec![("RUST_LOG".into(), "info".into())];
+    if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
+        env.push(("BORE_SECRET".into(), secret));
+    }
     SharePlan {
         program: "bore".into(),
-        args: bore_args(spec.local_port, b, secret.as_deref()),
+        args: bore_args(spec.local_port, b),
         // bore logs the "listening at" line via `tracing` at info on stderr;
         // make sure it's emitted regardless of an inherited RUST_LOG.
-        env: vec![("RUST_LOG".into(), "info".into())],
+        env,
         files: Vec::new(),
         url_rule: UrlRule::AfterMarker {
             marker: "listening at ".into(),
@@ -500,8 +505,8 @@ fn plan_bore(spec: &ShareSpec, b: &BoreConfig) -> SharePlan {
     }
 }
 
-/// `bore local <port> --to <relay> [--secret S] [--port N] [--local-host H] …`.
-fn bore_args(local_port: u16, b: &BoreConfig, secret: Option<&str>) -> Vec<String> {
+/// `bore local <port> --to <relay> [--port N] [--local-host H] …`.
+fn bore_args(local_port: u16, b: &BoreConfig) -> Vec<String> {
     let mut a = vec!["local".into(), local_port.to_string()];
     let to = b.to.trim();
     a.push("--to".into());
@@ -518,10 +523,6 @@ fn bore_args(local_port: u16, b: &BoreConfig, secret: Option<&str>) -> Vec<Strin
     if !local_host.is_empty() {
         a.push("--local-host".into());
         a.push(local_host.to_string());
-    }
-    if let Some(s) = secret {
-        a.push("--secret".into());
-        a.push(s.to_string());
     }
     a.extend(b.extra_args.iter().cloned());
     a
@@ -1190,6 +1191,35 @@ fn repository_identity(worktree: &std::path::Path) -> Vec<u8> {
     common_dir.as_os_str().as_encoded_bytes().to_vec()
 }
 
+const DIRECT_CLIENT_ENV_KEYS: &[&str] = &[
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "SystemRoot",
+    "WINDIR",
+];
+
+/// Keep only basic runtime locale, path, and temporary-directory settings.
+/// HOME, account names, DBUS_*, IROH_SECRET, provider credentials, and OCI
+/// connection variables are deliberately excluded. Adding a key requires
+/// source review because every direct share client starts with this environment.
+fn direct_client_env(
+    ambient: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    ambient
+        .into_iter()
+        .filter(|(key, _)| {
+            DIRECT_CLIENT_ENV_KEYS
+                .iter()
+                .any(|allowed| key == OsStr::new(allowed))
+        })
+        .collect()
+}
+
 /// Spawn the tunnel client described by `plan`, materializing its files into
 /// `statedir` (0600) and expanding the `{statedir}` token in its args.
 ///
@@ -1202,8 +1232,17 @@ pub fn start(
     statedir: &std::path::Path,
     timeout: Duration,
 ) -> Result<RunningShare> {
+    start_with_ambient(plan, statedir, timeout, std::env::vars_os())
+}
+
+fn start_with_ambient(
+    plan: &SharePlan,
+    statedir: &std::path::Path,
+    timeout: Duration,
+    ambient: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Result<RunningShare> {
     let manifest = read_owner_manifest(statedir)?;
-    match start_inner(plan, statedir, timeout, manifest.as_deref()) {
+    match start_inner(plan, statedir, timeout, manifest.as_deref(), ambient) {
         Ok(mut running) => {
             running.cleanup = Some((
                 statedir.to_path_buf(),
@@ -1292,6 +1331,7 @@ fn start_inner(
     statedir: &std::path::Path,
     timeout: Duration,
     owner_manifest: Option<&[u8]>,
+    ambient: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Result<RunningShare> {
     verify_owner_manifest(statedir, owner_manifest)?;
     if matches!(&plan.url_rule, UrlRule::Fixed(_)) && plan.url_rule.fixed().is_none() {
@@ -1306,7 +1346,9 @@ fn start_inner(
         .collect();
 
     let mut cmd = Command::new(&plan.program);
-    cmd.args(&args)
+    cmd.env_clear()
+        .envs(direct_client_env(ambient))
+        .args(&args)
         .current_dir(statedir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
