@@ -7863,7 +7863,6 @@ async fn event_loop<T: Terminal>(
     let mut pending_switch = crate::workspace_switch_prep::PendingSwitch::default();
     let (switch_result_tx, mut switch_result_rx) = tokio_mpsc::unbounded_channel();
     let mut deferred_preset: Option<(u64, thegn_core::store::IntentRow)> = None;
-    let mut last_activation_pending = false;
     let mut open_merge_queue_on_pending = false;
     let mut applied_switch_seq: Option<u64> = None;
     // Last-seen OSC-title generation (emulator::title_generation): the render
@@ -7997,7 +7996,7 @@ async fn event_loop<T: Terminal>(
                 model.status = format!("{} Opening {}…", crate::loading::plan::spinner_now(), name);
                 pending_switch.set_spinner(request.seq, model.status.clone());
                 switch_at = None;
-                dirty = true;
+                dirty |= true;
                 false
             } else {
                 pending_switch.supersede();
@@ -8069,7 +8068,6 @@ async fn event_loop<T: Terminal>(
     // one door every activation gesture already goes through.
     macro_rules! activate_row {
         ($target:expr) => {{
-            last_activation_pending = false;
             let target = $target;
             let was_terminal = active_is_terminal(&session);
             let project_target = is_project_activation_target(&target);
@@ -8100,7 +8098,7 @@ async fn event_loop<T: Terminal>(
             if project_target && !cold_target {
                 leave_terminal_region!();
             }
-            match activate_row_target(
+            let activation = activate_row_target(
                 target,
                 &mut session,
                 &mut model,
@@ -8113,9 +8111,13 @@ async fn event_loop<T: Terminal>(
                 &mut need_relayout,
                 &mut clear_on_next_frame,
                 Some((&terminal_restore_tx, &waker)),
-            ) {
+            );
+            let activation_pending = matches!(
+                &activation,
+                crate::handlers::sidebar_activate::Activation::Pending(_)
+            );
+            let workspace_switched = match activation {
                 crate::handlers::sidebar_activate::Activation::Pending(mut spec) => {
-                    last_activation_pending = true;
                     spec.after.open_merge_queue = open_merge_queue_on_pending;
                     spec.after.region_bookmark = Some((was_terminal, here));
                     spec.after.set_region_last_w = true;
@@ -8136,7 +8138,7 @@ async fn event_loop<T: Terminal>(
                         format!("{} Opening {}…", crate::loading::plan::spinner_now(), name);
                     pending_switch.set_spinner(request.seq, model.status.clone());
                     switch_at = None;
-                    dirty = true;
+                    dirty |= true;
                     false
                 }
                 crate::handlers::sidebar_activate::Activation::Failed => false,
@@ -8175,13 +8177,14 @@ async fn event_loop<T: Terminal>(
                     }
                     workspace_switched
                 }
-            }
+            };
+            (workspace_switched, activation_pending)
         }};
     }
 
     macro_rules! set_jump_status {
-        ($status:expr) => {
-            if crate::workspace_switch_prep::should_replace_jump_status(last_activation_pending) {
+        ($pending:expr, $status:expr) => {
+            if crate::workspace_switch_prep::should_replace_jump_status($pending) {
                 model.status = $status;
             }
         };
@@ -8203,7 +8206,7 @@ async fn event_loop<T: Terminal>(
                 Some(target) => {
                     board = None;
                     focus.zone = crate::focus::Zone::Center;
-                    if activate_row!(target) {
+                    if activate_row!(target).0 {
                         kick_model_hydration!();
                     }
                     need_relayout = true;
@@ -8345,7 +8348,7 @@ async fn event_loop<T: Terminal>(
                 SidebarOutcome::Activate(target) => {
                     let kind = crate::handlers::sidebar_activate::switch_kind(&target, &session.id);
                     switch_at = Some((std::time::Instant::now(), kind));
-                    if activate_row!(target) {
+                    if activate_row!(target).0 {
                         kick_model_hydration!();
                     }
                     dirty = true;
@@ -8368,7 +8371,8 @@ async fn event_loop<T: Terminal>(
                     let activated = activate_row!(crate::sidebar::RowTarget::Workspace {
                         repo_path: repo_path.clone(),
                         group: None,
-                    });
+                    })
+                    .0;
                     open_merge_queue_on_pending = false;
                     if !activated {
                         // Activation reports a user-visible status on DB/path
@@ -16804,7 +16808,7 @@ async fn event_loop<T: Terminal>(
                                         &session.id,
                                     ),
                                 ));
-                                let hydrate = activate_row!(target);
+                                let hydrate = activate_row!(target).0;
                                 // A switch from the sidebar keeps the user in
                                 // the center terminal if that's where they were
                                 // typing (matching keyboard NextTab/PrevTab);
@@ -17758,7 +17762,7 @@ async fn event_loop<T: Terminal>(
                             crate::detail::DetailAction::ActivateTarget(target),
                         ) => {
                             bar_detail = None;
-                            if activate_row!(target) {
+                            if activate_row!(target).0 {
                                 kick_model_hydration!();
                             }
                             sb.focus_active_row(&mut model);
@@ -21224,9 +21228,9 @@ async fn event_loop<T: Terminal>(
                                                             )
                                                         });
                                                     if let Some(target) = linked {
-                                                        let hydrate = activate_row!(target);
+                                                        let (hydrate, pending) = activate_row!(target);
                                                         sb.focus_active_row(&mut model);
-                                                        set_jump_status!(format!("Jumped to {}", p.head_ref));
+                                                        set_jump_status!(pending, format!("Jumped to {}", p.head_ref));
                                                         if hydrate {
                                                             kick_model_hydration!();
                                                         }
@@ -21378,9 +21382,9 @@ async fn event_loop<T: Terminal>(
                                                     active_repo,
                                                 ) {
                                                     crate::panel::sections::my_work::EnterTarget::Jump(target) => {
-                                                        let hydrate = activate_row!(target);
+                                                        let (hydrate, pending) = activate_row!(target);
                                                         sb.focus_active_row(&mut model);
-                                                        set_jump_status!(format!("Jumped to {}", row.number));
+                                                        set_jump_status!(pending, format!("Jumped to {}", row.number));
                                                         if hydrate {
                                                             kick_model_hydration!();
                                                         }
@@ -21445,7 +21449,7 @@ async fn event_loop<T: Terminal>(
                                                 let target = crate::handlers::take_me_there::notification_target(&notification, &groups, &model.sidebar_db_worktrees);
                                                 let mark_read = !matches!(&target, crate::handlers::take_me_there::NotificationTarget::Nothing);
                                                 match target {
-                                                    crate::handlers::take_me_there::NotificationTarget::Jump(target) => { let hydrate = activate_row!(target); sb.focus_active_row(&mut model); set_jump_status!(format!("Jumped to {}", notification.worktree_path)); if hydrate { kick_model_hydration!(); } }
+                                                    crate::handlers::take_me_there::NotificationTarget::Jump(target) => { let (hydrate, pending) = activate_row!(target); sb.focus_active_row(&mut model); set_jump_status!(pending, format!("Jumped to {}", notification.worktree_path)); if hydrate { kick_model_hydration!(); } }
                                                     crate::handlers::take_me_there::NotificationTarget::Browser(url) => model.status = crate::actions::open_status(open_url_detached(&url), || format!("Opened {} in browser", notification.source_ref)),
                                                     crate::handlers::take_me_there::NotificationTarget::Nothing => model.status = "nothing to jump to — space expands".into(),
                                                 }
@@ -21799,12 +21803,16 @@ async fn event_loop<T: Terminal>(
                                                     &model.sidebar_db_worktrees,
                                                 ) {
                                                     Some(target) => {
-                                                        let hydrate = activate_row!(target);
+                                                        let (hydrate, pending) =
+                                                            activate_row!(target);
                                                         sb.focus_active_row(&mut model);
-                                                        set_jump_status!(format!(
-                                                            "Jumped to {}",
-                                                            e.worktree_label
-                                                        ));
+                                                        set_jump_status!(
+                                                            pending,
+                                                            format!(
+                                                                "Jumped to {}",
+                                                                e.worktree_label
+                                                            )
+                                                        );
                                                         if hydrate {
                                                             kick_model_hydration!();
                                                         }
@@ -22038,9 +22046,12 @@ async fn event_loop<T: Terminal>(
                                             )
                                         });
                                     if let Some(target) = linked {
-                                        let hydrate = activate_row!(target);
+                                        let (hydrate, pending) = activate_row!(target);
                                         sb.focus_active_row(&mut model);
-                                        set_jump_status!(format!("Jumped to {}", p.head_ref));
+                                        set_jump_status!(
+                                            pending,
+                                            format!("Jumped to {}", p.head_ref)
+                                        );
                                         if hydrate {
                                             kick_model_hydration!();
                                         }
@@ -26772,9 +26783,9 @@ async fn event_loop<T: Terminal>(
                             Action::JumpAttention => {
                                 match crate::handlers::attention::next_target(&model, &session) {
                                     Some((t, status)) => {
-                                        let hydrate = activate_row!(t);
+                                        let (hydrate, pending) = activate_row!(t);
                                         sb.focus_active_row(&mut model);
-                                        set_jump_status!(status);
+                                        set_jump_status!(pending, status);
                                         if hydrate {
                                             kick_model_hydration!();
                                         }

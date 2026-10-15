@@ -2128,7 +2128,7 @@ mod tests {
         let repo = repo.to_string_lossy().into_owned();
         let first_slug = thegn_core::repo::repo_slug_with(&db, std::path::Path::new(&first_repo));
         let slug = thegn_core::repo::repo_slug_with(&db, std::path::Path::new(&repo));
-        let mut first = Session {
+        let first = Session {
             id: first_repo.clone(),
             worktrees: vec![WorktreeGroup::new(
                 format!("{first_slug}/main"),
