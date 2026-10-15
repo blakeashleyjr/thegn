@@ -87,7 +87,7 @@ fn cleanup_failed_scratch_add(repo_root: &Path, scratch: ScratchDirectory) {
                 &path,
                 "scratch identity changed after failed worktree add",
             );
-            tracing::warn!(target: "thegn::integrate", path = %path.display(), %error, "failed worktree add scratch identity changed; preserving it; inspect $XDG_STATE_HOME/thegn/gate quarantine records for repair");
+            tracing::warn!(target: "thegn::integrate", path = %path.display(), %error, "failed worktree add scratch identity changed; preserving it; see `thegn doctor` (merge gate quarantines) for repair");
         }
         return;
     }
@@ -99,7 +99,7 @@ fn cleanup_failed_scratch_add(repo_root: &Path, scratch: ScratchDirectory) {
                 &path,
                 "failed worktree add scratch contents unverifiable",
             );
-            tracing::warn!(target: "thegn::integrate", path = %path.display(), %error, "failed worktree add scratch contents unverifiable; preserving it; inspect $XDG_STATE_HOME/thegn/gate quarantine records for repair");
+            tracing::warn!(target: "thegn::integrate", path = %path.display(), %error, "failed worktree add scratch contents unverifiable; preserving it; see `thegn doctor` (merge gate quarantines) for repair");
             return;
         }
     };
@@ -109,7 +109,7 @@ fn cleanup_failed_scratch_add(repo_root: &Path, scratch: ScratchDirectory) {
                 &path,
                 "failed worktree add left an empty scratch directory",
             );
-            tracing::warn!(target: "thegn::integrate", path = %path.display(), %error, "empty scratch cleanup failed; preserving it; inspect $XDG_STATE_HOME/thegn/gate quarantine records for repair");
+            tracing::warn!(target: "thegn::integrate", path = %path.display(), %error, "empty scratch cleanup failed; preserving it; see `thegn doctor` (merge gate quarantines) for repair");
         }
         return;
     }
@@ -122,7 +122,7 @@ fn cleanup_failed_scratch_add(repo_root: &Path, scratch: ScratchDirectory) {
                 &path,
                 "failed worktree add gitfile unverifiable",
             );
-            tracing::warn!(target: "thegn::integrate", path = %path.display(), %error, "failed worktree add gitfile unverifiable; preserving it; inspect $XDG_STATE_HOME/thegn/gate quarantine records for repair");
+            tracing::warn!(target: "thegn::integrate", path = %path.display(), %error, "failed worktree add gitfile unverifiable; preserving it; see `thegn doctor` (merge gate quarantines) for repair");
             return;
         }
     };
@@ -133,7 +133,7 @@ fn cleanup_failed_scratch_add(repo_root: &Path, scratch: ScratchDirectory) {
             &path,
             "failed worktree add left a partial scratch directory",
         );
-        tracing::warn!(target: "thegn::integrate", path = %path.display(), %error, "partial scratch cleanup failed; preserving it; inspect $XDG_STATE_HOME/thegn/gate quarantine records for repair");
+        tracing::warn!(target: "thegn::integrate", path = %path.display(), %error, "partial scratch cleanup failed; preserving it; see `thegn doctor` (merge gate quarantines) for repair");
     }
 }
 
@@ -4954,6 +4954,8 @@ mod tests {
                 .iter()
                 .any(|(workspace, _)| workspace == &path)
         );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::remove_dir(&displaced).unwrap();
     }
 
     #[test]
