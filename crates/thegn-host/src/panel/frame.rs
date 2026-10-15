@@ -48,7 +48,11 @@ pub(super) fn header_rows(model: &FrameModel, focused: bool, cols: usize) -> Vec
         sp(1),
         seg(
             Tok::Slot(if focused { S::Accent } else { S::Text }),
-            data.branch.clone(),
+            if data.branch == "HEAD" && super::staging::active_worktree_jj(model) {
+                "HEAD (jj working copy)".to_string()
+            } else {
+                data.branch.clone()
+            },
         )
         .bold(),
     ];
@@ -1338,6 +1342,56 @@ mod tests {
         assert_eq!(
             section_rows(Section::Files, &model, &preview_ui, 100, 30),
             0
+        );
+    }
+
+    #[test]
+    fn detached_head_in_colocated_repo_reads_as_working_copy() {
+        let mut model = FrameModel {
+            panel: crate::panel::PanelData {
+                branch: "HEAD".into(),
+                ..Default::default()
+            },
+            sidebar_rows: vec![crate::sidebar::SidebarRow {
+                active: true,
+                worktree_path: Some("/repo/wt".into()),
+                ..crate::sidebar::SidebarRow::base(
+                    crate::sidebar::RowKind::Worktree,
+                    1,
+                    "wt",
+                    "repo",
+                )
+            }],
+            ..Default::default()
+        };
+        model.sidebar_status.git.insert(
+            "/repo/wt".into(),
+            crate::sidebar::GitGlyphs {
+                jj: true,
+                ..Default::default()
+            },
+        );
+        let rows = header_rows(&model, true, 80);
+        assert!(text_of(&rows[0].line).contains("HEAD (jj working copy)"));
+    }
+
+    #[test]
+    fn plain_repo_detached_head_stays_neutral() {
+        let model = FrameModel {
+            panel: crate::panel::PanelData {
+                branch: "HEAD".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rows = header_rows(&model, true, 80);
+        assert!(text_of(&rows[0].line).contains("HEAD"));
+        let (Line::Split { l, .. } | Line::SplitMinLeft { l, .. }) = &rows[0].line else {
+            panic!("expected split branch row");
+        };
+        assert!(
+            !l.iter()
+                .any(|item| matches!(item.fg, Tok::Hue(Hue::Red | Hue::Amber)))
         );
     }
 }

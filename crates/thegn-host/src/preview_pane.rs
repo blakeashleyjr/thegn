@@ -35,6 +35,8 @@ pub(crate) const PREVIEW_MAX_LINES: usize = 50_000;
 pub(crate) const PREVIEW_MAX_LINE_BYTES: usize = 4096;
 /// Maximum UTF-8 bytes retained across all rendered preview lines.
 pub(crate) const PREVIEW_MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum prefix retained for a binary hex preview.
+const HEX_PREVIEW_BYTES: usize = 4096;
 
 /// Read a file off the loop for the inline Files preview and route it by
 /// content type, sending text lines (always) and — when `kitty` and the route
@@ -154,7 +156,7 @@ fn route_and_render(
                 })
             },
         ),
-        PreviewRoute::Unknown => (Err("binary file".to_string()), None),
+        PreviewRoute::Unknown => (read_hex_preview(abs), None),
     }
 }
 
@@ -197,10 +199,65 @@ fn route(abs: &std::path::Path) -> PreviewRoute {
     preview::route_for(abs, &head)
 }
 
-/// Read + decode a file for the plain-text route, rejecting oversized/binary
-/// content. The decode/limits live in [`prepare_preview`] (pure).
+/// Read + decode a file for the plain-text route, falling back to hex for NUL
+/// bytes. The decode/limits live in [`prepare_preview`] (pure).
 fn read_text(abs: &std::path::Path) -> Result<Vec<String>, String> {
-    prepare_preview(&read_bytes(abs)?)
+    let bytes = read_bytes(abs)?;
+    if bytes.contains(&0) {
+        return Ok(hex_dump_lines(
+            &bytes[..bytes.len().min(HEX_PREVIEW_BYTES)],
+            bytes.len() > HEX_PREVIEW_BYTES,
+        ));
+    }
+    prepare_preview(&bytes)
+}
+
+fn read_hex_preview(abs: &std::path::Path) -> Result<Vec<String>, String> {
+    let prefix = crate::rasterize::read_regular_prefix(abs, HEX_PREVIEW_BYTES + 1)
+        .map_err(|e| format!("cannot preview file: {e}"))?;
+    let shown = prefix.len().min(HEX_PREVIEW_BYTES);
+    Ok(hex_dump_lines(
+        &prefix[..shown],
+        prefix.len() > HEX_PREVIEW_BYTES,
+    ))
+}
+
+/// Format a bounded byte prefix as 16-byte hex rows with an ASCII gutter.
+pub(crate) fn hex_dump_lines(bytes: &[u8], total_known_more: bool) -> Vec<String> {
+    let truncated = total_known_more || bytes.len() > HEX_PREVIEW_BYTES;
+    let bytes = &bytes[..bytes.len().min(HEX_PREVIEW_BYTES)];
+    let mut lines = vec![
+        format!(
+            "binary file: first {} bytes shown as hex{}",
+            bytes.len(),
+            if truncated { " (truncated)" } else { "" }
+        ),
+        String::new(),
+    ];
+    for (row, chunk) in bytes.chunks(16).enumerate() {
+        let mut line = format!("{:08x}  ", row * 16);
+        for column in 0..16 {
+            if let Some(byte) = chunk.get(column) {
+                line.push_str(&format!("{byte:02x} "));
+            } else {
+                line.push_str("   ");
+            }
+            if column == 7 {
+                line.push(' ');
+            }
+        }
+        line.push('|');
+        for byte in chunk {
+            line.push(if (0x20..=0x7e).contains(byte) {
+                char::from(*byte)
+            } else {
+                '.'
+            });
+        }
+        line.push('|');
+        lines.push(line);
+    }
+    lines
 }
 
 /// Read a file as UTF-8 (lossy) for the CSV/Jupyter/Mermaid text routes.
@@ -337,6 +394,59 @@ mod tests {
     #[test]
     fn prepare_preview_rejects_binary() {
         assert_eq!(prepare_preview(b"abc\0def"), Err("binary file".into()));
+    }
+
+    #[test]
+    fn hex_dump_formats_offset_hex_and_ascii() {
+        let lines = hex_dump_lines(b"Hello\0\x7f\x80 world!!!", false);
+        assert_eq!(lines[0], "binary file: first 17 bytes shown as hex");
+        assert_eq!(lines[1], "");
+        assert_eq!(
+            lines[2],
+            "00000000  48 65 6c 6c 6f 00 7f 80  20 77 6f 72 6c 64 21 21 |Hello... world!!|"
+        );
+        assert_eq!(
+            lines[3],
+            "00000010  21                                               |!|"
+        );
+    }
+
+    #[test]
+    fn hex_dump_caps_at_limit_and_marks_truncation() {
+        let bytes = vec![0x41; 5000];
+        let lines = hex_dump_lines(&bytes, false);
+        assert_eq!(
+            lines[0],
+            "binary file: first 4096 bytes shown as hex (truncated)"
+        );
+        assert_eq!(lines.len(), 258);
+        assert!(lines[2].starts_with("00000000"));
+        assert!(lines[257].starts_with("00000ff0"));
+    }
+
+    #[test]
+    fn unknown_route_renders_hex_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        std::fs::write(&path, b"\0unknown binary").unwrap();
+
+        let (text, raster) =
+            route_and_render(&path, false, &std::sync::atomic::AtomicBool::new(false));
+        assert!(raster.is_none());
+        assert!(text.unwrap()[0].starts_with("binary file: first 15 bytes shown as hex"));
+    }
+
+    #[test]
+    fn text_route_with_late_nul_falls_back_to_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        let mut bytes = vec![b'x'; 2000];
+        bytes.push(0);
+        std::fs::write(&path, bytes).unwrap();
+
+        let lines = read_text(&path).unwrap();
+        assert_eq!(lines[0], "binary file: first 2001 bytes shown as hex");
+        assert!(lines[2].starts_with("00000000  78 78"));
     }
 
     #[test]
