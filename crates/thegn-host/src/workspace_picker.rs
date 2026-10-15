@@ -221,6 +221,9 @@ pub(crate) struct WorkspacePicker {
     scroll_offset: usize,
     /// True while the off-loop `discover_repos` scan is in flight.
     scanning: bool,
+    db_pending: bool,
+    db_key: Option<String>,
+    db_generation: u64,
     truncated: bool,
     generation: u64,
     cancel: Option<Arc<AtomicBool>>,
@@ -263,6 +266,9 @@ impl WorkspacePicker {
             selected: 0,
             scroll_offset: 0,
             scanning: false,
+            db_pending: false,
+            db_key: None,
+            db_generation: 0,
             truncated: false,
             generation: 0,
             cancel: None,
@@ -281,6 +287,50 @@ impl WorkspacePicker {
     pub(crate) fn start_manual(&mut self, prefill: impl Into<String>) {
         self.mode = PickerMode::Manual;
         self.manual = TextField::new(prefill);
+    }
+
+    pub(crate) fn mark_db_pending(&mut self, key: String, generation: u64) {
+        self.db_key = Some(key);
+        self.db_generation = generation;
+        self.db_pending = true;
+    }
+
+    pub(crate) fn apply_db_result(
+        &mut self,
+        key: &str,
+        generation: u64,
+        seed: Vec<String>,
+        excluded: HashSet<String>,
+    ) -> bool {
+        if !self.db_pending
+            || self.db_key.as_deref() != Some(key)
+            || self.db_generation != generation
+        {
+            return false;
+        }
+        self.apply_db_seed(seed, excluded);
+        self.db_pending = false;
+        true
+    }
+
+    pub(crate) fn clear_db_pending(&mut self, key: &str, generation: u64) {
+        if self.db_key.as_deref() == Some(key) && self.db_generation == generation {
+            self.db_pending = false;
+        }
+    }
+
+    pub(crate) fn apply_db_seed(&mut self, seed: Vec<String>, excluded: HashSet<String>) {
+        let mut items = seed.into_iter().map(entry).collect::<Vec<_>>();
+        for existing in &self.items {
+            if !excluded.contains(&existing.path)
+                && !items.iter().any(|item| item.path == existing.path)
+            {
+                items.push(existing.clone());
+            }
+        }
+        self.items = items;
+        self.excluded = excluded;
+        self.recompute();
     }
 
     /// Enter the clone-in-flight phase (the manual `Clone` submit): the picker
@@ -671,12 +721,19 @@ impl WorkspacePicker {
         let Some(inner) = open_layer(surface, screen, &spec) else {
             return;
         };
+        let mut prompt = input_segs(&self.manual, "path, URL, or new dir…");
+        if self.db_pending {
+            prompt.push(seg(
+                Tok::Slot(S::Ghost2),
+                format!("  {}", crate::caps::active_glyphs().ellipsis),
+            ));
+        }
         seg::draw_line(
             surface,
             inner.x,
             inner.y,
             inner.cols,
-            &Line::segs(input_segs(&self.manual, "path, URL, or new dir…")),
+            &Line::segs(prompt),
             panel,
         );
         let mut y = inner.y + 1;
@@ -776,12 +833,19 @@ impl WorkspacePicker {
                 return;
             };
 
+            let mut prompt = input_segs(&self.query, "type to filter repos…");
+            if self.db_pending {
+                prompt.push(seg(
+                    Tok::Slot(S::Ghost2),
+                    format!("  {}", crate::caps::active_glyphs().ellipsis),
+                ));
+            }
             seg::draw_line(
                 surface,
                 inner.x,
                 inner.y,
                 inner.cols,
-                &Line::segs(input_segs(&self.query, "type to filter repos…")),
+                &Line::segs(prompt),
                 panel,
             );
             if inner.rows < 2 {
