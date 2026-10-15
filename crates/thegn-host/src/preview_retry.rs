@@ -167,7 +167,7 @@ pub(crate) fn oversized_copy_status(bytes: usize) -> String {
     const MIB: usize = KIB * KIB;
     let size = if bytes >= 1024 * 1024 {
         let whole = bytes / MIB;
-        let tenths = ((bytes % MIB) * 10 + MIB / 2) / MIB;
+        let tenths = ((bytes % MIB) * 10 + MIB - 1) / MIB;
         if tenths == 10 {
             format!("{}.0 MiB", whole + 1)
         } else {
@@ -184,7 +184,8 @@ pub(crate) fn oversized_copy_status(bytes: usize) -> String {
     } else {
         format!("{bytes} bytes")
     };
-    format!("Nothing copied: {size} is over the 4 MiB terminal clipboard limit")
+    let limit_mib = crate::frame_writer::OOB_QUEUE_BYTES / MIB;
+    format!("Nothing copied: {size} is over the {limit_mib} MiB terminal clipboard limit")
 }
 
 /// Coalesces refused bells into one retained BEL.
@@ -422,6 +423,9 @@ mod tests {
         assert!(status.contains("Nothing copied"));
         assert!(status.contains("5.2 MiB"));
         assert!(status.contains("4 MiB"));
+
+        let just_over_limit = oversized_copy_status(crate::frame_writer::OOB_QUEUE_BYTES + 1);
+        assert!(!just_over_limit.contains("4.0 MiB"));
     }
 
     #[test]
