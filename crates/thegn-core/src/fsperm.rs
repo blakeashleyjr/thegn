@@ -1490,7 +1490,7 @@ mod tests {
             let dir = &dir;
             let destination = &destination;
             let writing = &writing;
-            let reader = scope.spawn(|| {
+            let reader = scope.spawn(move || {
                 while writing.load(std::sync::atomic::Ordering::Acquire) {
                     match std::fs::read(destination) {
                         Ok(bytes) => {
