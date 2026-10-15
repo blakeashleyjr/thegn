@@ -3350,10 +3350,10 @@ pub struct LimitsConfig {
     /// Max concurrent test/discovery jobs across all worktrees. 1 keeps an
     /// explicit run from competing with another worktree's run for cores.
     pub test_max_parallel: usize,
-    /// Wall-clock ceiling (seconds) for an explicit test run before its process
-    /// group is killed. Generous, since suites legitimately take a while; the
-    /// point is that a wedged run (e.g. blocked on a build lock) can't hang the
-    /// panel forever. 0 disables the deadline.
+    /// Wall-clock ceiling (seconds) for an explicit test run or named job
+    /// before its process group is killed. Generous, since suites legitimately
+    /// take a while; the point is that a wedged run (e.g. blocked on a build
+    /// lock) can't hang the panel forever. 0 disables the deadline.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub test_timeout_secs: u64,
     /// Wall-clock ceiling (seconds) for test *discovery*. Discovery should be

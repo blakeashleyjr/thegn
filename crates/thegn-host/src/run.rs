@@ -10095,19 +10095,14 @@ async fn event_loop<T: Terminal>(
                 finished_at: thegn_core::util::now(),
                 output_tail: outcome.stdout_stderr.clone(),
                 running: false,
+                end: outcome.end,
             };
             model
                 .panel
                 .task_last_runs
                 .insert(outcome.task.name.clone(), rec);
-            model.status = if exit == 0 {
-                format!("Task '{}' done in {:.1}s", outcome.task.name, elapsed_s)
-            } else {
-                format!(
-                    "Task '{}' failed (exit {}) in {:.1}s",
-                    outcome.task.name, exit, elapsed_s
-                )
-            };
+            model.status =
+                crate::task::job_status_line(&outcome.task.name, outcome.end, exit, elapsed_s);
             // Extract diagnostics and populate the Problems panel.
             let new_diags =
                 crate::task::extract_diagnostics(&outcome.stdout_stderr, &outcome.task.name);
@@ -21867,6 +21862,7 @@ async fn event_loop<T: Terminal>(
                                 {
                                     crate::task::cancel_job(&wt, &task.name);
                                     rec.running = false;
+                                    rec.end = crate::task::RunEnd::Stopped;
                                     model.status = format!("Stopped: {}", task.name);
                                 } else {
                                     model.status = format!("'{}' is not running", task.name);

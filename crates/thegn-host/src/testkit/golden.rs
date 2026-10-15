@@ -171,6 +171,7 @@ fn synthetic(matcher: &str, fixture: &str) -> Vec<panel::TestNode> {
         duration_ms: 1,
         truncated: false,
         stdout_stderr: fixture.to_string(),
+        end: task::RunEnd::Exited,
     };
     task::parse_task_outcome(&outcome)
 }

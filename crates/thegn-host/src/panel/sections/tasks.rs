@@ -38,18 +38,24 @@ fn kind_hue(kind: &TaskKind) -> crate::seg::Tok {
     }
 }
 
+fn failed_mark() -> Seg {
+    seg(hue(Hue::Red), "✗")
+}
+
 fn status_segs(run: Option<&crate::panel::TaskRunRecord>) -> Vec<Seg> {
     match run {
         None => vec![seg(g2(), "not run")],
         Some(r) if r.running => vec![seg(hue(Hue::Amber), "…"), seg(g2(), " running")],
+        Some(r) if r.end == crate::task::RunEnd::Stopped => vec![seg(g3(), "stopped")],
+        Some(r) if matches!(r.end, crate::task::RunEnd::TimedOut { .. }) => vec![
+            failed_mark(),
+            seg(g2(), format!(" timed out {}", fmt_ms(r.duration_ms))),
+        ],
         Some(r) if r.exit_code == 0 => vec![
             seg(hue(Hue::Green), "✓"),
             seg(g2(), format!(" {:.1}s", r.duration_ms as f64 / 1000.0)),
         ],
-        Some(r) => vec![
-            seg(hue(Hue::Red), "✗"),
-            seg(g2(), format!(" exit {}", r.exit_code)),
-        ],
+        Some(r) => vec![failed_mark(), seg(g2(), format!(" exit {}", r.exit_code))],
     }
 }
 
@@ -204,7 +210,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let running = runs.values().filter(|r| r.running).count();
     let failed = runs
         .values()
-        .filter(|r| !r.running && r.exit_code != 0)
+        .filter(|r| !r.running && r.end != crate::task::RunEnd::Stopped && r.exit_code != 0)
         .count();
     let passed = runs
         .values()
@@ -321,12 +327,26 @@ fn task_detail_segs(
     match run {
         None => out.push(vec![seg(g3(), "never run")]),
         Some(r) if r.running => out.push(vec![seg(hue(Hue::Amber), "● running")]),
+        Some(r) if r.end == crate::task::RunEnd::Stopped => {
+            out.push(vec![seg(g3(), "stopped")]);
+        }
+        Some(r) if matches!(r.end, crate::task::RunEnd::TimedOut { .. }) => {
+            let secs = match r.end {
+                crate::task::RunEnd::TimedOut { secs } => secs,
+                _ => unreachable!(),
+            };
+            out.push(vec![
+                failed_mark(),
+                seg(hue(Hue::Red), format!(" timed out after {secs}s")),
+            ]);
+        }
         Some(r) if r.exit_code == 0 => out.push(vec![
             seg(hue(Hue::Green), "✓ passed  "),
             seg(g(), fmt_ms(r.duration_ms)),
         ]),
         Some(r) => out.push(vec![
-            seg(hue(Hue::Red), format!("✗ exit {}  ", r.exit_code)),
+            failed_mark(),
+            seg(hue(Hue::Red), format!(" exit {}  ", r.exit_code)),
             seg(g(), fmt_ms(r.duration_ms)),
         ]),
     }
@@ -419,6 +439,88 @@ mod tests {
         let s = status_segs(Some(&failed));
         let text: String = s.iter().map(|sg| sg.text.clone()).collect();
         assert!(text.contains('✗'), "{text}");
+    }
+
+    #[test]
+    fn status_segs_label_stopped_and_timed_out() {
+        let stopped = crate::panel::TaskRunRecord {
+            end: crate::task::RunEnd::Stopped,
+            exit_code: -1,
+            ..Default::default()
+        };
+        let text: String = status_segs(Some(&stopped))
+            .iter()
+            .map(|sg| sg.text.clone())
+            .collect();
+        assert!(text.contains("stopped"), "{text}");
+        assert!(!text.contains('\u{2717}'), "{text}");
+
+        let timed_out = crate::panel::TaskRunRecord {
+            end: crate::task::RunEnd::TimedOut { secs: 1 },
+            exit_code: 124,
+            duration_ms: 1_000,
+            ..Default::default()
+        };
+        let text: String = status_segs(Some(&timed_out))
+            .iter()
+            .map(|sg| sg.text.clone())
+            .collect();
+        assert!(text.contains("timed out"), "{text}");
+    }
+
+    #[test]
+    fn full_header_does_not_count_stopped_as_failed() {
+        let tasks = ["stopped", "failed"]
+            .into_iter()
+            .map(|name| thegn_core::config::Task {
+                name: name.into(),
+                command: "true".into(),
+                args: Vec::new(),
+                cwd: None,
+                env: Default::default(),
+                kind: TaskKind::Build,
+                matcher: None,
+                scope: None,
+            })
+            .collect();
+        let mut task_last_runs = std::collections::HashMap::new();
+        task_last_runs.insert(
+            "stopped".into(),
+            crate::panel::TaskRunRecord {
+                name: "stopped".into(),
+                exit_code: -1,
+                end: crate::task::RunEnd::Stopped,
+                ..Default::default()
+            },
+        );
+        task_last_runs.insert(
+            "failed".into(),
+            crate::panel::TaskRunRecord {
+                name: "failed".into(),
+                exit_code: 1,
+                ..Default::default()
+            },
+        );
+        let model = FrameModel {
+            panel: crate::panel::PanelData {
+                task_specs: tasks,
+                task_last_runs,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ui = PanelUi {
+            width: crate::layout::PanelWidth::Full,
+            ..Default::default()
+        };
+        let rows = full_view(&SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 150,
+            rows: 20,
+        });
+        let header = format!("{:?}", rows.first().unwrap());
+        assert!(header.contains("\u{2717} 1"), "{header}");
     }
 
     #[test]
