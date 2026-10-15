@@ -86,6 +86,7 @@ pub(crate) struct VoiceController {
     capture_reaped: Option<u64>,
     transcription_unresolved: Option<u64>,
     transcription_reaped: Option<u64>,
+    held_transcript: Option<String>,
 }
 
 impl VoiceController {
@@ -108,10 +109,14 @@ impl VoiceController {
             capture_reaped: None,
             transcription_unresolved: None,
             transcription_reaped: None,
+            held_transcript: None,
         }
     }
 
     pub(crate) fn configure(&mut self, cfg: VoiceConfig) {
+        if self.cfg != cfg {
+            self.held_transcript = None;
+        }
         self.cfg = cfg;
     }
 
@@ -121,6 +126,18 @@ impl VoiceController {
 
     pub(crate) fn is_recording(&self) -> bool {
         self.state.is_recording()
+    }
+
+    pub(crate) fn hold_transcript(&mut self, text: String) {
+        self.held_transcript = Some(text);
+    }
+
+    pub(crate) fn take_held_transcript(&mut self) -> Option<String> {
+        self.held_transcript.take()
+    }
+
+    pub(crate) fn has_held_transcript(&self) -> bool {
+        self.held_transcript.is_some()
     }
 
     pub(crate) fn shutdown_pending(&self) -> bool {
