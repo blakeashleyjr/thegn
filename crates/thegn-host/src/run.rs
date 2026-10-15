@@ -7035,6 +7035,7 @@ async fn event_loop<T: Terminal>(
         tokio_mpsc::unbounded_channel::<crate::task::TaskOutcome>();
     let (job_output_tx, mut job_output_rx) =
         tokio_mpsc::unbounded_channel::<std::result::Result<PathBuf, String>>();
+    let (job_live_tx, mut job_live_rx) = tokio_mpsc::unbounded_channel::<crate::task::JobLive>();
     let mut restart_arm = crate::task::RestartArm::default();
     let mut confirm_guard = crate::panel::confirm::TwoPress::default();
     // Off-loop worktree-rename completions (audit run.rs:12131/12147): the git
@@ -10235,6 +10236,17 @@ async fn event_loop<T: Terminal>(
                 model.panel.diagnostics.sort_by_key(|d| d.severity as u8);
             }
             dirty = true;
+        }
+        while let Ok(msg) = job_live_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            if crate::task::apply_job_live(
+                &mut model.panel.task_last_runs,
+                &latest_job_generation,
+                active_task_wt,
+                msg,
+            ) {
+                dirty = true;
+            }
         }
         while let Ok(result) = job_output_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Other);
@@ -21181,18 +21193,46 @@ async fn event_loop<T: Terminal>(
                                                         crate::hydrate::active_tab_path(&session);
                                                     let tx2 = named_task_run_tx.clone();
                                                     let wk2 = waker.clone();
+                                                    let live_tx = job_live_tx.clone();
+                                                    let live_waker = waker.clone();
                                                     let limits2 = keymap.config().limits.clone();
                                                     named_task_generation += 1;
                                                     let run_gen = named_task_generation;
                                                     latest_job_generation
                                                         .insert(task.name.clone(), run_gen);
                                                     tokio::task::spawn_blocking(move || {
+                                                        let sink: crate::task::JobLiveSink =
+                                                            std::sync::Arc::new(move |msg| {
+                                                                if let Err(error) =
+                                                                    live_tx.send(msg)
+                                                                {
+                                                                    tracing::debug!(
+                                                                        target: "thegn::tasks",
+                                                                        %error,
+                                                                        "job live receiver is gone"
+                                                                    );
+                                                                }
+                                                                if let Err(error) =
+                                                                    live_waker.wake()
+                                                                {
+                                                                    tracing::debug!(
+                                                                        target: "thegn::tasks",
+                                                                        %error,
+                                                                        "job live wake failed"
+                                                                    );
+                                                                }
+                                                            });
                                                         let loc =
                                                             thegn_core::remote::GitLoc::for_worktree(
                                                                 &wt,
                                                             );
                                                         let outcome = crate::task::run_job(
-                                                            wt, &loc, run_gen, test_task, &limits2,
+                                                            wt,
+                                                            &loc,
+                                                            run_gen,
+                                                            test_task,
+                                                            &limits2,
+                                                            Some(sink),
                                                         );
                                                         if let Err(error) = tx2.send(outcome) {
                                                             tracing::debug!(target: "thegn::tasks", %error, "job outcome receiver is gone");
@@ -21985,14 +22025,38 @@ async fn event_loop<T: Terminal>(
                                     let wt = crate::hydrate::active_tab_path(&session);
                                     let tx2 = named_task_run_tx.clone();
                                     let wk2 = waker.clone();
+                                    let live_tx = job_live_tx.clone();
+                                    let live_waker = waker.clone();
                                     let limits2 = keymap.config().limits.clone();
                                     named_task_generation += 1;
                                     let run_gen = named_task_generation;
                                     latest_job_generation.insert(task.name.clone(), run_gen);
                                     tokio::task::spawn_blocking(move || {
+                                        let sink: crate::task::JobLiveSink =
+                                            std::sync::Arc::new(move |msg| {
+                                                if let Err(error) = live_tx.send(msg) {
+                                                    tracing::debug!(
+                                                        target: "thegn::tasks",
+                                                        %error,
+                                                        "job live receiver is gone"
+                                                    );
+                                                }
+                                                if let Err(error) = live_waker.wake() {
+                                                    tracing::debug!(
+                                                        target: "thegn::tasks",
+                                                        %error,
+                                                        "job live wake failed"
+                                                    );
+                                                }
+                                            });
                                         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
                                         let outcome = crate::task::run_job(
-                                            wt, &loc, run_gen, test_task, &limits2,
+                                            wt,
+                                            &loc,
+                                            run_gen,
+                                            test_task,
+                                            &limits2,
+                                            Some(sink),
                                         );
                                         if let Err(error) = tx2.send(outcome) {
                                             tracing::debug!(target: "thegn::tasks", %error, "job outcome receiver is gone");

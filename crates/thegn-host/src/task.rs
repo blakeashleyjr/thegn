@@ -19,6 +19,79 @@ use thegn_core::remote::GitLoc;
 use crate::panel::{self, TestLocation, TestNode, TestNodeKind, TestState, TestTask};
 
 const MAX_CAPTURE_BYTES: usize = 256 * 1024;
+pub(crate) const LIVE_TAIL_BYTES: usize = 16 * 1024;
+const LIVE_EMIT_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JobLive {
+    pub worktree: String,
+    pub name: String,
+    pub generation: u64,
+    pub tail: String,
+}
+
+pub(crate) type JobLiveSink = Arc<dyn Fn(JobLive) + Send + Sync>;
+
+struct CapRun {
+    slot: String,
+    generation: u64,
+    timeout: Option<Duration>,
+    live: Option<JobLiveSink>,
+    label: (String, String),
+}
+
+#[derive(Default)]
+struct ReaderState {
+    stdout_capture: Vec<u8>,
+    stderr_capture: Vec<u8>,
+    produced: usize,
+    live_tail: Vec<u8>,
+}
+
+impl ReaderState {
+    fn push(&mut self, bytes: &[u8], with_live: bool, stdout: bool) {
+        self.produced = self.produced.saturating_add(bytes.len());
+        let capture = if stdout {
+            &mut self.stdout_capture
+        } else {
+            &mut self.stderr_capture
+        };
+        let remaining = MAX_CAPTURE_BYTES.saturating_sub(capture.len());
+        capture.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+        if with_live {
+            self.live_tail.extend_from_slice(bytes);
+            if self.live_tail.len() > LIVE_TAIL_BYTES {
+                let mut start = self.live_tail.len() - LIVE_TAIL_BYTES;
+                while start < self.live_tail.len() && self.live_tail[start] & 0xC0 == 0x80 {
+                    start += 1;
+                }
+                if let Some(newline) = self.live_tail[start..].iter().position(|b| *b == b'\n')
+                    && start + newline + 1 < self.live_tail.len()
+                {
+                    start += newline + 1;
+                }
+                self.live_tail.drain(..start);
+            }
+        }
+    }
+
+    fn tail(&self) -> String {
+        let mut tail = String::from_utf8_lossy(&self.live_tail).into_owned();
+        if tail.len() > LIVE_TAIL_BYTES {
+            let mut start = tail.len() - LIVE_TAIL_BYTES;
+            while !tail.is_char_boundary(start) {
+                start += 1;
+            }
+            if let Some(newline) = tail[start..].find('\n')
+                && start + newline + 1 < tail.len()
+            {
+                start += newline + 1;
+            }
+            tail.drain(..start);
+        }
+        tail
+    }
+}
 
 /// How a capped child gets its CPU/mem ceiling. Resolved once from `PATH`;
 /// `wrap_capped` is pure over it so it can be unit-tested deterministically.
@@ -202,9 +275,7 @@ fn run_capped(
     loc: &GitLoc,
     worktree: &Path,
     limits: &LimitsConfig,
-    slot: &str,
-    generation: u64,
-    timeout: Option<Duration>,
+    run: CapRun,
 ) -> CapOutput {
     // `-c`, NOT `-lc`: a login shell re-sources the user's profile on every
     // spawn — pure overhead on a path meant to be cheap, with surprising
@@ -214,7 +285,7 @@ fn run_capped(
         "-c".to_string(),
         command.to_string(),
     ];
-    run_capped_argv(&inner, loc, worktree, limits, slot, generation, timeout)
+    run_capped_argv(&inner, loc, worktree, limits, run)
 }
 
 /// Build the (unspawned) command for a capped job: program + args, the worktree
@@ -278,12 +349,10 @@ fn run_capped_argv(
     loc: &GitLoc,
     worktree: &Path,
     limits: &LimitsConfig,
-    slot: &str,
-    generation: u64,
-    timeout: Option<Duration>,
+    run: CapRun,
 ) -> CapOutput {
     // Supersede any older job in this slot.
-    cancel_slot(slot);
+    cancel_slot(&run.slot);
 
     let mut cmd = task_command(loc, inner, worktree, limits);
 
@@ -301,14 +370,14 @@ fn run_capped_argv(
         }
     };
     if let Ok(mut map) = registry().lock() {
-        map.insert(slot.to_string(), (generation, group.clone()));
+        map.insert(run.slot.clone(), (run.generation, group.clone()));
     }
 
     // Watchdog: kill the whole process group if the deadline passes before the
     // child exits. `done` lets the main thread retire the watchdog promptly.
     let done = Arc::new(AtomicBool::new(false));
     let timed_out = Arc::new(AtomicBool::new(false));
-    let watchdog = timeout.filter(|d| !d.is_zero()).map(|deadline| {
+    let watchdog = run.timeout.filter(|d| !d.is_zero()).map(|deadline| {
         let done = done.clone();
         let timed_out = timed_out.clone();
         let group = group.clone();
@@ -327,47 +396,155 @@ fn run_capped_argv(
         })
     });
 
-    // Read stdout and stderr concurrently on threads: reading one to EOF while
-    // the child fills the other pipe's buffer would deadlock. Each stream is
-    // capped, so a chatty suite can't blow memory.
+    // Read both streams concurrently to EOF: dropping either pipe at the
+    // capture limit would SIGPIPE a chatty child. Retained capture and live
+    // tail stay bounded even while every byte is drained.
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let out_h = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        if let Some(o) = stdout {
-            let _ = o.take(MAX_CAPTURE_BYTES as u64).read_to_end(&mut b); // best-effort: drain: bounded read of auxiliary output; failure loses the buffer, not the outcome
-        }
-        b
-    });
-    let err_h = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        if let Some(e) = stderr {
-            let _ = e.take(MAX_CAPTURE_BYTES as u64).read_to_end(&mut b); // best-effort: drain: bounded read of auxiliary output; failure loses the buffer, not the outcome
-        }
-        b
+    let state = Arc::new(Mutex::new(ReaderState::default()));
+    let (signal_tx, signal_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let out_h = spawn_output_reader(
+        stdout,
+        state.clone(),
+        signal_tx.clone(),
+        run.live.is_some(),
+        true,
+        "stdout",
+    );
+    let err_h = spawn_output_reader(
+        stderr,
+        state.clone(),
+        signal_tx,
+        run.live.is_some(),
+        false,
+        "stderr",
+    );
+    let forwarder = run.live.and_then(|sink| {
+        let state = state.clone();
+        let label = run.label.clone();
+        let generation = run.generation;
+        match std::thread::Builder::new()
+            .name("thegn-job-live".into())
+            .spawn(move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                let mut last_emit = Instant::now();
+                while signal_rx.recv().is_ok() {
+                    let until = last_emit + LIVE_EMIT_INTERVAL;
+                    if let Some(delay) = until.checked_duration_since(Instant::now()) {
+                        match signal_rx.recv_timeout(delay) {
+                            Ok(()) => continue,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                    }
+                    match signal_rx.try_recv() {
+                        Ok(()) => continue,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    }
+                    let tail = state.lock().map(|state| state.tail());
+                    if let Ok(tail) = tail {
+                        sink(JobLive {
+                            worktree: label.0.clone(),
+                            name: label.1.clone(),
+                            generation,
+                            tail,
+                        });
+                    }
+                    last_emit = Instant::now();
+                }
+            }) {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    tracing::debug!(target: "thegn::tasks", %error, "failed to start job live forwarder");
+                    None
+                }
+            }
     });
     let status = child.wait();
     done.store(true, Ordering::Relaxed);
     if let Some(w) = watchdog {
         let _ = w.join(); // best-effort: thread join: a panicked helper loses its output, not the caller
     }
-    let mut buf = out_h.join().unwrap_or_default();
-    let errbuf = err_h.join().unwrap_or_default();
-    let truncated = buf.len() >= MAX_CAPTURE_BYTES || errbuf.len() >= MAX_CAPTURE_BYTES;
-    buf.extend_from_slice(&errbuf);
-    if buf.len() > MAX_CAPTURE_BYTES {
-        buf.truncate(MAX_CAPTURE_BYTES);
+    let out_ok = out_h.join();
+    let err_ok = err_h.join();
+    if let Some(forwarder) = forwarder
+        && let Err(error) = forwarder.join()
+    {
+        tracing::debug!(target: "thegn::tasks", ?error, "job live forwarder panicked");
     }
+    if let Err(error) = out_ok {
+        tracing::debug!(target: "thegn::tasks", ?error, "stdout reader panicked");
+    }
+    if let Err(error) = err_ok {
+        tracing::debug!(target: "thegn::tasks", ?error, "stderr reader panicked");
+    }
+    let (buf, truncated) = match state.lock() {
+        Ok(state) => {
+            let mut capture = state.stdout_capture.clone();
+            let remaining = MAX_CAPTURE_BYTES.saturating_sub(capture.len());
+            capture.extend_from_slice(
+                &state.stderr_capture[..state.stderr_capture.len().min(remaining)],
+            );
+            let truncated = state.produced > capture.len();
+            (capture, truncated)
+        }
+        Err(error) => {
+            tracing::debug!(target: "thegn::tasks", %error, "job output state lock poisoned");
+            (Vec::new(), false)
+        }
+    };
 
-    let stopped = finish_slot(slot, generation);
+    let stopped = finish_slot(&run.slot, run.generation);
 
     CapOutput {
-        exit_code: status.ok().and_then(|s| s.code()),
+        exit_code: match status {
+            Ok(status) => status.code(),
+            Err(error) => {
+                tracing::debug!(target: "thegn::tasks", %error, "child wait failed");
+                None
+            }
+        },
         truncated,
         timed_out: timed_out.load(Ordering::Relaxed),
         stopped,
         text: String::from_utf8_lossy(&buf).into_owned(),
     }
+}
+
+fn spawn_output_reader(
+    stream: Option<impl Read + Send + 'static>,
+    state: Arc<Mutex<ReaderState>>,
+    signal: std::sync::mpsc::SyncSender<()>,
+    live: bool,
+    stdout: bool,
+    label: &'static str,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let Some(mut stream) = stream else { return };
+        let mut bytes = [0_u8; 8 * 1024];
+        loop {
+            match stream.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(count) => {
+                    if let Ok(mut state) = state.lock() {
+                        state.push(&bytes[..count], live, stdout);
+                    }
+                    if live {
+                        match signal.try_send(()) {
+                            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => {}
+                            Err(std::sync::mpsc::TrySendError::Disconnected(())) => {}
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    tracing::debug!(target: "thegn::tasks", %error, stream = label, "job output read failed");
+                    break;
+                }
+            }
+        }
+    })
 }
 
 /// Consume this run's stop mark while holding the registry lock used to decide
@@ -814,14 +991,20 @@ pub fn run_task(
     task: TestTask,
     limits: &LimitsConfig,
 ) -> TaskOutcome {
+    let label = (String::new(), task.name.clone());
     let mut outcome = run_task_in(
         worktree.clone(),
         loc,
         generation,
         task,
         limits,
-        test_slot(&worktree),
-        secs_to_timeout(limits.test_timeout_secs),
+        CapRun {
+            slot: test_slot(&worktree),
+            generation,
+            timeout: secs_to_timeout(limits.test_timeout_secs),
+            live: None,
+            label,
+        },
     );
     if let RunEnd::TimedOut { secs } = outcome.end {
         outcome.stdout_stderr = format!(
@@ -832,22 +1015,29 @@ pub fn run_task(
     outcome
 }
 
-pub fn run_job(
+pub(crate) fn run_job(
     worktree: PathBuf,
     loc: &GitLoc,
     generation: u64,
     task: TestTask,
     limits: &LimitsConfig,
+    live: Option<JobLiveSink>,
 ) -> TaskOutcome {
     let slot = job_slot(&worktree, &task.name);
+    let label = (worktree.to_string_lossy().into_owned(), task.name.clone());
     let mut outcome = run_task_in(
         worktree,
         loc,
         generation,
         task,
         limits,
-        slot,
-        secs_to_timeout(limits.test_timeout_secs),
+        CapRun {
+            slot,
+            generation,
+            timeout: secs_to_timeout(limits.test_timeout_secs),
+            live,
+            label,
+        },
     );
     match outcome.end {
         RunEnd::TimedOut { secs } => {
@@ -871,25 +1061,38 @@ pub(crate) fn job_outcome_is_stale(
     latest_generation.is_some_and(|latest| outcome_generation < latest)
 }
 
+pub(crate) fn apply_job_live(
+    runs: &mut HashMap<String, crate::panel::TaskRunRecord>,
+    latest: &HashMap<String, u64>,
+    active_wt: &str,
+    msg: JobLive,
+) -> bool {
+    if latest.get(&msg.name) != Some(&msg.generation)
+        || (!active_wt.is_empty() && active_wt != msg.worktree.as_str())
+        || !runs.get(&msg.name).is_some_and(|run| run.running)
+    {
+        return false;
+    }
+    let Some(run) = runs.get_mut(&msg.name) else {
+        return false;
+    };
+    if run.output_tail == msg.tail {
+        return false;
+    }
+    run.output_tail = msg.tail;
+    true
+}
+
 fn run_task_in(
     worktree: PathBuf,
     loc: &GitLoc,
     generation: u64,
     task: TestTask,
     limits: &LimitsConfig,
-    slot: String,
-    timeout: Option<Duration>,
+    run: CapRun,
 ) -> TaskOutcome {
     let started = Instant::now();
-    let out = run_capped(
-        &task.command,
-        loc,
-        &worktree,
-        limits,
-        &slot,
-        generation,
-        timeout,
-    );
+    let out = run_capped(&task.command, loc, &worktree, limits, run);
     let end = if out.timed_out {
         RunEnd::TimedOut {
             secs: limits.test_timeout_secs,
@@ -1128,7 +1331,19 @@ pub fn discover_tests(
             };
         }
         let argv = build_scan_argv(&rule);
-        let out = run_capped_argv(&argv, loc, &worktree, limits, &slot, generation, timeout);
+        let out = run_capped_argv(
+            &argv,
+            loc,
+            &worktree,
+            limits,
+            CapRun {
+                slot: slot.clone(),
+                generation,
+                timeout,
+                live: None,
+                label: (wt.clone(), task.name.clone()),
+            },
+        );
         if out.timed_out {
             return DiscoveryOutcome {
                 worktree: wt,
@@ -1167,7 +1382,19 @@ pub fn discover_tests(
         };
     };
 
-    let out = run_capped(command, loc, &worktree, limits, &slot, generation, timeout);
+    let out = run_capped(
+        command,
+        loc,
+        &worktree,
+        limits,
+        CapRun {
+            slot,
+            generation,
+            timeout,
+            live: None,
+            label: (wt.clone(), task.name.clone()),
+        },
+    );
     if out.timed_out {
         return DiscoveryOutcome {
             worktree: wt,
@@ -1427,6 +1654,7 @@ mod tests {
     fn private_temp_dir() -> tempfile::TempDir {
         tempfile::Builder::new()
             .prefix("thegn-task-runner-")
+            .permissions(0o700)
             .tempdir()
             .unwrap()
     }
@@ -1994,9 +2222,13 @@ mod tests {
                 &GitLoc::Local(wt.clone()),
                 &wt,
                 &uncapped(),
-                &slot2,
-                1,
-                None,
+                CapRun {
+                    slot: slot2,
+                    generation: 1,
+                    timeout: None,
+                    live: None,
+                    label: (String::new(), String::new()),
+                },
             )
         });
         // Wait for the child to register, then supersede it.
@@ -2029,6 +2261,7 @@ mod tests {
                 1,
                 TestTask::new("slow", "sleep 30", "generic"),
                 &uncapped(),
+                None,
             )
         });
         let wt_thread = wt.clone();
@@ -2039,6 +2272,7 @@ mod tests {
                 4,
                 TestTask::new("other", "sleep 30", "generic"),
                 &uncapped(),
+                None,
             )
         });
         let mut waited = 0;
@@ -2060,6 +2294,7 @@ mod tests {
             2,
             TestTask::new("fast", "true", "generic"),
             &uncapped(),
+            None,
         );
         assert_eq!(fast.exit_code, Some(0));
         let test = run_task(
@@ -2201,9 +2436,13 @@ mod tests {
             &GitLoc::Local(wt.clone()),
             &wt,
             &uncapped(),
-            &slot,
-            1,
-            Some(Duration::from_millis(300)),
+            CapRun {
+                slot,
+                generation: 1,
+                timeout: Some(Duration::from_millis(300)),
+                live: None,
+                label: (String::new(), String::new()),
+            },
         );
         assert!(
             start.elapsed().as_secs() < 10,
@@ -2227,11 +2466,158 @@ mod tests {
             1,
             TestTask::new("slow", "sleep 2", "generic"),
             &limits,
+            None,
         );
 
         assert_eq!(outcome.exit_code, Some(124));
         assert_eq!(outcome.end, RunEnd::TimedOut { secs: 1 });
         assert!(outcome.stdout_stderr.starts_with("job exceeded 1s"));
+    }
+
+    #[test]
+    fn live_sink_sees_output_while_the_job_runs() {
+        let dir = private_temp_dir();
+        let wt = dir.path().to_path_buf();
+        let messages = Arc::new(Mutex::new(Vec::<JobLive>::new()));
+        let sink_messages = messages.clone();
+        let sink: JobLiveSink = Arc::new(move |msg| {
+            sink_messages.lock().unwrap().push(msg);
+        });
+        let run_wt = wt.clone();
+        let handle = std::thread::spawn(move || {
+            run_job(
+                run_wt.clone(),
+                &GitLoc::Local(run_wt),
+                91,
+                TestTask::new("live", "printf 'first\\n'; sleep 5", "generic"),
+                &uncapped(),
+                Some(sink),
+            )
+        });
+        let mut saw_live = false;
+        for _ in 0..200 {
+            if messages
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|msg| msg.tail.contains("first"))
+                && !handle.is_finished()
+            {
+                saw_live = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(saw_live, "live output should arrive before the job exits");
+        cancel_job(&wt, "live");
+        assert_eq!(handle.join().unwrap().end, RunEnd::Stopped);
+    }
+
+    #[test]
+    fn live_tail_is_bounded_and_keeps_the_end() {
+        let dir = private_temp_dir();
+        let wt = dir.path().to_path_buf();
+        let messages = Arc::new(Mutex::new(Vec::<JobLive>::new()));
+        let sink_messages = messages.clone();
+        let sink: JobLiveSink = Arc::new(move |msg| sink_messages.lock().unwrap().push(msg));
+        let outcome = run_job(
+            wt.clone(),
+            &GitLoc::Local(wt),
+            92,
+            TestTask::new(
+                "bounded",
+                "head -c 200000 /dev/zero | tr '\\000' x; echo END; sleep 0.2",
+                "generic",
+            ),
+            &uncapped(),
+            Some(sink),
+        );
+        let tails = messages.lock().unwrap();
+        assert!(tails.iter().all(|msg| msg.tail.len() <= LIVE_TAIL_BYTES));
+        assert!(
+            !tails.is_empty(),
+            "the emitting job should produce live tails"
+        );
+        assert!(tails.last().is_some_and(|msg| msg.tail.ends_with("END\n")));
+        assert_eq!(outcome.exit_code, Some(0));
+    }
+
+    #[test]
+    fn chatty_job_past_the_capture_cap_is_not_killed() {
+        let dir = private_temp_dir();
+        let wt = dir.path().to_path_buf();
+        let outcome = run_job(
+            wt.clone(),
+            &GitLoc::Local(wt),
+            93,
+            TestTask::new("chatty", "head -c 400000 /dev/zero; echo ok", "generic"),
+            &uncapped(),
+            None,
+        );
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.truncated);
+    }
+
+    #[test]
+    fn live_sink_coalesces_bursts() {
+        let dir = private_temp_dir();
+        let wt = dir.path().to_path_buf();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink_count = count.clone();
+        let sink: JobLiveSink = Arc::new(move |_| {
+            sink_count.fetch_add(1, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let outcome = run_job(
+            wt.clone(),
+            &GitLoc::Local(wt),
+            94,
+            TestTask::new("burst", "seq 1 20000; sleep 0.3", "generic"),
+            &uncapped(),
+            Some(sink),
+        );
+        let elapsed_ms = started.elapsed().as_millis();
+        let emits = count.load(Ordering::Relaxed);
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(emits >= 1, "a non-silent job should emit live output");
+        assert!(
+            emits <= elapsed_ms / 100 + 2,
+            "{emits} emits in {elapsed_ms}ms"
+        );
+    }
+
+    #[test]
+    fn apply_job_live_fences_generation_worktree_and_finished_runs() {
+        let msg = |generation, worktree: &str, tail: &str| JobLive {
+            worktree: worktree.into(),
+            name: "build".into(),
+            generation,
+            tail: tail.into(),
+        };
+        let latest = HashMap::from([("build".to_string(), 7)]);
+        for (generation, worktree, running, tail, expected) in [
+            (6, "/a", true, "old", false),
+            (7, "/b", true, "old", false),
+            (7, "/a", false, "old", false),
+            (7, "/a", true, "same", false),
+            (7, "/a", true, "old", true),
+        ] {
+            let mut runs = HashMap::from([(
+                "build".to_string(),
+                crate::panel::TaskRunRecord {
+                    running,
+                    output_tail: tail.into(),
+                    ..Default::default()
+                },
+            )]);
+            let changed =
+                apply_job_live(&mut runs, &latest, "/a", msg(generation, worktree, "same"));
+            assert_eq!(changed, expected);
+            assert_eq!(
+                runs["build"].output_tail,
+                if expected { "same" } else { tail }
+            );
+        }
     }
 
     #[test]
@@ -2265,6 +2651,7 @@ mod tests {
                 71,
                 TestTask::new("slow", "sleep 30", "generic"),
                 &uncapped(),
+                None,
             )
         });
         for _ in 0..100 {
@@ -2304,6 +2691,7 @@ mod tests {
                 72,
                 TestTask::new("slow", "sleep 30", "generic"),
                 &uncapped(),
+                None,
             )
         });
         for _ in 0..100 {

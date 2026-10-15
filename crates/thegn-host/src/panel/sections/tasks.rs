@@ -187,6 +187,25 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             bg: None,
             hit: None,
         });
+        if i == cursor
+            && let Some(run) = run
+            && run.running
+            && !run.output_tail.is_empty()
+            && let Some(last) = run
+                .output_tail
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+        {
+            rows.push(PanelRow {
+                line: Line::segs(vec![seg(
+                    g2(),
+                    display_clip(&format!("  > {last}"), ctx.cols),
+                )]),
+                bg: None,
+                hit: None,
+            });
+        }
     }
 
     rows.push(hint_row(&[
@@ -354,7 +373,12 @@ fn task_detail_segs(
     if let Some(r) = run
         && !r.output_tail.is_empty()
     {
-        out.push(vec![seg(g3(), "─── output ───────────────────────────")]);
+        let label = if r.running {
+            "─── live output ──────────────────────"
+        } else {
+            "─── output ───────────────────────────"
+        };
+        out.push(vec![seg(g3(), label)]);
         let lines: Vec<&str> = r.output_tail.lines().collect();
         for line in lines.iter().skip(lines.len().saturating_sub(8)) {
             out.push(vec![seg(g2(), display_clip(line, w))]);
@@ -550,6 +574,101 @@ mod tests {
         assert!(lines.iter().any(|line| line == "line 13"), "{lines:?}");
         assert!(lines.iter().any(|line| line == "line 20"), "{lines:?}");
         assert!(!lines.iter().any(|line| line == "line 1"), "{lines:?}");
+    }
+
+    #[test]
+    fn running_job_detail_shows_live_output_tail() {
+        let task = thegn_core::config::Task {
+            name: "build".into(),
+            command: "make".into(),
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+            kind: TaskKind::Build,
+            matcher: None,
+            scope: None,
+        };
+        let running = crate::panel::TaskRunRecord {
+            running: true,
+            output_tail: "first\nlast".into(),
+            ..Default::default()
+        };
+        let running_text = format!("{:?}", task_detail_segs(&task, Some(&running), 100));
+        assert!(running_text.contains("live output"), "{running_text}");
+        assert!(running_text.contains("last"), "{running_text}");
+
+        let finished = crate::panel::TaskRunRecord {
+            output_tail: "last".into(),
+            ..Default::default()
+        };
+        let finished_text = format!("{:?}", task_detail_segs(&task, Some(&finished), 100));
+        assert!(finished_text.contains("output"), "{finished_text}");
+        assert!(!finished_text.contains("live output"), "{finished_text}");
+    }
+
+    #[test]
+    fn half_view_shows_only_the_running_cursor_jobs_last_line() {
+        let tasks = ["current", "other"]
+            .into_iter()
+            .map(|name| thegn_core::config::Task {
+                name: name.into(),
+                command: "echo task".into(),
+                args: Vec::new(),
+                cwd: None,
+                env: Default::default(),
+                kind: TaskKind::Build,
+                matcher: None,
+                scope: None,
+            })
+            .collect();
+        let task_last_runs = std::collections::HashMap::from([
+            (
+                "current".into(),
+                crate::panel::TaskRunRecord {
+                    running: true,
+                    output_tail: "a\nlast".into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "other".into(),
+                crate::panel::TaskRunRecord {
+                    running: true,
+                    output_tail: "other tail".into(),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let model = FrameModel {
+            panel: crate::panel::PanelData {
+                task_specs: tasks,
+                task_last_runs,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ui = PanelUi {
+            width: crate::layout::PanelWidth::Half,
+            tasks_cursor: 0,
+            ..Default::default()
+        };
+        let rows = half_view(&SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 75,
+            rows: 20,
+        });
+        let tail_rows: Vec<_> = rows
+            .iter()
+            .filter(|row| row.hit.is_none() && format!("{:?}", row.line).contains("  > last"))
+            .collect();
+        assert_eq!(tail_rows.len(), 1, "{rows:?}");
+        assert!(
+            !rows
+                .iter()
+                .any(|row| format!("{:?}", row.line).contains("other tail")),
+            "non-cursor job tail should be hidden: {rows:?}"
+        );
     }
 
     #[test]
