@@ -3268,6 +3268,7 @@ pub(crate) fn build_panel(
         diff_ok.then_some(diff_entries.as_slice()),
         &incoming,
     );
+    panel.dir_changes = crate::panel::dir_change_counts(&panel.changes);
     // Semantic git layer (items 311/313/317): entity-level view of the changes.
     // Blast-radius (313/316): enrich with the persisted caller→callee graph when
     // it has data (else `None` → the footer keeps its intra-diff summary).

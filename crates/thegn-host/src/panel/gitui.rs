@@ -451,12 +451,30 @@ pub struct GitUi {
     pub blame_cursor: usize,
     /// Vertical scroll offset for the blame region.
     pub blame_scroll: usize,
-    /// The selected stash's fetched patch (`stash show -p -u`), keyed by
-    /// stash index so a stale fetch never renders under another selection.
-    pub stash_diff: Option<(usize, String)>,
+    /// The selected stash's fetched patch (`stash show -p -u`), keyed by SHA.
+    pub stash_diff: Option<(String, String)>,
     /// The selected branch's fetched log, keyed by branch name (the branches
     /// main region falls back to HEAD's list while this is out or absent).
     pub branch_log: Option<(String, Vec<crate::panel::CommitRow>)>,
+}
+
+/// Refuse pull/push shortcuts on another branch row: both operations target
+/// HEAD, so the status explains that target and how to make the row HEAD.
+pub(crate) fn head_only_refusal(
+    data: &crate::panel::PanelData,
+    row: Option<&crate::panel::BranchRow>,
+    verb: &str,
+) -> Option<String> {
+    let row = row.filter(|row| !row.is_head)?;
+    let head = if data.branch.is_empty() {
+        "HEAD"
+    } else {
+        &data.branch
+    };
+    Some(format!(
+        "{verb} acts on HEAD ({head}), not {}; space checks {} out; f fast-forwards it",
+        row.name, row.name
+    ))
 }
 
 impl GitUi {
@@ -897,6 +915,7 @@ pub enum GitMsg {
     // branches
     Pull,
     Push,
+    NewBranch,
     FastForward,
     RebaseOntoSel,
     DeleteSel,
@@ -964,12 +983,12 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
         GitView::Branches => vec![
             k("space", "checkout", GitMsg::CheckoutSel),
             k("enter", "log", GitMsg::Drill),
-            k("n", "new branch", GitMsg::OpenMenu(MenuKind::BranchActions)),
+            k("n", "new branch", GitMsg::NewBranch),
             k("d", "delete", GitMsg::DeleteSel),
             k("r", "rebase onto", GitMsg::RebaseOntoSel),
             k("f", "fast-forward", GitMsg::FastForward),
-            k("p", "pull", GitMsg::Pull),
-            k("P", "push", GitMsg::Push),
+            k("p", "pull HEAD", GitMsg::Pull),
+            k("P", "push HEAD", GitMsg::Push),
             k("m", "actions", GitMsg::OpenMenu(MenuKind::BranchActions)),
             k("w", "worktree", GitMsg::CreateWorktree),
             k("G", "open PR", GitMsg::OpenPrInBrowser),
@@ -1588,8 +1607,9 @@ impl GitMsg {
             GitMsg::DeleteSel => "delete",
             GitMsg::RebaseOntoSel => "rebase onto",
             GitMsg::FastForward => "fast-forward",
-            GitMsg::Pull => "pull",
-            GitMsg::Push => "push",
+            GitMsg::Pull => "pull HEAD",
+            GitMsg::Push => "push HEAD",
+            GitMsg::NewBranch => "new branch",
             GitMsg::CreateWorktree => "worktree",
             GitMsg::StashPush => "stash",
             GitMsg::StashApply => "apply stash",
@@ -2891,5 +2911,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn head_only_refusal_names_head_and_fix() {
+        let data = crate::panel::PanelData {
+            branch: "main".into(),
+            ..Default::default()
+        };
+        let row = crate::panel::BranchRow {
+            name: "feature".into(),
+            is_head: false,
+            held_by: Vec::new(),
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            upstream_gone: false,
+            sha: String::new(),
+            date: 0,
+            subject: String::new(),
+            pr: None,
+        };
+        let message = head_only_refusal(&data, Some(&row), "push").unwrap();
+        assert!(message.contains("HEAD (main)"), "{message}");
+        assert!(message.contains("space"), "{message}");
+        assert!(message.contains("checks feature out"), "{message}");
+        assert_eq!(head_only_refusal(&data, None, "push"), None);
+        assert_eq!(
+            head_only_refusal(
+                &data,
+                Some(&crate::panel::BranchRow {
+                    is_head: true,
+                    ..row
+                }),
+                "pull"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn branch_keys_name_head_operations_and_open_new_branch_input() {
+        let keys = context_keys(GitView::Branches);
+        assert!(
+            keys.iter()
+                .any(|key| key.chord == "n" && key.msg == GitMsg::NewBranch)
+        );
+        assert!(
+            keys.iter()
+                .any(|key| key.chord == "p" && key.label == "pull HEAD")
+        );
+        assert!(
+            keys.iter()
+                .any(|key| key.chord == "P" && key.label == "push HEAD")
+        );
     }
 }

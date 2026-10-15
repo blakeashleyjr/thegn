@@ -303,7 +303,7 @@ mod tests {
             open: Section::Stash,
             ..base
         };
-        stash.git.stash_diff = Some((0, "one\ntwo\nthree".into()));
+        stash.git.stash_diff = Some(("stash-sha".into(), "one\ntwo\nthree".into()));
         let extent = super::super::scroll_extent(Section::Stash, &model, &stash, 80, 12)
             .expect("Full Stash diff scrolls");
         assert!(!extent.owns_nav);
