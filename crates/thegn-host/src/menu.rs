@@ -1906,16 +1906,32 @@ mod tests {
         // separate items on purpose: 'd' is `git branch -d` and refuses an
         // unmerged branch, and this path has no confirm step, so forcing has to
         // be the user's explicit choice rather than a silent escalation.
-        assert_eq!(
-            hotkeys(&m),
-            vec!['d', 'x', 'f', 'p', 'l', 'u', 'r', 'n', 'g', 'm']
-        );
+        assert_eq!(hotkeys(&m), vec!['d', 'x', 'u', 'r', 'n', 'g', 'm']);
+        assert!(m.items().iter().all(|item| !matches!(
+            &item.choice,
+            MenuChoice::BranchForcePush | MenuChoice::BranchPush | MenuChoice::BranchPull
+        )));
         assert_eq!(
             m.items().last().unwrap().choice,
             MenuChoice::BranchMerge("feature".into())
         );
         let head = branch_actions_menu("main", true);
         assert_eq!(hotkeys(&head), vec!['f', 'p', 'l', 'u', 'r', 'n', 'g']);
+        assert!(
+            head.items()
+                .iter()
+                .any(|item| item.choice == MenuChoice::BranchForcePush)
+        );
+        assert!(
+            head.items()
+                .iter()
+                .any(|item| item.choice == MenuChoice::BranchPush)
+        );
+        assert!(
+            head.items()
+                .iter()
+                .any(|item| item.choice == MenuChoice::BranchPull)
+        );
         assert_eq!(head.items().last().unwrap().choice, MenuChoice::BranchFetch);
     }
 
