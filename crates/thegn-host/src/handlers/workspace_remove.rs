@@ -240,6 +240,9 @@ pub(crate) fn remove_workspace_with_db(
         for group in &groups {
             forget_worktree_group(db, &session.id, group, true);
         }
+        if let Err(error) = db.delete_tab_groups_with_prefix(slug) {
+            tracing::debug!(%error, slug, "workspace removal could not prune matching groups from every persisted session");
+        }
     }
     remove_workspace_in_memory(session, panes, slug);
 
@@ -333,6 +336,9 @@ pub(crate) fn forget_workspace_in_db(
         }) {
             let _ = db.delete_tab_group(session_id, &group.name); // best-effort: cache write: layout is resurrection state
         }
+    }
+    if let Err(error) = db.delete_tab_groups_with_prefix(slug) {
+        tracing::debug!(%error, slug, "workspace removal could not prune matching groups from every persisted session");
     }
     let _ = db.del_worktrees_for_repo(repo_path); // best-effort: cache write: git is the source of truth
     let _ = db.del_workspace(repo_path); // best-effort: cache write: git is the source of truth
@@ -495,6 +501,26 @@ mod tests {
             None,
         )
         .unwrap();
+        let stale_group = thegn_core::models::TabGroupRow {
+            name: "lib/stale".into(),
+            kind: "branch".into(),
+            worktree: "/tmp/lib-stale".into(),
+            ordinal: 0,
+            active_tab: 0,
+        };
+        let stale_tab = thegn_core::models::GroupTabRow {
+            group_name: "lib/stale".into(),
+            ordinal: 0,
+            title: "1".into(),
+            pane_tree: r#"{"leaf":0}"#.into(),
+            focused_pane: 0,
+            pane_cwds: String::new(),
+            pane_cmds: String::new(),
+            pane_sessions: String::new(),
+            scrollback_snapshot: String::new(),
+        };
+        db.put_tab_group("/tmp/repo-app", &stale_group).unwrap();
+        db.put_group_tab("/tmp/repo-app", &stale_tab).unwrap();
         db.set_active_workspace("/tmp/repo-lib").unwrap();
 
         let mut session = Session {
@@ -551,6 +577,16 @@ mod tests {
         assert!(
             wt_roots.iter().any(|p| p == "/tmp/repo-app"),
             "sibling registry row kept: {wt_roots:?}"
+        );
+        assert!(
+            db.groups_for_session("/tmp/repo-app").unwrap().is_empty(),
+            "the removed slug is pruned from another session's saved groups"
+        );
+        assert!(
+            db.group_tabs_for_session("/tmp/repo-app")
+                .unwrap()
+                .is_empty(),
+            "tabs belonging to the removed foreign group are pruned too"
         );
         assert_eq!(db.active_workspace().unwrap(), None);
         let _ = std::fs::remove_file(&db_path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller

@@ -355,6 +355,11 @@ pub trait WorkspaceStore {
     /// identity and must not leave a stale layout row that can resurrect it.
     fn delete_tab_groups_for_worktree_all_sessions(&self, worktree: &str) -> Result<()>;
 
+    /// Forget every group and tab whose name starts with `{slug}/` across all
+    /// persisted sessions. Used when a workspace is removed, since stale
+    /// groups may have been saved under another workspace's session.
+    fn delete_tab_groups_with_prefix(&self, slug: &str) -> Result<()>;
+
     /// Wipe a session's whole persisted layout (groups + tabs). The host
     /// persists snapshots as clear-then-insert inside one transaction so
     /// closed/renamed entries can't linger.
