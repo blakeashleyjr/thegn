@@ -4,9 +4,11 @@ use anyhow::Result;
 use clap::Subcommand;
 use serde::Serialize;
 use std::time::Duration;
-use thegn_core::db::{Db, MaintenanceStep};
+use thegn_core::db::Db;
 use thegn_core::outln;
-use thegn_core::{AutoVacuum, DbSpace, NOTIFICATION_READ_RETENTION_SECS, plan_maintenance};
+use thegn_core::{
+    AutoVacuum, DbSpace, MaintenanceStep, NOTIFICATION_READ_RETENTION_SECS, plan_maintenance,
+};
 
 const CHUNK_PAGES: u32 = 1024;
 const MIB: u64 = 1024 * 1024;
@@ -126,7 +128,16 @@ pub fn vacuum_report(db: &Db, dry_run: bool) -> Result<VacuumReport> {
         let total = db.space()?.freelist_count;
         let mut freed = 0_u64;
         loop {
-            let chunk = db.incremental_vacuum(CHUNK_PAGES)?;
+            let chunk = db.incremental_vacuum(CHUNK_PAGES).map_err(|error| {
+                if error
+                    .downcast_ref::<thegn_core::VacuumError>()
+                    .is_some_and(|e| matches!(e, thegn_core::VacuumError::Busy))
+                {
+                    anyhow::anyhow!("the state database is busy; retry")
+                } else {
+                    error
+                }
+            })?;
             freed += chunk;
             if chunk == 0 {
                 break;
@@ -178,10 +189,7 @@ mod tests {
     use thegn_core::store::NotificationStore;
 
     fn fixture() -> (tempfile::TempDir, Db) {
-        let dir = tempfile::Builder::new()
-            .permissions(0o700)
-            .tempdir()
-            .unwrap();
+        let dir = tempfile::Builder::new().tempdir().unwrap();
         let db = Db::open_at(&dir.path().join("state.db")).unwrap();
         (dir, db)
     }
@@ -214,6 +222,27 @@ mod tests {
         assert_eq!(encoded["mode_before"], "incremental");
         assert_eq!(encoded["mode_after"], "incremental");
         assert!(encoded.get("pruned_notifications").is_some());
+    }
+
+    #[test]
+    fn vacuum_json_reports_conversion() {
+        use rusqlite::Connection;
+
+        let dir = tempfile::Builder::new().tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        drop(Db::open_at(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA auto_vacuum=NONE; VACUUM;")
+            .unwrap();
+        drop(conn);
+
+        let db = Db::open_at(&path).unwrap();
+        let report = vacuum_report(&db, false).unwrap();
+        assert_eq!(report.mode_before, AutoVacuum::None);
+        assert_eq!(report.mode_after, AutoVacuum::Incremental);
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["mode_before"], "none");
+        assert_eq!(encoded["mode_after"], "incremental");
     }
 
     #[test]

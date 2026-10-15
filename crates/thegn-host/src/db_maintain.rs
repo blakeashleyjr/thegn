@@ -99,17 +99,12 @@ fn run_round_with(
         tracing::info!(target: "thegn::db", live_bytes, free_bytes, "state database is too large for automatic conversion; run 'thegn db vacuum'");
     }
     if step == MaintenanceStep::Convert {
-        convert_round(db, space, attempts, busy, |db, _busy| {
-            let report = db.maintain(thegn_core::util::now(), MaintenanceStep::Convert)?;
-            if report.pruned_notifications > 0 {
-                tracing::debug!(
-                    rows = report.pruned_notifications,
-                    "pruned expired read notifications"
-                );
+        convert_round(db, space, attempts, busy, |db, busy| {
+            let pruned = db.prune_notifications(thegn_core::NOTIFICATION_READ_RETENTION_SECS)?;
+            if pruned > 0 {
+                tracing::debug!(rows = pruned, "pruned expired read notifications");
             }
-            report
-                .conversion
-                .ok_or_else(|| anyhow::anyhow!("database conversion did not run"))
+            db.convert_to_incremental(busy)
         });
         return;
     }
@@ -158,6 +153,7 @@ fn convert_round(
                 .downcast_ref::<VacuumError>()
                 .is_some_and(|e| matches!(e, VacuumError::Busy)) =>
         {
+            toast("State database busy; compaction will retry later".into());
             tracing::debug!(attempt, %error, "state database conversion is busy; will retry on a later disk round");
         }
         Err(error) => {
@@ -178,7 +174,7 @@ mod tests {
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn temp_db() -> (tempfile::TempDir, Db) {
-        let dir = Builder::new().permissions(0o700).tempdir().unwrap();
+        let dir = Builder::new().tempdir().unwrap();
         let path = dir.path().join("state.db");
         (dir, Db::open_at(&path).unwrap())
     }
