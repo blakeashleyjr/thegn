@@ -141,6 +141,7 @@ mod mem;
 mod menu;
 mod merge_driver;
 mod merge_lifecycle;
+mod merge_notify;
 mod merge_ops;
 mod merge_remote;
 mod merge_sweep;
