@@ -18,6 +18,9 @@ use super::{PanelHit, PanelTab, PanelUi, budget};
 pub struct PanelFrame {
     pub rows: Vec<PanelRow>,
     pub rail: Vec<RailSpan>,
+    /// X-spans (panel-relative) for rows that pack two hit targets side by
+    /// side, as in the git two-column zone. A listed row resolves by x only.
+    pub col_hits: Vec<ColHit>,
     /// X-spans for the tab bar (always row 0): `(col_range, tab)`.
     /// Used by `chrome::panel_tab_hit` for x-based click resolution.
     /// Empty for the git-family full view which omits the tab bar.
@@ -31,6 +34,14 @@ pub struct RailSpan {
     pub row: usize,
     pub cols: std::ops::Range<usize>,
     pub section: crate::panel::Section,
+}
+
+/// One clickable x-span within a packed panel row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColHit {
+    pub row: usize,
+    pub cols: std::ops::Range<usize>,
+    pub hit: crate::panel::PanelHit,
 }
 
 fn hue(h: Hue) -> Tok {
@@ -526,6 +537,7 @@ pub fn build_panel(
     PanelFrame {
         rows: out,
         rail: Vec::new(),
+        col_hits: Vec::new(),
         tab_spans,
     }
 }
@@ -696,6 +708,7 @@ fn build_full(
     PanelFrame {
         rows: out,
         rail: spans,
+        col_hits: Vec::new(),
         tab_spans,
     }
 }
