@@ -98,6 +98,8 @@ pub struct AppSlot {
     focus_told: Option<bool>,
     /// The last dimensions delivered through `on_resize`.
     last_size: Option<(u16, u16)>,
+    /// Palette generation last delivered to this running tile.
+    theme_told: Option<u64>,
     /// The last rendered buffer, re-blitted on frames where the tile reported
     /// no change.
     pub last_buf: Option<Buffer>,
@@ -112,6 +114,7 @@ impl AppSlot {
             visible_told: None,
             focus_told: None,
             last_size: None,
+            theme_told: None,
             last_buf: None,
         }
     }
@@ -431,10 +434,19 @@ impl AppHost {
     /// than hooking each place `active` is assigned.
     pub fn sync_visibility(&mut self) {
         let active = self.active;
+        let generation = crate::chrome::palette_generation();
+        let mut theme = None;
+        let mut theme_thunk = || {
+            theme
+                .get_or_insert_with(|| kit_theme(&crate::chrome::palette_snapshot()))
+                .clone()
+        };
         for (i, slot) in self.slots.iter_mut().enumerate() {
+            notify_slot_theme(slot, generation, &mut theme_thunk);
             let SlotState::Running(tile) = &mut slot.state else {
                 slot.visible_told = None;
                 slot.focus_told = None;
+                slot.theme_told = None;
                 slot.last_buf = None;
                 slot.last_size = None;
                 continue;
@@ -503,27 +515,51 @@ pub fn start_slot_tile(
 ) -> bool {
     match registry::builder(slot.id) {
         Some(b) => {
+            let generation = crate::chrome::palette_generation();
             let hook = app_change_hook(app_tx, idx, waker);
-            record_build_result(
+            record_build_result_at_generation(
                 slot,
                 (b.build)(hook, cfg, tokio::runtime::Handle::current()),
+                generation,
             )
         }
         None => false,
     }
 }
 
+#[cfg(test)]
 fn record_build_result(slot: &mut AppSlot, result: Result<Box<dyn AppTile>, String>) -> bool {
+    record_build_result_at_generation(slot, result, crate::chrome::palette_generation())
+}
+
+fn record_build_result_at_generation(
+    slot: &mut AppSlot,
+    result: Result<Box<dyn AppTile>, String>,
+    generation: u64,
+) -> bool {
     match result {
         Ok(tile) => {
             slot.state = SlotState::Running(tile);
+            slot.theme_told = Some(generation);
         }
         Err(error) => {
             tracing::warn!(target: "thegn::apps", app = slot.id, %error, "app construction failed");
             slot.state = SlotState::Failed(error);
+            slot.theme_told = None;
         }
     }
     true
+}
+
+fn notify_slot_theme(slot: &mut AppSlot, generation: u64, theme: &mut impl FnMut() -> Theme) {
+    if slot.theme_told != Some(generation)
+        && let SlotState::Running(tile) = &mut slot.state
+    {
+        let next_theme = theme();
+        tile.on_theme(&next_theme);
+        slot.theme_told = Some(generation);
+        slot.last_buf = None;
+    }
 }
 
 /// A tile's [`ChangeHook`](tg_kit::ChangeHook): fired off-thread when the tile
@@ -1039,6 +1075,90 @@ mod tests {
             matches!(slot.state, SlotState::Failed(ref error) if error == "injected spawn failure")
         );
         assert_eq!(slot.chip_label(), "Observe (failed)");
+    }
+
+    struct ThemeTile {
+        themes: std::sync::Arc<std::sync::Mutex<Vec<Theme>>>,
+        renders: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AppTile for ThemeTile {
+        fn id(&self) -> &'static str {
+            "observe"
+        }
+        fn title(&self) -> String {
+            "Observe".into()
+        }
+        fn pump(&mut self) -> bool {
+            false
+        }
+        fn wants_redraw(&self) -> bool {
+            false
+        }
+        fn handle_input(&mut self, _ev: tg_kit::InputEvent) -> tg_kit::InputResult {
+            tg_kit::InputResult::Ignored
+        }
+        fn render(&mut self, _area: tg_kit::ratatui::layout::Rect, _buf: &mut Buffer) {
+            self.renders
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn on_theme(&mut self, theme: &Theme) {
+            self.themes.lock().unwrap().push(theme.clone());
+        }
+    }
+
+    fn theme_slot() -> (
+        AppSlot,
+        std::sync::Arc<std::sync::Mutex<Vec<Theme>>>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let themes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let renders = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut slot = AppSlot::new("observe", "Observe");
+        slot.state = SlotState::Running(Box::new(ThemeTile {
+            themes: themes.clone(),
+            renders: renders.clone(),
+        }));
+        (slot, themes, renders)
+    }
+
+    #[test]
+    fn theme_change_is_delivered_once_per_generation_and_invalidates_cache() {
+        let (mut slot, themes, renders) = theme_slot();
+        slot.theme_told = Some(1);
+        let mut host = AppHost::new(vec![slot]);
+        host.set_active(ActiveApp::Tile(0));
+        let area = tg_kit::ratatui::layout::Rect::new(0, 0, 4, 2);
+        assert!(host.render_active(area).is_some());
+        assert_eq!(renders.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let mut make_theme = || Theme::prism();
+        notify_slot_theme(&mut host.slots[0], 2, &mut make_theme);
+        assert_eq!(themes.lock().unwrap().len(), 1);
+        assert!(host.slots[0].last_buf.is_none());
+        assert!(host.render_active(area).is_some());
+        assert_eq!(renders.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        host.set_active(ActiveApp::Work);
+        notify_slot_theme(&mut host.slots[0], 2, &mut make_theme);
+        assert_eq!(themes.lock().unwrap().len(), 1);
+        notify_slot_theme(&mut host.slots[0], 3, &mut make_theme);
+        assert_eq!(themes.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn light_palette_reaches_running_tile() {
+        let light = thegn_core::theme::preset("light").expect("light preset exists");
+        let expected = kit_theme(&light);
+        let (mut slot, themes, _) = theme_slot();
+        slot.theme_told = Some(1);
+        notify_slot_theme(&mut slot, 2, &mut || expected.clone());
+
+        let delivered = themes.lock().unwrap();
+        assert_eq!(delivered.as_slice(), &[expected.clone()]);
+        assert_eq!(delivered[0].accent, expected.accent);
+        assert_eq!(delivered[0].text, expected.text);
+        assert_ne!(delivered[0], Theme::prism());
     }
 
     #[test]
