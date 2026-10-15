@@ -380,7 +380,7 @@ pub fn native_trust_refusal(plugin: &LoadedPlugin) -> Option<SpecProblem> {
     };
     let problem = if plugin.dir.is_some() {
         format!(
-            "refused: declares {} but capabilities do not sandbox native plugin code; declare it as a [[plugins]] entry in the config file with trusted_native = true (plugin.toml cannot grant trust) to run it with your full user authority",
+            "refused: declares {} but capabilities do not sandbox native plugin code; move this plugin directory out of plugins/ (or remove its plugin.toml), then declare it as a [[plugins]] entry with absolute command and cwd paths and trusted_native = true to run it with your full user authority",
             gated_by.join(", ")
         )
     } else {
@@ -885,9 +885,10 @@ mod tests {
         assert!(
             problem
                 .problem
-                .contains("[[plugins]] entry in the config file")
+                .contains("move this plugin directory out of plugins/")
         );
-        assert!(problem.problem.contains("plugin.toml cannot grant trust"));
+        assert!(problem.problem.contains("remove its plugin.toml"));
+        assert!(problem.problem.contains("absolute command and cwd paths"));
     }
 
     #[test]
@@ -897,8 +898,10 @@ mod tests {
             .manifest
             .capabilities
             .push(Capability::new("network", "example.com"));
-        let surface: PluginSpec =
-            toml::from_str(include_str!("../../../examples/plugins/hello/plugin.toml")).unwrap();
+        let surface: PluginSpec = toml::from_str(include_str!(
+            "../../../../examples/plugins/hello/plugin.toml"
+        ))
+        .unwrap();
         let loaded = [
             LoadedPlugin {
                 spec: gated,

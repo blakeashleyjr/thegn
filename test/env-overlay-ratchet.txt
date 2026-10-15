@@ -331,9 +331,9 @@ plugins.id
 plugins.mode
 plugins.name
 plugins.scopes
+plugins.timeout_secs
 # plugins.trusted_native is trust policy and must never be granted by an ambient environment variable.
 plugins.trusted_native
-plugins.timeout_secs
 plugins.version
 pr.ttl_secs
 pr_queue.agent

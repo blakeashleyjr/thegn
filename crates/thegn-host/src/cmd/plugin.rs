@@ -154,17 +154,16 @@ fn negotiation_status(plugin: &LoadedPlugin) -> String {
 }
 
 fn list_row(plugin: &LoadedPlugin) -> PluginListRow {
-    let trust = match plugin.spec.native_trust() {
-        thegn_core::plugin_api::NativeTrust::Ungated => "n/a",
-        thegn_core::plugin_api::NativeTrust::Trusted => "trusted-native",
-        thegn_core::plugin_api::NativeTrust::Refused { .. } => "refused-untrusted",
-    };
+    let native_trust = plugin.spec.native_trust();
+    let trust = native_trust.status_token();
     let status = if plugin.spec.enabled
         && matches!(
-            plugin.spec.native_trust(),
+            native_trust,
             thegn_core::plugin_api::NativeTrust::Refused { .. }
         ) {
-        "refused: needs trusted_native = true".to_string()
+        thegn_svc::plugin::loader::native_trust_refusal(plugin)
+            .map(|problem| problem.problem)
+            .unwrap_or_else(|| "refused-untrusted".to_string())
     } else {
         negotiation_status(plugin)
     };
@@ -455,11 +454,31 @@ mod tests {
         let rows = [list_row(&trusted), list_row(&refused), list_row(&ungated)];
         assert_eq!(rows[0].trust, "trusted-native");
         assert_eq!(rows[1].trust, "refused-untrusted");
-        assert_eq!(rows[1].status, "refused: needs trusted_native = true");
-        assert_eq!(rows[2].trust, "n/a");
+        assert!(
+            rows[1]
+                .status
+                .contains("refused: declares network:example.com")
+        );
+        assert_eq!(rows[2].trust, "ungated");
         let json = serde_json::to_value(&rows[1]).unwrap();
         assert_eq!(json["trust"], "refused-untrusted");
         assert_eq!(json["gated_by"], serde_json::json!(["network:example.com"]));
+    }
+
+    #[test]
+    fn refused_directory_list_status_explains_how_to_grant_trust() {
+        let mut plugin = inspected_plugin(ExtensionPoint::PaletteAction, &["network:example.com"]);
+        plugin.spec.scopes.clear();
+        plugin.dir = Some(std::path::PathBuf::from("/tmp/plugins/untrusted"));
+
+        let row = list_row(&plugin);
+
+        assert!(
+            row.status
+                .contains("move this plugin directory out of plugins/")
+        );
+        assert!(row.status.contains("absolute command and cwd paths"));
+        assert!(row.status.contains("trusted_native = true"));
     }
 
     #[test]

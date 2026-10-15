@@ -501,6 +501,7 @@ pub(crate) fn drain(
                         first.to_string()
                     };
                 }
+                damage.merge(PluginDamage::Structural);
             }
             PluginMsg::Event { plugin, event } => match event {
                 SessionEvent::Message(m) => damage.merge(apply_message(state, &plugin, m)),
@@ -2119,7 +2120,7 @@ mod tests {
     fn refused_message_sets_status_naming_plugin_and_flag() {
         let mut state = PluginsState::new(thegn_core::config::Config::default());
         let mut model = FrameModel::default();
-        drain_one(
+        let damage = drain_one(
             &mut state,
             &mut model,
             PluginMsg::Refused(vec![
@@ -2137,5 +2138,6 @@ mod tests {
         assert!(model.status.contains("untrusted-plugin"));
         assert!(model.status.contains("trusted_native = true"));
         assert!(model.status.contains("(+1 more; see thegn plugin check)"));
+        assert_ne!(damage, PluginDamage::None);
     }
 }

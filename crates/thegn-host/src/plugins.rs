@@ -915,4 +915,54 @@ mod tests {
         assert!(!marker.exists());
         assert!(rx.try_recv().is_err());
     }
+
+    #[test]
+    fn startup_refuses_untrusted_gated_one_shot_without_running_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("ran");
+        let mut refused = capability_spec("untrusted-runner", "run:git");
+        refused.mode = PluginMode::OneShot;
+        refused.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "touch \"$1\"".into(),
+            "plugin".into(),
+            marker.display().to_string(),
+        ];
+        refused.manifest.contributions.clear();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+
+        setup_and_schedule_with_waker(
+            supervisor,
+            vec![refused],
+            tmp.path().to_path_buf(),
+            sessions,
+            disabled,
+            stop,
+            tx,
+            None,
+        );
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            PluginMsg::Loaded(loaded)
+                if loaded.iter().all(|state| state.plugin.spec.manifest.id.as_str() != "untrusted-runner")
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            PluginMsg::Refused(problems)
+                if problems.iter().any(|problem| problem.plugin == "untrusted-runner")
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(!marker.exists());
+    }
 }
