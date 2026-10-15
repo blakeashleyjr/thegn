@@ -6,11 +6,14 @@ use thegn_core::store::{AccountStore, WorkspaceStore};
 #[derive(Debug, Clone)]
 pub(crate) enum PendingDbResult {
     AccountAdded {
-        seq: u64,
         pane: u32,
         provider: String,
         name: String,
         dir: String,
+    },
+    AccountAddFailed {
+        provider: String,
+        error: String,
     },
     ApplyLayout {
         seq: u64,
@@ -19,7 +22,6 @@ pub(crate) enum PendingDbResult {
         spec: Option<crate::layout_spec::LayoutSpec>,
     },
     Template {
-        generation: u64,
         tab: String,
         fallback_commands: Vec<String>,
         spec: Option<crate::layout_spec::LayoutSpec>,
@@ -36,7 +38,7 @@ pub(crate) struct RequestFence {
 }
 
 impl RequestFence {
-    pub(crate) fn next(&mut self) -> u64 {
+    fn next(&mut self) -> u64 {
         self.next = self.next.wrapping_add(1);
         self.next
     }
@@ -81,6 +83,21 @@ pub(crate) fn account_gone_pane_status(provider: &str, name: &str) -> String {
     format!("Account {provider}:{name} registered; focused pane closed, run the login yourself")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccountAddDrainStatus {
+    LoginQueued,
+    PaneNotReading,
+    PaneClosed,
+}
+
+pub(crate) fn account_add_drain_status(pane_exists: bool, write_ok: bool) -> AccountAddDrainStatus {
+    match (pane_exists, write_ok) {
+        (false, _) => AccountAddDrainStatus::PaneClosed,
+        (true, true) => AccountAddDrainStatus::LoginQueued,
+        (true, false) => AccountAddDrainStatus::PaneNotReading,
+    }
+}
+
 pub(crate) fn dropped_layout_status() -> &'static str {
     "Apply layout: database busy, try again"
 }
@@ -101,10 +118,31 @@ pub(crate) struct TemplateTabPlan {
     pub(crate) restore: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct TemplateDrainPlan {
+    pub(crate) target: usize,
+    pub(crate) restore: Option<usize>,
+    pub(crate) spec: Option<crate::layout_spec::LayoutSpec>,
+}
+
 pub(crate) fn template_tab_plan(active: usize, target: usize) -> TemplateTabPlan {
     TemplateTabPlan {
         target,
         restore: (active != target).then_some(active),
+    }
+}
+
+pub(crate) fn plan_template_drain(
+    active: usize,
+    target: usize,
+    spec: Option<crate::layout_spec::LayoutSpec>,
+    fallback_commands: &[String],
+) -> TemplateDrainPlan {
+    let tabs = template_tab_plan(active, target);
+    TemplateDrainPlan {
+        target: tabs.target,
+        restore: tabs.restore,
+        spec: template_spec(spec, fallback_commands),
     }
 }
 
@@ -126,6 +164,21 @@ fn send_result(
     if let Err(error) = waker.wake() {
         tracing::debug!(target: "thegn::db", %error, "pending DB result wake failed");
     }
+}
+
+async fn send_dropped_result(
+    done_rx: tokio::sync::oneshot::Receiver<()>,
+    seq: u64,
+    tx: &tokio::sync::mpsc::UnboundedSender<PendingDbResult>,
+) -> bool {
+    if done_rx.await.is_ok() {
+        return false;
+    }
+    if let Err(error) = tx.send(PendingDbResult::Dropped { seq }) {
+        tracing::debug!(target: "thegn::db", %error, "pending DB result receiver is gone");
+        return false;
+    }
+    true
 }
 
 pub(crate) fn queue_apply_layout(
@@ -156,18 +209,15 @@ pub(crate) fn queue_apply_layout(
         }
     });
     tokio::spawn(async move {
-        if done_rx.await.is_err() {
-            send_result(
-                &fallback_tx,
-                &fallback_wake,
-                PendingDbResult::Dropped { seq },
-            );
+        if send_dropped_result(done_rx, seq, &fallback_tx).await
+            && let Err(error) = fallback_wake.wake()
+        {
+            tracing::debug!(target: "thegn::db", %error, "pending DB result wake failed");
         }
     });
 }
 
 pub(crate) fn queue_template(
-    generation: u64,
     tab: String,
     layout_name: Option<String>,
     fallback_commands: Vec<String>,
@@ -187,7 +237,6 @@ pub(crate) fn queue_template(
                 &job_tx,
                 &job_wake,
                 PendingDbResult::Template {
-                    generation,
                     tab: job_tab,
                     fallback_commands: job_commands,
                     spec: spec_from_db(db, &name),
@@ -203,7 +252,6 @@ pub(crate) fn queue_template(
                     &fallback_tx,
                     &fallback_wake,
                     PendingDbResult::Template {
-                        generation,
                         tab,
                         fallback_commands,
                         spec: None,
@@ -216,7 +264,6 @@ pub(crate) fn queue_template(
             tx,
             waker,
             PendingDbResult::Template {
-                generation,
                 tab,
                 fallback_commands,
                 spec: None,
@@ -226,7 +273,6 @@ pub(crate) fn queue_template(
 }
 
 pub(crate) fn queue_account_add(
-    seq: u64,
     pane: u32,
     provider: String,
     tx: &tokio::sync::mpsc::UnboundedSender<PendingDbResult>,
@@ -235,41 +281,37 @@ pub(crate) fn queue_account_add(
     let tx = tx.clone();
     let wake = waker.clone();
     crate::db_task::persist_critical(move |db| {
-        let count = match db.list_accounts(&provider) {
-            Ok(accounts) => accounts.len(),
-            Err(error) => {
-                tracing::warn!(target: "thegn::db", %error, "account list failed before account add");
-                return;
-            }
-        };
-        let name = format!("acct{}", count + 1);
-        if thegn_core::account::provider(&provider).is_none() {
-            return;
-        }
-        let dir = thegn_core::account::managed_dir(&provider, &name);
-        if let Err(error) = std::fs::create_dir_all(&dir) {
-            tracing::warn!(target: "thegn::db", %error, "managed account directory creation failed");
-            return;
-        }
-        let dir_string = dir.to_string_lossy().into_owned();
-        if let Err(error) =
-            db.put_account(&provider, &name, &dir_string, true, thegn_core::util::now())
-        {
-            tracing::warn!(target: "thegn::db", %error, "account registration failed");
-            return;
-        }
-        send_result(
-            &tx,
-            &wake,
-            PendingDbResult::AccountAdded {
-                seq,
+        let result = add_account(db, &provider);
+        let message = match result {
+            Ok((name, dir)) => PendingDbResult::AccountAdded {
                 pane,
                 provider,
                 name,
-                dir: dir_string,
+                dir,
             },
-        );
+            Err(error) => {
+                tracing::warn!(target: "thegn::db", %error, "account add failed");
+                PendingDbResult::AccountAddFailed {
+                    provider,
+                    error: error.to_string(),
+                }
+            }
+        };
+        send_result(&tx, &wake, message);
     });
+}
+
+fn add_account(db: &thegn_core::db::Db, provider: &str) -> anyhow::Result<(String, String)> {
+    if thegn_core::account::provider(provider).is_none() {
+        anyhow::bail!("unknown account provider \"{provider}\"");
+    }
+    let count = db.list_accounts(provider)?.len();
+    let name = format!("acct{}", count + 1);
+    let dir = thegn_core::account::managed_dir(provider, &name);
+    std::fs::create_dir_all(&dir)?;
+    let dir_string = dir.to_string_lossy().into_owned();
+    db.put_account(provider, &name, &dir_string, true, thegn_core::util::now())?;
+    Ok((name, dir_string))
 }
 
 pub(crate) fn persist_account_binding(worktree: String, provider: String, name: String) {
@@ -386,11 +428,29 @@ mod tests {
     }
 
     #[test]
-    fn template_layout_result_targets_its_own_tab_and_restores_previous() {
-        let plan = template_tab_plan(2, 5);
+    fn template_drain_plan_applies_to_its_tab_and_restores_previous() {
+        let commands = vec!["one".to_string(), "two".to_string()];
+        let plan = plan_template_drain(2, 5, None, &commands);
         assert_eq!(plan.target, 5);
         assert_eq!(plan.restore, Some(2));
-        assert_eq!(template_tab_plan(5, 5).restore, None);
+        assert!(plan.spec.is_some());
+        let same_tab = plan_template_drain(5, 5, None, &commands);
+        assert_eq!(same_tab.restore, None);
+    }
+
+    #[test]
+    fn dropped_layout_fallback_sends_a_dropped_result() {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        drop(done_tx);
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { send_dropped_result(done_rx, 7, &result_tx).await });
+        assert!(matches!(
+            result_rx.try_recv(),
+            Ok(PendingDbResult::Dropped { seq: 7 })
+        ));
     }
 
     #[test]
@@ -401,18 +461,18 @@ mod tests {
     }
 
     #[test]
-    fn account_added_to_gone_pane_reports_manual_login() {
+    fn account_add_drain_distinguishes_closed_and_unwritable_panes() {
         assert_eq!(
-            account_gone_pane_status("claude", "acct3"),
-            "Account claude:acct3 registered; focused pane closed, run the login yourself"
+            account_add_drain_status(false, false),
+            AccountAddDrainStatus::PaneClosed
         );
-    }
-
-    #[test]
-    fn dropped_layout_job_reports_busy() {
         assert_eq!(
-            dropped_layout_status(),
-            "Apply layout: database busy, try again"
+            account_add_drain_status(true, false),
+            AccountAddDrainStatus::PaneNotReading
+        );
+        assert_eq!(
+            account_add_drain_status(true, true),
+            AccountAddDrainStatus::LoginQueued
         );
     }
 
@@ -435,5 +495,23 @@ mod tests {
             ),
             Some("acct1".to_string())
         );
+        assert_eq!(
+            thegn_core::account::active_name(
+                &thegn_core::config::Config::default(),
+                &db,
+                "/elsewhere",
+                None,
+                "claude"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn account_add_helper_rejects_unknown_provider_with_db_open_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = thegn_core::db::Db::open_at(&dir.path().join("thegn.db")).unwrap();
+        let error = add_account(&db, "not-a-provider").unwrap_err();
+        assert!(error.to_string().contains("unknown account provider"));
     }
 }
