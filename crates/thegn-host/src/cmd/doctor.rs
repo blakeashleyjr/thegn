@@ -1592,6 +1592,33 @@ fn build_parity_lines() {
         }
         None => outln!("  schema        (no database yet) build v{build}"),
     }
+    match Db::open_read_only() {
+        Ok(Some(db)) => match db.space() {
+            Ok(space) => {
+                let step = thegn_core::plan_maintenance(&space, 1);
+                let recommend = space.auto_vacuum != thegn_core::AutoVacuum::Incremental
+                    || matches!(step, thegn_core::MaintenanceStep::TooLargeForAuto { .. });
+                outln!(
+                    "  db space      {} MB ({} MB reclaimable, auto_vacuum {}){}",
+                    space.file_bytes().div_ceil(1024 * 1024),
+                    space.free_bytes().div_ceil(1024 * 1024),
+                    match space.auto_vacuum {
+                        thegn_core::AutoVacuum::None => "none",
+                        thegn_core::AutoVacuum::Full => "full",
+                        thegn_core::AutoVacuum::Incremental => "incremental",
+                    },
+                    if recommend {
+                        "; run 'thegn db vacuum'"
+                    } else {
+                        ""
+                    },
+                );
+            }
+            Err(error) => outln!("  db space      unavailable ({error})"),
+        },
+        Ok(None) => outln!("  db space      (no database yet)"),
+        Err(error) => outln!("  db space      unavailable ({error})"),
+    }
     let cli = thegn_core::util::self_exe_path();
     outln!(
         "  cli binary    {}{}",

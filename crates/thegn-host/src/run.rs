@@ -706,6 +706,7 @@ pub async fn main(
     let (refresh_tx, refresh_rx) = tokio_mpsc::unbounded_channel::<RefreshKind>();
     crate::daemon::agent_error_cache::install_refresh(refresh_tx.clone(), waker.clone());
     crate::db_task::install_drop_notice(refresh_tx.clone(), waker.clone());
+    crate::db_maintain::install_notice(refresh_tx.clone(), waker.clone());
     crate::mise_provider::install_refresh(refresh_tx.clone(), waker.clone());
     // Defensive self-heal: strip any stray `core.worktree` that leaked into a
     // main checkout's shared `.git/config` (which silently retargets every git
@@ -15463,6 +15464,7 @@ async fn event_loop<T: Terminal>(
                 if std::env::var_os("THEGN_BENCH_FIRST_FRAME_EXIT").is_some() {
                     return Ok(());
                 }
+                crate::db_maintain::arm_after_first_frame();
                 // Deferred warms — AFTER the first flush so they never tax
                 // launch→first-frame: syntect's lazy sets (first diff
                 // drill-in) and the initial worktree's hidden yazi drawer.
