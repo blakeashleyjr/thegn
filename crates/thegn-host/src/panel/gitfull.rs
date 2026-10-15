@@ -803,16 +803,17 @@ pub(crate) fn stash_diff_wanted(ui: &PanelUi, data: &PanelData) -> Option<String
         .then_some(sha)
 }
 
-/// The selected branch's name (filter-aware) — the loop's demand-driven
-/// branch-log fetch keys on this; mirrors [`branches_region`]'s selection.
-pub(crate) fn selected_branch(ui: &PanelUi, data: &PanelData) -> Option<String> {
+/// The selected branch's name and observed tip (filter-aware) — the loop's
+/// demand-driven branch-log fetch keys on both; mirrors [`branches_region`].
+pub(crate) fn selected_branch(ui: &PanelUi, data: &PanelData) -> Option<(String, String)> {
     let ix = list_indices(ui, data, GitView::Branches);
     let cur = ui
         .git
         .cur
         .get(GitView::Branches)
         .min(ix.len().saturating_sub(1));
-    ix.get(cur).map(|&s| data.branches[s].name.clone())
+    ix.get(cur)
+        .map(|&s| (data.branches[s].name.clone(), data.branches[s].sha.clone()))
 }
 
 /// The branches main region: a cheap linear commit list titled with the
@@ -824,9 +825,11 @@ fn branches_region(data: &PanelData, ui: &PanelUi, avail: usize) -> Vec<PanelRow
         .cur
         .get(GitView::Branches)
         .min(ix.len().saturating_sub(1));
-    let selected = ix.get(cur).map(|&s| data.branches[s].name.clone());
+    let selected = ix
+        .get(cur)
+        .map(|&s| (data.branches[s].name.clone(), data.branches[s].sha.clone()));
     let head = data.branch.clone();
-    let name = selected.unwrap_or_else(|| head.clone());
+    let (name, tip) = selected.unwrap_or_else(|| (head.clone(), String::new()));
     // The selected branch's own log when the demand-driven fetch has landed;
     // HEAD's list (titled honestly) while it's still out or absent —
     // captioning main's commits as "feature-x — recent commits" was a lie.
@@ -834,15 +837,22 @@ fn branches_region(data: &PanelData, ui: &PanelUi, avail: usize) -> Vec<PanelRow
         .git
         .branch_log
         .as_ref()
-        .filter(|(n, _)| *n == name)
-        .map(|(_, rows)| rows);
+        .filter(|(n, t, _)| *n == name && *t == tip);
     let mut title_segs = vec![seg(ac(), name.clone()).bold()];
-    match fetched {
-        Some(_) => title_segs.push(seg(g2(), " — recent commits".to_string())),
+    match fetched.map(|(_, _, result)| result) {
+        Some(Ok(_)) => title_segs.push(seg(g2(), " — recent commits".to_string())),
+        Some(Err(_)) => title_segs.push(seg(g2(), " — log unavailable".to_string())),
         None => title_segs.push(seg(g2(), format!(" — recent commits on {head} (HEAD)…"))),
     }
     let mut out = vec![PanelRow::plain(Line::segs(title_segs))];
-    let list = fetched.unwrap_or(&data.commits);
+    if let Some((_, _, Err(error))) = fetched {
+        let error = thegn_svc::lsp::sanitize_for_terminal(error);
+        out.push(PanelRow::plain(Line::segs(vec![seg(g2(), error)])));
+        return out;
+    }
+    let list = fetched
+        .and_then(|(_, _, result)| result.as_ref().ok())
+        .unwrap_or(&data.commits);
     for c in list.iter().take(avail.saturating_sub(1)) {
         out.push(PanelRow::plain(Line::split(
             vec![
@@ -2236,5 +2246,77 @@ mod tests {
         plain.sidebar_rows = colocated.sidebar_rows;
         let rendered = text_of(&status_rows(&plain, &ui(GitView::Files), true)[0].line);
         assert!(!rendered.contains("jj: git index ignored"), "{rendered}");
+    }
+
+    #[test]
+    fn selected_branch_returns_name_and_tip() {
+        let m = model();
+        let selected = selected_branch(&ui(GitView::Branches), &m.panel);
+        assert_eq!(
+            selected,
+            Some(("feat/full".into(), "sha00aaaaaaaaaa".into()))
+        );
+    }
+
+    #[test]
+    fn branches_region_ignores_a_log_for_an_old_tip() {
+        let m = model();
+        let mut u = ui(GitView::Branches);
+        u.git.branch_log = Some((
+            "feat/full".into(),
+            "sha-old".into(),
+            Ok(vec![CommitRow {
+                subject: "stale log row".into(),
+                ..commit(77)
+            }]),
+        ));
+
+        let rendered = all_text(&PanelFrame {
+            rows: branches_region(&m.panel, &u, 10),
+            rail: Vec::new(),
+            tab_spans: Vec::new(),
+        });
+
+        assert!(
+            rendered.contains("recent commits on feat/full (HEAD)…"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("stale log row"), "{rendered}");
+    }
+
+    #[test]
+    fn branches_region_reports_an_unavailable_log() {
+        let m = model();
+        let mut u = ui(GitView::Branches);
+        u.git.branch_log = Some((
+            "feat/full".into(),
+            "sha00aaaaaaaaaa".into(),
+            Err("git log failed\u{1b}[31m".into()),
+        ));
+
+        let rendered = all_text(&PanelFrame {
+            rows: branches_region(&m.panel, &u, 10),
+            rail: Vec::new(),
+            tab_spans: Vec::new(),
+        });
+
+        assert!(
+            rendered.contains("feat/full — log unavailable"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("git log failed"), "{rendered}");
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "error text must be sanitized: {rendered:?}"
+        );
+        assert_eq!(
+            rendered.lines().count(),
+            2,
+            "one title and one error row: {rendered}"
+        );
+        assert!(
+            !rendered.contains("feat: change"),
+            "failed log has no commits: {rendered}"
+        );
     }
 }
