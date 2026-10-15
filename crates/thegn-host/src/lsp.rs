@@ -27,10 +27,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::lsp_admission::{AdmittedClient, RootAdmission};
 use thegn_core::config::Config;
 use thegn_svc::lsp::{
-    DiagnosticKey, DiagnosticsReceiver, DiagnosticsSender, LspClient, LspDiagnostic, LspError,
-    LspHealth, LspSeverity, PublishedDiagnostics, Registry, StreamKey, limits,
+    CancelToken, DiagnosticKey, DiagnosticsReceiver, DiagnosticsSender, LspClient, LspDiagnostic,
+    LspError, LspHealth, LspSeverity, PublishedDiagnostics, Registry, StreamKey, limits,
 };
 
 use crate::panel::{DiagnosticItem, Severity};
@@ -174,6 +175,7 @@ pub struct LspInner {
     /// across every off-loop request task.
     registry: Registry,
     diag_tx: DiagnosticsSender,
+    admission: RootAdmission,
     clients: Mutex<ClientState>,
 }
 
@@ -186,6 +188,7 @@ impl LspSupervisor {
                 enabled: cfg.lsp.enabled,
                 registry: Registry::build(&cfg.lsp.servers),
                 diag_tx,
+                admission: RootAdmission::new(),
                 clients: Mutex::new(ClientState::default()),
             }),
             raw_rx: Some(raw_rx),
@@ -287,8 +290,17 @@ impl LspInner {
 
     /// Get the warm client for `(root, key)`, lazily spawning+initializing it on
     /// first use. **Blocks** (spawn + initialize) — call off the event loop.
-    pub fn client(&self, root: &Path, key: &str) -> Result<Arc<LspClient>, LspError> {
-        self.client_with(root, key, |root, key, diagnostics, generation| {
+    pub fn client(&self, root: &Path, key: &str) -> Result<AdmittedClient, LspError> {
+        self.client_with_cancel(root, key, None)
+    }
+
+    pub(crate) fn client_with_cancel(
+        &self,
+        root: &Path,
+        key: &str,
+        cancel: Option<&CancelToken>,
+    ) -> Result<AdmittedClient, LspError> {
+        self.admitted_with(root, key, cancel, |root, key, diagnostics, generation| {
             let Some(spec) = self.registry.resolve(key) else {
                 return Err(LspError::NotAvailable);
             };
@@ -319,6 +331,21 @@ impl LspInner {
             client.initialize(root)?;
             Ok(Arc::new(client))
         })
+    }
+
+    fn admitted_with(
+        &self,
+        root: &Path,
+        key: &str,
+        cancel: Option<&CancelToken>,
+        start: impl FnOnce(&Path, &str, DiagnosticsSender, u64) -> Result<Arc<LspClient>, LspError>,
+    ) -> Result<AdmittedClient, LspError> {
+        let permit = self.admission.admit(root, cancel)?;
+        if cancel.is_some_and(CancelToken::is_cancelled) {
+            return Err(LspError::Cancelled);
+        }
+        let client = self.client_with(root, key, start)?;
+        Ok(AdmittedClient::new(permit, client))
     }
 
     /// [`LspInner::client`] with an injectable starter (tests drive the
@@ -3029,5 +3056,17 @@ mod tests {
         store.retain_streams(&HashSet::new());
         let f = assert_store_conserved(&store);
         assert_eq!((f.loss_bytes, store.active_loss(Path::new("/p"))), (0, 0));
+    }
+
+    #[test]
+    fn client_holds_a_permit_until_the_guard_drops() {
+        let (inner, _rx) = enabled_inner();
+        let root = Path::new("/admitted");
+        let client = inner
+            .admitted_with(root, "rust", None, fake_client)
+            .unwrap();
+        assert_eq!(inner.admission.in_flight(root), 1);
+        drop(client);
+        assert_eq!(inner.admission.in_flight(root), 0);
     }
 }
