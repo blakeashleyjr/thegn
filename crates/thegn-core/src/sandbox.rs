@@ -3273,6 +3273,155 @@ fn sweep_stale_env_files_in(
     }
 }
 
+fn sweep_orphan_vpn_staging_in(
+    anchor: &std::path::Path,
+    rel: &std::path::Path,
+    listed: Option<&std::collections::HashSet<String>>,
+    removed: &[String],
+    now: SystemTime,
+    max_age: Duration,
+) -> usize {
+    let root = anchor.join(rel);
+    match std::fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return 0,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(error) => {
+            tracing::debug!(target: "thegn::sandbox", %error, "unable to inspect VPN staging directory");
+            return 0;
+        }
+    }
+    let _pinned = match crate::fsperm::ensure_private_dir_beneath(anchor, rel) {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::debug!(target: "thegn::sandbox", %error, "unable to pin VPN staging directory");
+            return 0;
+        }
+    };
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::debug!(target: "thegn::sandbox", %error, "unable to list VPN staging directory");
+            return 0;
+        }
+    };
+    let mut count = 0;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::debug!(target: "thegn::sandbox", %error, "unable to inspect VPN staging entry");
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        let Some(name_text) = name.to_str() else {
+            continue;
+        };
+        if !name_text.ends_with(VPN_SIDECAR_SUFFIX) {
+            continue;
+        }
+        let path = root.join(&name);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::debug!(target: "thegn::sandbox", %error, "unable to inspect VPN staging entry");
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            if removed.iter().any(|removed_name| removed_name == name_text) {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => count += 1,
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::sandbox", %error, "unable to unlink VPN staging symlink")
+                    }
+                }
+            }
+            continue;
+        }
+        if !metadata.is_dir() {
+            continue;
+        }
+        let deleted_by_gc = removed.iter().any(|removed_name| removed_name == name_text);
+        let old_unlisted = listed.is_some_and(|listed| {
+            !listed.contains(name_text)
+                && metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .is_some_and(|age| age >= max_age)
+        });
+        if !deleted_by_gc && !old_unlisted {
+            continue;
+        }
+        let current = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::debug!(target: "thegn::sandbox", %error, "unable to recheck VPN staging directory");
+                continue;
+            }
+        };
+        if !current.is_dir() || current.file_type().is_symlink() {
+            continue;
+        }
+        let files = match std::fs::read_dir(&path) {
+            Ok(files) => files,
+            Err(error) => {
+                tracing::debug!(target: "thegn::sandbox", %error, "unable to list VPN staging files");
+                continue;
+            }
+        };
+        let mut has_residue = false;
+        for file in files {
+            let file = match file {
+                Ok(file) => file,
+                Err(error) => {
+                    tracing::debug!(target: "thegn::sandbox", %error, "unable to inspect VPN staging file");
+                    has_residue = true;
+                    continue;
+                }
+            };
+            let file_path = path.join(file.file_name());
+            match std::fs::symlink_metadata(&file_path) {
+                Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                    if let Err(error) = std::fs::remove_file(&file_path) {
+                        tracing::debug!(target: "thegn::sandbox", %error, "unable to remove VPN staging file");
+                        has_residue = true;
+                    }
+                }
+                Ok(_) => {
+                    tracing::debug!(target: "thegn::sandbox", path = %file_path.display(), "keeping non-file VPN staging entry");
+                    has_residue = true;
+                }
+                Err(error) => {
+                    tracing::debug!(target: "thegn::sandbox", %error, "unable to recheck VPN staging file");
+                    has_residue = true;
+                }
+            }
+        }
+        if has_residue {
+            continue;
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::debug!(target: "thegn::sandbox", %error, "unable to recheck VPN staging directory before removal");
+                continue;
+            }
+        }
+        match std::fs::remove_dir(&path) {
+            Ok(()) => count += 1,
+            Err(error) => {
+                tracing::debug!(target: "thegn::sandbox", %error, "unable to remove VPN staging directory")
+            }
+        }
+    }
+    count
+}
+
 fn oci_env_file_arg(argv: &[String]) -> Option<PathBuf> {
     argv.windows(2)
         .find(|pair| pair[0] == "--env-file")
@@ -4011,6 +4160,9 @@ pub fn run_gc_detailed(db_worktrees: &[String]) -> GcReport {
     );
     let mut removed_report = Vec::new();
     let mut unverified_report = Vec::new();
+    let mut listed_names = std::collections::HashSet::new();
+    let mut removed_names = Vec::new();
+    let mut listed_any = false;
     for backend in Backend::all_oci() {
         let Some(list) = gc_list_argv(backend) else {
             continue;
@@ -4035,6 +4187,8 @@ pub fn run_gc_detailed(db_worktrees: &[String]) -> GcReport {
         }
 
         let containers = parse_container_list(backend, &stdout);
+        listed_any = true;
+        listed_names.extend(containers.iter().cloned());
         let identity = crate::sandbox_manage::owner_identity();
         let mine = crate::sandbox_manage::gc_owned_list_argv(backend, &identity).and_then(|argv| {
             let mut command = backend_prefix(backend);
@@ -4062,6 +4216,7 @@ pub fn run_gc_detailed(db_worktrees: &[String]) -> GcReport {
         );
 
         for orphan in &plan.remove {
+            removed_names.push(orphan.clone());
             let mut rm = backend_prefix(backend);
             rm.extend(["rm".into(), "-f".into(), orphan.clone()]);
             let _ = status_with_timeout(&rm, PROBE_TIMEOUT); // best-effort: teardown: orphan container rm -f is best-effort
@@ -4073,6 +4228,14 @@ pub fn run_gc_detailed(db_worktrees: &[String]) -> GcReport {
             unverified_report.push((backend.label(), plan.unverified));
         }
     }
+    sweep_orphan_vpn_staging_in(
+        &state_home,
+        std::path::Path::new("thegn/vpn"),
+        listed_any.then_some(&listed_names),
+        &removed_names,
+        SystemTime::now(),
+        SECRET_ENV_FILE_MAX_AGE,
+    );
     GcReport {
         removed: removed_report,
         unverified: unverified_report,

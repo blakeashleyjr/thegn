@@ -3513,3 +3513,118 @@ fn universal_block_suppresses_vpn_sidecar() {
         "{opts:?}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn vpn_staging_sweep_removes_old_unlisted_and_gc_removed_sidecars() {
+    use std::time::{Duration, SystemTime};
+    let parent = tempfile::tempdir().unwrap();
+    let vpn = parent.path().join("thegn/vpn");
+    std::fs::create_dir_all(&vpn).unwrap();
+    let now = SystemTime::now();
+    let age = Duration::from_secs(60);
+    let old_unlisted = vpn.join("a-tgvpn");
+    let fresh_unlisted = vpn.join("b-tgvpn");
+    let old_listed = vpn.join("c-tgvpn");
+    let fresh_removed = vpn.join("d-tgvpn");
+    let other = vpn.join("e");
+    let nested_residue = vpn.join("f-tgvpn");
+    for dir in [
+        &old_unlisted,
+        &fresh_unlisted,
+        &old_listed,
+        &fresh_removed,
+        &other,
+        &nested_residue,
+    ] {
+        std::fs::create_dir(dir).unwrap();
+        std::fs::write(dir.join("secret"), b"staged").unwrap();
+    }
+    std::fs::create_dir(nested_residue.join("nested")).unwrap();
+    std::fs::File::open(&old_unlisted)
+        .unwrap()
+        .set_modified(now - Duration::from_secs(120))
+        .unwrap();
+    std::fs::File::open(&old_listed)
+        .unwrap()
+        .set_modified(now - Duration::from_secs(120))
+        .unwrap();
+    std::fs::File::open(&fresh_removed)
+        .unwrap()
+        .set_modified(now)
+        .unwrap();
+    let listed = std::collections::HashSet::from(["c-tgvpn".to_string()]);
+    assert_eq!(
+        sweep_orphan_vpn_staging_in(
+            parent.path(),
+            std::path::Path::new("thegn/vpn"),
+            Some(&listed),
+            &["d-tgvpn".to_string()],
+            now,
+            age,
+        ),
+        2
+    );
+    assert!(!old_unlisted.exists());
+    assert!(fresh_unlisted.is_dir());
+    assert!(old_listed.is_dir());
+    assert!(!fresh_removed.exists());
+    assert!(other.is_dir());
+    assert!(nested_residue.join("nested").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn vpn_staging_sweep_removes_nothing_when_no_runtime_was_listed() {
+    use std::time::{Duration, SystemTime};
+    let parent = tempfile::tempdir().unwrap();
+    let vpn = parent.path().join("thegn/vpn");
+    std::fs::create_dir_all(&vpn).unwrap();
+    let old_unlisted = vpn.join("old-tgvpn");
+    let removed = vpn.join("removed-tgvpn");
+    for dir in [&old_unlisted, &removed] {
+        std::fs::create_dir(dir).unwrap();
+        std::fs::write(dir.join("secret"), b"staged").unwrap();
+        std::fs::File::open(dir)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
+    }
+    assert_eq!(
+        sweep_orphan_vpn_staging_in(
+            parent.path(),
+            std::path::Path::new("thegn/vpn"),
+            None,
+            &["removed-tgvpn".to_string()],
+            SystemTime::now(),
+            Duration::from_secs(60),
+        ),
+        1
+    );
+    assert!(old_unlisted.is_dir());
+    assert!(!removed.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn vpn_staging_sweep_never_follows_a_symlinked_entry() {
+    use std::os::unix::fs::symlink;
+    use std::time::{Duration, SystemTime};
+    let parent = tempfile::tempdir().unwrap();
+    let vpn = parent.path().join("thegn/vpn");
+    let outside = parent.path().join("outside");
+    std::fs::create_dir_all(&vpn).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let canary = outside.join("secret");
+    std::fs::write(&canary, b"canary").unwrap();
+    symlink(&outside, vpn.join("c-tgvpn")).unwrap();
+    sweep_orphan_vpn_staging_in(
+        parent.path(),
+        std::path::Path::new("thegn/vpn"),
+        None,
+        &["c-tgvpn".to_string()],
+        SystemTime::now(),
+        Duration::from_secs(60),
+    );
+    assert_eq!(std::fs::read(canary).unwrap(), b"canary");
+}
