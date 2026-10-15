@@ -456,7 +456,7 @@ mod landed_row_tests {
 
     #[test]
     fn gate_error_message_names_phase_and_class() {
-        let message = gate_error_message(
+        let message = super::gate_error_message(
             "feature",
             "timeout",
             crate::integrate::GatePhase::Gate,
