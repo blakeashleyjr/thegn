@@ -129,28 +129,22 @@ impl Db {
     /// Convert a legacy DB. The normal five-second timeout is restored on all paths.
     pub fn convert_to_incremental(&self, busy: Duration) -> Result<ConvertOutcome> {
         let before = self.space()?;
-        if let Err(error) = self.conn().busy_timeout(busy) {
-            restore_busy_timeout(self.conn());
-            return Err(map_busy(error));
-        }
-        let conversion = (|| -> Result<DbSpace> {
-            self.conn()
-                .execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")
-                .map_err(map_busy)?;
-            let after = self.space()?;
-            if after.auto_vacuum != AutoVacuum::Incremental {
-                return Err(anyhow!(
-                    "database conversion did not enable incremental auto-vacuum"
-                ));
-            }
-            Ok(after)
-        })();
-        let restored = self.conn().busy_timeout(Duration::from_millis(5000));
-        match (conversion, restored) {
-            (Ok(after), Ok(())) => Ok(ConvertOutcome { before, after }),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error.into()),
-        }
+        let conversion = match self.conn().busy_timeout(busy) {
+            Err(error) => Err(map_busy(error)),
+            Ok(()) => (|| -> Result<DbSpace> {
+                self.conn()
+                    .execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")
+                    .map_err(map_busy)?;
+                if let Err(error) = checkpoint_wal(self.conn()) {
+                    tracing::debug!(%error, "could not truncate the state database WAL after VACUUM");
+                }
+                let after = self.space()?;
+                ensure_incremental(after)?;
+                Ok(after)
+            })(),
+        };
+        restore_busy_timeout(self.conn());
+        conversion.map(|after| ConvertOutcome { before, after })
     }
 
     /// Count expired read notifications before a writable open's startup prune.
@@ -196,6 +190,29 @@ fn restore_busy_timeout(conn: &rusqlite::Connection) {
     if let Err(error) = conn.busy_timeout(Duration::from_millis(5000)) {
         tracing::debug!(%error, "could not restore the normal database busy timeout");
     }
+}
+
+fn checkpoint_wal(conn: &rusqlite::Connection) -> Result<()> {
+    let busy = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(anyhow::Error::from)?;
+    if busy != 0 {
+        return Err(anyhow!(
+            "WAL checkpoint could not acquire the database lock"
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_incremental(after: DbSpace) -> Result<()> {
+    if after.auto_vacuum != AutoVacuum::Incremental {
+        return Err(anyhow!(
+            "database conversion did not enable incremental auto-vacuum"
+        ));
+    }
+    Ok(())
 }
 
 fn map_busy(error: SqlError) -> anyhow::Error {
@@ -244,19 +261,13 @@ mod tests {
     use rusqlite::Connection;
 
     fn temp_db() -> (tempfile::TempDir, Db) {
-        let dir = tempfile::Builder::new()
-            .permissions(0o700)
-            .tempdir()
-            .unwrap();
+        let dir = tempfile::Builder::new().tempdir().unwrap();
         let db = Db::open_at(&dir.path().join("state.db")).unwrap();
         (dir, db)
     }
 
     fn full_db() -> (tempfile::TempDir, Db) {
-        let dir = tempfile::Builder::new()
-            .permissions(0o700)
-            .tempdir()
-            .unwrap();
+        let dir = tempfile::Builder::new().tempdir().unwrap();
         let path = dir.path().join("state.db");
         drop(Db::open_at(&path).unwrap());
         let conn = Connection::open(&path).unwrap();
@@ -332,6 +343,27 @@ mod tests {
         assert!(AutoVacuum::from_pragma(3).is_err());
         let error = map_busy(SqlError::InvalidQuery);
         assert!(error.downcast_ref::<VacuumError>().is_none());
+    }
+
+    #[test]
+    fn vacuum_error_display_and_conversion_mode_check_are_stable() {
+        assert_eq!(VacuumError::Busy.to_string(), "database is busy");
+        assert_eq!(
+            VacuumError::NotIncremental.to_string(),
+            "incremental vacuum requires auto_vacuum=INCREMENTAL"
+        );
+        let legacy = DbSpace {
+            page_size: 4096,
+            page_count: 1,
+            freelist_count: 0,
+            auto_vacuum: AutoVacuum::None,
+        };
+        assert!(
+            ensure_incremental(legacy)
+                .unwrap_err()
+                .to_string()
+                .contains("database conversion did not enable incremental auto-vacuum")
+        );
     }
 
     #[test]
