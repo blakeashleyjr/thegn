@@ -36,7 +36,7 @@ fn events_argv(kind: EventKind) -> &'static [&'static str] {
             "--format",
             "json",
             "--filter",
-            "label=io.thegn=true",
+            crate::sandbox_manage::OWNED_LABEL_FILTER,
             "--filter",
             "event=exec",
             "--filter",
@@ -47,7 +47,7 @@ fn events_argv(kind: EventKind) -> &'static [&'static str] {
             "--format",
             "json",
             "--filter",
-            "label=io.thegn=true",
+            crate::sandbox_manage::OWNED_LABEL_FILTER,
             "--filter",
             "event=network",
         ],
@@ -195,7 +195,7 @@ mod tests {
                 "--format",
                 "json",
                 "--filter",
-                "label=io.thegn=true",
+                crate::sandbox_manage::OWNED_LABEL_FILTER,
                 "--filter",
                 "event=exec",
                 "--filter",
@@ -209,10 +209,22 @@ mod tests {
                 "--format",
                 "json",
                 "--filter",
-                "label=io.thegn=true",
+                crate::sandbox_manage::OWNED_LABEL_FILTER,
                 "--filter",
                 "event=network",
             ]
+        );
+    }
+
+    #[test]
+    fn create_label_and_events_filter_agree() {
+        assert_eq!(
+            crate::sandbox_manage::OWNED_LABEL_FILTER,
+            format!("label={}", crate::sandbox_manage::OWNED_LABEL)
+        );
+        assert!(events_argv(EventKind::Exec).contains(&crate::sandbox_manage::OWNED_LABEL_FILTER));
+        assert!(
+            events_argv(EventKind::Network).contains(&crate::sandbox_manage::OWNED_LABEL_FILTER)
         );
     }
 }

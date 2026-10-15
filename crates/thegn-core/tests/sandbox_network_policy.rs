@@ -1,15 +1,16 @@
-//! Suite G — Network policy enforcement (Tier 2, podman + DNS filter).
-//!
-//! Tests that the DNS filter configured via network_block/network_allow in
-//! SandboxSpec actually blocks or forwards DNS queries inside the container.
-//! The DNS filter proxy is started via dns_filter::get_or_start; containers
-//! receive --dns 127.0.0.1:<port> so their resolver hits the proxy.
+//! Opt-in Podman checks for hostname policy reporting and universal deny lowering.
 
 use std::path::PathBuf;
 
-use thegn_core::config::{FileAccess, Network};
-use thegn_core::dns_filter::{DnsPolicy, drain_events};
-use thegn_core::sandbox::{Backend, SandboxLimits, SandboxSpec, ensure, enter_argv};
+use thegn_core::config::{
+    FileAccess, IsolationFloor, Network, OnFloorMiss, SandboxBackend, SandboxConfig, SandboxProfile,
+};
+use thegn_core::placement::Placement;
+use thegn_core::remote::GitLoc;
+use thegn_core::sandbox::{
+    Backend, HOSTNAME_RULES, HostnameRulesPolicy, SandboxLimits, SandboxSpec, ensure, enter_argv,
+    hostname_rules_note, resolve_placed_exact,
+};
 
 fn skip() -> bool {
     !thegn_core::util::have("podman")
@@ -28,7 +29,7 @@ fn force_rm(name: &str) {
 fn spec_with_network_block(name: &str, block: Vec<String>) -> SandboxSpec {
     SandboxSpec {
         backend: Backend::Podman,
-        placement: thegn_core::placement::Placement::Local,
+        placement: Placement::Local,
         image: Some("docker.io/library/alpine:latest".into()),
         worktree: PathBuf::from("/tmp/tg-e2e-net"),
         mounts: vec![],
@@ -71,104 +72,96 @@ fn run_in(spec: &SandboxSpec, cmd: &str) -> String {
     String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr)
 }
 
-// ── G1: container can't resolve blocked domain ───────────────────────────────
-
+// G1: configured hostname rules remain labelled; the unit test
+// `no_dns_flag_in_oci_create_opts` covers the OCI create options directly.
 #[test]
-fn g1_blocked_domain_nxdomain_in_container() {
+fn g1_hostname_rules_do_not_inject_dns_flag() {
     if skip() {
         return;
     }
     let name = "thegn-e2e-g1";
     force_rm(name);
-    let spec = spec_with_network_block(name, vec!["blocked.internal".into()]);
+    let mut spec = spec_with_network_block(name, vec!["blocked.internal".into()]);
+    spec.network_allow = vec!["allowed.example".into()];
+    assert_eq!(HOSTNAME_RULES, HostnameRulesPolicy::WarnDnsOnly);
+    assert!(
+        hostname_rules_note(&spec)
+            .unwrap()
+            .contains("DNS-name rules only")
+    );
     ensure(&spec).expect("ensure failed");
-    // nslookup exits non-zero and prints "NXDOMAIN" or "can't resolve" for blocked.
-    let out = run_in(&spec, "nslookup blocked.internal 2>&1 || true");
+    let out = run_in(&spec, "true");
     force_rm(name);
-    let blocked = out.contains("NXDOMAIN")
-        || out.contains("can't resolve")
-        || out.contains("nxdomain")
-        || out.contains("server can't find");
-    assert!(blocked, "expected NXDOMAIN for blocked domain; got: {out}");
+    assert!(out.is_empty(), "true should produce no output: {out}");
 }
 
-// ── G2: allow-list restricts unlisted domains ────────────────────────────────
-
+// G3: allow lists also remain warnings; the unit test
+// `no_dns_flag_in_oci_create_opts` covers the OCI create options directly.
 #[test]
-fn g2_allow_list_blocks_unlisted() {
+fn g3_allow_list_does_not_inject_dns_flag() {
+    if skip() {
+        return;
+    }
+    let name = "thegn-e2e-g3";
+    force_rm(name);
+    let mut spec = spec_with_network_block(name, vec![]);
+    spec.network_allow = vec!["api.example.com".into()];
+    assert!(hostname_rules_note(&spec).is_some());
+    ensure(&spec).expect("ensure failed");
+    let out = run_in(&spec, "true");
+    force_rm(name);
+    assert!(out.is_empty(), "true should produce no output: {out}");
+}
+
+// G2: a resolved universal deny is the runtime's offline network boundary.
+#[test]
+fn g2_universal_block_runs_offline() {
     if skip() {
         return;
     }
     let name = "thegn-e2e-g2";
     force_rm(name);
-    let mut spec = spec_with_network_block(name, vec![]);
-    spec.network_allow = vec!["api.example.com".into()];
-    ensure(&spec).expect("ensure failed");
-    // Unlisted domain should get NXDOMAIN.
-    let out = run_in(&spec, "nslookup google.com 2>&1 || true");
+    std::fs::create_dir_all("/tmp/tg-e2e-net").expect("create Podman worktree bind source");
+    let cfg = SandboxConfig {
+        enabled: true,
+        backend: SandboxBackend::Podman,
+        image: "docker.io/library/alpine:latest".into(),
+        network: Network::Nat,
+        network_block: vec!["*".into()],
+        isolation_floor: IsolationFloor::Off,
+        on_floor_miss: OnFloorMiss::Degrade,
+        ..Default::default()
+    };
+    let loc = GitLoc::from_db("/tmp/tg-e2e-net", None);
+    let spec = resolve_placed_exact(&cfg, &loc, name, SandboxProfile::Hardened, Placement::Local)
+        .expect("Podman should resolve for the opt-in e2e");
+    assert_eq!(spec.network, Network::None);
+    ensure(&spec).expect("offline container ensure failed");
+    let argv = enter_argv(&spec, "ip route").expect("valid volume names");
+    let out = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .output()
+        .expect("ip route exec failed");
     force_rm(name);
-    let nxdomain = out.contains("NXDOMAIN")
-        || out.contains("can't resolve")
-        || out.contains("nxdomain")
-        || out.contains("server can't find");
+    assert!(out.status.success(), "ip route failed: {out:?}");
     assert!(
-        nxdomain,
-        "domain not in allow-list should get NXDOMAIN; got: {out}"
+        out.stdout.is_empty(),
+        "offline container has a route: {out:?}"
     );
 }
 
-// ── G3: DNS events captured in ring buffer ───────────────────────────────────
-
+// G4: empty hostname rules still launch; the unit test
+// `no_dns_flag_in_oci_create_opts` covers the OCI create options directly.
 #[test]
-fn g3_dns_events_captured() {
-    if skip() {
-        return;
-    }
-    // Start the dns filter explicitly with a known policy to prime the singleton.
-    // best-effort: test scratch: best-effort by design
-    let _ = thegn_core::dns_filter::get_or_start(DnsPolicy {
-        block: vec!["blocked.internal".into()],
-        allow: vec![],
-        upstream: None,
-    });
-    drain_events(); // clear prior
-    let name = "thegn-e2e-g3";
-    force_rm(name);
-    let spec = spec_with_network_block(name, vec!["blocked.internal".into()]);
-    ensure(&spec).expect("ensure failed");
-    // Query a blocked and an allowed domain inside the container.
-    // best-effort: test scratch: best-effort by design
-    let _ = run_in(&spec, "nslookup blocked.internal 2>&1 || true");
-    // best-effort: test scratch: best-effort by design
-    let _ = run_in(&spec, "nslookup example.com 2>&1 || true");
-    force_rm(name);
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    let events = drain_events();
-    assert!(
-        events
-            .iter()
-            .any(|e| e.name.contains("blocked.internal") && !e.allowed),
-        "expected blocked event for blocked.internal; events={events:?}"
-    );
-}
-
-// ── G4: network_block=[] → all domains resolve ───────────────────────────────
-
-#[test]
-fn g4_empty_block_list_allows_all() {
+fn g4_empty_rules_launch_without_dns_override() {
     if skip() {
         return;
     }
     let name = "thegn-e2e-g4";
     force_rm(name);
-    let spec = spec_with_network_block(name, vec![]); // no block-list
+    let spec = spec_with_network_block(name, vec![]);
     ensure(&spec).expect("ensure failed");
-    // With empty policy: all domains are allowed. The DNS filter won't be started
-    // (oci_create_opts only injects --dns when network_allow or network_block
-    // is non-empty), so the container uses the default resolver.
-    // Just verify the container is running and basic DNS resolves.
-    let out = run_in(&spec, "nslookup localhost 2>&1 || true");
+    let out = run_in(&spec, "true");
     force_rm(name);
-    // Localhost always resolves — any non-crash result is acceptable.
-    assert!(!out.is_empty(), "nslookup should produce some output");
+    assert!(out.is_empty(), "true should produce no output: {out}");
 }

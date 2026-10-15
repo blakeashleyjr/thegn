@@ -2008,6 +2008,9 @@ fn compose_row_lines(
                     thegn_core::preview::PreviewStatus::Up => {
                         (Tok::Hue(theme::Hue::Green), gl.dot_filled)
                     }
+                    thegn_core::preview::PreviewStatus::Seen => {
+                        (Tok::Hue(theme::Hue::Amber), gl.dot_hollow)
+                    }
                     thegn_core::preview::PreviewStatus::Down => {
                         (Tok::Hue(theme::Hue::Red), gl.cross)
                     }

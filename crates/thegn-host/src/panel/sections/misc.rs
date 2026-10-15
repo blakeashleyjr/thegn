@@ -20,6 +20,13 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
     let (model, deep, full) = (ctx.model, ctx.deep(), ctx.full());
     let data = &model.panel;
+    let fallback_dir_changes;
+    let dir_changes = if data.dir_changes.is_empty() && !data.changes.is_empty() {
+        fallback_dir_changes = crate::panel::dir_change_counts(&data.changes);
+        &fallback_dir_changes
+    } else {
+        &data.dir_changes
+    };
     let mut rows: Vec<PanelRow> = Vec::new();
 
     // Source: the tree hydration pre-built off-loop when available; fall back
@@ -77,11 +84,7 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
             let collapsed = ctx.ui.files_collapsed.contains(&e.path);
             let chevron = if collapsed { "▸ " } else { "▾ " };
             // Count changed files under this dir for an inline badge.
-            let changed_under = data
-                .changes
-                .iter()
-                .filter(|c| c.path.starts_with(&format!("{}/", e.path)))
-                .count();
+            let changed_under = dir_changes.get(&e.path).map_or(0, |c| c.files);
             let dir_fg = if changed_under > 0 { d() } else { f() };
             let mut l = vec![
                 sp(indent),
@@ -92,11 +95,9 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
                 l.push(seg(g(), format!("  {changed_under}✎")));
             }
             if full && !collapsed {
-                let (a, del) = data
-                    .changes
-                    .iter()
-                    .filter(|c| c.path.starts_with(&format!("{}/", e.path)))
-                    .fold((0u32, 0u32), |(a, d), c| (a + c.added, d + c.deleted));
+                let (a, del) = dir_changes
+                    .get(&e.path)
+                    .map_or((0, 0), |c| (c.added, c.deleted));
                 if a > 0 || del > 0 {
                     l.push(seg(g(), "  Σ "));
                     l.push(seg(hue(Hue::Green), format!("+{a}")));
@@ -156,6 +157,30 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
         )));
     }
     rows
+}
+
+/// Number of actionable Files rows without rendering or allocating the rows.
+pub(super) fn files_len(ctx: &SectionCtx) -> usize {
+    if ctx.ui.file_preview.is_some() {
+        return 0;
+    }
+    let data = &ctx.model.panel;
+    let fallback_tree;
+    let tree = if !data.file_tree.is_empty() {
+        &data.file_tree
+    } else if !data.changes.is_empty() {
+        let paths: Vec<String> = data
+            .changes
+            .iter()
+            .map(|change| change.path.clone())
+            .collect();
+        fallback_tree = crate::panel::build_file_tree(&paths);
+        &fallback_tree
+    } else {
+        return 0;
+    };
+    crate::panel::file_tree_visible_filtered(tree, &ctx.ui.files_collapsed, &ctx.ui.files_filter)
+        .len()
 }
 
 /// Render the inline file preview (full pane): a header (path + status + close
@@ -220,10 +245,13 @@ fn file_preview_rows(fp: &crate::panel::FilePreview, cols: usize, rows: usize) -
 pub(super) fn share(ctx: &SectionCtx) -> Vec<PanelRow> {
     let shares = &ctx.model.shares;
     if shares.is_empty() {
-        return vec![PanelRow::plain(Line::segs(vec![seg(
-            g(),
-            "no shares — Alt+Shift+S to share a port".to_string(),
-        )]))];
+        return vec![
+            PanelRow::plain(Line::segs(vec![seg(
+                g(),
+                "no shares — Alt+Shift+S to share a port".to_string(),
+            )])),
+            hint_row(&[("n", "share port")]),
+        ];
     }
     if ctx.full() {
         return share_full(ctx);
@@ -260,6 +288,7 @@ pub(super) fn share(ctx: &SectionCtx) -> Vec<PanelRow> {
         ("↵", "copy url"),
         ("o", "browser"),
         ("x", "stop"),
+        ("n", "share port"),
     ]));
     rows
 }
@@ -271,10 +300,13 @@ pub(super) fn forward(ctx: &SectionCtx) -> Vec<PanelRow> {
     let forwards = &ctx.model.forwards;
     let preview = ctx.model.preview.as_ref();
     if forwards.is_empty() && preview.is_none() {
-        return vec![PanelRow::plain(Line::segs(vec![seg(
-            g(),
-            "no preview targets — start a dev server or configure [preview]".to_string(),
-        )]))];
+        return vec![
+            PanelRow::plain(Line::segs(vec![seg(
+                g(),
+                "no preview targets — start a dev server or configure [preview]".to_string(),
+            )])),
+            hint_row(&[("n", "watch port")]),
+        ];
     }
     if ctx.full() {
         return forward_full(ctx);
@@ -284,17 +316,27 @@ pub(super) fn forward(ctx: &SectionCtx) -> Vec<PanelRow> {
         .map(|p| {
             let tone = match p.status {
                 thegn_core::preview::PreviewStatus::Up => hue(Hue::Green),
+                thegn_core::preview::PreviewStatus::Seen => hue(Hue::Amber),
                 thegn_core::preview::PreviewStatus::Down => hue(Hue::Red),
                 thegn_core::preview::PreviewStatus::Unknown => hue(Hue::Amber),
             };
             let gl = crate::caps::active_glyphs();
             let marker = match p.status {
                 thegn_core::preview::PreviewStatus::Up => gl.dot_filled,
+                thegn_core::preview::PreviewStatus::Seen => gl.dot_hollow,
                 thegn_core::preview::PreviewStatus::Down => gl.cross,
                 thegn_core::preview::PreviewStatus::Unknown => gl.dot_hollow,
             };
             PanelRow::plain(Line::segs(vec![
-                seg(tone, format!("{marker} {} {} ", p.port, p.status)).bold(),
+                seg(
+                    tone,
+                    format!(
+                        "{marker} {} {} ",
+                        p.port,
+                        thegn_core::preview::status_label(p.status, p.source)
+                    ),
+                )
+                .bold(),
                 seg(g2(), format!("{}  ", p.source)),
                 seg(g(), p.url.clone()),
             ]))
@@ -322,7 +364,12 @@ pub(super) fn forward(ctx: &SectionCtx) -> Vec<PanelRow> {
             ))
         }))
         .collect();
-    rows.push(hint_row(&[("↵", "copy url"), ("o", "browser")]));
+    rows.push(hint_row(&[
+        ("↵", "copy url"),
+        ("o", "browser"),
+        ("n", "watch port"),
+        ("x", "remove"),
+    ]));
     rows
 }
 
@@ -431,6 +478,7 @@ fn share_full(ctx: &SectionCtx) -> Vec<PanelRow> {
         ("↵", "copy endpoint"),
         ("o", "browser"),
         ("x", "stop"),
+        ("n", "share port"),
     ]));
     rows
 }
@@ -457,6 +505,7 @@ fn forward_full(ctx: &SectionCtx) -> Vec<PanelRow> {
         let gl = crate::caps::active_glyphs();
         let tone = match p.status {
             thegn_core::preview::PreviewStatus::Up => hue(Hue::Green),
+            thegn_core::preview::PreviewStatus::Seen => hue(Hue::Amber),
             thegn_core::preview::PreviewStatus::Down => hue(Hue::Red),
             thegn_core::preview::PreviewStatus::Unknown => hue(Hue::Amber),
         };
@@ -470,7 +519,14 @@ fn forward_full(ctx: &SectionCtx) -> Vec<PanelRow> {
                         "  ".to_string()
                     },
                 ),
-                seg(tone, format!("{} :{}", p.status, p.port)),
+                seg(
+                    tone,
+                    format!(
+                        "{} :{}",
+                        thegn_core::preview::status_label(p.status, p.source),
+                        p.port
+                    ),
+                ),
                 seg(
                     if cursor == 0 { t() } else { d() },
                     format!(" · {}", p.source),
@@ -507,13 +563,14 @@ fn forward_full(ctx: &SectionCtx) -> Vec<PanelRow> {
     {
         let tone = match p.status {
             thegn_core::preview::PreviewStatus::Up => hue(Hue::Green),
+            thegn_core::preview::PreviewStatus::Seen => hue(Hue::Amber),
             thegn_core::preview::PreviewStatus::Down => hue(Hue::Red),
             thegn_core::preview::PreviewStatus::Unknown => hue(Hue::Amber),
         };
         detail.push(vec![seg(t(), format!("preview port {}", p.port)).bold()]);
         detail.push(vec![
             seg(g2(), "status  "),
-            seg(tone, p.status.to_string()),
+            seg(tone, thegn_core::preview::status_label(p.status, p.source)),
             seg(g2(), "   source  "),
             seg(d(), p.source.to_string()),
         ]);
@@ -578,7 +635,12 @@ fn forward_full(ctx: &SectionCtx) -> Vec<PanelRow> {
         list_w,
         ctx.rows.saturating_sub(rows.len() + 1),
     ));
-    rows.push(hint_row(&[("↵", "copy url"), ("o", "browser")]));
+    rows.push(hint_row(&[
+        ("↵", "copy url"),
+        ("o", "browser"),
+        ("n", "watch port"),
+        ("x", "remove"),
+    ]));
     rows
 }
 

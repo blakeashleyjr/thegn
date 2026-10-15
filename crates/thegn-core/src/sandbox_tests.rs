@@ -1,5 +1,5 @@
 use super::*;
-use crate::sandbox_mounts::host_toolchain_mounts;
+use crate::sandbox_mounts::{host_toolchain_mounts, parse_mount};
 
 #[test]
 fn ambient_container_listing_runs_ps_only_for_present_backends() {
@@ -174,7 +174,7 @@ fn build_vpn_spec_carries_knobs_and_optional_image() {
 fn oci_opts_join_vpn_sidecar_netns_and_suppress_dns_ports() {
     let mut s = spec(Backend::Podman);
     s.network = Network::Nat;
-    s.network_allow = vec!["example.com".into()]; // would normally add --dns
+    s.network_allow = vec!["example.com".into()]; // hostname rules do not add runtime DNS flags
     s.ports = vec!["8080:8080".into()]; // would normally add -p
     s.vpn = build_vpn_spec(
         &vpn_cfg(VpnProviderKind::Tailscale),
@@ -455,6 +455,7 @@ fn refusal_constructor_preserves_each_class_and_field() {
         RefusalClass::SystemdMountPath,
         RefusalClass::ComposeTarget,
         RefusalClass::ComposeServiceMissing,
+        RefusalClass::HostnamePolicy,
     ] {
         let error = refusal(
             &spec,
@@ -1545,6 +1546,19 @@ fn test_identify_orphans_empty_inputs() {
     let containers = vec![container_name("/wt/a"), container_name("/wt/b")];
     let orphans = identify_orphans(&[], &containers);
     assert_eq!(orphans.len(), 2);
+}
+
+#[test]
+fn oci_create_opts_carry_this_profiles_owner_label() {
+    let podman = oci_create_opts(&spec(Backend::Podman)).unwrap();
+    assert!(
+        podman
+            .windows(2)
+            .any(|pair| pair[0] == "--label" && pair[1].starts_with("thegn.owner="))
+    );
+
+    let apple = oci_create_opts(&spec(Backend::Apple)).unwrap();
+    assert!(!apple.iter().any(|arg| arg.starts_with("thegn.owner=")));
 }
 
 #[test]
@@ -2846,64 +2860,172 @@ fn entrypoint_override_precedes_the_image_and_names_the_workload() {
 #[test]
 fn sealed_container_reuse_requires_exact_mounts_and_a_matching_seal_label() {
     let required: std::collections::HashSet<&str> = ["/wt", "/nix/store"].into_iter().collect();
-    // Probe format: RUNNING, seal label, then bind sources.
-    let exact = "RUNNING\n1\n/wt\n/nix/store\n";
-    assert_eq!(judge_inspect(exact, &required, true, false), (true, true));
+    // Probe format: RUNNING, seal label, policy fingerprint, then bind sources.
+    let exact = "RUNNING\n1\nfp\n/wt\n/nix/store\n";
+    assert_eq!(
+        judge_inspect(exact, &required, true, false, "fp"),
+        (true, true)
+    );
     // (a) a superset (a hardened container that also binds ~/.gnupg) is refused
     // for a sealed spec, though it is fine for a non-sealed one.
-    let superset = "RUNNING\n1\n/wt\n/nix/store\n/home/u/.gnupg\n";
+    let superset = "RUNNING\n1\nfp\n/wt\n/nix/store\n/home/u/.gnupg\n";
     assert_eq!(
-        judge_inspect(superset, &required, true, false),
+        judge_inspect(superset, &required, true, false, "fp"),
         (true, false)
     );
     assert_eq!(
         judge_inspect(
-            "RUNNING\n\n/wt\n/nix/store\n/home/u/.gnupg\n",
+            "RUNNING\n\nfp\n/wt\n/nix/store\n/home/u/.gnupg\n",
             &required,
             false,
-            false
+            false,
+            "fp"
         ),
         (true, true)
     );
     // devenv's own `/nix` bind is not an extra, but only while the current spec
     // would still emit it: with devenv off the leftover bind forces a recreate.
-    let with_nix = "RUNNING\n1\n/wt\n/nix/store\n/nix\n";
-    assert_eq!(judge_inspect(with_nix, &required, true, true), (true, true));
+    let with_nix = "RUNNING\n1\nfp\n/wt\n/nix/store\n/nix\n";
     assert_eq!(
-        judge_inspect(with_nix, &required, true, false),
+        judge_inspect(with_nix, &required, true, true, "fp"),
+        (true, true)
+    );
+    assert_eq!(
+        judge_inspect(with_nix, &required, true, false, "fp"),
         (true, false)
     );
     // (b) label mismatch forces recreate, both directions; a missing label on a
     // sealed spec is a pre-label container and is recreated.
     assert_eq!(
-        judge_inspect("RUNNING\n0\n/wt\n/nix/store\n", &required, true, false),
+        judge_inspect(
+            "RUNNING\n0\nfp\n/wt\n/nix/store\n",
+            &required,
+            true,
+            false,
+            "fp"
+        ),
         (true, false)
     );
     assert_eq!(
-        judge_inspect("RUNNING\n\n/wt\n/nix/store\n", &required, true, false),
+        judge_inspect(
+            "RUNNING\n\nfp\n/wt\n/nix/store\n",
+            &required,
+            true,
+            false,
+            "fp"
+        ),
         (true, false)
     );
     assert_eq!(
-        judge_inspect("RUNNING\n1\n/wt\n/nix/store\n", &required, false, false),
+        judge_inspect(
+            "RUNNING\n1\nfp\n/wt\n/nix/store\n",
+            &required,
+            false,
+            false,
+            "fp"
+        ),
         (true, false)
     );
     assert_eq!(
-        judge_inspect("RUNNING\n0\n/wt\n/nix/store\n", &required, false, false),
+        judge_inspect(
+            "RUNNING\n0\nfp\n/wt\n/nix/store\n",
+            &required,
+            false,
+            false,
+            "fp"
+        ),
         (true, true)
     );
     assert_eq!(
-        judge_inspect("EXITED\n1\n/wt\n", &required, true, false),
+        judge_inspect("EXITED\n1\nfp\n/wt\n", &required, true, false, "fp"),
         (false, false)
     );
     // Non-sealed reuse never cared about extras, nix included.
     assert_eq!(
         judge_inspect(
-            "RUNNING\n\n/wt\n/nix/store\n/nix\n",
+            "RUNNING\n\nfp\n/wt\n/nix/store\n/nix\n",
             &required,
             false,
-            false
+            false,
+            "fp"
         ),
         (true, true)
+    );
+}
+
+#[test]
+fn judge_inspect_rejects_policy_mismatch() {
+    let required: std::collections::HashSet<&str> = ["/wt"].into_iter().collect();
+    assert_eq!(
+        judge_inspect(
+            "RUNNING\n0\nold-fp\n/wt\n",
+            &required,
+            false,
+            false,
+            "new-fp"
+        ),
+        (true, false)
+    );
+}
+
+#[test]
+fn judge_inspect_rejects_missing_policy_label() {
+    let required: std::collections::HashSet<&str> = ["/wt"].into_iter().collect();
+    assert_eq!(
+        judge_inspect("RUNNING\n0\n/wt\n", &required, false, false, "new-fp"),
+        (true, false)
+    );
+    assert_eq!(
+        judge_inspect("RUNNING\n0\n\n/wt\n", &required, false, false, "new-fp"),
+        (true, false)
+    );
+}
+
+#[test]
+fn judge_inspect_accepts_exact_policy() {
+    let required: std::collections::HashSet<&str> = ["/wt"].into_iter().collect();
+    assert_eq!(
+        judge_inspect(
+            "RUNNING\n0\nnew-fp\n/wt\n",
+            &required,
+            false,
+            false,
+            "new-fp"
+        ),
+        (true, true)
+    );
+}
+
+#[test]
+fn expected_policy_is_stable_across_sealed_view() {
+    let mut s = spec(Backend::Podman);
+    s.seal_home = Some("/home/u".into());
+    s.mounts.push(Mount {
+        host: "/home/u/.gnupg".into(),
+        dest: "/home/u/.gnupg".into(),
+        ro: false,
+        cache: false,
+    });
+    assert_eq!(expected_policy(&s), expected_policy(&sealed_view(&s)));
+}
+
+#[test]
+fn create_opts_stamp_the_expected_policy() {
+    let s = spec(Backend::Podman);
+    let argv = oci_create_opts(&s).unwrap().join(" ");
+    assert!(argv.contains(&format!("--label {POLICY_LABEL}={}", expected_policy(&s))));
+    assert!(argv.contains(crate::sandbox_manage::OWNED_LABEL));
+    assert!(argv.contains("--label thegn.seal_home=0"));
+
+    let apple = SandboxSpec {
+        backend: Backend::Apple,
+        ..s
+    };
+    assert!(
+        !oci_create_opts(&apple)
+            .unwrap()
+            .join(" ")
+            .contains(POLICY_LABEL)
     );
 }
 
@@ -3189,5 +3311,205 @@ fn systemd_launch_refuses_mount_paths_systemd_would_misparse() {
         !open_argv
             .iter()
             .any(|arg| arg.starts_with("InaccessiblePaths="))
+    );
+}
+
+#[test]
+fn universal_block_lowers_to_network_none() {
+    assert_eq!(
+        lower_universal_deny(Network::Nat, &["*".into()]),
+        Network::None
+    );
+    assert_eq!(
+        lower_universal_deny(Network::Nat, &[" * ".into()]),
+        Network::None
+    );
+    assert_eq!(
+        lower_universal_deny(Network::Host, &["x.test".into()]),
+        Network::Host
+    );
+
+    let cfg = crate::config::SandboxConfig {
+        enabled: true,
+        backend: crate::config::SandboxBackend::Bwrap,
+        network_block: vec!["*".into()],
+        isolation_floor: crate::config::IsolationFloor::Off,
+        on_floor_miss: crate::config::OnFloorMiss::Degrade,
+        ..Default::default()
+    };
+    let loc = crate::remote::GitLoc::from_db("/wt/x", None);
+    if let Some(resolved) = resolve(&cfg, &loc, "test") {
+        assert_eq!(resolved.network, Network::None);
+    }
+}
+
+#[test]
+fn hostname_rules_note_names_backend_on_every_local_backend() {
+    for backend in [
+        Backend::Bwrap,
+        Backend::Systemd,
+        Backend::Podman,
+        Backend::PodmanRootful,
+        Backend::Docker,
+        Backend::Apple,
+    ] {
+        let mut s = spec(backend);
+        s.network_allow = vec!["example.com".into()];
+        let note = hostname_rules_note(&s).expect("active allow-list should be reported");
+        assert!(note.contains(backend.label()), "{note}");
+        assert!(note.contains("DNS-name rules only"), "{note}");
+
+        s.network = Network::Host;
+        s.network_allow.clear();
+        s.network_block = vec!["example.com".into()];
+        assert!(hostname_rules_note(&s).is_some());
+
+        s.network = Network::None;
+        assert!(hostname_rules_note(&s).is_none());
+        s.network = Network::Nat;
+        s.network_block.clear();
+        assert!(hostname_rules_note(&s).is_none());
+    }
+
+    let mut provider = spec(Backend::Podman);
+    provider.network_block = vec!["example.com".into()];
+    provider.placement = Placement::Provider(crate::placement::ProviderPlacement {
+        provider: "test".into(),
+        id: "sandbox".into(),
+        interactive_prefix: vec![],
+        control_prefix: vec![],
+        up_command: vec![],
+        down_command: vec![],
+    });
+    assert!(hostname_rules_note(&provider).is_none());
+}
+
+#[test]
+fn no_dns_flag_in_oci_create_opts() {
+    let mut s = spec(Backend::Podman);
+    s.network = Network::Nat;
+    s.network_block = vec!["x.test".into()];
+    let opts = oci_create_opts(&s).expect("valid volume names");
+    assert!(!opts.iter().any(|arg| arg == "--dns"), "{opts:?}");
+}
+
+#[test]
+fn default_hostname_policy_warns_not_refuses() {
+    assert_eq!(HOSTNAME_RULES, HostnameRulesPolicy::WarnDnsOnly);
+    let mut s = spec(Backend::Bwrap);
+    s.network_allow = vec!["example.com".into()];
+    assert!(!matches!(
+        enter_argv(&s, "sh"),
+        Err(EnterError::Refused(Refusal {
+            class: RefusalClass::HostnamePolicy,
+            ..
+        }))
+    ));
+}
+
+#[test]
+fn refuse_policy_refuses_hostname_rules() {
+    for backend in [
+        Backend::Bwrap,
+        Backend::Systemd,
+        Backend::Podman,
+        Backend::PodmanRootful,
+        Backend::Docker,
+        Backend::Apple,
+    ] {
+        let mut s = spec(backend);
+        s.network_block = vec!["example.com".into()];
+        let message = hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &s)
+            .expect("active local hostname rules should refuse");
+        assert!(message.contains("network = \"none\""), "{message}");
+        s.network = Network::Host;
+        assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &s).is_some());
+        s.network = Network::None;
+        assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &s).is_none());
+        s.network = Network::Nat;
+        assert!(hostname_policy_refusal_with(HostnameRulesPolicy::WarnDnsOnly, &s).is_none());
+    }
+
+    let mut remote = spec(Backend::Bwrap);
+    remote.network_allow = vec!["example.com".into()];
+    remote.placement = Placement::Ssh(SshPlacement::plain(
+        "host".into(),
+        22,
+        false,
+        TransportKind::Ssh,
+    ));
+    assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &remote).is_some());
+
+    let mut placement_spec = spec(Backend::Podman);
+    placement_spec.network_allow = vec!["example.com".into()];
+    placement_spec.placement = Placement::Provider(crate::placement::ProviderPlacement {
+        provider: "test".into(),
+        id: "sandbox".into(),
+        interactive_prefix: vec![],
+        control_prefix: vec![],
+        up_command: vec![],
+        down_command: vec![],
+    });
+    assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &placement_spec).is_none());
+    placement_spec.placement = Placement::K8s(crate::placement::K8sPlacement {
+        kubectl: "kubectl".into(),
+        context: None,
+        namespace: None,
+        pod: "test".into(),
+        container: None,
+        pod_template: None,
+        image: None,
+    });
+    assert!(hostname_policy_refusal_with(HostnameRulesPolicy::Refuse, &placement_spec).is_none());
+}
+
+#[test]
+fn universal_block_suppresses_vpn_sidecar() {
+    let cfg = crate::config::SandboxConfig {
+        enabled: true,
+        backend: crate::config::SandboxBackend::None,
+        network: Network::Nat,
+        network_block: vec!["*".into()],
+        vpn: {
+            let mut vpn = vpn_cfg(VpnProviderKind::Tailscale);
+            vpn.mode = VpnMode::Proxy;
+            vpn
+        },
+        isolation_floor: crate::config::IsolationFloor::Off,
+        on_floor_miss: crate::config::OnFloorMiss::Degrade,
+        ..Default::default()
+    };
+    let loc = crate::remote::GitLoc::from_db("/wt/x", None);
+    let resolved = resolve_placed_exact(
+        &cfg,
+        &loc,
+        "test",
+        SandboxProfile::Hardened,
+        Placement::Ssh(SshPlacement::plain(
+            "host".into(),
+            22,
+            false,
+            TransportKind::Ssh,
+        )),
+    )
+    .expect("explicit remote host backend should resolve without probing");
+    assert_eq!(resolved.network, Network::None);
+    assert!(
+        resolved.vpn.is_none(),
+        "universal deny must suppress VPN egress"
+    );
+
+    let mut oci = spec(Backend::Podman);
+    oci.network = resolved.network;
+    oci.vpn = resolved.vpn;
+    let opts = oci_create_opts(&oci).expect("valid volume names");
+    assert!(
+        opts.windows(2)
+            .any(|pair| pair[0] == "--network" && pair[1] == "none"),
+        "{opts:?}"
+    );
+    assert!(
+        !opts.iter().any(|arg| arg.starts_with("container:")),
+        "{opts:?}"
     );
 }

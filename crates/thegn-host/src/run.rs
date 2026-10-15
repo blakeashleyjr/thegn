@@ -2965,8 +2965,8 @@ enum GitDoc {
         key: gitui::CommitDetailKey,
         result: std::result::Result<String, String>,
     },
-    /// The selected stash's patch (`stash show -p -u`), keyed by index.
-    StashDiff(usize, String),
+    /// The selected stash's patch (`stash show -p -u`), keyed by SHA.
+    StashDiff(String, String),
     /// The selected branch's log, keyed by branch name.
     BranchLog(String, Vec<crate::panel::CommitRow>),
 }
@@ -3041,7 +3041,7 @@ fn load_loop_startup_prefs(
 fn spawn_stash_diff_fetch(
     generation: u64,
     session: &crate::session::Session,
-    index: usize,
+    sha: String,
     tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
     waker: &TerminalWaker,
 ) {
@@ -3052,12 +3052,9 @@ fn spawn_stash_diff_fetch(
         use thegn_svc::git::StashOps;
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
         let text = thegn_svc::git::CliGit
-            .stash_show(&loc, index)
+            .stash_show(&loc, &sha)
             .unwrap_or_else(|e| format!("stash diff failed: {e}"));
-        if tx
-            .send((generation, GitDoc::StashDiff(index, text)))
-            .is_ok()
-        {
+        if tx.send((generation, GitDoc::StashDiff(sha, text))).is_ok() {
             let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
@@ -3421,6 +3418,8 @@ pub(crate) enum HostInputKind {
     ShareWorktreePort {
         reach: Option<thegn_core::config::ShareReach>,
     },
+    /// Add a memory-only candidate to System ▸ Forward.
+    WatchPreviewPort,
     /// File the active worktree into a new folder named by the typed value
     /// (the "＋ New folder…" path of the move-to-folder picker).
     FileWorktreeNewFolder,
@@ -4689,14 +4688,36 @@ fn handle_git_msg(
             }
         },
         // ---- branches ---------------------------------------------------
-        GitMsg::Pull => enqueue(panel_ui, model, GitOp::Pull),
-        GitMsg::Push => enqueue(
-            panel_ui,
-            model,
-            GitOp::Push {
-                force: thegn_svc::git::ForceMode::None,
-            },
-        ),
+        GitMsg::NewBranch => {
+            *ov.input = Some((
+                menu::InputOverlay::new("new branch name", ""),
+                GitInputKind::BranchCreate,
+            ));
+        }
+        GitMsg::Pull => {
+            if let Some(message) =
+                gitui::head_only_refusal(&model.panel, sel_branch(panel_ui, model).as_ref(), "pull")
+            {
+                model.status = message;
+            } else {
+                enqueue(panel_ui, model, GitOp::Pull);
+            }
+        }
+        GitMsg::Push => {
+            if let Some(message) =
+                gitui::head_only_refusal(&model.panel, sel_branch(panel_ui, model).as_ref(), "push")
+            {
+                model.status = message;
+            } else {
+                enqueue(
+                    panel_ui,
+                    model,
+                    GitOp::Push {
+                        force: thegn_svc::git::ForceMode::None,
+                    },
+                );
+            }
+        }
         GitMsg::FastForward => {
             if let Some(b) = sel_branch(panel_ui, model) {
                 enqueue(
@@ -6807,7 +6828,7 @@ async fn event_loop<T: Terminal>(
     // Demand-driven git-doc fetches for the stash/branches main regions:
     // `(op_gen, key)` of the read that's out, so the per-frame demand check
     // re-kicks on selection change or worktree switch but never duplicates.
-    let mut stash_diff_inflight: Option<(u64, usize)> = None;
+    let mut stash_diff_inflight: Option<(u64, String)> = None;
     let mut branch_log_inflight: Option<(u64, String)> = None;
     let mut commit_show_inflight: Option<(u64, gitui::CommitDetailKey)> = None;
     let mut commit_file_inflight: Option<(u64, String, String)> = None;
@@ -7249,6 +7270,7 @@ async fn event_loop<T: Terminal>(
     preview_supervisor.set_enabled(keymap.config().preview.enabled);
     let (preview_tx, mut preview_rx) =
         tokio_mpsc::unbounded_channel::<crate::preview_watch::ScanResult>();
+    let (probe_tx, mut probe_rx) = tokio_mpsc::unbounded_channel::<crate::preview::ProbeResult>();
     request_preview_scan(
         &mut preview_supervisor,
         &session,
@@ -10740,9 +10762,9 @@ async fn event_loop<T: Terminal>(
                         tracing::debug!(target: "thegn::git", sha = %key.sha, "dropping stale commit detail result");
                     }
                 }
-                GitDoc::StashDiff(index, text) => {
+                GitDoc::StashDiff(sha, text) => {
                     stash_diff_inflight = None;
-                    panel_ui.git.stash_diff = Some((index, text));
+                    panel_ui.git.stash_diff = Some((sha, text));
                 }
                 GitDoc::BranchLog(name, rows) => {
                     branch_log_inflight = None;
@@ -14075,6 +14097,39 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
         }
+        while let Ok(result) = probe_rx.try_recv() {
+            let worktree = result.request.worktree.clone();
+            if preview_supervisor.apply_probe(result)
+                && session
+                    .active_group()
+                    .is_some_and(|group| group.path == worktree)
+            {
+                model.preview = preview_supervisor.view(&worktree);
+                dirty = true;
+            }
+        }
+        if let Some(group) = session.active_group()
+            && group.kind == crate::session::GroupKind::Branch
+            && !group.path.is_empty()
+        {
+            preview_supervisor.active_worktree(&group.path);
+        }
+        if let Some(group) = session.active_group()
+            && group.kind == crate::session::GroupKind::Branch
+            && !group.path.is_empty()
+            && crate::preview::probe_allowed(
+                &model.active_sandbox_backend,
+                model.active_placement_kind.as_deref(),
+                current_config.sandbox.enabled,
+                current_config.sandbox.network,
+                preview_supervisor.has_live_pane_evidence(&group.path),
+            )
+        {
+            let requests = preview_supervisor.probe_requests(&group.path);
+            if !requests.is_empty() {
+                crate::preview_watch::spawn_probe(requests, probe_tx.clone(), waker.clone());
+            }
+        }
 
         // Expire any toasts whose deadline passed, and arm ONE one-shot wake
         // for the earliest remaining deadline — centrally, so every push site
@@ -14355,17 +14410,12 @@ async fn event_loop<T: Terminal>(
             if dirty && want_panel && panel_ui.width.is_expanded() {
                 let opgen = panel_ui.git.op_gen;
                 if panel_ui.git.focus == GitView::Stash
-                    && let Some(idx) =
-                        crate::panel::gitfull::selected_stash(&panel_ui, &model.panel)
-                    && panel_ui
-                        .git
-                        .stash_diff
-                        .as_ref()
-                        .is_none_or(|(i, _)| *i != idx)
-                    && stash_diff_inflight != Some((opgen, idx))
+                    && let Some(sha) =
+                        crate::panel::gitfull::stash_diff_wanted(&panel_ui, &model.panel)
+                    && stash_diff_inflight != Some((opgen, sha.clone()))
                 {
-                    stash_diff_inflight = Some((opgen, idx));
-                    spawn_stash_diff_fetch(opgen, &session, idx, &gitdoc_tx, &waker);
+                    stash_diff_inflight = Some((opgen, sha.clone()));
+                    spawn_stash_diff_fetch(opgen, &session, sha, &gitdoc_tx, &waker);
                 }
                 if panel_ui.git.focus == GitView::Branches
                     && let Some(name) =
@@ -17857,6 +17907,39 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                     }
+                                    HostInputKind::WatchPreviewPort => {
+                                        match text.trim().parse::<u16>() {
+                                            Ok(port) if port > 0 => {
+                                                if let Some(wt) =
+                                                    session.active_group().map(|g| g.path.clone())
+                                                    && preview_supervisor.watch(&wt, port)
+                                                {
+                                                    model.preview = preview_supervisor.view(&wt);
+                                                    model.status = model.preview.as_ref().map_or_else(
+                                                        || format!("Watching :{port}"),
+                                                        |preview| {
+                                                            if preview.port == port {
+                                                                format!("Watching preview :{port}")
+                                                            } else {
+                                                                format!(
+                                                                    "Watching :{port}; preview shows :{}",
+                                                                    preview.port
+                                                                )
+                                                            }
+                                                        },
+                                                    );
+                                                } else if session.active_group().is_some() {
+                                                    model.status = format!(
+                                                        "Preview :{port} is already watched"
+                                                    );
+                                                }
+                                            }
+                                            _ => {
+                                                model.status =
+                                                    "Watch preview: invalid port number".into()
+                                            }
+                                        }
+                                    }
                                     HostInputKind::SaveLayout => {
                                         let name = text.trim().to_string();
                                         if name.is_empty() {
@@ -18840,6 +18923,39 @@ async fn event_loop<T: Terminal>(
                             panel_ui.logs_filter.push(c);
                             panel_ui.logs_cursor = 0;
                             panel_ui.cursor = 0;
+                        }
+                        _ => consumed = false,
+                    }
+                    if consumed {
+                        dirty = true;
+                        continue;
+                    }
+                }
+                // Keys filter editing mirrors Logs, including Esc-clears.
+                if focus.panel()
+                    && panel_ui.open == crate::panel::Section::Keys
+                    && panel_ui.keys_filter_editing
+                {
+                    let mut consumed = true;
+                    match k.key {
+                        KeyCode::Enter => {
+                            panel_ui.keys_filter_editing = false;
+                        }
+                        key if crate::input::is_escape_key(&key) => {
+                            panel_ui.keys_filter_editing = false;
+                            panel_ui.keys_filter.clear();
+                            panel_ui.scroll = 0;
+                        }
+                        KeyCode::Backspace => {
+                            panel_ui.keys_filter.pop();
+                            panel_ui.scroll = 0;
+                        }
+                        KeyCode::Char(c)
+                            if !k.modifiers.contains(Modifiers::CTRL)
+                                && !k.modifiers.contains(Modifiers::ALT) =>
+                        {
+                            panel_ui.keys_filter.push(c);
+                            panel_ui.scroll = 0;
                         }
                         _ => consumed = false,
                     }
@@ -20977,10 +21093,39 @@ async fn event_loop<T: Terminal>(
                                                         format!("Clipboard copy failed: {error}")
                                                     }
                                                 };
+                                            } else if let Some(share) =
+                                                model.shares.get(panel_ui.cursor)
+                                            {
+                                                model.status = if share.stopping {
+                                                    format!("Share :{} is stopping", share.port)
+                                                } else if share.failed {
+                                                    format!(
+                                                        "Share :{} failed: {} — `x` clears it, `n` retries",
+                                                        share.port,
+                                                        share
+                                                            .error
+                                                            .as_deref()
+                                                            .unwrap_or("unknown error")
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "Share :{} is still starting…",
+                                                        share.port
+                                                    )
+                                                };
                                             }
                                         }
                                         Section::Forward => {
                                             // Enter copies the focused preview/forward URL.
+                                            if panel_ui.cursor == 0
+                                                && let Some((worktree, port)) =
+                                                    model.preview.as_ref().map(|preview| {
+                                                        (preview.worktree.clone(), preview.port)
+                                                    })
+                                            {
+                                                preview_supervisor.rearm_port(&worktree, port);
+                                                model.preview = preview_supervisor.view(&worktree);
+                                            }
                                             if let Some(url) =
                                                 forward_url_at(&model, panel_ui.cursor)
                                                     .map(str::to_owned)
@@ -20995,6 +21140,17 @@ async fn event_loop<T: Terminal>(
                                                         format!("Clipboard copy failed: {error}")
                                                     }
                                                 };
+                                                if panel_ui.cursor == 0
+                                                    && let Some(preview) = &model.preview
+                                                    && preview.status
+                                                        != thegn_core::preview::PreviewStatus::Up
+                                                {
+                                                    model.status.push_str(" (not answering yet)");
+                                                }
+                                            } else if model.preview.is_some()
+                                                && panel_ui.cursor == 0
+                                            {
+                                                model.status = "Preview target unavailable".into();
                                             }
                                         }
                                         Section::Ci => {
@@ -21138,6 +21294,34 @@ async fn event_loop<T: Terminal>(
                                                 &focus,
                                                 &panel_ui,
                                             );
+                                        }
+                                        Section::Keys => {
+                                            if !panel_ui.width.is_expanded() {
+                                                model.status =
+                                                    "widen the panel (e) to look up a binding"
+                                                        .into();
+                                            } else {
+                                                let (cols, rows) = panel_geom(&chrome);
+                                                let viewport =
+                                                    crate::panel::sections::scroll_viewport(
+                                                        &model, &panel_ui, cols, rows,
+                                                    );
+                                                if let Some(row) =
+                                                    crate::panel::sections::keys::top_row(
+                                                        &panel_ui, viewport,
+                                                    )
+                                                {
+                                                    let bindings = crate::keymap_merge::collect(
+                                                        keymap.config(),
+                                                    );
+                                                    model.status =
+                                                        crate::panel::sections::keys::where_bound(
+                                                            &row, &bindings,
+                                                        );
+                                                } else {
+                                                    model.status = "No key row in view".into();
+                                                }
+                                            }
                                         }
                                         Section::PrQueue | Section::MergeQueue => {
                                             for _ in 0..2 {
@@ -21898,6 +22082,15 @@ async fn event_loop<T: Terminal>(
                         }
                         // -- forward: open the focused preview in the browser --
                         (Section::Forward, KeyCode::Char('o')) => {
+                            if panel_ui.cursor == 0
+                                && let Some((worktree, port)) = model
+                                    .preview
+                                    .as_ref()
+                                    .map(|preview| (preview.worktree.clone(), preview.port))
+                            {
+                                preview_supervisor.rearm_port(&worktree, port);
+                                model.preview = preview_supervisor.view(&worktree);
+                            }
                             if let Some(url) =
                                 forward_url_at(&model, panel_ui.cursor).map(str::to_owned)
                             {
@@ -21908,6 +22101,12 @@ async fn event_loop<T: Terminal>(
                                     ),
                                     || "Opened preview in browser".to_string(),
                                 );
+                                if panel_ui.cursor == 0
+                                    && let Some(preview) = &model.preview
+                                    && preview.status != thegn_core::preview::PreviewStatus::Up
+                                {
+                                    model.status.push_str(" (not answering yet)");
+                                }
                             } else {
                                 model.status = "No preview selected".into();
                             }
@@ -21926,7 +22125,18 @@ async fn event_loop<T: Terminal>(
                                         || "Opened share link in browser".to_string(),
                                     );
                                 }
-                                None => model.status = "No share URL to open".into(),
+                                None => {
+                                    model.status = model.shares.get(panel_ui.cursor).map_or_else(
+                                        || "No share URL to open".into(),
+                                        |share| if share.stopping {
+                                            format!("Share :{} is stopping", share.port)
+                                        } else if share.failed {
+                                            format!("Share :{} failed: {} — `x` clears it, `n` retries", share.port, share.error.as_deref().unwrap_or("unknown error"))
+                                        } else {
+                                            format!("Share :{} is still starting…", share.port)
+                                        },
+                                    );
+                                }
                             }
                             true
                         }
@@ -21962,6 +22172,83 @@ async fn event_loop<T: Terminal>(
                                     };
                                 }
                                 None => model.status = "No share selected".into(),
+                            }
+                            true
+                        }
+                        (Section::Share, KeyCode::Char('n')) => {
+                            let (menu, input, status) =
+                                crate::handlers::share_panel::begin_share_port(keymap.config());
+                            active_menu = menu;
+                            host_input = input;
+                            model.status = status;
+                            true
+                        }
+                        (Section::Forward, KeyCode::Char('n')) => {
+                            host_input = Some((
+                                menu::InputOverlay::new("watch preview port (number)", ""),
+                                HostInputKind::WatchPreviewPort,
+                            ));
+                            model.status =
+                                "Watch preview: enter a port number (Esc cancels)".into();
+                            true
+                        }
+                        (Section::Forward, KeyCode::Char('x')) => {
+                            if panel_ui.cursor < usize::from(model.preview.is_some()) {
+                                if let Some((worktree, port, source)) =
+                                    model.preview.as_ref().map(|preview| {
+                                        (preview.worktree.clone(), preview.port, preview.source)
+                                    })
+                                {
+                                    if preview_supervisor.is_watched(&worktree, port) {
+                                        preview_supervisor.unwatch(&worktree, port);
+                                        model.preview = preview_supervisor.view(&worktree);
+                                        model.status = format!("Removed watched preview :{port}");
+                                    } else if source == thegn_core::preview::PortHintSource::Config
+                                    {
+                                        model.status = format!(
+                                            "Preview :{port} is configured in [preview] ports"
+                                        );
+                                    } else if source
+                                        == thegn_core::preview::PortHintSource::PaneOutput
+                                    {
+                                        model.status = format!(
+                                            "Preview :{port} was seen in pane output — stop the server to clear it"
+                                        );
+                                    } else {
+                                        model.status =
+                                            format!("Preview :{port} is not a watched port");
+                                    }
+                                }
+                            } else {
+                                let offset = usize::from(model.preview.is_some());
+                                if let Some((worktree, port)) = model
+                                    .forwards
+                                    .get(panel_ui.cursor.saturating_sub(offset))
+                                    .map(|forward| {
+                                        (forward.worktree.clone(), forward.container_port)
+                                    })
+                                {
+                                    let stopped = forward_supervisor.stop(&worktree, port);
+                                    if stopped {
+                                        preview_supervisor.provider_down(&worktree, port);
+                                        let preview_worktree = worktree.clone();
+                                        crate::db_task::persist(move |db| {
+                                            if let Err(error) = db.delete_forward(&worktree, port) {
+                                                tracing::debug!(target: "thegn::db", %error, "forward delete persist failed");
+                                            }
+                                        });
+                                        model.preview = preview_supervisor.view(&preview_worktree);
+                                        model.forwards =
+                                            current_forward_views(&forward_supervisor, &session);
+                                        model.status = format!(
+                                            "Removed forward :{port} — re-detected when the port re-binds or on worktree re-entry"
+                                        );
+                                    } else {
+                                        model.status = format!("Forward :{port} was already down");
+                                    }
+                                } else {
+                                    model.status = "No forward selected".into();
+                                }
                             }
                             true
                         }
@@ -22269,6 +22556,11 @@ async fn event_loop<T: Terminal>(
                                 panel_ui.logs_cursor = 0;
                                 panel_ui.cursor = 0;
                             }
+                            true
+                        }
+                        (Section::Keys, KeyCode::Char('/')) => {
+                            panel_ui.keys_filter_editing = true;
+                            panel_ui.scroll = 0;
                             true
                         }
                         (Section::Logs, KeyCode::Char('l')) => {
@@ -23670,23 +23962,11 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::ShareWorktreePort => {
-                                // Intent-first: when ≥2 reaches are configured,
-                                // pick public/team/peer first; otherwise go
-                                // straight to port entry (the single reach, or
-                                // `None` ⇒ `[share] provider`).
-                                let reaches = keymap.config().share.configured_reaches();
-                                if reaches.len() >= 2 {
-                                    active_menu = Some(menu::reach_picker(&keymap.config().share));
-                                    model.status = "Share to… pick a reach (Esc cancels)".into();
-                                } else {
-                                    let reach = reaches.first().copied();
-                                    host_input = Some((
-                                        menu::InputOverlay::new("share worktree port (number)", ""),
-                                        HostInputKind::ShareWorktreePort { reach },
-                                    ));
-                                    model.status =
-                                        "Share port: enter a port number (Esc cancels)".into();
-                                }
+                                let (menu, input, status) =
+                                    crate::handlers::share_panel::begin_share_port(keymap.config());
+                                active_menu = menu;
+                                host_input = input;
+                                model.status = status;
                             }
                             Action::StopWorktreeShare => {
                                 crate::handlers::host::stop_worktree_share(

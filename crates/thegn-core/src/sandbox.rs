@@ -26,7 +26,7 @@ use crate::remote::GitLoc;
 use crate::sandbox_events::EventsCap;
 use crate::sandbox_mounts::{
     auto_cache_mounts, default_writable_carveouts, host_toolchain_mounts_ro_home, keep_cfg_mount,
-    parse_mount,
+    parse_mount_checked,
 };
 use crate::{msg, util};
 use std::path::PathBuf;
@@ -363,8 +363,14 @@ impl Backend {
     /// invent them: guessing is how the Apple backend ended up emitting
     /// `container pull` and `container image exists`, neither of which exists.
     /// When someone does that, flip this and add a `liveness_argv` arm.
+    ///
+    /// `winappcontainer` is also unverified: it is reserved, has no token, ACL,
+    /// or network implementation, and currently launches a plain host shell.
     pub fn verified(self) -> bool {
-        !matches!(self, Backend::Smol | Backend::Wsl)
+        !matches!(
+            self,
+            Backend::Smol | Backend::Wsl | Backend::WinAppContainer
+        )
     }
 
     /// The OCI runtimes worth probing for a container on this host (WSL is
@@ -601,6 +607,7 @@ pub enum RefusalClass {
     SystemdMountPath,
     ComposeTarget,
     ComposeServiceMissing,
+    HostnamePolicy,
 }
 
 /// Structured, safe context for a refused sandbox launch.
@@ -701,6 +708,9 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
     if let Some(message) = compose_policy_refusal(spec) {
         return Err(refusal(spec, RefusalClass::ComposePolicy, None, message));
     }
+    if let Some(message) = hostname_policy_refusal_with(HOSTNAME_RULES, spec) {
+        return Err(refusal(spec, RefusalClass::HostnamePolicy, None, message));
+    }
     let mut view = if !spec.backend.is_oci() && spec.compose.is_some() {
         let mut owned = spec.clone();
         owned.compose = None;
@@ -785,6 +795,73 @@ fn compose_cannot_enforce(spec: &SandboxSpec) -> bool {
         || spec.limits.cpu.is_some()
         || spec.limits.memory.is_some()
         || spec.vpn.is_some()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostnameRulesPolicy {
+    WarnDnsOnly,
+    Refuse,
+}
+
+/// SD-3 (THE-799): flip to `Refuse` for the audit design; one line.
+pub const HOSTNAME_RULES: HostnameRulesPolicy = HostnameRulesPolicy::WarnDnsOnly;
+
+pub fn lower_universal_deny(network: Network, block: &[String]) -> Network {
+    if block.iter().any(|rule| rule.trim() == "*") {
+        Network::None
+    } else {
+        network
+    }
+}
+
+pub fn hostname_rules_active(network: Network, allow: &[String], block: &[String]) -> bool {
+    network != Network::None && (!allow.is_empty() || !block.is_empty())
+}
+
+pub fn hostname_rules_note_for(
+    network: Network,
+    allow: &[String],
+    block: &[String],
+    backend: Backend,
+    placement: &Placement,
+) -> Option<String> {
+    if !hostname_rules_active(network, allow, block) {
+        return None;
+    }
+    // Provider placements lower these rules to provider egress policy (THE-534).
+    if matches!(placement, Placement::Provider(_)) {
+        return None;
+    }
+    Some(format!(
+        "sandbox {}: network_allow/network_block are DNS-name rules only — not an egress boundary, and not \
+         applied by this backend (direct IPs and other resolvers bypass them); set `network = \"none\"` \
+         to deny egress, or remove the lists",
+        backend.label()
+    ))
+}
+
+pub fn hostname_rules_note(spec: &SandboxSpec) -> Option<String> {
+    hostname_rules_note_for(
+        spec.network,
+        &spec.network_allow,
+        &spec.network_block,
+        spec.backend,
+        &spec.placement,
+    )
+}
+
+fn hostname_policy_refusal_with(policy: HostnameRulesPolicy, spec: &SandboxSpec) -> Option<String> {
+    if policy == HostnameRulesPolicy::WarnDnsOnly
+        || !hostname_rules_active(spec.network, &spec.network_allow, &spec.network_block)
+        || matches!(spec.placement, Placement::Provider(_) | Placement::K8s(_))
+    {
+        return None;
+    }
+    Some(format!(
+        "`network_allow`/`network_block` are DNS-name rules, which are not an egress boundary and are not \
+         enforced by the `{}` backend; set `network = \"none\"` or remove the lists",
+        spec.backend.label()
+    ))
 }
 
 /// The portable Thegn named-volume lexical policy. A source must begin with
@@ -992,7 +1069,7 @@ pub fn resolve_placed_exact(
 }
 
 /// Warn once per path when a USER-authored `[sandbox] mounts` entry is dropped.
-/// Built-in defaults (`~/.gnupg:rw` …) are listed by `thegn doctor` instead.
+/// Built-in defaults are listed by `thegn doctor` instead.
 fn warn_dropped_mount_once(raw: &str, host: &str, reason: &str) {
     use std::sync::{Mutex, OnceLock};
     if SandboxConfig::default().mounts.iter().any(|d| d == raw) {
@@ -1032,6 +1109,7 @@ fn resolve_placed_with(
     if backend == Backend::None && placement.is_local() {
         return None;
     }
+    let universal_deny = lower_universal_deny(Network::Nat, &cfg.network_block) == Network::None;
 
     let image = {
         let t = cfg.image.trim();
@@ -1202,10 +1280,16 @@ fn resolve_placed_with(
     }
 
     for m in &cfg.mounts {
-        let parsed = parse_mount(m);
+        let parsed = match parse_mount_checked(m) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                warn_dropped_mount_once(m, m, &format!("malformed mount: {error}"));
+                continue;
+            }
+        };
         // THE-215: a sealed launch never honors a mount (host path or dest,
         // canonicalized) that reaches the credential deny list — this covers the
-        // DEFAULT `~/.gnupg:rw` as much as a user entry. Drop and name the path.
+        // configured mount as much as a user entry. Drop and name the path.
         if let Some(home) = &seal_home
             && !home.is_empty()
             && crate::sandbox_mounts::sealed_denies_mount(&parsed, std::path::Path::new(home))
@@ -1342,11 +1426,14 @@ fn resolve_placed_with(
             .collect(),
         // A profile with a no-network floor (sealed) overrides the configured
         // network mode; otherwise the worktree's `[sandbox] network` stands.
-        network: if profile.forces_no_network() {
-            Network::None
-        } else {
-            cfg.network
-        },
+        network: lower_universal_deny(
+            if profile.forces_no_network() {
+                Network::None
+            } else {
+                cfg.network
+            },
+            &cfg.network_block,
+        ),
         network_allow: cfg.network_allow.clone(),
         network_block: cfg.network_block.clone(),
         read_only_root: profile.read_only_root(),
@@ -1381,7 +1468,10 @@ fn resolve_placed_with(
         devenv_path: util::which_path("devenv"),
         name: name.to_string(),
         vpn: {
-            if cfg.vpn.is_enabled() && cfg.network == Network::Host && !profile.forces_no_network()
+            if cfg.vpn.is_enabled()
+                && cfg.network == Network::Host
+                && !profile.forces_no_network()
+                && !universal_deny
             {
                 msg::warn(
                     "sandbox: [sandbox] network=host conflicts with a VPN tunnel \
@@ -1389,7 +1479,11 @@ fn resolve_placed_with(
                      will join the tunnel instead of sharing the host network.",
                 );
             }
-            build_vpn_spec(&cfg.vpn, name, profile)
+            if universal_deny {
+                None
+            } else {
+                build_vpn_spec(&cfg.vpn, name, profile)
+            }
         },
         oci_host: (!cfg.oci_host.trim().is_empty()).then(|| cfg.oci_host.trim().to_string()),
         oci_runtime: (!cfg.oci_runtime.trim().is_empty())
@@ -1914,9 +2008,13 @@ pub fn health_check(spec: &SandboxSpec) -> bool {
     if !spec.backend.is_oci() {
         return true;
     }
-    // Verify both liveness AND that all required bind-mounts are present.
-    let (running, mounts_ok) = container_status(spec);
-    running && mounts_ok
+    // Judge the same resolved view that ensure used to create the container.
+    launchable(spec)
+        .map(|view| {
+            let (running, reusable) = container_status(&view);
+            running && reusable
+        })
+        .unwrap_or(false)
 }
 
 /// Check whether the named container is running AND has all the bind-mounts
@@ -1953,6 +2051,12 @@ fn emits_nix_bind(spec: &SandboxSpec) -> bool {
 /// profile, so reuse must compare it or a `hardened` container (ro `$HOME`,
 /// `~/.gnupg` rw) would be reused by a later `sealed` launch.
 const SEAL_LABEL: &str = "thegn.seal_home";
+const POLICY_LABEL: &str = "thegn.policy";
+
+fn expected_policy(spec: &SandboxSpec) -> String {
+    let sealed = sealed_view(spec);
+    crate::sandbox_policy_fp::policy_fingerprint(&sealed, vpn_sidecar_join(&sealed).is_some())
+}
 
 /// Whether a running container's bind sources satisfy the spec. Non-sealed: the
 /// required set must be a subset (historic behaviour). Sealed: the live set must
@@ -1976,15 +2080,16 @@ fn mounts_match(
 }
 
 /// Judge `inspect` output in thegn's probe format: line 1 `RUNNING` (or empty),
-/// line 2 the [`SEAL_LABEL`] value (empty when absent), then one bind source per
-/// line. Returns `(running, reusable)`. Reusable also requires the seal label to
-/// match the spec: `1` for sealed, absent-or-`0` for non-sealed; an absent label
-/// on a sealed spec means a pre-label container and is recreated.
+/// line 2 the [`SEAL_LABEL`] value, line 3 the [`POLICY_LABEL`] value (empty
+/// when absent), then one bind source per line. Returns `(running, reusable)`.
+/// Reuse requires the seal and policy labels to match and the mounts to pass;
+/// an absent policy label identifies a legacy container and forces recreation.
 fn judge_inspect(
     stdout: &str,
     required: &std::collections::HashSet<&str>,
     sealed: bool,
     nix_expected: bool,
+    expected_fp: &str,
 ) -> (bool, bool) {
     let mut lines = stdout.lines();
     if lines.next() != Some("RUNNING") {
@@ -1992,10 +2097,11 @@ fn judge_inspect(
     }
     let label = lines.next().unwrap_or("").trim();
     let label_ok = if sealed { label == "1" } else { label != "1" };
+    let policy = lines.next().unwrap_or("").trim();
     let active: std::collections::HashSet<&str> = lines.filter(|l| !l.is_empty()).collect();
     (
         true,
-        label_ok && mounts_match(required, &active, sealed, nix_expected),
+        label_ok && policy == expected_fp && mounts_match(required, &active, sealed, nix_expected),
     )
 }
 
@@ -2079,9 +2185,12 @@ pub(crate) fn remove_container(spec: &SandboxSpec) {
     let _ = run_control_owned(spec, &rm, PROBE_TIMEOUT);
 }
 
+/// Return `(running, reusable)` after checking the policy label and mounts.
+/// Apple retains its mount-only check because its CLI has no verified label.
 fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     let sealed = spec.seal_home.is_some();
     let nix_expected = emits_nix_bind(spec);
+    let expected_fp = expected_policy(spec);
     let required: std::collections::HashSet<&str> = spec
         .mounts
         .iter()
@@ -2092,7 +2201,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     // Emit "RUNNING" if actually running (not "created"/"exited"), then one
     // bind-mount source per line. A container in "created" state passes inspect
     // but cannot accept exec sessions — we must not treat it as healthy.
-    let fmt = "{{if .State.Running}}RUNNING{{end}}\n{{index .Config.Labels \"thegn.seal_home\"}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
+    let fmt = "{{if .State.Running}}RUNNING{{end}}\n{{index .Config.Labels \"thegn.seal_home\"}}\n{{index .Config.Labels \"thegn.policy\"}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
     let mut argv = oci_prefix(spec);
     // For remote worktrees the transport wraps the argv; for local we call
     // podman/docker directly. run_control_t_owned gives us the timeout but
@@ -2110,6 +2219,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
                 return (false, false); // container doesn't exist
             }
             let req: Vec<&str> = required.iter().copied().collect();
+            // Apple has no verified policy label; mount-only reuse is a THE-513 residual.
             return parse_apple_inspect_sealed(&stdout, &req, sealed, nix_expected);
         }
         argv.extend([
@@ -2127,7 +2237,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
             return (false, false); // container doesn't exist
         }
         // First line must be "RUNNING" — "CREATED" / "EXITED" / missing → not usable.
-        judge_inspect(&stdout, &required, sealed, nix_expected)
+        judge_inspect(&stdout, &required, sealed, nix_expected, &expected_fp)
     } else {
         // Remote: run the same inspect command over SSH to verify mounts.
         let mut remote_argv = oci_prefix(spec);
@@ -2141,7 +2251,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
         let Some((_, stdout)) = output_control_owned(spec, &remote_argv, PROBE_TIMEOUT) else {
             return (false, false);
         };
-        judge_inspect(&stdout, &required, sealed, nix_expected)
+        judge_inspect(&stdout, &required, sealed, nix_expected, &expected_fp)
     }
 }
 
@@ -2169,16 +2279,15 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
 
     let rt = spec.backend.binary();
 
-    // Single inspect call: are we running, and do the mounts match?
+    // Single inspect call: are we running, and do policy and mounts match?
     let (running, mounts_ok) = container_status(spec);
     if running {
         if mounts_ok {
             return Ok(()); // already running with the correct mounts
         }
-        // Stale mounts (e.g. host_toolchain_mounts() added /nix/store after
-        // an upgrade) — force-remove and fall through to recreate.
+        // Stale policy or mounts — force-remove and fall through to recreate.
         msg::warn(&format!(
-            "sandbox: container '{}' has stale mounts (config changed); recreating",
+            "sandbox: container '{}' policy or mounts changed (config changed); recreating",
             spec.name
         ));
         remove_container(spec);
@@ -3215,9 +3324,14 @@ fn oci_create_opts_with_remote_stdin_secrets(
     // their `thegn-` name, which is what management uses for them anyway.
     if spec.backend != Backend::Apple {
         v.extend(["--label".into(), crate::sandbox_manage::OWNED_LABEL.into()]);
+        v.extend(["--label".into(), crate::sandbox_manage::owner_label_arg()]);
         v.extend([
             "--label".into(),
             format!("{SEAL_LABEL}={}", u8::from(spec.seal_home.is_some())),
+        ]);
+        v.extend([
+            "--label".into(),
+            format!("{POLICY_LABEL}={}", expected_policy(spec)),
         ]);
     }
     // Run under a specific OCI runtime (gVisor's `runsc`, libkrun's `krun`, …)
@@ -3277,24 +3391,6 @@ fn oci_create_opts_with_remote_stdin_secrets(
             "--device".into(),
             "/dev/net/tun".into(),
         ]);
-    }
-    // DNS-based domain filtering: start the proxy on first use and point the
-    // container at it. Skip when network is None (DNS unreachable anyway), when
-    // a VPN sidecar owns DNS (`--dns` is illegal on a container-netns join), or
-    // when no filtering is configured.
-    if spec.network != Network::None
-        && vpn_join.is_none()
-        && (!spec.network_allow.is_empty() || !spec.network_block.is_empty())
-        && spec.placement.is_local()
-    {
-        let policy = crate::dns_filter::DnsPolicy {
-            allow: spec.network_allow.clone(),
-            block: spec.network_block.clone(),
-            upstream: None,
-        };
-        if let Some(port) = crate::dns_filter::get_or_start(policy) {
-            v.extend(["--dns".into(), format!("127.0.0.1:{port}")]);
-        }
     }
     for m in &spec.mounts {
         // Never bind-mount the host's DNS/hosts files into an OCI container:
@@ -3831,6 +3927,7 @@ pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> V
 /// `wsl` is deliberately absent: its command shape is unverified, and this feeds
 /// a **force-remove**. A wrong guess here deletes someone's container, so it
 /// waits for someone who can check it against the real runtime.
+/// Smol and Apple are list-only until their label-filter semantics are verified.
 pub(crate) fn gc_list_argv(backend: Backend) -> Option<Vec<&'static str>> {
     match backend {
         Backend::Podman | Backend::PodmanRootful | Backend::Docker | Backend::Smol => {
@@ -3870,16 +3967,36 @@ pub(crate) fn parse_container_list(backend: Backend, stdout: &str) -> Vec<String
 /// separate container store, so the rootless pass never sees it) on Linux and
 /// **apple** on macOS — where each leaked container also pins its own Linux VM.
 pub fn run_gc(db_worktrees: &[String]) -> Vec<String> {
-    run_gc_detailed(db_worktrees)
+    let report = run_gc_detailed(db_worktrees);
+    let unverified_count = report
+        .unverified
+        .iter()
+        .map(|(_, names)| names.len())
+        .sum::<usize>();
+    if unverified_count > 0 {
+        tracing::info!(
+            target: "thegn::sandbox",
+            count = unverified_count,
+            "orphan GC kept unverified containers; run `thegn sandbox gc` to list them"
+        );
+    }
+    report
+        .removed
         .into_iter()
-        .flat_map(|(_, v)| v)
+        .flat_map(|(_, names)| names)
         .collect()
 }
 
-/// [`run_gc`] with the removals grouped by backend, for the on-demand
-/// `thegn sandbox gc` report ("removed N on `<backend>`"). The startup sweep
-/// uses the flattened [`run_gc`]; both share this loop.
-pub fn run_gc_detailed(db_worktrees: &[String]) -> Vec<(&'static str, Vec<String>)> {
+/// [`run_gc`] results grouped by backend for the on-demand `thegn sandbox gc`
+/// report. Only this profile's labelled orphans are removed; unverified
+/// orphan-looking names are returned for the user to review. The startup sweep
+/// uses the flattened removals and logs the unverified count.
+pub struct GcReport {
+    pub removed: Vec<(&'static str, Vec<String>)>,
+    pub unverified: Vec<(&'static str, Vec<String>)>,
+}
+
+pub fn run_gc_detailed(db_worktrees: &[String]) -> GcReport {
     let state_home = util::xdg_state_home();
     sweep_stale_env_files_in(
         &state_home,
@@ -3887,7 +4004,8 @@ pub fn run_gc_detailed(db_worktrees: &[String]) -> Vec<(&'static str, Vec<String
         SystemTime::now(),
         SECRET_ENV_FILE_MAX_AGE,
     );
-    let mut out = Vec::new();
+    let mut removed_report = Vec::new();
+    let mut unverified_report = Vec::new();
     for backend in Backend::all_oci() {
         let Some(list) = gc_list_argv(backend) else {
             continue;
@@ -3912,19 +4030,48 @@ pub fn run_gc_detailed(db_worktrees: &[String]) -> Vec<(&'static str, Vec<String
         }
 
         let containers = parse_container_list(backend, &stdout);
+        let identity = crate::sandbox_manage::owner_identity();
+        let mine = crate::sandbox_manage::gc_owned_list_argv(backend, &identity).and_then(|argv| {
+            let mut command = backend_prefix(backend);
+            command.extend(argv);
+            output_with_timeout(&command, PROBE_TIMEOUT)
+                .filter(|(ok, _)| *ok)
+                .map(|(_, stdout)| parse_container_list(backend, &stdout))
+        });
+        let labelled = crate::sandbox_manage::gc_labelled_list_argv(backend).and_then(|argv| {
+            let mut command = backend_prefix(backend);
+            command.extend(argv);
+            output_with_timeout(&command, PROBE_TIMEOUT)
+                .filter(|(ok, _)| *ok)
+                .map(|(_, stdout)| parse_container_list(backend, &stdout))
+        });
+        let plan = crate::sandbox_manage::plan_gc(
+            db_worktrees,
+            &containers,
+            if labelled.is_some() {
+                mine.as_deref()
+            } else {
+                None
+            },
+            labelled.as_deref(),
+        );
 
-        let mut removed = Vec::new();
-        for orphan in identify_orphans(db_worktrees, &containers) {
+        for orphan in &plan.remove {
             let mut rm = backend_prefix(backend);
             rm.extend(["rm".into(), "-f".into(), orphan.clone()]);
             let _ = status_with_timeout(&rm, PROBE_TIMEOUT); // best-effort: teardown: orphan container rm -f is best-effort
-            removed.push(orphan);
         }
-        if !removed.is_empty() {
-            out.push((backend.label(), removed));
+        if !plan.remove.is_empty() {
+            removed_report.push((backend.label(), plan.remove));
+        }
+        if !plan.unverified.is_empty() {
+            unverified_report.push((backend.label(), plan.unverified));
         }
     }
-    out
+    GcReport {
+        removed: removed_report,
+        unverified: unverified_report,
+    }
 }
 
 /// Which owned resource kinds a prune touches. Default = all three.

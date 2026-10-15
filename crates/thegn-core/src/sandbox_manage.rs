@@ -30,7 +30,9 @@
 //! in a
 //! witness, so no action can target them.
 
-use crate::sandbox::{Backend, CONTAINER_PREFIX};
+use crate::sandbox::{Backend, CONTAINER_PREFIX, identify_orphans};
+use sha2::{Digest, Sha256};
+use std::path::Path;
 
 /// The label every thegn-created **volume** (and the seed helper container)
 /// carries, in `key=value` form. Images use [`crate::image::MANAGED_IMAGE_REPO`]
@@ -42,6 +44,127 @@ pub const OWNED_LABEL: &str = "thegn.managed=true";
 /// labelled resources. Hard-wired into every volume-listing builder so an
 /// ownership-blind volume enumeration cannot be constructed.
 pub const OWNED_LABEL_FILTER: &str = "label=thegn.managed=true";
+
+/// Label key that binds a container to the profile/install that created it.
+pub const OWNER_LABEL_KEY: &str = "thegn.owner";
+
+/// Derive a stable ownership identity without writing state. The identity is
+/// distinct per profile, OS user and relocated thegn/XDG state directory. It
+/// is an accident fence, not a secret: anyone who can run the runtime can
+/// already remove its containers. Relocating the state dir makes older
+/// containers unverified, so GC fails closed for them.
+pub fn owner_identity_for(profile: &str, profile_root: &Path, state_home: &Path) -> String {
+    let profile = crate::util::slugify(profile);
+    let profile = if profile.is_empty() {
+        "default".to_string()
+    } else {
+        profile
+    };
+    let mut digest = Sha256::new();
+    digest.update(b"thegn-owner-v1\0");
+    digest.update(profile_root.to_string_lossy().as_bytes());
+    digest.update(b"\0");
+    digest.update(state_home.to_string_lossy().as_bytes());
+    let hash = format!("{:x}", digest.finalize());
+    format!("{profile}.{}", &hash[..16])
+}
+
+/// The current process profile's derived ownership identity.
+pub fn owner_identity() -> String {
+    let profile = crate::profile::active();
+    owner_identity_for(&profile.name, &profile.root, &crate::util::xdg_state_home())
+}
+
+/// The `--label` argument stamped on newly created non-Apple OCI containers.
+pub fn owner_label_arg() -> String {
+    format!("{OWNER_LABEL_KEY}={}", owner_identity())
+}
+
+/// Bounded container listing filtered to this profile's owner label. Only
+/// backends whose CLI filter semantics are verified can be destructively swept.
+pub fn gc_owned_list_argv(backend: Backend, identity: &str) -> Option<Vec<String>> {
+    gc_label_filter_supported(backend).then(|| {
+        vec![
+            "ps".into(),
+            "-a".into(),
+            "--filter".into(),
+            format!("label={OWNER_LABEL_KEY}={identity}"),
+            "--format".into(),
+            "{{.Names}}".into(),
+        ]
+    })
+}
+
+/// Bounded listing of all containers carrying any thegn owner label.
+pub fn gc_labelled_list_argv(backend: Backend) -> Option<Vec<String>> {
+    gc_label_filter_supported(backend).then(|| {
+        vec![
+            "ps".into(),
+            "-a".into(),
+            "--filter".into(),
+            format!("label={OWNER_LABEL_KEY}"),
+            "--format".into(),
+            "{{.Names}}".into(),
+        ]
+    })
+}
+
+fn gc_label_filter_supported(backend: Backend) -> bool {
+    matches!(
+        backend,
+        Backend::Podman | Backend::PodmanRootful | Backend::Docker
+    )
+}
+
+/// A pure GC decision. Unverified names are orphan-looking containers that
+/// lack a label proving they belong to this profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcPlan {
+    pub remove: Vec<String>,
+    pub unverified: Vec<String>,
+}
+
+/// Decide which orphan-looking names are safe to remove from the full listing.
+/// Listing order is retained and duplicate names are removed.
+pub fn plan_gc(
+    active: &[String],
+    all: &[String],
+    mine: Option<&[String]>,
+    labelled: Option<&[String]>,
+) -> GcPlan {
+    let mut remove = Vec::new();
+    let mut unverified = Vec::new();
+    let mut seen_remove = std::collections::HashSet::new();
+    let mut seen_unverified = std::collections::HashSet::new();
+    let mine_set: std::collections::HashSet<&str> = mine
+        .unwrap_or_default()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let labelled_set: std::collections::HashSet<&str> = labelled
+        .unwrap_or_default()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let owned_orphans = identify_orphans(active, all)
+        .into_iter()
+        .filter(|name| mine_set.contains(name.as_str()));
+    for name in owned_orphans {
+        if seen_remove.insert(name.clone()) {
+            remove.push(name);
+        }
+    }
+    let orphan_names = identify_orphans(active, all);
+    for name in orphan_names {
+        if !mine_set.contains(name.as_str())
+            && !labelled_set.contains(name.as_str())
+            && seen_unverified.insert(name.clone())
+        {
+            unverified.push(name);
+        }
+    }
+    GcPlan { remove, unverified }
+}
 
 /// The volume label whose value names the seeded warm-volume role
 /// (`thegn-nix-store`, `thegn-cargo`, …). A role-labelled volume is a
