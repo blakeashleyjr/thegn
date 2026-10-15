@@ -470,7 +470,7 @@ refresh_secs = 2           # Polling interval in seconds
 # leaves a gap between the icon and its value.
 # cpu_icon = "CPU"
 # mem_icon = "MEM"
-# net_icon = "NET"      # shipped default auto-selects Ethernet/Wi-Fi/generic from default route; any other value is fixed
+# net_icon = "NET"      # shipped default auto-selects per-medium glyphs below; any other value is a fixed override
 # gpu_icon = "GPU"              # shows only if a GPU is detected
 # temp_icon = "TMP"             # CPU/package temperature
 # swap_icon = "SWP"             # swap usage
@@ -485,6 +485,13 @@ disk_free_warn = 15             # disk widget turns amber at/below this free %
 disk_free_critical = 10         # disk widget turns red at/below this free %
 # disk_path = "~/projects"      # fs the disk widget measures; "" = worktrees_dir's fs
 refresh_rates = [1, 2, 5, 10]  # Click the top-right stats block to cycle
+
+# Per-medium network icons, used only while net_icon is its shipped default.
+# Empty values use built-in glyphs, which degrade to ASCII on limited terminals.
+# [stats.net_icons]
+# wifi = ""
+# ethernet = ""
+# generic = ""
 
 # Threshold alerts on system metrics. A metric must stay past a threshold for
 # `sustain_secs` before firing (so a one-sample spike is silent), and a standing

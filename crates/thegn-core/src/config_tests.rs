@@ -4071,3 +4071,17 @@ fn sandbox_default_is_fail_closed_and_online() {
     let from_file = Config::load_layered(&MapEnv::default(), &[], Some(path));
     assert_eq!(from_file.sandbox.isolation_floor, Some(IsolationFloor::Off));
 }
+
+#[test]
+fn stats_net_icons_default_empty_and_parse() {
+    let defaults = StatsConfig::default().net_icons;
+    assert_eq!(defaults, NetIconsConfig::default());
+    assert!(defaults.wifi.is_empty());
+    assert!(defaults.ethernet.is_empty());
+    assert!(defaults.generic.is_empty());
+
+    let cfg: Config = toml::from_str("[stats.net_icons]\nethernet = \"ETH\"\n").unwrap();
+    assert_eq!(cfg.stats.net_icons.ethernet, "ETH");
+    assert!(cfg.stats.net_icons.wifi.is_empty());
+    assert!(cfg.stats.net_icons.generic.is_empty());
+}
