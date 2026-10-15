@@ -187,11 +187,17 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
             }
             anyhow::bail!("{branch} breaks the build (gate red); not landed:\n{failures}");
         }
-        AttemptOutcome::GateError { reason, .. } => {
+        AttemptOutcome::GateError {
+            reason,
+            phase,
+            class,
+            ..
+        } => {
             // The gate never ran, so this says nothing about the branch. Naming
             // it "breaks the build" would be a false accusation.
+            let context = crate::cmd::integrate::gate_error_context(Some(phase), Some(class));
             anyhow::bail!(
-                "{branch} was NOT gated — {reason}. The branch was not judged; \
+                "{branch} was NOT gated{context} — {reason}. The branch was not judged; \
                  fix the gate environment (see `[merge_queue] gate_setup_command`) \
                  and re-run."
             );
@@ -437,5 +443,15 @@ mod landed_row_tests {
         .unwrap();
 
         assert_eq!(db.list_merge_queue().unwrap().pop().unwrap(), before);
+    }
+
+    #[test]
+    fn gate_error_message_names_phase_and_class() {
+        let context = crate::cmd::integrate::gate_error_context(
+            Some(crate::integrate::GatePhase::Gate),
+            Some(crate::integrate::GateErrorClass::Timeout),
+        );
+        let message = format!("feature was NOT gated{context} — timeout");
+        assert!(message.contains("gate/timeout"));
     }
 }
