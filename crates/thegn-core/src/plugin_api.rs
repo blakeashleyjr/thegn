@@ -369,6 +369,19 @@ pub struct PluginSpec {
     pub mode: PluginMode,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Explicitly opts this plugin into running as unsandboxed native code
+    /// with the user's full authority. Declared capabilities and scopes are
+    /// protocol checks, not executable containment.
+    #[serde(default)]
+    pub trusted_native: bool,
+}
+
+/// Whether a native plugin has the explicit trust required by its grants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeTrust {
+    Ungated,
+    Trusted,
+    Refused { gated_by: Vec<String> },
 }
 
 impl PluginSpec {
@@ -380,6 +393,34 @@ impl PluginSpec {
     /// The scope set a `host.call` is checked against.
     pub fn scope_set(&self) -> crate::control::ScopeSet {
         crate::control::ScopeSet::of(&self.scopes)
+    }
+
+    /// Protocol grants that make native execution require explicit trust.
+    pub fn gated_by(&self) -> Vec<String> {
+        let mut gated = self
+            .manifest
+            .capabilities
+            .iter()
+            .filter(|capability| capability.kind() != "surface")
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        gated.sort();
+        if !self.scopes.is_empty() {
+            gated.push(format!("scopes:{}", self.scope_set().to_csv()));
+        }
+        gated
+    }
+
+    /// Classify whether this plugin may run as native code under its grants.
+    pub fn native_trust(&self) -> NativeTrust {
+        let gated_by = self.gated_by();
+        if gated_by.is_empty() {
+            NativeTrust::Ungated
+        } else if self.trusted_native {
+            NativeTrust::Trusted
+        } else {
+            NativeTrust::Refused { gated_by }
+        }
     }
 }
 
@@ -2988,6 +3029,7 @@ timeout_secs = 5
             scopes: Vec::new(),
             mode,
             enabled: true,
+            trusted_native: false,
         }
     }
 
@@ -3264,5 +3306,65 @@ mod run_timeout_tests {
             spec_with_timeout(u64::MAX).run_timeout(),
             std::time::Duration::from_secs(MAX_PLUGIN_TIMEOUT_SECS)
         );
+    }
+}
+
+#[cfg(test)]
+mod native_trust_tests {
+    use super::*;
+
+    fn spec_with(capabilities: &[&str], scopes: Vec<crate::control::Scope>) -> PluginSpec {
+        let mut spec: PluginSpec =
+            toml::from_str(include_str!("../../../examples/plugins/hello/plugin.toml")).unwrap();
+        spec.manifest.capabilities = capabilities
+            .iter()
+            .map(|capability| Capability::parse(capability).unwrap())
+            .collect();
+        spec.scopes = scopes;
+        spec
+    }
+
+    #[test]
+    fn native_trust_classifies_surface_only_as_ungated() {
+        let spec: PluginSpec =
+            toml::from_str(include_str!("../../../examples/plugins/hello/plugin.toml")).unwrap();
+        assert!(matches!(spec.native_trust(), NativeTrust::Ungated));
+    }
+
+    #[test]
+    fn native_trust_refuses_network_capability_without_the_flag() {
+        let mut spec = spec_with(&["network:example.com"], Vec::new());
+        assert_eq!(
+            spec.native_trust(),
+            NativeTrust::Refused {
+                gated_by: vec!["network:example.com".into()]
+            }
+        );
+        spec.trusted_native = true;
+        assert_eq!(spec.native_trust(), NativeTrust::Trusted);
+    }
+
+    #[test]
+    fn nonempty_scopes_are_gated() {
+        let spec = spec_with(&[], vec![crate::control::Scope::Read]);
+        assert!(matches!(
+            spec.native_trust(),
+            NativeTrust::Refused { gated_by } if gated_by == ["scopes:read"]
+        ));
+    }
+
+    #[test]
+    fn trusted_native_defaults_false_when_omitted() {
+        let spec: PluginSpec = toml::from_str(
+            r#"id = "minimal"
+name = "Minimal"
+version = "1.0.0"
+api = "0.1.0"
+capabilities = []
+contributions = []
+command = ["true"]"#,
+        )
+        .unwrap();
+        assert!(!spec.trusted_native);
     }
 }

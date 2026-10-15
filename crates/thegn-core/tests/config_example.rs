@@ -307,6 +307,10 @@ label = "Minimal status"
     assert_eq!(spec.mode, minimal.mode, "mode example default");
     assert_eq!(spec.enabled, minimal.enabled, "enabled example default");
     assert_eq!(
+        spec.trusted_native, minimal.trusted_native,
+        "trusted_native example default"
+    );
+    assert_eq!(
         spec.manifest.capabilities, minimal.manifest.capabilities,
         "capabilities example default"
     );
