@@ -232,7 +232,11 @@ const SHARE: &[SectionKey] = &[
 const ROW_ONLY: &[SectionKey] = &[nav("j/k", "row")];
 const HELP: &[SectionKey] = &[nav("j/k", "scroll")];
 const TELEMETRY: &[SectionKey] = &[nav("j/k", "scroll")];
-const KEYS: &[SectionKey] = &[nav("j/k", "scroll")];
+const KEYS: &[SectionKey] = &[
+    k('/', "/", "filter"),
+    nav("j/k", "scroll"),
+    nav("↵", "where bound"),
+];
 
 /// Row-mode keys for a section. Order is display order; the statusbar shows a
 /// prefix, so the most useful keys come first.
@@ -659,6 +663,7 @@ mod tests {
             (Section::Jobs, include_str!("sections/tasks.rs")),
             (Section::Problems, include_str!("sections/problems.rs")),
             (Section::Symbols, include_str!("sections/symbols.rs")),
+            (Section::Keys, include_str!("sections/keys.rs")),
         ];
         for (section, src) in files {
             let body_labels = hint_row_labels(src);

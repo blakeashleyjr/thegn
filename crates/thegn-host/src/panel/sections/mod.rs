@@ -20,7 +20,7 @@ mod git;
 pub(crate) mod help;
 mod hosts;
 pub(crate) mod issues;
-mod keys;
+pub(crate) mod keys;
 pub(crate) mod logs;
 mod media;
 mod merge_queue;
@@ -1183,15 +1183,14 @@ pub fn scroll_extent(
                 crate::layout::PanelWidth::Half | crate::layout::PanelWidth::Full
             ) =>
         {
-            let lines: usize = ui
-                .docs
-                .cfg_keys
-                .iter()
-                .map(|g| g.rows.len() + 2)
-                .sum::<usize>()
-                + 8;
+            let lines = keys::line_count(&ctx);
+            let visible = if ui.width == crate::layout::PanelWidth::Full {
+                viewport.saturating_sub(2)
+            } else {
+                viewport
+            };
             Some(ScrollExtent {
-                max: lines.div_ceil(2).saturating_sub(1),
+                max: lines.saturating_sub(visible),
                 owns_nav: true,
             })
         }

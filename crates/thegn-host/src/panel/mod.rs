@@ -1233,6 +1233,10 @@ pub struct PanelUi {
     pub logs_filter: String,
     /// True while the Logs section's filter field is being edited.
     pub logs_filter_editing: bool,
+    /// Active free-text filter query for the Keys section (`/` mode).
+    pub keys_filter: String,
+    /// True while the Keys section's filter field is being edited.
+    pub keys_filter_editing: bool,
     /// Level gate: `None` = all levels; `Some(L)` shows lines at L and above.
     pub logs_level: Option<thegn_core::log_view::LogLevel>,
     /// When true, the cursor auto-jumps to the newest line on each arrival.
@@ -1282,6 +1286,8 @@ impl Default for PanelUi {
             logs_cursor: 0,
             logs_filter: String::new(),
             logs_filter_editing: false,
+            keys_filter: String::new(),
+            keys_filter_editing: false,
             logs_level: None,
             logs_tail: true,
             files_filter: String::new(),
