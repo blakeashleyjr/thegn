@@ -7,7 +7,7 @@
 //! supervisor; the loop-side state machine lives in
 //! [`crate::handlers::plugins`] and applies the messages at drain time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,6 +44,13 @@ pub(crate) enum PluginMsg {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OneShotStart {
+    Started,
+    Busy,
+    Failed,
+}
+
 /// One discovered + negotiated plugin, ready for the loop to build state from.
 pub(crate) struct LoadedState {
     pub plugin: LoadedPlugin,
@@ -66,6 +73,33 @@ pub(crate) fn restart_delay(restarts: u32) -> Option<Duration> {
 
 type Sessions = Arc<Mutex<BTreeMap<String, ResidentSession>>>;
 type Disabled = Arc<Mutex<std::collections::BTreeSet<String>>>;
+
+#[derive(Clone, Default)]
+struct OneShotGate(Arc<Mutex<BTreeSet<String>>>);
+
+struct OneShotTicket {
+    gate: OneShotGate,
+    plugin: String,
+}
+
+impl OneShotGate {
+    fn try_begin(&self, plugin: &str) -> Option<OneShotTicket> {
+        let mut in_flight = lock(&self.0);
+        if !in_flight.insert(plugin.to_string()) {
+            return None;
+        }
+        Some(OneShotTicket {
+            gate: self.clone(),
+            plugin: plugin.to_string(),
+        })
+    }
+}
+
+impl Drop for OneShotTicket {
+    fn drop(&mut self) {
+        lock(&self.gate.0).remove(&self.plugin);
+    }
+}
 
 /// Admit a live session only while shutdown has not begun. Checking under the
 /// same lock used by shutdown makes insertion atomic with the final drain.
@@ -94,6 +128,7 @@ pub(crate) struct PluginsHost {
     disabled: Disabled,
     tx: tokio_mpsc::UnboundedSender<PluginMsg>,
     waker: TerminalWaker,
+    one_shot_gate: OneShotGate,
 }
 
 /// Start the plugin host. A SETUP thread does discovery (fs I/O) and spawns
@@ -110,6 +145,7 @@ pub(crate) fn spawn_plugins_host(
     let stop = Arc::new(AtomicBool::new(false));
     let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
     let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
+    let one_shot_gate = OneShotGate::default();
     let host = PluginsHost {
         stop: stop.clone(),
         supervisor: supervisor.clone(),
@@ -117,6 +153,7 @@ pub(crate) fn spawn_plugins_host(
         disabled: disabled.clone(),
         tx: tx.clone(),
         waker: waker.clone(),
+        one_shot_gate,
     };
     let spawn = std::thread::Builder::new()
         .name("thegn-plugins".into())
@@ -179,7 +216,11 @@ impl PluginsHost {
     /// Run a one-shot plugin once, now, off-loop (a palette action was
     /// invoked). The result lands as [`PluginMsg::OneShot`] like a scheduled
     /// run.
-    pub(crate) fn run_one_shot(&self, plugin: LoadedPlugin) {
+    pub(crate) fn run_one_shot(&self, plugin: LoadedPlugin) -> OneShotStart {
+        let id = plugin.spec.manifest.id.as_str().to_string();
+        let Some(ticket) = self.one_shot_gate.try_begin(&id) else {
+            return OneShotStart::Busy;
+        };
         let tx = self.tx.clone();
         let waker = self.waker.clone();
         let spawn = std::thread::Builder::new()
@@ -192,14 +233,19 @@ impl PluginsHost {
                     &plugin.spec.command,
                     &plugin.spec.env,
                     plugin.effective_cwd().as_deref(),
-                    std::time::Duration::from_secs(plugin.spec.timeout_secs.max(1)),
+                    plugin.spec.run_timeout(),
                 );
+                drop(ticket);
                 // best-effort: the loop may be shutting down.
                 let _ = tx.send(PluginMsg::OneShot { plugin: id, run });
                 let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             });
-        if let Err(e) = spawn {
-            tracing::warn!(target: "thegn::plugin", error = %e, "one-shot thread failed to start");
+        match spawn {
+            Ok(_) => OneShotStart::Started,
+            Err(e) => {
+                tracing::warn!(target: "thegn::plugin", error = %e, "one-shot thread failed to start");
+                OneShotStart::Failed
+            }
         }
     }
 
@@ -324,7 +370,7 @@ fn build_schedule(loaded: &[LoadedState], now: Instant) -> Vec<SchedEntry> {
                 command: plugin.spec.command.clone(),
                 env: plugin.spec.env.clone(),
                 cwd: plugin.effective_cwd(),
-                timeout: Duration::from_secs(plugin.spec.timeout_secs.max(1)),
+                timeout: plugin.spec.run_timeout(),
                 surface: contribution.surface.clone(),
                 contribution: contribution.id.clone(),
                 interval,
@@ -461,7 +507,7 @@ fn setup_and_schedule_with_waker(
                 command: st.plugin.spec.command.clone(),
                 env: st.plugin.spec.env.clone(),
                 cwd: st.plugin.effective_cwd(),
-                timeout: Duration::from_secs(st.plugin.spec.timeout_secs.max(1)),
+                timeout: st.plugin.spec.run_timeout(),
             });
         }
     }
@@ -549,7 +595,7 @@ fn setup_and_schedule_with_waker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thegn_core::plugin_api::{ContributionId, PluginId, PluginSpec};
+    use thegn_core::plugin_api::{ContributionId, MAX_PLUGIN_TIMEOUT_SECS, PluginId, PluginSpec};
 
     fn example_spec() -> PluginSpec {
         toml::from_str(include_str!("../../../examples/plugins/hello/plugin.toml")).unwrap()
@@ -609,6 +655,14 @@ mod tests {
         assert_eq!(one_shot[0].plugin, "cadenced");
         assert_eq!(one_shot[0].interval, Duration::from_millis(300));
 
+        let mut unbounded_timeout = spec_with_two_intervals(PluginMode::OneShot);
+        unbounded_timeout.timeout_secs = u64::MAX;
+        let bounded = build_schedule(&[loaded_state(unbounded_timeout)], now);
+        assert_eq!(
+            bounded[0].timeout,
+            Duration::from_secs(MAX_PLUGIN_TIMEOUT_SECS)
+        );
+
         let resident = build_schedule(
             &[loaded_state(spec_with_two_intervals(PluginMode::Resident))],
             now,
@@ -618,6 +672,61 @@ mod tests {
             resident
                 .iter()
                 .all(|entry| entry.mode == PluginMode::Resident)
+        );
+    }
+
+    #[test]
+    fn one_shot_gate_admits_one_run_per_plugin() {
+        let gate = OneShotGate::default();
+        let first = gate.try_begin("p").unwrap();
+        assert!(gate.try_begin("p").is_none());
+        let other = gate.try_begin("q").unwrap();
+        drop(first);
+        assert!(gate.try_begin("p").is_some());
+        drop(other);
+    }
+
+    #[test]
+    fn palette_run_is_single_flight() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(tmp.path()).unwrap();
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let host = PluginsHost {
+            stop: Arc::new(AtomicBool::new(false)),
+            supervisor,
+            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            disabled: Arc::new(Mutex::new(Default::default())),
+            tx,
+            waker,
+            one_shot_gate: OneShotGate::default(),
+        };
+        let mut spec = example_spec();
+        spec.manifest.id = PluginId::new("single-flight");
+        spec.command = vec!["sh".into(), "-c".into(), "sleep 0.2".into()];
+        spec.timeout_secs = 2;
+        let plugin = LoadedPlugin {
+            spec,
+            dir: Some(tmp.path().to_path_buf()),
+        };
+
+        assert_eq!(host.run_one_shot(plugin.clone()), OneShotStart::Started);
+        assert_eq!(host.run_one_shot(plugin.clone()), OneShotStart::Busy);
+        assert!(
+            matches!(rx.blocking_recv(), Some(PluginMsg::OneShot { plugin, .. }) if plugin == "single-flight")
+        );
+        assert_eq!(host.run_one_shot(plugin), OneShotStart::Started);
+        assert!(
+            matches!(rx.blocking_recv(), Some(PluginMsg::OneShot { plugin, .. }) if plugin == "single-flight")
         );
     }
 

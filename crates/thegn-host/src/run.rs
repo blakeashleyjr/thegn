@@ -378,8 +378,8 @@ fn toggle_recorder(
 }
 
 /// Fetch the git section's heat/velocity/log payload off the loop (skipped
-/// while the per-worktree cache is warm). The result rides `tx` + a waker
-/// pulse; the body shows "loading…" until it lands.
+/// while the per-worktree cache is warm). Failed payloads remain renderable
+/// and retry on the next sync. The result rides `tx` + a waker pulse.
 fn kick_git_docs_fetch(
     generation: u64,
     session: &crate::session::Session,
@@ -387,8 +387,8 @@ fn kick_git_docs_fetch(
     tx: &tokio_mpsc::UnboundedSender<(u64, crate::panel::docs::DocsPayload)>,
     waker: &TerminalWaker,
 ) {
-    use crate::panel::docs::{DocsPayload, GitDocs};
-    if panel_ui.docs.git.is_some() {
+    use crate::panel::docs::{DocsPayload, git_docs_from, needs_git_fetch};
+    if !needs_git_fetch(panel_ui.docs.git.as_ref()) {
         return;
     }
     const WEEKS: usize = 36;
@@ -400,12 +400,9 @@ fn kick_git_docs_fetch(
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
         let git = thegn_svc::git::CliGit;
         let now = thegn_core::util::now();
-        let epochs = git.commit_times(&loc, WEEKS).unwrap_or_default();
-        let data = GitDocs {
-            weekly: thegn_core::gitviz::weekly_counts(&epochs, now, WEEKS),
-            log: git.log_graph(&loc, 40).unwrap_or_default(),
-            total: epochs.len() as u32,
-        };
+        let epochs = git.commit_times(&loc, WEEKS);
+        let log = git.log_graph(&loc, 40);
+        let data = git_docs_from(epochs, log, now, WEEKS);
         if tx.send((generation, DocsPayload::Git(data))).is_ok() {
             let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
@@ -678,7 +675,11 @@ pub async fn main(
     // Start the bounded catalog scan as soon as config identifies the selected
     // preset. It overlaps the remaining startup work and is awaited only at
     // the palette chokepoint, so filesystem I/O never runs on this thread.
-    let mut theme_store = crate::theme_store::ThemeStore::spawn(waker.clone(), config_path.clone());
+    let mut theme_store = crate::theme_store::ThemeStore::spawn(
+        waker.clone(),
+        config_path.clone(),
+        &cfg.theme.preset,
+    );
     crate::forge_handle::install(&cfg);
     // Same install as `main.rs`'s subcommand path — the interactive launch does
     // not go through `run_subcommand`, and the tracker panel (`hydrate_tracker`)
@@ -6807,6 +6808,7 @@ async fn event_loop<T: Terminal>(
     let mut pending_corner_oob = crate::preview_retry::PendingCornerOob::default();
     let mut pending_clipboard_oob = crate::preview_retry::PendingClipboardOob::default();
     let mut pending_ready_marker = crate::preview_retry::PendingReadyMarker::default();
+    let mut pending_bell = crate::preview_retry::PendingBellOob::default();
     // The git mutation runner + the line-cursor document fetches (staging
     // diff, drilled-commit files, patch doc). Results are tagged with
     // `panel_ui.git.op_gen` so a worktree switch kills strays on arrival.
@@ -8434,6 +8436,12 @@ async fn event_loop<T: Terminal>(
                             &current_config,
                             Some(waker.clone()),
                         );
+                        let orphaned_sids =
+                            workspace_pool.retain_groups_for_removed_workspace(&slug);
+                        crate::handlers::daemon_lifecycle::kill_orphaned_daemon_sessions(
+                            current_config.daemon.clone(),
+                            orphaned_sids,
+                        );
                         crate::handlers::workspace_remove::forget_workspace_in_model(
                             &mut model, &slug, &repo_path,
                         );
@@ -8990,11 +8998,17 @@ async fn event_loop<T: Terminal>(
             && replay.is_none();
         pending_corner_oob.retry(corner_visible, |bytes| writer.try_submit_oob(bytes));
         pending_clipboard_oob.retry(|bytes| writer.try_submit_oob(bytes));
+        pending_bell.retry(|bytes| writer.try_submit_oob(bytes));
+        if let Some(bytes) = pending_clipboard_oob.take_oversized() {
+            model.status = crate::preview_retry::oversized_copy_status(bytes);
+            dirty = true;
+        }
         if muse_ready
             && pending_ready_marker.is_pending()
             && !pending_preview_oob.is_pending()
             && !pending_corner_oob.blocks_output(corner_visible)
             && !pending_clipboard_oob.is_pending()
+            && !pending_bell.is_pending()
             && !dirty
             && !full_repaint
             && dirty_panes.is_empty()
@@ -12674,6 +12688,20 @@ async fn event_loop<T: Terminal>(
                     crate::chrome::set_palette(
                         new_cfg.palette_with_user_themes(&new_cfg.theme.preset, &theme_users),
                     );
+                    if new_cfg.theme.preset != current_config.theme.preset {
+                        theme_store.set_active(&new_cfg.theme.preset);
+                        if !theme_users
+                            .iter()
+                            .any(|theme| theme.meta.name == new_cfg.theme.preset)
+                            && let Err(error) = theme_store.scan()
+                        {
+                            tracing::debug!(
+                                target: "thegn::theme",
+                                %error,
+                                "could not rescan themes after config reload"
+                            );
+                        }
+                    }
                     if let Some(builder) = theme_builder.as_mut() {
                         builder.config_reloaded(&new_cfg);
                         crate::chrome::set_palette(builder.candidate().clone());
@@ -13061,26 +13089,35 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 RefreshKind::VanishedTabs(result) => {
-                    let paths = fence_vanished_paths(&session, &creating_tabs, &result.paths);
-                    let gone: Vec<&str> = paths.iter().map(String::as_str).collect();
-                    let landing = crate::handlers::worktree_delete::Landing::plan(
-                        &model, &session, &sb, &gone,
-                    );
-                    if crate::merge_lifecycle::apply_vanished_tabs(
-                        &mut session,
-                        &mut panes,
-                        &paths,
-                        &landing,
-                    ) {
-                        model.status = format!(
-                            "Worktree dir gone: {} — removed from session",
-                            paths.join(", ")
+                    let current = result.still_current(&session);
+                    let candidate_paths: Vec<String> =
+                        current.iter().map(|group| group.path.clone()).collect();
+                    let paths = fence_vanished_paths(&session, &creating_tabs, &candidate_paths);
+                    let groups: Vec<crate::merge_lifecycle::VanishedGroup> = current
+                        .into_iter()
+                        .filter(|group| paths.contains(&group.path))
+                        .collect();
+                    if !groups.is_empty() {
+                        let gone: Vec<&str> = paths.iter().map(String::as_str).collect();
+                        let landing = crate::handlers::worktree_delete::Landing::plan(
+                            &model, &session, &sb, &gone,
                         );
-                        refresh_tab_model(&mut model, &session, &mut sb);
-                        landing.place_cursor(&mut model, &mut sb);
-                        need_relayout = true;
-                        dirty = true;
-                        want_model_refresh = true;
+                        if crate::merge_lifecycle::apply_vanished_tabs(
+                            &mut session,
+                            &mut panes,
+                            &groups,
+                            &landing,
+                        ) {
+                            model.status = format!(
+                                "Worktree dir gone: {} — removed from session",
+                                paths.join(", ")
+                            );
+                            refresh_tab_model(&mut model, &session, &mut sb);
+                            landing.place_cursor(&mut model, &mut sb);
+                            need_relayout = true;
+                            dirty = true;
+                            want_model_refresh = true;
+                        }
                     }
                 }
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
@@ -15227,7 +15264,7 @@ async fn event_loop<T: Terminal>(
             // right after the frame in the writer FIFO. BEL neither moves the
             // cursor nor prints, so it is safe between frames.
             if notify_state.take_bell() {
-                writer.submit_oob(b"\x07".to_vec());
+                pending_bell.offer(|bytes| writer.try_submit_oob(bytes));
             }
             // Corner kitty images ride ON TOP of the cell frame: emit the queued,
             // repositioned graphics AFTER the diff — the writer FIFO orders them
@@ -15297,6 +15334,7 @@ async fn event_loop<T: Terminal>(
                         if pending_preview_oob.is_pending()
                             || pending_corner_oob.blocks_output(false)
                             || pending_clipboard_oob.is_pending()
+                            || pending_bell.is_pending()
                         {
                             Err(bytes)
                         } else {
@@ -18600,6 +18638,14 @@ async fn event_loop<T: Terminal>(
                                     &current_config,
                                     Some(waker.clone()),
                                 );
+                                if !model.status.contains("failed to start") {
+                                    let orphaned_sids =
+                                        workspace_pool.retain_groups_for_removed_workspace(&slug);
+                                    crate::handlers::daemon_lifecycle::kill_orphaned_daemon_sessions(
+                                        current_config.daemon.clone(),
+                                        orphaned_sids,
+                                    );
+                                }
                                 if keep_files {
                                     crate::handlers::workspace_remove::forget_workspace_in_model(
                                         &mut model, &slug, &repo_path,
@@ -21446,7 +21492,15 @@ async fn event_loop<T: Terminal>(
                                         });
                                     model.status = format!("Copied {sha}");
                                 }
-                                None => model.status = "No commit data yet".into(),
+                                None => {
+                                    model.status = panel_ui
+                                        .docs
+                                        .git
+                                        .as_ref()
+                                        .and_then(|docs| docs.error.as_ref())
+                                        .map(|reason| format!("No commit data: {reason}"))
+                                        .unwrap_or_else(|| "No commit data yet".into());
+                                }
                             }
                             true
                         }
@@ -25358,6 +25412,14 @@ async fn event_loop<T: Terminal>(
                                             &current_config,
                                             Some(waker.clone()),
                                         );
+                                    if !model.status.contains("failed to start") {
+                                        let orphaned_sids = workspace_pool
+                                            .retain_groups_for_removed_workspace(&slug);
+                                        crate::handlers::daemon_lifecycle::kill_orphaned_daemon_sessions(
+                                            current_config.daemon.clone(),
+                                            orphaned_sids,
+                                        );
+                                    }
                                     sb.marked.clear();
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     sb.focus_active_row(&mut model);

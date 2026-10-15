@@ -71,6 +71,8 @@ pub(crate) struct DriveOutcome {
     /// separately from `deferred` so a caller never reads "the branch is bad"
     /// out of "the gate binary is missing".
     pub gate_error: Vec<String>,
+    /// Per-branch gate verdict details for machine and human drain reports.
+    pub gate_verdicts: Vec<GateVerdictReport>,
     /// Live checkouts of the target branch and what the ref advance did to them.
     /// Advisory; the CLI warns about the ones it could not fast-forward.
     pub resyncs: Vec<thegn_core::util::CheckoutResync>,
@@ -84,6 +86,15 @@ pub(crate) struct DriveOutcome {
     pub persistence_errors: Vec<String>,
     /// Git advanced, but the landed status could not be persisted.
     pub bookkeeping_failed: Vec<RefAdvancedBookkeepingFailed>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GateVerdictReport {
+    pub branch: String,
+    pub verdict: String,
+    pub phase: String,
+    pub class: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -532,7 +543,12 @@ fn drive_queue_with(
                     out.deferred.push(item.branch.clone());
                     break;
                 }
-                AttemptOutcome::GateError { reason, log } => {
+                AttemptOutcome::GateError {
+                    reason,
+                    log,
+                    phase,
+                    class,
+                } => {
                     // The gate could not RUN. This is a fact about the
                     // environment, not a verdict about the branch, so it must
                     // NOT become a `Failure`: handing it to the fixing agent
@@ -552,6 +568,17 @@ fn drive_queue_with(
                         detail: &detail,
                     });
                     out.gate_error.push(item.branch.clone());
+                    out.gate_verdicts.push(GateVerdictReport {
+                        branch: item.branch.clone(),
+                        verdict: "error".into(),
+                        phase: phase.as_str().into(),
+                        class: class.as_str().into(),
+                        reason: if log.trim().is_empty() {
+                            reason
+                        } else {
+                            format!("{reason}: {}", tail_line(&log))
+                        },
+                    });
                     break;
                 }
                 AttemptOutcome::Conflict {
@@ -561,7 +588,20 @@ fn drive_queue_with(
                     paths,
                     submodule_conflicts,
                 },
-                AttemptOutcome::GateFailed { log } => Failure::Gate(log),
+                AttemptOutcome::GateFailed { log } => {
+                    out.gate_verdicts.push(GateVerdictReport {
+                        branch: item.branch.clone(),
+                        verdict: "failed".into(),
+                        phase: "gate".into(),
+                        class: "red".into(),
+                        reason: if log.trim().is_empty() {
+                            "gate_command failed".into()
+                        } else {
+                            format!("gate_command failed: {}", tail_line(&log))
+                        },
+                    });
+                    Failure::Gate(log)
+                }
             };
 
             // A land failure. Dispatch the agent to fix it, if we still can.
@@ -1247,6 +1287,10 @@ mod tests {
             );
 
             assert_eq!(outcome.gate_error, ["feat"]);
+            assert_eq!(outcome.gate_verdicts.len(), 1);
+            assert_eq!(outcome.gate_verdicts[0].branch, "feat");
+            assert_eq!(outcome.gate_verdicts[0].verdict, "error");
+            assert!(!outcome.gate_verdicts[0].class.is_empty());
             assert!(outcome.needs_human.is_empty());
             assert_eq!(db.list_merge_queue().unwrap()[0].agent_attempts, 0);
         }

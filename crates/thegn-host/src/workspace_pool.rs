@@ -129,6 +129,34 @@ impl WorkspacePool {
         self.parked.iter().flat_map(|(_, rw)| rw.worktrees.iter())
     }
 
+    /// Drop persisted worktree groups for a removed workspace from every
+    /// parked session so a later warm switch cannot save them again.
+    pub(crate) fn retain_groups_for_removed_workspace(&mut self, slug: &str) -> Vec<String> {
+        let prefix = format!("{slug}/");
+        let mut orphaned_sids = Vec::new();
+        for (_, rw) in &mut self.parked {
+            let active_name = rw.worktrees.get(rw.active).map(|group| group.name.clone());
+            rw.worktrees.retain(|group| {
+                let keep = group.kind == crate::session::GroupKind::Terminal
+                    || !group.name.starts_with(&prefix);
+                if !keep {
+                    orphaned_sids.extend(group.tabs.iter().flat_map(|tab| {
+                        tab.pane_sessions
+                            .values()
+                            .filter(|provider| provider.provider == "daemon")
+                            .map(|provider| provider.session.clone())
+                    }));
+                }
+                keep
+            });
+            rw.active = active_name
+                .and_then(|name| rw.worktrees.iter().position(|group| group.name == name))
+                .unwrap_or_else(|| rw.active.min(rw.worktrees.len().saturating_sub(1)));
+        }
+        self.parked.retain(|(_, rw)| !rw.worktrees.is_empty());
+        orphaned_sids
+    }
+
     /// Names owned by live terminal groups in parked workspaces. Creation must
     /// include these in its uniqueness set even when the registry write that
     /// normally advertises the terminal failed.
@@ -387,6 +415,33 @@ mod tests {
             &mut p,
         );
         assert_eq!(pool.resident_terminal_names().collect::<Vec<_>>(), ["prod"]);
+    }
+
+    #[test]
+    fn removed_workspace_groups_are_pruned_from_parked_sessions() {
+        let mut pool = WorkspacePool::default();
+        let mut p = panes();
+        pool.stash(
+            "repo".into(),
+            ResidentWorkspace {
+                worktrees: vec![
+                    group("lib/home", GroupKind::Home, 40),
+                    group("app/home", GroupKind::Home, 41),
+                    group("terminals/ops", GroupKind::Terminal, 42),
+                ],
+                active: 1,
+            },
+            &mut p,
+        );
+
+        let orphaned_sids = pool.retain_groups_for_removed_workspace("lib");
+
+        let names: Vec<_> = pool
+            .resident_groups()
+            .map(|group| group.name.as_str())
+            .collect();
+        assert_eq!(names, ["app/home", "terminals/ops"]);
+        assert!(orphaned_sids.is_empty());
     }
 
     #[test]
