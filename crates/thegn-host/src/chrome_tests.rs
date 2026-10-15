@@ -3311,7 +3311,8 @@ fn fixed_net_icon_overrides_per_medium_glyphs() {
 #[test]
 fn panel_hit_at_resolves_main_column_drill_click() {
     use crate::layout::PanelWidth;
-    use crate::panel::{CommitRow, GitView, PanelHit, PanelTab, PanelUi, Section};
+    use crate::panel::gitui::GitView;
+    use crate::panel::{CommitRow, PanelHit, PanelTab, PanelUi, Section};
 
     let rect = Rect {
         x: 7,
@@ -3352,6 +3353,8 @@ fn panel_hit_at_resolves_main_column_drill_click() {
         .col_hits
         .iter()
         .find(|span| span.row == drill.row && span.cols.end <= drill.cols.start);
+    let side_hit = side.map(|span| span.hit);
+    assert!(side_hit.is_some(), "Commits row 0 has a side-column hit");
     let side_x = rect.x + side.map_or(0, |span| span.cols.start);
     let divider_x = rect.x + drill.cols.start - 1;
     let click_y = rect.y + drill.row;
@@ -3360,9 +3363,6 @@ fn panel_hit_at_resolves_main_column_drill_click() {
         panel_hit_at(&model, &ui, rect, main_x, click_y),
         Some(PanelHit::GitDrill(0))
     );
-    assert_eq!(
-        panel_hit_at(&model, &ui, rect, side_x, click_y),
-        side.map(|span| span.hit)
-    );
+    assert_eq!(panel_hit_at(&model, &ui, rect, side_x, click_y), side_hit);
     assert_eq!(panel_hit_at(&model, &ui, rect, divider_x, click_y), None);
 }
