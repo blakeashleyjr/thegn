@@ -79,6 +79,15 @@ fn read_argv<'a>(args: &[&'a str]) -> Vec<&'a str> {
     argv
 }
 
+/// Bridge commands run through the remote/provider exec contract, which
+/// expects the caller's argv. Keep the local read-fence flags out of bridged
+/// argv so remote reads retain the command shape the agent accepts.
+fn bridge_git_argv(loc: &GitLoc, args: &[&str]) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["git".into(), "-C".into(), loc.path()];
+    argv.extend(args.iter().map(|s| s.to_string()));
+    argv
+}
+
 // Fetch and push can hold this per-command lock while waiting on a remote.
 // Keep the wait long enough for ordinary transfers without blocking forever.
 const MUTATION_LOCK_WAIT: Duration = Duration::from_secs(120);
@@ -696,13 +705,7 @@ fn run_bridge(
     env: &[(String, String)],
     read_only: bool,
 ) -> Result<String> {
-    let mut argv: Vec<String> = vec!["git".into(), "-C".into(), loc.path()];
-    let effective_args = if read_only {
-        read_argv(args)
-    } else {
-        args.to_vec()
-    };
-    argv.extend(effective_args.iter().map(|s| s.to_string()));
+    let argv = bridge_git_argv(loc, args);
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     // Reads (status/diff/rev-*) take the shorter interactive deadline; writes
     // (fetch/push/pull via `run_w`) keep the long default — a big fetch is slow
@@ -745,9 +748,7 @@ fn run(loc: &GitLoc, args: &[&str]) -> Result<String> {
 /// `ssh` process spawn — the bridge's `exec` already carries the exit code.
 fn run_status(loc: &GitLoc, args: &[&str]) -> Result<(i32, String)> {
     if let Some(b) = crate::bridge::for_loc(loc) {
-        let mut argv: Vec<String> = vec!["git".into(), "-C".into(), loc.path()];
-        let guarded_args = read_argv(args);
-        argv.extend(guarded_args.iter().map(|s| s.to_string()));
+        let argv = bridge_git_argv(loc, args);
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
         let r = b.exec_read(&refs, None, &[])?; // read: no-upstream/absent-ref probes
         return Ok((r.exit, r.stdout));
@@ -1713,12 +1714,7 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
         let want = specs.len();
         let cmds: Vec<Vec<String>> = specs
             .iter()
-            .map(|args| {
-                let mut argv = vec!["git".to_string(), "-C".into(), loc.path()];
-                let guarded_args = read_argv(args);
-                argv.extend(guarded_args.iter().map(|s| s.to_string()));
-                argv
-            })
+            .map(|args| bridge_git_argv(loc, args))
             .collect();
         match b.exec_batch(&cmds, &[]) {
             Ok(r) if r.len() == want => {
@@ -2679,6 +2675,26 @@ mod tests {
                 "core.hooksPath=/dev/null",
                 "status",
                 "--porcelain=v1"
+            ]
+        );
+    }
+
+    #[test]
+    fn bridge_git_argv_keeps_provider_read_args_bare() {
+        let loc = thegn_core::remote::GitLoc::provider(
+            vec!["sprite".into(), "exec".into(), "--".into()],
+            "/workspace",
+        );
+
+        assert_eq!(
+            bridge_git_argv(&loc, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            vec![
+                String::from("git"),
+                String::from("-C"),
+                String::from("/workspace"),
+                String::from("rev-parse"),
+                String::from("--abbrev-ref"),
+                String::from("HEAD")
             ]
         );
     }
