@@ -92,20 +92,21 @@ mod tests {
     use super::*;
 
     fn last_v4(network: Ipv4Addr, prefix: u8) -> Ipv4Addr {
-        let host_mask = u32::MAX.checked_shr(u32::from(prefix)).unwrap_or(u32::MAX);
+        let host_mask = u32::MAX.checked_shr(u32::from(prefix)).unwrap_or(0);
         Ipv4Addr::from(u32::from(network) | host_mask)
     }
 
     fn last_v6(network: Ipv6Addr, prefix: u8) -> Ipv6Addr {
-        let host_mask = u128::MAX
-            .checked_shr(u32::from(prefix))
-            .unwrap_or(u128::MAX);
+        let host_mask = u128::MAX.checked_shr(u32::from(prefix)).unwrap_or(0);
         Ipv6Addr::from(u128::from(network) | host_mask)
     }
 
     #[test]
     fn every_special_v4_range_denies_both_edges() {
         for &(network, prefix) in SPECIAL_DENY {
+            if prefix == 32 {
+                assert_eq!(last_v4(network, prefix), network);
+            }
             for address in [network, last_v4(network, prefix)] {
                 assert!(is_special_ipv4(address), "{address}/{prefix}");
                 assert!(is_forbidden_destination(IpAddr::V4(address)));
@@ -117,6 +118,9 @@ mod tests {
     #[test]
     fn special_v6_ranges_deny_both_edges() {
         for &(network, prefix) in SPECIAL_DENY_V6 {
+            if prefix == 128 {
+                assert_eq!(last_v6(network, prefix), network);
+            }
             for address in [network, last_v6(network, prefix)] {
                 assert!(is_special_ipv6(address), "{address}/{prefix}");
                 assert!(is_forbidden_destination(IpAddr::V6(address)));
