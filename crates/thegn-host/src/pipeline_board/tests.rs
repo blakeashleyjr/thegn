@@ -421,6 +421,13 @@ fn truncated_history_is_labelled_and_staleness_keeps_precedence() {
     let text = render_text(&b, 140, 40);
     assert!(text.contains("newest 2048 finished"), "{text}");
 
+    ch(&mut b, ' ');
+    assert!(b.is_frozen());
+    let text = render_text(&b, 140, 40);
+    assert!(text.contains("frozen"), "{text}");
+    assert!(!text.contains("newest 2048 finished"), "{text}");
+    ch(&mut b, ' ');
+
     r.stale = Some(crate::monitor_pipeline::RosterStale {
         last_good_ms: Some(NOW_MS - 12_000),
         error: "database is locked".into(),
