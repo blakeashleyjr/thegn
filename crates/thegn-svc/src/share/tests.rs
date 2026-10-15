@@ -141,6 +141,22 @@ fn direct_client_env_drops_ambient_credentials() {
 }
 
 #[test]
+fn direct_client_env_matches_windows_key_casing() {
+    let ambient = [
+        ("Path".into(), "C:\\Windows\\System32".into()),
+        ("windir".into(), "C:\\Windows".into()),
+    ];
+
+    assert_eq!(
+        direct_client_env(ambient),
+        [
+            ("Path".into(), "C:\\Windows\\System32".into()),
+            ("windir".into(), "C:\\Windows".into()),
+        ]
+    );
+}
+
+#[test]
 fn remote_port_zero_is_omitted() {
     let bore = BoreConfig {
         remote_port: 0,
@@ -989,23 +1005,18 @@ fn start_keeps_draining_so_child_survives_post_return() {
 #[cfg(unix)]
 #[test]
 fn spawned_client_sees_only_allowlisted_env() {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempfile::tempdir().expect("temporary client directory");
     let script_path = temp.path().join("fake-client");
     let dump_path = temp.path().join("environment.txt");
-    let script =
-        format!("#!/bin/sh\nenv > \"$1\"\nprintf 'listening at fake.example:4123\\n'\nsleep 2\n");
+    let script = "#!/bin/sh\nenv > \"$1\"\nprintf 'listening at fake.example:4123\\n'\nsleep 2\n";
     std::fs::write(&script_path, script).expect("write fake client");
-    let mut permissions = std::fs::metadata(&script_path)
-        .expect("fake client metadata")
-        .permissions();
-    permissions.set_mode(0o700);
-    std::fs::set_permissions(&script_path, permissions).expect("make fake client executable");
 
     let plan = SharePlan {
-        program: script_path.to_string_lossy().into_owned(),
-        args: vec![dump_path.to_string_lossy().into_owned()],
+        program: "/bin/sh".into(),
+        args: vec![
+            script_path.to_string_lossy().into_owned(),
+            dump_path.to_string_lossy().into_owned(),
+        ],
         env: vec![("RUST_LOG".into(), "info".into())],
         files: Vec::new(),
         url_rule: UrlRule::AfterMarker {
@@ -1013,8 +1024,9 @@ fn spawned_client_sees_only_allowlisted_env() {
             scheme: "http".into(),
         },
     };
+    let path = std::env::var_os("PATH").expect("test runner PATH");
     let ambient = [
-        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("PATH".into(), path.clone()),
         ("LANG".into(), "C".into()),
         ("HOME".into(), "/private/home".into()),
         ("THEGN_TEST_CANARY_SECRET".into(), "canary-value".into()),
@@ -1024,12 +1036,28 @@ fn spawned_client_sees_only_allowlisted_env() {
         .expect("start fake client");
     let dumped_env = std::fs::read_to_string(&dump_path).expect("read child environment");
 
-    assert!(dumped_env.lines().any(|line| line == "PATH=/usr/bin:/bin"));
+    assert!(
+        dumped_env
+            .lines()
+            .any(|line| line == format!("PATH={}", path.to_string_lossy()))
+    );
     assert!(dumped_env.lines().any(|line| line == "RUST_LOG=info"));
     assert!(!dumped_env.contains("THEGN_TEST_CANARY_SECRET"));
     assert!(!dumped_env.contains("canary-value"));
     assert!(!dumped_env.contains("HOME="));
     assert!(!dumped_env.contains("GITHUB_TOKEN="));
+    let allowed_keys = DIRECT_CLIENT_ENV_KEYS
+        .iter()
+        .copied()
+        .chain(["RUST_LOG", "PWD", "SHLVL", "_", "OLDPWD"])
+        .collect::<Vec<_>>();
+    for line in dumped_env.lines() {
+        let (key, _) = line.split_once('=').expect("environment entry has key");
+        assert!(
+            allowed_keys.contains(&key),
+            "unexpected child environment key: {key}"
+        );
+    }
     running.stop();
 }
 
