@@ -536,12 +536,30 @@ mod bind_checkout_tests {
         .unwrap();
         let rows = db.list_pr_queue().unwrap();
         assert_eq!(rebind_target(&rows, 7).unwrap().number, 7);
-        assert_eq!(
-            bind_checkout(&root, &wt, true, Some(&root), branch.as_deref(), "feat")
-                .unwrap()
-                .as_deref(),
-            Some(wt.as_path())
-        );
+        let binding = bind_checkout(&root, &wt, true, Some(&root), branch.as_deref(), "feat")
+            .unwrap()
+            .expect("matching checkout branch remains bound");
+        assert_eq!(binding, wt);
+        let row = rows.first().unwrap();
+        let key = db
+            .rebind_pr(
+                &row.key,
+                &PrRebind {
+                    worktree: Some(wt.to_string_lossy().into_owned()),
+                    branch: branch.unwrap(),
+                    base_branch: "main".into(),
+                    forge: "github".into(),
+                    pr_url: "https://github.com/me/repo/pull/7".into(),
+                },
+            )
+            .unwrap();
+        let rebound = db
+            .list_pr_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.key == key)
+            .unwrap();
+        assert_eq!(rebound.branch, "feat");
     }
 
     #[test]
@@ -604,12 +622,24 @@ mod bind_checkout_tests {
     #[expect(clippy::disallowed_methods)]
     fn init_repo(path: &Path) {
         thegn_core::fsperm::restrict_dir_to_owner(path).unwrap();
-        let status = thegn_core::util::git_cmd(path)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .args(["init"])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        let git = |args: &[&str]| {
+            let status = thegn_core::util::git_cmd(path)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "git {args:?} failed in {}",
+                path.display()
+            );
+        };
+        git(&["-c", "commit.gpgsign=false", "init"]);
+        git(&["config", "user.email", "queue-test@example.invalid"]);
+        git(&["config", "user.name", "Queue Test"]);
+        std::fs::write(path.join("tracked"), "fixture\n").unwrap();
+        git(&["add", "tracked"]);
+        git(&["-c", "commit.gpgsign=false", "commit", "-m", "fixture"]);
     }
 
     #[test]
