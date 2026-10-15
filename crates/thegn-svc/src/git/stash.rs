@@ -24,29 +24,30 @@ fn stash_index_for(loc: &GitLoc, sha: &str) -> Result<Option<usize>> {
         .map(|entry| entry.index))
 }
 
+fn require_index(sha: &str, index: Option<usize>) -> Result<usize> {
+    match index {
+        Some(index) => Ok(index),
+        None => {
+            let short: String = sha.chars().take(7).collect();
+            bail!("stash {short} no longer exists (the stash list changed); refresh and retry");
+        }
+    }
+}
+
 fn stash_mutate(loc: &GitLoc, verb: &str, sha: &str) -> Result<()> {
-    let index = if loc.is_remote() || crate::bridge::for_loc(loc).is_some() {
-        stash_index_for(loc, sha)?
+    if loc.is_remote() || crate::bridge::for_loc(loc).is_some() {
+        let index = require_index(sha, stash_index_for(loc, sha)?)?;
+        run_w(loc, &[], &["stash", verb, &at(index)]).map(|_| ())
     } else {
         let lock = super::require_mutation_lock_within(
             std::path::Path::new(&loc.path()),
             &["stash", verb],
             super::MUTATION_LOCK_WAIT,
         )?;
-        let index = stash_index_for(loc, sha)?;
-        let Some(index) = index else {
-            let short: String = sha.chars().take(7).collect();
-            bail!("stash {short} no longer exists (the stash list changed); refresh and retry");
-        };
+        let index = require_index(sha, stash_index_for(loc, sha)?)?;
         let selector = at(index);
-        run_w_locked(loc, &[], &["stash", verb, &selector], &lock)?;
-        return Ok(());
-    };
-    let Some(index) = index else {
-        let short: String = sha.chars().take(7).collect();
-        bail!("stash {short} no longer exists (the stash list changed); refresh and retry");
-    };
-    run_w(loc, &[], &["stash", verb, &at(index)]).map(|_| ())
+        run_w_locked(loc, &[], &["stash", verb, &selector], &lock).map(|_| ())
+    }
 }
 
 pub trait StashOps: GitBackend {
@@ -123,7 +124,7 @@ impl<T: GitBackend + ?Sized> StashOps for T {}
 mod tests {
     use super::super::testutil::{TestRepo, git_in};
     use super::super::{CliGit, GitBackend};
-    use super::StashOps;
+    use super::{StashOps, require_index};
     use std::path::Path;
     use thegn_core::gitrefs::{parse_git_version, supports_stash_staged};
 
@@ -137,6 +138,16 @@ mod tests {
 
     fn read(repo: &TestRepo, path: &str) -> String {
         std::fs::read_to_string(repo.dir.join(path)).unwrap()
+    }
+
+    #[test]
+    fn require_index_formats_the_vanished_stash_error_once() {
+        let error = require_index("1234567890abcdef", None).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "stash 1234567 no longer exists (the stash list changed); refresh and retry"
+        );
     }
 
     #[test]
