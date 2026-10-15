@@ -240,40 +240,89 @@ mod tests {
     use crate::panel::PanelUi;
     use thegn_core::ci::CiRun;
 
+    fn assert_safe_rows(rows: &[PanelRow], cols: usize) {
+        fn check(segs: &[Seg], cols: usize) {
+            for segment in segs {
+                assert!(
+                    segment.text.chars().all(|c| {
+                        !c.is_control() && !thegn_core::pipeline_report::is_format_control(c)
+                    }),
+                    "{:?}",
+                    segment.text
+                );
+                if segment.text.contains('…') {
+                    assert!(
+                        unicode_width::UnicodeWidthStr::width(segment.text.as_str()) <= cols,
+                        "clipped segment exceeds {cols} columns: {:?}",
+                        segment.text
+                    );
+                }
+            }
+        }
+
+        for row in rows {
+            match &row.line {
+                Line::Segs(segs) => check(segs, cols),
+                Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
+                    check(l, cols);
+                    check(r, cols);
+                }
+                Line::Blank | Line::Fill { .. } => {}
+            }
+        }
+    }
+
     #[test]
     fn hostile_ci_run_fields_render_without_terminal_controls() {
         let mut model = FrameModel::default();
         model.panel.ci_runs = vec![CiRun {
             name: "\u{1b}]0;pwn\u{7}日本語".repeat(12),
             title: "\u{202e}title日本語".repeat(12),
+            event: "\u{1b}[31mevent".into(),
+            jobs: vec![thegn_core::ci::CiJob {
+                name: "\u{200b}job name".into(),
+                steps: vec![thegn_core::ci::CiStep {
+                    name: "\u{202e}step name".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
             ..Default::default()
         }];
-        let ui = PanelUi::default();
-        let rows = content(&SectionCtx {
-            model: &model,
-            ui: &ui,
-            cols: 39,
-            rows: 20,
-        });
-        assert!(rows.iter().all(|row| {
-            match &row.line {
-                Line::Segs(segs) => segs.iter().all(|seg| {
-                    seg.text.chars().all(|c| {
-                        !c.is_control() && !thegn_core::pipeline_report::is_format_control(c)
-                    })
-                }),
-                Line::Split { l, r } => l.iter().chain(r).all(|seg| {
-                    seg.text.chars().all(|c| {
-                        !c.is_control() && !thegn_core::pipeline_report::is_format_control(c)
-                    })
-                }),
-                Line::SplitMinLeft { l, r, .. } => l.iter().chain(r).all(|seg| {
-                    seg.text.chars().all(|c| {
-                        !c.is_control() && !thegn_core::pipeline_report::is_format_control(c)
-                    })
-                }),
-                Line::Blank | Line::Fill { .. } => true,
+        for (width, cols) in [
+            (crate::layout::PanelWidth::Normal, 39),
+            (crate::layout::PanelWidth::Half, 75),
+            (crate::layout::PanelWidth::Full, 150),
+        ] {
+            let ui = PanelUi {
+                width,
+                cursor: 0,
+                ..Default::default()
+            };
+            let rows = content(&SectionCtx {
+                model: &model,
+                ui: &ui,
+                cols,
+                rows: 20,
+            });
+            assert_safe_rows(&rows, cols);
+            let text = format!("{rows:?}");
+            assert!(
+                text.contains("�"),
+                "hostile CI fields were not rendered: {text}"
+            );
+            if width == crate::layout::PanelWidth::Full {
+                assert!(text.contains("title"), "run title was not rendered: {text}");
+                assert!(text.contains("event"), "run event was not rendered: {text}");
+                assert!(
+                    text.contains("job name"),
+                    "job name was not rendered: {text}"
+                );
+                assert!(
+                    text.contains("step name"),
+                    "step name was not rendered: {text}"
+                );
             }
-        }));
+        }
     }
 }

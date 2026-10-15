@@ -520,6 +520,38 @@ mod tests {
     use super::*;
     use thegn_core::issue::{Issue, IssuePriority, IssueStatus};
 
+    fn assert_safe_rows(rows: &[PanelRow], cols: usize) {
+        fn check(segs: &[Seg], cols: usize) {
+            for segment in segs {
+                assert!(
+                    segment.text.chars().all(|c| {
+                        !c.is_control() && !thegn_core::pipeline_report::is_format_control(c)
+                    }),
+                    "{:?}",
+                    segment.text
+                );
+                if segment.text.contains('…') {
+                    assert!(
+                        UnicodeWidthStr::width(segment.text.as_str()) <= cols,
+                        "clipped segment exceeds {cols} columns: {:?}",
+                        segment.text
+                    );
+                }
+            }
+        }
+
+        for row in rows {
+            match &row.line {
+                Line::Segs(segs) => check(segs, cols),
+                Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
+                    check(l, cols);
+                    check(r, cols);
+                }
+                Line::Blank | Line::Fill { .. } => {}
+            }
+        }
+    }
+
     fn issue(id: &str, prio: IssuePriority, status: IssueStatus, project: &str) -> Issue {
         Issue {
             id: id.to_string(),
@@ -755,31 +787,42 @@ mod tests {
             panel: panel_with(vec![hostile]),
             ..Default::default()
         };
-        let ui = crate::panel::PanelUi {
-            open: Section::Issues,
-            ..Default::default()
-        };
-        let rows = content(&SectionCtx {
-            model: &model,
-            ui: &ui,
-            cols: 60,
-            rows: 20,
-        });
-        let text = rows
-            .iter()
-            .flat_map(|row| match &row.line {
-                Line::Segs(segs) => segs.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>(),
-                Line::Split { l, r } => l.iter().chain(r).map(|seg| seg.text.as_str()).collect(),
-                Line::SplitMinLeft { l, r, .. } => {
-                    l.iter().chain(r).map(|seg| seg.text.as_str()).collect()
-                }
-                Line::Blank | Line::Fill { .. } => Vec::new(),
-            })
-            .collect::<String>();
-        assert!(
-            text.chars()
-                .all(|c| !c.is_control() && !thegn_core::pipeline_report::is_format_control(c)),
-            "{text:?}"
-        );
+        for (width, cols) in [
+            (crate::layout::PanelWidth::Normal, 39),
+            (crate::layout::PanelWidth::Half, 75),
+            (crate::layout::PanelWidth::Full, 150),
+        ] {
+            let ui = crate::panel::PanelUi {
+                open: Section::Issues,
+                width,
+                cursor: 0,
+                ..Default::default()
+            };
+            let rows = content(&SectionCtx {
+                model: &model,
+                ui: &ui,
+                cols,
+                rows: 20,
+            });
+            assert_safe_rows(&rows, cols);
+            let text = format!("{rows:?}");
+            assert!(
+                text.contains("�"),
+                "hostile issue fields were not rendered: {text}"
+            );
+            if matches!(
+                width,
+                crate::layout::PanelWidth::Half | crate::layout::PanelWidth::Full
+            ) {
+                assert!(
+                    text.contains("label�"),
+                    "issue label was not rendered: {text}"
+                );
+                assert!(
+                    text.contains("user�"),
+                    "issue assignee was not rendered: {text}"
+                );
+            }
+        }
     }
 }

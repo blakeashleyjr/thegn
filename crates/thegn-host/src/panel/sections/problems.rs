@@ -274,6 +274,38 @@ mod tests {
 
     use crate::panel::{DiagnosticItem, PanelUi, Severity};
 
+    fn assert_safe_rows(rows: &[PanelRow], cols: usize) {
+        fn check(segs: &[Seg], cols: usize) {
+            for segment in segs {
+                assert!(
+                    segment.text.chars().all(|c| {
+                        !c.is_control() && !thegn_core::pipeline_report::is_format_control(c)
+                    }),
+                    "{:?}",
+                    segment.text
+                );
+                if segment.text.contains('…') {
+                    assert!(
+                        unicode_width::UnicodeWidthStr::width(segment.text.as_str()) <= cols,
+                        "clipped segment exceeds {cols} columns: {:?}",
+                        segment.text
+                    );
+                }
+            }
+        }
+
+        for row in rows {
+            match &row.line {
+                crate::seg::Line::Segs(segs) => check(segs, cols),
+                crate::seg::Line::Split { l, r } | crate::seg::Line::SplitMinLeft { l, r, .. } => {
+                    check(l, cols);
+                    check(r, cols);
+                }
+                crate::seg::Line::Blank | crate::seg::Line::Fill { .. } => {}
+            }
+        }
+    }
+
     fn make_ctx<'a>(
         model: &'a FrameModel,
         ui: &'a PanelUi,
@@ -352,27 +384,27 @@ mod tests {
             "\u{1b}]0;pwn\u{7}日本語".repeat(12).as_str(),
             "src/\u{202e}main.rs",
         )];
-        let ui = PanelUi::default();
-        let rows = content(&make_ctx(&model, &ui, 39, 20));
-        let text = rows
-            .iter()
-            .flat_map(|row| match &row.line {
-                crate::seg::Line::Segs(segs) => {
-                    segs.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>()
-                }
-                crate::seg::Line::Split { l, r } => {
-                    l.iter().chain(r).map(|seg| seg.text.as_str()).collect()
-                }
-                crate::seg::Line::SplitMinLeft { l, r, .. } => {
-                    l.iter().chain(r).map(|seg| seg.text.as_str()).collect()
-                }
-                crate::seg::Line::Blank | crate::seg::Line::Fill { .. } => Vec::new(),
-            })
-            .collect::<String>();
-        assert!(
-            text.chars()
-                .all(|c| !c.is_control() && !thegn_core::pipeline_report::is_format_control(c)),
-            "{text:?}"
-        );
+        for (width, cols) in [
+            (crate::layout::PanelWidth::Normal, 39),
+            (crate::layout::PanelWidth::Half, 75),
+            (crate::layout::PanelWidth::Full, 150),
+        ] {
+            let ui = PanelUi {
+                width,
+                problems_cursor: 0,
+                ..Default::default()
+            };
+            let rows = content(&make_ctx(&model, &ui, cols, 20));
+            assert_safe_rows(&rows, cols);
+            let text = format!("{rows:?}");
+            assert!(
+                text.contains("�"),
+                "hostile diagnostic was not rendered: {text}"
+            );
+            assert!(
+                text.contains("pwn"),
+                "diagnostic message was not rendered: {text}"
+            );
+        }
     }
 }
