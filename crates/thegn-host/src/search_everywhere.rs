@@ -311,10 +311,10 @@ pub struct PaletteSession {
     waker: Option<termwiz::terminal::TerminalWaker>,
 }
 
-pub(crate) struct CancelOnDrop(CancelToken);
+pub(crate) struct CancelOnDrop(pub(crate) CancelToken);
 
 impl CancelOnDrop {
-    fn replace(&mut self) -> CancelToken {
+    pub(crate) fn replace(&mut self) -> CancelToken {
         self.0.cancel();
         self.0 = CancelToken::new();
         self.0.clone()

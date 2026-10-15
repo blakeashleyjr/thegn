@@ -315,7 +315,10 @@ struct CancelState {
     waiters: Vec<Box<dyn FnOnce() + Send>>,
 }
 
-/// Cloneable caller-owned cancellation signal for blocking LSP operations.
+/// Cloneable caller-owned cancellation signal for one blocking LSP operation.
+///
+/// A token is per operation, not long-lived: registered callbacks remain owned
+/// by the token until it is cancelled or dropped.
 #[derive(Clone, Default)]
 pub struct CancelToken(Arc<Mutex<CancelState>>);
 
@@ -4533,8 +4536,16 @@ mod tests {
         );
         release_tx.send(()).unwrap();
         request_thread.join().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while captured.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let bytes = captured.lock().unwrap().clone();
+            if String::from_utf8_lossy(&bytes).contains("$/cancelRequest") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancellation frame is written before the deadline"
+            );
             thread::yield_now();
         }
         let bytes = captured.lock().unwrap().clone();
@@ -4552,10 +4563,45 @@ mod tests {
         let late = framing::encode(r#"{"jsonrpc":"2.0","id":1,"result":null}"#);
         server_writer.write_all(&late).unwrap();
         server_writer.flush().unwrap();
-        thread::sleep(Duration::from_millis(20));
+
+        let second_client = client.clone();
+        let (second_tx, second_rx) = mpsc::channel();
+        let second_thread = thread::spawn(move || {
+            second_tx
+                .send(second_client.request_until(
+                    "second",
+                    Value::Null,
+                    std::time::Instant::now() + Duration::from_secs(2),
+                    None,
+                ))
+                .unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let bytes = captured.lock().unwrap().clone();
+            if String::from_utf8_lossy(&bytes).contains("\"method\":\"second\"") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "second request is written before the deadline"
+            );
+            thread::yield_now();
+        }
+        let response = framing::encode(r#"{"jsonrpc":"2.0","id":2,"result":"second-result"}"#);
+        server_writer.write_all(&response).unwrap();
+        server_writer.flush().unwrap();
+        assert_eq!(
+            second_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            json!("second-result")
+        );
+        second_thread.join().unwrap();
         assert!(
-            !client.pending.lock().unwrap().contains_key(&1),
-            "late response is ignored after cancellation removed the pending id"
+            !client.is_closed(),
+            "late response does not close the reader"
         );
         drop(server_writer);
     }
