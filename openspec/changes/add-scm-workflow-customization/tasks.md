@@ -100,7 +100,7 @@ Run tests with `cargo nextest run -p <crate> <filter>`, never bare
       Toggle key + new action id.
 - [ ] 7.4 `thegn diff --structural` (flag on the existing verb; catalog row
       unchanged).
-- [ ] 7.5 Guard test: stageable-diff call sites still pin `SANITIZED_DIFF`
+- [x] 7.5 Guard test: stageable-diff call sites still pin `SANITIZED_DIFF`
       (`--no-ext-diff`) regardless of `structural_diff`.
 
 ## 8. Help + docs

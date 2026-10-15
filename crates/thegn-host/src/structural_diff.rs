@@ -391,4 +391,126 @@ mod tests {
         assert!(env.contains(&("DFT_WIDTH".into(), "20".into())));
         assert!(env.contains(&("DFT_BACKGROUND".into(), "light".into())));
     }
+
+    #[test]
+    fn binary_external_diff_output_is_lossy_decoded_without_panicking() {
+        if !shell_available() {
+            return;
+        }
+        let dir = fixture();
+        let binary = dir.path().join("binary.dat");
+        std::fs::write(&binary, [0_u8, 0xff, 0xfe, b'\n']).unwrap();
+        git(&dir, &["add", "binary.dat"]);
+        git(&dir, &["commit", "-q", "-m", "add binary fixture"]);
+        std::fs::write(&binary, [0_u8, 0xff, 0xfd, b'\n']).unwrap();
+
+        // Regression: external output containing NUL/invalid UTF-8 must survive
+        // the lossy decoder and reach styled cells instead of panicking.
+        let lines = capture(
+            &GitLoc::Local(dir.path().to_path_buf()),
+            "HEAD",
+            Some("binary.dat"),
+            "cat \"$5\" #",
+            &CaptureOpts::default(),
+        )
+        .unwrap();
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.iter().map(|run| run.text.as_str()))
+            .collect();
+        assert!(
+            text.contains('\u{fffd}'),
+            "invalid bytes were not lossy-decoded"
+        );
+    }
+
+    #[test]
+    fn large_structural_output_retains_the_full_below_cap_length() {
+        if !shell_available() {
+            return;
+        }
+        // Regression: an accidental smaller stdout cap must not truncate a
+        // valid structural diff before the documented 8 MiB ceiling.
+        let lines = capture_with(
+            "head -c 6291456 /dev/zero | tr '\\000' x #",
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let length: usize = lines
+            .iter()
+            .flat_map(|line| line.iter())
+            .map(|run| run.text.len())
+            .sum();
+        assert_eq!(length, 6 * 1024 * 1024);
+    }
+
+    #[test]
+    fn stderr_flood_is_drained_while_stdout_is_collected() {
+        if !shell_available() {
+            return;
+        }
+        // Regression: reading stdout to completion before stderr deadlocks when
+        // stderr exceeds the operating system pipe capacity.
+        let start = Instant::now();
+        let lines = capture_with(
+            "head -c 2097152 /dev/zero | tr '\\000' e >&2; echo ok #",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(lines[0][0].text, "ok");
+    }
+
+    #[test]
+    fn structural_diff_has_only_read_only_callers_and_owns_external_diff_env() {
+        fn rust_sources(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    rust_sources(&path, files);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+
+        let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&source_dir, &mut files);
+        let own_path = source_dir.join("structural_diff.rs");
+        let actions_path = source_dir.join("actions.rs");
+        let cli_path = source_dir.join("cmd/diff.rs");
+        let mut capture_callers = Vec::new();
+        let mut cli_callers = Vec::new();
+        for path in files {
+            let source = std::fs::read_to_string(&path).unwrap();
+            if path == own_path {
+                assert!(source.contains("GIT_EXTERNAL_DIFF"));
+                continue;
+            }
+            assert!(
+                !source.contains("GIT_EXTERNAL_DIFF"),
+                "{} contains GIT_EXTERNAL_DIFF outside structural_diff.rs",
+                path.display()
+            );
+            if source.contains("structural_diff::capture") {
+                capture_callers.push(path.clone());
+                assert_eq!(path, actions_path, "unexpected structural capture caller");
+                assert!(source.contains("fn spawn_diff_view_fetch("));
+            }
+            if source.contains("structural_diff::run_cli") {
+                cli_callers.push(path);
+                assert_eq!(
+                    cli_callers.last(),
+                    Some(&cli_path),
+                    "unexpected structural CLI caller"
+                );
+            }
+        }
+        assert_eq!(
+            capture_callers.as_slice(),
+            std::slice::from_ref(&actions_path)
+        );
+        assert_eq!(cli_callers.as_slice(), std::slice::from_ref(&cli_path));
+    }
 }

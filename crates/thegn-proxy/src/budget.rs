@@ -37,6 +37,19 @@ pub struct Identity {
 
 static ATTRIBUTION_SECRET: OnceLock<Vec<u8>> = OnceLock::new();
 
+#[cfg(test)]
+pub(crate) const TEST_ATTRIBUTION_SECRET: &[u8] = b"budget-test-secret";
+
+#[cfg(test)]
+pub(crate) fn install_test_attribution_secret() {
+    assert_eq!(
+        ATTRIBUTION_SECRET
+            .get_or_init(|| TEST_ATTRIBUTION_SECRET.to_vec())
+            .as_slice(),
+        TEST_ATTRIBUTION_SECRET
+    );
+}
+
 /// Installs the host-provided signing secret once per daemon process.
 pub fn install_attribution_secret(secret: Vec<u8>) -> Result<(), Vec<u8>> {
     ATTRIBUTION_SECRET.set(secret)
@@ -314,19 +327,13 @@ mod tests {
                 nonce: "n".into(),
                 exp_ms: None,
             },
-            TEST_SECRET,
+            TEST_ATTRIBUTION_SECRET,
             crate::shared::now_ms() + 60_000,
         )
     }
 
-    const TEST_SECRET: &[u8] = b"budget-test-secret";
     fn install_test_secret() {
-        assert_eq!(
-            ATTRIBUTION_SECRET
-                .get_or_init(|| TEST_SECRET.to_vec())
-                .as_slice(),
-            TEST_SECRET
-        );
+        install_test_attribution_secret();
     }
 
     #[test]
@@ -347,7 +354,7 @@ mod tests {
                 scope: "agent:x".into(),
                 ..Default::default()
             },
-            TEST_SECRET,
+            TEST_ATTRIBUTION_SECRET,
             0,
         );
         assert!(matches!(
@@ -399,7 +406,7 @@ mod tests {
                 agent: Some("agent:reviewer".into()),
                 ..Default::default()
             },
-            TEST_SECRET,
+            TEST_ATTRIBUTION_SECRET,
             crate::shared::now_ms() + 60_000,
         );
         let identity = resolve_identity(Some(&token));
