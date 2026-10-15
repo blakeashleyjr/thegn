@@ -1438,7 +1438,7 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                 write,
             ))
         }
-        AttemptOutcome::GateError { reason, log } => {
+        AttemptOutcome::GateError { reason, log, .. } => {
             // The gate could not run — an environment fact, not a verdict about
             // the branch, so it gets its own state and never reaches the agent.
             let detail = if log.trim().is_empty() {

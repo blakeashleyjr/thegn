@@ -834,6 +834,15 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
                 out.gate_error.len()
             );
         }
+        for verdict in &out.gate_verdicts {
+            outln!(
+                "  {}: {}/{} — {}",
+                verdict.branch,
+                verdict.phase,
+                verdict.class,
+                verdict.reason
+            );
+        }
     }
     if let Some(e) = push_err {
         return Err(e);
@@ -856,6 +865,13 @@ fn drain_json(target: &str, out: &merge_driver::DriveOutcome) -> serde_json::Val
         // The gate could not RUN for these — reported apart from `deferred` so a
         // script never reads "the branch is bad" out of "the gate is missing".
         "gate_error": out.gate_error,
+        "gate_verdicts": out.gate_verdicts.iter().map(|verdict| serde_json::json!({
+            "branch": verdict.branch,
+            "verdict": verdict.verdict,
+            "phase": verdict.phase,
+            "class": verdict.class,
+            "reason": verdict.reason,
+        })).collect::<Vec<_>>(),
         "needs_human": out.needs_human,
         // Non-fatal setup problems (e.g. `agent` naming no configured entry), so
         // a scripted drain can tell "nothing to fix" from "couldn't fix".
@@ -1007,7 +1023,7 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
             outln!("✗ {branch} breaks the build (gate red).");
             failure = Some(format!("land failed: {branch} gate red"));
         }
-        AttemptOutcome::GateError { reason, log } => {
+        AttemptOutcome::GateError { reason, log, .. } => {
             // The gate never ran: record it as an environment failure, not as a
             // verdict about the branch, and keep the log so the row can say why.
             let detail = if log.trim().is_empty() {
@@ -1217,5 +1233,32 @@ mod progress_tests {
                     .contains("deferred")
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod gate_verdict_tests {
+    use super::drain_json;
+    use crate::merge_driver::{DriveOutcome, GateVerdictReport};
+
+    #[test]
+    fn drain_json_reports_gate_phase_and_class_and_keeps_compatibility_list() {
+        let outcome = DriveOutcome {
+            gate_error: vec!["feature".into()],
+            gate_verdicts: vec![GateVerdictReport {
+                branch: "feature".into(),
+                verdict: "error".into(),
+                phase: "setup".into(),
+                class: "timeout".into(),
+                reason: "setup command timed out".into(),
+            }],
+            ..Default::default()
+        };
+        let json = drain_json("main", &outcome);
+        assert_eq!(json["gate_error"][0], "feature");
+        assert_eq!(json["gate_verdicts"][0]["branch"], "feature");
+        assert_eq!(json["gate_verdicts"][0]["verdict"], "error");
+        assert_eq!(json["gate_verdicts"][0]["phase"], "setup");
+        assert_eq!(json["gate_verdicts"][0]["class"], "timeout");
     }
 }
