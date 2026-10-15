@@ -288,7 +288,8 @@ fn rebind(number: u64, worktree: Option<String>, no_worktree: bool) -> Result<()
         .canonicalize()
         .context("canonicalize repo root")?;
     let db = Db::open()?;
-    let old = rebind_target(&pr_driver::rows_for_repo(&db, &root), number)?;
+    let rows = pr_driver::rows_for_repo(&db, &root);
+    let old = rebind_target(&rows, number)?;
     let explicit = worktree.is_some();
     let wt_path = if no_worktree {
         None
@@ -301,7 +302,8 @@ fn rebind(number: u64, worktree: Option<String>, no_worktree: bool) -> Result<()
     };
     let query_path = wt_path.as_deref().unwrap_or(root.as_path());
     let loc = thegn_core::remote::GitLoc::from_db(&query_path.to_string_lossy(), None);
-    let forge = crate::forge_handle::get().for_loc(&loc);
+    let forge_handle = crate::forge_handle::get();
+    let forge = forge_handle.for_loc(&loc);
     let status = forge
         .pr_status(&loc, thegn_core::forge::PrRef::Number(number))
         .map_err(|error| anyhow::anyhow!("could not resolve PR #{number}: {}", error.describe()))?;
