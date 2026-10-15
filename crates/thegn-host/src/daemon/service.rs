@@ -2825,10 +2825,7 @@ mod tests {
         let grandchild_pid_file = temp.path().join("gc.pid");
         let read_pid = |path: &std::path::Path| -> Option<i64> {
             match std::fs::read_to_string(path) {
-                Ok(contents) => match contents.trim().parse() {
-                    Ok(pid) => Some(pid),
-                    Err(_) => None,
-                },
+                Ok(contents) => contents.trim().parse().ok(),
                 Err(_) => None,
             }
         };
