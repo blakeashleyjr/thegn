@@ -27,8 +27,8 @@ mod stash;
 mod submodule;
 mod undo;
 
-pub use background_commit::BackgroundCommitTimeout;
 pub(crate) use background_commit::run as run_background_commit_stdin;
+pub use background_commit::{BackgroundCommitFailure, BackgroundCommitTimeout};
 pub use bisect::BisectOps;
 pub use branch::{BranchOps, ForceMode};
 pub use cherry::CherryOps;
@@ -48,17 +48,51 @@ pub use undo::UndoOps;
 /// Diff flags for any output that will later be fed to `git apply`: user
 /// config (`diff.noprefix`), external diff drivers, and rename headers all
 /// produce patches `git apply` rejects, so the panel's stageable diffs pin
-/// them off. `-c` must precede the subcommand, so this replaces the leading
-/// `"diff"` arg rather than following it.
+/// them off. Textconv is a repo-configurable helper too, and must not execute
+/// during a read. `-c` must precede the subcommand, so this replaces the
+/// leading `"diff"` arg rather than following it.
 pub(crate) const SANITIZED_DIFF: &[&str] = &[
     "-c",
     "diff.noprefix=false",
     "diff",
     "--no-color",
     "--no-ext-diff",
+    "--no-textconv",
     "--no-renames",
     "-U3",
 ];
+
+/// F18 audit: UI Git reads must not invoke repository-configured fsmonitor or
+/// hooks. Keep this in the service read runners; the core Git helper also
+/// serves writes, which intentionally retain the user's hooks and signers.
+const READ_ONLY_CONFIG: &[&str] = &[
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+];
+
+fn read_argv<'a>(loc: &GitLoc, args: &[&'a str]) -> Vec<&'a str> {
+    // Remote and provider locations run git on the remote host through their
+    // own exec contract, which expects the caller's argv unchanged; the fence
+    // protects the local host's git, so it applies to local locations only.
+    if loc.is_remote() {
+        return args.to_vec();
+    }
+    let mut argv: Vec<&'a str> = Vec::with_capacity(READ_ONLY_CONFIG.len() + args.len());
+    argv.extend(READ_ONLY_CONFIG.iter().copied());
+    argv.extend(args.iter().copied());
+    argv
+}
+
+/// Bridge commands run through the remote/provider exec contract, which
+/// expects the caller's argv. Keep the local read-fence flags out of bridged
+/// argv so remote reads retain the command shape the agent accepts.
+fn bridge_git_argv(loc: &GitLoc, args: &[&str]) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["git".into(), "-C".into(), loc.path()];
+    argv.extend(args.iter().map(|s| s.to_string()));
+    argv
+}
 
 // Fetch and push can hold this per-command lock while waiting on a remote.
 // Keep the wait long enough for ordinary transfers without blocking forever.
@@ -436,14 +470,14 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
         path: &str,
         max_lines: usize,
     ) -> Result<Vec<Hunk>> {
-        // `--no-ext-diff`: a configured external diff driver emits non-unified
-        // output that `parse_unified_hunks` can't read (empty inline hunk
-        // preview). See audit run.rs:346 / the SANITIZED_DIFF rationale above.
+        // External diff and textconv drivers are repo-configurable helpers that
+        // emit output the parser cannot use and must not execute during reads.
         let out = run(
             loc,
             &[
                 "diff",
                 "--no-ext-diff",
+                "--no-textconv",
                 "--no-color",
                 "-U3",
                 base,
@@ -575,6 +609,7 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
             "diff",
             "--no-color",
             "--no-ext-diff",
+            "--no-textconv",
             "--no-index",
             "-U3",
             "--",
@@ -597,6 +632,7 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
             "show",
             "--no-color",
             "--no-ext-diff",
+            "--no-textconv",
             "--no-renames",
             "--diff-merges=first-parent",
             "-U3",
@@ -619,6 +655,7 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
                 "show",
                 "--no-color",
                 "--no-ext-diff",
+                "--no-textconv",
                 "--no-renames",
                 "--diff-merges=first-parent",
                 "-U3",
@@ -636,6 +673,7 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
                 "diff",
                 "--no-color",
                 "--no-ext-diff",
+                "--no-textconv",
                 "--no-renames",
                 "-U3",
                 from,
@@ -673,8 +711,7 @@ fn run_bridge(
     env: &[(String, String)],
     read_only: bool,
 ) -> Result<String> {
-    let mut argv: Vec<String> = vec!["git".into(), "-C".into(), loc.path()];
-    argv.extend(args.iter().map(|s| s.to_string()));
+    let argv = bridge_git_argv(loc, args);
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     // Reads (status/diff/rev-*) take the shorter interactive deadline; writes
     // (fetch/push/pull via `run_w`) keep the long default — a big fetch is slow
@@ -696,7 +733,8 @@ fn run(loc: &GitLoc, args: &[&str]) -> Result<String> {
     if let Some(b) = crate::bridge::for_loc(loc) {
         return run_bridge(&b, loc, args, &[], true);
     }
-    let out = output_bounded(loc.git_command(args), args)
+    let guarded_args = read_argv(loc, args);
+    let out = output_bounded(loc.git_command(&guarded_args), args)
         .with_context(|| format!("git {}", args.join(" ")))?;
     if !out.status.success() {
         anyhow::bail!(
@@ -716,13 +754,13 @@ fn run(loc: &GitLoc, args: &[&str]) -> Result<String> {
 /// `ssh` process spawn — the bridge's `exec` already carries the exit code.
 fn run_status(loc: &GitLoc, args: &[&str]) -> Result<(i32, String)> {
     if let Some(b) = crate::bridge::for_loc(loc) {
-        let mut argv: Vec<String> = vec!["git".into(), "-C".into(), loc.path()];
-        argv.extend(args.iter().map(|s| s.to_string()));
+        let argv = bridge_git_argv(loc, args);
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
         let r = b.exec_read(&refs, None, &[])?; // read: no-upstream/absent-ref probes
         return Ok((r.exit, r.stdout));
     }
-    let out = output_bounded(loc.git_command(args), args)
+    let guarded_args = read_argv(loc, args);
+    let out = output_bounded(loc.git_command(&guarded_args), args)
         .with_context(|| format!("git {}", args.join(" ")))?;
     Ok((
         out.status.code().unwrap_or(-1),
@@ -1651,14 +1689,26 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
             vec!["rev-list", "--left-right", "--count", "@{u}...HEAD"],
             vec!["rev-parse", "--abbrev-ref", "HEAD"],
             // Uncommitted working-tree stat (staged + unstaged) vs HEAD.
-            vec!["diff", "--numstat", "HEAD"],
+            vec![
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--numstat",
+                "HEAD",
+            ],
         ];
         // Total branch change vs the repo's LOCAL default branch; a non-zero
         // exit is "no base" — data, not an error. Keep its index explicit so
         // the optional submodule read can be omitted without shifting it.
         let branch_diff_idx = if let Some(range) = &branch_range {
             let idx = specs.len();
-            specs.push(vec!["diff", "--numstat", range.as_str()]);
+            specs.push(vec![
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--numstat",
+                range.as_str(),
+            ]);
             Some(idx)
         } else {
             None
@@ -1670,11 +1720,7 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
         let want = specs.len();
         let cmds: Vec<Vec<String>> = specs
             .iter()
-            .map(|args| {
-                let mut argv = vec!["git".to_string(), "-C".into(), loc.path()];
-                argv.extend(args.iter().map(|s| s.to_string()));
-                argv
-            })
+            .map(|args| bridge_git_argv(loc, args))
             .collect();
         match b.exec_batch(&cmds, &[]) {
             Ok(r) if r.len() == want => {
@@ -1767,13 +1813,32 @@ fn local_glyph_reads(
         dirty: git.is_dirty(loc),
         ahead_behind: git.ahead_behind(loc),
         branch: git.current_branch(loc),
-        uncommitted: run_status(loc, &["diff", "--numstat", "HEAD"]).and_then(|(exit, out)| {
+        uncommitted: run_status(
+            loc,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--numstat",
+                "HEAD",
+            ],
+        )
+        .and_then(|(exit, out)| {
             anyhow::ensure!(exit == 0, "git diff --numstat HEAD failed");
             sum_numstat(&out)
         }),
         branch_diff: match &base {
-            Some(b) => run_status(loc, &["diff", "--numstat", &format!("{b}...HEAD")])
-                .and_then(|(exit, out)| (exit == 0).then(|| sum_numstat(&out)).transpose()),
+            Some(b) => run_status(
+                loc,
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--numstat",
+                    &format!("{b}...HEAD"),
+                ],
+            )
+            .and_then(|(exit, out)| (exit == 0).then(|| sum_numstat(&out)).transpose()),
             // No base resolvable — "no badge", not an error.
             None => Ok(None),
         },
@@ -1798,7 +1863,10 @@ fn numstat_totals(loc: &GitLoc, spec: &str) -> Result<(u32, u32)> {
     {
         return Ok(t);
     }
-    let (exit, out) = run_status(loc, &["diff", "--numstat", spec])?;
+    let (exit, out) = run_status(
+        loc,
+        &["diff", "--no-ext-diff", "--no-textconv", "--numstat", spec],
+    )?;
     anyhow::ensure!(exit == 0, "git diff --numstat {spec} failed");
     sum_numstat(&out)
 }
@@ -2000,7 +2068,15 @@ impl GitBackend for CliGit {
         let base = op::revision(base)?;
         let out = run(
             loc,
-            &["-c", "core.quotePath=true", "diff", "--numstat", base],
+            &[
+                "-c",
+                "core.quotePath=true",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--numstat",
+                base,
+            ],
         )?;
         parse_numstat(&out)
     }
@@ -2594,6 +2670,53 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn read_argv_leaves_remote_and_provider_argv_bare() {
+        let loc = GitLoc::provider(vec!["sh".into()], "/remote/repo");
+        assert_eq!(
+            read_argv(&loc, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            vec!["rev-parse", "--abbrev-ref", "HEAD"]
+        );
+    }
+
+    #[test]
+    fn read_argv_prefixes_guard_and_keeps_args() {
+        assert_eq!(
+            read_argv(
+                &GitLoc::Local(std::path::PathBuf::from("/tmp/repo")),
+                &["status", "--porcelain=v1"]
+            ),
+            vec![
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "status",
+                "--porcelain=v1"
+            ]
+        );
+    }
+
+    #[test]
+    fn bridge_git_argv_keeps_provider_read_args_bare() {
+        let loc = thegn_core::remote::GitLoc::provider(
+            vec!["sprite".into(), "exec".into(), "--".into()],
+            "/workspace",
+        );
+
+        assert_eq!(
+            bridge_git_argv(&loc, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            vec![
+                String::from("git"),
+                String::from("-C"),
+                String::from("/workspace"),
+                String::from("rev-parse"),
+                String::from("--abbrev-ref"),
+                String::from("HEAD")
+            ]
+        );
+    }
+
     /// Guard (SCM workflow customization, task 7.5): every stageable diff MUST
     /// keep the sanitized flags — `--no-ext-diff` above all — so a user's
     /// external diff driver (difftastic, delta) can never rewrite a patch the
@@ -2605,6 +2728,7 @@ mod tests {
             SANITIZED_DIFF.contains(&"--no-ext-diff"),
             "stageable diffs must disable external diff drivers: {SANITIZED_DIFF:?}"
         );
+        assert!(SANITIZED_DIFF.contains(&"--no-textconv"));
         assert!(SANITIZED_DIFF.contains(&"--no-color"));
         assert!(SANITIZED_DIFF.contains(&"--no-renames"));
         // `-c diff.noprefix=false` must lead (before the `diff` subcommand).
@@ -3959,6 +4083,89 @@ mod tests {
         assert_eq!(
             patch_paths, listed,
             "per-file diff paths must agree with first-parent file list"
+        );
+    }
+}
+
+#[cfg(test)]
+mod read_fence_tests {
+    use super::{CliGit, GitBackend};
+    use thegn_core::remote::GitLoc;
+
+    fn private_repo() -> (tempfile::TempDir, GitLoc) {
+        let dir = tempfile::tempdir().unwrap();
+        super::testutil::git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        let loc = GitLoc::for_worktree(dir.path());
+        (dir, loc)
+    }
+
+    #[test]
+    fn status_read_never_runs_repo_fsmonitor_hook() {
+        let (dir, loc) = private_repo();
+        std::fs::write(dir.path().join("tracked.txt"), "tracked\n").unwrap();
+        super::testutil::git_in(dir.path(), &["add", "tracked.txt"]);
+        super::testutil::git_in(dir.path(), &["commit", "-q", "-m", "initial"]);
+        let marker = dir.path().join("fsmonitor-ran");
+        let hook = dir.path().join("fsmonitor.sh");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nprintf 'token\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        super::testutil::git_in(
+            dir.path(),
+            &[
+                "config",
+                "core.fsmonitor",
+                &format!("sh '{}'", hook.display()),
+            ],
+        );
+
+        CliGit.status(&loc).unwrap();
+
+        assert!(
+            !marker.exists(),
+            "status must disable the repo-configured fsmonitor hook"
+        );
+    }
+
+    #[test]
+    fn diff_reads_never_run_textconv_drivers() {
+        let (dir, loc) = private_repo();
+        std::fs::write(dir.path().join("sample.txt"), "before\n").unwrap();
+        std::fs::write(dir.path().join(".gitattributes"), "*.txt diff=canary\n").unwrap();
+        super::testutil::git_in(dir.path(), &["add", "sample.txt", ".gitattributes"]);
+        super::testutil::git_in(dir.path(), &["commit", "-q", "-m", "initial"]);
+        std::fs::write(dir.path().join("sample.txt"), "committed change\n").unwrap();
+        super::testutil::git_in(dir.path(), &["add", "sample.txt"]);
+        super::testutil::git_in(dir.path(), &["commit", "-q", "-m", "changed"]);
+        let changed_commit = super::run(&loc, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(dir.path().join("sample.txt"), "worktree change\n").unwrap();
+        let marker = dir.path().join("textconv-ran");
+        let driver = dir.path().join("textconv.sh");
+        std::fs::write(
+            &driver,
+            format!("#!/bin/sh\ntouch '{}'\ncat \"$1\"\n", marker.display()),
+        )
+        .unwrap();
+        super::testutil::git_in(
+            dir.path(),
+            &[
+                "config",
+                "diff.canary.textconv",
+                &format!("sh '{}'", driver.display()),
+            ],
+        );
+        CliGit.diff_hunks(&loc, "HEAD", "sample.txt", 40).unwrap();
+        CliGit.unstaged_diff(&loc, "sample.txt").unwrap();
+        CliGit.commit_show(&loc, changed_commit.trim()).unwrap();
+
+        assert!(
+            !marker.exists(),
+            "diff readers must disable configured textconv drivers"
         );
     }
 }
