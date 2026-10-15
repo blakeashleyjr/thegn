@@ -145,21 +145,26 @@ projection when the runway drops below a configured number of hours.
 ## Containers
 
 The Containers tab lists every container on the machine across the detected
-backends, thegn's own first (tinted, foreign ones ghosted), with each one's
-status/health and — while the tab is open — live CPU, memory and network. The
-heading is just `containers`: the note beside it leads with the ownership
-split — how many are thegn's own, how many are foreign — because the list
-deliberately includes rows thegn did not create. On an engine that reports a
-footprint it continues with images, volumes and the engine's on-disk total
-(marked `≥` when a backend can't report disk usage); otherwise with how many
-are running. The tab only appears when a container engine is present.
+backends, containers proven to belong to this profile first (tinted, foreign
+ones ghosted), with each one's status/health and — while the tab is open — live
+CPU, memory and network. The heading is just `containers`: the note beside it
+leads with the ownership split — how many are owned under that rule, how many
+are foreign — because the list deliberately includes foreign containers. On an
+engine that reports a footprint it continues with images, volumes and the
+engine's on-disk total (marked `≥` when a backend can't report disk usage);
+otherwise with how many are running. The tab only appears when a container engine is present.
 
 Sampling those per-container numbers (and the disk total) is the one expensive
 reading here, so — like Processes — it runs **only while this tab is open**;
 close it and the ambient refresh drops back to the cheap listing. The disk
 total refreshes on a slower cadence than the stats.
 
-Actions apply only to **thegn's own** containers (foreign ones are read-only):
+Actions apply only to containers proven to belong to this profile for a
+known worktree on that worktree's launch backend (including recognized
+`-tgvpn`/`-tgagent` companions). A user's `thegn-foo`, another profile's
+container, or the same name in another Podman store is foreign and read-only.
+A new container may appear foreign until the next refresh. Actions on owned
+containers:
 
 - `↵` opens a shell inside the container in a new pane.
 - `o` tails its logs live in a new pane.
@@ -168,9 +173,9 @@ Actions apply only to **thegn's own** containers (foreign ones are read-only):
   to confirm a force-remove.
 
 Stop, restart and remove run off the UI loop and report their outcome as a
-toast; the row's own status catches up on the next refresh. Managing containers
-thegn did not create is deliberately not offered — run `lazydocker`/`oxker` in a
-pane for that. Estate cleanup from the command line is `thegn sandbox gc` /
+toast; the row's own status catches up on the next refresh. Managing foreign
+containers is deliberately not offered — run `lazydocker`/`oxker` in a pane for
+that. Estate cleanup from the command line is `thegn sandbox gc` /
 `thegn sandbox prune` (see [[sandboxing]]).
 
 ## Pipeline
