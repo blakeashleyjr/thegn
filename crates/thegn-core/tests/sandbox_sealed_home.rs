@@ -386,7 +386,7 @@ fn real_bwrap_sealed_cannot_read_canaries_but_worktree_and_git_work() {
 // ── review fixes: mounts deny filter, doctor listing, gate edge cases ────────
 
 #[test]
-fn default_config_mounts_never_bring_gnupg_into_a_sealed_argv() {
+fn user_gnupg_mount_never_reaches_a_sealed_argv() {
     if !thegn_core::util::have("bwrap") {
         // skipped: no usable bwrap here
         return;
@@ -401,10 +401,8 @@ fn default_config_mounts_never_bring_gnupg_into_a_sealed_argv() {
         backend: thegn_core::config::SandboxBackend::Bwrap,
         ..Default::default()
     };
-    assert!(
-        cfg.mounts.iter().any(|m| m.contains(".gnupg")),
-        "default mounts should still carry ~/.gnupg (the case under test)"
-    );
+    assert!(!cfg.mounts.iter().any(|m| m.contains(".gnupg")));
+    cfg.mounts.push("~/.gnupg:rw".into());
     cfg.mounts.push("~/.ssh:ro".into());
     cfg.mounts
         .push(format!("{}:/ssh-alias:ro", h.join(".ssh").display()));
