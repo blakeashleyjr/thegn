@@ -329,11 +329,18 @@ fn rebind(number: u64, worktree: Option<String>, no_worktree: bool) -> Result<()
         None
     };
     let old_key = old.key.clone();
+    let branch = if binding_worktree.is_some() {
+        wt_branch
+            .clone()
+            .unwrap_or_else(|| status.head_ref_name.clone())
+    } else {
+        status.head_ref_name.clone()
+    };
     let new_key = db.rebind_pr(
         &old_key,
         &PrRebind {
             worktree: binding_worktree,
-            branch: status.head_ref_name,
+            branch,
             base_branch: status.base_ref_name,
             forge: forge.id().to_owned(),
             pr_url: status.url,

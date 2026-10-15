@@ -1272,7 +1272,8 @@ mod tests {
                 db.enqueue_pr("/repo", 7, Some("/w/feat"), "feat", "main", "github")
                     .unwrap();
             }
-            db.set_pr_agent_attempts("/repo#7", 1).unwrap();
+            let saved = db.list_pr_queue().unwrap().remove(0);
+            db.set_pr_agent_attempts(&saved.key, 1).unwrap();
             let row = db.list_pr_queue().unwrap().remove(0);
             let forge = FakeForge::new(Some(failing_ci_pr("abc")));
             forge.pr.lock().unwrap().as_mut().unwrap().url = fetched_url.into();
@@ -1324,6 +1325,29 @@ mod tests {
             pr_url: Some("https://github.com/me/repo/pull/7".into()),
             checkout_gen: 0,
         }
+    }
+
+    /// Persist the authorization used by driver tests, then pass the exact row
+    /// snapshot the production queue loader would construct.
+    fn saved_bound_item(db: &Db, item: PrItem) -> PrItem {
+        db.enqueue_bound_pr(
+            "/repo",
+            item.number,
+            None,
+            &item.branch,
+            "main",
+            &item.forge,
+            item.pr_url
+                .as_deref()
+                .expect("bound driver fixture needs a PR URL"),
+        )
+        .unwrap();
+        let rows = db.list_pr_queue().unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.number == item.number)
+            .expect("fixture row was persisted with its bound identity");
+        PrItem::from(row)
     }
 
     fn thread(author: &str, path: &str, line: Option<u64>, resolved: bool) -> ReviewThreadRow {
@@ -2272,7 +2296,7 @@ mod tests {
             &forge,
             Path::new("/repo"),
             &db,
-            vec![item()],
+            vec![saved_bound_item(&db, item())],
             |_| {},
         );
         assert!(out.merged.is_empty());
@@ -2296,7 +2320,7 @@ mod tests {
             &forge,
             Path::new("/repo"),
             &db,
-            vec![item()],
+            vec![saved_bound_item(&db, item())],
             |_| {},
         );
         assert!(
@@ -2321,7 +2345,7 @@ mod tests {
             &forge,
             Path::new("/repo"),
             &db,
-            vec![item()],
+            vec![saved_bound_item(&db, item())],
             |step| statuses.push(step.status.to_string()),
         );
         assert_eq!(db.list_review_tasks().unwrap().len(), 1);
@@ -2338,7 +2362,7 @@ mod tests {
             &forge,
             Path::new("/repo"),
             &db,
-            vec![item()],
+            vec![saved_bound_item(&db, item())],
             |_| {},
         );
         assert!(unchanged.review_events.is_empty());
@@ -2351,7 +2375,7 @@ mod tests {
             &revised_forge,
             Path::new("/repo"),
             &db,
-            vec![item()],
+            vec![saved_bound_item(&db, item())],
             |_| {},
         );
         assert_eq!(revised.review_events.len(), 1);
@@ -2373,7 +2397,7 @@ mod tests {
             &forge,
             Path::new("/repo"),
             &db,
-            vec![number_only],
+            vec![saved_bound_item(&db, number_only)],
             |step| statuses.push(step.status.to_string()),
         );
         let task = db.list_review_tasks().unwrap().pop().unwrap();
@@ -2394,7 +2418,7 @@ mod tests {
             &first,
             Path::new("/repo"),
             &db,
-            vec![item()],
+            vec![saved_bound_item(&db, item())],
             |_| {},
         );
         let before = db.list_review_tasks().unwrap();
@@ -2407,7 +2431,7 @@ mod tests {
             &failed,
             Path::new("/repo"),
             &db,
-            vec![item()],
+            vec![saved_bound_item(&db, item())],
             |_| {},
         );
         assert_eq!(db.list_review_tasks().unwrap(), before);
@@ -2425,7 +2449,7 @@ mod tests {
         db.enqueue_bound_pr(
             "/repo",
             7,
-            Some("/w/feat"),
+            None,
             "feat",
             "main",
             "github",
@@ -2467,7 +2491,7 @@ mod tests {
         db.enqueue_bound_pr(
             "/repo",
             7,
-            Some("/w/feat"),
+            None,
             "feat",
             "main",
             "github",
