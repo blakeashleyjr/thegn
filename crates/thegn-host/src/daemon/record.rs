@@ -194,6 +194,8 @@ pub(crate) struct Finished {
     pub(crate) capped: bool,
     /// `Some(reason)` when recording was incomplete or finalization failed.
     pub(crate) truncated: Option<String>,
+    /// Raw PTY bytes omitted under overload, including UTF-8 carry discarded at gaps.
+    pub(crate) dropped_bytes: u64,
 }
 
 impl Recorder {
@@ -258,9 +260,41 @@ impl Recorder {
         }
         let at = self.elapsed();
         let mut chunks = bytes.chunks(MAX_CHUNK_BYTES);
-        if self.pending_gap.is_some() && !self.admit_pending_gap() {
-            for chunk in chunks {
-                self.add_gap(at, chunk.len(), GapReason::QueueFull);
+        let Some(first) = chunks.next() else { return };
+        let Some(first_permit) =
+            BytePermit::reserve(&self.inflight, first.len(), self.inflight_limit)
+        else {
+            self.add_gap(at, first.len(), GapReason::BufferBudget);
+            for rest in chunks {
+                self.add_gap(at, rest.len(), GapReason::BufferBudget);
+            }
+            return;
+        };
+        if !self.admit_pending_gap() {
+            drop(first_permit);
+            self.add_gap(at, first.len(), GapReason::QueueFull);
+            for rest in chunks {
+                self.add_gap(at, rest.len(), GapReason::QueueFull);
+            }
+            return;
+        }
+        if self.done() {
+            return;
+        }
+        if let Err(command) = self.try_enqueue(Command::Output {
+            at,
+            bytes: first.to_vec(),
+            _permit: first_permit,
+        }) {
+            if self.done() {
+                return;
+            }
+            let Command::Output { bytes, .. } = command else {
+                unreachable!()
+            };
+            self.add_gap(at, bytes.len(), GapReason::QueueFull);
+            for rest in chunks {
+                self.add_gap(at, rest.len(), GapReason::QueueFull);
             }
             return;
         }
@@ -440,6 +474,9 @@ impl Recorder {
                 {
                     finished.truncated = Some("recording writer panicked".to_string());
                 }
+                finished.dropped_bytes = finished
+                    .dropped_bytes
+                    .max(self.state.dropped_bytes.load(Ordering::Acquire));
                 finished
             }
             Err(error) => {
@@ -453,6 +490,7 @@ impl Recorder {
                     path: self.path.clone(),
                     capped: self.state.capped(),
                     truncated: Some(reason.to_string()),
+                    dropped_bytes: self.state.dropped_bytes.load(Ordering::Acquire),
                 }
             }
         }
@@ -496,6 +534,7 @@ fn run_worker(
                 path: path.to_path_buf(),
                 capped: false,
                 truncated: Some(format!("recording start failed: {error}")),
+                dropped_bytes: state.dropped_bytes.load(Ordering::Acquire),
             };
         }
     };
@@ -671,6 +710,7 @@ fn run_writer<W: Write>(
         } else {
             failure
         },
+        dropped_bytes: state.dropped_bytes.load(Ordering::Acquire),
     }
 }
 
@@ -1016,6 +1056,29 @@ mod tests {
         assert!(first_finished.truncated.is_none());
         assert!(second_finished.truncated.is_none());
         assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn global_budget_exhaustion_coalesces_consecutive_reads_into_one_gap() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut header = Header::new(80, 24);
+        header.timestamp = Some(0);
+        let writer = CastWriter::new(BufWriter::new(Capture(Arc::clone(&captured))), &header)
+            .expect("capture header");
+        let budget = Arc::new(AtomicUsize::new(MAX_CHUNK_BYTES));
+        let mut rec = start_with_writer_budget(writer, Arc::clone(&budget), MAX_CHUNK_BYTES);
+
+        rec.feed(b"one");
+        rec.feed(b"two");
+        rec.feed(b"three");
+        assert_eq!(rec.dropped_bytes(), 11);
+        let finished = rec.finish();
+        assert!(finished.truncated.is_none());
+
+        let events = captured_events(&captured);
+        let markers: Vec<_> = events.iter().filter(|event| event[1] == "m").collect();
+        assert_eq!(markers.len(), 1, "one contiguous overload makes one marker");
+        assert!(markers[0][2].as_str().unwrap().contains("11 bytes"));
     }
 
     #[test]

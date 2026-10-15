@@ -497,6 +497,7 @@ impl SessionActor {
                     path: self.record_last_path.clone().unwrap_or_default(),
                     capped: self.record_capped,
                     truncated: Some(format!("recording finalization task failed: {error}")),
+                    dropped_bytes: self.record_dropped_bytes,
                 });
             self.recording_completed(finished);
         }
@@ -1208,6 +1209,7 @@ impl SessionActor {
             return;
         }
         self.recorder.take();
+        self.record_dropped_bytes = self.record_dropped_bytes.max(fin.dropped_bytes);
         self.record_capped = fin.capped;
         if let Some(reason) = &fin.truncated {
             tracing::warn!(
@@ -2591,13 +2593,19 @@ mod tests {
             .expect("recording starts");
         assert_eq!(started.dropped_bytes, 0);
         actor.on_record(RecordSpec::Stop).expect("recording stops");
-        tokio::time::timeout(std::time::Duration::from_secs(2), completed_rx.recv())
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(2), completed_rx.recv())
             .await
             .expect("worker completes")
             .expect("completion arrives");
 
-        // Model the count recorded by an overload gap completed by the worker.
-        actor.record_dropped_bytes = 9;
+        // Model the worker's count after it accounts for UTF-8 carry discarded
+        // while finalizing a gap, and exercise the real completion path.
+        actor.recording_completed(super::record::Finished {
+            path: finished.path,
+            capped: finished.capped,
+            truncated: finished.truncated,
+            dropped_bytes: 9,
+        });
         let gapped = actor.record_status();
         assert_eq!(gapped.dropped_bytes, 9);
         assert!(
