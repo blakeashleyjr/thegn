@@ -122,7 +122,7 @@ fn stronger_runtime_preflight_failure_rechecks_final_host_floor() {
         )
         .expect("fixture Podman candidate resolves");
         let sealed = thegn_core::sandbox::sealed_view(&resolved);
-        let policy = thegn_core::sandbox_policy_fp::policy_fingerprint(&sealed, false);
+        let policy_fp = thegn_core::sandbox_policy_fp::policy_fingerprint(&sealed, false);
         // The resolution probe is setup, not part of the behavior under test.
         thegn_core::sandbox_backend::clear_probe_cache();
         std::fs::write(&journal, "").unwrap();
@@ -151,7 +151,7 @@ fi
             image = q(IMAGE),
             inspect = q(INSPECT_FORMAT),
             name = q(&name),
-            policy = q(&policy),
+            policy = q(&policy_fp),
             failure = q(PREFLIGHT_FAILURE),
         );
         std::fs::write(&executable, script).unwrap();
