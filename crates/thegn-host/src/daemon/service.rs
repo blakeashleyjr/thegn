@@ -2783,7 +2783,12 @@ mod tests {
                 .expect("read fd directory")
                 .map(|entry| match entry {
                     Ok(entry) => match std::fs::read_link(entry.path()) {
-                        Ok(target) if target == std::path::Path::new("/dev/ptmx") => 1,
+                        Ok(target)
+                            if target == std::path::Path::new("/dev/ptmx")
+                                || target == std::path::Path::new("/dev/pts/ptmx") =>
+                        {
+                            1
+                        }
                         Ok(_) | Err(_) => 0,
                     },
                     Err(_) => 0,
@@ -2818,30 +2823,42 @@ mod tests {
 
         let child_pid_file = temp.path().join("c.pid");
         let grandchild_pid_file = temp.path().join("gc.pid");
+        let read_pid = |path: &std::path::Path| -> Option<i64> {
+            match std::fs::read_to_string(path) {
+                Ok(contents) => match contents.trim().parse() {
+                    Ok(pid) => Some(pid),
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            }
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while (!child_pid_file.exists() || !grandchild_pid_file.exists())
-            && std::time::Instant::now() < deadline
-        {
+        let mut child_pid = None;
+        let mut grandchild_pid = None;
+        while std::time::Instant::now() < deadline {
+            child_pid = read_pid(&child_pid_file);
+            grandchild_pid = read_pid(&grandchild_pid_file);
+            if child_pid.is_some() && grandchild_pid.is_some() {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert!(
-            child_pid_file.exists(),
-            "session shell did not publish its pid"
+            child_pid.is_some(),
+            "session shell did not publish a numeric pid"
         );
         assert!(
-            grandchild_pid_file.exists(),
-            "session grandchild did not publish its pid"
+            grandchild_pid.is_some(),
+            "session grandchild did not publish a numeric pid"
         );
-        let child_pid: i64 = std::fs::read_to_string(child_pid_file)
-            .expect("read session shell pid")
-            .trim()
-            .parse()
-            .expect("numeric session shell pid");
-        let grandchild_pid: i64 = std::fs::read_to_string(grandchild_pid_file)
-            .expect("read session grandchild pid")
-            .trim()
-            .parse()
-            .expect("numeric session grandchild pid");
+        let child_pid = child_pid.expect("session shell pid was validated");
+        let grandchild_pid = grandchild_pid.expect("session grandchild pid was validated");
+        if std::path::Path::new("/proc/self/fd").exists() {
+            assert!(
+                ptmx_count() > baseline_ptmx,
+                "PTY master fd count did not rise after spawning a session"
+            );
+        }
         assert!(crate::platform::pid_alive(child_pid));
         assert!(crate::platform::pid_alive(grandchild_pid));
 
