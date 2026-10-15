@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn board_roster_read_reports_history_truncation() {
         let db = thegn_core::db::Db::open_memory().unwrap();
-        for index in 0..thegn_core::db::Db::ROSTER_HISTORY_LIMIT + 1 {
+        for _ in 0..thegn_core::db::Db::ROSTER_HISTORY_LIMIT + 1 {
             let id = db
                 .put_agent_dispatch(thegn_core::issue::NewDispatch {
                     issue_id: "THE-259",
@@ -269,12 +269,6 @@ mod tests {
                 })
                 .unwrap();
             db.update_dispatch_status(id, thegn_core::issue::AgentDispatchStatus::Done)
-                .unwrap();
-            db.conn()
-                .execute(
-                    "UPDATE agent_dispatches SET dispatched_at_ms=?1 WHERE id=?2",
-                    [index as i64, id],
-                )
                 .unwrap();
         }
         let (rows, truncated) = read_roster(&db).unwrap();
