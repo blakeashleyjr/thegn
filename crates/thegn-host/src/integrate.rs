@@ -516,6 +516,9 @@ fn run_driver_command(command: std::process::Command, timeout: Duration) -> Driv
         crate::gate_capture::CaptureResult::Infrastructure { reason, log } => {
             DriverRun::Failed { reason, log }
         }
+        crate::gate_capture::CaptureResult::SpawnFailed { reason, log } => {
+            DriverRun::Failed { reason, log }
+        }
         crate::gate_capture::CaptureResult::Poisoned { reason, log } => {
             DriverRun::Poisoned { reason, log }
         }
@@ -878,9 +881,17 @@ fn record_gate(diagnostics: &mut String, phase: &str, verdict: &GateVerdict) {
         return;
     }
     let (headline, log) = match verdict {
-        GateVerdict::Passed => ("passed", ""),
-        GateVerdict::Failed { log } => ("failed", log.as_str()),
-        GateVerdict::Error { reason, log } => (reason.as_str(), log.as_str()),
+        GateVerdict::Passed => ("passed".to_string(), ""),
+        GateVerdict::Failed { log } => ("failed".to_string(), log.as_str()),
+        GateVerdict::Error {
+            reason,
+            log,
+            phase,
+            class,
+        } => (
+            format!("{reason} ({}/{})", phase.as_str(), class.as_str()),
+            log.as_str(),
+        ),
     };
     let entry = format!("[{phase}] {headline}\n{}\n", tail(log, 4000));
     let mut clean = String::new();
@@ -1174,6 +1185,54 @@ fn gate_base_for_repo(repo_root: &Path) -> PathBuf {
     gate_base(&identity.hex())
 }
 
+/// The queue stage in which an infrastructure error occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatePhase {
+    Preparation,
+    Setup,
+    Gate,
+}
+
+impl GatePhase {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparation => "preparation",
+            Self::Setup => "setup",
+            Self::Gate => "gate",
+        }
+    }
+}
+
+/// Stable machine-readable category for a gate infrastructure error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateErrorClass {
+    Timeout,
+    Spawn,
+    Killed,
+    SetupFailed,
+    Capture,
+    Poisoned,
+    Preparation,
+    Signing,
+    SourceMoved,
+}
+
+impl GateErrorClass {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Spawn => "spawn",
+            Self::Killed => "killed",
+            Self::SetupFailed => "setup_failed",
+            Self::Capture => "capture",
+            Self::Poisoned => "poisoned",
+            Self::Preparation => "preparation",
+            Self::Signing => "signing",
+            Self::SourceMoved => "source_moved",
+        }
+    }
+}
+
 /// What one gate invocation established. The distinction between `Failed` and
 /// `Error` is load-bearing, not cosmetic: only `Failed` is a verdict about the
 /// *branch*. An `Error` (missing binary, non-executable, killed, unprovisioned
@@ -1187,7 +1246,12 @@ pub(crate) enum GateVerdict {
     Failed { log: String },
     /// The gate could not run. `reason` is the short headline, `log` whatever
     /// output there was.
-    Error { reason: String, log: String },
+    Error {
+        reason: String,
+        log: String,
+        phase: GatePhase,
+        class: GateErrorClass,
+    },
 }
 
 impl GateVerdict {
@@ -1211,7 +1275,12 @@ pub(crate) fn gate_tip(repo_root: &Path, oid: &str, cfg: &MergeQueueConfig) -> R
                 .collect::<String>();
             let log = tail(&detail, 4000);
             let reason = tail(&detail.replace('\n', " | "), 1200);
-            GateVerdict::Error { reason, log }
+            GateVerdict::Error {
+                reason,
+                log,
+                phase: GatePhase::Preparation,
+                class: GateErrorClass::Preparation,
+            }
         }),
     )
 }
@@ -1386,6 +1455,8 @@ fn aborted_bisect(error: anyhow::Error, diagnostics: &mut String) -> BisectAbort
     let verdict = GateVerdict::Error {
         reason: "bisect prefix preparation unavailable".into(),
         log: tail(&format!("{error:#}"), 4000),
+        phase: GatePhase::Preparation,
+        class: GateErrorClass::Preparation,
     };
     record_gate(diagnostics, "prefix preparation", &verdict);
     BisectAborted(verdict)
@@ -1416,6 +1487,8 @@ fn diagnosed_gate(
         .unwrap_or_else(|error| GateVerdict::Error {
             reason: "gate preparation unavailable".into(),
             log: tail(&format!("{error:#}"), 4000),
+            phase: GatePhase::Preparation,
+            class: GateErrorClass::Preparation,
         });
     record_gate(diagnostics, phase, &verdict);
     verdict
@@ -1443,7 +1516,14 @@ pub(crate) struct BisectAborted(pub(crate) GateVerdict);
 impl std::fmt::Display for BisectAborted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.0 {
-            GateVerdict::Error { reason, .. } => write!(f, "{reason}"),
+            GateVerdict::Error {
+                reason,
+                phase,
+                class,
+                ..
+            } => {
+                write!(f, "{}/{}: {reason}", phase.as_str(), class.as_str())
+            }
             _ => write!(f, "gate could not run"),
         }
     }
@@ -1551,6 +1631,8 @@ fn history_failure_report(
         &GateVerdict::Error {
             reason: reason.clone(),
             log: tail(&format!("{error:#}"), 4000),
+            phase: GatePhase::Preparation,
+            class: GateErrorClass::Preparation,
         },
     );
     let mut report = build_report(
@@ -1717,6 +1799,8 @@ fn run_fold_admitted(
                     &GateVerdict::Error {
                         reason: reason.clone(),
                         log: tail(&format!("{e:#}"), 4000),
+                        phase: GatePhase::Preparation,
+                        class: GateErrorClass::Preparation,
                     },
                 );
                 let empty = empty_plan(&original);
@@ -1886,6 +1970,8 @@ fn run_fold_admitted(
                     &GateVerdict::Error {
                         reason: reason.clone(),
                         log: tail(&format!("{error:#}"), 4000),
+                        phase: GatePhase::Preparation,
+                        class: GateErrorClass::Preparation,
                     },
                 );
                 return Ok(build_report(
@@ -2022,7 +2108,12 @@ pub(crate) enum AttemptOutcome {
     /// Merged clean, but the gate could not RUN (missing binary, unprovisioned
     /// gate worktree, killed). A fact about the *environment*, so the branch is
     /// not blamed and the fixing agent is never dispatched — it cannot help.
-    GateError { reason: String, log: String },
+    GateError {
+        reason: String,
+        log: String,
+        phase: GatePhase,
+        class: GateErrorClass,
+    },
     /// The branch tip is already an ancestor of the target — nothing to do.
     UpToDate { commit: String },
     /// The branch lives on another host and its tip could not be fetched into
@@ -2048,6 +2139,8 @@ pub(crate) fn attempt_land(
         Ok(AttemptOutcome::GateError {
             reason: "merge preparation or canonical history unavailable".into(),
             log: tail(&format!("{error:#}"), 4000),
+            phase: GatePhase::Preparation,
+            class: GateErrorClass::Preparation,
         })
     })
 }
@@ -2122,6 +2215,8 @@ fn attempt_land_admitted(
                 return Ok(AttemptOutcome::GateError {
                     reason: sf.to_string(),
                     log: String::new(),
+                    phase: GatePhase::Preparation,
+                    class: GateErrorClass::Signing,
                 });
             }
         };
@@ -2150,8 +2245,18 @@ fn attempt_land_admitted(
                 GateVerdict::Failed { log } => {
                     return Ok(AttemptOutcome::GateFailed { log });
                 }
-                GateVerdict::Error { reason, log } => {
-                    return Ok(AttemptOutcome::GateError { reason, log });
+                GateVerdict::Error {
+                    reason,
+                    log,
+                    phase,
+                    class,
+                } => {
+                    return Ok(AttemptOutcome::GateError {
+                        reason,
+                        log,
+                        phase,
+                        class,
+                    });
                 }
             }
         }
@@ -2188,12 +2293,16 @@ fn attempt_land_admitted(
                 return Ok(AttemptOutcome::GateError {
                     reason: "source moved after gate; retry".into(),
                     log: format!("source ref {name} moved to {actual}"),
+                    phase: GatePhase::Gate,
+                    class: GateErrorClass::SourceMoved,
                 });
             }
             CasOutcome::SourceMissing { name } => {
                 return Ok(AttemptOutcome::GateError {
                     reason: "source moved after gate; retry".into(),
                     log: format!("source ref {name} disappeared"),
+                    phase: GatePhase::Gate,
+                    class: GateErrorClass::SourceMoved,
                 });
             }
             CasOutcome::Missing => anyhow::bail!("target ref disappeared during fold"),
@@ -3788,9 +3897,12 @@ mod tests {
         }
         let loc = GitLoc::Local(repo.dir.clone());
         let outcome = attempt_land(&config, &repo.dir, "b1", &loc).unwrap();
-        assert!(matches!(&outcome, AttemptOutcome::GateError { reason, log }
-            if reason.contains("source moved after gate; retry")
-                && log.contains("refs/heads/b1")));
+        assert!(
+            matches!(&outcome, AttemptOutcome::GateError { reason, log, class, .. }
+                if reason.contains("source moved after gate; retry")
+                    && log.contains("refs/heads/b1")
+                    && *class == GateErrorClass::SourceMoved)
+        );
         assert_eq!(repo.out(&["rev-parse", "main"]), original);
     }
 
@@ -3975,6 +4087,8 @@ mod tests {
         let error = GateVerdict::Error {
             reason: "gate capture unavailable".into(),
             log: String::new(),
+            phase: GatePhase::Gate,
+            class: GateErrorClass::Capture,
         };
 
         budget.remember_base_verdict(base, &error);
@@ -4770,6 +4884,39 @@ mod tests {
             derive_landed_commit(&repo.dir, &branch_tip, &target).unwrap(),
             branch_tip,
             "a fast-forward landing must retain the branch tip as its identity"
+        );
+    }
+
+    #[test]
+    fn gate_phase_and_error_class_wire_names_are_distinct_snake_case() {
+        let phases =
+            [GatePhase::Preparation, GatePhase::Setup, GatePhase::Gate].map(GatePhase::as_str);
+        assert_eq!(phases, ["preparation", "setup", "gate"]);
+        let classes = [
+            GateErrorClass::Timeout,
+            GateErrorClass::Spawn,
+            GateErrorClass::Killed,
+            GateErrorClass::SetupFailed,
+            GateErrorClass::Capture,
+            GateErrorClass::Poisoned,
+            GateErrorClass::Preparation,
+            GateErrorClass::Signing,
+            GateErrorClass::SourceMoved,
+        ]
+        .map(GateErrorClass::as_str);
+        assert_eq!(
+            classes,
+            [
+                "timeout",
+                "spawn",
+                "killed",
+                "setup_failed",
+                "capture",
+                "poisoned",
+                "preparation",
+                "signing",
+                "source_moved",
+            ]
         );
     }
 }
