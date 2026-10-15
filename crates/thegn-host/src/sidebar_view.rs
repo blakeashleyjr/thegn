@@ -3585,6 +3585,9 @@ mod tests {
             .into_iter()
             .flat_map(|line| match line {
                 crate::seg::Line::Segs(segs) => segs,
+                crate::seg::Line::Split { l, r } | crate::seg::Line::SplitMinLeft { l, r, .. } => {
+                    l.into_iter().chain(r).collect()
+                }
                 _ => Vec::new(),
             })
             .map(|seg| seg.text)
