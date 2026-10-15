@@ -138,7 +138,7 @@ fn filter_bar(ui: &PanelUi) -> Option<PanelRow> {
     }
     let mut segs = vec![seg(g2(), "/ "), seg(t(), ui.keys_filter.clone())];
     if ui.keys_filter_editing {
-        segs.push(seg(d(), "▌"));
+        segs.push(seg(d(), crate::caps::active_glyphs().half_block_r));
     } else {
         segs.push(seg(g3(), "  (Esc clears)"));
     }
