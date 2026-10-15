@@ -229,25 +229,22 @@ fn isolation_for(
         return IsolationClass::GuestKernel;
     }
     match backend {
-        // A plain host process, and — honestly — a Windows Job Object: its
-        // kill-on-close job scopes the process tree's lifetime and (once shipped)
-        // resources, but binds no mount/network namespace, so it is a host
-        // process with scoping, never a container. It therefore satisfies no
+        // Plain host processes, a Windows Job Object (lifetime/resource
+        // scoping only), and the reserved AppContainer (no token/ACL/network
+        // implementation) bind no mount/network namespace. They satisfy no
         // isolation floor at `shared-kernel` or above.
-        Backend::None | Backend::WinJobObject => IsolationClass::HostProcess,
+        Backend::None | Backend::WinAppContainer | Backend::WinJobObject => {
+            IsolationClass::HostProcess
+        }
         // Apple's `container` runs each container in its own lightweight VM.
         Backend::Apple => IsolationClass::GuestKernel,
-        // `WinAppContainer` keeps a container-class *reservation* (an OS-enforced
-        // capability/integrity boundary) to be claimed only when it ships and its
-        // enforcement is verified — see `sandbox_matrix`.
         Backend::Podman
         | Backend::PodmanRootful
         | Backend::Docker
         | Backend::Smol
         | Backend::Bwrap
         | Backend::Systemd
-        | Backend::Wsl
-        | Backend::WinAppContainer => IsolationClass::SharedKernel,
+        | Backend::Wsl => IsolationClass::SharedKernel,
     }
 }
 
@@ -266,8 +263,8 @@ fn egress_for(backend: Backend, placement: &Placement, has_vpn: bool) -> EgressK
         // the policy is translated to their controls.
         return EgressKind::Translate;
     }
-    // We can actively enforce egress when there is an OCI container to apply
-    // `--dns`/network policy to, or a VPN attachment carrying the only route.
+    // OCI containers provide a network namespace; hostname rules are DNS-only.
+    // A VPN attachment can carry the only route.
     if backend.is_oci() || has_vpn {
         EgressKind::Enforce
     } else {
@@ -675,8 +672,7 @@ mod tests {
             .isolation,
             IsolationClass::HostProcess,
         );
-        // AppContainer keeps a container-class reservation: it is an OS-enforced
-        // capability/integrity boundary, to be claimed when it ships.
+        // AppContainer is still a plain host process until its enforcement ships.
         assert_eq!(
             Capabilities::from_parts_on(
                 Backend::WinAppContainer,
@@ -686,7 +682,7 @@ mod tests {
                 HostOs::Windows,
             )
             .isolation,
-            IsolationClass::SharedKernel,
+            IsolationClass::HostProcess,
         );
     }
 

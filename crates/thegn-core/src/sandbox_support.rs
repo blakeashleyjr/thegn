@@ -163,15 +163,18 @@ pub fn support_report(
 /// row.
 ///
 /// Says plainly what `ready` does and does not mean for an unverified runtime:
-/// it was reached by a PATH probe, because thegn has no liveness verb for it, so
-/// it reports that the binary exists and nothing more.
+/// Smol and WSL were reached by a PATH probe with no liveness verb; AppContainer
+/// has no implementation and would launch a plain host shell.
 ///
 /// Suppressed for `Unsupported`, which is the stronger and completely different
 /// statement: that backend cannot run on this OS however it is configured, so
-/// whether thegn's verbs for it were ever tested is irrelevant. Printing both
-/// would put two unrelated reasons under one row and bury the one that decides
-/// it — `wsl` on a Mac is not a verification problem.
+/// whether thegn's verbs for it were ever tested is irrelevant. AppContainer is
+/// the exception: it is reserved on every OS, and the reserved reason must
+/// remain visible even when its state is `Unsupported`.
 pub fn caveat_for(backend: Backend, state: BackendState) -> Option<String> {
+    if backend == Backend::WinAppContainer {
+        return Some("reserved: not implemented — thegn would launch a plain host shell".into());
+    }
     (!backend.verified() && state != BackendState::Unsupported).then(|| {
         format!(
             "unverified: no liveness check, and thegn's `{}` verbs were never tested against the \
@@ -275,7 +278,10 @@ mod tests {
         .into_iter()
         .filter(|b| !b.verified())
         .collect();
-        assert_eq!(unverified, vec![Backend::Smol, Backend::Wsl]);
+        assert_eq!(
+            unverified,
+            vec![Backend::Smol, Backend::Wsl, Backend::WinAppContainer]
+        );
 
         for b in [Backend::Smol, Backend::Wsl] {
             let c = caveat_for(b, BackendState::Ready).unwrap_or_default();
@@ -290,6 +296,16 @@ mod tests {
             // bury the reason that actually applies.
             assert_eq!(caveat_for(b, BackendState::Unsupported), None, "{b:?}");
         }
+        assert_eq!(
+            classify(Backend::WinAppContainer, &Placement::Local, HostOs::Windows),
+            BackendState::Unsupported
+        );
+        let appcontainer =
+            caveat_for(Backend::WinAppContainer, BackendState::Unsupported).unwrap_or_default();
+        assert!(appcontainer.contains("reserved"), "{appcontainer}");
+        assert!(appcontainer.contains("plain host shell"), "{appcontainer}");
+        assert!(!appcontainer.contains("PATH"), "{appcontainer}");
+        assert!(!appcontainer.contains("liveness"), "{appcontainer}");
         for b in [Backend::Podman, Backend::None, Backend::Apple] {
             for st in [
                 BackendState::Ready,

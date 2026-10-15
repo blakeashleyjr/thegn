@@ -44,8 +44,9 @@ pub enum FsIsolation {
 /// Network isolation a backend can provide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetIsolation {
-    /// thegn owns egress: `network=none`, the DNS filter, or a VPN sidecar can
-    /// all be applied (`EgressKind::Enforce`).
+    /// An own network namespace; only `network = "none"` is an enforced deny.
+    /// `network_allow` and `network_block` hostname rules are DNS-only, not an
+    /// egress boundary (`EgressKind::Enforce`).
     Enforceable,
     /// A network namespace is unshared **only** under `network = none`; otherwise
     /// the pane shares the host network stack.
@@ -107,7 +108,7 @@ impl FsIsolation {
 impl NetIsolation {
     pub fn as_str(self) -> &'static str {
         match self {
-            NetIsolation::Enforceable => "enforceable",
+            NetIsolation::Enforceable => "netns; rules DNS-only",
             NetIsolation::WhenSealed => "only when network=none",
             NetIsolation::HostShared => "none (host net)",
         }
@@ -220,12 +221,11 @@ fn fs_for(backend: Backend) -> FsIsolation {
         | Backend::Apple
         | Backend::Wsl
         | Backend::Bwrap => FsIsolation::Isolated,
-        // An OS-enforced capability boundary (reserved) restricts fs access.
-        Backend::WinAppContainer => FsIsolation::Isolated,
         // systemd unit props harden parts of the host fs but do not give a root.
         Backend::Systemd => FsIsolation::Partial,
-        // A Job Object and the plain host both see the whole host filesystem.
-        Backend::WinJobObject | Backend::None => FsIsolation::None,
+        // AppContainer is reserved and launches a plain shell, just like the
+        // Job Object and plain host for filesystem visibility.
+        Backend::WinAppContainer | Backend::WinJobObject | Backend::None => FsIsolation::None,
     }
 }
 
@@ -240,12 +240,12 @@ fn net_for(backend: Backend, os: HostOs) -> NetIsolation {
         return NetIsolation::Enforceable;
     }
     match backend {
-        // An OS capability boundary can gate network (reserved).
-        Backend::WinAppContainer => NetIsolation::Enforceable,
         // Namespace tools: sealed netns only under `network = none`.
         Backend::Bwrap | Backend::Systemd => NetIsolation::WhenSealed,
         // Host-process backends: the host network, always shared.
-        Backend::None | Backend::WinJobObject => NetIsolation::HostShared,
+        Backend::None | Backend::WinAppContainer | Backend::WinJobObject => {
+            NetIsolation::HostShared
+        }
         // OCI backends always reach `Enforce` above; a fall-through here would be
         // a bug, but keep it honest rather than panicking.
         Backend::Podman
@@ -403,11 +403,37 @@ mod tests {
         // worktree at its real path) — declared but unreachable locally.
         assert!(!c(Backend::Podman).reachable);
         assert!(!c(Backend::Docker).reachable);
-        // AppContainer keeps a container-class reservation.
-        assert_eq!(
-            c(Backend::WinAppContainer).class,
-            IsolationClass::SharedKernel
-        );
+        // AppContainer is an unavailable, unverified plain host shell.
+        let appcontainer = c(Backend::WinAppContainer);
+        assert_eq!(appcontainer.class, IsolationClass::HostProcess);
+        assert_eq!(appcontainer.fs, FsIsolation::None);
+        assert_eq!(appcontainer.net, NetIsolation::HostShared);
+        assert!(!appcontainer.verified);
+    }
+
+    #[test]
+    fn oci_net_label_does_not_claim_filtering() {
+        let label = NetIsolation::Enforceable.as_str();
+        assert_eq!(label, "netns; rules DNS-only");
+        assert!(!label.contains("enforceable"));
+        assert!(label.len() <= 22);
+    }
+
+    #[test]
+    fn appcontainer_does_not_meet_shared_kernel_floor() {
+        use crate::config::{IsolationFloor, OnFloorMiss};
+        use crate::sandbox_floor::{FloorDecision, decide};
+
+        let class = row(Backend::WinAppContainer, HostOs::Windows).class;
+        assert!(matches!(
+            decide(
+                IsolationFloor::SharedKernel,
+                OnFloorMiss::Fail,
+                class,
+                class,
+            ),
+            FloorDecision::Fail(_)
+        ));
     }
 
     #[test]
