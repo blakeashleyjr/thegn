@@ -44,6 +44,11 @@ enum Work {
     Shutdown,
 }
 
+struct WorkerState {
+    shutdown: Arc<AtomicBool>,
+    active: Arc<Mutex<String>>,
+}
+
 #[derive(Debug)]
 pub(crate) enum ThemeStoreResult {
     Catalog {
@@ -98,8 +103,10 @@ impl ThemeStore {
                     themes_dir,
                     config_path,
                     watcher_tx,
-                    worker_shutdown,
-                    worker_active,
+                    WorkerState {
+                        shutdown: worker_shutdown,
+                        active: worker_active,
+                    },
                 )
             });
         Self::from_worker_spawn(worker, request, results, shutdown, active)
@@ -243,9 +250,9 @@ fn worker(
     themes_dir: PathBuf,
     config_path: PathBuf,
     watcher_tx: mpsc::Sender<Work>,
-    shutdown: Arc<AtomicBool>,
-    active: Arc<Mutex<String>>,
+    state: WorkerState,
 ) {
+    let WorkerState { shutdown, active } = state;
     if let Err(error) = std::fs::create_dir_all(&themes_dir) {
         tracing::warn!(target: "thegn::theme", error = %error, "theme directory unavailable");
     }
@@ -981,8 +988,10 @@ mod tests {
                 themes_dir,
                 config_path,
                 watcher_tx,
-                worker_shutdown,
-                Arc::new(Mutex::new(String::new())),
+                WorkerState {
+                    shutdown: worker_shutdown,
+                    active: Arc::new(Mutex::new(String::new())),
+                },
             );
         });
         request_tx.send(Work::Changed).unwrap();
