@@ -63,26 +63,29 @@ pub(crate) fn file_active_worktree(
                         .map(|path| path.to_string_lossy().into_owned())
                 });
             let Some(repo_path) = repo_path else {
-                tracing::warn!(target: "thegn::sidebar", "cannot resolve repository for folder filing");
-                return Ok(());
+                anyhow::bail!("No worktree to file into a folder");
             };
             let (workspace_name, workspace_kind) =
                 crate::workspace_identity::workspace_identity(&repo_path, None);
-            let folder_id = db.ensure_folder(
-                &repo_path,
-                &folder_owned,
-                &workspace_name,
-                workspace_kind,
-            )?;
+            let folder_id =
+                db.ensure_folder(&repo_path, &folder_owned, &workspace_name, workspace_kind)?;
             db.set_worktree_folder(&worktree, Some(folder_id))?;
             Ok(())
         });
-        if let Err(error) = result {
+        if let Err(error) = &result {
             tracing::warn!(target: "thegn::sidebar", %error, "worktree folder filing failed");
+            let toast = RefreshKind::Toast {
+                message: format!("Couldn't file worktree into \"{folder_owned}\": {error}"),
+                priority: thegn_core::notification::Priority::Alert,
+            };
+            if let Err(send_error) = refresh_tx.send(toast) {
+                tracing::debug!(target: "thegn::sidebar", %send_error, "folder filing status receiver is gone");
+            }
         }
         if let Err(error) = refresh_tx.send(RefreshKind::Model) {
             tracing::debug!(target: "thegn::sidebar", %error, "folder filing refresh receiver is gone");
-        } else if let Err(error) = waker.wake() {
+        }
+        if let Err(error) = waker.wake() {
             tracing::debug!(target: "thegn::sidebar", %error, "folder filing refresh wake failed");
         }
     });

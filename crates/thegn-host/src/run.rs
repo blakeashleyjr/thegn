@@ -51,7 +51,7 @@ use crate::recorder::Recorder;
 use crate::wizard;
 use crate::workspace_create::complete_workspace_create;
 use thegn_core::store::{
-    AccountStore, CacheStore, NotificationStore, PoolStore, WorkspaceStore, WorktreeAuxStore,
+    CacheStore, NotificationStore, PoolStore, WorkspaceStore, WorktreeAuxStore,
 };
 
 #[path = "run_palette_db.rs"]
@@ -10061,7 +10061,6 @@ async fn event_loop<T: Terminal>(
             loop_perf.tick(crate::perf::WakeSource::Other);
             match result {
                 run_pending_db::PendingDbResult::AccountAdded {
-                    seq: _,
                     pane,
                     provider,
                     name,
@@ -10077,16 +10076,26 @@ async fn event_loop<T: Terminal>(
                         let queued = panes.table.get_mut(&pane).is_some_and(|target| {
                             target.write_input(login_line.as_bytes()).is_ok()
                         });
-                        model.status = if panes.table.contains_key(&pane) {
-                            injected_command_status(
-                                queued,
-                                format!("Logging into {provider}:{name} — finish in the terminal"),
-                            )
-                        } else {
-                            run_pending_db::account_gone_pane_status(&provider, &name)
+                        model.status = match run_pending_db::account_add_drain_status(
+                            panes.table.contains_key(&pane),
+                            queued,
+                        ) {
+                            run_pending_db::AccountAddDrainStatus::LoginQueued => {
+                                format!("Logging into {provider}:{name} — finish in the terminal")
+                            }
+                            run_pending_db::AccountAddDrainStatus::PaneNotReading => {
+                                "pane isn't reading input — command dropped".into()
+                            }
+                            run_pending_db::AccountAddDrainStatus::PaneClosed => {
+                                run_pending_db::account_gone_pane_status(&provider, &name)
+                            }
                         };
                         dirty = true;
                     }
+                }
+                run_pending_db::PendingDbResult::AccountAddFailed { provider, error } => {
+                    model.status = format!("Couldn't add {provider} account: {error}");
+                    dirty = true;
                 }
                 run_pending_db::PendingDbResult::ApplyLayout {
                     seq,
@@ -10131,7 +10140,6 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 run_pending_db::PendingDbResult::Template {
-                    generation: _,
                     tab,
                     fallback_commands,
                     spec,
@@ -10139,11 +10147,15 @@ async fn event_loop<T: Terminal>(
                     if let Some(target) =
                         session.worktrees.iter().position(|group| group.name == tab)
                     {
-                        let previous = session.active;
-                        let plan = run_pending_db::template_tab_plan(previous, target);
+                        let previous_active = session.active;
+                        let plan = run_pending_db::plan_template_drain(
+                            previous_active,
+                            target,
+                            spec,
+                            &fallback_commands,
+                        );
                         session.switch_to(plan.target);
-                        if let Some(spec) = run_pending_db::template_spec(spec, &fallback_commands)
-                        {
+                        if let Some(spec) = plan.spec {
                             apply_layout_to_active_tab(
                                 &spec,
                                 &mut session,
@@ -12461,6 +12473,8 @@ async fn event_loop<T: Terminal>(
                     // template's pins. The layout replaces the default agent pane;
                     // pins are orthogonal strip/float daemons.
                     if let Some(tmpl) = pending_template.remove(&generation) {
+                        // Only restore the user's tab afterward when they've navigated away
+                        // (audit run.rs:9288).
                         let previous_active = session.active;
                         if let Some(target) = session
                             .worktrees
@@ -12519,8 +12533,9 @@ async fn event_loop<T: Terminal>(
                         let named_layout = eff_layout.filter(|name| !name.trim().is_empty());
                         let has_named_layout = named_layout.is_some();
                         if named_layout.is_some() {
+                            // The named-layout case defers apply + refresh + persist to the
+                            // pending-DB drain.
                             run_pending_db::queue_template(
-                                generation,
                                 payload.tab.clone(),
                                 named_layout,
                                 eff_commands.clone(),
@@ -12586,6 +12601,8 @@ async fn event_loop<T: Terminal>(
                                 );
                             }
                         }
+                        // Restore the user's tab unless the new worktree is still the one
+                        // they're looking at.
                         if !is_active_new && previous_active < session.worktrees.len() {
                             session.switch_to(previous_active);
                         }
@@ -18211,19 +18228,19 @@ async fn event_loop<T: Terminal>(
                                     }
                                     HostInputKind::ApplyLayout => {
                                         let name = text.trim().to_string();
-                                        let seq = pending_db_fence.begin_layout();
-                                        let tab = session
-                                            .active_group()
-                                            .map(|group| group.name.clone())
-                                            .unwrap_or_default();
-                                        run_pending_db::queue_apply_layout(
-                                            seq,
-                                            tab,
-                                            name.clone(),
-                                            &pending_db_tx,
-                                            &waker,
-                                        );
-                                        model.status = format!("Applying layout \"{name}\"…");
+                                        if let Some(group) = session.active_group() {
+                                            let seq = pending_db_fence.begin_layout();
+                                            run_pending_db::queue_apply_layout(
+                                                seq,
+                                                group.name.clone(),
+                                                name.clone(),
+                                                &pending_db_tx,
+                                                &waker,
+                                            );
+                                            model.status = format!("Applying layout \"{name}\"…");
+                                        } else {
+                                            model.status = "Apply layout: nothing spawned".into();
+                                        }
                                     }
                                     HostInputKind::ExportLayout => {
                                         let path = text.trim().to_string();
@@ -19622,17 +19639,13 @@ async fn event_loop<T: Terminal>(
                                     // credential dir and run the provider's login in
                                     // the focused pane, with its credential-home env
                                     // pointed at that dir (item 656).
-                                    if thegn_core::account::provider(provider).is_some() {
-                                        let seq = pending_db_fence.next();
-                                        run_pending_db::queue_account_add(
-                                            seq,
-                                            focused,
-                                            provider.to_string(),
-                                            &pending_db_tx,
-                                            &waker,
-                                        );
-                                        model.status = format!("Adding {provider} account…");
-                                    }
+                                    run_pending_db::queue_account_add(
+                                        focused,
+                                        provider.to_string(),
+                                        &pending_db_tx,
+                                        &waker,
+                                    );
+                                    model.status = format!("Adding {provider} account…");
                                     palette = None;
                                     dirty = true;
                                     continue;
