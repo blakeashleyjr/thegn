@@ -3044,9 +3044,9 @@ pub struct StatsConfig {
     pub cpu_icon: String,
     /// Icon for memory stat.
     pub mem_icon: String,
-    /// Icon for network stat. The shipped default auto-selects Ethernet, Wi-Fi,
-    /// or a generic network glyph from the default route; any other value is a
-    /// fixed icon override.
+    /// Icon for network stat. The shipped default auto-selects the per-medium
+    /// glyph from `[stats.net_icons]` (or the built-in glyph); any other value
+    /// is a fixed icon override that ignores `[stats.net_icons]`.
     pub net_icon: String,
     /// Icon for GPU stat.
     pub gpu_icon: String,
@@ -3079,6 +3079,22 @@ pub struct StatsConfig {
     pub refresh_rates: Vec<f64>,
     /// `[stats.alerts]` — threshold alerts on the sampled metrics.
     pub alerts: StatsAlertsConfig,
+    /// `[stats.net_icons]` — per-medium glyphs used only in network auto mode.
+    pub net_icons: NetIconsConfig,
+}
+
+/// `[stats.net_icons]` — optional per-medium network glyphs.
+///
+/// Used only while `stats.net_icon` is its shipped default (automatic mode).
+/// An empty value uses the built-in glyph, which degrades to ASCII on limited
+/// terminals. Non-empty values are printed as-is and should be single-width
+/// PUA glyphs (U+E000–U+F8FF) to keep the icon aligned with its value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct NetIconsConfig {
+    pub wifi: String,
+    pub ethernet: String,
+    pub generic: String,
 }
 
 /// `[stats.alerts]` — threshold alerts on system metrics.
@@ -3269,6 +3285,7 @@ impl Default for StatsConfig {
             disk_path: String::new(),
             refresh_rates: vec![1.0, 2.0, 5.0, 10.0],
             alerts: StatsAlertsConfig::default(),
+            net_icons: NetIconsConfig::default(),
         }
     }
 }
