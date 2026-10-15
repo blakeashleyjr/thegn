@@ -8548,7 +8548,7 @@ async fn event_loop<T: Terminal>(
                     let folders = keymap.file_worktree_folders();
                     let key = run_palette_db::PaletteKey {
                         kind: run_palette_db::PaletteKind::MoveToFolder,
-                        context: repo_path.clone(),
+                        context: format!("repo:{repo_path}"),
                     };
                     let (generation, rows) = palette_db_cache.begin(
                         key.clone(),
@@ -8556,13 +8556,14 @@ async fn event_loop<T: Terminal>(
                             crate::palette::build_move_to_folder_seed(&folders),
                         ),
                     );
-                    let run_palette_db::PaletteRows::Items(items) = rows else {
-                        unreachable!("move-to-folder cache stores item rows")
-                    };
+                    let (items, cached_repo) = run_palette_db::move_to_folder_parts(rows);
                     let mut open_palette = crate::search_everywhere::PaletteSession::new(items);
                     open_palette.mark_db_pending(key.cache_id(), generation);
                     palette = Some(open_palette);
-                    pending_file_target = Some((worktree_path, repo_path.clone()));
+                    pending_file_target = Some((
+                        worktree_path,
+                        cached_repo.unwrap_or_else(|| repo_path.clone()),
+                    ));
                     let request_key = key;
                     run_palette_db::spawn_load(
                         request_key,
@@ -10057,14 +10058,12 @@ async fn event_loop<T: Terminal>(
                                 .as_ref()
                                 .is_some_and(|(_, kind)| *kind == HostInputKind::ApplyLayout)
                         {
-                            if names.is_empty() {
+                            let (close_prompt, status) =
+                                run_palette_db::layout_names_state(&names, true);
+                            if close_prompt {
                                 host_input = None;
-                                model.status =
-                                    "No saved layouts yet — use \"Save layout as…\" first".into();
-                            } else {
-                                model.status =
-                                    format!("Apply layout — saved: {}", names.join(", "));
                             }
+                            model.status = status;
                             dirty = true;
                         }
                     }
@@ -23498,7 +23497,7 @@ async fn event_loop<T: Terminal>(
                                     let folders = keymap.file_worktree_folders();
                                     let key = run_palette_db::PaletteKey {
                                         kind: run_palette_db::PaletteKind::MoveToFolder,
-                                        context: worktree_path.clone(),
+                                        context: format!("wt:{worktree_path}"),
                                     };
                                     let (generation, rows) = palette_db_cache.begin(
                                         key.clone(),
@@ -23506,13 +23505,16 @@ async fn event_loop<T: Terminal>(
                                             crate::palette::build_move_to_folder_seed(&folders),
                                         ),
                                     );
-                                    let run_palette_db::PaletteRows::Items(items) = rows else {
-                                        unreachable!("move-to-folder cache stores item rows")
-                                    };
+                                    let (items, cached_repo) =
+                                        run_palette_db::move_to_folder_parts(rows);
                                     let mut open_palette =
                                         crate::search_everywhere::PaletteSession::new(items);
                                     open_palette.mark_db_pending(key.cache_id(), generation);
                                     palette = Some(open_palette);
+                                    if let Some(repo_path) = cached_repo {
+                                        pending_file_target =
+                                            Some((worktree_path.clone(), repo_path));
+                                    }
                                     let request_worktree = worktree_path.clone();
                                     run_palette_db::spawn_load(
                                         key,
@@ -23536,7 +23538,7 @@ async fn event_loop<T: Terminal>(
                                                     )
                                                     .map(|path| path.to_string_lossy().into_owned())
                                                 })
-                                                .unwrap_or_else(String::new);
+                                                .unwrap_or_default();
                                             let items = crate::palette::build_move_to_folder_items(
                                                 db, &repo_path, &folders,
                                             );
@@ -25016,7 +25018,6 @@ async fn event_loop<T: Terminal>(
                                     kind: run_palette_db::PaletteKind::LayoutNames,
                                     context: session.id.clone(),
                                 };
-                                let cache_hit = palette_db_cache.contains(&key);
                                 let (generation, rows) = palette_db_cache.begin(
                                     key.clone(),
                                     run_palette_db::PaletteRows::LayoutNames(Vec::new()),
@@ -25029,17 +25030,12 @@ async fn event_loop<T: Terminal>(
                                     menu::InputOverlay::new("apply layout (name)", ""),
                                     HostInputKind::ApplyLayout,
                                 ));
-                                if cache_hit && names.is_empty() {
+                                let (close_prompt, status) =
+                                    run_palette_db::layout_names_state(&names, false);
+                                if close_prompt {
                                     host_input = None;
-                                    model.status =
-                                        "No saved layouts yet — use \"Save layout as…\" first"
-                                            .into();
-                                } else if names.is_empty() {
-                                    model.status = "Apply layout — loading saved layouts".into();
-                                } else {
-                                    model.status =
-                                        format!("Apply layout — saved: {}", names.join(", "));
                                 }
+                                model.status = status;
                                 run_palette_db::spawn_load(
                                     key,
                                     generation,

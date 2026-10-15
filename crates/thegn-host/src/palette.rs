@@ -208,6 +208,8 @@ impl Palette {
                 .position(|index| self.items[*index].key == key)
         {
             self.selected = index;
+        } else {
+            self.selected = 0;
         }
         self.scroll_offset = self.selected.saturating_sub(MAX_ITEMS - 1);
     }
@@ -501,11 +503,7 @@ pub(crate) fn build_move_to_folder_items(
     }
     items.push(PaletteItem::new(
         "move-to-folder:__new__",
-        format!(
-            "{} {}",
-            crate::caps::active_glyphs().diamond_filled,
-            crate::i18n_surface::palette(PaletteText::NewFolder)
-        ),
+        move_to_folder_new_label(),
     ));
     items
 }
@@ -523,13 +521,16 @@ pub(crate) fn build_move_to_folder_seed(configured: &[String]) -> Vec<crate::pal
         .collect::<Vec<_>>();
     items.push(PaletteItem::new(
         "move-to-folder:__new__",
-        format!(
-            "{} {}",
-            crate::caps::active_glyphs().diamond_filled,
-            crate::i18n_surface::palette(PaletteText::NewFolder)
-        ),
+        move_to_folder_new_label(),
     ));
     items
+}
+
+fn move_to_folder_new_label() -> String {
+    format!(
+        "＋ {}",
+        crate::i18n_surface::palette(PaletteText::NewFolder)
+    )
 }
 
 /// The display label for a workspace switch entry. Carries the Ctrl+1..9
@@ -609,11 +610,7 @@ pub(crate) fn build_palette(
     {
         items.push(PaletteItem::new(
             format!("summon-pin-{}", i + 1),
-            format!(
-                "{} {}",
-                crate::caps::active_glyphs().diamond_filled,
-                p.display_label()
-            ),
+            format!("📌 {}", p.display_label()),
         ));
     }
 
@@ -724,11 +721,7 @@ pub(crate) fn build_palette_seed(
     {
         items.push(PaletteItem::new(
             format!("summon-pin-{}", i + 1),
-            format!(
-                "{} {}",
-                crate::caps::active_glyphs().diamond_filled,
-                pin.display_label()
-            ),
+            format!("📌 {}", pin.display_label()),
         ));
     }
     for group in &session.worktrees {
@@ -1847,6 +1840,27 @@ mod tests {
         ]);
         assert_eq!(palette.query(), "a");
         assert_eq!(palette.selected_item().unwrap().key, selected_key);
+    }
+
+    #[test]
+    fn replacing_rows_with_shorter_list_clamps_empty_query_selection() {
+        let mut palette = Palette::new(vec![
+            PaletteItem::new("alpha", "Alpha"),
+            PaletteItem::new("beta", "Beta"),
+            PaletteItem::new("gamma", "Gamma"),
+        ]);
+        palette.move_down();
+        palette.move_down();
+        assert_eq!(palette.selected_item().unwrap().key, "gamma");
+
+        palette.replace_items(vec![
+            PaletteItem::new("alpha", "Alpha refreshed"),
+            PaletteItem::new("beta", "Beta refreshed"),
+        ]);
+
+        assert_eq!(palette.selected_idx(), 0);
+        assert_eq!(palette.selected_item().unwrap().key, "alpha");
+        assert_eq!(palette.scroll_offset(), 0);
     }
 
     #[test]
