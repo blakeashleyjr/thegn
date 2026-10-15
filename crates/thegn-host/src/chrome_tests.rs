@@ -776,9 +776,12 @@ fn sidebar_worktree_row_shows_diff_stat_pr_chip_and_focus_detail() {
         dirty: true,
         ahead: 2,
         behind: 1,
-        add: 42,
-        del: 7,
-        branch_diff: Some((310, 84)),
+        add: thegn_svc::git::DiffCount::Exact(42),
+        del: thegn_svc::git::DiffCount::Exact(7),
+        branch_diff: Some((
+            thegn_svc::git::DiffCount::Exact(310),
+            thegn_svc::git::DiffCount::Exact(84),
+        )),
         submodule_dirty: false,
         jj: false,
     });
@@ -830,7 +833,10 @@ fn sidebar_worktree_detail_hidden_when_sidebar_unfocused() {
     ws.collapsed = false;
     let mut wt = row(RowKind::Worktree, "feat");
     wt.git = Some(GitGlyphs {
-        branch_diff: Some((310, 84)),
+        branch_diff: Some((
+            thegn_svc::git::DiffCount::Exact(310),
+            thegn_svc::git::DiffCount::Exact(84),
+        )),
         ..Default::default()
     });
     let model = FrameModel {
