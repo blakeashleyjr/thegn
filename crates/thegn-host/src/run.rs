@@ -8436,6 +8436,12 @@ async fn event_loop<T: Terminal>(
                             &current_config,
                             Some(waker.clone()),
                         );
+                        let orphaned_sids =
+                            workspace_pool.retain_groups_for_removed_workspace(&slug);
+                        crate::handlers::daemon_lifecycle::kill_orphaned_daemon_sessions(
+                            current_config.daemon.clone(),
+                            orphaned_sids,
+                        );
                         crate::handlers::workspace_remove::forget_workspace_in_model(
                             &mut model, &slug, &repo_path,
                         );
@@ -18632,6 +18638,14 @@ async fn event_loop<T: Terminal>(
                                     &current_config,
                                     Some(waker.clone()),
                                 );
+                                if !model.status.contains("failed to start") {
+                                    let orphaned_sids =
+                                        workspace_pool.retain_groups_for_removed_workspace(&slug);
+                                    crate::handlers::daemon_lifecycle::kill_orphaned_daemon_sessions(
+                                        current_config.daemon.clone(),
+                                        orphaned_sids,
+                                    );
+                                }
                                 if keep_files {
                                     crate::handlers::workspace_remove::forget_workspace_in_model(
                                         &mut model, &slug, &repo_path,
@@ -25398,6 +25412,14 @@ async fn event_loop<T: Terminal>(
                                             &current_config,
                                             Some(waker.clone()),
                                         );
+                                    if !model.status.contains("failed to start") {
+                                        let orphaned_sids = workspace_pool
+                                            .retain_groups_for_removed_workspace(&slug);
+                                        crate::handlers::daemon_lifecycle::kill_orphaned_daemon_sessions(
+                                            current_config.daemon.clone(),
+                                            orphaned_sids,
+                                        );
+                                    }
                                     sb.marked.clear();
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     sb.focus_active_row(&mut model);
