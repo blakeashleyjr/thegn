@@ -1558,6 +1558,7 @@ mod spec {
                     refs: "HEAD -> main".into(),
                 }],
                 total: 108,
+                error: None,
             }),
             cfg_keys: crate::keyhint::cheatsheet_groups(&thegn_core::config::Config::default()),
             ..Default::default()
