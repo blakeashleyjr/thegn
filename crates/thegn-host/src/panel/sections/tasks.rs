@@ -330,11 +330,10 @@ fn task_detail_segs(
         Some(r) if r.end == crate::task::RunEnd::Stopped => {
             out.push(vec![seg(g3(), "stopped")]);
         }
-        Some(r) if matches!(r.end, crate::task::RunEnd::TimedOut { .. }) => {
-            let secs = match r.end {
-                crate::task::RunEnd::TimedOut { secs } => secs,
-                _ => unreachable!(),
-            };
+        Some(crate::panel::TaskRunRecord {
+            end: crate::task::RunEnd::TimedOut { secs },
+            ..
+        }) => {
             out.push(vec![
                 failed_mark(),
                 seg(hue(Hue::Red), format!(" timed out after {secs}s")),

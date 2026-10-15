@@ -161,11 +161,8 @@ pub fn cancel_job(worktree: &Path, name: &str) {
     if let Ok(map) = registry().lock()
         && let Some((generation, group)) = map.get(&slot)
     {
-        match stopped_runs().lock() {
-            Ok(mut stopped) => {
-                stopped.insert((slot, *generation));
-            }
-            Err(_) => {}
+        if let Ok(mut stopped) = stopped_runs().lock() {
+            stopped.insert((slot.clone(), *generation));
         }
         group.terminate();
     }
@@ -356,26 +353,13 @@ fn run_capped_argv(
     }
     let mut buf = out_h.join().unwrap_or_default();
     let errbuf = err_h.join().unwrap_or_default();
-    let stopped = if let Ok(mut marks) = stopped_runs().lock() {
-        marks.remove(&(slot.to_string(), generation))
-    } else {
-        false
-    };
     let truncated = buf.len() >= MAX_CAPTURE_BYTES || errbuf.len() >= MAX_CAPTURE_BYTES;
     buf.extend_from_slice(&errbuf);
     if buf.len() > MAX_CAPTURE_BYTES {
         buf.truncate(MAX_CAPTURE_BYTES);
     }
 
-    // Deregister iff we still own the slot (a newer job may have replaced us).
-    if let Ok(mut map) = registry().lock()
-        && map
-            .get(slot)
-            .map(|(g, _)| *g == generation)
-            .unwrap_or(false)
-    {
-        map.remove(slot);
-    }
+    let stopped = finish_slot(slot, generation);
 
     CapOutput {
         exit_code: status.ok().and_then(|s| s.code()),
@@ -383,6 +367,30 @@ fn run_capped_argv(
         timed_out: timed_out.load(Ordering::Relaxed),
         stopped,
         text: String::from_utf8_lossy(&buf).into_owned(),
+    }
+}
+
+/// Consume this run's stop mark while holding the registry lock used to decide
+/// whether it may deregister its slot. `cancel_job` takes these locks in the
+/// same order, so a cancellation cannot leave a mark behind after this run
+/// exits.
+fn finish_slot(slot: &str, generation: u64) -> bool {
+    if let Ok(mut map) = registry().lock() {
+        let owns_slot = map
+            .get(slot)
+            .map(|(current, _)| *current == generation)
+            .unwrap_or(false);
+        let marked_stopped = if let Ok(mut marks) = stopped_runs().lock() {
+            marks.remove(&(slot.to_string(), generation))
+        } else {
+            false
+        };
+        if owns_slot {
+            map.remove(slot);
+        }
+        owns_slot && marked_stopped
+    } else {
+        false
     }
 }
 
@@ -2256,7 +2264,7 @@ mod tests {
                 &GitLoc::Local(wt2),
                 71,
                 TestTask::new("slow", "sleep 30", "generic"),
-                &LimitsConfig::default(),
+                &uncapped(),
             )
         });
         for _ in 0..100 {
@@ -2274,6 +2282,12 @@ mod tests {
         assert_eq!(outcome.end, RunEnd::Stopped);
         assert!(outcome.stdout_stderr.starts_with("stopped by user"));
         assert!(!slot_active(&wt), "cancelled job should be reaped");
+        assert!(
+            !stopped_runs()
+                .lock()
+                .unwrap()
+                .contains(&(job_slot(&wt, "slow"), 71))
+        );
     }
 
     #[test]
@@ -2289,7 +2303,7 @@ mod tests {
                 &GitLoc::Local(wt2),
                 72,
                 TestTask::new("slow", "sleep 30", "generic"),
-                &LimitsConfig::default(),
+                &uncapped(),
             )
         });
         for _ in 0..100 {
@@ -2303,6 +2317,23 @@ mod tests {
         let outcome = handle.join().unwrap();
         assert_eq!(outcome.end, RunEnd::Exited);
         assert!(!stopped_runs().lock().unwrap().contains(&(slot2, 72)));
+    }
+
+    #[test]
+    fn finishing_superseded_generation_clears_its_stop_mark_without_stopping_newer_run() {
+        let dir = private_temp_dir();
+        let slot = job_slot(dir.path(), "slow");
+        registry().lock().unwrap().insert(
+            slot.clone(),
+            (73, crate::platform::GroupHandle::from_pid(4242)),
+        );
+        stopped_runs().lock().unwrap().insert((slot.clone(), 72));
+
+        assert!(!finish_slot(&slot, 72));
+        assert!(registry().lock().unwrap().contains_key(&slot));
+        assert!(!stopped_runs().lock().unwrap().contains(&(slot.clone(), 72)));
+
+        registry().lock().unwrap().remove(&slot);
     }
 
     #[test]
