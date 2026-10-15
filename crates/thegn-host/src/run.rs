@@ -6807,6 +6807,7 @@ async fn event_loop<T: Terminal>(
     let mut pending_corner_oob = crate::preview_retry::PendingCornerOob::default();
     let mut pending_clipboard_oob = crate::preview_retry::PendingClipboardOob::default();
     let mut pending_ready_marker = crate::preview_retry::PendingReadyMarker::default();
+    let mut pending_bell = crate::preview_retry::PendingBellOob::default();
     // The git mutation runner + the line-cursor document fetches (staging
     // diff, drilled-commit files, patch doc). Results are tagged with
     // `panel_ui.git.op_gen` so a worktree switch kills strays on arrival.
@@ -8990,11 +8991,17 @@ async fn event_loop<T: Terminal>(
             && replay.is_none();
         pending_corner_oob.retry(corner_visible, |bytes| writer.try_submit_oob(bytes));
         pending_clipboard_oob.retry(|bytes| writer.try_submit_oob(bytes));
+        pending_bell.retry(|bytes| writer.try_submit_oob(bytes));
+        if let Some(bytes) = pending_clipboard_oob.take_oversized() {
+            model.status = crate::preview_retry::oversized_copy_status(bytes);
+            dirty = true;
+        }
         if muse_ready
             && pending_ready_marker.is_pending()
             && !pending_preview_oob.is_pending()
             && !pending_corner_oob.blocks_output(corner_visible)
             && !pending_clipboard_oob.is_pending()
+            && !pending_bell.is_pending()
             && !dirty
             && !full_repaint
             && dirty_panes.is_empty()
@@ -15227,7 +15234,7 @@ async fn event_loop<T: Terminal>(
             // right after the frame in the writer FIFO. BEL neither moves the
             // cursor nor prints, so it is safe between frames.
             if notify_state.take_bell() {
-                writer.submit_oob(b"\x07".to_vec());
+                pending_bell.offer(|bytes| writer.try_submit_oob(bytes));
             }
             // Corner kitty images ride ON TOP of the cell frame: emit the queued,
             // repositioned graphics AFTER the diff — the writer FIFO orders them
@@ -15297,6 +15304,7 @@ async fn event_loop<T: Terminal>(
                         if pending_preview_oob.is_pending()
                             || pending_corner_oob.blocks_output(false)
                             || pending_clipboard_oob.is_pending()
+                            || pending_bell.is_pending()
                         {
                             Err(bytes)
                         } else {
