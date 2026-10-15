@@ -1428,6 +1428,7 @@ mod tests {
         peak: Arc<std::sync::atomic::AtomicUsize>,
         hung_active: Arc<std::sync::atomic::AtomicUsize>,
         hung_peak: Arc<std::sync::atomic::AtomicUsize>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl DataSource for SustainedRefreshSource {
@@ -1435,6 +1436,7 @@ mod tests {
             &self,
             queries: Vec<Query>,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>, QueryError>> + Send>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             let is_hung = queries[0].expr == "hang";
             let guard = LiveQueryGuard::new(
                 self.active.clone(),
@@ -1458,11 +1460,13 @@ mod tests {
         let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let hung_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let hung_peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let source = Arc::new(SustainedRefreshSource {
             active,
             peak: peak.clone(),
             hung_active,
             hung_peak: hung_peak.clone(),
+            calls: calls.clone(),
         });
         let mut panel_dashboard = dashboard(4);
         panel_dashboard.panels[0].targets[0].expr = "hang".into();
@@ -1481,13 +1485,15 @@ mod tests {
             WakeGate::new(true),
         );
         let mut fast_deliveries = [0_usize; 4];
-        let mut peak_queued = 0;
+        let mut queries_before_drain = None;
         let start = tokio::time::Instant::now();
         while start.elapsed() < Duration::from_millis(1500) {
             cmd.send(EngineCmd::Requery).unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
-            peak_queued = peak_queued.max(updates.len());
             if start.elapsed() >= Duration::from_millis(700) {
+                if queries_before_drain.is_none() {
+                    queries_before_drain = Some(calls.load(Ordering::SeqCst));
+                }
                 while let Ok(update) = updates.try_recv() {
                     if update.panel_id > 0 {
                         fast_deliveries[update.panel_id as usize] += 1;
@@ -1506,8 +1512,8 @@ mod tests {
             "refreshes exceeded the live panel-query concurrency cap"
         );
         assert!(
-            peak_queued <= RESULT_CHANNEL_CAPACITY,
-            "undrained frame queue exceeded its fixed capacity"
+            queries_before_drain.unwrap() <= RESULT_CHANNEL_CAPACITY + MAX_CONCURRENT_PANELS + 1,
+            "undrained refreshes started too many panel queries"
         );
         assert!(
             fast_deliveries[1..].iter().all(|count| *count > 1),

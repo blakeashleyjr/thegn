@@ -410,7 +410,7 @@ mod tests {
     }
 
     async fn mock_upstream() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let accepted = Arc::new(AtomicUsize::new(0));
@@ -420,6 +420,33 @@ mod tests {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 count.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let header_end = loop {
+                        if let Some(index) =
+                            request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                        {
+                            break index + 4;
+                        }
+                        let mut chunk = [0_u8; 4096];
+                        let read = socket.read(&mut chunk).await.unwrap();
+                        assert!(read > 0, "upstream request ended before its headers");
+                        request.extend_from_slice(&chunk[..read]);
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    while request.len() < header_end + content_length {
+                        let mut chunk = [0_u8; 4096];
+                        let read = socket.read(&mut chunk).await.unwrap();
+                        assert!(read > 0, "upstream request ended before its body");
+                        request.extend_from_slice(&chunk[..read]);
+                    }
                     let body = r#"{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
                     let response = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
