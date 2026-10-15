@@ -27,6 +27,8 @@ fn on_missing_fail_refuses_the_pane_instead_of_exiting() {
         let mut cfg = cfg_with(&[], &[]);
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
         cfg.sandbox.backend_chain = vec!["host".to_string()];
+        // host-semantics fixture: the THE-419 default floor would refuse this chain-host landing
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
         cfg.sandbox.on_missing = thegn_core::config::OnMissing::Fail;
         let worktree =
             std::env::temp_dir().join(format!("tg-agent-on-missing-{}", std::process::id()));
@@ -69,7 +71,9 @@ fn only_a_configured_auto_chain_naming_the_host_lands_there() {
         backend: SandboxBackend::Auto,
         ..Default::default()
     };
-    // The default chain ends in `host`: landing there is configured, not a fallback.
+    // A chain-listed host is a fallback preference, not the shipped default.
+    assert!(!auto_chain_names_host(&sb));
+    sb.backend_chain = vec!["host".into()];
     assert!(auto_chain_names_host(&sb));
     sb.backend_chain = vec!["none".into()];
     assert!(auto_chain_names_host(&sb));
@@ -284,6 +288,8 @@ fn automatic_prewarm_rejects_host_reintroduced_by_remembered_agent_relaunch() {
         let mut cfg = cfg_with(&[("remembered", "remembered-agent")], &[]);
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
         cfg.sandbox.backend_chain = vec!["host".to_string()];
+        // host-semantics fixture: the THE-419 default floor would refuse this chain-host landing
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
         let worktree =
             std::env::temp_dir().join(format!("tg-prewarm-relaunch-host-{}", std::process::id()));
         let wt = worktree.to_string_lossy().into_owned();
@@ -1256,6 +1262,8 @@ fn tool_drawer_launch_is_not_recorded_as_worktree_agent() {
         let mut cfg = cfg_with(&[("claude", "claude")], &[("yazi", "yazi")]);
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
         cfg.sandbox.backend_chain = vec!["host".to_string()];
+        // host-semantics fixture: the THE-419 default floor would refuse this chain-host landing
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
         let worktree =
             std::env::temp_dir().join(format!("tg-agent-tool-not-agent-{}", std::process::id()));
         let wt = worktree.to_string_lossy();
@@ -1304,6 +1312,8 @@ fn shell_materialize_with_suppressed_record_leaves_the_worktrees_agent_alone() {
         let mut cfg = cfg_with(&[("claude", "claude")], &[]);
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
         cfg.sandbox.backend_chain = vec!["host".to_string()];
+        // host-semantics fixture: the THE-419 default floor would refuse this chain-host landing
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
         let worktree =
             std::env::temp_dir().join(format!("tg-agent-shell-suppress-{}", std::process::id()));
         let wt = worktree.to_string_lossy();
@@ -1363,6 +1373,8 @@ fn prewarm_spec_leaves_the_worktrees_agent_alone() {
         let mut cfg = cfg_with(&[("claude", "claude")], &[]);
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
         cfg.sandbox.backend_chain = vec!["host".to_string()];
+        // host-semantics fixture: the THE-419 default floor would refuse this chain-host landing
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
         let worktree =
             std::env::temp_dir().join(format!("tg-agent-prewarm-{}", std::process::id()));
         let wt = worktree.to_string_lossy();
@@ -1422,6 +1434,8 @@ fn sandbox_argv_resolution_leaves_the_worktrees_agent_alone() {
         let mut cfg = cfg_with(&[("claude", "claude")], &[]);
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
         cfg.sandbox.backend_chain = vec!["host".to_string()];
+        // host-semantics fixture: the THE-419 default floor would refuse this chain-host landing
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
         let worktree = std::env::temp_dir().join(format!("tg-agent-argv-{}", std::process::id()));
         let wt = worktree.to_string_lossy();
 
@@ -1481,6 +1495,8 @@ fn auto_backend_chain_can_fall_back_to_host() {
         let mut cfg = cfg_with(&[], &[]);
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
         cfg.sandbox.backend_chain = vec!["host".to_string()];
+        // host-semantics fixture: the THE-419 default floor would refuse this chain-host landing
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
         let worktree =
             std::env::temp_dir().join(format!("tg-agent-auto-host-{}", std::process::id()));
         let spec = launch_spec(&cfg, &worktree.to_string_lossy(), None, "shell").unwrap();
@@ -1502,6 +1518,8 @@ fn auto_backend_fallthrough_carries_visible_warning() {
         // Linux box; `wsl` used to play this role but is now a reserved kind,
         // which the chain skips outright rather than probing.
         cfg.sandbox.backend_chain = vec!["apple".to_string(), "host".to_string()];
+        // host-semantics fixture: the THE-419 default floor would refuse this chain-host landing
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
         let worktree =
             std::env::temp_dir().join(format!("tg-agent-auto-fallthrough-{}", std::process::id()));
         let spec = launch_spec(&cfg, &worktree.to_string_lossy(), None, "shell").unwrap();
@@ -1861,10 +1879,10 @@ fn final_host_fallback_honors_fail_closed_floor_without_a_resolved_candidate() {
     with_temp_state("floor-auto-host", || {
         let mut cfg = Config::default();
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
-        // No candidate reaches the pre-ensure floor check; the chain lands on
-        // the host directly. This used to bypass fail-closed admission entirely.
+        // No candidate reaches the pre-ensure floor check; final admission must
+        // still enforce this explicit floor on the chain-host landing.
         cfg.sandbox.backend_chain = vec!["host".to_string()];
-        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::SharedKernel);
         cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
         let loc = GitLoc::from_db("/wt/x", None);
         let error = prepare_sandbox_env(&cfg, Path::new("/repo"), "/wt/x", &loc, None, false, None)
@@ -1879,7 +1897,7 @@ fn explicit_host_does_not_override_fail_closed_floor() {
     with_temp_state("floor-explicit-host", || {
         let mut cfg = Config::default();
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Bwrap;
-        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::SharedKernel);
         cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
         let loc = GitLoc::from_db("/wt/x", None);
         let error = prepare_sandbox_env(
@@ -1901,7 +1919,7 @@ fn final_host_floor_degrade_reports_the_missed_boundary() {
     with_temp_state("floor-degraded-host", || {
         let mut cfg = Config::default();
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
-        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::SharedKernel);
         cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Degrade;
         let loc = GitLoc::from_db("/wt/x", None);
         let outcome =
@@ -1922,7 +1940,7 @@ fn bare_remote_ssh_honors_fail_closed_floor() {
     with_temp_state("floor-remote-host", || {
         let mut cfg = Config::default();
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
-        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::SharedKernel);
         cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
         let target = SshTarget::plain("example.invalid".into(), 22, false);
         let location = GitLoc::remote_db_string_for(&target, "/remote/worktree");
@@ -2582,4 +2600,67 @@ fn walkdir_names(dir: &Path) -> Vec<String> {
         }
     }
     out
+}
+
+#[test]
+fn default_floor_refuses_runtimeless_auto_host_chain() {
+    with_temp_state("default-floor-runtimeless", || {
+        let mut cfg = Config::default();
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+        cfg.sandbox.backend_chain = vec!["wsl".into(), "host".into()];
+        let worktree = std::env::temp_dir().join(format!("tg-floor-refuse-{}", std::process::id()));
+        let error = launch_spec(&cfg, &worktree.to_string_lossy(), None, "shell")
+            .expect_err("the default floor must refuse chain-host execution");
+        assert!(error.to_string().contains("isolation floor"), "{error:#}");
+    });
+}
+
+#[test]
+fn default_floor_skips_deliberate_host_choices() {
+    with_temp_state("default-floor-host-choice", || {
+        let mut cfg = Config::default();
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
+        let none_worktree =
+            std::env::temp_dir().join(format!("tg-floor-none-{}", std::process::id()));
+        let none = launch_spec(&cfg, &none_worktree.to_string_lossy(), None, "shell").unwrap();
+        assert_eq!(none.backend, "host");
+
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+        cfg.sandbox.enabled = false;
+        let disabled_worktree =
+            std::env::temp_dir().join(format!("tg-floor-disabled-{}", std::process::id()));
+        let disabled =
+            launch_spec(&cfg, &disabled_worktree.to_string_lossy(), None, "shell").unwrap();
+        assert_eq!(disabled.backend, "host");
+
+        cfg.sandbox.enabled = true;
+        cfg.sandbox.backend_chain = vec!["wsl".into(), "host".into()];
+        let pinned_worktree =
+            std::env::temp_dir().join(format!("tg-floor-pinned-{}", std::process::id()));
+        let pinned = pinned_worktree.to_string_lossy().into_owned();
+        request_force_host(&pinned);
+        let result = launch_spec(&cfg, &pinned, None, "shell");
+        clear_force_host(&pinned);
+        assert_eq!(result.unwrap().backend, "host");
+    });
+}
+
+#[test]
+fn explicit_floor_beats_deliberate_host() {
+    with_temp_state("explicit-floor-host-choice", || {
+        let cfg = Config {
+            sandbox: thegn_core::config::SandboxConfig {
+                enabled: false,
+                isolation_floor: Some(thegn_core::config::IsolationFloor::SharedKernel),
+                on_floor_miss: thegn_core::config::OnFloorMiss::Fail,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let worktree =
+            std::env::temp_dir().join(format!("tg-floor-explicit-{}", std::process::id()));
+        let error = launch_spec(&cfg, &worktree.to_string_lossy(), None, "shell")
+            .expect_err("an explicit floor must apply to disabled sandbox host execution");
+        assert!(error.to_string().contains("isolation floor"), "{error:#}");
+    });
 }

@@ -571,7 +571,7 @@ pub fn classify_repo_overlay(
         &mut out.isolation_floor,
         &mut events,
         isolation_floor,
-        base.isolation_floor,
+        crate::sandbox_floor::floor_in_force(base, false),
         "sandbox.isolation_floor",
         isolation_floor_rank,
         |f| f.as_str().to_string(),
@@ -1418,8 +1418,8 @@ fn repo_hint_weakens(
                     on_dormant_rank(hinted.on_dormant) < on_dormant_rank(base.on_dormant)
                 }
                 "isolation_floor" => {
-                    isolation_floor_rank(hinted.isolation_floor)
-                        < isolation_floor_rank(base.isolation_floor)
+                    isolation_floor_rank(crate::sandbox_floor::floor_in_force(hinted, false))
+                        < isolation_floor_rank(crate::sandbox_floor::floor_in_force(base, false))
                 }
                 "on_floor_miss" => {
                     on_floor_miss_rank(hinted.on_floor_miss)
@@ -1890,7 +1890,7 @@ mod tests {
         // Lowering it is denied and surfaced (the trusted base already demands
         // guest-kernel; a repo asking for shared-kernel cannot weaken it).
         let mut strict = base();
-        strict.isolation_floor = IsolationFloor::GuestKernel;
+        strict.isolation_floor = Some(IsolationFloor::GuestKernel);
         let mut o = overlay();
         o.isolation_floor = Some(IsolationFloor::SharedKernel);
         let r = classify_repo_overlay(o, &strict, &Approvals::deny_all());
@@ -1904,10 +1904,12 @@ mod tests {
     #[test]
     fn repo_can_harden_the_miss_policy_but_not_soften_it() {
         use crate::config::OnFloorMiss;
-        // degrade → fail is a hardening: granted.
+        // A base that explicitly permits degradation can be hardened to fail.
+        let mut permissive = base();
+        permissive.on_floor_miss = OnFloorMiss::Degrade;
         let mut o = overlay();
         o.on_floor_miss = Some(OnFloorMiss::Fail);
-        let r = classify_repo_overlay(o, &base(), &Approvals::deny_all());
+        let r = classify_repo_overlay(o, &permissive, &Approvals::deny_all());
         assert_eq!(r.sanctioned.on_floor_miss, Some(OnFloorMiss::Fail));
 
         // fail → degrade is a softening: denied.
@@ -2731,7 +2733,7 @@ mod tests {
         assert_eq!(env.sandbox.network, crate::config::Network::None);
         assert_eq!(
             env.sandbox.isolation_floor,
-            crate::config::IsolationFloor::SharedKernel
+            Some(crate::config::IsolationFloor::SharedKernel)
         );
         assert_eq!(env.sandbox.on_floor_miss, crate::config::OnFloorMiss::Fail);
         let event = resolved
@@ -2917,5 +2919,38 @@ mod tests {
             );
         }
         assert_eq!(keys.len(), HINT_FIELDS.len());
+    }
+
+    #[test]
+    fn repo_off_floor_is_denied_against_default_and_granted_for_host_base() {
+        let mut enabled_base = base();
+        enabled_base.enabled = true;
+        enabled_base.backend = crate::config::SandboxBackend::Auto;
+        let mut request = overlay();
+        request.isolation_floor = Some(crate::config::IsolationFloor::Off);
+        let denied = classify_repo_overlay(request, &enabled_base, &Approvals::deny_all());
+        assert_eq!(denied.sanctioned.isolation_floor, None);
+        assert!(
+            denied
+                .events
+                .iter()
+                .any(|event| event.key == "sandbox.isolation_floor")
+        );
+
+        let mut host_base = enabled_base;
+        host_base.enabled = false;
+        let mut request = overlay();
+        request.isolation_floor = Some(crate::config::IsolationFloor::Off);
+        let granted = classify_repo_overlay(request, &host_base, &Approvals::deny_all());
+        assert_eq!(
+            granted.sanctioned.isolation_floor,
+            Some(crate::config::IsolationFloor::Off)
+        );
+        assert!(
+            granted
+                .events
+                .iter()
+                .all(|event| event.key != "sandbox.isolation_floor")
+        );
     }
 }

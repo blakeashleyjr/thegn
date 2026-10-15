@@ -325,7 +325,7 @@ fn admit_terminal(
         }
         TerminalOutcome::Wrapped(class) => class,
     };
-    crate::sandbox_admission::admit(sb, actual, "terminal", warnings)
+    crate::sandbox_admission::admit(sb, actual, "terminal", false, warnings)
         .map_err(|error| error.context(format!("requested terminal sandbox `{requested}`")))
 }
 
@@ -1611,7 +1611,7 @@ mod tests {
         // sandbox backends happen to be installed on the host.
         let mut cfg = thegn_core::config::Config::default();
         cfg.sandbox.enabled = true;
-        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::Off;
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
         let spec = terminal_launch_spec(&cfg, "", "bwrap").expect("valid volume names");
         assert!(!spec.argv.is_empty());
         // When bwrap is the runtime that actually resolved, it must front the
@@ -2134,7 +2134,7 @@ mod tests {
     #[test]
     fn terminal_unknown_backend_with_fail_floor_refuses() {
         let mut cfg = thegn_core::config::Config::default();
-        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::SharedKernel);
         cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
 
         let error = terminal_launch_spec(&cfg, "", "nonsense-backend")
@@ -2145,7 +2145,7 @@ mod tests {
     #[test]
     fn terminal_unknown_backend_with_degrade_floor_is_labelled_degraded() {
         let mut cfg = thegn_core::config::Config::default();
-        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::SharedKernel);
         cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Degrade;
 
         let spec = terminal_launch_spec(&cfg, "", "nonsense-backend")
@@ -2158,7 +2158,7 @@ mod tests {
     #[test]
     fn terminal_unknown_backend_without_floor_is_not_silent() {
         let mut cfg = thegn_core::config::Config::default();
-        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::Off;
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
         cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
 
         let spec = terminal_launch_spec(&cfg, "", "nonsense-backend")
@@ -2172,7 +2172,7 @@ mod tests {
     #[test]
     fn admit_terminal_refuses_weaker_wrapped_class_under_fail() {
         let mut cfg = thegn_core::config::Config::default();
-        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::SharedKernel);
         cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
         let mut warnings = Vec::new();
         assert!(
@@ -2214,7 +2214,7 @@ mod tests {
     #[test]
     fn terminal_explicit_host_and_ssh_unchanged_under_fail_floor() {
         let mut cfg = thegn_core::config::Config::default();
-        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::SharedKernel);
         cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
 
         for backend in ["", "host", "none"] {
