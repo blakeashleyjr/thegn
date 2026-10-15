@@ -204,7 +204,10 @@ fn route(abs: &std::path::Path) -> PreviewRoute {
 fn read_text(abs: &std::path::Path) -> Result<Vec<String>, String> {
     let bytes = read_bytes(abs)?;
     if bytes.contains(&0) {
-        return read_hex_preview(abs);
+        return Ok(hex_dump_lines(
+            &bytes[..bytes.len().min(HEX_PREVIEW_BYTES)],
+            bytes.len() > HEX_PREVIEW_BYTES,
+        ));
     }
     prepare_preview(&bytes)
 }

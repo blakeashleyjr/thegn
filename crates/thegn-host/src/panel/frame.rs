@@ -1391,7 +1391,7 @@ mod tests {
         };
         assert!(
             !l.iter()
-                .any(|item| matches!(item.tok, Tok::Hue(Hue::Red | Hue::Amber)))
+                .any(|item| matches!(item.fg, Tok::Hue(Hue::Red | Hue::Amber)))
         );
     }
 }
