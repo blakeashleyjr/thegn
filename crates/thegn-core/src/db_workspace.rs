@@ -1235,9 +1235,27 @@ impl WorkspaceStore for Db {
         Ok(())
     }
 
-    fn delete_tab_groups_with_prefix(&self, slug: &str) -> Result<()> {
+    fn delete_tab_groups_with_prefix(&self, slug: &str) -> Result<Vec<(String, String)>> {
         let prefix = format!("{slug}/");
         self.transaction(|db| {
+            let pane_sessions = {
+                let mut statement = db.conn().prepare(
+                    "SELECT group_tabs.session_name, group_tabs.pane_sessions
+                     FROM group_tabs
+                     WHERE group_tabs.pane_sessions != ''
+                       AND EXISTS (
+                           SELECT 1 FROM tab_groups
+                           WHERE tab_groups.session_name = group_tabs.session_name
+                             AND tab_groups.name = group_tabs.group_name
+                             AND substr(tab_groups.name, 1, length(?1)) = ?1
+                       )
+                     ORDER BY group_tabs.session_name, group_tabs.group_name, group_tabs.ordinal",
+                )?;
+                let rows = statement.query_map([&prefix], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
             db.conn().execute(
                 "DELETE FROM group_tabs
                  WHERE EXISTS (
@@ -1252,7 +1270,7 @@ impl WorkspaceStore for Db {
                 "DELETE FROM tab_groups WHERE substr(name, 1, length(?1)) = ?1",
                 [&prefix],
             )?;
-            Ok(())
+            Ok(pane_sessions)
         })
     }
 
@@ -1769,7 +1787,7 @@ mod tests {
             db.put_group_tab(session, &tab(name)).unwrap();
         }
 
-        db.delete_tab_groups_with_prefix("lib").unwrap();
+        assert!(db.delete_tab_groups_with_prefix("lib").unwrap().is_empty());
 
         assert!(db.groups_for_session("app-session").unwrap().is_empty());
         let remaining = db.groups_for_session("other-session").unwrap();
@@ -1779,6 +1797,72 @@ mod tests {
         let remaining_tabs = db.group_tabs_for_session("other-session").unwrap();
         assert_eq!(remaining_tabs.len(), 1);
         assert_eq!(remaining_tabs[0].group_name, "library/feat");
+    }
+
+    #[test]
+    fn delete_tab_groups_with_prefix_returns_deleted_pane_sessions() {
+        use crate::models::{GroupTabRow, TabGroupRow};
+        let db = Db::open_memory().unwrap();
+        let group = |name: &str| TabGroupRow {
+            name: name.into(),
+            kind: "branch".into(),
+            worktree: format!("/wt/{name}"),
+            ordinal: 0,
+            active_tab: 0,
+        };
+        let tab = |group_name: &str, pane_sessions: &str| GroupTabRow {
+            group_name: group_name.into(),
+            ordinal: 0,
+            title: "1".into(),
+            pane_tree: r#"{"leaf":0}"#.into(),
+            focused_pane: 0,
+            pane_cwds: String::new(),
+            pane_cmds: String::new(),
+            pane_sessions: pane_sessions.into(),
+            scrollback_snapshot: String::new(),
+        };
+        db.put_tab_group("other-session", &group("lib/feat"))
+            .unwrap();
+        db.put_group_tab(
+            "other-session",
+            &tab(
+                "lib/feat",
+                r#"{"0":{"provider":"daemon","id":"x","session":"sid-a"}}"#,
+            ),
+        )
+        .unwrap();
+        db.put_tab_group("other-session", &group("library/feat"))
+            .unwrap();
+        db.put_group_tab(
+            "other-session",
+            &tab(
+                "library/feat",
+                r#"{"0":{"provider":"daemon","id":"y","session":"sid-b"}}"#,
+            ),
+        )
+        .unwrap();
+
+        let deleted = db.delete_tab_groups_with_prefix("lib").unwrap();
+
+        assert_eq!(
+            deleted,
+            vec![(
+                "other-session".to_string(),
+                r#"{"0":{"provider":"daemon","id":"x","session":"sid-a"}}"#.to_string(),
+            )]
+        );
+        assert!(
+            db.groups_for_session("other-session")
+                .unwrap()
+                .iter()
+                .all(|group| group.name == "library/feat")
+        );
+        assert!(
+            db.group_tabs_for_session("other-session")
+                .unwrap()
+                .iter()
+                .all(|tab| tab.group_name == "library/feat")
+        );
     }
 
     #[test]
