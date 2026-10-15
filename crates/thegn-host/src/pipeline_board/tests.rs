@@ -74,6 +74,7 @@ fn d(id: i64, st: Option<&str>, parent: Option<i64>) -> AgentDispatch {
 fn roster(rows: Vec<AgentDispatch>) -> DispatchRoster {
     DispatchRoster {
         rows,
+        truncated: false,
         stage_order: stages().iter().map(|s| s.name.clone()).collect(),
         stale: None,
     }
@@ -409,4 +410,36 @@ fn a_stale_roster_keeps_its_rows_and_says_how_old_they_are() {
     let t = render_text(&b, 140, 40);
     assert!(t.contains("stale 12s"), "{t}");
     assert!(t.contains("architect"), "rows survive a failed sample");
+}
+
+#[test]
+fn truncated_history_is_labelled_and_staleness_keeps_precedence() {
+    let (mut b, h) = open_board();
+    let mut r = full_roster();
+    r.truncated = true;
+    assert!(b.refresh(&r, &config(), &ctx_at(&h, Rect::full(140, 40))));
+    let text = render_text(&b, 140, 40);
+    assert!(text.contains("newest 2048 finished"), "{text}");
+
+    ch(&mut b, ' ');
+    assert!(b.is_frozen());
+    let text = render_text(&b, 140, 40);
+    assert!(text.contains("frozen"), "{text}");
+    assert!(!text.contains("newest 2048 finished"), "{text}");
+    ch(&mut b, ' ');
+
+    r.stale = Some(crate::monitor_pipeline::RosterStale {
+        last_good_ms: Some(NOW_MS - 12_000),
+        error: "database is locked".into(),
+    });
+    assert!(b.refresh(&r, &config(), &ctx_at(&h, Rect::full(140, 40))));
+    let text = render_text(&b, 140, 40);
+    assert!(text.contains("stale 12s"), "{text}");
+    assert!(!text.contains("newest 2048 finished"), "{text}");
+
+    r.truncated = false;
+    r.stale = None;
+    assert!(b.refresh(&r, &config(), &ctx_at(&h, Rect::full(140, 40))));
+    let text = render_text(&b, 140, 40);
+    assert!(text.contains("esc close"), "{text}");
 }

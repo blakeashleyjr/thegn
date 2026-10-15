@@ -568,8 +568,9 @@ impl NotificationStore for Db {
 }
 
 impl Db {
-    /// List the dispatch roster for display and summary readers that never
-    /// read handoff text. Note and report bodies are not selected or decoded.
+    /// List the unbounded dispatch roster for tests and non-display callers.
+    /// Display paths should use [`Self::list_dispatch_roster_window`]. This
+    /// projection never reads or decodes note and report bodies.
     pub fn list_dispatch_roster(&self) -> Result<Vec<crate::issue::AgentDispatch>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
@@ -580,6 +581,82 @@ impl Db {
             .query_map([], map_roster_dispatch)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Maximum active roster rows read for display safety derivations.
+    pub const ROSTER_ACTIVE_LIMIT: usize = 4096;
+    /// Maximum newest finished roster rows retained in display snapshots.
+    pub const ROSTER_HISTORY_LIMIT: usize = 2048;
+
+    /// Read every active row up to the safety cap plus the newest finished
+    /// history window. The returned flag is true when either part overflowed.
+    /// A zero limit disables that part; it never means unbounded.
+    pub fn list_dispatch_roster_window(
+        &self,
+        active_limit: usize,
+        history_limit: usize,
+    ) -> Result<(Vec<crate::issue::AgentDispatch>, bool)> {
+        use crate::issue::AgentDispatchStatus as S;
+
+        let active = [
+            S::Queued,
+            S::Spawning,
+            S::Running,
+            S::WaitingHuman,
+            S::PrOpen,
+        ];
+        let statuses = active
+            .iter()
+            .map(|status| status.as_str().to_string())
+            .collect::<Vec<_>>();
+        let placeholders = (1..=statuses.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let (mut active_rows, mut history_rows) = {
+            let read_part = |exclude_active: bool,
+                             limit: usize|
+             -> Result<Vec<crate::issue::AgentDispatch>> {
+                if limit == 0 {
+                    return Ok(Vec::new());
+                }
+                let operator = if exclude_active { "NOT IN" } else { "IN" };
+                let limit_index = statuses.len() + 1;
+                let sql = format!(
+                    "SELECT {ROSTER_DISPATCH_COLS} FROM agent_dispatches \
+                 WHERE status {operator} ({placeholders}) \
+                 ORDER BY dispatched_at_ms DESC, id DESC LIMIT ?{limit_index}"
+                );
+                let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+                let mut values = statuses
+                    .iter()
+                    .map(|status| status as &dyn rusqlite::ToSql)
+                    .collect::<Vec<_>>();
+                values.push(&fetch_limit);
+                let mut statement = tx.prepare(&sql)?;
+                let rows = statement.query_map(params_from_iter(values), map_roster_dispatch)?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            };
+            (
+                read_part(false, active_limit)?,
+                read_part(true, history_limit)?,
+            )
+        };
+        tx.commit()?;
+        let truncated = active_rows.len() > active_limit || history_rows.len() > history_limit;
+        active_rows.truncate(active_limit);
+        history_rows.truncate(history_limit);
+        active_rows.append(&mut history_rows);
+        active_rows.sort_by(|left, right| {
+            right
+                .dispatched_at_ms
+                .cmp(&left.dispatched_at_ms)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        active_rows.dedup_by_key(|row| row.id);
+        Ok((active_rows, truncated))
     }
 
     /// List the oldest rows matching the requested statuses, plus whether
@@ -936,6 +1013,103 @@ mod tests {
         assert_eq!(unbounded.len(), 2);
 
         let (empty, truncated) = db.list_dispatches_with_status(&[], 1).unwrap();
+        assert!(empty.is_empty());
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn roster_window_keeps_every_active_row_and_caps_history() {
+        use crate::issue::{AgentDispatchStatus as S, NewDispatch};
+
+        let db = Db::open_memory().unwrap();
+        let mut finished = Vec::new();
+        for (index, status) in [S::Merged, S::Done, S::Failed, S::Abandoned, S::Done]
+            .into_iter()
+            .enumerate()
+        {
+            let id = db
+                .put_agent_dispatch(NewDispatch {
+                    issue_id: "THE-259",
+                    worktree_path: "/wt/finished",
+                    agent_name: "codex",
+                    stage: Some("code"),
+                    parent_id: None,
+                    session_id: None,
+                    artifact_path: None,
+                    chunk_path: None,
+                })
+                .unwrap();
+            db.update_dispatch_status(id, status).unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE agent_dispatches SET dispatched_at_ms=?1 WHERE id=?2",
+                    rusqlite::params![100 + index as i64, id],
+                )
+                .unwrap();
+            if index == 4 {
+                db.set_dispatch_report(id, "not projected").unwrap();
+                db.stamp_dispatch_note(id, "not projected").unwrap();
+            }
+            finished.push(id);
+        }
+        for (index, status) in [S::WaitingHuman, S::Running].into_iter().enumerate() {
+            let id = db
+                .put_agent_dispatch(NewDispatch {
+                    issue_id: "THE-259",
+                    worktree_path: "/wt/active",
+                    agent_name: "codex",
+                    stage: Some("review"),
+                    parent_id: None,
+                    session_id: None,
+                    artifact_path: None,
+                    chunk_path: None,
+                })
+                .unwrap();
+            db.update_dispatch_status(id, status).unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE agent_dispatches SET dispatched_at_ms=?1 WHERE id=?2",
+                    rusqlite::params![index as i64 + 1, id],
+                )
+                .unwrap();
+        }
+
+        let (window, truncated) = db.list_dispatch_roster_window(10, 3).unwrap();
+        assert!(truncated);
+        assert_eq!(window.len(), 5);
+        assert_eq!(
+            window[..3].iter().map(|row| row.id).collect::<Vec<_>>(),
+            finished[2..].iter().rev().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            window[3..]
+                .iter()
+                .filter(|row| row.status.is_active())
+                .count(),
+            2
+        );
+        assert!(window.windows(2).all(|pair| {
+            (pair[0].dispatched_at_ms, pair[0].id) > (pair[1].dispatched_at_ms, pair[1].id)
+        }));
+        assert!(
+            window
+                .iter()
+                .all(|row| row.note.is_none() && row.report.is_none())
+        );
+
+        let (all, truncated) = db.list_dispatch_roster_window(10, 10).unwrap();
+        assert!(!truncated);
+        assert_eq!(all.len(), 7);
+        let (active_overflow, truncated) = db.list_dispatch_roster_window(1, 10).unwrap();
+        assert!(truncated);
+        assert_eq!(
+            active_overflow
+                .iter()
+                .filter(|row| row.status.is_active())
+                .count(),
+            1
+        );
+        let (empty, truncated) = db.list_dispatch_roster_window(0, 0).unwrap();
         assert!(empty.is_empty());
         assert!(!truncated);
     }

@@ -81,6 +81,8 @@ const MAX_DEPTH: u8 = 4;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DispatchRoster {
     pub rows: Vec<AgentDispatch>,
+    /// True when active rows or finished history were cut at the display caps.
+    pub truncated: bool,
     /// Stage names in configured order. Empty ⇒ [`ordered_rows`] falls back to
     /// alphabetical stage names.
     pub stage_order: Vec<String>,
@@ -857,6 +859,7 @@ mod tests {
         assert!(
             DispatchRoster {
                 rows: vec![],
+                truncated: false,
                 stage_order: vec!["code".into()],
                 stale: None,
             }
@@ -866,6 +869,7 @@ mod tests {
         assert!(
             DispatchRoster {
                 rows: vec![d(1, None, None, 0)],
+                truncated: false,
                 stage_order: vec![],
                 stale: None,
             }
