@@ -156,22 +156,18 @@ pub(crate) fn record_cli_drain(cfg: &Config, db: &Db, steps: &[CliDrainStep], ou
                 ),
             }
         }
-        let insert_result = if signature.is_some() {
-            db.put_notification(kind.as_str(), &step.worktree, &message, &step.worktree)
-                .map(|_| ())
-        } else {
-            db.put_notification_once(kind.as_str(), &step.worktree, &message, &step.worktree)
-                .map(|_| ())
-        };
+        let insert_result = db
+            .put_notification(kind.as_str(), &step.worktree, &message, &step.worktree)
+            .map(|_| ());
         if let Err(error) = insert_result {
             tracing::warn!(target: "thegn::merge", %error, "could not record CLI merge queue notification");
         }
     }
 
-    for (kind, key, message) in done_notifications(out) {
-        let decision = notification_route::decide(kind, &key, &message, "", &effective, &ctx);
+    for (kind, _, message) in done_notifications(out) {
+        let decision = notification_route::decide(kind, "", &message, "", &effective, &ctx);
         if decision.record
-            && let Err(error) = db.put_notification_once(kind.as_str(), &key, &message, "")
+            && let Err(error) = db.put_notification_once(kind.as_str(), "", &message, "")
         {
             tracing::warn!(target: "thegn::merge", %error, "could not record CLI merge queue bookkeeping notification");
         }
@@ -281,7 +277,37 @@ mod tests {
             )],
             &DriveOutcome::default(),
         );
-        assert_eq!(db.get_unread_notifications().unwrap().len(), 2);
+        let unread = db.get_unread_notifications().unwrap();
+        assert_eq!(unread.len(), 2);
+        let deferred_signature = hold_signature(MqStatus::Deferred, "feat-a").unwrap();
+        let gate_failed_signature = hold_signature(MqStatus::GateFailed, "feat-a").unwrap();
+        assert!(
+            unread
+                .iter()
+                .any(|notification| { notification.message.starts_with(&deferred_signature) })
+        );
+        assert!(
+            unread
+                .iter()
+                .any(|notification| { notification.message.starts_with(&gate_failed_signature) })
+        );
+    }
+
+    #[test]
+    fn landed_step_can_be_recorded_again_after_reading() {
+        let db = Db::open_memory().unwrap();
+        let config = Config::default();
+        let steps = [step("/work/feature", "feature", MqStatus::Landed, "")];
+
+        record_cli_drain(&config, &db, &steps, &DriveOutcome::default());
+        let first = db.get_all_notifications(10).unwrap();
+        assert_eq!(first.len(), 1);
+        db.mark_notification_read(first[0].id).unwrap();
+
+        record_cli_drain(&config, &db, &steps, &DriveOutcome::default());
+
+        let all = db.get_all_notifications(10).unwrap();
+        assert_eq!(all.len(), 2);
     }
 
     #[test]
