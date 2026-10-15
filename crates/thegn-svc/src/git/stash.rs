@@ -1,13 +1,53 @@
 //! Stash operations, including the staged-only (git ≥ 2.35) and
 //! unstaged-only (temp-commit dance) variants.
 
-use super::{GitBackend, run_w};
+use super::{GitBackend, run_w, run_w_locked};
 use anyhow::{Result, bail};
 use thegn_core::gitrefs::{parse_git_version, supports_stash_staged};
 use thegn_core::remote::GitLoc;
 
 fn at(index: usize) -> String {
     format!("stash@{{{index}}}")
+}
+
+fn stash_index_for(loc: &GitLoc, sha: &str) -> Result<Option<usize>> {
+    let (exit, out) = super::run_status(
+        loc,
+        &["stash", "list", "-z", "--format=%gd%x00%H%x00%ct%x00%gs"],
+    )?;
+    if exit != 0 {
+        bail!("git stash list exited with status {exit}");
+    }
+    Ok(thegn_core::gitrefs::parse_stashes(&out)?
+        .into_iter()
+        .find(|entry| entry.sha == sha)
+        .map(|entry| entry.index))
+}
+
+fn require_index(sha: &str, index: Option<usize>) -> Result<usize> {
+    match index {
+        Some(index) => Ok(index),
+        None => {
+            let short: String = sha.chars().take(7).collect();
+            bail!("stash {short} no longer exists (the stash list changed); refresh and retry");
+        }
+    }
+}
+
+fn stash_mutate(loc: &GitLoc, verb: &str, sha: &str) -> Result<()> {
+    if loc.is_remote() || crate::bridge::for_loc(loc).is_some() {
+        let index = require_index(sha, stash_index_for(loc, sha)?)?;
+        run_w(loc, &[], &["stash", verb, &at(index)]).map(|_| ())
+    } else {
+        let lock = super::require_mutation_lock_within(
+            std::path::Path::new(&loc.path()),
+            &["stash", verb],
+            super::MUTATION_LOCK_WAIT,
+        )?;
+        let index = require_index(sha, stash_index_for(loc, sha)?)?;
+        let selector = at(index);
+        run_w_locked(loc, &[], &["stash", verb, &selector], &lock).map(|_| ())
+    }
 }
 
 pub trait StashOps: GitBackend {
@@ -56,16 +96,19 @@ pub trait StashOps: GitBackend {
         restored.map(|_| ())
     }
 
-    fn stash_pop(&self, loc: &GitLoc, index: usize) -> Result<()> {
-        run_w(loc, &[], &["stash", "pop", &at(index)]).map(|_| ())
+    /// Resolve the stash index at mutation time under the local git lock.
+    fn stash_pop(&self, loc: &GitLoc, sha: &str) -> Result<()> {
+        stash_mutate(loc, "pop", sha)
     }
 
-    fn stash_apply(&self, loc: &GitLoc, index: usize) -> Result<()> {
-        run_w(loc, &[], &["stash", "apply", &at(index)]).map(|_| ())
+    /// Resolve the stash index at mutation time under the local git lock.
+    fn stash_apply(&self, loc: &GitLoc, sha: &str) -> Result<()> {
+        stash_mutate(loc, "apply", sha)
     }
 
-    fn stash_drop(&self, loc: &GitLoc, index: usize) -> Result<()> {
-        run_w(loc, &[], &["stash", "drop", &at(index)]).map(|_| ())
+    /// Resolve the stash index at mutation time under the local git lock.
+    fn stash_drop(&self, loc: &GitLoc, sha: &str) -> Result<()> {
+        stash_mutate(loc, "drop", sha)
     }
 
     /// A stash's patch. `-u` includes the untracked third-parent tree that
@@ -81,7 +124,7 @@ impl<T: GitBackend + ?Sized> StashOps for T {}
 mod tests {
     use super::super::testutil::{TestRepo, git_in};
     use super::super::{CliGit, GitBackend};
-    use super::StashOps;
+    use super::{StashOps, require_index};
     use std::path::Path;
     use thegn_core::gitrefs::{parse_git_version, supports_stash_staged};
 
@@ -95,6 +138,16 @@ mod tests {
 
     fn read(repo: &TestRepo, path: &str) -> String {
         std::fs::read_to_string(repo.dir.join(path)).unwrap()
+    }
+
+    #[test]
+    fn require_index_formats_the_vanished_stash_error_once() {
+        let error = require_index("1234567890abcdef", None).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "stash 1234567 no longer exists (the stash list changed); refresh and retry"
+        );
     }
 
     #[test]
@@ -122,7 +175,8 @@ mod tests {
             list[0].message
         );
 
-        CliGit.stash_pop(&loc, 0).unwrap();
+        let sha = CliGit.stash_list(&loc).unwrap()[0].sha.clone();
+        CliGit.stash_pop(&loc, &sha).unwrap();
         assert!(
             CliGit.stash_list(&loc).unwrap().is_empty(),
             "pop drops the entry"
@@ -140,11 +194,12 @@ mod tests {
         let loc = repo.loc();
         CliGit.stash_push(&loc, "keepme", false).unwrap();
 
-        CliGit.stash_apply(&loc, 0).unwrap();
+        let sha = CliGit.stash_list(&loc).unwrap()[0].sha.clone();
+        CliGit.stash_apply(&loc, &sha).unwrap();
         assert_eq!(read(&repo, "f.txt"), "two\n");
         assert_eq!(CliGit.stash_list(&loc).unwrap().len(), 1, "apply keeps it");
 
-        CliGit.stash_drop(&loc, 0).unwrap();
+        CliGit.stash_drop(&loc, &sha).unwrap();
         assert!(CliGit.stash_list(&loc).unwrap().is_empty());
         assert_eq!(
             read(&repo, "f.txt"),
@@ -253,5 +308,119 @@ mod tests {
         let patch = CliGit.stash_show(&loc, &sha_a).unwrap();
         assert!(patch.contains("stash A"), "{patch}");
         assert!(!patch.contains("stash B"), "{patch}");
+    }
+
+    #[test]
+    fn stash_drop_by_sha_survives_index_shift() {
+        let repo = TestRepo::new("st-drop-shift");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "base\n", "c0");
+        let loc = repo.loc();
+        std::fs::write(repo.dir.join("f.txt"), "stash A\n").unwrap();
+        CliGit.stash_push(&loc, "stash A", false).unwrap();
+        let sha_a = CliGit.stash_list(&loc).unwrap()[0].sha.clone();
+        std::fs::write(repo.dir.join("f.txt"), "stash B\n").unwrap();
+        CliGit.stash_push(&loc, "stash B", false).unwrap();
+        let sha_b = CliGit.stash_list(&loc).unwrap()[0].sha.clone();
+
+        CliGit.stash_drop(&loc, &sha_a).unwrap();
+
+        let remaining = CliGit.stash_list(&loc).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].sha, sha_b, "drop removed the selected stash A");
+    }
+
+    #[test]
+    fn stash_pop_and_apply_by_sha_target_the_shifted_entry() {
+        let apply_repo = TestRepo::new("st-apply-shift");
+        ident(&apply_repo.dir);
+        apply_repo.commit_file("f.txt", "base\n", "c0");
+        let apply_loc = apply_repo.loc();
+        std::fs::write(apply_repo.dir.join("f.txt"), "stash A\n").unwrap();
+        CliGit.stash_push(&apply_loc, "stash A", false).unwrap();
+        let apply_sha_a = CliGit.stash_list(&apply_loc).unwrap()[0].sha.clone();
+        std::fs::write(apply_repo.dir.join("f.txt"), "stash B\n").unwrap();
+        CliGit.stash_push(&apply_loc, "stash B", false).unwrap();
+        let apply_sha_b = CliGit.stash_list(&apply_loc).unwrap()[0].sha.clone();
+
+        CliGit.stash_apply(&apply_loc, &apply_sha_a).unwrap();
+
+        assert_eq!(read(&apply_repo, "f.txt"), "stash A\n");
+        let apply_stashes = CliGit.stash_list(&apply_loc).unwrap();
+        assert_eq!(apply_stashes.len(), 2, "apply preserves both entries");
+        assert!(apply_stashes.iter().any(|entry| entry.sha == apply_sha_b));
+
+        let pop_repo = TestRepo::new("st-pop-shift");
+        ident(&pop_repo.dir);
+        pop_repo.commit_file("f.txt", "base\n", "c0");
+        let pop_loc = pop_repo.loc();
+        std::fs::write(pop_repo.dir.join("f.txt"), "stash A\n").unwrap();
+        CliGit.stash_push(&pop_loc, "stash A", false).unwrap();
+        let pop_sha_a = CliGit.stash_list(&pop_loc).unwrap()[0].sha.clone();
+        std::fs::write(pop_repo.dir.join("f.txt"), "stash B\n").unwrap();
+        CliGit.stash_push(&pop_loc, "stash B", false).unwrap();
+        let pop_sha_b = CliGit.stash_list(&pop_loc).unwrap()[0].sha.clone();
+
+        CliGit.stash_pop(&pop_loc, &pop_sha_a).unwrap();
+
+        assert_eq!(read(&pop_repo, "f.txt"), "stash A\n");
+        let pop_stashes = CliGit.stash_list(&pop_loc).unwrap();
+        assert_eq!(pop_stashes.len(), 1);
+        assert_eq!(
+            pop_stashes[0].sha, pop_sha_b,
+            "pop removed selected stash A"
+        );
+    }
+
+    #[test]
+    fn stash_mutation_refuses_a_vanished_sha() {
+        let repo = TestRepo::new("st-vanished");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "base\n", "c0");
+        let loc = repo.loc();
+        std::fs::write(repo.dir.join("f.txt"), "stash A\n").unwrap();
+        CliGit.stash_push(&loc, "stash A", false).unwrap();
+        let sha_a = CliGit.stash_list(&loc).unwrap()[0].sha.clone();
+        std::fs::write(repo.dir.join("f.txt"), "stash B\n").unwrap();
+        CliGit.stash_push(&loc, "stash B", false).unwrap();
+        let sha_b = CliGit.stash_list(&loc).unwrap()[0].sha.clone();
+        CliGit.stash_drop(&loc, &sha_a).unwrap();
+
+        for result in [
+            CliGit.stash_drop(&loc, &sha_a),
+            CliGit.stash_pop(&loc, &sha_a),
+            CliGit.stash_apply(&loc, &sha_a),
+        ] {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("no longer exists"), "{error}");
+        }
+        let remaining = CliGit.stash_list(&loc).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].sha, sha_b);
+    }
+
+    #[test]
+    fn stash_mutation_refuses_when_the_mutation_lock_is_unavailable() {
+        let repo = TestRepo::new("st-no-lock");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "base\n", "c0");
+        let loc = repo.loc();
+        std::fs::write(repo.dir.join("f.txt"), "stash A\n").unwrap();
+        CliGit.stash_push(&loc, "stash A", false).unwrap();
+        let sha_a = CliGit.stash_list(&loc).unwrap()[0].sha.clone();
+        let lock_path = thegn_core::util::git_common_dir(&repo.dir).join("thegn-git.lock");
+        // The earlier stash push left the regular lock file behind; replace it
+        // with a directory so the lock cannot be opened.
+        if lock_path.exists() {
+            std::fs::remove_file(&lock_path).unwrap();
+        }
+        std::fs::create_dir(lock_path).unwrap();
+
+        let error = CliGit.stash_drop(&loc, &sha_a).unwrap_err().to_string();
+
+        assert!(error.contains("mutation lock"), "{error}");
+        let remaining = CliGit.stash_list(&loc).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].sha, sha_a);
     }
 }

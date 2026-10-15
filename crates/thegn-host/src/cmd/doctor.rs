@@ -173,8 +173,13 @@ fn sandbox_json_with(cfg: &Config, backend: Backend, actual: IsolationClass) -> 
             "policy": profile_policy(cfg.sandbox.profile),
         },
         "limits": limits_json(cfg),
-        "isolation_floor": cfg.sandbox.isolation_floor.as_str(),
-        "on_floor_miss": cfg.sandbox.on_floor_miss.as_str(),
+        "isolation_floor": thegn_core::sandbox_floor::floor_in_force(&cfg.sandbox, false).as_str(),
+        "isolation_floor_source": if cfg.sandbox.isolation_floor.is_some() {
+            "configured"
+        } else {
+            "default"
+        },
+        "on_floor_miss": thegn_core::sandbox_floor::miss_policy_in_force(&cfg.sandbox).as_str(),
         "containment": thegn_core::sandbox_floor::containment_summary(
             cfg.sandbox.enabled,
             actual,
@@ -3660,13 +3665,20 @@ fn network_rules_line(sb: &thegn_core::config::SandboxConfig, backend: Backend) 
     .map(|note| note.trim_start_matches("sandbox ").to_string())
 }
 
-/// The isolation floor line: the demanded minimum, the miss policy, and whether
+/// The isolation floor line: the effective minimum, its source, and whether
 /// the launch this host would actually pick meets it — computed with the same
 /// pure [`thegn_core::sandbox_floor::decide`] the launch path uses.
 fn floor_report(cfg: &Config) {
     use thegn_core::config::IsolationFloor;
-    use thegn_core::sandbox_floor::{FloorDecision, containment_summary, decide};
-    let floor = cfg.sandbox.isolation_floor;
+    use thegn_core::sandbox_floor::{
+        FloorDecision, containment_summary, decide, floor_in_force, miss_policy_in_force,
+    };
+    let floor = floor_in_force(&cfg.sandbox, false);
+    let source = if cfg.sandbox.isolation_floor.is_some() {
+        "configured"
+    } else {
+        "default"
+    };
     let report = local_backend_report(cfg);
     let (_, actual) = effective_first_ready(cfg, &report);
     // The strongest class any usable backend could give, for a concrete remedy.
@@ -3676,15 +3688,23 @@ fn floor_report(cfg: &Config) {
         .filter_map(|r| r.isolation)
         .max_by_key(|c| c.rank().unwrap_or(0))
         .unwrap_or(actual);
-    if floor == IsolationFloor::Off {
-        outln!("  floor         (none — set [sandbox] isolation_floor to demand a minimum)");
+    if floor == IsolationFloor::Off && source == "default" {
+        let bypass = if !cfg.sandbox.enabled {
+            "sandbox disabled"
+        } else {
+            "backend = \"none\""
+        };
+        outln!("  floor         off (default floor not applied: {bypass})");
+    } else if floor == IsolationFloor::Off {
+        outln!("  floor         off (configured)");
     } else {
         outln!(
-            "  floor         {} (on miss: {})",
+            "  floor         {} (on miss: {}; {})",
             floor.as_str(),
-            cfg.sandbox.on_floor_miss.as_str()
+            miss_policy_in_force(&cfg.sandbox).as_str(),
+            source
         );
-        match decide(floor, cfg.sandbox.on_floor_miss, actual, best) {
+        match decide(floor, miss_policy_in_force(&cfg.sandbox), actual, best) {
             FloorDecision::Ok => outln!(
                 "                met — this host would launch at `{}`",
                 actual
@@ -4881,7 +4901,7 @@ args = ["--verbose"]
             sandbox: SandboxConfig {
                 backend: SandboxBackend::None,
                 file_access: FileAccess::Worktree,
-                isolation_floor: IsolationFloor::Off,
+                isolation_floor: Some(IsolationFloor::Off),
                 on_floor_miss: OnFloorMiss::Fail,
                 ..SandboxConfig::default()
             },
@@ -4889,6 +4909,8 @@ args = ["--verbose"]
         };
         let value = sandbox_json_with(&cfg, Backend::None, IsolationClass::HostProcess);
         assert_eq!(value["containment"], "not-contained");
+        assert_eq!(value["isolation_floor"], "off");
+        assert_eq!(value["isolation_floor_source"], "configured");
         assert!(!value["file_access_enforced"].as_bool().unwrap());
         assert!(value["containment"].is_string());
         assert!(value["file_access_enforced"].is_boolean());
@@ -4896,5 +4918,11 @@ args = ["--verbose"]
         let contained = sandbox_json_with(&cfg, Backend::Bwrap, IsolationClass::SharedKernel);
         assert_eq!(contained["containment"], "contained:shared-kernel");
         assert!(contained["file_access_enforced"].as_bool().unwrap());
+
+        let defaults = Config::default();
+        let value = sandbox_json_with(&defaults, Backend::Bwrap, IsolationClass::SharedKernel);
+        assert_eq!(value["isolation_floor"], "shared-kernel");
+        assert_eq!(value["isolation_floor_source"], "default");
+        assert_eq!(value["on_floor_miss"], "fail");
     }
 }

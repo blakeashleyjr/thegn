@@ -128,7 +128,7 @@ fn g2_universal_block_runs_offline() {
         image: "docker.io/library/alpine:latest".into(),
         network: Network::Nat,
         network_block: vec!["*".into()],
-        isolation_floor: IsolationFloor::Off,
+        isolation_floor: Some(IsolationFloor::Off),
         on_floor_miss: OnFloorMiss::Degrade,
         ..Default::default()
     };

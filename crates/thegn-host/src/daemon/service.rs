@@ -1174,6 +1174,7 @@ impl ControlApi for DaemonService {
                         // A tombstone only knows where the file went; the live
                         // actor already logged/reported any finalize failure.
                         truncated: None,
+                        dropped_bytes: 0,
                     });
                 }
                 Lookup::Unknown => return Err(Self::not_found(session)),

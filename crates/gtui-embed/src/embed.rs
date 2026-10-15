@@ -224,6 +224,11 @@ impl AppTile for ObserveTile {
             self.is_panicked = true;
         }
     }
+
+    fn on_theme(&mut self, theme: &Theme) {
+        self.theme = theme.clone();
+        self.needs_redraw = true;
+    }
 }
 
 /// Maximum custom dashboard size accepted at the load boundary (1 MiB).
@@ -925,6 +930,37 @@ mod tests {
         );
         assert_eq!(buf.cell((0, 0)).unwrap().fg, theme.color(Tok::Border));
         assert_eq!(buf.cell((2, 0)).unwrap().fg, theme.color(Tok::Text));
+    }
+
+    #[test]
+    fn theme_update_redraws_crash_placeholder_with_new_border_token() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut tile = ObserveTile::new(
+                Arc::new(|| {}),
+                &ObserveConfig::default(),
+                tokio::runtime::Handle::current(),
+                Theme::prism(),
+                || {},
+            )
+            .unwrap();
+            tile.is_panicked = true;
+            let area = Rect::new(0, 0, 30, 5);
+            let mut buf = Buffer::empty(area);
+            tile.render(area, &mut buf);
+            assert!(!tile.wants_redraw());
+
+            let mut next_theme = Theme::prism();
+            next_theme.border = (1, 2, 3);
+            tile.on_theme(&next_theme);
+            assert!(tile.wants_redraw());
+            tile.render(area, &mut buf);
+
+            assert_eq!(buf.cell((0, 0)).unwrap().fg, next_theme.color(Tok::Border));
+        });
     }
 
     #[test]

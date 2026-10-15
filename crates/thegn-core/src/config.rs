@@ -641,9 +641,11 @@ config_enum! {
 config_enum! {
     /// `[sandbox] isolation_floor` — the minimum honest isolation class a launch
     /// may enter (reusing the [`IsolationClass`](crate::capabilities::IsolationClass)
-    /// vocabulary). `off` (default) preserves today's behavior: the chain
-    /// degrades freely. A set floor demands the *resolved* launch meet or exceed
-    /// the named class; the comparison and miss policy live in
+    /// vocabulary). When omitted, enabled launches without a deliberate host
+    /// opt-out require `shared-kernel`; explicit host choices default to
+    /// `off`. An explicit value always wins. A set floor demands the *resolved*
+    /// launch meet or exceed the named class; the comparison and miss policy
+    /// live in
     /// [`crate::sandbox_floor`]. `host-process` is not a valid floor — it is
     /// always met — and is rejected here.
     pub enum IsolationFloor: "isolation floor" {
@@ -689,10 +691,10 @@ impl IsolationFloor {
 }
 config_enum! {
     /// `[sandbox] on_floor_miss` — what happens when the resolved launch cannot
-    /// meet [`IsolationFloor`]. `degrade` (default) launches with the degraded
-    /// flag + a warning naming the floor and the class actually provided (the
-    /// fail-safe interactive convention); `fail` refuses to launch before any
+    /// meet [`IsolationFloor`]. `fail` (default) refuses to launch before any
     /// process spawns on the host (the VPN `on_error = "fail"` precedent).
+    /// `degrade` applies only to an explicitly configured `isolation_floor`; the
+    /// default floor always refuses.
     pub enum OnFloorMiss: "on_floor_miss" {
         Degrade = "degrade", Fail = "fail",
     } default = Degrade;
@@ -3042,9 +3044,9 @@ pub struct StatsConfig {
     pub cpu_icon: String,
     /// Icon for memory stat.
     pub mem_icon: String,
-    /// Icon for network stat. The shipped default auto-selects Ethernet, Wi-Fi,
-    /// or a generic network glyph from the default route; any other value is a
-    /// fixed icon override.
+    /// Icon for network stat. The shipped default auto-selects the per-medium
+    /// glyph from `[stats.net_icons]` (or the built-in glyph); any other value
+    /// is a fixed icon override that ignores `[stats.net_icons]`.
     pub net_icon: String,
     /// Icon for GPU stat.
     pub gpu_icon: String,
@@ -3077,6 +3079,22 @@ pub struct StatsConfig {
     pub refresh_rates: Vec<f64>,
     /// `[stats.alerts]` — threshold alerts on the sampled metrics.
     pub alerts: StatsAlertsConfig,
+    /// `[stats.net_icons]` — per-medium glyphs used only in network auto mode.
+    pub net_icons: NetIconsConfig,
+}
+
+/// `[stats.net_icons]` — optional per-medium network glyphs.
+///
+/// Used only while `stats.net_icon` is its shipped default (automatic mode).
+/// An empty value uses the built-in glyph, which degrades to ASCII on limited
+/// terminals. Non-empty values are printed as-is and should be single-width
+/// PUA glyphs (U+E000–U+F8FF) to keep the icon aligned with its value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct NetIconsConfig {
+    pub wifi: String,
+    pub ethernet: String,
+    pub generic: String,
 }
 
 /// `[stats.alerts]` — threshold alerts on system metrics.
@@ -3267,6 +3285,7 @@ impl Default for StatsConfig {
             disk_path: String::new(),
             refresh_rates: vec![1.0, 2.0, 5.0, 10.0],
             alerts: StatsAlertsConfig::default(),
+            net_icons: NetIconsConfig::default(),
         }
     }
 }
@@ -3350,10 +3369,10 @@ pub struct LimitsConfig {
     /// Max concurrent test/discovery jobs across all worktrees. 1 keeps an
     /// explicit run from competing with another worktree's run for cores.
     pub test_max_parallel: usize,
-    /// Wall-clock ceiling (seconds) for an explicit test run before its process
-    /// group is killed. Generous, since suites legitimately take a while; the
-    /// point is that a wedged run (e.g. blocked on a build lock) can't hang the
-    /// panel forever. 0 disables the deadline.
+    /// Wall-clock ceiling (seconds) for an explicit test run or named job
+    /// before its process group is killed. Generous, since suites legitimately
+    /// take a while; the point is that a wedged run (e.g. blocked on a build
+    /// lock) can't hang the panel forever. 0 disables the deadline.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub test_timeout_secs: u64,
     /// Wall-clock ceiling (seconds) for test *discovery*. Discovery should be
@@ -4336,14 +4355,18 @@ pub struct SandboxConfig {
     /// OCI runtime for worktree containers (`--runtime`): `"runsc"` (gVisor) / `"krun"`
     /// (libkrun microVM); empty ⇒ default. OCI backends only. See config.toml.example.
     pub oci_runtime: String,
-    /// Minimum honest isolation class a launch may enter. `off` (default) leaves
-    /// the chain to degrade freely; a set floor demands the *resolved* launch
+    /// Minimum honest isolation class a launch may enter. Omitted means
+    /// `shared-kernel` for enabled launches except deliberate host choices
+    /// (`enabled = false`, `backend = "none"`, or run-on-host); explicit values
+    /// always win. A set floor demands the *resolved* launch
     /// meet or exceed it (compared over the honest class, after any runtime
     /// degrade). A repo overlay may only RAISE it. See [`crate::sandbox_floor`].
-    pub isolation_floor: IsolationFloor,
-    /// What happens when [`Self::isolation_floor`] cannot be met: `degrade`
-    /// (default — warn + degraded flag, then launch) or `fail` (refuse before any
-    /// host spawn). A repo overlay may only HARDEN it (`degrade` → `fail`).
+    pub isolation_floor: Option<IsolationFloor>,
+    /// What happens when the effective isolation floor cannot be met: `fail`
+    /// (default — refuse before any host spawn) or `degrade` (warn and launch
+    /// with a degraded flag). A repo overlay may only HARDEN it
+    /// (`degrade` → `fail`). `degrade` applies only to an explicitly configured
+    /// `isolation_floor`; the default floor always refuses.
     pub on_floor_miss: OnFloorMiss,
     pub remote: RemoteConfig,
     /// Allow-only these hostnames for outbound connections (empty = allow all).
@@ -4427,8 +4450,8 @@ impl Default for SandboxConfig {
             failover: FailoverMode::Halt,
             oci_host: String::new(),
             oci_runtime: String::new(),
-            isolation_floor: IsolationFloor::Off,
-            on_floor_miss: OnFloorMiss::Degrade,
+            isolation_floor: None,
+            on_floor_miss: OnFloorMiss::Fail,
             remote: RemoteConfig::default(),
             network_allow: Vec::new(),
             network_block: Vec::new(),

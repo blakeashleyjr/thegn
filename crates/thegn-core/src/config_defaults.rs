@@ -33,10 +33,10 @@ pub(crate) fn default_custom_command_timeout_secs() -> u64 {
 ///
 /// `apple` sits after `docker` and before `bwrap`: on a Mac the two OCI entries
 /// ahead of it (podman/docker machine) are explicit user installs and keep
-/// priority, `bwrap`/`systemd-run` are Linux-only, and without any of them the
-/// chain still ends at `host`. Before `apple` was in this list, a Mac with
-/// Apple's `container` installed silently resolved `auto` to an unsandboxed
-/// host pane.
+/// priority, while `bwrap`/`systemd-run` are Linux-only. The chain intentionally
+/// has no host fallback: if no usable backend meets the isolation floor, the
+/// sandboxed launch refuses. Host execution requires an explicit opt-out such
+/// as `[sandbox] isolation_floor = "off"` or `backend = "none"`.
 pub(crate) fn default_backend_chain() -> Vec<String> {
     [
         "podman-rootless",
@@ -45,7 +45,6 @@ pub(crate) fn default_backend_chain() -> Vec<String> {
         "apple",
         "bwrap",
         "jobobject",
-        "host",
     ]
     .iter()
     .map(|s| s.to_string())

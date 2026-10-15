@@ -493,6 +493,8 @@ mod tests {
         }
         c.sandbox.backend = SandboxBackend::Auto;
         c.sandbox.backend_chain = vec!["host".to_string()];
+        // host-semantics fixture: the THE-419 default floor would refuse this chain-host landing
+        c.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
         c
     }
 

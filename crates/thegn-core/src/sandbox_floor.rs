@@ -20,8 +20,35 @@
 //! the floor and is reported as `provider-managed`, never counted as a tier.
 
 use crate::capabilities::IsolationClass;
-use crate::config::{FileAccess, IsolationFloor, OnFloorMiss};
+use crate::config::{FileAccess, IsolationFloor, OnFloorMiss, SandboxBackend, SandboxConfig};
 use crate::sandbox::{Backend, BackendFamily};
+
+/// Default minimum for enabled sandbox launches that have not opted into a
+/// deliberate host execution choice.
+pub const DEFAULT_ISOLATION_FLOOR: IsolationFloor = IsolationFloor::SharedKernel;
+
+/// Resolve the floor that governs this launch. An explicit configured floor
+/// always wins, including over deliberate host choices.
+pub fn floor_in_force(sb: &SandboxConfig, host_pinned: bool) -> IsolationFloor {
+    if let Some(floor) = sb.isolation_floor {
+        return floor;
+    }
+    if !sb.enabled || sb.backend == SandboxBackend::None || host_pinned {
+        IsolationFloor::Off
+    } else {
+        DEFAULT_ISOLATION_FLOOR
+    }
+}
+
+/// Default-floor misses always refuse; only an explicitly configured floor
+/// may opt into its configured miss policy.
+pub fn miss_policy_in_force(sb: &SandboxConfig) -> OnFloorMiss {
+    if sb.isolation_floor.is_some() {
+        sb.on_floor_miss
+    } else {
+        OnFloorMiss::Fail
+    }
+}
 
 /// The outcome of comparing a resolved launch's honest class against the floor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,11 +90,11 @@ impl FloorMiss {
         )
     }
 
-    /// An actionable refusal that names both supported floor opt-outs.
+    /// An actionable refusal that names the supported floor opt-outs.
     /// `message()` remains the concise warning used by degrade paths.
     pub fn refusal(&self) -> String {
         format!(
-            "{}; to launch anyway set [sandbox] on_floor_miss = \"degrade\" (warn and mark degraded) or isolation_floor = \"off\"",
+            "{}; to launch on the host set [sandbox] isolation_floor = \"off\"; with no explicit floor, enabled = false, backend = \"none\", or \"run on host\" also opts out; for an explicit floor, on_floor_miss = \"degrade\" permits a warned launch",
             self.message()
         )
     }
@@ -370,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn refusal_names_both_opt_outs_and_preserves_message() {
+    fn refusal_names_opt_outs_and_explicit_floor_degrade_and_preserves_message() {
         let FloorDecision::Fail(miss) = decide(
             IsolationFloor::SharedKernel,
             OnFloorMiss::Fail,
@@ -382,8 +409,11 @@ mod tests {
         let refusal = miss.refusal();
         let message = miss.message();
         assert!(refusal.contains(message.as_str()));
-        assert!(refusal.contains("on_floor_miss = \"degrade\""));
         assert!(refusal.contains("isolation_floor = \"off\""));
+        assert!(refusal.contains("enabled = false"));
+        assert!(refusal.contains("backend = \"none\""));
+        assert!(refusal.contains("run on host"));
+        assert!(refusal.contains("on_floor_miss = \"degrade\""));
     }
 
     #[test]
@@ -598,5 +628,49 @@ mod tests {
             ),
             AgentGate::Run
         );
+    }
+
+    #[test]
+    fn default_floor_applies_only_to_enabled_non_host_launches() {
+        use crate::config::{SandboxBackend, SandboxConfig};
+
+        let base = SandboxConfig::default();
+        assert_eq!(floor_in_force(&base, false), IsolationFloor::SharedKernel);
+        assert_eq!(miss_policy_in_force(&base), OnFloorMiss::Fail);
+        let default_with_degrade = SandboxConfig {
+            on_floor_miss: OnFloorMiss::Degrade,
+            ..base.clone()
+        };
+        assert_eq!(
+            miss_policy_in_force(&default_with_degrade),
+            OnFloorMiss::Fail
+        );
+
+        let disabled = SandboxConfig {
+            enabled: false,
+            ..base.clone()
+        };
+        assert_eq!(floor_in_force(&disabled, false), IsolationFloor::Off);
+
+        let no_backend = SandboxConfig {
+            backend: SandboxBackend::None,
+            ..base.clone()
+        };
+        assert_eq!(floor_in_force(&no_backend, false), IsolationFloor::Off);
+        assert_eq!(floor_in_force(&base, true), IsolationFloor::Off);
+
+        let explicit = SandboxConfig {
+            enabled: false,
+            isolation_floor: Some(IsolationFloor::GuestKernel),
+            on_floor_miss: OnFloorMiss::Degrade,
+            ..base.clone()
+        };
+        assert_eq!(floor_in_force(&explicit, true), IsolationFloor::GuestKernel);
+        assert_eq!(miss_policy_in_force(&explicit), OnFloorMiss::Degrade);
+        let explicit_off = SandboxConfig {
+            isolation_floor: Some(IsolationFloor::Off),
+            ..base
+        };
+        assert_eq!(floor_in_force(&explicit_off, false), IsolationFloor::Off);
     }
 }

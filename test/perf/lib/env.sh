@@ -21,7 +21,8 @@ perf_make_tmp() {
   export XDG_STATE_HOME="$PERF_TMP/state"
   export XDG_CACHE_HOME="$PERF_TMP/cache"
   # ALSO the runtime dir, and this one is not cosmetic. The pane daemon's
-  # control socket resolves to `$XDG_RUNTIME_DIR/thegn/daemon.sock` FIRST and
+  # control socket resolves to
+  # `$XDG_RUNTIME_DIR/thegn/<scope-key>/daemon.sock` FIRST and
   # only falls back to the isolated `$XDG_STATE_HOME/thegn/run/` when that is
   # unset. Leaving the developer's real `/run/user/<uid>` in place means a
   # daemon-enabled scenario binds — or worse, attaches to — the daemon owning

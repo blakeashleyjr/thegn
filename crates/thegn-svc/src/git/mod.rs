@@ -1170,6 +1170,12 @@ pub enum DiffCount {
     Unavailable,
 }
 
+impl Default for DiffCount {
+    fn default() -> Self {
+        Self::Exact(0)
+    }
+}
+
 /// Convert per-file rows into typed added/deleted totals. Mixed text/binary
 /// diffs retain their exact text-line sums; binary-only diffs report `Binary`.
 pub fn typed_totals(entries: Result<&[DiffEntry]>) -> (DiffCount, DiffCount) {
@@ -1225,19 +1231,20 @@ pub fn typed_totals(entries: Result<&[DiffEntry]>) -> (DiffCount, DiffCount) {
 /// saturate at `u32::MAX`, exactly like the native backend, so the result never
 /// depends on the build profile or backend. Shared by the batched
 /// [`GitBackend::glyph_reads`] sidebar diff-stat reads.
+#[cfg(test)]
 pub(crate) fn sum_numstat(out: &str) -> Result<(u32, u32)> {
     let entries = parse_numstat(out)?;
-    let (added, deleted) = typed_totals(Ok(&entries));
-    let numeric = |count| match count {
-        DiffCount::Exact(n) => n,
-        DiffCount::Binary => 0,
-        DiffCount::Capped => u32::MAX,
-        DiffCount::Unavailable => 0,
-    };
-    Ok((numeric(added), numeric(deleted)))
+    Ok(sum_entries(&entries))
+}
+
+/// Parse numstat rows and preserve binary and overflow observations.
+pub(crate) fn typed_numstat(out: &str) -> Result<(DiffCount, DiffCount)> {
+    let entries = parse_numstat(out)?;
+    Ok(typed_totals(Ok(&entries)))
 }
 
 /// Saturating `(added, deleted)` totals of per-file rows (shared by both backends).
+#[cfg(test)]
 pub(crate) fn sum_entries(entries: &[DiffEntry]) -> (u32, u32) {
     entries.iter().fold((0u32, 0u32), |(a, d), e| {
         (a.saturating_add(e.added), d.saturating_add(e.deleted))
@@ -1742,7 +1749,7 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
                     ))
                 };
                 let uncommitted = if r[3].exit == 0 {
-                    sum_numstat(&r[3].stdout)
+                    typed_numstat(&r[3].stdout)
                 } else {
                     Err(anyhow::anyhow!("git diff failed: {}", r[3].stderr.trim()))
                 };
@@ -1750,7 +1757,7 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
                 let branch_diff = if let Some(idx) = branch_diff_idx {
                     r.get(idx)
                         .filter(|res| res.exit == 0)
-                        .map(|res| sum_numstat(&res.stdout))
+                        .map(|res| typed_numstat(&res.stdout))
                         .transpose()
                 } else {
                     Ok(None)
@@ -1825,7 +1832,7 @@ fn local_glyph_reads(
         )
         .and_then(|(exit, out)| {
             anyhow::ensure!(exit == 0, "git diff --numstat HEAD failed");
-            sum_numstat(&out)
+            typed_numstat(&out)
         }),
         branch_diff: match &base {
             Some(b) => run_status(
@@ -1838,7 +1845,7 @@ fn local_glyph_reads(
                     &format!("{b}...HEAD"),
                 ],
             )
-            .and_then(|(exit, out)| (exit == 0).then(|| sum_numstat(&out)).transpose()),
+            .and_then(|(exit, out)| (exit == 0).then(|| typed_numstat(&out)).transpose()),
             // No base resolvable — "no badge", not an error.
             None => Ok(None),
         },
@@ -1857,7 +1864,7 @@ fn local_glyph_reads(
 /// This is the read that dominated the audit: `git diff --numstat <base>...HEAD`
 /// is a merge-base plus a whole-tree diff, and the glyph scan runs it per
 /// refresh. See [`native_diff`] for why the native path needs no new dependency.
-fn numstat_totals(loc: &GitLoc, spec: &str) -> Result<(u32, u32)> {
+fn numstat_totals(loc: &GitLoc, spec: &str) -> Result<(DiffCount, DiffCount)> {
     if !loc.is_remote()
         && let Ok(t) = native_diff::totals(loc.path(), spec)
     {
@@ -1868,7 +1875,7 @@ fn numstat_totals(loc: &GitLoc, spec: &str) -> Result<(u32, u32)> {
         &["diff", "--no-ext-diff", "--no-textconv", "--numstat", spec],
     )?;
     anyhow::ensure!(exit == 0, "git diff --numstat {spec} failed");
-    sum_numstat(&out)
+    typed_numstat(&out)
 }
 
 /// The gix backend's glyph reads: [`local_glyph_reads`]'s shape, but with the
@@ -1902,12 +1909,12 @@ pub struct GlyphReads {
     pub ahead_behind: Result<Option<(usize, usize)>>,
     pub branch: Result<String>,
     /// Uncommitted working-tree change (added, deleted) vs HEAD.
-    pub uncommitted: Result<(u32, u32)>,
+    pub uncommitted: Result<(DiffCount, DiffCount)>,
     /// Total branch change (added, deleted) vs the repo's **local** default
     /// branch (see `glyph_base` — deliberately not `origin/HEAD`, so an
     /// unpushed trunk doesn't leak its backlog into every row). `None` when no
     /// base is resolvable.
-    pub branch_diff: Result<Option<(u32, u32)>>,
+    pub branch_diff: Result<Option<(DiffCount, DiffCount)>>,
     /// Whether any gitlink is moved, dirty, untracked, diverged, conflicted,
     /// unavailable, or uninitialized. This is independent of ordinary files.
     pub submodule_dirty: Result<bool>,
@@ -1926,7 +1933,7 @@ pub(crate) fn run_w(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Resul
     }
     // Remote locs do not have a local repository lock; local mutations must
     // fail closed when the advisory lock cannot be acquired.
-    let _lock = if loc.is_remote() {
+    let lock = if loc.is_remote() {
         None
     } else {
         Some(require_mutation_lock(
@@ -1934,6 +1941,14 @@ pub(crate) fn run_w(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Resul
             args,
         )?)
     };
+    match lock.as_ref() {
+        Some(held) => run_w_locked(loc, envs, args, held),
+        None => run_w_unlocked(loc, envs, args),
+    }
+}
+
+/// Run the write subprocess after the caller has selected the locking policy.
+fn run_w_unlocked(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Result<String> {
     // Marks the write for snapshot caches of git reads (THE-718); dropped
     // (advancing the epoch) after the subprocess and its lock are done.
     let _epoch = thegn_core::util::GitWriteScope::begin();
@@ -1952,6 +1967,17 @@ pub(crate) fn run_w(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Resul
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// [`run_w`] for a local mutation whose caller already holds the repository
+/// mutation lock. The guard is required as proof and must outlive this call.
+pub(crate) fn run_w_locked(
+    loc: &GitLoc,
+    envs: &[(&str, &str)],
+    args: &[&str],
+    _held: &thegn_core::util::GitLock,
+) -> Result<String> {
+    run_w_unlocked(loc, envs, args)
 }
 
 /// [`run_w`] with bytes piped to stdin (`git apply -`, `git commit -F -`).
@@ -4085,6 +4111,18 @@ mod tests {
             "per-file diff paths must agree with first-parent file list"
         );
     }
+    #[test]
+    fn typed_numstat_keeps_binary_and_capped() {
+        assert_eq!(
+            typed_numstat("-\t-\timage.png\n").unwrap(),
+            (DiffCount::Binary, DiffCount::Binary)
+        );
+        let out = format!("{}\t0\ta\n1\t0\tb\n", u32::MAX);
+        assert_eq!(
+            typed_numstat(&out).unwrap(),
+            (DiffCount::Capped, DiffCount::Exact(0))
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4166,6 +4204,73 @@ mod read_fence_tests {
         assert!(
             !marker.exists(),
             "diff readers must disable configured textconv drivers"
+        );
+    }
+
+    #[test]
+    fn stageable_diff_reads_never_run_external_diff_or_attribute_drivers() {
+        let (dir, loc) = private_repo();
+        std::fs::write(dir.path().join("sample.txt"), "base\n").unwrap();
+        std::fs::write(dir.path().join(".gitattributes"), "*.txt diff=canary\n").unwrap();
+        super::testutil::git_in(dir.path(), &["add", "sample.txt", ".gitattributes"]);
+        super::testutil::git_in(dir.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::write(dir.path().join("sample.txt"), "committed\n").unwrap();
+        super::testutil::git_in(dir.path(), &["add", "sample.txt"]);
+        super::testutil::git_in(dir.path(), &["commit", "-q", "-m", "committed change"]);
+        std::fs::write(dir.path().join("sample.txt"), "staged\n").unwrap();
+        super::testutil::git_in(dir.path(), &["add", "sample.txt"]);
+        std::fs::write(dir.path().join("sample.txt"), "worktree\n").unwrap();
+
+        let marker = dir.path().join("external-diff-ran");
+        let driver = dir.path().join("external-diff.sh");
+        std::fs::write(
+            &driver,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nprintf 'not a patch\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        super::testutil::git_in(
+            dir.path(),
+            &[
+                "config",
+                "diff.external",
+                &format!("sh '{}'", driver.display()),
+            ],
+        );
+        super::testutil::git_in(
+            dir.path(),
+            &[
+                "config",
+                "diff.canary.command",
+                &format!("sh '{}'", driver.display()),
+            ],
+        );
+
+        let plain_diff = super::run(&loc, &["diff", "HEAD", "--", "sample.txt"]).unwrap();
+        assert!(
+            marker.exists(),
+            "plain git diff positive control did not run external diff"
+        );
+        assert!(plain_diff.contains("not a patch"));
+        std::fs::remove_file(&marker).unwrap();
+
+        let hunks = CliGit.diff_hunks(&loc, "HEAD", "sample.txt", 40).unwrap();
+        let unstaged = CliGit.unstaged_diff(&loc, "sample.txt").unwrap();
+        let staged = CliGit.staged_diff(&loc, "sample.txt").unwrap();
+        let range = CliGit.range_patch(&loc, "HEAD~1", "HEAD").unwrap();
+
+        assert!(!hunks.is_empty(), "hunk reader returned no unified change");
+        for (name, patch) in [("unstaged", unstaged), ("staged", staged), ("range", range)] {
+            assert!(
+                patch.starts_with("diff --git "),
+                "{name} output was not a unified patch"
+            );
+        }
+        assert!(
+            !marker.exists(),
+            "stageable diff readers must disable both repo external diff and attribute drivers"
         );
     }
 }

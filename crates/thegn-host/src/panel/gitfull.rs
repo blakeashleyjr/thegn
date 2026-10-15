@@ -243,6 +243,9 @@ fn status_rows(model: &FrameModel, ui: &PanelUi, _focused: bool) -> Vec<PanelRow
     }
     let mut l = vec![sp(3), seg(d(), "STATUS")];
     l.extend(flow_chips(&ui.git.flow, data.merge.is_some()));
+    if super::staging::active_worktree_jj(model) {
+        l.push(Seg::chip(hue(Hue::Amber), " jj: git index ignored "));
+    }
     if let Some(snapshot) = &data.review_snapshot {
         let unresolved = snapshot
             .conversation
@@ -2208,5 +2211,30 @@ mod tests {
         ));
         assert!(!rendered.contains("1 STATUS"), "{rendered}");
         assert!(rendered.contains("1 FILES"), "{rendered}");
+    }
+
+    #[test]
+    fn status_strip_shows_jj_notice_only_for_active_colocated_worktree() {
+        let row = crate::sidebar::SidebarRow {
+            active: true,
+            worktree_path: Some("/repo/wt".into()),
+            ..crate::sidebar::SidebarRow::base(crate::sidebar::RowKind::Worktree, 1, "wt", "repo")
+        };
+        let mut colocated = model();
+        colocated.sidebar_rows = vec![row];
+        colocated.sidebar_status.git.insert(
+            "/repo/wt".into(),
+            crate::sidebar::GitGlyphs {
+                jj: true,
+                ..Default::default()
+            },
+        );
+        let rendered = text_of(&status_rows(&colocated, &ui(GitView::Files), true)[0].line);
+        assert!(rendered.contains("jj: git index ignored"), "{rendered}");
+
+        let mut plain = model();
+        plain.sidebar_rows = colocated.sidebar_rows;
+        let rendered = text_of(&status_rows(&plain, &ui(GitView::Files), true)[0].line);
+        assert!(!rendered.contains("jj: git index ignored"), "{rendered}");
     }
 }

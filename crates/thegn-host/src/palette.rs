@@ -193,6 +193,27 @@ impl Palette {
         self.recompute();
     }
 
+    /// Replace rows after an off-loop DB read without losing the active query
+    /// or the selected stable key when that key still exists.
+    pub(crate) fn replace_items(&mut self, items: Vec<PaletteItem>) {
+        let selected_key = self.selected_item().map(|item| item.key.clone());
+        let query = self.query.clone();
+        self.items = items;
+        self.query = query;
+        self.recompute();
+        if let Some(key) = selected_key
+            && let Some(index) = self
+                .matches
+                .iter()
+                .position(|index| self.items[*index].key == key)
+        {
+            self.selected = index;
+        } else {
+            self.selected = 0;
+        }
+        self.scroll_offset = self.selected.saturating_sub(MAX_ITEMS - 1);
+    }
+
     #[allow(dead_code)] // used in tests
     pub fn push_char(&mut self, c: char) {
         self.query.push(c);
@@ -482,12 +503,34 @@ pub(crate) fn build_move_to_folder_items(
     }
     items.push(PaletteItem::new(
         "move-to-folder:__new__",
-        format!(
-            "＋ {}",
-            crate::i18n_surface::palette(PaletteText::NewFolder)
-        ),
+        move_to_folder_new_label(),
     ));
     items
+}
+
+pub(crate) fn build_move_to_folder_seed(configured: &[String]) -> Vec<crate::palette::PaletteItem> {
+    use crate::palette::PaletteItem;
+    let mut items = configured
+        .iter()
+        .map(|folder| {
+            PaletteItem::new(
+                format!("move-to-folder:{folder}"),
+                crate::i18n_surface::move_to_folder(folder),
+            )
+        })
+        .collect::<Vec<_>>();
+    items.push(PaletteItem::new(
+        "move-to-folder:__new__",
+        move_to_folder_new_label(),
+    ));
+    items
+}
+
+fn move_to_folder_new_label() -> String {
+    format!(
+        "＋ {}",
+        crate::i18n_surface::palette(PaletteText::NewFolder)
+    )
 }
 
 /// The display label for a workspace switch entry. Carries the Ctrl+1..9
@@ -567,7 +610,7 @@ pub(crate) fn build_palette(
     {
         items.push(PaletteItem::new(
             format!("summon-pin-{}", i + 1),
-            format!("\u{1f4cc} {}", p.display_label()),
+            format!("📌 {}", p.display_label()),
         ));
     }
 
@@ -576,7 +619,7 @@ pub(crate) fn build_palette(
     for g in &session.worktrees {
         items.push(PaletteItem::new(
             format!("tab:{}", g.name),
-            format!("→ {}", g.name),
+            format!("{} {}", crate::caps::active_glyphs().arrow_right, g.name),
         ));
     }
 
@@ -652,6 +695,106 @@ pub(crate) fn build_palette(
     }
 
     crate::palette::order_by_frecency(items, &usage)
+}
+
+/// Rows that can be shown on the loop while the persisted palette sources load.
+pub(crate) fn build_palette_seed(
+    session: &crate::session::Session,
+    cfg: &thegn_core::config::Config,
+    issues: &[thegn_core::issue::Issue],
+) -> Vec<crate::palette::PaletteItem> {
+    use crate::palette::PaletteItem;
+    let mut items = build_command_palette_items(cfg);
+    for folder in configured_file_worktree_folders(cfg) {
+        let key = format!("move-to-folder:{folder}");
+        if !items.iter().any(|item| item.key == key) {
+            items.push(PaletteItem::new(
+                key,
+                crate::i18n_surface::move_to_folder(&folder),
+            ));
+        }
+    }
+    let ws = (!session.id.is_empty()).then_some(session.id.as_str());
+    for (i, pin) in crate::pins::PinSupervisor::resolve(cfg, ws)
+        .into_iter()
+        .enumerate()
+    {
+        items.push(PaletteItem::new(
+            format!("summon-pin-{}", i + 1),
+            format!("📌 {}", pin.display_label()),
+        ));
+    }
+    for group in &session.worktrees {
+        items.push(PaletteItem::new(
+            format!("tab:{}", group.name),
+            format!(
+                "{} {}",
+                crate::caps::active_glyphs().arrow_right,
+                group.name
+            ),
+        ));
+    }
+    for issue in issues {
+        items.push(PaletteItem::new(
+            format!("issue:{}", issue.id),
+            format!("{} {} {}", issue.status.glyph(), issue.number, issue.title),
+        ));
+    }
+    items
+}
+
+pub(crate) fn build_account_palette_seed(cfg: &thegn_core::config::Config) -> Vec<PaletteItem> {
+    let mut items = Vec::new();
+    for provider in thegn_core::account::providers() {
+        for account in cfg
+            .accounts
+            .iter()
+            .filter(|account| account.provider == provider.id)
+        {
+            items.push(PaletteItem::new(
+                format!("account:{}:{}", provider.id, account.name),
+                format!(
+                    "{} {} · {}",
+                    crate::caps::active_glyphs().diamond_filled,
+                    provider.id,
+                    account.name
+                ),
+            ));
+        }
+        items.push(PaletteItem::new(
+            format!("account-add:{}", provider.id),
+            format!("Add {} account…", provider.id),
+        ));
+    }
+    items
+}
+
+pub(crate) fn build_bundle_palette_seed(cfg: &thegn_core::config::Config) -> Vec<PaletteItem> {
+    let mut items = vec![PaletteItem::new(
+        "bundle-clear",
+        format!("{} No bundle", crate::caps::active_glyphs().dot_hollow),
+    )];
+    items.extend(cfg.bundle.keys().map(|name| {
+        PaletteItem::new(
+            format!("bundle:{name}"),
+            format!("{} {name}", crate::caps::active_glyphs().diamond_filled),
+        )
+    }));
+    items
+}
+
+pub(crate) fn build_identity_palette_seed(cfg: &thegn_core::config::Config) -> Vec<PaletteItem> {
+    let mut items = vec![PaletteItem::new(
+        "identity-clear",
+        format!("{} No identity", crate::caps::active_glyphs().dot_hollow),
+    )];
+    items.extend(cfg.identities.keys().map(|name| {
+        PaletteItem::new(
+            format!("identity:{name}"),
+            format!("{} {name}", crate::caps::active_glyphs().diamond_filled),
+        )
+    }));
+    items
 }
 
 /// Build the sandbox picker shown before the agent picker for a new worktree.
@@ -1678,5 +1821,68 @@ mod tests {
             text.lines().all(|line| line.width() <= 72),
             "a rendered line exceeded the screen cell budget: {text:?}"
         );
+    }
+
+    #[test]
+    fn replacing_rows_preserves_query_and_selected_key() {
+        let mut palette = Palette::new(vec![
+            PaletteItem::new("alpha", "Alpha"),
+            PaletteItem::new("beta", "Beta"),
+            PaletteItem::new("gamma", "Gamma"),
+        ]);
+        palette.set_query("a");
+        palette.move_down();
+        let selected_key = palette.selected_item().unwrap().key.clone();
+        palette.replace_items(vec![
+            PaletteItem::new("gamma", "Gamma updated"),
+            PaletteItem::new("beta", "Beta updated"),
+            PaletteItem::new("alpha", "Alpha updated"),
+        ]);
+        assert_eq!(palette.query(), "a");
+        assert_eq!(palette.selected_item().unwrap().key, selected_key);
+    }
+
+    #[test]
+    fn replacing_rows_with_shorter_list_clamps_empty_query_selection() {
+        let mut palette = Palette::new(vec![
+            PaletteItem::new("alpha", "Alpha"),
+            PaletteItem::new("beta", "Beta"),
+            PaletteItem::new("gamma", "Gamma"),
+        ]);
+        palette.move_down();
+        palette.move_down();
+        assert_eq!(palette.selected_item().unwrap().key, "gamma");
+
+        palette.replace_items(vec![
+            PaletteItem::new("alpha", "Alpha refreshed"),
+            PaletteItem::new("beta", "Beta refreshed"),
+        ]);
+
+        assert_eq!(palette.selected_idx(), 0);
+        assert_eq!(palette.selected_item().unwrap().key, "alpha");
+        assert_eq!(palette.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn db_free_palette_seed_rows_match_the_full_builder_sources() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_workspace("/repo/app", "app", "repo").unwrap();
+        db.put_workspace("/repo/svc", "svc", "repo").unwrap();
+        let session = crate::session::Session {
+            id: "/repo/app".into(),
+            worktrees: vec![],
+            active: 0,
+        };
+        let cfg = thegn_core::config::Config::default();
+        let issues = Vec::new();
+        let seed = build_palette_seed(&session, &cfg, &issues);
+        let full = build_palette(&session, &db, &cfg, &issues, &[]);
+        for row in seed {
+            assert!(
+                full.iter()
+                    .any(|full_row| full_row.key == row.key && full_row.label == row.label),
+                "DB-backed palette omitted its immediate row: {row:?}"
+            );
+        }
     }
 }

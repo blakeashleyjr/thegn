@@ -482,7 +482,7 @@ mod tests {
         let cfg = Config::load_layered(&MapEnv::default(), &[], Some(path));
         assert_eq!(
             cfg.sandbox.isolation_floor,
-            crate::config::IsolationFloor::SharedKernel
+            Some(crate::config::IsolationFloor::SharedKernel)
         );
         assert_eq!(cfg.ci.poll_interval_secs, 1u64 << 61);
         let lifetime = cfg.env["expensive"].provider.max_lifetime_secs;
@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn invalid_explicit_overlay_is_atomic_and_unrelated_repair_is_allowed() {
         let mut cfg = Config::default();
-        cfg.sandbox.isolation_floor = crate::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.isolation_floor = Some(crate::config::IsolationFloor::SharedKernel);
         let before = cfg.ci.poll_interval_secs;
         assert!(
             Config::apply_toml_overlay(
@@ -508,7 +508,7 @@ mod tests {
         assert_eq!(cfg.ci.poll_interval_secs, before);
         assert_eq!(
             cfg.sandbox.isolation_floor,
-            crate::config::IsolationFloor::SharedKernel
+            Some(crate::config::IsolationFloor::SharedKernel)
         );
         assert!(
             Config::apply_override_str(&mut cfg, "ci.poll_interval_secs", &u64::MAX.to_string())
@@ -538,7 +538,7 @@ mod tests {
         assert_eq!(cfg.pr.ttl_secs, 33);
         assert_eq!(
             cfg.sandbox.isolation_floor,
-            crate::config::IsolationFloor::SharedKernel
+            Some(crate::config::IsolationFloor::SharedKernel)
         );
     }
 
@@ -559,7 +559,7 @@ mod tests {
         assert_eq!(cfg.pr.ttl_secs, 33);
         assert_eq!(
             cfg.sandbox.isolation_floor,
-            crate::config::IsolationFloor::SharedKernel
+            Some(crate::config::IsolationFloor::SharedKernel)
         );
         assert_eq!(cfg.sandbox.network, crate::config::Network::None);
     }

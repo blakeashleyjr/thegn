@@ -352,6 +352,9 @@ thegn keys validate      # chord conflicts; exits non-zero, so it fits a hook
 thegn keys hints --zone sidebar   # what that zone's hint strip renders
 ```
 
+For GitLab CI, the `thegn doctor` probe reports whether a configured
+`[ci.gitlab]` token resolved, without printing the token value.
+
 Some provider `kind` values are **reserved**: the name is accepted so a
 config stays forward-compatible (for example `[ci] provider = "drone"`,
 `[[forges]] kind = "forgejo"`, `[media] backend = "jellyfin"`), but this build

@@ -1334,6 +1334,13 @@
           "description": "Set when the recording stopped because it reached `[recording] max_bytes` (the file is finalized and valid; the session was unaffected).",
           "type": "boolean"
         },
+        "dropped_bytes": {
+          "default": 0,
+          "description": "PTY output bytes dropped under recording overload. Each gap has an `m` marker in the cast; non-zero means the file is valid but incomplete.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "path": {
           "description": "The on-disk path of the (active or just-finalized) `.cast` file, if any. A path is a locator for audit — the contents are never returned.",
           "type": [

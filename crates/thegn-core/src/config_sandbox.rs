@@ -132,7 +132,7 @@ impl SandboxOverlay {
             base.on_missing = v;
         }
         if let Some(v) = self.isolation_floor {
-            base.isolation_floor = v;
+            base.isolation_floor = Some(v);
         }
         if let Some(v) = self.on_floor_miss {
             base.on_floor_miss = v;

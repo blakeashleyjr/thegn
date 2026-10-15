@@ -80,11 +80,11 @@ Run tests with `cargo nextest run -p <crate> <filter>`, never bare
 - [ ] 6.1 `.jj/` detection cached alongside the glyph scan (no subprocess);
       sidebar badge glyph via `caps::active_glyphs()` + a
       `[ui] sidebar_show_*` toggle.
-- [ ] 6.2 Staging/commit surfaces show a colocated-repo notice; detached HEAD
+- [x] 6.2 Staging/commit surfaces show a colocated-repo notice; detached HEAD
       in a colocated repo renders as the working copy, not an error state.
-- [ ] 6.3 `auto_fetch` skips colocated repos unless `auto_fetch_colocated`;
+- [x] 6.3 `auto_fetch` skips colocated repos unless `auto_fetch_colocated`;
       unit-test the skip decision as pure logic.
-- [ ] 6.4 doctor line (folds into 4.1).
+- [x] 6.4 doctor line (folds into 4.1).
 
 ## 7. Structural diff (thegn-core + thegn-host)
 
@@ -100,7 +100,7 @@ Run tests with `cargo nextest run -p <crate> <filter>`, never bare
       Toggle key + new action id.
 - [ ] 7.4 `thegn diff --structural` (flag on the existing verb; catalog row
       unchanged).
-- [ ] 7.5 Guard test: stageable-diff call sites still pin `SANITIZED_DIFF`
+- [x] 7.5 Guard test: stageable-diff call sites still pin `SANITIZED_DIFF`
       (`--no-ext-diff`) regardless of `structural_diff`.
 
 ## 8. Help + docs

@@ -50,11 +50,19 @@ pub fn set_palette(p: theme::Palette) {
     if let Ok(mut g) = RESOLVED.write() {
         *g = resolved;
     }
+    PALETTE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// Snapshot the palette currently used by chrome.
 pub fn palette_snapshot() -> theme::Palette {
     PALETTE.read().expect("palette lock").clone()
+}
+
+static PALETTE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Monotonic version of the palette installed for chrome and embedded apps.
+pub fn palette_generation() -> u64 {
+    PALETTE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// A palette slot, resolvable to a live color via [`col`]. Kept complete even
@@ -1469,6 +1477,27 @@ fn wall_clock() -> chrono::DateTime<chrono::Local> {
 
 /// Resolve a masthead widget id to its display text + color; `None` hides the
 /// widget (no data yet, GPU absent, unknown id).
+fn net_widget_icon<'a>(
+    ic: &'a thegn_core::config::StatsConfig,
+    medium: thegn_metrics::NetMedium,
+    glyphs: &'a thegn_core::termcaps::GlyphSet,
+) -> &'a str {
+    if ic.net_icon.as_str() != DEFAULT_NET_ICON.as_str() {
+        return ic.net_icon.as_str();
+    }
+
+    let (configured, builtin) = match medium {
+        thegn_metrics::NetMedium::Wifi => (&ic.net_icons.wifi, glyphs.net_wifi),
+        thegn_metrics::NetMedium::Ethernet => (&ic.net_icons.ethernet, glyphs.net_wired),
+        thegn_metrics::NetMedium::Unknown => (&ic.net_icons.generic, glyphs.net_generic),
+    };
+    if !configured.trim().is_empty() {
+        configured.as_str()
+    } else {
+        builtin
+    }
+}
+
 pub(crate) fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
     let s = &model.stats;
     let ic = &model.stats_icons;
@@ -1542,15 +1571,7 @@ pub(crate) fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWi
         }),
         "net" => s.net_bps.map(|(rx, tx)| {
             let glyphs = crate::caps::active_glyphs();
-            let icon = if ic.net_icon.as_str() == DEFAULT_NET_ICON.as_str() {
-                match s.net_medium {
-                    thegn_metrics::NetMedium::Wifi => glyphs.net_wifi,
-                    thegn_metrics::NetMedium::Ethernet => glyphs.net_wired,
-                    thegn_metrics::NetMedium::Unknown => glyphs.net_generic,
-                }
-            } else {
-                ic.net_icon.as_str()
-            };
+            let icon = net_widget_icon(ic, s.net_medium, glyphs);
             w(
                 format!(
                     "{icon} {}{} {}{}",

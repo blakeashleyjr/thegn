@@ -471,6 +471,10 @@ pub struct RecordStatus {
     /// `path` is short of the session's last output, so a client must report it
     /// as truncated rather than saved. `None` on every healthy path.
     pub truncated: Option<String>,
+    /// PTY output bytes dropped under recording overload. Each gap has an `m`
+    /// marker in the cast; non-zero means the file is valid but incomplete.
+    #[serde(default)]
+    pub dropped_bytes: u64,
 }
 
 /// One changed file in a worktree (the mobile stage/commit contract).

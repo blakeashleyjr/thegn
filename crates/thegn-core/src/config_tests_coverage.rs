@@ -830,8 +830,7 @@ fn sandbox_config_default_collections() {
             "docker",
             "apple",
             "bwrap",
-            "jobobject",
-            "host"
+            "jobobject"
         ]
     );
     assert!(s.image.is_empty());
