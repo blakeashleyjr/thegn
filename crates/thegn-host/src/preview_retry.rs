@@ -167,7 +167,7 @@ pub(crate) fn oversized_copy_status(bytes: usize) -> String {
     const MIB: usize = KIB * KIB;
     let size = if bytes >= 1024 * 1024 {
         let whole = bytes / MIB;
-        let tenths = ((bytes % MIB) * 10 + MIB - 1) / MIB;
+        let tenths = ((bytes % MIB) * 10).div_ceil(MIB);
         if tenths == 10 {
             format!("{}.0 MiB", whole + 1)
         } else {
