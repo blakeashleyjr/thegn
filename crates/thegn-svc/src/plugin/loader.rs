@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use thegn_core::config::Config;
 use thegn_core::plugin_api::{
-    API_VERSION, CadenceHint, Capability, HOST_EXTENSION_SUPPORT, HostContract, NegotiatedManifest,
-    PluginSpec, SupportState,
+    API_VERSION, CadenceHint, Capability, HOST_EXTENSION_SUPPORT, HostContract, NativeTrust,
+    NegotiatedManifest, PluginSpec, SupportState,
 };
 
 pub use thegn_core::plugin_api::MAX_PLUGIN_TIMEOUT_SECS;
@@ -50,6 +50,9 @@ pub struct LoadedPlugin {
     /// `None` for `[[plugins]]` config entries; the plugin directory for
     /// `plugins/<dir>/plugin.toml` discoveries.
     pub dir: Option<PathBuf>,
+    /// A `trusted_native = true` value from plugin.toml is ignored; only the
+    /// user's `[[plugins]]` config entry can grant native trust.
+    pub trusted_native_ignored: bool,
 }
 
 impl LoadedPlugin {
@@ -89,7 +92,11 @@ pub fn discover(cfg: &Config, config_dir: &Path) -> (Vec<LoadedPlugin>, Vec<Spec
         .plugins
         .iter()
         .cloned()
-        .map(|spec| LoadedPlugin { spec, dir: None })
+        .map(|spec| LoadedPlugin {
+            spec,
+            dir: None,
+            trusted_native_ignored: false,
+        })
         .collect();
     let plugins_dir = config_dir.join("plugins");
     let mut problems = Vec::new();
@@ -196,10 +203,15 @@ pub fn discover(cfg: &Config, config_dir: &Path) -> (Vec<LoadedPlugin>, Vec<Spec
                 toml::from_str::<PluginSpec>(&text).map_err(|error| error.to_string())
             });
         match parsed {
-            Ok(spec) => out.push(LoadedPlugin {
-                spec,
-                dir: Some(dir),
-            }),
+            Ok(mut spec) => {
+                let trusted_native_ignored = spec.trusted_native;
+                spec.trusted_native = false;
+                out.push(LoadedPlugin {
+                    spec,
+                    dir: Some(dir),
+                    trusted_native_ignored,
+                });
+            }
             Err(e) => {
                 tracing::warn!(target: "thegn::plugin", path = %manifest_path.display(), error = %e, "unparseable plugin.toml");
                 problems.push(discovery_problem(
@@ -358,6 +370,31 @@ pub fn check_loaded(loaded: &[LoadedPlugin], broken: Vec<SpecProblem>) -> Vec<Sp
     out
 }
 
+/// Refuse one enabled capability-gated plugin without rejecting its peers.
+pub fn native_trust_refusal(plugin: &LoadedPlugin) -> Option<SpecProblem> {
+    if !plugin.spec.enabled {
+        return None;
+    }
+    let NativeTrust::Refused { gated_by } = plugin.spec.native_trust() else {
+        return None;
+    };
+    let problem = if plugin.dir.is_some() {
+        format!(
+            "refused: declares {} but capabilities do not sandbox native plugin code; move this plugin directory out of plugins/ (or remove its plugin.toml), then declare it as a [[plugins]] entry with absolute command and cwd paths and trusted_native = true to run it with your full user authority",
+            gated_by.join(", ")
+        )
+    } else {
+        format!(
+            "refused: declares {} but capabilities do not sandbox native plugin code; add trusted_native = true to its [[plugins]] entry to run it with your full user authority",
+            gated_by.join(", ")
+        )
+    };
+    Some(SpecProblem {
+        plugin: plugin.spec.manifest.id.as_str().to_string(),
+        problem,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +417,7 @@ mod tests {
             scopes: Vec::new(),
             mode: Default::default(),
             enabled: true,
+            trusted_native: false,
         }
     }
 
@@ -439,6 +477,7 @@ mod tests {
             let loaded = LoadedPlugin {
                 spec: spec(id, vec!["true".into()]),
                 dir: None,
+                trusted_native_ignored: false,
             };
             assert!(
                 check_spec(&loaded)
@@ -451,6 +490,7 @@ mod tests {
         let loaded = LoadedPlugin {
             spec: spec(&max_id, vec!["true".into()]),
             dir: None,
+            trusted_native_ignored: false,
         };
         assert!(
             !check_spec(&loaded)
@@ -473,6 +513,7 @@ mod tests {
             let loaded = LoadedPlugin {
                 spec: plugin,
                 dir: None,
+                trusted_native_ignored: false,
             };
             assert_eq!(
                 check_spec(&loaded)
@@ -511,6 +552,7 @@ mod tests {
             let loaded = LoadedPlugin {
                 spec: plugin,
                 dir: None,
+                trusted_native_ignored: false,
             };
             assert_eq!(
                 check_spec(&loaded)
@@ -534,6 +576,7 @@ mod tests {
             let loaded = LoadedPlugin {
                 spec: plugin,
                 dir: None,
+                trusted_native_ignored: false,
             };
             assert!(
                 check_spec(&loaded)
@@ -688,6 +731,7 @@ mod tests {
             let loaded = LoadedPlugin {
                 spec: plugin,
                 dir: None,
+                trusted_native_ignored: false,
             };
             assert!(
                 check_spec(&loaded)
@@ -706,6 +750,7 @@ mod tests {
             let loaded = LoadedPlugin {
                 spec: plugin,
                 dir: None,
+                trusted_native_ignored: false,
             };
             assert!(
                 check_spec(&loaded)
@@ -726,7 +771,8 @@ mod tests {
         assert!(
             check_spec(&LoadedPlugin {
                 spec: plugin,
-                dir: None
+                dir: None,
+                trusted_native_ignored: false,
             })
             .is_empty()
         );
@@ -793,5 +839,83 @@ mod tests {
         .unwrap();
         assert_eq!(example.manifest.api, API_VERSION);
         assert!(negotiate(&example).is_ok());
+    }
+
+    #[test]
+    fn untrusted_gated_plugin_is_refused_with_the_config_line() {
+        let mut plugin_spec = spec("untrusted", vec!["true".into()]);
+        plugin_spec
+            .manifest
+            .capabilities
+            .push(Capability::new("network", "example.com"));
+        let plugin = LoadedPlugin {
+            spec: plugin_spec,
+            dir: None,
+            trusted_native_ignored: false,
+        };
+        let problem = native_trust_refusal(&plugin).expect("gated plugin is refused");
+        assert!(problem.to_string().contains("untrusted"));
+        assert!(problem.problem.contains("network:example.com"));
+        assert!(problem.problem.contains("trusted_native = true"));
+        assert!(problem.problem.contains("its [[plugins]] entry"));
+    }
+
+    #[test]
+    fn directory_plugin_cannot_trust_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("plugins/self-trusting");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut plugin_spec = spec("self-trusting", vec!["true".into()]);
+        plugin_spec
+            .manifest
+            .capabilities
+            .push(Capability::new("network", "example.com"));
+        plugin_spec.trusted_native = true;
+        std::fs::write(
+            dir.join("plugin.toml"),
+            toml::to_string(&plugin_spec).unwrap(),
+        )
+        .unwrap();
+
+        let (loaded, problems) = discover(&Config::default(), tmp.path());
+        assert!(problems.is_empty());
+        assert!(!loaded[0].spec.trusted_native);
+        assert!(loaded[0].trusted_native_ignored);
+        let problem = native_trust_refusal(&loaded[0]).expect("manifest trust is ignored");
+        assert!(
+            problem
+                .problem
+                .contains("move this plugin directory out of plugins/")
+        );
+        assert!(problem.problem.contains("remove its plugin.toml"));
+        assert!(problem.problem.contains("absolute command and cwd paths"));
+    }
+
+    #[test]
+    fn refusal_does_not_reject_the_rest_of_the_set() {
+        let mut gated = spec("untrusted", vec!["true".into()]);
+        gated
+            .manifest
+            .capabilities
+            .push(Capability::new("network", "example.com"));
+        let surface: PluginSpec = toml::from_str(include_str!(
+            "../../../../examples/plugins/hello/plugin.toml"
+        ))
+        .unwrap();
+        let loaded = [
+            LoadedPlugin {
+                spec: gated,
+                dir: None,
+                trusted_native_ignored: false,
+            },
+            LoadedPlugin {
+                spec: surface,
+                dir: None,
+                trusted_native_ignored: false,
+            },
+        ];
+        assert!(check_loaded(&loaded, Vec::new()).is_empty());
+        assert!(native_trust_refusal(&loaded[0]).is_some());
+        assert!(native_trust_refusal(&loaded[1]).is_none());
     }
 }
