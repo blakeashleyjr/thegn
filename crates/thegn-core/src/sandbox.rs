@@ -3355,17 +3355,14 @@ fn sweep_orphan_vpn_staging_in(
         if !deleted_by_gc && !old_unlisted {
             continue;
         }
-        let current = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Ok(_) => continue,
             Err(error) => {
                 tracing::debug!(target: "thegn::sandbox", %error, "unable to recheck VPN staging directory");
                 continue;
             }
         };
-        if !current.is_dir() || current.file_type().is_symlink() {
-            continue;
-        }
         let files = match std::fs::read_dir(&path) {
             Ok(files) => files,
             Err(error) => {
@@ -4228,7 +4225,7 @@ pub fn run_gc_detailed(db_worktrees: &[String]) -> GcReport {
             unverified_report.push((backend.label(), plan.unverified));
         }
     }
-    sweep_orphan_vpn_staging_in(
+    let swept_vpn_staging = sweep_orphan_vpn_staging_in(
         &state_home,
         std::path::Path::new("thegn/vpn"),
         listed_any.then_some(&listed_names),
@@ -4236,6 +4233,13 @@ pub fn run_gc_detailed(db_worktrees: &[String]) -> GcReport {
         SystemTime::now(),
         SECRET_ENV_FILE_MAX_AGE,
     );
+    if swept_vpn_staging > 0 {
+        tracing::debug!(
+            target: "thegn::sandbox",
+            removed = swept_vpn_staging,
+            "swept orphan VPN staging dirs"
+        );
+    }
     GcReport {
         removed: removed_report,
         unverified: unverified_report,
