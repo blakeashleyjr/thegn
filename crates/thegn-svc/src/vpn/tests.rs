@@ -126,6 +126,22 @@ fn sidecar_argv_uses_owner_only_env_file_not_secret_values() {
 }
 
 #[test]
+fn sidecar_argv_carries_managed_and_profile_owner_labels() {
+    let plan = for_provider(&spec(ts_cfg()))
+        .sidecar_plan("tg-owned-sidecar")
+        .unwrap();
+    let args = sidecar_run_args(&plan, &[], None);
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--label", "thegn.managed=true"])
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair[0] == "--label" && pair[1].starts_with("thegn.owner="))
+    );
+}
+
+#[test]
 fn wireguard_plan_mounts_conf_and_adds_tun() {
     let mut c = VpnConfig {
         provider: VpnProviderKind::Wireguard,
