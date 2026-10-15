@@ -2507,7 +2507,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn kill_teardown_does_not_block_the_runtime_worker() {
-        let harness = spawn_actor("trap '' TERM; sleep 60", None);
+        let mut harness = spawn_actor("trap '' TERM; sleep 60", None);
         let largest_gap_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let ticker_gap = Arc::clone(&largest_gap_ms);
         let (stop_tx, mut stop_rx) = oneshot::channel();
