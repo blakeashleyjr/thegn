@@ -17,11 +17,32 @@ pub(crate) fn toggle(
     voice: &mut VoiceController,
     pane_id: u32,
     pane_live: bool,
+    panes: &mut Panes,
     now_ms: u64,
     waker: &TerminalWaker,
 ) -> String {
     if matches!(voice.state, VoiceState::Idle) && voice.shutdown_pending() {
         return "Voice shutdown pending".into();
+    }
+    if matches!(voice.state, VoiceState::Idle)
+        && pane_live
+        && pane_id != 0
+        && voice.has_held_transcript()
+    {
+        let transcript = voice
+            .take_held_transcript()
+            .expect("held transcript checked above");
+        let Some(pane) = panes.table.get_mut(&pane_id) else {
+            voice.hold_transcript(transcript);
+            return "Voice transcript not inserted: focused pane unavailable".into();
+        };
+        return match crate::run::paste_text_into_pane(pane, &transcript) {
+            Ok(()) => "Voice transcript inserted".into(),
+            Err(error) => {
+                voice.hold_transcript(transcript);
+                format!("Voice transcript not inserted: {error}")
+            }
+        };
     }
     if !voice.config().enabled {
         return "Voice is off ([voice] enabled = false)".into();
@@ -52,6 +73,9 @@ pub(crate) fn toggle(
 
 pub(crate) fn cancel(voice: &mut VoiceController, waker: &TerminalWaker) -> String {
     if !voice.is_recording() && !matches!(voice.state, VoiceState::Transcribing { .. }) {
+        if voice.take_held_transcript().is_some() {
+            return "Held voice transcript discarded".into();
+        }
         return "".into();
     }
     voice.cancel_transcription();
@@ -175,19 +199,26 @@ fn apply_event(
                 pane_id,
                 transcript,
             } => {
-                if let Some(model) = model.as_deref_mut() {
-                    if pane_id != focused_pane
-                        || !panes
-                            .as_ref()
-                            .is_some_and(|p| p.table.contains_key(&pane_id))
-                    {
-                        model.status = "Voice transcript discarded: focus changed".into();
-                    } else if let Some(pane) =
-                        panes.as_deref_mut().and_then(|p| p.table.get_mut(&pane_id))
-                    {
-                        match crate::run::paste_text_into_pane(pane, &transcript) {
-                            Ok(()) => model.status = "Voice transcript inserted".into(),
-                            Err(e) => model.status = format!("Voice transcript dropped: {e}"),
+                let pane_present = panes
+                    .as_ref()
+                    .is_some_and(|panes| panes.table.contains_key(&pane_id));
+                match deliver_transcript(voice, pane_id, transcript, focused_pane, pane_present) {
+                    Delivery::Held(status) => {
+                        if let Some(model) = model.as_deref_mut() {
+                            model.status = status;
+                        }
+                    }
+                    Delivery::Inject(transcript) => {
+                        if let Some(model) = model.as_deref_mut()
+                            && let Some(pane) =
+                                panes.as_deref_mut().and_then(|p| p.table.get_mut(&pane_id))
+                        {
+                            match crate::run::paste_text_into_pane(pane, &transcript) {
+                                Ok(()) => model.status = "Voice transcript inserted".into(),
+                                Err(e) => {
+                                    model.status = format!("Voice transcript not inserted: {e}")
+                                }
+                            }
                         }
                     }
                 }
@@ -201,9 +232,127 @@ fn apply_event(
     }
 }
 
+enum Delivery {
+    Inject(String),
+    Held(String),
+}
+
+fn deliver_transcript(
+    voice: &mut VoiceController,
+    pane_id: u32,
+    transcript: String,
+    focused_pane: u32,
+    pane_present: bool,
+) -> Delivery {
+    if transcript.is_empty() || (pane_id == focused_pane && pane_present) {
+        return Delivery::Inject(transcript);
+    }
+    voice.hold_transcript(transcript.clone());
+    let preview = thegn_core::pipeline_report::display_fit(&transcript, 40);
+    let preview = preview.trim_end();
+    Delivery::Held(format!(
+        "Voice transcript held (focus changed): \"{preview}\" - Alt v inserts it here, Alt V discards"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::sound_process::test_support::test_waker;
+    use thegn_core::config::VoiceConfig;
+
+    fn voice() -> VoiceController {
+        VoiceController::new(VoiceConfig {
+            enabled: true,
+            ..VoiceConfig::default()
+        })
+    }
+
+    #[test]
+    fn focus_changed_transcript_is_held_not_dropped() {
+        let mut voice = voice();
+        let delivery = deliver_transcript(&mut voice, 1, "spoken words".into(), 2, true);
+        let Delivery::Held(status) = delivery else {
+            panic!("expected held transcript");
+        };
+        assert_eq!(
+            voice.take_held_transcript().as_deref(),
+            Some("spoken words")
+        );
+        assert!(status.contains("held"));
+        assert!(status.contains("spoken words"));
+    }
+
+    #[test]
+    fn pane_gone_transcript_is_held() {
+        let mut voice = voice();
+        let delivery = deliver_transcript(&mut voice, 1, "spoken words".into(), 1, false);
+        assert!(matches!(delivery, Delivery::Held(_)));
+        assert_eq!(
+            voice.take_held_transcript().as_deref(),
+            Some("spoken words")
+        );
+    }
+
+    #[test]
+    fn focused_transcript_injects_and_leaves_slot_empty() {
+        let mut voice = voice();
+        let delivery = deliver_transcript(&mut voice, 1, "spoken words".into(), 1, true);
+        assert!(matches!(delivery, Delivery::Inject(text) if text == "spoken words"));
+        assert!(!voice.has_held_transcript());
+    }
+
+    #[test]
+    fn newer_held_transcript_replaces_older() {
+        let mut voice = voice();
+        assert!(matches!(
+            deliver_transcript(&mut voice, 1, "older".into(), 2, true),
+            Delivery::Held(_)
+        ));
+        assert!(matches!(
+            deliver_transcript(&mut voice, 1, "newer".into(), 2, true),
+            Delivery::Held(_)
+        ));
+        assert_eq!(voice.take_held_transcript().as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn cancel_while_idle_discards_held_transcript() {
+        let mut voice = voice();
+        voice.hold_transcript("spoken words".into());
+        let (waker, _master, _terminal) = test_waker();
+        assert_eq!(
+            cancel(&mut voice, &waker),
+            "Held voice transcript discarded"
+        );
+        assert!(!voice.has_held_transcript());
+    }
+
+    #[test]
+    fn reconfigure_clears_held_transcript() {
+        let mut voice = voice();
+        voice.hold_transcript("spoken words".into());
+        voice.configure(VoiceConfig::default());
+        assert!(!voice.has_held_transcript());
+    }
+
+    #[test]
+    fn long_transcript_preview_is_truncated() {
+        let mut voice = voice();
+        let delivery = deliver_transcript(&mut voice, 1, "a".repeat(80), 2, true);
+        let Delivery::Held(status) = delivery else {
+            panic!("expected held transcript");
+        };
+        let preview = status
+            .split("): \"")
+            .nth(1)
+            .unwrap()
+            .split("\" -")
+            .next()
+            .unwrap();
+        assert!(unicode_width::UnicodeWidthStr::width(preview) <= 40);
+        assert!(preview.ends_with('…'));
+    }
 
     #[test]
     fn idle_cancel_is_a_noop() {
