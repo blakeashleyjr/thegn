@@ -283,7 +283,11 @@ one of them is about your branch:
 - **`gate_error`** — the gate could not run at all (missing binary,
   setup failed, killed). An environment fact. It never wakes the agent,
   never triggers a bisect, and never blames a branch — but it is retried
-  on the next drain, since the environment may be fixed by then.
+  on the next drain, since the environment may be fixed by then. The human
+  footer and `thegn merge drain --json` report each gate error's `phase`
+  (preparation, setup, or gate) and `class` (timeout, spawn, killed,
+  setup_failed, capture, poisoned, preparation, signing, or source_moved). The JSON
+  `gate_verdicts` entries carry both fields.
 
 ## Driving it from an agent pane
 
@@ -314,5 +318,6 @@ notifications. Deferred and red-gate holds create inbox-only `queue_held`
 notices, while bookkeeping or persistence failures create inbox-only
 `queue_needs_human` entries. Set `[notifications] merge_queue_hold_desktop = true`
 (`THEGN_NOTIFICATIONS_MERGE_QUEUE_HOLD_DESKTOP`) to include these notices in
-desktop notifications, toasts, sound, and push. E2E baselines are not re-recorded
-for this behavior change.
+desktop notifications, toasts, sound, and push. The CLI `thegn merge drain`
+records the same inbox notices. An unread notice for the same row and state
+suppresses a repeat, including after a restart.
