@@ -199,8 +199,10 @@ fn project_prefix(target: &ComposeTarget, project: &str, c: &ComposeSpec) -> Vec
     v
 }
 
-/// `docker compose … config --services`. Pure; used to enumerate precisely
-/// which services will receive the owner-label override.
+/// `docker compose … config --services`. Pure; used to enumerate services
+/// that receive the owner-label override. Compose omits profile-gated services
+/// unless profiles are enabled, so services started by profile remain
+/// unlabelled and are kept by GC as unverified.
 pub(crate) fn services_argv(target: &ComposeTarget, project: &str, c: &ComposeSpec) -> Vec<String> {
     let mut argv = project_prefix(target, project, c);
     argv.extend(["config".into(), "--services".into()]);
@@ -238,10 +240,20 @@ fn labelled_compose(
     compose: &ComposeSpec,
     services_stdout: Option<&str>,
     owner: &str,
+    existing: Option<PathBuf>,
     write: impl FnOnce(&str) -> std::io::Result<PathBuf>,
 ) -> ComposeSpec {
+    let with_existing = || {
+        if let Some(path) = &existing {
+            let mut labelled = compose.clone();
+            labelled.files.push(path.to_string_lossy().into_owned());
+            labelled
+        } else {
+            compose.clone()
+        }
+    };
     let Some(services_stdout) = services_stdout else {
-        return compose.clone();
+        return with_existing();
     };
     let services = services_stdout
         .lines()
@@ -250,7 +262,7 @@ fn labelled_compose(
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let Some(body) = owner_label_override(&services, owner) else {
-        return compose.clone();
+        return with_existing();
     };
     match write(&body) {
         Ok(path) => {
@@ -259,8 +271,8 @@ fn labelled_compose(
             labelled
         }
         Err(error) => {
-            tracing::info!(target: "thegn::sandbox", %error, "unable to write Compose owner-label override; starting unlabelled");
-            compose.clone()
+            tracing::info!(target: "thegn::sandbox", %error, "unable to write Compose owner-label override; reusing existing override when available");
+            with_existing()
         }
     }
 }
@@ -279,7 +291,7 @@ fn enumerate_services(target: &ComposeTarget, argv: &[String]) -> Option<String>
     match outcome.into_stdout() {
         Some((true, stdout)) => Some(stdout),
         Some((false, _)) | None => {
-            tracing::info!(target: "thegn::sandbox", "unable to enumerate Compose services for owner labels; starting unlabelled");
+            tracing::info!(target: "thegn::sandbox", "unable to enumerate Compose services for owner labels");
             None
         }
     }
@@ -410,14 +422,33 @@ pub(crate) fn run_up_checked(
 pub(crate) fn up_and_verify(spec: &SandboxSpec, compose: &ComposeSpec) -> anyhow::Result<()> {
     let target = ComposeTarget::for_spec(spec)?;
     let labelled = if matches!(&spec.placement, Placement::Local) {
+        let state_home = crate::util::xdg_state_home();
+        let existing_path = state_home
+            .join("thegn/compose-labels")
+            .join(format!("{}.json", spec.name));
+        let existing = match std::fs::symlink_metadata(&existing_path) {
+            Ok(metadata) if metadata.file_type().is_file() => Some(existing_path),
+            Ok(_) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                tracing::debug!(target: "thegn::sandbox", %error, "unable to inspect existing Compose owner-label override");
+                None
+            }
+        };
         let services = enumerate_services(&target, &services_argv(&target, &spec.name, compose));
-        labelled_compose(compose, services.as_deref(), &owner_identity(), |body| {
-            let directory = crate::fsperm::ensure_private_dir_beneath(
-                &crate::util::xdg_state_home(),
-                std::path::Path::new("thegn/compose-labels"),
-            )?;
-            directory.write_owner_only_atomic(&format!("{}.json", spec.name), body.as_bytes())
-        })
+        labelled_compose(
+            compose,
+            services.as_deref(),
+            &owner_identity(),
+            existing,
+            |body| {
+                let directory = crate::fsperm::ensure_private_dir_beneath(
+                    &state_home,
+                    std::path::Path::new("thegn/compose-labels"),
+                )?;
+                directory.write_owner_only_atomic(&format!("{}.json", spec.name), body.as_bytes())
+            },
+        )
     } else {
         compose.clone()
     };
@@ -628,7 +659,7 @@ mod tests {
             ..Default::default()
         };
         let mut written = None;
-        let labelled = labelled_compose(&compose, Some("web\ndb\n"), "owner", |body| {
+        let labelled = labelled_compose(&compose, Some("web\ndb\n"), "owner", None, |body| {
             written = Some(body.to_owned());
             Ok(PathBuf::from("/private/proj.json"))
         });
@@ -637,14 +668,39 @@ mod tests {
             serde_json::from_str(&written.expect("writer called")).expect("valid JSON");
         assert_eq!(json["services"]["web"]["labels"][OWNER_LABEL_KEY], "owner");
 
-        let unchanged = labelled_compose(&compose, Some("web\n"), "owner", |_| {
+        let unchanged = labelled_compose(&compose, Some("web\n"), "owner", None, |_| {
             Err(std::io::Error::other("write denied"))
         });
         assert_eq!(unchanged, compose);
-        let unenumerated = labelled_compose(&compose, None, "owner", |_| {
+        let unenumerated = labelled_compose(&compose, None, "owner", None, |_| {
             panic!("writer must not run without service enumeration")
         });
         assert_eq!(unenumerated, compose);
+    }
+
+    #[test]
+    fn labelled_compose_reuses_existing_override_on_transient_failures() {
+        let compose = ComposeSpec {
+            files: vec!["base.yml".into()],
+            ..Default::default()
+        };
+        let existing = PathBuf::from("/private/proj.json");
+        let expected = ComposeSpec {
+            files: vec!["base.yml".into(), "/private/proj.json".into()],
+            ..Default::default()
+        };
+
+        let unenumerated =
+            labelled_compose(&compose, None, "owner", Some(existing.clone()), |_| {
+                panic!("writer must not run without service enumeration")
+            });
+        assert_eq!(unenumerated, expected);
+
+        let write_failed =
+            labelled_compose(&compose, Some("web\n"), "owner", Some(existing), |_| {
+                Err(std::io::Error::other("transient write failure"))
+            });
+        assert_eq!(write_failed, expected);
     }
 
     #[test]
