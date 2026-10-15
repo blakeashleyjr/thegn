@@ -281,6 +281,7 @@ pub mod sandbox_manage;
 pub mod sandbox_matrix;
 pub mod sandbox_mountcheck;
 pub mod sandbox_mounts;
+pub mod sandbox_policy_fp;
 pub mod sandbox_prefetch;
 pub mod sandbox_preflight;
 pub mod sandbox_runtime;

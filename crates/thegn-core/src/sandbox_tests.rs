@@ -2846,64 +2846,172 @@ fn entrypoint_override_precedes_the_image_and_names_the_workload() {
 #[test]
 fn sealed_container_reuse_requires_exact_mounts_and_a_matching_seal_label() {
     let required: std::collections::HashSet<&str> = ["/wt", "/nix/store"].into_iter().collect();
-    // Probe format: RUNNING, seal label, then bind sources.
-    let exact = "RUNNING\n1\n/wt\n/nix/store\n";
-    assert_eq!(judge_inspect(exact, &required, true, false), (true, true));
+    // Probe format: RUNNING, seal label, policy fingerprint, then bind sources.
+    let exact = "RUNNING\n1\nfp\n/wt\n/nix/store\n";
+    assert_eq!(
+        judge_inspect(exact, &required, true, false, "fp"),
+        (true, true)
+    );
     // (a) a superset (a hardened container that also binds ~/.gnupg) is refused
     // for a sealed spec, though it is fine for a non-sealed one.
-    let superset = "RUNNING\n1\n/wt\n/nix/store\n/home/u/.gnupg\n";
+    let superset = "RUNNING\n1\nfp\n/wt\n/nix/store\n/home/u/.gnupg\n";
     assert_eq!(
-        judge_inspect(superset, &required, true, false),
+        judge_inspect(superset, &required, true, false, "fp"),
         (true, false)
     );
     assert_eq!(
         judge_inspect(
-            "RUNNING\n\n/wt\n/nix/store\n/home/u/.gnupg\n",
+            "RUNNING\n\nfp\n/wt\n/nix/store\n/home/u/.gnupg\n",
             &required,
             false,
-            false
+            false,
+            "fp"
         ),
         (true, true)
     );
     // devenv's own `/nix` bind is not an extra, but only while the current spec
     // would still emit it: with devenv off the leftover bind forces a recreate.
-    let with_nix = "RUNNING\n1\n/wt\n/nix/store\n/nix\n";
-    assert_eq!(judge_inspect(with_nix, &required, true, true), (true, true));
+    let with_nix = "RUNNING\n1\nfp\n/wt\n/nix/store\n/nix\n";
     assert_eq!(
-        judge_inspect(with_nix, &required, true, false),
+        judge_inspect(with_nix, &required, true, true, "fp"),
+        (true, true)
+    );
+    assert_eq!(
+        judge_inspect(with_nix, &required, true, false, "fp"),
         (true, false)
     );
     // (b) label mismatch forces recreate, both directions; a missing label on a
     // sealed spec is a pre-label container and is recreated.
     assert_eq!(
-        judge_inspect("RUNNING\n0\n/wt\n/nix/store\n", &required, true, false),
+        judge_inspect(
+            "RUNNING\n0\nfp\n/wt\n/nix/store\n",
+            &required,
+            true,
+            false,
+            "fp"
+        ),
         (true, false)
     );
     assert_eq!(
-        judge_inspect("RUNNING\n\n/wt\n/nix/store\n", &required, true, false),
+        judge_inspect(
+            "RUNNING\n\nfp\n/wt\n/nix/store\n",
+            &required,
+            true,
+            false,
+            "fp"
+        ),
         (true, false)
     );
     assert_eq!(
-        judge_inspect("RUNNING\n1\n/wt\n/nix/store\n", &required, false, false),
+        judge_inspect(
+            "RUNNING\n1\nfp\n/wt\n/nix/store\n",
+            &required,
+            false,
+            false,
+            "fp"
+        ),
         (true, false)
     );
     assert_eq!(
-        judge_inspect("RUNNING\n0\n/wt\n/nix/store\n", &required, false, false),
+        judge_inspect(
+            "RUNNING\n0\nfp\n/wt\n/nix/store\n",
+            &required,
+            false,
+            false,
+            "fp"
+        ),
         (true, true)
     );
     assert_eq!(
-        judge_inspect("EXITED\n1\n/wt\n", &required, true, false),
+        judge_inspect("EXITED\n1\nfp\n/wt\n", &required, true, false, "fp"),
         (false, false)
     );
     // Non-sealed reuse never cared about extras, nix included.
     assert_eq!(
         judge_inspect(
-            "RUNNING\n\n/wt\n/nix/store\n/nix\n",
+            "RUNNING\n\nfp\n/wt\n/nix/store\n/nix\n",
             &required,
             false,
-            false
+            false,
+            "fp"
         ),
         (true, true)
+    );
+}
+
+#[test]
+fn judge_inspect_rejects_policy_mismatch() {
+    let required: std::collections::HashSet<&str> = ["/wt"].into_iter().collect();
+    assert_eq!(
+        judge_inspect(
+            "RUNNING\n0\nold-fp\n/wt\n",
+            &required,
+            false,
+            false,
+            "new-fp"
+        ),
+        (true, false)
+    );
+}
+
+#[test]
+fn judge_inspect_rejects_missing_policy_label() {
+    let required: std::collections::HashSet<&str> = ["/wt"].into_iter().collect();
+    assert_eq!(
+        judge_inspect("RUNNING\n0\n/wt\n", &required, false, false, "new-fp"),
+        (true, false)
+    );
+    assert_eq!(
+        judge_inspect("RUNNING\n0\n\n/wt\n", &required, false, false, "new-fp"),
+        (true, false)
+    );
+}
+
+#[test]
+fn judge_inspect_accepts_exact_policy() {
+    let required: std::collections::HashSet<&str> = ["/wt"].into_iter().collect();
+    assert_eq!(
+        judge_inspect(
+            "RUNNING\n0\nnew-fp\n/wt\n",
+            &required,
+            false,
+            false,
+            "new-fp"
+        ),
+        (true, true)
+    );
+}
+
+#[test]
+fn expected_policy_is_stable_across_sealed_view() {
+    let mut s = spec(Backend::Podman);
+    s.seal_home = Some("/home/u".into());
+    s.mounts.push(Mount {
+        host: "/home/u/.gnupg".into(),
+        dest: "/home/u/.gnupg".into(),
+        ro: false,
+        cache: false,
+    });
+    assert_eq!(expected_policy(&s), expected_policy(&sealed_view(&s)));
+}
+
+#[test]
+fn create_opts_stamp_the_expected_policy() {
+    let s = spec(Backend::Podman);
+    let argv = oci_create_opts(&s).unwrap().join(" ");
+    assert!(argv.contains(&format!("--label {POLICY_LABEL}={}", expected_policy(&s))));
+    assert!(argv.contains(crate::sandbox_manage::OWNED_LABEL));
+    assert!(argv.contains("--label thegn.seal_home=0"));
+
+    let apple = SandboxSpec {
+        backend: Backend::Apple,
+        ..s
+    };
+    assert!(
+        !oci_create_opts(&apple)
+            .unwrap()
+            .join(" ")
+            .contains(POLICY_LABEL)
     );
 }
 
