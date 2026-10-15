@@ -2600,7 +2600,7 @@ mod tests {
 
         // Model the worker's count after it accounts for UTF-8 carry discarded
         // while finalizing a gap, and exercise the real completion path.
-        actor.recording_completed(super::record::Finished {
+        actor.recording_completed(crate::daemon::record::Finished {
             path: finished.path,
             capped: finished.capped,
             truncated: finished.truncated,
