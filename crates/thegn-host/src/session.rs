@@ -961,6 +961,7 @@ impl Session {
         db: &thegn_core::db::Db,
         cfg: &thegn_core::config::Config,
     ) -> Result<()> {
+        // Preserve A→B→A layout-read ordering for off-loop synchronous callers.
         if !crate::db_task::flush(std::time::Duration::from_millis(300)) {
             tracing::debug!(target: "thegn::workspace_switch", "workspace switch layout barrier timed out");
         }
@@ -2116,37 +2117,55 @@ mod tests {
     }
 
     #[test]
-    fn prepare_then_apply_equals_switch_to_workspace_deferred() {
+    fn prepare_then_apply_matches_resurrected_second_workspace() {
         let scratch = tempfile::tempdir().unwrap();
-        let db = Db::open_at(scratch.path().join("db.sqlite")).unwrap();
-        let repo = "/home/me/code/prepared-switch";
-        let slug = thegn_core::repo::repo_slug_with(&db, std::path::Path::new(repo));
-        let tab = format!("{slug}/main");
-        let mut persisted = Session {
-            id: repo.into(),
-            worktrees: vec![WorktreeGroup::new(tab, GroupKind::Home, repo)],
+        let db = Db::open_at(&scratch.path().join("db.sqlite")).unwrap();
+        let first_repo = scratch.path().join("prepared-switch-a");
+        let repo = scratch.path().join("prepared-switch-b");
+        std::fs::create_dir(&first_repo).unwrap();
+        std::fs::create_dir(&repo).unwrap();
+        let first_repo = first_repo.to_string_lossy().into_owned();
+        let repo = repo.to_string_lossy().into_owned();
+        let first_slug = thegn_core::repo::repo_slug_with(&db, std::path::Path::new(&first_repo));
+        let slug = thegn_core::repo::repo_slug_with(&db, std::path::Path::new(&repo));
+        let mut first = Session {
+            id: first_repo.clone(),
+            worktrees: vec![WorktreeGroup::new(
+                format!("{first_slug}/main"),
+                GroupKind::Home,
+                &first_repo,
+            )],
             active: 0,
         };
-        persisted.persist(&db, repo, 10).unwrap();
+        first.persist(&db, &first_repo, 10).unwrap();
+        let second = Session {
+            id: repo.clone(),
+            worktrees: vec![WorktreeGroup::new(
+                format!("{slug}/main"),
+                GroupKind::Home,
+                &repo,
+            )],
+            active: 0,
+        };
+        second.persist(&db, &repo, 11).unwrap();
 
-        let mut split = Session::default();
-        let mut deferred = Session::default();
-        deferred
-            .switch_to_workspace_deferred(repo, &db, &thegn_core::config::Config::default())
-            .unwrap();
+        let mut split = first;
         let prepared =
-            Session::prepare_workspace_switch(repo, &db, &thegn_core::config::Config::default())
+            Session::prepare_workspace_switch(&repo, &db, &thegn_core::config::Config::default())
                 .unwrap();
-        split.apply_workspace_switch(repo, prepared);
+        split.apply_workspace_switch(&repo, prepared);
+        let expected =
+            Session::resurrect_with_cfg(&db, &repo, &thegn_core::config::Config::default())
+                .unwrap();
         assert_eq!(split.id, repo);
-        assert_eq!(split.worktrees, deferred.worktrees);
-        assert_eq!(split.active, deferred.active);
+        assert_eq!(split.worktrees, expected.worktrees);
+        assert_eq!(split.active, expected.active);
     }
 
     #[test]
     fn prepare_empty_workspace_seeds_workspace_row_and_slug_home_group() {
         let scratch = tempfile::tempdir().unwrap();
-        let db = Db::open_at(scratch.path().join("db.sqlite")).unwrap();
+        let db = Db::open_at(&scratch.path().join("db.sqlite")).unwrap();
         let repo = scratch.path().join("empty-workspace");
         std::fs::create_dir(&repo).unwrap();
         let repo = repo.to_string_lossy().into_owned();
@@ -2166,7 +2185,7 @@ mod tests {
     #[test]
     fn adopt_prepare_apply_matches_adopt_missing_registered() {
         let scratch = tempfile::tempdir().unwrap();
-        let db = Db::open_at(scratch.path().join("db.sqlite")).unwrap();
+        let db = Db::open_at(&scratch.path().join("db.sqlite")).unwrap();
         let repo = "/home/me/code/adopt-prepared";
         let slug = thegn_core::repo::repo_slug_with(&db, std::path::Path::new(repo));
         let worktree = scratch.path().join("worktree");
@@ -2207,7 +2226,7 @@ mod tests {
     #[test]
     fn adoption_does_not_resurrect_a_group_removed_between_prepare_and_apply() {
         let scratch = tempfile::tempdir().unwrap();
-        let db = Db::open_at(scratch.path().join("db.sqlite")).unwrap();
+        let db = Db::open_at(&scratch.path().join("db.sqlite")).unwrap();
         let repo = "/home/me/code/adopt-race";
         let slug = thegn_core::repo::repo_slug_with(&db, std::path::Path::new(repo));
         let worktree = scratch.path().join("registered");
