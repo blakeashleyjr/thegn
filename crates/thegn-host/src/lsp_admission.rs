@@ -87,15 +87,24 @@ impl RootAdmission {
         entry.queue.push_back(Waiter { id, tx: tx.clone() });
         drop(state);
 
-        if let Some(cancel) = cancel {
-            if let Err(error) = cancel.on_cancel(move || {
+        if let Some(cancel) = cancel
+            && let Err(error) = cancel.on_cancel(move || {
                 if let Err(send_error) = tx.send(Err(LspError::Cancelled)) {
-                    tracing::debug!(target: "thegn::lsp", %send_error, "cancelled admission waiter was already gone");
+                    tracing::debug!(
+                        target: "thegn::lsp",
+                        %send_error,
+                        "cancelled admission waiter was already gone"
+                    );
                 }
-            }) {
-                if !self.remove_waiter(&root, id) { drop(RootPermit { state: self.state.clone(), root }); }
-                return Err(error);
+            })
+        {
+            if !self.remove_waiter(&root, id) {
+                drop(RootPermit {
+                    state: self.state.clone(),
+                    root: root.clone(),
+                });
             }
+            return Err(error);
         }
 
         match rx.recv_timeout(self.wait) {
@@ -189,7 +198,11 @@ impl Drop for RootPermit {
             match waiter.tx.send(Ok(())) {
                 Ok(()) => return,
                 Err(error) => {
-                    tracing::debug!(target: "thegn::lsp", %error, "skipping abandoned LSP admission waiter")
+                    tracing::debug!(
+                        target: "thegn::lsp",
+                        %error,
+                        "skipping abandoned LSP admission waiter"
+                    )
                 }
             }
         }
@@ -241,11 +254,11 @@ mod tests {
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut joins = Vec::new();
         for name in ["A", "B"] {
-            let admission = admission.clone();
+            let thread_admission = admission.clone();
             let order = order.clone();
-            let root = root.clone();
+            let thread_root = root.clone();
             joins.push(thread::spawn(move || {
-                let _permit = admission.admit(&root, None).unwrap();
+                let _permit = thread_admission.admit(&thread_root, None).unwrap();
                 order.lock().unwrap().push(name);
             }));
             while admission
@@ -261,7 +274,7 @@ mod tests {
         }
         let mut permits = permits;
         drop(permits.pop());
-        while order.lock().unwrap().len() < 1 {
+        while order.lock().unwrap().is_empty() {
             thread::yield_now();
         }
         assert_eq!(order.lock().unwrap()[0], "A");
@@ -279,9 +292,11 @@ mod tests {
         let permits = fill(&admission, &root);
         let mut joins = Vec::new();
         for _ in 0..MAX_QUEUED_PER_ROOT {
-            let admission = admission.clone();
-            let root = root.clone();
-            joins.push(thread::spawn(move || admission.admit(&root, None)));
+            let thread_admission = admission.clone();
+            let thread_root = root.clone();
+            joins.push(thread::spawn(move || {
+                thread_admission.admit(&thread_root, None)
+            }));
             while admission
                 .state
                 .lock()
@@ -329,7 +344,10 @@ mod tests {
         let a_root = root.clone();
         let a_token = token.clone();
         let a = thread::spawn(move || a_admission.admit(&a_root, Some(&a_token)));
-        while admission.state.lock().unwrap().roots[&root].queue.len() < 1 {
+        while admission.state.lock().unwrap().roots[&root]
+            .queue
+            .is_empty()
+        {
             thread::yield_now();
         }
         let b_admission = admission.clone();

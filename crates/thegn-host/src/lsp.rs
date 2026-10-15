@@ -1748,18 +1748,6 @@ mod tests {
     }
 
     #[test]
-    fn client_holds_a_permit_until_the_guard_drops() {
-        let (inner, _rx) = enabled_inner();
-        let root = Path::new("/admitted");
-        let client = inner
-            .admitted_with(root, "rust", None, fake_client)
-            .unwrap();
-        assert_eq!(inner.admission.in_flight(root), 1);
-        drop(client);
-        assert_eq!(inner.admission.in_flight(root), 0);
-    }
-
-    #[test]
     fn disabled_supervisor_yields_unavailable() {
         let mut cfg = Config::default();
         cfg.lsp.enabled = false;
@@ -3068,5 +3056,17 @@ mod tests {
         store.retain_streams(&HashSet::new());
         let f = assert_store_conserved(&store);
         assert_eq!((f.loss_bytes, store.active_loss(Path::new("/p"))), (0, 0));
+    }
+
+    #[test]
+    fn client_holds_a_permit_until_the_guard_drops() {
+        let (inner, _rx) = enabled_inner();
+        let root = Path::new("/admitted");
+        let client = inner
+            .admitted_with(root, "rust", None, fake_client)
+            .unwrap();
+        assert_eq!(inner.admission.in_flight(root), 1);
+        drop(client);
+        assert_eq!(inner.admission.in_flight(root), 0);
     }
 }
