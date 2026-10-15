@@ -124,6 +124,7 @@ mod loc_scan;
 mod logotype;
 mod loop_policy;
 mod lsp;
+mod lsp_admission;
 mod machine0_bridge;
 mod managed_ssh_rotation;
 mod managed_tool;
