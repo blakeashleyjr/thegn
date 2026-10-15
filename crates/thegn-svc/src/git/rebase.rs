@@ -377,7 +377,8 @@ pub trait RebaseOps: GitBackend {
         let base = run_read(
             loc,
             &["rev-parse", "--verify", &format!("{base_sha}^{{commit}}")],
-        )?;
+        )
+        .with_context(|| "marked base no longer exists; press B to re-mark")?;
         let head = run_read(loc, &["rev-parse", "--verify", "HEAD^{commit}"])?;
         if base.trim() == head.trim() {
             bail!("marked base is HEAD: no commits to rebase");
@@ -843,6 +844,18 @@ mod tests {
         git_in(&r.dir, &["checkout", "-"]);
         let sibling_error = CliGit.rebase_todo_since(&r.loc(), &sibling).unwrap_err();
         assert!(sibling_error.to_string().contains("not an ancestor"));
+    }
+
+    #[test]
+    fn rebase_todo_since_explains_when_the_mark_is_missing() {
+        let r = linear("marked-base-missing");
+        let missing = "0123456789012345678901234567890123456789";
+        let error = CliGit.rebase_todo_since(&r.loc(), missing).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("marked base no longer exists; press B to re-mark")
+        );
     }
 
     #[test]
