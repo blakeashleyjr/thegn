@@ -2739,61 +2739,6 @@ fn worktree_landing_never_lands_on_a_terminal() {
     assert_eq!(worktree_landing(&only_terminals, None), None);
 }
 
-#[test]
-fn failed_project_switch_restores_terminal_focus_and_region_bookmarks() {
-    let mut session = Session {
-        id: "repo".into(),
-        worktrees: vec![
-            WorktreeGroup::new("repo/home", GroupKind::Home, "/wt/home"),
-            WorktreeGroup::terminal("prod"),
-        ],
-        active: 0,
-    };
-    session.switch_to(1);
-    let mut last_w = Some("repo/home".into());
-    let mut last_t = Some("prod".into());
-    let prior_last_w = last_w.clone();
-    let prior_last_t = last_t.clone();
-
-    // This is the provisional park-time sanitisation performed immediately
-    // before the cold switch discovers that its target is unavailable.
-    session.switch_to(0);
-    last_t = Some("other".into());
-    restore_failed_region_switch(
-        &mut session,
-        1,
-        &mut last_w,
-        prior_last_w,
-        &mut last_t,
-        prior_last_t,
-    );
-
-    assert_eq!(session.active, 1);
-    assert_eq!(last_w.as_deref(), Some("repo/home"));
-    assert_eq!(last_t.as_deref(), Some("prod"));
-}
-
-#[test]
-fn sidebar_activation_rollback_only_covers_failed_project_targets() {
-    use crate::sidebar::RowTarget;
-
-    // Same-workspace tab activation returns `landed == false` because the
-    // activation helper's bool means `workspace_switched`; it must not undo
-    // the active pointer that the helper just moved.
-    assert!(!is_project_activation_target(&RowTarget::Tab(1, 0)));
-    assert!(!should_restore_failed_activation(false, false, true));
-
-    // The rollback remains available for the one provisional mutation that
-    // needs it: leaving a terminal region before a failed project switch.
-    assert!(is_project_activation_target(&RowTarget::Workspace {
-        repo_path: "/other".into(),
-        group: None,
-    }));
-    assert!(should_restore_failed_activation(true, false, true));
-    assert!(!should_restore_failed_activation(true, true, true));
-    assert!(!should_restore_failed_activation(true, false, false));
-}
-
 /// Build a one-tab workspace whose single leaf pane has id `pane_id`, and
 /// register a live `PtyPane` for it in `panes` so eviction has something to reap.
 #[cfg(test)]
@@ -3465,11 +3410,9 @@ fn the73_worktree_dir(tag: &str) -> String {
 
 #[test]
 fn a_warm_switch_adopts_worktrees_registered_while_it_was_parked() {
-    // THE-73: the warm arm restored the parked in-memory tree verbatim — no DB
-    // read, no adoption — so a worktree registered while the workspace sat in
-    // the pool (`thegn wt new` from another shell) never became a live group,
-    // and every switch back re-parked the same stale tree. Only a cold start
-    // re-read the registry, so the staleness outlived the whole UI process.
+    // THE-73: a warm switch now swaps immediately; the DB-writer adoption
+    // result appends a worktree registered while this workspace sat in the
+    // pool (`thegn wt new` from another shell).
     //
     // `switch_workspace`'s warm arm queues an off-loop `set_active_workspace`
     // on the process-global db_task writer, which opens the REAL state DB —
@@ -3517,22 +3460,30 @@ fn a_warm_switch_adopts_worktrees_registered_while_it_was_parked() {
         active: 0,
     };
     let (mut need_relayout, mut clear) = (false, false);
-    assert!(
+    assert_eq!(
         switch_workspace(
             repo_b,
             Some(&fresh),
             &mut session,
             &mut panes,
             &mut pool,
-            &db,
-            &thegn_core::config::Config::default(),
             &mut need_relayout,
             &mut clear,
         ),
-        "the warm switch happened"
+        SwitchStart::Switched,
+        "the warm swap happens synchronously"
     );
 
     assert_eq!(session.id, repo_b);
+    assert!(!session.worktrees.iter().any(|g| g.name == fresh));
+    let adopted = Session::prepare_registered_adoption(
+        &session.id,
+        &session.worktrees,
+        &db,
+        &thegn_core::config::Config::default(),
+    );
+    session.apply_registered_adoption(adopted);
+    assert!(session.land_on_group(&fresh));
     assert!(
         session.worktrees.iter().any(|g| g.name == fresh),
         "the row registered while B was parked is now a live group: {:?}",
@@ -3551,11 +3502,8 @@ fn a_warm_switch_adopts_worktrees_registered_while_it_was_parked() {
 
 #[test]
 fn activating_a_not_yet_loaded_group_of_the_active_workspace_lands_on_it() {
-    // THE-73: for the ACTIVE workspace `switch_workspace` short-circuits, and
-    // its `land_on` did nothing when no group carried the name — then returned
-    // `true`, so the caller stayed quiet too. Activating a union row was
-    // literally nothing: no pane, no switch, no message. This arm takes the
-    // early return, so it queues no db_task write and needs no XDG isolation.
+    // THE-73: the active-workspace switch stays immediate; a missing group is
+    // appended and focused only after registry adoption is applied.
     let db_path = std::env::temp_dir().join(format!(
         "tg-run-the73-active-{}-{}.sqlite",
         std::process::id(),
@@ -3585,17 +3533,27 @@ fn activating_a_not_yet_loaded_group_of_the_active_workspace_lands_on_it() {
     };
     let (mut need_relayout, mut clear) = (false, false);
 
-    assert!(switch_workspace(
-        repo,
-        Some(&late),
-        &mut session,
-        &mut panes,
-        &mut pool,
+    assert_eq!(
+        switch_workspace(
+            repo,
+            Some(&late),
+            &mut session,
+            &mut panes,
+            &mut pool,
+            &mut need_relayout,
+            &mut clear,
+        ),
+        SwitchStart::Switched
+    );
+    assert!(!session.worktrees.iter().any(|g| g.name == late));
+    let adopted = Session::prepare_registered_adoption(
+        &session.id,
+        &session.worktrees,
         &db,
         &thegn_core::config::Config::default(),
-        &mut need_relayout,
-        &mut clear,
-    ));
+    );
+    session.apply_registered_adoption(adopted);
+    assert!(session.land_on_group(&late));
     assert_eq!(
         session.active_group().unwrap().name,
         late,
@@ -3609,7 +3567,7 @@ fn activating_a_not_yet_loaded_group_of_the_active_workspace_lands_on_it() {
 }
 
 #[test]
-fn a_failed_workspace_activation_reports_failure_to_merge_queue_route() {
+fn a_failed_terminal_activation_reports_failure_to_merge_queue_route() {
     // The merge-queue sidebar outcome must not open a panel after this seam
     // fails: the activation status is the only diagnostic the user gets for a
     // deleted or unreadable dormant workspace.
@@ -3646,7 +3604,10 @@ fn a_failed_workspace_activation_reports_failure_to_merge_queue_route() {
         None,
     );
 
-    assert!(!activated);
+    assert!(matches!(
+        activated,
+        crate::handlers::sidebar_activate::Activation::Failed
+    ));
     assert!(model.status.is_empty());
 }
 
@@ -4469,4 +4430,38 @@ fn test_run_failed_caps_to_whole_suite() {
         "{}",
         task.name
     );
+}
+
+#[test]
+fn cold_request_changes_nothing_until_apply() {
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1);
+    let mut panes = Panes::new(tx);
+    let mut session = one_tab_session();
+    let original_id = session.id.clone();
+    let original_active = session.active;
+    let original_worktrees = session.worktrees.clone();
+    let mut pool = WorkspacePool::default();
+    let (mut need_relayout, mut clear_on_next_frame) = (false, false);
+    let region_last_w = Some("home".to_string());
+    let region_last_t = Some("terminal".to_string());
+
+    assert_eq!(
+        switch_workspace(
+            "/cold-target",
+            None,
+            &mut session,
+            &mut panes,
+            &mut pool,
+            &mut need_relayout,
+            &mut clear_on_next_frame,
+        ),
+        SwitchStart::NeedsCold
+    );
+    assert_eq!(session.id, original_id);
+    assert_eq!(session.active, original_active);
+    assert_eq!(session.worktrees, original_worktrees);
+    assert!(!need_relayout);
+    assert!(!clear_on_next_frame);
+    assert_eq!(region_last_w.as_deref(), Some("home"));
+    assert_eq!(region_last_t.as_deref(), Some("terminal"));
 }

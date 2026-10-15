@@ -6,9 +6,15 @@ use crate::chrome::FrameModel;
 use crate::compositor::Rect;
 use crate::panes::Panes;
 use crate::run::{
-    DrawerRuntime, SidebarState, WorkspacePool, persist_active_focus, persist_session_layout,
-    refresh_tab_model, switch_workspace,
+    DrawerRuntime, SidebarState, SwitchStart, WorkspacePool, persist_active_focus,
+    persist_session_layout, refresh_tab_model, switch_workspace,
 };
+
+pub(crate) enum Activation {
+    Landed { workspace_switched: bool },
+    Pending(crate::workspace_switch_prep::SwitchRequestSpec),
+    Failed,
+}
 
 fn resident_terminal_index(session: &crate::session::Session, name: &str) -> Option<usize> {
     session
@@ -59,7 +65,7 @@ pub(crate) fn activate_row_target(
         &tokio::sync::mpsc::UnboundedSender<crate::handlers::terminal::RestoreDone>,
         &termwiz::terminal::TerminalWaker,
     )>,
-) -> bool {
+) -> Activation {
     // Set when this activation switched to a different workspace, so the caller
     // can kick an immediate model hydration (the new workspace's worktree paths
     // aren't in `model.sidebar_status` yet — without this the git glyphs blank
@@ -77,7 +83,7 @@ pub(crate) fn activate_row_target(
     match target {
         crate::sidebar::RowTarget::Tab(gi, ti) => {
             if gi >= session.worktrees.len() {
-                return false;
+                return Activation::Failed;
             }
             session.switch_to_tab(gi, ti);
             pure_focus = true;
@@ -112,7 +118,7 @@ pub(crate) fn activate_row_target(
         // original kept running, invisible, in the pane daemon.
         crate::sidebar::RowTarget::Workspace { repo_path, group } if repo_path == "terminal" => {
             let Some(name) = group else {
-                return false;
+                return Activation::Failed;
             };
             // NOT `pure_focus`: this row carried a Workspace fallback target
             // (the group wasn't resident at the last rebuild), so the light
@@ -134,7 +140,7 @@ pub(crate) fn activate_row_target(
                     }
                     None => {
                         let Some((tx, waker)) = terminal_restore else {
-                            return false;
+                            return Activation::Failed;
                         };
                         crate::handlers::terminal::request_restore(
                             session.id.clone(),
@@ -143,7 +149,7 @@ pub(crate) fn activate_row_target(
                             waker.clone(),
                         );
                         model.status = format!("Restoring terminal '{name}'…");
-                        return false;
+                        return Activation::Failed;
                     }
                 };
                 session.worktrees.push(group);
@@ -153,45 +159,29 @@ pub(crate) fn activate_row_target(
             }
         }
         crate::sidebar::RowTarget::Workspace { repo_path, group } => {
-            let Ok(db) = thegn_core::db::Db::open() else {
-                model.status = "Can't switch project — the state DB is unavailable".into();
-                return false;
-            };
             // Park the outgoing workspace's panes (kept alive) and restore the
             // target's — no reaping, so an editor/server keeps running across
-            // the switch. `switch_workspace` handles the id-aliasing that the
-            // old reap guarded against by remapping cold-resurrected ids.
-            if !switch_workspace(
+            // the switch. Cold results remap restored ids before their layout
+            // is persisted, so they cannot alias a parked workspace.
+            match switch_workspace(
                 &repo_path,
                 group.as_deref(),
                 session,
                 panes,
                 workspace_pool,
-                &db,
-                cfg,
                 need_relayout,
                 clear_on_next_frame,
             ) {
-                // The cold resurrect refused (checkout deleted outside thegn,
-                // `.git` unreadable). Absolutely nothing happening on Enter is
-                // the one outcome the user can't diagnose — say why.
-                model.status = format!("Can't open project — {repo_path} is gone or unreadable");
-                return false;
+                SwitchStart::NeedsCold => {
+                    return Activation::Pending(crate::workspace_switch_prep::SwitchRequestSpec {
+                        target: repo_path,
+                        group,
+                        after: crate::workspace_switch_prep::AfterSwitch::default(),
+                    });
+                }
+                SwitchStart::Switched => {}
             }
             workspace_switched = true;
-            // A `true` return means the workspace is now active; it does NOT
-            // promise the named group exists. The sidebar renders the union of
-            // the live session and the registry (THE-73), so a row can name a
-            // worktree whose registry row no longer resolves to a group even
-            // after `switch_workspace` re-read the registry. Say that, rather
-            // than leaving the click silent — and NOT via the "gone or
-            // unreadable" message above, which would send the user looking at
-            // the workspace when the workspace is fine and the row is stale.
-            if let Some(name) = group.as_deref()
-                && !session.worktrees.iter().any(|g| g.name == name)
-            {
-                model.status = format!("'{name}' isn't loaded — its registry row may be stale");
-            }
         }
     }
     // The tab keeps the pane you left focused — and, when it is zoomed, the
@@ -212,16 +202,15 @@ pub(crate) fn activate_row_target(
     }
     // Persist the new active worktree/tab so it survives a non-graceful exit.
     // Only a structural change (the terminal-materialize arm, which pushes a
-    // new group) needs the full layout rewrite; the Workspace arm already
-    // persisted its full layout inside `switch_workspace`, and the in-workspace
-    // Tab arm is a pure focus move — both just need the cheap, off-loop
-    // active-pointer write so sidebar activation never blocks a frame.
+    // new group) needs the full layout rewrite. Workspace persistence is queued
+    // by the switch path; an in-workspace Tab arm only needs the cheap,
+    // off-loop active-pointer write.
     if structural {
         persist_session_layout(session, panes);
     } else {
         persist_active_focus(session);
     }
-    workspace_switched
+    Activation::Landed { workspace_switched }
 }
 
 /// Point a tab whose `focused_pane` no longer names one of its panes at the
@@ -268,5 +257,42 @@ mod tests {
         assert_eq!(switch_kind(&ws("/repo"), "/repo"), SwitchKind::Worktree);
         assert_eq!(switch_kind(&ws("terminal"), "/repo"), SwitchKind::Worktree);
         assert_eq!(switch_kind(&ws("/other"), "/repo"), SwitchKind::Workspace);
+    }
+
+    #[test]
+    fn nonresident_workspace_activation_returns_pending_without_database_open() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = Panes::new(tx);
+        let mut session = crate::session::Session::default();
+        let mut model = FrameModel::default();
+        let mut sidebar = SidebarState::default();
+        let mut drawer = DrawerRuntime::default();
+        let mut pool = WorkspacePool::default();
+        let mut need_relayout = false;
+        let mut clear_on_next_frame = false;
+        let activation = activate_row_target(
+            crate::sidebar::RowTarget::Workspace {
+                repo_path: "/tmp/nonresident-switch-target".into(),
+                group: None,
+            },
+            &mut session,
+            &mut model,
+            &mut sidebar,
+            &mut panes,
+            &mut drawer,
+            &mut pool,
+            &thegn_core::config::Config::default(),
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 80,
+                rows: 24,
+            },
+            &mut need_relayout,
+            &mut clear_on_next_frame,
+            None,
+        );
+        assert!(matches!(activation, Activation::Pending(_)));
+        assert_eq!(session.id, "default");
     }
 }
