@@ -191,6 +191,7 @@ fn sandbox_json_with(cfg: &Config, backend: Backend, actual: IsolationClass) -> 
         ),
         "enforcement_matrix": enforcement_matrix_json(),
         "home": home_json(cfg),
+        "network_rules": network_rules_line(&cfg.sandbox, backend),
     })
 }
 
@@ -4924,5 +4925,28 @@ args = ["--verbose"]
         assert_eq!(value["isolation_floor"], "shared-kernel");
         assert_eq!(value["isolation_floor_source"], "default");
         assert_eq!(value["on_floor_miss"], "fail");
+    }
+
+    #[test]
+    fn sandbox_json_reports_network_rules_note() {
+        let cfg = Config {
+            sandbox: thegn_core::config::SandboxConfig {
+                network_allow: vec!["example.com".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let report = sandbox_json_with(&cfg, Backend::Bwrap, IsolationClass::SharedKernel);
+        assert!(
+            report["network_rules"]
+                .as_str()
+                .unwrap()
+                .contains("DNS-name rules only")
+        );
+
+        let default_cfg = Config::default();
+        let default_report =
+            sandbox_json_with(&default_cfg, Backend::Bwrap, IsolationClass::SharedKernel);
+        assert!(default_report["network_rules"].is_null());
     }
 }

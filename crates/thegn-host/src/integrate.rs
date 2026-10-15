@@ -838,8 +838,13 @@ pub enum GateOutcome {
     Failed { offender: Option<String> },
     /// The gate could not RUN (missing binary, unprovisioned worktree, killed).
     /// Distinct from `Failed`: it is a fact about the environment, so no branch
-    /// is blamed and no bisect is attempted.
-    Errored { reason: String },
+    /// is blamed and no bisect is attempted. Phase and class are absent only
+    /// when the fold exhausted its CAS retry budget without a gate verdict.
+    Errored {
+        reason: String,
+        phase: Option<GatePhase>,
+        class: Option<GateErrorClass>,
+    },
 }
 
 /// A branch that landed in this fold.
@@ -896,7 +901,20 @@ impl FoldReport {
     /// A no-op is successful; any requested branch still held is not.
     pub(crate) fn request_result(&self) -> Result<()> {
         match &self.gate {
-            GateOutcome::Errored { reason } => anyhow::bail!("integration held: {reason}"),
+            GateOutcome::Errored {
+                reason,
+                phase,
+                class,
+            } => {
+                if let (Some(phase), Some(class)) = (phase, class) {
+                    anyhow::bail!(
+                        "integration held ({}/{}): {reason}",
+                        phase.as_str(),
+                        class.as_str()
+                    );
+                }
+                anyhow::bail!("integration held: {reason}");
+            }
             GateOutcome::Failed { .. } => anyhow::bail!("integration held: gate failed"),
             _ if !self.prepared.is_empty()
                 || !self.unprepared.is_empty()
@@ -1690,7 +1708,11 @@ fn history_failure_report(
         original,
         &empty_plan(original),
         &[],
-        GateOutcome::Errored { reason },
+        GateOutcome::Errored {
+            reason,
+            phase: Some(GatePhase::Preparation),
+            class: Some(GateErrorClass::Preparation),
+        },
         attempts,
         &diagnostics,
     );
@@ -1859,7 +1881,11 @@ fn run_fold_admitted(
                     &original,
                     &empty,
                     &gate_offenders,
-                    GateOutcome::Errored { reason },
+                    GateOutcome::Errored {
+                        reason,
+                        phase: Some(GatePhase::Preparation),
+                        class: Some(GateErrorClass::Preparation),
+                    },
                     cas_attempts,
                     &diagnostics,
                 );
@@ -1912,7 +1938,13 @@ fn run_fold_admitted(
             record_gate_sources(&mut diagnostics, &base, &plan);
             // The gate could not run: report the environment and hold everything
             // back. Never bisect — the failure is identical at every prefix.
-            if let GateVerdict::Error { reason, .. } = &verdict {
+            if let GateVerdict::Error {
+                reason,
+                phase,
+                class,
+                ..
+            } = &verdict
+            {
                 return Ok(build_report(
                     &target_branch,
                     &original,
@@ -1920,6 +1952,8 @@ fn run_fold_admitted(
                     &gate_offenders,
                     GateOutcome::Errored {
                         reason: reason.clone(),
+                        phase: Some(*phase),
+                        class: Some(*class),
                     },
                     cas_attempts,
                     &diagnostics,
@@ -1949,8 +1983,13 @@ fn run_fold_admitted(
                     // The gate stopped being runnable mid-bisect: report the
                     // environment rather than blaming whichever branch was next.
                     Err(e) => {
-                        let reason = match e.downcast_ref::<BisectAborted>() {
-                            Some(b) => b.to_string(),
+                        let (reason, phase, class) = match e.downcast_ref::<BisectAborted>() {
+                            Some(b) => {
+                                let GateVerdict::Error { phase, class, .. } = &b.0 else {
+                                    return Err(e);
+                                };
+                                (b.to_string(), Some(*phase), Some(*class))
+                            }
                             None => return Err(e),
                         };
                         return Ok(build_report(
@@ -1958,7 +1997,11 @@ fn run_fold_admitted(
                             &original,
                             &plan,
                             &gate_offenders,
-                            GateOutcome::Errored { reason },
+                            GateOutcome::Errored {
+                                reason,
+                                phase,
+                                class,
+                            },
                             cas_attempts,
                             &diagnostics,
                         ));
@@ -2029,7 +2072,11 @@ fn run_fold_admitted(
                     &original,
                     &plan,
                     &gate_offenders,
-                    GateOutcome::Errored { reason },
+                    GateOutcome::Errored {
+                        reason,
+                        phase: Some(GatePhase::Preparation),
+                        class: Some(GateErrorClass::Preparation),
+                    },
                     cas_attempts,
                     &diagnostics,
                 ));
@@ -2094,6 +2141,8 @@ fn run_fold_admitted(
                     reason: format!(
                         "{target_branch} kept moving under the fold; CAS retry budget exhausted"
                     ),
+                    phase: None,
+                    class: None,
                 },
                 cas_attempts,
                 &diagnostics,
