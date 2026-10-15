@@ -164,7 +164,6 @@ fn terminate_and_reap_parts(
         force_kill_group(group);
     }
     child
-        .as_deref_mut()
         .and_then(|child| child.wait().ok())
         .map(|status| status.exit_code() as i32)
 }
