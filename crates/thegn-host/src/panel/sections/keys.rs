@@ -3,7 +3,8 @@
 
 use std::collections::BTreeSet;
 
-use crate::panel::{PanelUi, SECTION_ORDER, Section, SectionCtx};
+use crate::panel::sections::SectionCtx;
+use crate::panel::{PanelUi, SECTION_ORDER, Section};
 use crate::seg::{Line, Seg, Tok, seg, sp};
 
 use super::{PanelRow, d, g2, g3, hint_row, t, two_col};
@@ -394,7 +395,7 @@ pub(crate) fn where_bound(row: &KeyRow, bindings: &[crate::keymap_merge::Binding
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::panel::PanelWidth;
+    use crate::layout::PanelWidth;
 
     fn test_ui() -> PanelUi {
         PanelUi {
