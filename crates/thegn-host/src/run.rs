@@ -22459,16 +22459,22 @@ async fn event_loop<T: Terminal>(
                         // `a` asks for confirmation before clearing the inbox
                         // and acknowledging live needs-you signals.
                         (Section::Notifications, KeyCode::Char('a')) => {
-                            match crate::handlers::attention::clear_all_confirm(
-                                &model,
-                                crate::panel::scope::system_all(),
-                                &crate::handlers::attention::filtered_unread_ids(
-                                    &model.panel,
-                                    &panel_ui,
-                                ),
-                            ) {
-                                Some(menu) => active_menu = Some(menu),
-                                None => model.status = "inbox already clear".into(),
+                            let filtered = crate::handlers::attention::filtered_unread_ids(
+                                &model.panel,
+                                &panel_ui,
+                            );
+                            if matches!(&filtered, Some(ids) if ids.is_empty()) {
+                                model.status = "no unread notifications match the filter".into();
+                            } else {
+                                let ids = filtered.as_deref().unwrap_or(&[]);
+                                match crate::handlers::attention::clear_all_confirm(
+                                    &model,
+                                    crate::panel::scope::system_all(),
+                                    ids,
+                                ) {
+                                    Some(menu) => active_menu = Some(menu),
+                                    None => model.status = "inbox already clear".into(),
+                                }
                             }
                             true
                         }

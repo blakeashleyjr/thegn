@@ -423,21 +423,23 @@ pub(crate) fn clear_all_confirm(
     ))
 }
 
-/// Visible unread inbox ids, preserving display order. An inactive filter
-/// leaves the caller on the existing clear-all confirmation path.
+/// Visible unread inbox ids, preserving display order. `None` means no filter
+/// is active; `Some(Vec::new())` means the active filter has no unread matches.
 pub(crate) fn filtered_unread_ids(
     panel: &crate::panel::PanelData,
     ui: &crate::panel::PanelUi,
-) -> Vec<i64> {
+) -> Option<Vec<i64>> {
     if ui.notifications_filter.is_empty() {
-        return Vec::new();
+        return None;
     }
-    crate::panel::sections::notifications::visible_indices(panel, ui)
-        .into_iter()
-        .filter_map(|index| panel.notifications.get(index))
-        .filter(|notification| !notification.read)
-        .map(|notification| notification.id)
-        .collect()
+    Some(
+        crate::panel::sections::notifications::visible_indices(panel, ui)
+            .into_iter()
+            .filter_map(|index| panel.notifications.get(index))
+            .filter(|notification| !notification.read)
+            .map(|notification| notification.id)
+            .collect(),
+    )
 }
 
 /// Mark only the confirmed filtered rows read. Live needs-you signals are
@@ -540,7 +542,24 @@ mod tests {
             notifications_filter: "needle".into(),
             ..Default::default()
         };
-        assert_eq!(filtered_unread_ids(&model.panel, &ui), vec![1, 4]);
+        assert_eq!(filtered_unread_ids(&model.panel, &ui), Some(vec![1, 4]));
+    }
+
+    #[test]
+    fn filtered_unread_ids_preserves_active_filter_with_no_unread_matches() {
+        let mut model = FrameModel::default();
+        model.panel.notifications = vec![
+            notification(1, "needle read", true),
+            notification(2, "unrelated unread", false),
+        ];
+        let ui = crate::panel::PanelUi {
+            notifications_filter: "needle".into(),
+            ..Default::default()
+        };
+        assert_eq!(filtered_unread_ids(&model.panel, &ui), Some(Vec::new()));
+
+        let unfiltered_ui = crate::panel::PanelUi::default();
+        assert_eq!(filtered_unread_ids(&model.panel, &unfiltered_ui), None);
     }
 
     #[test]
