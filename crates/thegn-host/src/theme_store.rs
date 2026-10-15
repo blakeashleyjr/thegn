@@ -632,7 +632,7 @@ fn bounded_theme_paths(
             continue;
         }
         theme_file_count += 1;
-        if entry.file_name().to_str() == pinned {
+        if pinned.is_some_and(|p| entry.file_name() == std::ffi::OsStr::new(p)) {
             pinned_path = Some(path);
             continue;
         }
@@ -1207,6 +1207,8 @@ mod tests {
         }
         let selected = theme("zz-selected");
         std::fs::write(themes.join("zz-selected.toml"), selected.to_toml().unwrap()).unwrap();
+        let other = theme("zz-other");
+        std::fs::write(themes.join("zz-other.toml"), other.to_toml().unwrap()).unwrap();
         let mut store = ThemeStore::start(
             None,
             themes,
@@ -1219,11 +1221,12 @@ mod tests {
         let (catalog, _) = runtime.block_on(store.initial_catalog());
         assert!(catalog.iter().any(|item| item.meta.name == "zz-selected"));
 
-        store.set_active("t000");
+        store.set_active("zz-other");
         store.scan().unwrap();
         let (catalog, _) = runtime.block_on(store.initial_catalog());
         assert!(catalog.len() >= 256);
-        assert!(catalog.iter().any(|item| item.meta.name == "t000"));
+        assert!(catalog.iter().any(|item| item.meta.name == "zz-other"));
+        assert!(!catalog.iter().any(|item| item.meta.name == "zz-selected"));
     }
 
     #[test]
