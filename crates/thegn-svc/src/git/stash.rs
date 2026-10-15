@@ -409,6 +409,11 @@ mod tests {
         CliGit.stash_push(&loc, "stash A", false).unwrap();
         let sha_a = CliGit.stash_list(&loc).unwrap()[0].sha.clone();
         let lock_path = thegn_core::util::git_common_dir(&repo.dir).join("thegn-git.lock");
+        // The earlier stash push left the regular lock file behind; replace it
+        // with a directory so the lock cannot be opened.
+        if lock_path.exists() {
+            std::fs::remove_file(&lock_path).unwrap();
+        }
         std::fs::create_dir(lock_path).unwrap();
 
         let error = CliGit.stash_drop(&loc, &sha_a).unwrap_err().to_string();
