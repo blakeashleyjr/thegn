@@ -3556,4 +3556,52 @@ mod tests {
             "the suppressed digit is replaced by an equal-width gutter",
         );
     }
+
+    #[test]
+    fn right_cluster_renders_typed_diff_counts_without_sentinels() {
+        use crate::sidebar::{GitGlyphs, SidebarRow};
+        use thegn_svc::git::DiffCount;
+
+        let render = |add, del| {
+            let mut row = SidebarRow::base(RowKind::Worktree, 1, "feat", "app");
+            row.git = Some(GitGlyphs {
+                add,
+                del,
+                ..GitGlyphs::default()
+            });
+            compose_row_lines(
+                &row,
+                None,
+                None,
+                false,
+                false,
+                true,
+                None,
+                None,
+                40,
+                &mut None,
+                &SidebarDisplay::default(),
+            )
+            .into_iter()
+            .flat_map(|line| match line {
+                crate::seg::Line::Segs(segs) => segs,
+                _ => Vec::new(),
+            })
+            .map(|seg| seg.text)
+            .collect::<String>()
+        };
+
+        let binary = render(DiffCount::Binary, DiffCount::Binary);
+        assert!(binary.contains("bin"), "{binary:?}");
+        assert!(!binary.contains("+0"), "{binary:?}");
+
+        let capped = render(DiffCount::Capped, DiffCount::Capped);
+        assert!(capped.contains("+capped"), "{capped:?}");
+        assert!(capped.contains("-capped"), "{capped:?}");
+        assert!(!capped.contains("4294967295"), "{capped:?}");
+
+        let exact = render(DiffCount::Exact(42), DiffCount::Exact(7));
+        assert!(exact.contains("+42"), "{exact:?}");
+        assert!(exact.contains("-7"), "{exact:?}");
+    }
 }

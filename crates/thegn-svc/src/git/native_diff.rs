@@ -1091,15 +1091,21 @@ mod tests {
 
     /// `git diff --numstat <spec>` reduced to `(added, deleted)` — the exact
     /// output the native path must reproduce.
-    fn cli_totals(repo: &TestRepo, spec: &str) -> (u32, u32) {
+    fn cli_totals(
+        repo: &TestRepo,
+        spec: &str,
+    ) -> (super::super::DiffCount, super::super::DiffCount) {
         let out = repo.out(&["-c", "core.quotePath=false", "diff", "--numstat", spec]);
-        super::super::sum_numstat(&out).expect("numstat parses")
+        super::super::typed_numstat(&out).expect("numstat parses")
     }
 
     /// Git's process filter in `filtered_dirty_repo` intentionally is not a
     /// protocol implementation. Make its required failure nonfatal so Git
     /// leaves the identity-filtered content unchanged for a totals comparison.
-    fn cli_totals_with_nonrequired_filter(repo: &TestRepo, spec: &str) -> (u32, u32) {
+    fn cli_totals_with_nonrequired_filter(
+        repo: &TestRepo,
+        spec: &str,
+    ) -> (super::super::DiffCount, super::super::DiffCount) {
         let out = repo.out(&[
             "-c",
             "filter.tgtest.required=false",
@@ -1109,7 +1115,7 @@ mod tests {
             "--numstat",
             spec,
         ]);
-        super::super::sum_numstat(&out).expect("numstat parses")
+        super::super::typed_numstat(&out).expect("numstat parses")
     }
 
     /// Every native read must agree with the CLI it replaced. A performance
@@ -1510,5 +1516,26 @@ mod tests {
         let message = typed.to_string();
         assert!(message.contains("66696c65ff"));
         assert!(!message.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn binary_only_totals_are_typed_and_match_git() {
+        let repo = TestRepo::new("nd-binary-only-totals");
+        repo.commit_file("base.txt", "x\n", "base");
+        repo.out(&["checkout", "-q", "-b", "feat"]);
+        std::fs::write(repo.dir.join("blob.bin"), [0u8, 1, 0, 2]).unwrap();
+        repo.out(&["add", "blob.bin"]);
+        repo.out(&["commit", "-q", "-m", "binary"]);
+
+        let want = cli_totals(&repo, "main...HEAD");
+        let got = totals(&repo.dir, "main...HEAD").unwrap();
+        assert_eq!(got, want, "native totals must match real git");
+        assert_eq!(
+            got,
+            (
+                super::super::DiffCount::Binary,
+                super::super::DiffCount::Binary
+            )
+        );
     }
 }
