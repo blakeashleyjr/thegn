@@ -1433,6 +1433,7 @@ mod spec {
                     finished_at: 1_700_000_000_000,
                     output_tail: "Compiling thegn v0.1.0\nFinished dev profile".into(),
                     running: false,
+                    end: Default::default(),
                 },
             );
             h

@@ -549,6 +549,8 @@ pub struct TaskRunRecord {
     pub output_tail: String,
     /// True while the task process is still running.
     pub running: bool,
+    /// How the last run ended, distinguishing timeouts and user stops from exits.
+    pub end: crate::task::RunEnd,
 }
 
 /// A trimmed test snapshot for the tests section (read from `test_cache`
