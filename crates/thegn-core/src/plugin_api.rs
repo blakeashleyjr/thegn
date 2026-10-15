@@ -424,6 +424,17 @@ impl PluginSpec {
     }
 }
 
+impl NativeTrust {
+    /// Stable machine-readable label shared by plugin inspection surfaces.
+    pub fn status_token(&self) -> &'static str {
+        match self {
+            Self::Ungated => "ungated",
+            Self::Trusted => "trusted-native",
+            Self::Refused { .. } => "refused-untrusted",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginApiError {
     IncompatibleApi {

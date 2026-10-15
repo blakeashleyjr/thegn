@@ -1407,13 +1407,7 @@ fn plugin_trust_rows(cfg: &Config, config_path: &std::path::Path) -> Vec<serde_j
         .into_iter()
         .filter(|plugin| plugin.spec.enabled)
         .map(|plugin| {
-            let trust = match plugin.spec.native_trust() {
-                thegn_core::plugin_api::NativeTrust::Ungated => "ungated",
-                thegn_core::plugin_api::NativeTrust::Trusted => "trusted-native",
-                thegn_core::plugin_api::NativeTrust::Refused { .. } => {
-                    "refused (needs trusted_native = true)"
-                }
-            };
+            let trust = plugin.spec.native_trust().status_token();
             let source = if let Some(dir) = &plugin.dir {
                 let mut source = dir.display().to_string();
                 if plugin.trusted_native_ignored {
@@ -1462,10 +1456,15 @@ fn plugins_trust_report(cfg: &Config, config_path: &std::path::Path) {
                 .join(", "),
             None => String::new(),
         };
+        let trust = if row["trust"] == "refused-untrusted" {
+            "refused-untrusted (needs trusted_native = true)"
+        } else {
+            row["trust"].as_str().unwrap_or("")
+        };
         outln!(
             "  {}  {}  gated by [{}]  {}",
             row["id"].as_str().unwrap_or(""),
-            row["trust"].as_str().unwrap_or(""),
+            trust,
             gated_by,
             row["source"].as_str().unwrap_or(""),
         );
@@ -1476,11 +1475,10 @@ fn plugins_trust_report(cfg: &Config, config_path: &std::path::Path) {
 #[test]
 fn plugins_trust_json_reports_trusted_refused_and_ungated() {
     let spec = |id: &str, capability: &str, trusted_native: bool| {
-        let spec: thegn_core::plugin_api::PluginSpec = toml::from_str(&format!(
+        toml::from_str::<thegn_core::plugin_api::PluginSpec>(&format!(
             "id = \"{id}\"\nname = \"{id}\"\nversion = \"1\"\napi = \"0.3.0\"\ncapabilities = [\"{capability}\"]\ncommand = [\"true\"]\ntrusted_native = {trusted_native}"
         ))
         .unwrap();
-        spec
     };
     let cfg = Config {
         plugins: vec![
@@ -1493,7 +1491,7 @@ fn plugins_trust_json_reports_trusted_refused_and_ungated() {
     let tmp = tempfile::tempdir().unwrap();
     let rows = plugins_trust_json(&cfg, &tmp.path().join("config.toml"));
     assert_eq!(rows[0]["trust"], "trusted-native");
-    assert_eq!(rows[1]["trust"], "refused (needs trusted_native = true)");
+    assert_eq!(rows[1]["trust"], "refused-untrusted");
     assert_eq!(rows[2]["trust"], "ungated");
     assert_eq!(
         rows[1]["gated_by"],
