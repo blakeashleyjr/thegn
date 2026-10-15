@@ -656,6 +656,37 @@ mod authorship_tests {
     }
 
     #[test]
+    fn reattest_failure_never_claims_or_spends() {
+        let fixture = Fixture::new();
+        let handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
+        assert!(
+            fixture
+                .loc
+                .git_out(&["checkout", "-b", "moved-checkout"])
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .loc
+                .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+                .as_deref(),
+            Some("moved-checkout")
+        );
+
+        consider(&handoff, false);
+
+        assert!(!handoff.sentinel.exists());
+        assert_eq!(handoff.db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+        assert!(
+            handoff
+                .db
+                .claim_ci_autofix(&handoff.entry.candidate())
+                .unwrap(),
+            "reattest refusal must happen before the dedupe claim"
+        );
+    }
+
+    #[test]
     fn repeated_refusal_keeps_one_unread_notification_for_candidate() {
         let fixture = Fixture::new();
         let handoff = handoff(&fixture, CiAutofixMode::Auto, "stale-head");

@@ -52,6 +52,7 @@ impl Fixture {
             "-m",
             "fixture",
         ]);
+        git(&["checkout", "-b", "fixture"]);
         let head = git(&["rev-parse", "HEAD"]);
         let author = PrAuthor {
             id: "U_me".into(),

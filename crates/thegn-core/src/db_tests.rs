@@ -1154,6 +1154,49 @@ fn pr_queue_enqueue_update_list_and_remove() {
     db.set_pr_agent_attempts(&k, 2).unwrap();
     assert_eq!(by(&k).agent_attempts, 2);
 
+    db.enqueue_bound_pr(
+        "/repo",
+        7,
+        Some("/wt/a"),
+        "feat-a",
+        "main",
+        "github",
+        "https://github.com/me/repo/pull/7",
+    )
+    .unwrap();
+    let reset = by(&k);
+    assert_eq!(reset.status, "watching");
+    assert_eq!(reset.agent_attempts, 0);
+    assert!(reset.blocker.is_none() && reset.detail.is_none());
+    assert_eq!(
+        reset.worktree.as_deref(),
+        Some("/wt/a"),
+        "worktree survives"
+    );
+
+    db.enqueue_pr("/legacy", 8, Some("/wt/legacy"), "legacy", "main", "github")
+        .unwrap();
+    let legacy_key = PrQueueRow::make_key("/legacy", "github", None, 8);
+    db.set_pr_agent_attempts(&legacy_key, 2).unwrap();
+    db.update_pr_status(&legacy_key, "blocked_ci", Some("ci"), Some("failed"), None)
+        .unwrap();
+    db.enqueue_pr("/legacy", 8, None, "legacy", "main", "github")
+        .unwrap();
+    let legacy = db
+        .list_pr_queue()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.key == legacy_key)
+        .unwrap();
+    assert_eq!(
+        legacy.worktree.as_deref(),
+        Some("/wt/legacy"),
+        "COALESCE preserves worktree"
+    );
+    assert_eq!(legacy.status, "watching");
+    assert_eq!(legacy.agent_attempts, 0);
+    assert!(legacy.blocker.is_none() && legacy.detail.is_none());
+
     assert!(
         db.enqueue_bound_pr(
             "/repo",
@@ -1169,7 +1212,7 @@ fn pr_queue_enqueue_update_list_and_remove() {
     );
 
     db.remove_pr_entry(&k).unwrap();
-    assert_eq!(db.list_pr_queue().unwrap().len(), 1);
+    assert_eq!(db.list_pr_queue().unwrap().len(), 2);
 }
 
 #[test]
@@ -5928,4 +5971,63 @@ fn issue_link_worktrees_lists_every_link() {
     assert!(links.contains(&("linear:ABC-1".into(), "/wt/one".into())));
     assert!(links.contains(&("linear:ABC-1".into(), "/wt/two".into())));
     assert!(links.contains(&("github:acme/2".into(), "/wt/three".into())));
+}
+
+#[test]
+fn bound_enqueue_validates_identity_absorbs_legacy_and_rebind_validates_rows() {
+    let db = db();
+    assert!(
+        db.enqueue_bound_pr("/repo", 7, None, "feat", "main", "github", "bad-url")
+            .is_err()
+    );
+    assert!(
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            None,
+            "feat",
+            "main",
+            "github",
+            "https://github.com/acme/repo/pull/8"
+        )
+        .is_err()
+    );
+    let legacy_key = PrQueueRow::make_key("/repo", "github", None, 7);
+    db.enqueue_pr("/repo", 7, None, "feat", "main", "github")
+        .unwrap();
+    db.enqueue_bound_pr(
+        "/repo",
+        7,
+        None,
+        "feat",
+        "main",
+        "github",
+        "https://github.com/acme/repo/pull/7",
+    )
+    .unwrap();
+    let rows = db.list_pr_queue().unwrap();
+    assert_eq!(rows.len(), 1, "binding absorbs the legacy unbound row");
+    assert_ne!(rows[0].key, legacy_key);
+    let missing = db.rebind_pr(
+        "/missing",
+        &PrRebind {
+            worktree: None,
+            branch: "feat".into(),
+            base_branch: "main".into(),
+            forge: "github".into(),
+            pr_url: "https://github.com/acme/repo/pull/7".into(),
+        },
+    );
+    assert!(missing.is_err());
+    let mismatch = db.rebind_pr(
+        &rows[0].key,
+        &PrRebind {
+            worktree: None,
+            branch: "feat".into(),
+            base_branch: "main".into(),
+            forge: "github".into(),
+            pr_url: "https://github.com/acme/repo/pull/8".into(),
+        },
+    );
+    assert!(mismatch.is_err());
 }

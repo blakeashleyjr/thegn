@@ -720,6 +720,11 @@ impl WorktreeAuxStore for Db {
         let host = identity.host.to_ascii_lowercase();
         let project = identity.path.to_ascii_lowercase();
         let tx = self.conn().unchecked_transaction()?;
+        let legacy_key = crate::db::PrQueueRow::make_key(repo_root, forge, None, number);
+        tx.execute(
+            "DELETE FROM pr_queue WHERE key=?1 AND pr_url IS NULL",
+            [&legacy_key],
+        )?;
         let existing = tx
             .query_row(
                 "SELECT worktree,branch FROM pr_queue WHERE key=?1",

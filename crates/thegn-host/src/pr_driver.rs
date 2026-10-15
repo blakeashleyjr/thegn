@@ -298,6 +298,9 @@ pub(crate) fn drive_queue(
         let mut attempts = item.agent_attempts;
         if moved && pr_queue::attempts_reset(item.last_head_oid.as_deref(), &head, cfg) {
             attempts = 0;
+            if let Err(error) = db.set_pr_agent_attempts(&item.key, 0) {
+                tracing::debug!(target: "thegn::prq", %error, "could not persist PR agent budget reset after head change");
+            }
         }
 
         let facts = PrQueueFacts {
@@ -539,26 +542,6 @@ pub(crate) fn drive_queue(
                         step(status.as_str(), &detail, &mut progress);
                         continue;
                     }
-                    if item.agent_attempts != attempts
-                        && let Err(error) = db.set_pr_agent_attempts(&item.key, attempts)
-                    {
-                        let detail = format!(
-                            "could not reset the PR agent budget after a verified head change: {error}"
-                        );
-                        if let Err(write_error) = db.update_pr_status(
-                            &item.key,
-                            PrqStatus::NeedsHuman.as_str(),
-                            None,
-                            Some(&detail),
-                            None,
-                        ) {
-                            tracing::debug!(target: "thegn::prq", %write_error, "could not persist failed CI budget reset hold");
-                        }
-                        out.warnings.push(format!("PR #{}: {detail}", item.number));
-                        out.needs_human.push(item.number);
-                        step(PrqStatus::NeedsHuman.as_str(), &detail, &mut progress);
-                        continue;
-                    }
                     // Spend the durable per-head allowance before the network
                     // mutation. An error may mean the provider accepted the
                     // request but its response was lost; keep it spent and
@@ -776,28 +759,24 @@ pub(crate) fn reattest(
         return Err("head moved before effect; refreshing".to_owned());
     }
     if let Some(worktree) = item.worktree.as_deref() {
-        let actual_root = loc.git_out(&["rev-parse", "--show-toplevel"])
-            .ok_or_else(|| "queued checkout is missing or no longer a Git worktree; run `thegn pr queue rebind --pr N`".to_owned())?;
-        let expected_root = Path::new(worktree).canonicalize().map_err(|_| {
-            "queued checkout path no longer exists; run `thegn pr queue rebind --pr N`".to_owned()
-        })?;
-        let actual_root = Path::new(&actual_root).canonicalize().map_err(|_| {
-            "queued checkout identity could not be verified; run `thegn pr queue rebind --pr N`"
-                .to_owned()
-        })?;
-        if actual_root != expected_root {
-            return Err("queued checkout now resolves to another repository; run `thegn pr queue rebind --pr N`".to_owned());
+        let hint = format!("run `thegn pr queue rebind --pr {}`", item.number);
+        let actual_root = loc
+            .git_out(&["rev-parse", "--show-toplevel"])
+            .ok_or_else(|| {
+                format!("queued checkout is missing or no longer a Git worktree; {hint}")
+            })?;
+        if !checkout_root_matches(loc, &actual_root, worktree)
+            .ok_or_else(|| format!("queued checkout identity could not be verified; {hint}"))?
+        {
+            return Err(format!(
+                "queued checkout now resolves to another repository; {hint}"
+            ));
         }
         let branch = loc
             .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-            .ok_or_else(|| {
-                "queued checkout branch could not be verified; run `thegn pr queue rebind --pr N`"
-                    .to_owned()
-            })?;
+            .ok_or_else(|| format!("queued checkout branch could not be verified; {hint}"))?;
         if !checkout_matches(Some(&branch), &expected.pr.head_ref_name) {
-            return Err(
-                "queued checkout branch changed; run `thegn pr queue rebind --pr N`".to_owned(),
-            );
+            return Err(format!("queued checkout branch changed; {hint}"));
         }
     }
     let current = db
@@ -806,6 +785,7 @@ pub(crate) fn reattest(
         .into_iter()
         .find(|row| row.key == item.key);
     let snapshot = QueueRowSnapshot {
+        number: item.number,
         key: item.key.clone(),
         pr_url: item.pr_url.clone(),
         forge: item.forge.clone(),
@@ -815,6 +795,20 @@ pub(crate) fn reattest(
     };
     pr_queue::attest_queue_row(&snapshot, current.as_ref())?;
     Ok(())
+}
+
+fn checkout_root_matches(loc: &GitLoc, actual_root: &str, worktree: &str) -> Option<bool> {
+    if matches!(loc, GitLoc::Local(_)) {
+        // The stored binding can be a subdirectory; resolve both paths through Git.
+        let expected_root =
+            GitLoc::from_db(worktree, None).git_out(&["rev-parse", "--show-toplevel"])?;
+        return Some(
+            Path::new(actual_root.trim()).canonicalize().ok()?
+                == Path::new(expected_root.trim()).canonicalize().ok()?,
+        );
+    }
+    // Remote/provider paths belong to their Git location, not the host filesystem.
+    Some(actual_root.trim() == worktree)
 }
 
 fn effect_detail(reason: String, effect: &str) -> String {
@@ -2117,7 +2111,7 @@ mod tests {
         db.enqueue_bound_pr(
             "/repo",
             7,
-            Some("/w/feat"),
+            None,
             "feat",
             "main",
             "github",
@@ -2165,7 +2159,7 @@ mod tests {
         db.enqueue_bound_pr(
             "/repo",
             7,
-            Some("/w/feat"),
+            None,
             "feat",
             "main",
             "github",
@@ -2216,7 +2210,7 @@ mod tests {
         db.enqueue_bound_pr(
             "/repo",
             7,
-            Some("/w/feat"),
+            None,
             "feat",
             "main",
             "github",
@@ -2572,5 +2566,172 @@ mod tests {
         let current = db.list_pr_queue().unwrap().remove(0);
         assert_eq!(current.ci_rerun_head, None);
         assert_eq!(current.agent_attempts, 0);
+    }
+
+    #[test]
+    fn foreign_push_during_wait_persists_budget_refill_for_later_ci_failure() {
+        let (_dir, db) = temp_db("prq-wait-push-budget");
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            None,
+            "feature",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/7",
+        )
+        .unwrap();
+        let key = db.list_pr_queue().unwrap().remove(0).key;
+        db.set_pr_agent_attempts(&key, 3).unwrap();
+        db.update_pr_status(&key, "blocked_ci", Some("ci"), None, Some("head-a"))
+            .unwrap();
+        let mut config = cfg();
+        config.watch = vec![PrWatchKind::Ci];
+        config.pause_on_foreign_push = false;
+        let mut pending = failing_ci_pr("head-b");
+        pending.status_check_rollup[0].status = "IN_PROGRESS".into();
+        pending.status_check_rollup[0].conclusion = None;
+        let forge = FakeForge::new(Some(pending));
+        let row = db.list_pr_queue().unwrap().remove(0);
+        drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+        assert_eq!(
+            db.list_pr_queue().unwrap()[0].agent_attempts,
+            0,
+            "Wait persists the foreign-push refill"
+        );
+        *forge.pr.lock().unwrap() = Some(failing_ci_pr("head-b"));
+        let row = db.list_pr_queue().unwrap().remove(0);
+        drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+        assert_eq!(
+            forge
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("rerun"))
+                .count(),
+            1,
+            "the later CI failure dispatches the rerun using the refilled budget"
+        );
+    }
+
+    #[test]
+    fn rebind_between_read_and_dispatch_holds_without_agent() {
+        let (dir, db) = temp_db("prq-rebind-before-dispatch");
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        git_repo_on_branch(&checkout, "feat");
+        let checkout = checkout.canonicalize().unwrap();
+        let checkout = checkout.to_string_lossy().into_owned();
+        let sentinel = dir.path().join("agent-ran");
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            Some(&checkout),
+            "feat",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/7",
+        )
+        .unwrap();
+        let stale = PrItem::from(&db.list_pr_queue().unwrap()[0]);
+        db.rebind_pr(
+            &stale.key,
+            &thegn_core::db::PrRebind {
+                worktree: Some(checkout),
+                branch: "feat".into(),
+                base_branch: "main".into(),
+                forge: "github".into(),
+                pr_url: "https://github.com/me/repo/pull/7".into(),
+            },
+        )
+        .unwrap();
+        let mut config = cfg();
+        config.watch = vec![PrWatchKind::Ci];
+        config.agent_command = format!("touch {}", sentinel.display());
+        config.own_prs_only = false;
+        let forge = FakeForge::new(Some(failing_ci_pr("abc")));
+        let out = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![stale],
+            |_| {},
+        );
+        assert!(out.needs_human.contains(&7));
+        assert_eq!(db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+        assert!(!sentinel.exists());
+        assert!(!forge.calls().iter().any(|call| call.starts_with("rerun")));
+    }
+
+    #[test]
+    fn same_number_other_project_never_reaches_effects() {
+        let (_dir, db) = temp_db("prq-same-number-other-project");
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            None,
+            "feature",
+            "main",
+            "github",
+            "https://github.com/other/project/pull/7",
+        )
+        .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let mut config = cfg();
+        config.merge_mode = thegn_core::config::PrMergeMode::Thegn;
+        let mut originally_bound = green_pr();
+        originally_bound.url = "https://github.com/other/project/pull/7".into();
+        let forge = FakeForge::new(Some(green_pr()))
+            .with_status_sequence(vec![originally_bound, green_pr()]);
+        let out = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+        assert!(out.needs_human.contains(&7));
+        assert!(
+            forge
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("merge") && !call.starts_with("rerun"))
+        );
+        assert_eq!(db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+    }
+
+    #[test]
+    fn remote_checkout_identity_uses_remote_git_paths_without_local_canonicalization() {
+        let remote = GitLoc::Provider {
+            control_prefix: vec!["fixture-provider".into()],
+            path: "/workspace/project".into(),
+        };
+        assert_eq!(
+            checkout_root_matches(&remote, " /workspace/project\n", "/workspace/project"),
+            Some(true)
+        );
+        assert_eq!(
+            checkout_root_matches(&remote, "/workspace/other", "/workspace/project"),
+            Some(false)
+        );
     }
 }
