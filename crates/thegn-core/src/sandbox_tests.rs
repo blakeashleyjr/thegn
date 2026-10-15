@@ -1,6 +1,16 @@
 use super::*;
 use crate::sandbox_mounts::{host_toolchain_mounts, parse_mount};
 
+#[cfg(unix)]
+fn private_tempdir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap()
+}
+
 #[test]
 fn ambient_container_listing_runs_ps_only_for_present_backends() {
     let mut calls = Vec::new();
@@ -3518,7 +3528,7 @@ fn universal_block_suppresses_vpn_sidecar() {
 #[test]
 fn vpn_staging_sweep_removes_old_unlisted_and_gc_removed_sidecars() {
     use std::time::{Duration, SystemTime};
-    let parent = tempfile::tempdir().unwrap();
+    let parent = private_tempdir();
     let vpn = parent.path().join("thegn/vpn");
     std::fs::create_dir_all(&vpn).unwrap();
     let now = SystemTime::now();
@@ -3553,6 +3563,10 @@ fn vpn_staging_sweep_removes_old_unlisted_and_gc_removed_sidecars() {
         .unwrap()
         .set_modified(now)
         .unwrap();
+    std::fs::File::open(&nested_residue)
+        .unwrap()
+        .set_modified(now - Duration::from_secs(120))
+        .unwrap();
     let listed = std::collections::HashSet::from(["c-tgvpn".to_string()]);
     assert_eq!(
         sweep_orphan_vpn_staging_in(
@@ -3570,6 +3584,8 @@ fn vpn_staging_sweep_removes_old_unlisted_and_gc_removed_sidecars() {
     assert!(old_listed.is_dir());
     assert!(!fresh_removed.exists());
     assert!(other.is_dir());
+    assert!(!nested_residue.join("secret").exists());
+    assert!(nested_residue.is_dir());
     assert!(nested_residue.join("nested").is_dir());
 }
 
@@ -3577,7 +3593,7 @@ fn vpn_staging_sweep_removes_old_unlisted_and_gc_removed_sidecars() {
 #[test]
 fn vpn_staging_sweep_removes_nothing_when_no_runtime_was_listed() {
     use std::time::{Duration, SystemTime};
-    let parent = tempfile::tempdir().unwrap();
+    let parent = private_tempdir();
     let vpn = parent.path().join("thegn/vpn");
     std::fs::create_dir_all(&vpn).unwrap();
     let old_unlisted = vpn.join("old-tgvpn");
@@ -3610,7 +3626,7 @@ fn vpn_staging_sweep_removes_nothing_when_no_runtime_was_listed() {
 fn vpn_staging_sweep_never_follows_a_symlinked_entry() {
     use std::os::unix::fs::symlink;
     use std::time::{Duration, SystemTime};
-    let parent = tempfile::tempdir().unwrap();
+    let parent = private_tempdir();
     let vpn = parent.path().join("thegn/vpn");
     let outside = parent.path().join("outside");
     std::fs::create_dir_all(&vpn).unwrap();

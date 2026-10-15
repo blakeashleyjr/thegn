@@ -88,7 +88,10 @@ impl PtyProcessOwner {
         if state.complete {
             return state.exit_code;
         }
-        let code = terminate_and_reap_parts(state.child.as_deref_mut(), state.group.as_ref());
+        let code = {
+            let PtyProcessState { child, group, .. } = &mut *state;
+            terminate_and_reap_parts(child.as_mut(), group.as_ref())
+        };
         state.child.take();
         state.exit_code = code;
         state.complete = true;
@@ -131,7 +134,7 @@ impl Drop for PtyProcessState {
                     .unwrap_or_else(|poison| poison.into_inner())
                     .take();
                 if let Some((mut child, group)) = parts {
-                    terminate_and_reap_parts(child.as_deref_mut(), group.as_ref());
+                    terminate_and_reap_parts(child.as_mut(), group.as_ref());
                 }
             });
         if let Err(error) = spawn {
@@ -141,14 +144,14 @@ impl Drop for PtyProcessState {
                 .unwrap_or_else(|poison| poison.into_inner())
                 .take();
             if let Some((mut child, group)) = parts {
-                terminate_and_reap_parts(child.as_deref_mut(), group.as_ref());
+                terminate_and_reap_parts(child.as_mut(), group.as_ref());
             }
         }
     }
 }
 
 fn terminate_and_reap_parts(
-    mut child: Option<&mut (dyn portable_pty::Child + Send + Sync)>,
+    mut child: Option<&mut Box<dyn portable_pty::Child + Send + Sync>>,
     group: Option<&crate::platform::GroupHandle>,
 ) -> Option<i32> {
     if let Some(group) = group {
