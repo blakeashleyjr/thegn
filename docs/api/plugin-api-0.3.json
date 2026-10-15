@@ -469,7 +469,7 @@
         },
         "timeout_secs": {
           "default": 30,
-          "description": "Per-call (one-shot: per-run) wall-clock cap before the process group is killed.",
+          "description": "Per-call (one-shot: per-run) wall-clock cap before the process group is killed, clamped to [`MAX_PLUGIN_TIMEOUT_SECS`] seconds.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"

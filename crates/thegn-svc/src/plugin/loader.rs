@@ -12,10 +12,11 @@ use thegn_core::plugin_api::{
     PluginSpec, SupportState,
 };
 
+pub use thegn_core::plugin_api::MAX_PLUGIN_TIMEOUT_SECS;
+
 pub const MIN_PLUGIN_ID_BYTES: usize = 1;
 pub const MAX_PLUGIN_ID_BYTES: usize = 64;
 pub const MIN_PLUGIN_TIMEOUT_SECS: u64 = 1;
-pub const MAX_PLUGIN_TIMEOUT_SECS: u64 = 3600;
 pub const MIN_PLUGIN_INTERVAL_MILLIS: u64 = 100;
 pub const MAX_PLUGIN_INTERVAL_MILLIS: u64 = 86_400_000;
 /// Maximum discovered plugin directories that contain a `plugin.toml`.
