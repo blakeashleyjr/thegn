@@ -54,6 +54,8 @@ use thegn_core::store::{
     AccountStore, CacheStore, NotificationStore, PoolStore, WorkspaceStore, WorktreeAuxStore,
 };
 
+#[path = "run_palette_db.rs"]
+mod run_palette_db;
 #[path = "run_test_cache.rs"]
 mod run_test_cache;
 
@@ -7045,6 +7047,9 @@ async fn event_loop<T: Terminal>(
         tokio_mpsc::unbounded_channel::<crate::task::DiscoveryOutcome>();
     let (test_cache_tx, mut test_cache_rx) =
         tokio_mpsc::unbounded_channel::<(String, u64, Option<crate::panel::TestCache>)>();
+    let (palette_db_tx, mut palette_db_rx) =
+        tokio_mpsc::unbounded_channel::<run_palette_db::PaletteDbResult>();
+    let mut palette_db_cache = run_palette_db::PaletteDbCache::default();
     // Test-explorer open-by-name results (Tests `o`/`b`): locating a test with
     // ripgrep/grep runs off the loop and completes over this channel.
     let (test_open_tx, mut test_open_rx) = tokio_mpsc::unbounded_channel::<TestOpenOutcome>();
@@ -8541,18 +8546,39 @@ async fn event_loop<T: Terminal>(
                     worktree_path,
                     repo_path,
                 } => {
-                    match thegn_core::db::Db::open() {
-                        Ok(db) => {
-                            let items = crate::palette::build_move_to_folder_items(
-                                &db,
-                                &repo_path,
-                                &keymap.file_worktree_folders(),
-                            );
-                            pending_file_target = Some((worktree_path, repo_path));
-                            palette = Some(crate::search_everywhere::PaletteSession::new(items));
-                        }
-                        Err(e) => model.status = format!("DB open failed: {e}"),
-                    }
+                    let folders = keymap.file_worktree_folders();
+                    let key = run_palette_db::PaletteKey {
+                        kind: run_palette_db::PaletteKind::MoveToFolder,
+                        context: format!("repo:{repo_path}"),
+                    };
+                    let (generation, rows) = palette_db_cache.begin(
+                        key.clone(),
+                        run_palette_db::PaletteRows::Items(
+                            crate::palette::build_move_to_folder_seed(&folders),
+                        ),
+                    );
+                    let (items, cached_repo) = run_palette_db::move_to_folder_parts(rows);
+                    let mut open_palette = crate::search_everywhere::PaletteSession::new(items);
+                    open_palette.mark_db_pending(key.cache_id(), generation);
+                    palette = Some(open_palette);
+                    pending_file_target = Some((
+                        worktree_path,
+                        cached_repo.unwrap_or_else(|| repo_path.clone()),
+                    ));
+                    let request_key = key;
+                    run_palette_db::spawn_load(
+                        request_key,
+                        generation,
+                        &palette_db_tx,
+                        &waker,
+                        move |db| {
+                            run_palette_db::PaletteRows::Items(
+                                crate::palette::build_move_to_folder_items(
+                                    db, &repo_path, &folders,
+                                ),
+                            )
+                        },
+                    );
                     dirty = true;
                     continue;
                 }
@@ -9970,6 +9996,79 @@ async fn event_loop<T: Terminal>(
             if test_cache_load.accept(&worktree, seq, &loaded_tests_worktree, &mut panel_ui, cache)
             {
                 dirty = true;
+            }
+        }
+        while let Ok(result) = palette_db_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            let key = result.key.clone();
+            let key_id = key.cache_id();
+            let generation = result.generation;
+            let current = palette_db_cache.is_current(&key, generation);
+            let failed = result.rows.is_none();
+            if failed && current {
+                if let Some(open_palette) = palette.as_mut() {
+                    open_palette.clear_db_pending(&key_id, generation);
+                }
+                if let Some(picker) = workspace_picker.as_mut() {
+                    picker.clear_db_pending(&key_id, generation);
+                }
+                if key.kind == run_palette_db::PaletteKind::LayoutNames
+                    && host_input
+                        .as_ref()
+                        .is_some_and(|(_, kind)| *kind == HostInputKind::ApplyLayout)
+                {
+                    model.status = "Saved layouts could not be loaded".into();
+                }
+                dirty = true;
+            }
+            if let Some(rows) = palette_db_cache.apply(result) {
+                match rows {
+                    run_palette_db::PaletteRows::Items(items) => {
+                        if current
+                            && let Some(open_palette) = palette.as_mut()
+                            && open_palette.apply_db_items(&key_id, generation, items)
+                        {
+                            dirty = true;
+                        }
+                    }
+                    run_palette_db::PaletteRows::MoveToFolder { items, repo_path } => {
+                        if current
+                            && let Some(open_palette) = palette.as_mut()
+                            && open_palette.apply_db_items(&key_id, generation, items)
+                        {
+                            if let Some(group) = session.active_group()
+                                && group.kind == crate::session::GroupKind::Branch
+                                && !repo_path.is_empty()
+                            {
+                                pending_file_target = Some((group.path.clone(), repo_path));
+                            }
+                            dirty = true;
+                        }
+                    }
+                    run_palette_db::PaletteRows::PickerSeed(seed, excluded) => {
+                        if current
+                            && let Some(picker) = workspace_picker.as_mut()
+                            && picker.apply_db_result(&key_id, generation, seed, excluded)
+                        {
+                            dirty = true;
+                        }
+                    }
+                    run_palette_db::PaletteRows::LayoutNames(names) => {
+                        if current
+                            && host_input
+                                .as_ref()
+                                .is_some_and(|(_, kind)| *kind == HostInputKind::ApplyLayout)
+                        {
+                            let (close_prompt, status) =
+                                run_palette_db::layout_names_state(&names, true);
+                            if close_prompt {
+                                host_input = None;
+                            }
+                            model.status = status;
+                            dirty = true;
+                        }
+                    }
+                }
             }
         }
         let active_tests_wt = active_tab_path(&session).to_string_lossy().into_owned();
@@ -23389,29 +23488,69 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::MoveWorktreeToFolder => {
-                                // Open the folder picker for the active worktree's
-                                // workspace; the chosen row files via the
-                                // `move-to-folder:` palette-dispatch arm.
                                 pending_file_target = None;
-                                match active_worktree_repo(&session) {
-                                    Some((_, repo_path)) => match thegn_core::db::Db::open() {
-                                        Ok(db) => {
-                                            let items = crate::palette::build_move_to_folder_items(
-                                                &db,
-                                                &repo_path,
-                                                &keymap.file_worktree_folders(),
-                                            );
-                                            palette = Some(
-                                                crate::search_everywhere::PaletteSession::new(
-                                                    items,
-                                                ),
-                                            );
-                                        }
-                                        Err(e) => model.status = format!("DB open failed: {e}"),
-                                    },
-                                    None => {
-                                        model.status = "No worktree to file into a folder".into();
+                                let branch = session.active_group().filter(|group| {
+                                    group.kind == crate::session::GroupKind::Branch
+                                        && !group.path.is_empty()
+                                });
+                                if let Some(group) = branch {
+                                    let worktree_path = group.path.clone();
+                                    let folders = keymap.file_worktree_folders();
+                                    let key = run_palette_db::PaletteKey {
+                                        kind: run_palette_db::PaletteKind::MoveToFolder,
+                                        context: format!("wt:{worktree_path}"),
+                                    };
+                                    let (generation, rows) = palette_db_cache.begin(
+                                        key.clone(),
+                                        run_palette_db::PaletteRows::Items(
+                                            crate::palette::build_move_to_folder_seed(&folders),
+                                        ),
+                                    );
+                                    let (items, cached_repo) =
+                                        run_palette_db::move_to_folder_parts(rows);
+                                    let mut open_palette =
+                                        crate::search_everywhere::PaletteSession::new(items);
+                                    open_palette.mark_db_pending(key.cache_id(), generation);
+                                    palette = Some(open_palette);
+                                    if let Some(repo_path) = cached_repo {
+                                        pending_file_target =
+                                            Some((worktree_path.clone(), repo_path));
                                     }
+                                    let request_worktree = worktree_path.clone();
+                                    run_palette_db::spawn_load(
+                                        key,
+                                        generation,
+                                        &palette_db_tx,
+                                        &waker,
+                                        move |db| {
+                                            let db_repo = match db.repo_root_for(&request_worktree)
+                                            {
+                                                Ok(Some(path)) if !path.is_empty() => Some(path),
+                                                Ok(_) => None,
+                                                Err(error) => {
+                                                    tracing::debug!(target: "thegn::db", %error, "failed to resolve move-to-folder workspace");
+                                                    None
+                                                }
+                                            };
+                                            let repo_path = db_repo
+                                                .or_else(|| {
+                                                    thegn_core::repo::main_worktree(
+                                                        std::path::Path::new(&request_worktree),
+                                                    )
+                                                    .map(|path| path.to_string_lossy().into_owned())
+                                                })
+                                                .unwrap_or_default();
+                                            let items = crate::palette::build_move_to_folder_items(
+                                                db, &repo_path, &folders,
+                                            );
+                                            run_palette_db::PaletteRows::MoveToFolder {
+                                                items,
+                                                repo_path,
+                                            }
+                                        },
+                                    );
+                                } else {
+                                    model.status = "No worktree to file into a folder".into();
                                 }
                             }
                             Action::Quit | Action::Detach => {
@@ -23466,24 +23605,45 @@ async fn event_loop<T: Terminal>(
                                 );
                             }
                             Action::OpenPalette => {
-                                if let Ok(db) = thegn_core::db::Db::open() {
-                                    let mut items = build_palette(
-                                        &session,
-                                        &db,
-                                        &current_config,
-                                        &model.panel.tracker_issues,
-                                        &sidebar_workspace_order(&model.sidebar_rows),
-                                    );
-                                    // Plugin-contributed PaletteAction rows
-                                    // (`plugin:<id>:<contribution>` keys; the
-                                    // dispatch arm below routes them to the
-                                    // owning plugin as an Action event).
-                                    items.extend(crate::handlers::plugins::palette_items(
-                                        &plugins_state,
-                                    ));
-                                    palette =
-                                        Some(crate::search_everywhere::PaletteSession::new(items));
-                                }
+                                let key = run_palette_db::PaletteKey {
+                                    kind: run_palette_db::PaletteKind::Main,
+                                    context: session.id.clone(),
+                                };
+                                let cfg = current_config.clone();
+                                let issues = model.panel.tracker_issues.clone();
+                                let order = sidebar_workspace_order(&model.sidebar_rows);
+                                let (generation, rows) = palette_db_cache.begin(
+                                    key.clone(),
+                                    run_palette_db::PaletteRows::Items(
+                                        crate::palette::build_palette_seed(&session, &cfg, &issues),
+                                    ),
+                                );
+                                let run_palette_db::PaletteRows::Items(mut items) = rows else {
+                                    unreachable!("main palette cache stores item rows")
+                                };
+                                items.extend(crate::handlers::plugins::palette_items(
+                                    &plugins_state,
+                                ));
+                                let mut open_palette =
+                                    crate::search_everywhere::PaletteSession::new(items);
+                                open_palette.mark_db_pending(key.cache_id(), generation);
+                                palette = Some(open_palette);
+                                let worker_session = session.clone_for_hydrate();
+                                run_palette_db::spawn_load(
+                                    key,
+                                    generation,
+                                    &palette_db_tx,
+                                    &waker,
+                                    move |db| {
+                                        run_palette_db::PaletteRows::Items(build_palette(
+                                            &worker_session,
+                                            db,
+                                            &cfg,
+                                            &issues,
+                                            &order,
+                                        ))
+                                    },
+                                );
                             }
                             Action::LaunchMenu => {
                                 // The runtime launch menu: presets + agents + tools
@@ -23495,41 +23655,111 @@ async fn event_loop<T: Terminal>(
                                 ));
                             }
                             Action::SwitchAccount => {
-                                if let Ok(db) = thegn_core::db::Db::open() {
-                                    palette = Some(crate::search_everywhere::PaletteSession::new(
-                                        crate::palette::build_account_palette(&current_config, &db),
-                                    ));
-                                }
+                                let key = run_palette_db::PaletteKey {
+                                    kind: run_palette_db::PaletteKind::Account,
+                                    context: String::new(),
+                                };
+                                let cfg = current_config.clone();
+                                let (generation, rows) = palette_db_cache.begin(
+                                    key.clone(),
+                                    run_palette_db::PaletteRows::Items(
+                                        crate::palette::build_account_palette_seed(&cfg),
+                                    ),
+                                );
+                                let run_palette_db::PaletteRows::Items(items) = rows else {
+                                    unreachable!("account palette cache stores item rows")
+                                };
+                                let mut open_palette =
+                                    crate::search_everywhere::PaletteSession::new(items);
+                                open_palette.mark_db_pending(key.cache_id(), generation);
+                                palette = Some(open_palette);
+                                run_palette_db::spawn_load(
+                                    key,
+                                    generation,
+                                    &palette_db_tx,
+                                    &waker,
+                                    move |db| {
+                                        run_palette_db::PaletteRows::Items(
+                                            crate::palette::build_account_palette(&cfg, db),
+                                        )
+                                    },
+                                );
                             }
                             Action::SwitchBundle => {
-                                if let Ok(db) = thegn_core::db::Db::open() {
-                                    let wt = active_tab_path(&session);
-                                    let wt_s = wt.to_string_lossy().into_owned();
-                                    let slug = bundle_scope_slug(&db, &wt_s);
-                                    palette = Some(crate::search_everywhere::PaletteSession::new(
-                                        crate::palette::build_bundle_palette(
-                                            &current_config,
-                                            &db,
-                                            &wt_s,
-                                            slug.as_deref(),
-                                        ),
-                                    ));
-                                }
+                                let wt_s = active_tab_path(&session).to_string_lossy().into_owned();
+                                let key = run_palette_db::PaletteKey {
+                                    kind: run_palette_db::PaletteKind::Bundle,
+                                    context: wt_s.clone(),
+                                };
+                                let cfg = current_config.clone();
+                                let (generation, rows) = palette_db_cache.begin(
+                                    key.clone(),
+                                    run_palette_db::PaletteRows::Items(
+                                        crate::palette::build_bundle_palette_seed(&cfg),
+                                    ),
+                                );
+                                let run_palette_db::PaletteRows::Items(items) = rows else {
+                                    unreachable!("bundle palette cache stores item rows")
+                                };
+                                let mut open_palette =
+                                    crate::search_everywhere::PaletteSession::new(items);
+                                open_palette.mark_db_pending(key.cache_id(), generation);
+                                palette = Some(open_palette);
+                                run_palette_db::spawn_load(
+                                    key,
+                                    generation,
+                                    &palette_db_tx,
+                                    &waker,
+                                    move |db| {
+                                        let slug = bundle_scope_slug(db, &wt_s);
+                                        run_palette_db::PaletteRows::Items(
+                                            crate::palette::build_bundle_palette(
+                                                &cfg,
+                                                db,
+                                                &wt_s,
+                                                slug.as_deref(),
+                                            ),
+                                        )
+                                    },
+                                );
                             }
                             Action::SwitchIdentity => {
-                                if let Ok(db) = thegn_core::db::Db::open() {
-                                    let wt = active_tab_path(&session);
-                                    let wt_s = wt.to_string_lossy().into_owned();
-                                    let slug = bundle_scope_slug(&db, &wt_s);
-                                    palette = Some(crate::search_everywhere::PaletteSession::new(
-                                        crate::palette::build_identity_palette(
-                                            &current_config,
-                                            &db,
-                                            &wt_s,
-                                            slug.as_deref(),
-                                        ),
-                                    ));
-                                }
+                                let wt_s = active_tab_path(&session).to_string_lossy().into_owned();
+                                let key = run_palette_db::PaletteKey {
+                                    kind: run_palette_db::PaletteKind::Identity,
+                                    context: wt_s.clone(),
+                                };
+                                let cfg = current_config.clone();
+                                let (generation, rows) = palette_db_cache.begin(
+                                    key.clone(),
+                                    run_palette_db::PaletteRows::Items(
+                                        crate::palette::build_identity_palette_seed(&cfg),
+                                    ),
+                                );
+                                let run_palette_db::PaletteRows::Items(items) = rows else {
+                                    unreachable!("identity palette cache stores item rows")
+                                };
+                                let mut open_palette =
+                                    crate::search_everywhere::PaletteSession::new(items);
+                                open_palette.mark_db_pending(key.cache_id(), generation);
+                                palette = Some(open_palette);
+                                run_palette_db::spawn_load(
+                                    key,
+                                    generation,
+                                    &palette_db_tx,
+                                    &waker,
+                                    move |db| {
+                                        let slug = bundle_scope_slug(db, &wt_s);
+                                        run_palette_db::PaletteRows::Items(
+                                            crate::palette::build_identity_palette(
+                                                &cfg,
+                                                db,
+                                                &wt_s,
+                                                slug.as_deref(),
+                                            ),
+                                        )
+                                    },
+                                );
                             }
                             Action::SwitchProfile => {
                                 let mut ps = crate::search_everywhere::PaletteSession::new(
@@ -24785,28 +25015,44 @@ async fn event_loop<T: Terminal>(
                                 model.status = "Save layout: enter a name (Esc cancels)".into();
                             }
                             Action::ApplyLayout => {
-                                let names = thegn_core::db::Db::open()
-                                    .ok()
-                                    .and_then(|db| db.list_layouts().ok())
-                                    .unwrap_or_default();
-                                if names.is_empty() {
-                                    model.status =
-                                        "No saved layouts yet — use \"Save layout as…\" first"
-                                            .into();
-                                } else {
-                                    // Kick the sandbox pre-warm now (audit
-                                    // run.rs:4951): by the time the user types a
-                                    // name and hits Enter, `launch_spec`'s podman
-                                    // `ensure` is already warm off-loop, so the
-                                    // on-loop apply won't block on a cold runtime.
-                                    prewarm_sandbox_chain(keymap.config(), active_cwd(&session));
-                                    host_input = Some((
-                                        menu::InputOverlay::new("apply layout (name)", ""),
-                                        HostInputKind::ApplyLayout,
-                                    ));
-                                    model.status =
-                                        format!("Apply layout — saved: {}", names.join(", "));
+                                let key = run_palette_db::PaletteKey {
+                                    kind: run_palette_db::PaletteKind::LayoutNames,
+                                    context: session.id.clone(),
+                                };
+                                let (generation, rows) = palette_db_cache.begin(
+                                    key.clone(),
+                                    run_palette_db::PaletteRows::LayoutNames(Vec::new()),
+                                );
+                                let run_palette_db::PaletteRows::LayoutNames(names) = rows else {
+                                    unreachable!("layout cache stores layout names")
+                                };
+                                prewarm_sandbox_chain(keymap.config(), active_cwd(&session));
+                                host_input = Some((
+                                    menu::InputOverlay::new("apply layout (name)", ""),
+                                    HostInputKind::ApplyLayout,
+                                ));
+                                let (close_prompt, status) =
+                                    run_palette_db::layout_names_state(&names, false);
+                                if close_prompt {
+                                    host_input = None;
                                 }
+                                model.status = status;
+                                run_palette_db::spawn_load(
+                                    key,
+                                    generation,
+                                    &palette_db_tx,
+                                    &waker,
+                                    |db| {
+                                        let names = match db.list_layouts() {
+                                            Ok(names) => names,
+                                            Err(error) => {
+                                                tracing::debug!(target: "thegn::db", %error, "failed to load saved layout names");
+                                                Vec::new()
+                                            }
+                                        };
+                                        run_palette_db::PaletteRows::LayoutNames(names)
+                                    },
+                                );
                             }
                             Action::ExportLayout => {
                                 host_input = Some((
@@ -25291,17 +25537,37 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::CloneOpen => {
-                                // Clone-and-open: the new-workspace picker in
-                                // manual mode; a pasted URL clones OFF the loop
-                                // (spawn_workspace_clone → workspace_clone_rx
-                                // drain), then registers + opens the first tab.
-                                let (seed, excluded) = thegn_core::db::Db::open()
-                                    .map(|db| crate::workspace_picker::picker_seed(&db))
-                                    .unwrap_or_default();
+                                let key = run_palette_db::PaletteKey {
+                                    kind: run_palette_db::PaletteKind::WorkspacePickerSeed,
+                                    context: session.id.clone(),
+                                };
+                                let (generation, rows) = palette_db_cache.begin(
+                                    key.clone(),
+                                    run_palette_db::PaletteRows::PickerSeed(
+                                        Vec::new(),
+                                        std::collections::HashSet::new(),
+                                    ),
+                                );
+                                let run_palette_db::PaletteRows::PickerSeed(seed, excluded) = rows
+                                else {
+                                    unreachable!("picker cache stores picker seed rows")
+                                };
                                 let mut p =
                                     crate::workspace_picker::WorkspacePicker::new(seed, excluded);
                                 p.start_manual("");
+                                p.mark_db_pending(key.cache_id(), generation);
                                 workspace_picker = Some(p);
+                                run_palette_db::spawn_load(
+                                    key,
+                                    generation,
+                                    &palette_db_tx,
+                                    &waker,
+                                    move |db| {
+                                        let (seed, excluded) =
+                                            crate::workspace_picker::picker_seed(db);
+                                        run_palette_db::PaletteRows::PickerSeed(seed, excluded)
+                                    },
+                                );
                                 model.status =
                                     "Clone and open: paste a git URL or path (Esc cancels)".into();
                             }
@@ -25356,17 +25622,37 @@ async fn event_loop<T: Terminal>(
                                     Some(crate::onboarding::OnboardingWizard::new(keymap.config()));
                             }
                             Action::NewWorkspace => {
-                                // Fuzzy picker, seeded instantly from the DB;
-                                // the `repo_roots` scan (a filesystem walk that
-                                // can take a while on big trees) runs off-loop
-                                // and streams in via `drain_discovery`.
-                                let (seed, excluded) = thegn_core::db::Db::open()
-                                    .map(|db| crate::workspace_picker::picker_seed(&db))
-                                    .unwrap_or_default();
+                                let key = run_palette_db::PaletteKey {
+                                    kind: run_palette_db::PaletteKind::WorkspacePickerSeed,
+                                    context: session.id.clone(),
+                                };
+                                let (generation, rows) = palette_db_cache.begin(
+                                    key.clone(),
+                                    run_palette_db::PaletteRows::PickerSeed(
+                                        Vec::new(),
+                                        std::collections::HashSet::new(),
+                                    ),
+                                );
+                                let run_palette_db::PaletteRows::PickerSeed(seed, excluded) = rows
+                                else {
+                                    unreachable!("picker cache stores picker seed rows")
+                                };
                                 let mut p =
                                     crate::workspace_picker::WorkspacePicker::new(seed, excluded);
+                                p.mark_db_pending(key.cache_id(), generation);
                                 p.spawn_discovery(current_config.clone(), waker.clone());
                                 workspace_picker = Some(p);
+                                run_palette_db::spawn_load(
+                                    key,
+                                    generation,
+                                    &palette_db_tx,
+                                    &waker,
+                                    move |db| {
+                                        let (seed, excluded) =
+                                            crate::workspace_picker::picker_seed(db);
+                                        run_palette_db::PaletteRows::PickerSeed(seed, excluded)
+                                    },
+                                );
                                 model.status = crate::i18n_surface::status(
                                     crate::i18n_surface::StatusText::NewWorkspacePrompt,
                                 )
@@ -25439,23 +25725,38 @@ async fn event_loop<T: Terminal>(
                                 continue;
                             }
                             Action::SwitchWorkspace => {
-                                // Open a workspace-filtered palette (audit
-                                // run.rs:17226): the old body read
-                                // `palette.selected_key()` at dispatch time, but
-                                // the palette is always closed by then (Enter nulls
-                                // it before dispatch; Alt+o with the palette open
-                                // just types 'o'), so it was unreachable-dead. The
-                                // actual switch happens via the `repo:` palette-key
-                                // arm once the user picks a row here.
-                                if let Ok(db) = thegn_core::db::Db::open() {
-                                    palette = Some(crate::search_everywhere::PaletteSession::new(
-                                        crate::palette::build_workspace_switch_palette(
-                                            &session,
-                                            &db,
-                                            &sidebar_workspace_order(&model.sidebar_rows),
-                                        ),
-                                    ));
-                                }
+                                let key = run_palette_db::PaletteKey {
+                                    kind: run_palette_db::PaletteKind::WorkspaceSwitch,
+                                    context: session.id.clone(),
+                                };
+                                let (generation, rows) = palette_db_cache.begin(
+                                    key.clone(),
+                                    run_palette_db::PaletteRows::Items(Vec::new()),
+                                );
+                                let run_palette_db::PaletteRows::Items(items) = rows else {
+                                    unreachable!("workspace switch cache stores item rows")
+                                };
+                                let mut open_palette =
+                                    crate::search_everywhere::PaletteSession::new(items);
+                                open_palette.mark_db_pending(key.cache_id(), generation);
+                                palette = Some(open_palette);
+                                let worker_session = session.clone_for_hydrate();
+                                let order = sidebar_workspace_order(&model.sidebar_rows);
+                                run_palette_db::spawn_load(
+                                    key,
+                                    generation,
+                                    &palette_db_tx,
+                                    &waker,
+                                    move |db| {
+                                        run_palette_db::PaletteRows::Items(
+                                            crate::palette::build_workspace_switch_palette(
+                                                &worker_session,
+                                                db,
+                                                &order,
+                                            ),
+                                        )
+                                    },
+                                );
                             }
                             Action::NewWorktree
                                 if (focus.sidebar() && sb.cursor_in_terminals(&model))
