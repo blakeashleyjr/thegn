@@ -23,10 +23,10 @@ const PR_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
 const ISSUE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Cached git-glyph row for one worktree: `(dirty, ahead, behind, branch,
-/// repo_root, uncommitted_add, uncommitted_del, branch_diff)`. Computing it runs
+/// repo_root, typed uncommitted counts, typed branch_diff)`. Computing it runs
 /// a full `git status` (50-150ms), so only the *active* worktree pays that every
 /// Model tick; background worktrees reuse the last value until it goes stale (see
-/// [`should_rescan_glyphs`]). `branch_diff` is the `(added, deleted)` total vs
+/// [`should_rescan_glyphs`]). `branch_diff` is the typed `(added, deleted)` total vs
 /// the repo's LOCAL default branch (`thegn_svc::git::glyph_base` — not
 /// `origin/HEAD`, so an unpushed trunk doesn't leak its backlog into every row),
 /// `None` when no base is resolvable.
@@ -194,8 +194,11 @@ pub(crate) fn merge_glyph_scan(
     ahead_behind: std::result::Result<Option<(usize, usize)>, ()>,
     branch: std::result::Result<Option<String>, ()>,
     repo_root: String,
-    uncommitted: std::result::Result<(u32, u32), ()>,
-    branch_diff: std::result::Result<Option<(u32, u32)>, ()>,
+    uncommitted: std::result::Result<(thegn_svc::git::DiffCount, thegn_svc::git::DiffCount), ()>,
+    branch_diff: std::result::Result<
+        Option<(thegn_svc::git::DiffCount, thegn_svc::git::DiffCount)>,
+        (),
+    >,
     submodule_dirty: std::result::Result<bool, ()>,
 ) -> (GlyphRow, bool) {
     let mut clean = true;
@@ -225,7 +228,10 @@ pub(crate) fn merge_glyph_scan(
         Ok(ad) => ad,
         Err(()) => {
             clean = false;
-            prior.map(|p| (p.add, p.del)).unwrap_or((0, 0))
+            prior.map(|p| (p.add, p.del)).unwrap_or((
+                thegn_svc::git::DiffCount::Exact(0),
+                thegn_svc::git::DiffCount::Exact(0),
+            ))
         }
     };
     let branch_diff = match branch_diff {
