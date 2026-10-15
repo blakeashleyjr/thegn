@@ -861,6 +861,7 @@ impl Session {
     /// absolute path: a non-path session id (the legacy `"default"`, or an empty
     /// id) must adopt nothing rather than mint a bogus slug and pull in rows
     /// that merely share a legacy `session_name`.
+    #[cfg(test)]
     pub(crate) fn adopt_missing_registered(
         &mut self,
         db: &Db,
@@ -2173,7 +2174,10 @@ mod tests {
         let prepared =
             Session::prepare_workspace_switch(&repo, &db, &thegn_core::config::Config::default())
                 .unwrap();
-        assert_eq!(prepared.worktrees[0].name, format!("{slug}/"));
+        assert_eq!(
+            prepared.worktrees[0].name,
+            thegn_core::repo::home_tab(&slug)
+        );
         assert!(
             db.workspaces()
                 .unwrap()

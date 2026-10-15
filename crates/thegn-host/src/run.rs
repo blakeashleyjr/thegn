@@ -7996,7 +7996,6 @@ async fn event_loop<T: Terminal>(
                 model.status = format!("{} Opening {}…", crate::loading::plan::spinner_now(), name);
                 pending_switch.set_spinner(request.seq, model.status.clone());
                 switch_at = None;
-                dirty |= true;
                 false
             } else {
                 pending_switch.supersede();
@@ -8138,7 +8137,6 @@ async fn event_loop<T: Terminal>(
                         format!("{} Opening {}…", crate::loading::plan::spinner_now(), name);
                     pending_switch.set_spinner(request.seq, model.status.clone());
                     switch_at = None;
-                    dirty |= true;
                     false
                 }
                 crate::handlers::sidebar_activate::Activation::Failed => false,
@@ -25883,7 +25881,6 @@ async fn event_loop<T: Terminal>(
                                     &waker,
                                 );
                                 model.status = "Resolving root…".into();
-                                dirty = true;
                             }
                             Action::CloneOpen => {
                                 let key = run_palette_db::PaletteKey {

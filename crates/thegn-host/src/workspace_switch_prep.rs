@@ -2,6 +2,9 @@
 
 use crate::session::{PreparedWorkspaceSwitch, Session};
 
+type WorktreeRegistryRow = (String, String, String);
+type ConnectRegistry = (Vec<WorktreeRegistryRow>, Vec<String>);
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AfterSwitch {
     pub(crate) focus_center: bool,
@@ -107,7 +110,7 @@ pub(crate) enum SwitchResult {
         root: Option<std::path::PathBuf>,
         cwd: Option<std::path::PathBuf>,
         group_paths: Vec<String>,
-        result: anyhow::Result<(Vec<(String, String, String)>, Vec<String>)>,
+        result: anyhow::Result<ConnectRegistry>,
     },
 }
 
@@ -209,9 +212,7 @@ pub(crate) fn request_connect_root(
     });
 }
 
-fn read_connect_registry(
-    db: &thegn_core::db::Db,
-) -> anyhow::Result<(Vec<(String, String, String)>, Vec<String>)> {
+fn read_connect_registry(db: &thegn_core::db::Db) -> anyhow::Result<ConnectRegistry> {
     use thegn_core::store::WorkspaceStore;
     let worktrees = db
         .worktrees()?
@@ -408,7 +409,6 @@ mod tests {
             focus_active_row: true,
             region_bookmark: Some((true, Some("terminal".into()))),
             open_merge_queue: true,
-            ..AfterSwitch::default()
         };
         let session = Session {
             id: "/repo".into(),
