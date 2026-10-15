@@ -53,6 +53,7 @@ mod config_startup;
 mod connectivity_gate;
 mod copymode;
 mod daemon;
+mod db_maintain;
 mod db_task;
 mod desktop_notify;
 mod detail;
@@ -633,6 +634,11 @@ pub enum Command {
         /// A doctor sub-verb (e.g. `bundle`). With none, print the report.
         #[command(subcommand)]
         action: Option<DoctorAction>,
+    },
+    /// Inspect or reclaim unused state database space.
+    Db {
+        #[command(subcommand)]
+        action: cmd::db::Action,
     },
     /// Launch the compositor straight into the onboarding wizard (forge auth,
     /// issue trackers, hosts, sandbox, appearance). Re-runnable any time.
@@ -1395,6 +1401,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
         Command::Keys { action } => cmd::keys::run(&cfg, &action),
+        Command::Db { action } => cmd::db::run(action),
         Command::Doctor { json, action } => match action {
             Some(DoctorAction::Bundle { args }) => {
                 cmd::bundle::run(&cfg, args, config_path, repo_context.clone())

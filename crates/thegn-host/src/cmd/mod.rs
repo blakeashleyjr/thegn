@@ -19,6 +19,7 @@ pub mod ci;
 pub mod config;
 pub mod config_health;
 pub mod daemon;
+pub mod db;
 pub mod debug;
 pub mod diff;
 pub mod disk;
