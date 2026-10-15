@@ -949,10 +949,18 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             if let Some(preview) = &model.preview {
                 let tone = match preview.status {
                     thegn_core::preview::PreviewStatus::Up => hue(Hue::Green),
+                    thegn_core::preview::PreviewStatus::Seen => hue(Hue::Amber),
                     thegn_core::preview::PreviewStatus::Down => hue(Hue::Red),
                     thegn_core::preview::PreviewStatus::Unknown => hue(Hue::Amber),
                 };
-                vec![seg(tone, format!(":{} {}", preview.port, preview.status))]
+                vec![seg(
+                    tone,
+                    format!(
+                        ":{} {}",
+                        preview.port,
+                        thegn_core::preview::status_label(preview.status, preview.source)
+                    ),
+                )]
             } else if !model.forwards.is_empty() {
                 vec![seg(
                     hue(Hue::Teal),
@@ -1642,6 +1650,10 @@ mod spec {
 
     fn render(section: Section, width: PanelWidth) -> String {
         let m = model();
+        render_model(section, width, &m)
+    }
+
+    fn render_model(section: Section, width: PanelWidth, m: &FrameModel) -> String {
         let u = ui(width, section);
         let (cols, rows) = match width {
             PanelWidth::Normal => (39, 28),
@@ -1649,7 +1661,7 @@ mod spec {
             PanelWidth::Full => (150, 38),
         };
         let ctx = SectionCtx {
-            model: &m,
+            model: m,
             ui: &u,
             cols,
             rows,
@@ -1791,6 +1803,24 @@ mod spec {
             ],
             "preview and existing forward share one cursor/URL ordering"
         );
+
+        let mut seen = model();
+        seen.preview.as_mut().unwrap().status = thegn_core::preview::PreviewStatus::Seen;
+        for width in [PanelWidth::Normal, PanelWidth::Full] {
+            assert!(render_model(Section::Forward, width, &seen).contains("seen"));
+        }
+
+        let mut configured = model();
+        configured.preview.as_mut().unwrap().status = thegn_core::preview::PreviewStatus::Unknown;
+        configured.preview.as_mut().unwrap().source = thegn_core::preview::PortHintSource::Config;
+        for width in [PanelWidth::Normal, PanelWidth::Full] {
+            assert!(render_model(Section::Forward, width, &configured).contains("configured"));
+        }
+    }
+
+    #[test]
+    fn share_hint_row_includes_panel_add_key() {
+        assert!(render(Section::Share, PanelWidth::Normal).contains("n share port"));
     }
 
     #[test]

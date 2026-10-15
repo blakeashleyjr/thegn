@@ -7,11 +7,73 @@
 //! deliberately no interval timer, reconnect probe, or idle poll here.
 
 use std::io::Read as _;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::preview::{MAX_PACKAGE_JSON_BYTES, PortHint, parse_package_scripts};
 use tokio::sync::mpsc::UnboundedSender;
+
+/// Probe one batch of loopback candidates off the event loop. Each request gets
+/// one bounded retry sequence, one result, and one waker pulse.
+pub(crate) fn spawn_probe(
+    requests: Vec<crate::preview::ProbeRequest>,
+    tx: UnboundedSender<crate::preview::ProbeResult>,
+    waker: TerminalWaker,
+) {
+    let spawn = std::thread::Builder::new().name("preview-probe".into()).spawn(move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        let backoff = [0, 500, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
+        let mut pending: Vec<(crate::preview::ProbeRequest, Vec<SocketAddr>)> = requests
+            .into_iter()
+            .map(|request| {
+                let addresses = match request.host.as_str() {
+                    "::1" => vec![SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), request.port)],
+                    "127.0.0.1" => vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), request.port)],
+                    "localhost" => vec![
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), request.port),
+                        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), request.port),
+                    ],
+                    _ => Vec::new(),
+                };
+                (request, addresses)
+            })
+            .collect();
+        for delay in backoff {
+            std::thread::sleep(Duration::from_millis(delay));
+            let mut retry = Vec::with_capacity(pending.len());
+            for (request, addresses) in pending {
+                let ok = addresses.iter().any(|address| {
+                    TcpStream::connect_timeout(address, Duration::from_millis(250)).is_ok()
+                });
+                if ok {
+                    if tx.send(crate::preview::ProbeResult { request, ok }).is_err() {
+                        tracing::debug!(target: "thegn::preview", "preview probe result receiver closed");
+                    }
+                    if let Err(error) = waker.wake() {
+                        tracing::debug!(target: "thegn::preview", %error, "preview probe waker pulse failed");
+                    }
+                } else {
+                    retry.push((request, addresses));
+                }
+            }
+            pending = retry;
+            if pending.is_empty() { break; }
+        }
+        for (request, _) in pending {
+            if tx.send(crate::preview::ProbeResult { request, ok: false }).is_err() {
+                tracing::debug!(target: "thegn::preview", "preview probe result receiver closed");
+            }
+            if let Err(error) = waker.wake() {
+                tracing::debug!(target: "thegn::preview", %error, "preview probe waker pulse failed");
+            }
+        }
+    });
+    if let Err(error) = spawn {
+        tracing::debug!(target: "thegn::preview", %error, "preview probe thread spawn failed");
+    }
+}
 
 /// Result of one worktree/config discovery pass.
 #[derive(Debug)]
