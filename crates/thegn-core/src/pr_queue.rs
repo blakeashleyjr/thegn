@@ -23,7 +23,7 @@ pub fn attest_pr_identity(
     fetched_url: &str,
     fetched_number: u64,
 ) -> Result<(), String> {
-    let readd = format!("re-add with `thegn pr queue add --pr {number}` to verify it");
+    let readd = format!("run `thegn pr queue rebind --pr {number}` to verify it");
     let Some(bound_url) = bound_url else {
         return Err(format!(
             "queued PR identity is unbound; fetched identity is {fetched_url} (#{fetched_number}); {readd}"
@@ -63,7 +63,42 @@ pub fn attest_pr_identity(
     Ok(())
 }
 
-fn pr_url_number_matches(url: &str, expected: u64) -> bool {
+/// Immutable queue-row facts captured before a forge read. Equality with a
+/// fresh row fences any explicit rebind that happened while the read ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueRowSnapshot {
+    pub key: String,
+    pub pr_url: Option<String>,
+    pub forge: String,
+    pub worktree: Option<String>,
+    pub branch: String,
+    pub checkout_gen: i64,
+}
+
+/// Revalidate the persisted queue authorization immediately before an effect.
+pub fn attest_queue_row(
+    snapshot: &QueueRowSnapshot,
+    current: Option<&crate::db::PrQueueRow>,
+) -> Result<(), String> {
+    let Some(current) = current else {
+        return Err("queued PR row disappeared; run `thegn pr queue rebind --pr N`".to_owned());
+    };
+    if current.key != snapshot.key
+        || current.pr_url != snapshot.pr_url
+        || current.forge != snapshot.forge
+        || current.worktree != snapshot.worktree
+        || current.branch != snapshot.branch
+        || current.checkout_gen != snapshot.checkout_gen
+        || matches!(current.status.as_str(), "merged" | "closed")
+    {
+        return Err(
+            "queued PR identity or checkout changed; run `thegn pr queue rebind --pr N`".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn pr_url_number_matches(url: &str, expected: u64) -> bool {
     let Some((_, path)) = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
@@ -1149,7 +1184,69 @@ mod tests {
         ] {
             let message = attest_pr_identity(binding, 7, url, number).unwrap_err();
             assert!(message.contains(expected), "{message}");
-            assert!(message.contains("thegn pr queue add --pr 7"), "{message}");
+            assert!(
+                message.contains("thegn pr queue rebind --pr 7"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn attest_queue_row_table() {
+        let row = crate::db::PrQueueRow {
+            key: "root#github:github.com/acme/repo#7".into(),
+            repo_root: "root".into(),
+            number: 7,
+            worktree: Some("/wt".into()),
+            branch: "feature".into(),
+            base_branch: "main".into(),
+            forge: "github".into(),
+            pr_url: Some("https://github.com/acme/repo/pull/7".into()),
+            forge_host: Some("github.com".into()),
+            project: Some("acme/repo".into()),
+            checkout_gen: 4,
+            status: "watching".into(),
+            blocker: None,
+            detail: None,
+            agent_attempts: 1,
+            ci_rerun_head: None,
+            last_head_oid: None,
+            queued_at: 0,
+            updated_at: 0,
+        };
+        let snapshot = QueueRowSnapshot {
+            key: row.key.clone(),
+            pr_url: row.pr_url.clone(),
+            forge: row.forge.clone(),
+            worktree: row.worktree.clone(),
+            branch: row.branch.clone(),
+            checkout_gen: row.checkout_gen,
+        };
+        assert_eq!(attest_queue_row(&snapshot, Some(&row)), Ok(()));
+        assert!(attest_queue_row(&snapshot, None).is_err());
+        for changed in [
+            crate::db::PrQueueRow {
+                checkout_gen: 5,
+                ..row.clone()
+            },
+            crate::db::PrQueueRow {
+                worktree: Some("/other".into()),
+                ..row.clone()
+            },
+            crate::db::PrQueueRow {
+                pr_url: Some("https://github.com/else/repo/pull/7".into()),
+                ..row.clone()
+            },
+            crate::db::PrQueueRow {
+                forge: "gitlab".into(),
+                ..row.clone()
+            },
+            crate::db::PrQueueRow {
+                status: "merged".into(),
+                ..row.clone()
+            },
+        ] {
+            assert!(attest_queue_row(&snapshot, Some(&changed)).is_err());
         }
     }
 }

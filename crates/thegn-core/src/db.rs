@@ -205,7 +205,8 @@ mod db_open_memo;
 /// v79: canonical dispatch statuses and admission lookup indexes.
 /// v80: bind PR queue rows to the forge PR URL observed at enqueue.
 /// v81: shares.generation, the share run that owns the row (THE-340).
-pub const SCHEMA_VERSION: i64 = 81;
+/// v82: bind PR queue keys to forge/project and fence checkout rebinding.
+pub const SCHEMA_VERSION: i64 = 82;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1005,12 +1006,12 @@ pub struct MergeQueueRow {
 
 /// One `pr_queue` row — a pull request thegn is shepherding on a forge.
 ///
-/// Keyed by repo + number rather than worktree, because a queued PR need not
-/// have a local checkout. `status` is a [`crate::pr_queue::PrqStatus`] word and
-/// `blocker` a [`crate::pr_queue::Blocker`] word.
+/// Keyed by repo, provider/project identity and number rather than worktree,
+/// because a queued PR need not have a local checkout. `status` is a
+/// [`crate::pr_queue::PrqStatus`] word and `blocker` a [`crate::pr_queue::Blocker`] word.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PrQueueRow {
-    /// `<repo_root>#<number>` — the primary key.
+    /// Repo root plus provider/project identity and PR number; legacy rows may be unbound.
     pub key: String,
     pub repo_root: String,
     pub number: u64,
@@ -1024,6 +1025,9 @@ pub struct PrQueueRow {
     pub forge: String,
     /// Canonical PR URL observed when the row was queued. Legacy rows are unbound.
     pub pr_url: Option<String>,
+    pub forge_host: Option<String>,
+    pub project: Option<String>,
+    pub checkout_gen: i64,
     pub status: String,
     /// The classified blocker word, or `None` before the first refresh.
     pub blocker: Option<String>,
@@ -1040,10 +1044,31 @@ pub struct PrQueueRow {
     pub updated_at: i64,
 }
 
+/// New binding selected by an explicit PR queue rebind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrRebind {
+    pub worktree: Option<String>,
+    pub branch: String,
+    pub base_branch: String,
+    pub forge: String,
+    pub pr_url: String,
+}
+
 impl PrQueueRow {
-    /// The primary key for a repo + PR number.
-    pub fn make_key(repo_root: &str, number: u64) -> String {
-        format!("{repo_root}#{number}")
+    /// The primary key for a repo + provider/project + PR number.
+    pub fn make_key(
+        repo_root: &str,
+        forge: &str,
+        identity: Option<&crate::forge::model::ForgeRepoIdentity>,
+        number: u64,
+    ) -> String {
+        if let Some(identity) = identity {
+            let host = identity.host.to_ascii_lowercase();
+            let path = identity.path.to_ascii_lowercase();
+            format!("{repo_root}#{forge}:{host}/{path}#{number}")
+        } else {
+            format!("{repo_root}#{number}")
+        }
     }
 }
 
@@ -1549,6 +1574,7 @@ impl Db {
                     crate::db_migrate::verify_v79_schema(&conn)?;
                     crate::db_migrate::verify_v80_schema(&conn)?;
                     crate::db_migrate::verify_v81_schema(&conn)?;
+                    crate::db_migrate::verify_v82_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2214,6 +2240,7 @@ impl Db {
         crate::db_migrate::migrate_v79(&conn)?;
         crate::db_migrate::migrate_v80(&conn)?;
         crate::db_migrate::migrate_v81(&conn)?;
+        crate::db_migrate::migrate_v82(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2233,6 +2260,7 @@ impl Db {
             crate::db_migrate::verify_v79_schema(&conn)?;
             crate::db_migrate::verify_v80_schema(&conn)?;
             crate::db_migrate::verify_v81_schema(&conn)?;
+            crate::db_migrate::verify_v82_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can

@@ -660,7 +660,7 @@ impl WorktreeAuxStore for Db {
         forge: &str,
     ) -> Result<()> {
         let now = util::now();
-        let key = crate::db::PrQueueRow::make_key(repo_root, number);
+        let key = crate::db::PrQueueRow::make_key(repo_root, forge, None, number);
         // Re-queueing resets the row: back to `watching`, blocker/detail/attempts
         // cleared. That is the "I fixed it, watch again" gesture, and it is why
         // there is no separate retry verb for the PR queue.
@@ -708,18 +708,40 @@ impl WorktreeAuxStore for Db {
         forge: &str,
         pr_url: &str,
     ) -> Result<()> {
+        let identity = crate::forge::model::repo_identity_from_pr_url(pr_url).ok_or_else(|| {
+            anyhow::anyhow!("invalid PR URL; rebind the queue row after verifying its identity")
+        })?;
+        anyhow::ensure!(
+            crate::pr_queue::pr_url_number_matches(pr_url, number),
+            "PR URL does not identify PR #{number}"
+        );
         let now = util::now();
-        let key = crate::db::PrQueueRow::make_key(repo_root, number);
-        self.conn().execute(
+        let key = crate::db::PrQueueRow::make_key(repo_root, forge, Some(&identity), number);
+        let host = identity.host.to_ascii_lowercase();
+        let project = identity.path.to_ascii_lowercase();
+        let tx = self.conn().unchecked_transaction()?;
+        let existing = tx
+            .query_row(
+                "SELECT worktree,branch FROM pr_queue WHERE key=?1",
+                [&key],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((old_worktree, old_branch)) = existing {
+            anyhow::ensure!(
+                old_worktree.as_deref() == worktree && old_branch == branch,
+                "PR queue checkout changed; run `thegn pr queue rebind --pr {number}`"
+            );
+            tx.execute("UPDATE pr_queue SET base_branch=?2,forge_host=?3,project=?4,pr_url=?5,status='watching',blocker=NULL,detail=NULL,agent_attempts=0,updated_at=?6 WHERE key=?1",
+                params![key,base_branch,host,project,pr_url,now])?;
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute(
             "INSERT INTO pr_queue(key,repo_root,number,worktree,branch,base_branch,forge,
                                   status,blocker,detail,agent_attempts,last_head_oid,
-                                  queued_at,updated_at,pr_url)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,'watching',NULL,NULL,0,NULL,?8,?8,?9)
-             ON CONFLICT(key) DO UPDATE SET
-               worktree=excluded.worktree, branch=excluded.branch,
-               base_branch=excluded.base_branch, forge=excluded.forge,
-               pr_url=excluded.pr_url, status='watching', blocker=NULL,
-               detail=NULL, agent_attempts=0, updated_at=excluded.updated_at",
+                                  queued_at,updated_at,pr_url,forge_host,project,checkout_gen)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,'watching',NULL,NULL,0,NULL,?8,?8,?9,?10,?11,0)",
             params![
                 key,
                 repo_root,
@@ -729,10 +751,52 @@ impl WorktreeAuxStore for Db {
                 base_branch,
                 forge,
                 now,
-                pr_url
+                pr_url,
+                host,
+                project
             ],
         )?;
+        tx.commit()?;
         Ok(())
+    }
+
+    fn rebind_pr(&self, old_key: &str, binding: &crate::db::PrRebind) -> Result<String> {
+        let identity = crate::forge::model::repo_identity_from_pr_url(&binding.pr_url)
+            .ok_or_else(|| anyhow::anyhow!("invalid PR URL for rebind"))?;
+        let tx = self.conn().unchecked_transaction()?;
+        let old = tx
+            .query_row(
+                "SELECT repo_root,number FROM pr_queue WHERE key=?1",
+                [old_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("PR queue row {old_key} no longer exists"))?;
+        anyhow::ensure!(
+            crate::pr_queue::pr_url_number_matches(&binding.pr_url, old.1.max(0) as u64),
+            "PR URL does not match the queued PR number"
+        );
+        let new_key = crate::db::PrQueueRow::make_key(
+            &old.0,
+            &binding.forge,
+            Some(&identity),
+            old.1.max(0) as u64,
+        );
+        let occupied: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pr_queue WHERE key=?1 AND key<>?2)",
+            params![new_key, old_key],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            !occupied,
+            "PR queue identity already belongs to another row"
+        );
+        let host = identity.host.to_ascii_lowercase();
+        let project = identity.path.to_ascii_lowercase();
+        tx.execute("UPDATE pr_queue SET key=?2,worktree=?3,branch=?4,base_branch=?5,forge=?6,pr_url=?7,forge_host=?8,project=?9,checkout_gen=checkout_gen+1,status='watching',blocker=NULL,detail=NULL,ci_rerun_head=NULL,updated_at=?10 WHERE key=?1",
+            params![old_key,new_key,binding.worktree,binding.branch,binding.base_branch,binding.forge,binding.pr_url,host,project,util::now()])?;
+        tx.commit()?;
+        Ok(new_key)
     }
 
     fn update_pr_status(
@@ -801,7 +865,8 @@ impl WorktreeAuxStore for Db {
     fn list_pr_queue(&self) -> Result<Vec<PrQueueRow>> {
         let mut stmt = self.conn().prepare(
             r#"SELECT key,repo_root,number,worktree,branch,base_branch,forge,status,
-                      blocker,detail,agent_attempts,ci_rerun_head,last_head_oid,queued_at,updated_at,pr_url
+                      blocker,detail,agent_attempts,ci_rerun_head,last_head_oid,queued_at,updated_at,pr_url,
+                      forge_host,project,checkout_gen
                FROM pr_queue ORDER BY queued_at"#,
         )?;
         let rows = stmt.query_map([], |r| {
@@ -822,6 +887,9 @@ impl WorktreeAuxStore for Db {
                 queued_at: r.get(13)?,
                 updated_at: r.get(14)?,
                 pr_url: r.get(15)?,
+                forge_host: r.get(16)?,
+                project: r.get(17)?,
+                checkout_gen: r.get(18)?,
             })
         })?;
         let mut v = Vec::new();

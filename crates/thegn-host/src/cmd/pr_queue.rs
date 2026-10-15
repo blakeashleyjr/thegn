@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
-use thegn_core::db::{Db, PrQueueRow};
+use thegn_core::db::{Db, PrQueueRow, PrRebind};
 use thegn_core::outln;
 use thegn_core::store::WorktreeAuxStore;
 
@@ -35,6 +35,15 @@ pub enum Action {
         /// PR without a worktree is watched but cannot be agent-fixed.
         #[arg(long)]
         worktree: Option<String>,
+    },
+    /// Explicitly re-authorize a queued PR identity or checkout.
+    Rebind {
+        #[arg(long)]
+        pr: u64,
+        #[arg(long, conflicts_with = "no_worktree")]
+        worktree: Option<String>,
+        #[arg(long)]
+        no_worktree: bool,
     },
     /// Remove a pull request from the queue.
     Rm {
@@ -91,6 +100,11 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
         Action::List { json } => list(json),
         Action::Add { pr, worktree } => add(cfg, pr, worktree),
+        Action::Rebind {
+            pr,
+            worktree,
+            no_worktree,
+        } => rebind(pr, worktree, no_worktree),
         Action::Rm { number } => rm(number),
         Action::Clear => clear(),
         Action::Drain { json } => drain(cfg, json),
@@ -246,10 +260,105 @@ fn bind_checkout(
 
 fn rm(number: u64) -> Result<()> {
     let root = repo_root()?;
-    let key = PrQueueRow::make_key(&root.to_string_lossy(), number);
     let db = Db::open()?;
+    let mut matches: Vec<_> = pr_driver::rows_for_repo(&db, &root)
+        .into_iter()
+        .filter(|row| row.number == number)
+        .collect();
+    anyhow::ensure!(!matches.is_empty(), "PR #{number} is not in the queue");
+    anyhow::ensure!(
+        matches.len() == 1,
+        "PR #{number} is ambiguous; remove by identity after rebinding"
+    );
+    let key = matches.remove(0).key;
     db.remove_pr_entry(&key)?;
     outln!("Removed PR #{number} from the queue.");
+    Ok(())
+}
+
+fn rebind(number: u64, worktree: Option<String>, no_worktree: bool) -> Result<()> {
+    let root = repo_root()?
+        .canonicalize()
+        .context("canonicalize repo root")?;
+    let db = Db::open()?;
+    let matches: Vec<_> = pr_driver::rows_for_repo(&db, &root)
+        .into_iter()
+        .filter(|row| row.number == number)
+        .collect();
+    anyhow::ensure!(
+        !matches.is_empty(),
+        "PR #{number} is not in the queue; add it before rebinding"
+    );
+    anyhow::ensure!(
+        matches.len() == 1,
+        "PR #{number} has multiple queue identities: {}",
+        matches
+            .iter()
+            .map(|row| row.key.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let old = &matches[0];
+    let explicit = worktree.is_some();
+    let wt_path = if no_worktree {
+        None
+    } else {
+        Some(
+            super::resolve_worktree(worktree)
+                .canonicalize()
+                .context("canonicalize PR worktree")?,
+        )
+    };
+    let query_path = wt_path.as_deref().unwrap_or(root.as_path());
+    let loc = thegn_core::remote::GitLoc::from_db(&query_path.to_string_lossy(), None);
+    let forge = crate::forge_handle::get().for_loc(&loc);
+    let status = forge
+        .pr_status(&loc, thegn_core::forge::PrRef::Number(number))
+        .map_err(|error| anyhow::anyhow!("could not resolve PR #{number}: {}", error.describe()))?;
+    let wt_main = wt_path
+        .as_deref()
+        .and_then(|path| integrate::main_checkout(path));
+    let wt_branch = wt_path.as_deref().and_then(|path| {
+        thegn_core::remote::GitLoc::from_db(&path.to_string_lossy(), None).git_out(&[
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD",
+        ])
+    });
+    let binding_worktree = if let Some(path) = &wt_path {
+        bind_checkout(
+            &root,
+            path,
+            explicit,
+            wt_main.as_deref(),
+            wt_branch.as_deref(),
+            &status.head_ref_name,
+        )?
+        .map(|path| path.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+    let old_key = old.key.clone();
+    let new_key = db.rebind_pr(
+        &old_key,
+        &PrRebind {
+            worktree: binding_worktree,
+            branch: status.head_ref_name,
+            base_branch: status.base_ref_name,
+            forge: forge.id().to_owned(),
+            pr_url: status.url,
+        },
+    )?;
+    let rebound = db
+        .list_pr_queue()?
+        .into_iter()
+        .find(|row| row.key == new_key)
+        .context("rebound PR queue row disappeared")?;
+    outln!(
+        "Rebound PR #{number}: {old_key} → {} (checkout generation {}).",
+        new_key,
+        rebound.checkout_gen
+    );
     Ok(())
 }
 

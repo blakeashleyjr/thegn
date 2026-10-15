@@ -381,7 +381,7 @@ fn rewatch_row(
         || thegn_core::forge::model::repo_identity_from_pr_url(&fetched.url).is_none()
     {
         return Err(format!(
-            "re-watch refused: fetched identity does not verify PR #{number}; use `thegn pr queue add --pr {number}` to rebind"
+            "re-watch refused: fetched identity does not verify PR #{number}; use `thegn pr queue rebind --pr {number}`"
         ));
     }
     // Validate fetched URL route and number when an unbound row has no identity to compare against.
@@ -392,13 +392,13 @@ fn rewatch_row(
         fetched.number,
     ) {
         return Err(format!(
-            "re-watch refused: {reason}; use `thegn pr queue add --pr {number}` to rebind"
+            "re-watch refused: {reason}; use `thegn pr queue rebind --pr {number}`"
         ));
     }
     if row.pr_url.is_some() {
         if row.forge != forge_id {
             return Err(format!(
-                "re-watch refused: queued forge `{}` differs from `{forge_id}`; use `thegn pr queue add --pr {number}` to rebind",
+                "re-watch refused: queued forge `{}` differs from `{forge_id}`; use `thegn pr queue rebind --pr {number}`",
                 row.forge
             ));
         }
@@ -409,21 +409,22 @@ fn rewatch_row(
             fetched.number,
         ) {
             return Err(format!(
-                "re-watch refused: {reason}; use `thegn pr queue add --pr {number}` to rebind"
+                "re-watch refused: {reason}; use `thegn pr queue rebind --pr {number}`"
             ));
         }
     }
     let worktree = (fetched.head_ref_name == row.branch)
         .then_some(row.worktree.as_deref())
         .flatten();
-    db.enqueue_bound_pr(
-        &row.repo_root,
-        number,
-        worktree,
-        &fetched.head_ref_name,
-        &fetched.base_ref_name,
-        forge_id,
-        &fetched.url,
+    db.rebind_pr(
+        &row.key,
+        &thegn_core::db::PrRebind {
+            worktree: worktree.map(str::to_owned),
+            branch: fetched.head_ref_name,
+            base_branch: fetched.base_ref_name,
+            forge: forge_id.to_owned(),
+            pr_url: fetched.url,
+        },
     )
     .map_err(|error| format!("re-watch failed: {error}"))?;
     Ok(format!("Watching PR #{number} again"))
@@ -837,7 +838,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_at(&dir.path().join("q.db")).unwrap();
         let root = dir.path().to_string_lossy().into_owned();
-        let key = format!("{root}#7");
         match bound_url {
             Some(url) => db
                 .enqueue_bound_pr(&root, 7, Some("/worktree"), branch, "main", forge, url)
@@ -846,6 +846,13 @@ mod tests {
                 .enqueue_pr(&root, 7, Some("/worktree"), branch, "main", forge)
                 .unwrap(),
         }
+        let key = db
+            .list_pr_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.number == 7)
+            .unwrap()
+            .key;
         db.update_pr_status(&key, "needs_human", None, None, None)
             .unwrap();
         let row = db
@@ -907,7 +914,7 @@ mod tests {
                 "feature",
             )),
         );
-        assert!(result.unwrap_err().contains("thegn pr queue add --pr 7"));
+        assert!(result.unwrap_err().contains("thegn pr queue rebind --pr 7"));
         let unchanged = db.list_pr_queue().unwrap().remove(0);
         assert_eq!(unchanged.status, "needs_human");
         assert_eq!(unchanged.pr_url, row.pr_url);
@@ -930,7 +937,7 @@ mod tests {
                 "feature",
             )),
         );
-        assert!(result.unwrap_err().contains("thegn pr queue add --pr 7"));
+        assert!(result.unwrap_err().contains("thegn pr queue rebind --pr 7"));
         let unchanged = db.list_pr_queue().unwrap().remove(0);
         assert_eq!(unchanged.status, "needs_human");
         assert_eq!(unchanged.forge, "github");
@@ -1054,6 +1061,9 @@ mod tests {
             base_branch: "main".into(),
             forge: "github".into(),
             pr_url: None,
+            forge_host: None,
+            project: None,
+            checkout_gen: 0,
             status: status.into(),
             blocker: None,
             detail: None,

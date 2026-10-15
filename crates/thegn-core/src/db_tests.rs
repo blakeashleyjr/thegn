@@ -1086,8 +1086,6 @@ fn pr_queue_enqueue_update_list_and_remove() {
     let db = db();
     assert!(db.list_pr_queue().unwrap().is_empty());
 
-    db.enqueue_pr("/repo", 7, Some("/wt/a"), "feat-a", "main", "github")
-        .unwrap();
     db.enqueue_bound_pr(
         "/repo",
         7,
@@ -1098,8 +1096,7 @@ fn pr_queue_enqueue_update_list_and_remove() {
         "https://github.com/me/repo/pull/7",
     )
     .unwrap();
-    // Same number in a DIFFERENT repo is a distinct row — the key is repo+number,
-    // so two repos' PR #7 must not collide.
+    // Same number in a DIFFERENT repo is a distinct row.
     db.enqueue_pr("/other", 7, None, "feat-x", "main", "github")
         .unwrap();
     let q = db.list_pr_queue().unwrap();
@@ -1112,8 +1109,11 @@ fn pr_queue_enqueue_update_list_and_remove() {
             .find(|r| r.key == key)
             .unwrap()
     };
-    let k = PrQueueRow::make_key("/repo", 7);
-    assert_eq!(k, "/repo#7");
+    let identity =
+        crate::forge::model::repo_identity_from_pr_url("https://github.com/me/repo/pull/7")
+            .unwrap();
+    let k = PrQueueRow::make_key("/repo", "github", Some(&identity), 7);
+    assert_eq!(k, "/repo#github:github.com/me/repo#7");
     let a = by(&k);
     assert_eq!(a.status, "watching");
     assert_eq!(a.number, 7);
@@ -1154,38 +1154,108 @@ fn pr_queue_enqueue_update_list_and_remove() {
     db.set_pr_agent_attempts(&k, 2).unwrap();
     assert_eq!(by(&k).agent_attempts, 2);
 
-    // Re-queueing resets the row, but KEEPS a worktree the caller didn't supply
-    // — dropping it would silently disable agent handoff for that PR.
-    db.enqueue_pr("/repo", 7, None, "feat-a", "main", "github")
-        .unwrap();
-    let a = by(&k);
-    assert_eq!(a.status, "watching");
-    assert_eq!(a.agent_attempts, 0);
-    assert!(a.blocker.is_none() && a.detail.is_none());
-    assert_eq!(a.worktree.as_deref(), Some("/wt/a"), "worktree survives");
-    assert_eq!(
-        a.pr_url.as_deref(),
-        Some("https://github.com/me/repo/pull/7")
-    );
-    db.enqueue_bound_pr(
-        "/repo",
-        7,
-        Some("/wt/b"),
-        "feat-b",
-        "main",
-        "github",
-        "https://github.com/other/repo/pull/7",
-    )
-    .unwrap();
-    let a = by(&k);
-    assert_eq!(a.worktree.as_deref(), Some("/wt/b"));
-    assert_eq!(
-        a.pr_url.as_deref(),
-        Some("https://github.com/other/repo/pull/7")
+    assert!(
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            Some("/wt/b"),
+            "feat-a",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/7",
+        )
+        .is_err(),
+        "checkout changes require explicit rebind"
     );
 
     db.remove_pr_entry(&k).unwrap();
     assert_eq!(db.list_pr_queue().unwrap().len(), 1);
+}
+
+#[test]
+fn bound_enqueue_projects_and_explicit_rebind_generation() {
+    let db = db();
+    db.enqueue_bound_pr(
+        "/repo",
+        7,
+        Some("/wt/a"),
+        "feat",
+        "main",
+        "github",
+        "https://github.com/acme/one/pull/7",
+    )
+    .unwrap();
+    db.enqueue_bound_pr(
+        "/repo",
+        7,
+        Some("/wt/b"),
+        "feat",
+        "main",
+        "github",
+        "https://github.com/acme/two/pull/7",
+    )
+    .unwrap();
+    let before = db.list_pr_queue().unwrap();
+    assert_eq!(
+        before.len(),
+        2,
+        "same number in two projects has distinct authority keys"
+    );
+    let first = before
+        .iter()
+        .find(|row| row.project.as_deref() == Some("acme/one"))
+        .unwrap();
+    let first_key = first.key.clone();
+    db.set_pr_agent_attempts(&first_key, 2).unwrap();
+    assert!(
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            Some("/wt/changed"),
+            "feat",
+            "main",
+            "github",
+            "https://github.com/acme/one/pull/7"
+        )
+        .is_err()
+    );
+    let new_key = db
+        .rebind_pr(
+            &first_key,
+            &PrRebind {
+                worktree: Some("/wt/changed".into()),
+                branch: "feat".into(),
+                base_branch: "main".into(),
+                forge: "github".into(),
+                pr_url: "https://github.com/acme/one/pull/7".into(),
+            },
+        )
+        .unwrap();
+    let row = db
+        .list_pr_queue()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.key == new_key)
+        .unwrap();
+    assert_eq!(row.checkout_gen, 1);
+    assert_eq!(
+        row.agent_attempts, 2,
+        "rebind does not refill the agent budget"
+    );
+    assert!(
+        db.rebind_pr(
+            &new_key,
+            &PrRebind {
+                worktree: Some("/wt/changed".into()),
+                branch: "feat".into(),
+                base_branch: "main".into(),
+                forge: "github".into(),
+                pr_url: "https://github.com/acme/two/pull/7".into(),
+            }
+        )
+        .is_err(),
+        "an existing identity cannot be stolen by rebind"
+    );
 }
 
 #[test]
