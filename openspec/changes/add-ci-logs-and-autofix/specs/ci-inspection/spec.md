@@ -7,8 +7,9 @@
 When a CI run reaches a terminal failed state, thegn SHALL fetch and cache the
 failing jobs' log tails off the event loop (bounded by `[ci] log_tail_lines`
 and a `[ci] log_cache_runs` retention count, `0` disabling the cache), and
-every log consumer — the drill overlay, `thegn ci log`, and the control/MCP
-surfaces — SHALL serve a terminal run's log from the cache without
+every log consumer — the drill overlay, `thegn ci logs` (with `ci log` as a
+compatibility alias), and the control/MCP surfaces — SHALL serve a terminal
+run's log from the cache without
 re-fetching. A cache miss for an in-flight or uncached job MAY fall through to
 a live provider fetch on the TUI/CLI paths; retention MUST evict oldest-run
 logs per worktree so the table stays bounded.
@@ -30,7 +31,7 @@ logs per worktree so the table stays bounded.
 ### Requirement: Log content is redacted before it is stored or leaves the process
 
 CI log text SHALL pass through a single pure redaction chokepoint
-(`thegn_core::ci_redact`) **before being written to the log cache**, masking
+(`thegn_core::ci_log::redact`) **before being written to the log cache**, masking
 secret-shaped content (provider token prefixes, AWS key ids, JWTs, PEM blocks,
 `Authorization:` header values, URL userinfo credentials, and
 credential-named `key = value` assignments), so that no surface — TUI, CLI,
@@ -42,7 +43,8 @@ indication that lines were redacted and/or the tail truncated.
 
 - **WHEN** a fetched job log contains a `ghp_…` token on a line
 - **THEN** the cached text carries `***redacted***` in its place, and the
-  drill view, `thegn ci log`, the `ci.log` capability payload, and any agent
+  drill view, `thegn ci logs` (with `ci log` as a compatibility alias), the
+  `ci.logs` capability payload, and any agent
   prompt excerpt all show the masked form
 
 #### Scenario: Only the chokepoint writes the cache
@@ -54,7 +56,7 @@ indication that lines were redacted and/or the tail truncated.
 ### Requirement: A failed run can be handed to the headless agent engine under an explicit policy
 
 thegn SHALL support handing a failed CI run to the shared agent-task engine as
-a `ci_failure` task (prompt variables: branch, worktree, workflow, run id and
+a `pr_ci_failure` task (prompt variables: branch, worktree, workflow, run id and
 URL, job name, and a redacted log excerpt centered on the first failure line),
 governed by `[ci.autofix] mode = "off" | "suggest" | "auto"` (default `off`).
 In `suggest` mode a failure MUST only raise an actionable notification plus a
@@ -106,7 +108,7 @@ ordinary pane sandboxing, with a recipe in the example config and help.
 Failure explanation SHALL be a log scan that marks the first failure line
 (error markers / exit codes / panics), with no LLM involvement. The same
 deterministic marker SHALL anchor the redacted log excerpt handed to the
-agent-task engine and reported in the `ci.log` capability payload — the
+agent-task engine and reported in the `ci.logs` capability payload — the
 optional agent handoff consumes the scan's output and never replaces it.
 
 #### Scenario: First-failure marker
@@ -117,7 +119,7 @@ optional agent handoff consumes the scan's output and never replaces it.
 
 #### Scenario: The excerpt is anchored on the marker
 
-- **WHEN** a `ci_failure` task prompt or a `ci.log` payload is built for a
+- **WHEN** a `pr_ci_failure` task prompt or a `ci.logs` payload is built for a
   failed job
 - **THEN** its excerpt window and reported failure line come from the same
   deterministic scan
