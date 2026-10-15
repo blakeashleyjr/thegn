@@ -23320,6 +23320,7 @@ async fn event_loop<T: Terminal>(
                                     &mut voice,
                                     focused,
                                     panes.table.contains_key(&focused),
+                                    &mut panes,
                                     start.elapsed().as_millis() as u64,
                                     &waker,
                                 );

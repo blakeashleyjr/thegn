@@ -55,7 +55,7 @@
 - [ ] 4.3 whisper-cli resolution through the managed-tools three-tier order
       (`[managed_tools.whisper-cli]` override → PATH → managed, where assets
       exist).
-- [ ] 4.4 Injection via `paste_text_into_pane` (focused pane at injection
+- [x] 4.4 Injection via `paste_text_into_pane` (focused pane at injection
       time; status-line fallback when focus moved/pane died; never a trailing
       newline).
 - [ ] 4.5 Statusbar REC badge (state-transition damage only; optional elapsed
