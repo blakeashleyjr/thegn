@@ -36,8 +36,7 @@ fn kind_is_bore() {
 
 #[test]
 fn bore_args_minimal_use_public_relay() {
-    // Ensure no inherited secret leaks into the minimal-config assertion.
-    unsafe { std::env::remove_var("BORE_SECRET") };
+    // Arg construction is independent of whether the configured secret resolves.
     let spec = spec_with(BoreConfig::default(), 3000);
     let plan = process_plan(&spec);
     assert_eq!(plan.program, "bore");
@@ -52,7 +51,7 @@ fn bore_args_minimal_use_public_relay() {
             "127.0.0.1",
         ]
     );
-    // No secret flag when BORE_SECRET is unset.
+    // Secrets are delivered through the child environment, never argv.
     assert!(!plan.args.iter().any(|a| a == "--secret"));
 }
 
@@ -78,10 +77,65 @@ fn bore_args_full() {
             "9000",
             "--local-host",
             "0.0.0.0",
-            "--secret",
-            "literal-secret",
             "--max-conn",
             "10",
+        ]
+    );
+    assert!(!plan.args.iter().any(|arg| arg.contains("literal-secret")));
+    assert!(
+        plan.env
+            .iter()
+            .any(|(key, value)| { key == "BORE_SECRET" && value == "literal-secret" })
+    );
+}
+
+#[test]
+fn bore_secret_never_reaches_argv() {
+    let secret = "literal-test-secret";
+    let spec = spec_with(
+        BoreConfig {
+            secret: secret.into(),
+            ..BoreConfig::default()
+        },
+        3000,
+    );
+    let plan = process_plan(&spec);
+
+    assert!(
+        !plan
+            .args
+            .iter()
+            .any(|arg| arg == secret || arg.contains(secret))
+    );
+    assert!(!plan.args.iter().any(|arg| arg == "--secret"));
+    assert!(
+        plan.env
+            .iter()
+            .any(|(key, value)| key == "BORE_SECRET" && value == secret)
+    );
+}
+
+#[test]
+fn direct_client_env_drops_ambient_credentials() {
+    let ambient = [
+        ("GITHUB_TOKEN", "github-secret"),
+        ("LINEAR_API_KEY", "linear-secret"),
+        ("IROH_SECRET", "iroh-secret"),
+        ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/secret"),
+        ("HOME", "/home/private"),
+        ("CONTAINER_HOST", "unix:///secret"),
+        ("PATH", "/usr/bin:/bin"),
+        ("LANG", "en_US.UTF-8"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.into(), value.into()));
+    let filtered = direct_client_env(ambient);
+
+    assert_eq!(
+        filtered,
+        vec![
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("LANG".into(), "en_US.UTF-8".into()),
         ]
     );
 }
@@ -930,6 +984,53 @@ fn start_keeps_draining_so_child_survives_post_return() {
 
     running.stop();
     let _ = std::fs::remove_dir_all(&tmp); // best-effort: test tmp cleanup
+}
+
+#[cfg(unix)]
+#[test]
+fn spawned_client_sees_only_allowlisted_env() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temporary client directory");
+    let script_path = temp.path().join("fake-client");
+    let dump_path = temp.path().join("environment.txt");
+    let script =
+        format!("#!/bin/sh\nenv > \"$1\"\nprintf 'listening at fake.example:4123\\n'\nsleep 2\n");
+    std::fs::write(&script_path, script).expect("write fake client");
+    let mut permissions = std::fs::metadata(&script_path)
+        .expect("fake client metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&script_path, permissions).expect("make fake client executable");
+
+    let plan = SharePlan {
+        program: script_path.to_string_lossy().into_owned(),
+        args: vec![dump_path.to_string_lossy().into_owned()],
+        env: vec![("RUST_LOG".into(), "info".into())],
+        files: Vec::new(),
+        url_rule: UrlRule::AfterMarker {
+            marker: "listening at ".into(),
+            scheme: "http".into(),
+        },
+    };
+    let ambient = [
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("LANG".into(), "C".into()),
+        ("HOME".into(), "/private/home".into()),
+        ("THEGN_TEST_CANARY_SECRET".into(), "canary-value".into()),
+        ("GITHUB_TOKEN".into(), "github-value".into()),
+    ];
+    let running = start_with_ambient(&plan, temp.path(), Duration::from_secs(1), ambient)
+        .expect("start fake client");
+    let dumped_env = std::fs::read_to_string(&dump_path).expect("read child environment");
+
+    assert!(dumped_env.lines().any(|line| line == "PATH=/usr/bin:/bin"));
+    assert!(dumped_env.lines().any(|line| line == "RUST_LOG=info"));
+    assert!(!dumped_env.contains("THEGN_TEST_CANARY_SECRET"));
+    assert!(!dumped_env.contains("canary-value"));
+    assert!(!dumped_env.contains("HOME="));
+    assert!(!dumped_env.contains("GITHUB_TOKEN="));
+    running.stop();
 }
 
 #[cfg(unix)]
