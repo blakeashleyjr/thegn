@@ -265,6 +265,8 @@ pub(crate) struct SessionActor {
     /// Why the last recording could not be finalized cleanly, if it couldn't:
     /// the `.cast` on disk is truncated and must not be reported as saved.
     record_truncated: Option<String>,
+    /// Raw PTY bytes omitted from the most recent recording under overload.
+    record_dropped_bytes: u64,
     fork_handoff: Option<std::path::PathBuf>,
 
     // ── harness-failure classification (THE-89) ─────────────────────────────
@@ -332,6 +334,7 @@ impl SessionActor {
             record_last_path: None,
             record_capped: false,
             record_truncated: None,
+            record_dropped_bytes: 0,
             fork_handoff,
             error_state: AgentErrorState::default(),
             error_signatures,
@@ -1151,6 +1154,7 @@ impl SessionActor {
                         self.record_last_path = Some(rec.path().to_path_buf());
                         self.record_capped = false;
                         self.record_truncated = None;
+                        self.record_dropped_bytes = 0;
                         self.recorder = Some(rec);
                         // Refresh listings + any attached UI recording chip.
                         let _ = self.events.send(Arc::new(EventFrame::Sessions)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
@@ -1173,6 +1177,7 @@ impl SessionActor {
         if let Some(rec) = self.recorder.take() {
             self.record_capped = rec.capped();
             self.record_truncated = rec.failure();
+            self.record_dropped_bytes = rec.dropped_bytes();
             self.record_last_path = Some(rec.path().to_path_buf());
             if let Ok(mut live) = self.live.lock() {
                 live.recording = None;
@@ -1238,6 +1243,10 @@ impl SessionActor {
                 .unwrap_or(0),
             capped: self.record_capped,
             truncated: self.record_truncated.clone(),
+            dropped_bytes: self
+                .recorder
+                .as_ref()
+                .map_or(self.record_dropped_bytes, |rec| rec.dropped_bytes()),
         }
     }
 
@@ -2561,5 +2570,69 @@ mod tests {
             "one-worker runtime ticker stalled for {} ms during teardown",
             largest_gap_ms.load(std::sync::atomic::Ordering::Relaxed)
         );
+    }
+
+    #[tokio::test]
+    async fn recording_status_keeps_gap_count_and_start_resets_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.recording.dir = tmp.path().to_string_lossy().into_owned();
+        let BuiltActor {
+            mut actor,
+            pane_rx,
+            msg_rx,
+            mut harness,
+        } = build_actor_cfg("cat", None, "sh", cfg);
+        let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+        actor.recording_done_tx = Some(completed_tx);
+
+        let started = actor
+            .on_record(RecordSpec::Start)
+            .expect("recording starts");
+        assert_eq!(started.dropped_bytes, 0);
+        actor.on_record(RecordSpec::Stop).expect("recording stops");
+        tokio::time::timeout(std::time::Duration::from_secs(2), completed_rx.recv())
+            .await
+            .expect("worker completes")
+            .expect("completion arrives");
+
+        // Model the count recorded by an overload gap completed by the worker.
+        actor.record_dropped_bytes = 9;
+        let gapped = actor.record_status();
+        assert_eq!(gapped.dropped_bytes, 9);
+        assert!(
+            gapped.truncated.is_none(),
+            "gap-only recordings remain valid"
+        );
+
+        let restarted = actor
+            .on_record(RecordSpec::Start)
+            .expect("recording restarts");
+        assert_eq!(
+            restarted.dropped_bytes, 0,
+            "a new recording resets gap status"
+        );
+        actor
+            .on_record(RecordSpec::Stop)
+            .expect("second recording stops");
+        tokio::time::timeout(std::time::Duration::from_secs(2), completed_rx.recv())
+            .await
+            .expect("second worker completes")
+            .expect("second completion arrives");
+        tokio::spawn(actor.run(pane_rx, msg_rx));
+        harness
+            .msg_tx
+            .send(SessionMsg::Kill)
+            .await
+            .expect("actor accepts kill");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(harness.feed.recv().await, Ok(frame) if matches!(frame.as_ref(), EventFrame::SessionExit { session, .. } if session == "s1")) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("actor tears down after test");
     }
 }
