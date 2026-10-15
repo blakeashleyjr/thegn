@@ -1178,7 +1178,7 @@ fn inherited_remote_ambient_env_survives_missing_local_dir() {
 }
 
 #[test]
-fn devcontainer_status_resolves_the_repo_selected_host_environment() {
+fn devcontainer_status_ignores_repo_host_environment_that_weakens_backend() {
     use thegn_core::config::{Config, EnvConfig, PlacementMode, SandboxBackend, SandboxOverlay};
 
     let repo = tempfile::tempdir().unwrap();
@@ -1209,9 +1209,28 @@ fn devcontainer_status_resolves_the_repo_selected_host_environment() {
         None,
         &thegn_core::config_resolve::Approvals::deny_all(),
     );
-    assert_eq!(environment.name, "host");
-    assert_eq!(environment.sandbox.backend, SandboxBackend::None);
-    assert!(!environment.allows_devcontainer());
+    assert_eq!(environment.name, "default");
+    assert_eq!(environment.sandbox.backend, SandboxBackend::Bwrap);
+    assert!(environment.allows_devcontainer());
+
+    let (_, resolved) = cfg.resolve_env_with(
+        repo.path(),
+        &thegn_core::placement::GitLoc::Local(repo.path().to_path_buf()),
+        repo.path(),
+        None,
+        &thegn_core::config_resolve::Approvals::deny_all(),
+    );
+    let event = resolved
+        .events
+        .iter()
+        .find(|event| event.key == "env")
+        .unwrap();
+    assert_eq!(
+        event.rule,
+        thegn_core::config_resolve::RepoFieldRule::Forbidden
+    );
+    assert!(event.reason.contains("host"));
+    assert!(event.reason.contains("sandbox.backend"));
 }
 
 // --- THE-73: only git may condemn a worktree row -----------------------
