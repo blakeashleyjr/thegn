@@ -2626,7 +2626,7 @@ mod tests {
         assert_eq!(outcome.exit_code, Some(0));
         assert!(emits >= 1, "a non-silent job should emit live output");
         assert!(
-            u128::from(emits) <= elapsed_ms / 100 + 2,
+            emits as u128 <= elapsed_ms / 100 + 2,
             "{emits} emits in {elapsed_ms}ms"
         );
     }
