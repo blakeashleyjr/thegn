@@ -1934,6 +1934,14 @@ pub(crate) fn run_w(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Resul
             args,
         )?)
     };
+    match _lock.as_ref() {
+        Some(held) => run_w_locked(loc, envs, args, held),
+        None => run_w_unlocked(loc, envs, args),
+    }
+}
+
+/// Run the write subprocess after the caller has selected the locking policy.
+fn run_w_unlocked(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Result<String> {
     // Marks the write for snapshot caches of git reads (THE-718); dropped
     // (advancing the epoch) after the subprocess and its lock are done.
     let _epoch = thegn_core::util::GitWriteScope::begin();
@@ -1952,6 +1960,17 @@ pub(crate) fn run_w(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Resul
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// [`run_w`] for a local mutation whose caller already holds the repository
+/// mutation lock. The guard is required as proof and must outlive this call.
+pub(crate) fn run_w_locked(
+    loc: &GitLoc,
+    envs: &[(&str, &str)],
+    args: &[&str],
+    _held: &thegn_core::util::GitLock,
+) -> Result<String> {
+    run_w_unlocked(loc, envs, args)
 }
 
 /// [`run_w`] with bytes piped to stdin (`git apply -`, `git commit -F -`).
