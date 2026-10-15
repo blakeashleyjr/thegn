@@ -555,6 +555,35 @@ pub fn render_page(blocks: &[Block], width: usize, selected_link: Option<usize>)
                     .collect();
                 let sep = format!(" {} ", g.box_v);
                 let sep_w = sep.width() * cols.saturating_sub(1);
+                if cols == 2 && natural.iter().sum::<usize>() + sep_w > width {
+                    for row in rows {
+                        let mut a = Vec::new();
+                        if let Some(key) = row.first() {
+                            let key_start = a.len();
+                            atoms(key, false, &mut next_link, selected_link, &mut meta, &mut a);
+                            for atom in &mut a[key_start..] {
+                                atom.seg = atom.seg.clone().bold();
+                            }
+                        }
+                        a.push(Atom {
+                            seg: seg(Tok::Slot(S::Text), " "),
+                            link: None,
+                            space: true,
+                        });
+                        if let Some(description) = row.get(1) {
+                            atoms(
+                                description,
+                                false,
+                                &mut next_link,
+                                selected_link,
+                                &mut meta,
+                                &mut a,
+                            );
+                        }
+                        f.flow(a, &[], &[sp(2)], &meta);
+                    }
+                    continue;
+                }
                 if natural.iter().sum::<usize>() + sep_w > width {
                     for (n, values) in natural.iter_mut().zip(cells.iter_mut()) {
                         values.sort_unstable();
@@ -836,9 +865,9 @@ mod tests {
     fn clipped_table_cell_ends_with_ellipsis_at_exact_width() {
         let page = render_page(
             &parse(
-                "| key | label |
-| --- | --- |
-| extraordinarily-long-key | surviving label |
+                "| key | label | flag |
+| --- | --- | --- |
+| extraordinarily-long-key | surviving label | yes |
 ",
             ),
             18,
@@ -872,12 +901,12 @@ mod tests {
     #[test]
     fn table_p90_cap_preserves_the_label_column() {
         let mut source = String::from(
-            "| key | label |\n| --- | --- |\n| extraordinarily-long-key-for-one-row | exceptionally-long-label-that-is-also-over-40-chars |\n",
+            "| key | label | flag |\n| --- | --- | --- |\n| extraordinarily-long-key-for-one-row | exceptionally-long-label-that-is-also-over-40-chars | yes |\n",
         );
         for _ in 0..10 {
-            source.push_str("| aaa | label-kept-readable |\n");
+            source.push_str("| aaa | label-kept-readable | yes |\n");
         }
-        let page = render_page(&parse(&source), 30, None);
+        let page = render_page(&parse(&source), 40, None);
         assert!(
             page.lines
                 .iter()
@@ -913,6 +942,36 @@ mod tests {
             })
             .collect();
         assert_eq!(targets, vec!["sidebar".to_string(), "panel".to_string()]);
+    }
+
+    #[test]
+    fn two_column_table_stacks_and_wraps_at_narrow_width() {
+        let page = render_page(&parse(TABLE), 20, None);
+        let texts: Vec<String> = page.lines.iter().map(line_text).collect();
+        let output = texts.join(" ");
+        assert!(output.contains("Split pane right"), "{output:?}");
+        for line in &texts {
+            assert!(!line.contains('…'), "unexpected clipping: {line:?}");
+            assert!(!line.contains('│'), "grid separator remains: {line:?}");
+            assert!(line.width() <= 20, "line too wide: {line:?}");
+        }
+    }
+
+    #[test]
+    fn stacked_table_registers_links_in_order() {
+        let src = "| a | b |\n| - | - |\n| [[sidebar]] | x |\n\nAfter [[panel]].\n";
+        for width in 6..=10 {
+            let page = render_page(&parse(src), width, None);
+            let targets: Vec<String> = page
+                .links
+                .iter()
+                .map(|link| match &link.target {
+                    LinkTarget::Page(page) => page.clone(),
+                    LinkTarget::Url(url) => url.clone(),
+                })
+                .collect();
+            assert_eq!(targets, vec!["sidebar".to_string(), "panel".to_string()]);
+        }
     }
 
     /// The "Referenced by" footer is appended as real blocks, so its entries
