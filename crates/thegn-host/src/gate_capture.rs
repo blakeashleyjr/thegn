@@ -28,6 +28,7 @@ static REAPER: OnceLock<Result<mpsc::Sender<ReapOwner>, String>> = OnceLock::new
 pub(super) enum CaptureResult {
     Completed { status: ExitStatus, log: String },
     Timeout { log: String },
+    SpawnFailed { reason: String, log: String },
     Infrastructure { reason: String, log: String },
     Poisoned { reason: String, log: String },
 }
@@ -273,7 +274,7 @@ pub(super) fn run(mut command: Command, timeout: Duration) -> CaptureResult {
     let (mut child, group) = match crate::platform::spawn_gate_grouped(&mut command) {
         Ok(pair) => pair,
         Err(error) => {
-            return CaptureResult::Infrastructure {
+            return CaptureResult::SpawnFailed {
                 reason: format!(
                     "gate command could not be started with process containment: {error}"
                 ),
@@ -760,7 +761,7 @@ mod tests {
         let missing = Command::new("thegn-gate-command-that-does-not-exist");
         assert!(matches!(
             run(missing, Duration::from_secs(1)),
-            CaptureResult::Infrastructure { reason, .. } if reason.contains("could not be started")
+            CaptureResult::SpawnFailed { reason, .. } if reason.contains("could not be started")
         ));
 
         struct FailingReader;

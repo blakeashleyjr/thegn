@@ -1055,7 +1055,7 @@ fn timeout_is_a_public_hold_and_a_live_group_quarantines_the_reused_lease() {
     escaped.gate_timeout_secs = 1;
     let verdict = gate_tip(&f.repo, &f.first, &escaped).unwrap();
     assert!(
-        matches!(verdict, GateVerdict::Error { reason, log } if reason.contains("quarantined") && log.contains("outlived its leader"))
+        matches!(verdict, GateVerdict::Error { reason, log, .. } if reason.contains("quarantined") && log.contains("outlived its leader"))
     );
     let old_gate = gate_base_for_repo(&f.repo).join("wt");
     assert!(gate_base_for_repo(&f.repo).join("gate.poisoned").is_file());
@@ -1129,10 +1129,17 @@ fn setup_failure_keeps_exit_code_and_does_not_run_gate() {
     f.config.gate_setup_command = "printf setup-marker; exit 42".into();
     f.config.gate_command = "printf gate-marker".into();
     match gate_tip(&f.repo, &f.first, &f.config).unwrap() {
-        GateVerdict::Error { reason, log } => {
+        GateVerdict::Error {
+            reason,
+            log,
+            phase,
+            class,
+        } => {
             assert!(reason.contains("exit 42"));
             assert!(log.contains("setup-marker"));
             assert!(!log.contains("gate-marker"));
+            assert_eq!(phase, crate::integrate::GatePhase::Setup);
+            assert_eq!(class, crate::integrate::GateErrorClass::SetupFailed);
         }
         other => panic!("expected setup infrastructure error: {other:?}"),
     }
@@ -1154,7 +1161,10 @@ fn setup_timeout_is_an_infrastructure_hold_and_does_not_run_gate() {
     );
     assert!(matches!(
         gate_tip(&f.repo, &f.first, &config).unwrap(),
-        GateVerdict::Error { reason, .. } if reason.contains("gate_setup_command timed out")
+        GateVerdict::Error { reason, phase, class, .. }
+            if reason.contains("gate_setup_command timed out")
+                && phase == crate::integrate::GatePhase::Setup
+                && class == crate::integrate::GateErrorClass::Timeout
     ));
     assert!(!marker.exists());
     assert_eq!(git(&f.repo, &["rev-parse", "HEAD"]), f.first);
@@ -1188,6 +1198,47 @@ fn linked_root_gitfile_reassignment_is_not_a_new_repository() {
         std::fs::read_to_string(linked.join("value")).unwrap(),
         "one\n"
     );
+}
+
+#[test]
+fn gate_exit_classes_distinguish_spawn_timeout_and_red_verdicts() {
+    if !posix_shell_gate_only() {
+        return;
+    }
+    let f = Fixture::new();
+    if !f.supported_or_refused() {
+        return;
+    }
+
+    let mut spawn = f.config.clone();
+    spawn.gate_command = "exit 127".into();
+    assert!(matches!(
+        gate_tip(&f.repo, &f.first, &spawn).unwrap(),
+        GateVerdict::Error {
+            phase: crate::integrate::GatePhase::Gate,
+            class: crate::integrate::GateErrorClass::Spawn,
+            ..
+        }
+    ));
+
+    let mut timeout = f.config.clone();
+    timeout.gate_command = "sleep 3".into();
+    timeout.gate_timeout_secs = 1;
+    assert!(matches!(
+        gate_tip(&f.repo, &f.first, &timeout).unwrap(),
+        GateVerdict::Error {
+            phase: crate::integrate::GatePhase::Gate,
+            class: crate::integrate::GateErrorClass::Timeout,
+            ..
+        }
+    ));
+
+    let mut red = f.config.clone();
+    red.gate_command = "exit 1".into();
+    assert!(matches!(
+        gate_tip(&f.repo, &f.first, &red).unwrap(),
+        GateVerdict::Failed { .. }
+    ));
 }
 
 #[test]
