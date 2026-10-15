@@ -516,7 +516,8 @@ mod tests {
 
     #[test]
     fn json_list_row_keeps_config_and_health_fields_in_one_stable_projection() {
-        let plugin = inspected_plugin(ExtensionPoint::PaletteAction, &["surface:palette"]);
+        let mut plugin = inspected_plugin(ExtensionPoint::PaletteAction, &["surface:palette"]);
+        plugin.spec.trusted_native = true;
         let json = serde_json::to_value(list_row(&plugin)).unwrap();
         assert_eq!(json["id"], "inspect");
         assert_eq!(json["name"], "Inspect");
