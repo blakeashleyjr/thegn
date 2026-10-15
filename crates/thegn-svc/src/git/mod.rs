@@ -4168,6 +4168,65 @@ mod read_fence_tests {
             "diff readers must disable configured textconv drivers"
         );
     }
+
+    #[test]
+    fn stageable_diff_reads_never_run_external_diff_or_attribute_drivers() {
+        let (dir, loc) = private_repo();
+        std::fs::write(dir.path().join("sample.txt"), "base\n").unwrap();
+        std::fs::write(dir.path().join(".gitattributes"), "*.txt diff=canary\n").unwrap();
+        super::testutil::git_in(dir.path(), &["add", "sample.txt", ".gitattributes"]);
+        super::testutil::git_in(dir.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::write(dir.path().join("sample.txt"), "committed\n").unwrap();
+        super::testutil::git_in(dir.path(), &["add", "sample.txt"]);
+        super::testutil::git_in(dir.path(), &["commit", "-q", "-m", "committed change"]);
+        std::fs::write(dir.path().join("sample.txt"), "staged\n").unwrap();
+        super::testutil::git_in(dir.path(), &["add", "sample.txt"]);
+        std::fs::write(dir.path().join("sample.txt"), "worktree\n").unwrap();
+
+        let marker = dir.path().join("external-diff-ran");
+        let driver = dir.path().join("external-diff.sh");
+        std::fs::write(
+            &driver,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nprintf 'not a patch\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        super::testutil::git_in(
+            dir.path(),
+            &[
+                "config",
+                "diff.external",
+                &format!("sh '{}'", driver.display()),
+            ],
+        );
+        super::testutil::git_in(
+            dir.path(),
+            &[
+                "config",
+                "diff.canary.command",
+                &format!("sh '{}'", driver.display()),
+            ],
+        );
+
+        let hunks = CliGit.diff_hunks(&loc, "HEAD", "sample.txt", 40).unwrap();
+        let unstaged = CliGit.unstaged_diff(&loc, "sample.txt").unwrap();
+        let staged = CliGit.staged_diff(&loc, "sample.txt").unwrap();
+        let range = CliGit.range_patch(&loc, "HEAD~1", "HEAD").unwrap();
+
+        assert!(!hunks.is_empty(), "hunk reader returned no unified change");
+        for (name, patch) in [("unstaged", unstaged), ("staged", staged), ("range", range)] {
+            assert!(
+                patch.starts_with("diff --git "),
+                "{name} output was not a unified patch"
+            );
+        }
+        assert!(
+            !marker.exists(),
+            "stageable diff readers must disable both repo external diff and attribute drivers"
+        );
+    }
 }
 
 /// The configured git read engine (`[git] backend`). Writes always go
