@@ -77,6 +77,66 @@ fn remove_scratch_worktree(repo_root: &Path, scratch: ScratchDirectory) {
     }
 }
 
+fn cleanup_failed_scratch_add(repo_root: &Path, scratch: ScratchDirectory) {
+    let path = scratch.path().to_path_buf();
+    if let Err(error) = scratch.verify() {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            tracing::debug!(target: "thegn::integrate", path = %path.display(), "failed worktree add already removed its scratch directory");
+        } else {
+            gate_runner::record_external_quarantine(
+                &path,
+                "scratch identity changed after failed worktree add",
+            );
+            tracing::warn!(target: "thegn::integrate", path = %path.display(), %error, "failed worktree add scratch identity changed; preserving it; see `thegn doctor` (merge gate quarantines) for repair");
+        }
+        return;
+    }
+
+    let empty = match std::fs::read_dir(&path) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(error) => {
+            gate_runner::record_external_quarantine(
+                &path,
+                "failed worktree add scratch contents unverifiable",
+            );
+            tracing::warn!(target: "thegn::integrate", path = %path.display(), %error, "failed worktree add scratch contents unverifiable; preserving it; see `thegn doctor` (merge gate quarantines) for repair");
+            return;
+        }
+    };
+    if empty {
+        if let Err(error) = scratch.remove_empty() {
+            gate_runner::record_external_quarantine(
+                &path,
+                "failed worktree add left an empty scratch directory",
+            );
+            tracing::warn!(target: "thegn::integrate", path = %path.display(), %error, "empty scratch cleanup failed; preserving it; see `thegn doctor` (merge gate quarantines) for repair");
+        }
+        return;
+    }
+
+    let has_gitfile = match std::fs::symlink_metadata(path.join(".git")) {
+        Ok(metadata) => metadata.file_type().is_file(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            gate_runner::record_external_quarantine(
+                &path,
+                "failed worktree add gitfile unverifiable",
+            );
+            tracing::warn!(target: "thegn::integrate", path = %path.display(), %error, "failed worktree add gitfile unverifiable; preserving it; see `thegn doctor` (merge gate quarantines) for repair");
+            return;
+        }
+    };
+    if has_gitfile {
+        remove_scratch_worktree(repo_root, scratch);
+    } else if let Err(error) = scratch.remove_tree() {
+        gate_runner::record_external_quarantine(
+            &path,
+            "failed worktree add left a partial scratch directory",
+        );
+        tracing::warn!(target: "thegn::integrate", path = %path.display(), %error, "partial scratch cleanup failed; preserving it; see `thegn doctor` (merge gate quarantines) for repair");
+    }
+}
+
 /// A fold commit failed to be created while `sign_commits` was on. Carried as a
 /// distinct error so the drain can classify it as an infrastructure fault (stop
 /// with a reason, never blame the branch, never wake the fixing agent) rather
@@ -395,12 +455,7 @@ fn driver_merge(
     if scratch.verify().is_err()
         || !util::git_ok(repo_root, &["worktree", "add", "--detach", &tmp_s, ours])
     {
-        if scratch.verify().is_ok()
-            && std::fs::read_dir(&tmp).is_ok_and(|mut entries| entries.next().is_none())
-            && let Err(error) = scratch.remove_empty()
-        {
-            tracing::warn!(target: "thegn::integrate", path = %tmp.display(), %error, "empty scratch cleanup failed");
-        }
+        cleanup_failed_scratch_add(repo_root, scratch);
         return None;
     }
     let mut preserve_scratch = false;
@@ -516,6 +571,9 @@ fn run_driver_command(command: std::process::Command, timeout: Duration) -> Driv
         crate::gate_capture::CaptureResult::Infrastructure { reason, log } => {
             DriverRun::Failed { reason, log }
         }
+        crate::gate_capture::CaptureResult::SpawnFailed { reason, log } => {
+            DriverRun::Failed { reason, log }
+        }
         crate::gate_capture::CaptureResult::Poisoned { reason, log } => {
             DriverRun::Poisoned { reason, log }
         }
@@ -570,12 +628,7 @@ fn regenerate_merge(
     if scratch.verify().is_err()
         || !util::git_ok(repo_root, &["worktree", "add", "--detach", &tmp_s, ours])
     {
-        if scratch.verify().is_ok()
-            && std::fs::read_dir(&tmp).is_ok_and(|mut entries| entries.next().is_none())
-            && let Err(error) = scratch.remove_empty()
-        {
-            tracing::warn!(target: "thegn::integrate", path = %tmp.display(), %error, "empty scratch cleanup failed");
-        }
+        cleanup_failed_scratch_add(repo_root, scratch);
         return None;
     }
     let mut preserve_scratch = false;
@@ -878,9 +931,17 @@ fn record_gate(diagnostics: &mut String, phase: &str, verdict: &GateVerdict) {
         return;
     }
     let (headline, log) = match verdict {
-        GateVerdict::Passed => ("passed", ""),
-        GateVerdict::Failed { log } => ("failed", log.as_str()),
-        GateVerdict::Error { reason, log } => (reason.as_str(), log.as_str()),
+        GateVerdict::Passed => ("passed".to_string(), ""),
+        GateVerdict::Failed { log } => ("failed".to_string(), log.as_str()),
+        GateVerdict::Error {
+            reason,
+            log,
+            phase,
+            class,
+        } => (
+            format!("{reason} ({}/{})", phase.as_str(), class.as_str()),
+            log.as_str(),
+        ),
     };
     let entry = format!("[{phase}] {headline}\n{}\n", tail(log, 4000));
     let mut clean = String::new();
@@ -1174,6 +1235,54 @@ fn gate_base_for_repo(repo_root: &Path) -> PathBuf {
     gate_base(&identity.hex())
 }
 
+/// The queue stage in which an infrastructure error occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatePhase {
+    Preparation,
+    Setup,
+    Gate,
+}
+
+impl GatePhase {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparation => "preparation",
+            Self::Setup => "setup",
+            Self::Gate => "gate",
+        }
+    }
+}
+
+/// Stable machine-readable category for a gate infrastructure error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateErrorClass {
+    Timeout,
+    Spawn,
+    Killed,
+    SetupFailed,
+    Capture,
+    Poisoned,
+    Preparation,
+    Signing,
+    SourceMoved,
+}
+
+impl GateErrorClass {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Spawn => "spawn",
+            Self::Killed => "killed",
+            Self::SetupFailed => "setup_failed",
+            Self::Capture => "capture",
+            Self::Poisoned => "poisoned",
+            Self::Preparation => "preparation",
+            Self::Signing => "signing",
+            Self::SourceMoved => "source_moved",
+        }
+    }
+}
+
 /// What one gate invocation established. The distinction between `Failed` and
 /// `Error` is load-bearing, not cosmetic: only `Failed` is a verdict about the
 /// *branch*. An `Error` (missing binary, non-executable, killed, unprovisioned
@@ -1187,7 +1296,12 @@ pub(crate) enum GateVerdict {
     Failed { log: String },
     /// The gate could not run. `reason` is the short headline, `log` whatever
     /// output there was.
-    Error { reason: String, log: String },
+    Error {
+        reason: String,
+        log: String,
+        phase: GatePhase,
+        class: GateErrorClass,
+    },
 }
 
 impl GateVerdict {
@@ -1211,7 +1325,12 @@ pub(crate) fn gate_tip(repo_root: &Path, oid: &str, cfg: &MergeQueueConfig) -> R
                 .collect::<String>();
             let log = tail(&detail, 4000);
             let reason = tail(&detail.replace('\n', " | "), 1200);
-            GateVerdict::Error { reason, log }
+            GateVerdict::Error {
+                reason,
+                log,
+                phase: GatePhase::Preparation,
+                class: GateErrorClass::Preparation,
+            }
         }),
     )
 }
@@ -1386,6 +1505,8 @@ fn aborted_bisect(error: anyhow::Error, diagnostics: &mut String) -> BisectAbort
     let verdict = GateVerdict::Error {
         reason: "bisect prefix preparation unavailable".into(),
         log: tail(&format!("{error:#}"), 4000),
+        phase: GatePhase::Preparation,
+        class: GateErrorClass::Preparation,
     };
     record_gate(diagnostics, "prefix preparation", &verdict);
     BisectAborted(verdict)
@@ -1416,6 +1537,8 @@ fn diagnosed_gate(
         .unwrap_or_else(|error| GateVerdict::Error {
             reason: "gate preparation unavailable".into(),
             log: tail(&format!("{error:#}"), 4000),
+            phase: GatePhase::Preparation,
+            class: GateErrorClass::Preparation,
         });
     record_gate(diagnostics, phase, &verdict);
     verdict
@@ -1443,7 +1566,14 @@ pub(crate) struct BisectAborted(pub(crate) GateVerdict);
 impl std::fmt::Display for BisectAborted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.0 {
-            GateVerdict::Error { reason, .. } => write!(f, "{reason}"),
+            GateVerdict::Error {
+                reason,
+                phase,
+                class,
+                ..
+            } => {
+                write!(f, "{}/{}: {reason}", phase.as_str(), class.as_str())
+            }
             _ => write!(f, "gate could not run"),
         }
     }
@@ -1551,6 +1681,8 @@ fn history_failure_report(
         &GateVerdict::Error {
             reason: reason.clone(),
             log: tail(&format!("{error:#}"), 4000),
+            phase: GatePhase::Preparation,
+            class: GateErrorClass::Preparation,
         },
     );
     let mut report = build_report(
@@ -1717,6 +1849,8 @@ fn run_fold_admitted(
                     &GateVerdict::Error {
                         reason: reason.clone(),
                         log: tail(&format!("{e:#}"), 4000),
+                        phase: GatePhase::Preparation,
+                        class: GateErrorClass::Preparation,
                     },
                 );
                 let empty = empty_plan(&original);
@@ -1886,6 +2020,8 @@ fn run_fold_admitted(
                     &GateVerdict::Error {
                         reason: reason.clone(),
                         log: tail(&format!("{error:#}"), 4000),
+                        phase: GatePhase::Preparation,
+                        class: GateErrorClass::Preparation,
                     },
                 );
                 return Ok(build_report(
@@ -2022,7 +2158,12 @@ pub(crate) enum AttemptOutcome {
     /// Merged clean, but the gate could not RUN (missing binary, unprovisioned
     /// gate worktree, killed). A fact about the *environment*, so the branch is
     /// not blamed and the fixing agent is never dispatched — it cannot help.
-    GateError { reason: String, log: String },
+    GateError {
+        reason: String,
+        log: String,
+        phase: GatePhase,
+        class: GateErrorClass,
+    },
     /// The branch tip is already an ancestor of the target — nothing to do.
     UpToDate { commit: String },
     /// The branch lives on another host and its tip could not be fetched into
@@ -2048,6 +2189,8 @@ pub(crate) fn attempt_land(
         Ok(AttemptOutcome::GateError {
             reason: "merge preparation or canonical history unavailable".into(),
             log: tail(&format!("{error:#}"), 4000),
+            phase: GatePhase::Preparation,
+            class: GateErrorClass::Preparation,
         })
     })
 }
@@ -2122,6 +2265,8 @@ fn attempt_land_admitted(
                 return Ok(AttemptOutcome::GateError {
                     reason: sf.to_string(),
                     log: String::new(),
+                    phase: GatePhase::Preparation,
+                    class: GateErrorClass::Signing,
                 });
             }
         };
@@ -2150,8 +2295,18 @@ fn attempt_land_admitted(
                 GateVerdict::Failed { log } => {
                     return Ok(AttemptOutcome::GateFailed { log });
                 }
-                GateVerdict::Error { reason, log } => {
-                    return Ok(AttemptOutcome::GateError { reason, log });
+                GateVerdict::Error {
+                    reason,
+                    log,
+                    phase,
+                    class,
+                } => {
+                    return Ok(AttemptOutcome::GateError {
+                        reason,
+                        log,
+                        phase,
+                        class,
+                    });
                 }
             }
         }
@@ -2188,12 +2343,16 @@ fn attempt_land_admitted(
                 return Ok(AttemptOutcome::GateError {
                     reason: "source moved after gate; retry".into(),
                     log: format!("source ref {name} moved to {actual}"),
+                    phase: GatePhase::Gate,
+                    class: GateErrorClass::SourceMoved,
                 });
             }
             CasOutcome::SourceMissing { name } => {
                 return Ok(AttemptOutcome::GateError {
                     reason: "source moved after gate; retry".into(),
                     log: format!("source ref {name} disappeared"),
+                    phase: GatePhase::Gate,
+                    class: GateErrorClass::SourceMoved,
                 });
             }
             CasOutcome::Missing => anyhow::bail!("target ref disappeared during fold"),
@@ -3788,9 +3947,12 @@ mod tests {
         }
         let loc = GitLoc::Local(repo.dir.clone());
         let outcome = attempt_land(&config, &repo.dir, "b1", &loc).unwrap();
-        assert!(matches!(&outcome, AttemptOutcome::GateError { reason, log }
-            if reason.contains("source moved after gate; retry")
-                && log.contains("refs/heads/b1")));
+        assert!(
+            matches!(&outcome, AttemptOutcome::GateError { reason, log, class, .. }
+                if reason.contains("source moved after gate; retry")
+                    && log.contains("refs/heads/b1")
+                    && *class == GateErrorClass::SourceMoved)
+        );
         assert_eq!(repo.out(&["rev-parse", "main"]), original);
     }
 
@@ -3975,6 +4137,8 @@ mod tests {
         let error = GateVerdict::Error {
             reason: "gate capture unavailable".into(),
             log: String::new(),
+            phase: GatePhase::Gate,
+            class: GateErrorClass::Capture,
         };
 
         budget.remember_base_verdict(base, &error);
@@ -4770,6 +4934,210 @@ mod tests {
             derive_landed_commit(&repo.dir, &branch_tip, &target).unwrap(),
             branch_tip,
             "a fast-forward landing must retain the branch tip as its identity"
+        );
+    }
+
+    fn install_failing_post_checkout(repo: &Repo) {
+        let hooks = repo._worktree.path().join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hooks, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let hook = hooks.join("post-checkout");
+            std::fs::write(
+                &hook,
+                "#!/bin/sh\nprintf hit > \"$(git rev-parse --git-common-dir)/post-checkout-marker\"\nexit 1\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(hooks.join("post-checkout"), "exit 1\n").unwrap();
+        }
+        let hooks = hooks.to_str().unwrap();
+        git(&repo.dir, &["config", "core.hooksPath", hooks]);
+    }
+
+    fn scratch_registrations(repo: &Repo) -> Vec<String> {
+        std::fs::read_dir(repo.dir.join(".git/worktrees"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "exercise real git worktree-add failure"
+    )]
+    fn failed_worktree_add_with_populated_scratch_is_removed_with_its_registration() {
+        let repo = Repo::new("failed-add-cleanup");
+        if !crate::platform::gate_path::verified_workspace_supported() {
+            return;
+        }
+        install_failing_post_checkout(&repo);
+        let scratch = ScratchDirectory::create("tg-drivermerge-").unwrap();
+        let path = scratch.path().to_path_buf();
+        let path_s = path.to_string_lossy().to_string();
+        let output = util::git_cmd(&repo.dir)
+            .args(["worktree", "add", "--detach", &path_s, "main"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "post-checkout hook must fail");
+        assert!(repo.dir.join(".git/post-checkout-marker").is_file());
+        assert!(
+            path.join(".git").is_file(),
+            "hook failure must leave a worktree"
+        );
+        assert!(!scratch_registrations(&repo).is_empty());
+
+        cleanup_failed_scratch_add(&repo.dir, scratch);
+
+        assert!(
+            !path.exists(),
+            "failed-add worktree directory must be removed"
+        );
+        assert!(
+            !repo
+                .out(&["worktree", "list", "--porcelain"])
+                .contains("tg-drivermerge-")
+        );
+        assert!(scratch_registrations(&repo).is_empty());
+        assert!(
+            !gate_runner::poisoned_gate_workspaces()
+                .iter()
+                .any(|(workspace, _)| workspace == &path)
+        );
+    }
+
+    #[test]
+    fn driver_merge_failed_add_leaves_no_worktree_behind() {
+        let repo = Repo::new("driver-failed-add-cleanup");
+        if !crate::platform::gate_path::verified_workspace_supported() {
+            return;
+        }
+        repo.feature("feature", "feature.txt", "feature\n");
+        let ours = repo.out(&["rev-parse", "main"]);
+        let theirs = repo.out(&["rev-parse", "feature"]);
+        let tree = repo.out(&["rev-parse", "main^{tree}"]);
+        install_failing_post_checkout(&repo);
+
+        assert!(
+            driver_merge(
+                &repo.dir,
+                &ours,
+                &theirs,
+                &tree,
+                &[],
+                false,
+                Duration::from_secs(3),
+            )
+            .is_none()
+        );
+        assert!(repo.dir.join(".git/post-checkout-marker").is_file());
+        assert!(
+            !repo
+                .out(&["worktree", "list", "--porcelain"])
+                .contains("tg-drivermerge-")
+        );
+        assert!(scratch_registrations(&repo).is_empty());
+    }
+
+    #[test]
+    fn failed_add_cleanup_quarantines_a_swapped_scratch() {
+        let repo = Repo::new("failed-add-swapped");
+        if !crate::platform::gate_path::verified_workspace_supported() {
+            return;
+        }
+        let scratch = ScratchDirectory::create("tg-drivermerge-").unwrap();
+        let path = scratch.path().to_path_buf();
+        let displaced = path.with_extension("displaced");
+        std::fs::rename(&path, &displaced).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        cleanup_failed_scratch_add(&repo.dir, scratch);
+
+        assert!(path.is_dir(), "replacement path must be preserved");
+        assert!(displaced.is_dir(), "original scratch must remain untouched");
+        assert!(
+            gate_runner::poisoned_gate_workspaces()
+                .iter()
+                .any(|(workspace, _)| workspace == &path)
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::remove_dir(&displaced).unwrap();
+    }
+
+    #[test]
+    fn failed_add_cleanup_ignores_a_scratch_git_already_removed() {
+        let repo = Repo::new("failed-add-already-removed");
+        if !crate::platform::gate_path::verified_workspace_supported() {
+            return;
+        }
+        let scratch = ScratchDirectory::create("tg-drivermerge-").unwrap();
+        let path = scratch.path().to_path_buf();
+        std::fs::remove_dir(&path).unwrap();
+
+        cleanup_failed_scratch_add(&repo.dir, scratch);
+
+        assert!(!path.exists());
+        assert!(
+            !gate_runner::poisoned_gate_workspaces()
+                .iter()
+                .any(|(workspace, _)| workspace == &path)
+        );
+    }
+
+    #[test]
+    fn failed_add_cleanup_removes_partial_directory_without_gitfile() {
+        let repo = Repo::new("failed-add-partial");
+        if !crate::platform::gate_path::verified_workspace_supported() {
+            return;
+        }
+        let scratch = ScratchDirectory::create("tg-drivermerge-").unwrap();
+        let path = scratch.path().to_path_buf();
+        std::fs::write(path.join("partial"), "partial").unwrap();
+
+        cleanup_failed_scratch_add(&repo.dir, scratch);
+
+        assert!(!path.exists(), "partial scratch directory must be removed");
+        assert!(scratch_registrations(&repo).is_empty());
+    }
+
+    #[test]
+    fn gate_phase_and_error_class_wire_names_are_distinct_snake_case() {
+        let phases =
+            [GatePhase::Preparation, GatePhase::Setup, GatePhase::Gate].map(GatePhase::as_str);
+        assert_eq!(phases, ["preparation", "setup", "gate"]);
+        let classes = [
+            GateErrorClass::Timeout,
+            GateErrorClass::Spawn,
+            GateErrorClass::Killed,
+            GateErrorClass::SetupFailed,
+            GateErrorClass::Capture,
+            GateErrorClass::Poisoned,
+            GateErrorClass::Preparation,
+            GateErrorClass::Signing,
+            GateErrorClass::SourceMoved,
+        ]
+        .map(GateErrorClass::as_str);
+        assert_eq!(
+            classes,
+            [
+                "timeout",
+                "spawn",
+                "killed",
+                "setup_failed",
+                "capture",
+                "poisoned",
+                "preparation",
+                "signing",
+                "source_moved",
+            ]
         );
     }
 }

@@ -5,7 +5,7 @@
 //! headers do not, so the live `ui.cursor` walks only actionable rows and the
 //! Enter handler can index the same `work::sort_rows` order.
 
-use thegn_core::pipeline_report::display_cell;
+use thegn_core::pipeline_report::{display_cell, display_clip};
 use thegn_core::work::{WorkGroup, WorkKind, WorkRow};
 
 use crate::seg::{Line, seg, sp};
@@ -73,15 +73,6 @@ fn kind_hue(kind: WorkKind) -> crate::seg::Tok {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    let s = display_cell(s);
-    if s.chars().count() <= max {
-        return s;
-    }
-    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{}…", cut.trim_end())
-}
-
 /// The feed in display order — the single source of truth shared by the
 /// renderer and the Enter handler so cursor indices line up.
 pub fn ordered_rows(panel: &crate::panel::PanelData) -> Vec<WorkRow> {
@@ -147,7 +138,7 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         };
         let prefix_len =
             2 + link_mark.len() + repo_part.chars().count() + number.chars().count() + 1;
-        let title = truncate(&row.title, cols.saturating_sub(prefix_len));
+        let title = display_clip(&row.title, cols.saturating_sub(prefix_len));
 
         let mut segs = vec![seg(kind_hue(row.kind), sigil), seg(g(), " ".to_string())];
         if !link_mark.is_empty() {
@@ -166,7 +157,7 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         if ctx.deep() && !row.url.is_empty() {
             out.push(PanelRow::plain(Line::segs(vec![
                 sp(2),
-                seg(f(), truncate(&row.url, cols.saturating_sub(2))),
+                seg(f(), display_clip(&row.url, cols.saturating_sub(2))),
             ])));
         }
     }
@@ -195,7 +186,7 @@ fn push_note(out: &mut Vec<PanelRow>, ctx: &SectionCtx) {
     }
     out.push(PanelRow::plain(Line::segs(vec![
         seg(hue(thegn_core::theme::Hue::Amber), "⚠ ".to_string()),
-        seg(g2(), truncate(note, ctx.cols.saturating_sub(2))),
+        seg(g2(), display_clip(note, ctx.cols.saturating_sub(2))),
     ])));
 }
 
@@ -272,7 +263,7 @@ mod spec {
 
     #[test]
     fn truncate_replaces_terminal_and_format_controls_before_cutting() {
-        let rendered = truncate("ok\r\nforged\u{202e}\u{200b}", 40);
+        let rendered = display_clip("ok\r\nforged\u{202e}\u{200b}", 40);
         assert!(
             !rendered
                 .chars()

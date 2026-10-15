@@ -191,7 +191,7 @@ fn host_discovery_probes(cfg: &Config) -> Vec<ProbeReport> {
 }
 
 fn ci_probes(cfg: &Config) -> Vec<ProbeReport> {
-    use crate::ci::{client_for_system, system_for_kind};
+    use crate::ci::{client_for_system_with_config, gitlab_credential_note, system_for_kind};
     use thegn_core::config::CiProviderKind;
     let kind = cfg.ci.provider;
     if kind.is_reserved() {
@@ -203,9 +203,12 @@ fn ci_probes(cfg: &Config) -> Vec<ProbeReport> {
         }
         CiProviderKind::Auto => vec![
             ProbeReport::new("ci", "auto", Availability::Ready)
-                .note("resolved per worktree from the origin host / CI files"),
+                .note("resolved per worktree from the origin host / CI files")
+                .note(format!("gitlab {}", gitlab_credential_note(&cfg.ci))),
         ],
-        explicit => match system_for_kind(explicit).and_then(client_for_system) {
+        explicit => match system_for_kind(explicit)
+            .and_then(|system| client_for_system_with_config(system, &cfg.ci))
+        {
             Some(c) => vec![c.probe()],
             None => vec![ProbeReport::new(
                 "ci",
@@ -824,5 +827,34 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn explicit_gitlab_ci_probe_sees_the_configured_token() {
+        let mut cfg = Config::default();
+        cfg.ci.provider = thegn_core::config::CiProviderKind::Gitlab;
+        assert!(std::env::var_os("THE541_SURELY_UNSET_VAR").is_none());
+        cfg.ci.gitlab.token = "env:THE541_SURELY_UNSET_VAR".into();
+        let reports = ci_probes(&cfg);
+        let ci = &reports[0];
+        assert!(matches!(
+            &ci.availability,
+            Availability::Unavailable(reason) if reason.contains("[ci.gitlab] token")
+        ));
+
+        cfg.ci.provider = thegn_core::config::CiProviderKind::Auto;
+        cfg.ci.gitlab.token = "fixture-secret-token".into();
+        let reports = ci_probes(&cfg);
+        let auto = &reports[0];
+        assert!(
+            auto.notes
+                .iter()
+                .any(|note| note.contains("gitlab credential:") && note.contains("resolved"))
+        );
+        assert!(
+            auto.notes
+                .iter()
+                .all(|note| !note.contains("fixture-secret-token"))
+        );
     }
 }

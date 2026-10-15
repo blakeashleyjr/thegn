@@ -24,7 +24,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::chrome::FrameModel;
 use crate::plugin_damage::PluginDamage;
-use crate::plugins::{LoadedState, PluginMsg, PluginsHost};
+use crate::plugins::{LoadedState, OneShotStart, PluginMsg, PluginsHost};
 
 const MAX_PENDING_ALERTS_PER_PLUGIN: usize = 16;
 const MAX_ALERT_MESSAGE_BYTES: usize = 1024;
@@ -229,10 +229,7 @@ fn build_entry(st: LoadedState) -> PluginEntry {
             .iter()
             .any(|c| c.extension_point == ExtensionPoint::IssueProvider)
             .then(|| {
-                thegn_svc::plugin::ProviderBridge::new(
-                    w.clone(),
-                    std::time::Duration::from_secs(st.plugin.spec.timeout_secs.max(1)),
-                )
+                thegn_svc::plugin::ProviderBridge::new(w.clone(), st.plugin.spec.run_timeout())
             })
     });
     PluginEntry {
@@ -402,9 +399,17 @@ pub(crate) fn invoke_palette_action(
             None => Some(format!("Plugin {plugin} is not running (restarting)")),
         },
         PluginMode::OneShot => {
-            host?.run_one_shot(entry.plugin.clone());
-            Some(format!("Plugin {plugin}: running {contribution}"))
+            let start = host?.run_one_shot(entry.plugin.clone());
+            Some(one_shot_status(plugin, contribution, start))
         }
+    }
+}
+
+fn one_shot_status(plugin: &str, contribution: &str, start: OneShotStart) -> String {
+    match start {
+        OneShotStart::Started => format!("Plugin {plugin}: running {contribution}"),
+        OneShotStart::Busy => format!("Plugin {plugin}: {contribution} is already running"),
+        OneShotStart::Failed => format!("Plugin {plugin}: could not start {contribution}"),
     }
 }
 
@@ -528,9 +533,7 @@ pub(crate) fn drain(
                         {
                             entry.bridge = Some(thegn_svc::plugin::ProviderBridge::new(
                                 w.clone(),
-                                std::time::Duration::from_secs(
-                                    entry.plugin.spec.timeout_secs.max(1),
-                                ),
+                                entry.plugin.spec.run_timeout(),
                             ));
                         }
                         entry.writer = Some(w);
@@ -1897,6 +1900,14 @@ mod tests {
 
     #[test]
     fn palette_actions_list_and_route_to_their_owner() {
+        assert_eq!(
+            one_shot_status("one-shot", "one-shot.hello", OneShotStart::Busy),
+            "Plugin one-shot: one-shot.hello is already running"
+        );
+        assert_eq!(
+            one_shot_status("one-shot", "one-shot.hello", OneShotStart::Failed),
+            "Plugin one-shot: could not start one-shot.hello"
+        );
         let mut state = state_with(vec![spec(
             "acts",
             vec![contribution(

@@ -585,6 +585,8 @@ fn gate_and_unreachable_errors_never_become_conflict_paths() {
             Ok(AttemptOutcome::GateError {
                 reason: "tool unavailable".into(),
                 log: "gate log".into(),
+                phase: integrate::GatePhase::Gate,
+                class: integrate::GateErrorClass::Spawn,
             }),
             "gate_error",
             "tool unavailable",
@@ -1362,6 +1364,8 @@ fn gate_error_never_admits_agent_and_next_item_still_reaches_ready() {
                     AttemptOutcome::GateError {
                         reason: "private setup exit 23".into(),
                         log: "private setup diagnostic".into(),
+                        phase: integrate::GatePhase::Setup,
+                        class: integrate::GateErrorClass::SetupFailed,
                     }
                 } else {
                     AttemptOutcome::Ready {

@@ -536,6 +536,13 @@ done
             ..Default::default()
         };
         assert!(backend.validate_issue(wrong_provider.clone()).is_err());
+        let foreign_provider_id = thegn_core::issue::Issue {
+            id: "linear:ABC-1".into(),
+            number: "ABC-1".into(),
+            provider: "linear".into(),
+            ..Default::default()
+        };
+        assert!(backend.validate_issue(foreign_provider_id).is_err());
         wrong_provider.id = "plugin:demo:7".into();
         wrong_provider.provider = "plugin:demo".into();
         wrong_provider.project_ids = vec!["bad\nproject".into()];

@@ -107,6 +107,23 @@ impl PtyProcessOwner {
         state.complete = true;
         code
     }
+
+    /// Run the bounded, blocking process-tree teardown away from a Tokio
+    /// worker. The cloned owner preserves serialization with the PTY reader.
+    pub(crate) async fn terminate_and_reap_off_runtime(&self) -> Option<i32> {
+        let owner = self.clone();
+        match tokio::task::spawn_blocking(move || owner.terminate_and_reap()).await {
+            Ok(code) => code,
+            Err(error) => {
+                tracing::warn!(
+                    target: "thegn::daemon",
+                    %error,
+                    "PTY termination/reap task failed"
+                );
+                None
+            }
+        }
+    }
 }
 
 impl Drop for PtyProcessState {

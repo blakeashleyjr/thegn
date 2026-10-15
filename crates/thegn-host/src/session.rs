@@ -7,6 +7,7 @@
 //! thin shell over `thegn_core::db`'s v6 `tab_groups`/`group_tabs`.
 
 use anyhow::Result;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thegn_core::db::Db;
 use thegn_core::models::{GroupTabRow, TabGroupRow};
 use thegn_core::store::WorkspaceStore;
@@ -220,7 +221,7 @@ impl Tab {
 
 /// One worktree in the session: what the sidebar lists and what the tabbar
 /// scopes to. Owns its tabs; always has at least one.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct WorktreeGroup {
     /// Display name, e.g. "app/feat" — unique within the session.
     pub name: String,
@@ -229,6 +230,27 @@ pub struct WorktreeGroup {
     pub path: String,
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
+    /// Process-local identity of this live group: assigned once when the group is created or
+    /// resurrected, copied by clones of the same group, never persisted; stale off-loop results
+    /// compare it to tell a replacement group at the same path from the sampled one.
+    pub epoch: u64,
+}
+
+impl PartialEq for WorktreeGroup {
+    fn eq(&self, other: &Self) -> bool {
+        // Epoch is runtime identity; layout equality intentionally ignores it.
+        self.name == other.name
+            && self.kind == other.kind
+            && self.path == other.path
+            && self.tabs == other.tabs
+            && self.active_tab == other.active_tab
+    }
+}
+
+static NEXT_GROUP_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_group_epoch() -> u64 {
+    NEXT_GROUP_EPOCH.fetch_add(1, Ordering::Relaxed)
 }
 
 impl WorktreeGroup {
@@ -239,6 +261,7 @@ impl WorktreeGroup {
             path: path.into(),
             tabs: vec![Tab::new("1")],
             active_tab: 0,
+            epoch: next_group_epoch(),
         }
     }
 
@@ -251,6 +274,7 @@ impl WorktreeGroup {
             path: String::new(),
             tabs: vec![Tab::new("main")],
             active_tab: 0,
+            epoch: next_group_epoch(),
         }
     }
 
@@ -328,6 +352,7 @@ fn adopt_registered_worktrees(
     cfg: &thegn_core::config::Config,
     session: &str,
     slug: &str,
+    registry_rows: Option<&[thegn_core::models::WorktreeRow]>,
     worktrees: &mut Vec<WorktreeGroup>,
 ) -> std::collections::HashMap<String, i64> {
     // The registry is the order authority: capture each worktree's persistent
@@ -335,8 +360,8 @@ fn adopt_registered_worktrees(
     let mut positions: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut ambient_cache: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    if let Ok(wts) = db.worktrees() {
-        for wt in &wts {
+    if let Some(wts) = registry_rows {
+        for wt in wts {
             positions.insert(wt.worktree.clone(), wt.position);
         }
         for wt in wts {
@@ -389,6 +414,17 @@ fn adopt_registered_worktrees(
     positions
 }
 
+fn registered_group_paths(
+    registry_rows: &[thegn_core::models::WorktreeRow],
+    session: &str,
+) -> std::collections::HashSet<String> {
+    registry_rows
+        .iter()
+        .filter(|wt| wt.session_name == session || wt.repo_root == session)
+        .map(|wt| wt.worktree.clone())
+        .collect()
+}
+
 impl Session {
     /// Rebuild the session from the DB (cold-start resurrect). Groups come back
     /// in persisted order; the active group is restored from `session_state`.
@@ -435,6 +471,7 @@ impl Session {
                     path: g.worktree.clone(),
                     tabs,
                     active_tab,
+                    epoch: next_group_epoch(),
                 }
             })
             .collect();
@@ -448,9 +485,24 @@ impl Session {
             .then(|| thegn_core::repo::repo_slug_with(db, session_path));
         let slug = canonical.clone().unwrap_or_else(|| session.to_string());
 
+        let registry_rows = match db.worktrees() {
+            Ok(rows) => Some(rows),
+            Err(error) => {
+                tracing::debug!(%error, session, "worktree registry read failed during session resurrect");
+                None
+            }
+        };
+
         // Also adopt worktrees recorded for this session that aren't in
         // tab_groups yet (state from sessions that predate layout persistence).
-        let positions = adopt_registered_worktrees(db, cfg, session, &slug, &mut worktrees);
+        let positions = adopt_registered_worktrees(
+            db,
+            cfg,
+            session,
+            &slug,
+            registry_rows.as_deref(),
+            &mut worktrees,
+        );
 
         // Home groups persisted by older binaries carry the raw dir basename
         // (`WASHU/home`) instead of the canonical slug (`washu/home`) — rename
@@ -476,6 +528,41 @@ impl Session {
                         g.name = target;
                     }
                 }
+            }
+
+            // A path-keyed session owns only groups under its canonical slug.
+            // Older layouts could retain groups from a workspace that was
+            // removed elsewhere; they then leak into the sidebar as live
+            // fallback workspaces. Keep legacy raw-basename prefixes when
+            // they normalize to this slug, and keep registered worktrees even
+            // if their tab name has an older prefix.
+            if let Some(registry_rows) = registry_rows.as_deref() {
+                let registered_paths = registered_group_paths(registry_rows, session);
+                let mut orphaned_sids = Vec::new();
+                worktrees.retain(|g| {
+                    if matches!(g.kind, GroupKind::Terminal | GroupKind::Home) {
+                        return true;
+                    }
+                    let Some((prefix, _)) = crate::sidebar::split_tab(&g.name) else {
+                        return true;
+                    };
+                    let keep = thegn_core::util::slugify(&prefix) == *slug
+                        || registered_paths.contains(&g.path);
+                    if !keep {
+                        tracing::warn!(group = %g.name, session, "pruned foreign workspace tab group during resurrect");
+                        orphaned_sids.extend(g.tabs.iter().flat_map(|tab| {
+                            tab.pane_sessions
+                                .values()
+                                .filter(|provider| provider.provider == "daemon")
+                                .map(|provider| provider.session.clone())
+                        }));
+                    }
+                    keep
+                });
+                crate::handlers::daemon_lifecycle::kill_orphaned_daemon_sessions(
+                    cfg.daemon.clone(),
+                    orphaned_sids,
+                );
             }
         }
 
@@ -676,6 +763,7 @@ impl Session {
                     kind: g.kind,
                     path: g.path.clone(),
                     active_tab: g.active_tab,
+                    epoch: g.epoch,
                     tabs: g
                         .tabs
                         .iter()
@@ -778,7 +866,21 @@ impl Session {
         }
         let slug = thegn_core::repo::repo_slug_with(db, path);
         let before = self.worktrees.len();
-        adopt_registered_worktrees(db, cfg, &id, &slug, &mut self.worktrees);
+        let registry_rows = match db.worktrees() {
+            Ok(rows) => Some(rows),
+            Err(error) => {
+                tracing::debug!(%error, session = %id, "worktree registry read failed during warm adoption");
+                None
+            }
+        };
+        adopt_registered_worktrees(
+            db,
+            cfg,
+            &id,
+            &slug,
+            registry_rows.as_deref(),
+            &mut self.worktrees,
+        );
         self.worktrees.len() - before
     }
 
@@ -1531,6 +1633,99 @@ mod tests {
     }
 
     #[test]
+    fn resurrect_drops_foreign_workspace_groups_and_keeps_legacy_home_and_terminals() {
+        let db = temp_db();
+        let repo = "/r/WASHU";
+        let legacy = Session {
+            id: repo.into(),
+            worktrees: vec![
+                WorktreeGroup::new("WASHU/home", GroupKind::Home, repo),
+                WorktreeGroup::new("lib/feat", GroupKind::Branch, "/wt/lib-feat"),
+                WorktreeGroup::new("terminals/ops", GroupKind::Terminal, ""),
+            ],
+            active: 0,
+        };
+        legacy.persist(&db, repo, 1).unwrap();
+
+        let loaded = Session::resurrect(&db, repo).unwrap();
+        let names: Vec<_> = loaded.worktrees.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            names.contains(&"washu/home"),
+            "legacy home prefix is renamed"
+        );
+        assert!(
+            names.contains(&"terminals/ops"),
+            "terminal group is preserved"
+        );
+        assert!(!names.contains(&"lib/feat"), "foreign group is pruned");
+
+        loaded.persist(&db, repo, 2).unwrap();
+        let round_trip = Session::resurrect(&db, repo).unwrap();
+        assert!(
+            round_trip.worktrees.iter().all(|g| g.name != "lib/feat"),
+            "persist after pruning must not restore the foreign group"
+        );
+    }
+
+    #[test]
+    fn resurrect_keeps_registered_old_prefix_and_slugified_legacy_branch() {
+        let db = temp_db();
+        let repo = "/r/WASHU";
+        let wt = temp_worktree_dir("legacy-prefix-session-match");
+        db.put_worktree("old/feat", repo, &wt, "feat", None, None)
+            .unwrap();
+        let session = Session {
+            id: repo.into(),
+            worktrees: vec![
+                WorktreeGroup::new("app/home", GroupKind::Home, repo),
+                WorktreeGroup::new("old/feat", GroupKind::Branch, &wt),
+                WorktreeGroup::new("WASHU/feat", GroupKind::Branch, "/wt/washu-feat"),
+            ],
+            active: 0,
+        };
+        session.persist(&db, repo, 1).unwrap();
+
+        let loaded = Session::resurrect(&db, repo).unwrap();
+        let names: Vec<_> = loaded
+            .worktrees
+            .iter()
+            .map(|group| group.name.as_str())
+            .collect();
+
+        assert!(
+            names.contains(&"old/feat"),
+            "registered path is retained despite its old tab prefix"
+        );
+        assert!(
+            names.contains(&"WASHU/feat"),
+            "legacy branch prefix that slugifies to the canonical slug is retained"
+        );
+    }
+
+    #[test]
+    fn registered_path_match_accepts_session_name_with_a_different_repo_root() {
+        let row = thegn_core::models::WorktreeRow {
+            worktree: "/wt/old-feat".into(),
+            branch: "feat".into(),
+            agent: String::new(),
+            created_at: 0,
+            repo_root: "/different/repo/root".into(),
+            tab_name: "old/feat".into(),
+            session_name: "/r/WASHU".into(),
+            location: String::new(),
+            position: 0,
+            sandbox_backend: None,
+            observed_backend: None,
+            folder_id: None,
+            env_name: None,
+        };
+
+        let paths = registered_group_paths(&[row], "/r/WASHU");
+
+        assert!(paths.contains("/wt/old-feat"));
+    }
+
+    #[test]
     fn resurrect_skips_home_rename_that_would_collide() {
         let db = temp_db();
         let repo = "/r/WASHU";
@@ -1851,5 +2046,21 @@ mod tests {
             assert_eq!(n, 0, "session id {id:?} adopts nothing");
             assert!(s.worktrees.is_empty());
         }
+    }
+
+    #[test]
+    fn epoch_is_unique_per_group_and_ignored_by_equality() {
+        let first = WorktreeGroup::new("app/feat", GroupKind::Branch, "/wt/feat");
+        let second = WorktreeGroup::new("app/feat", GroupKind::Branch, "/wt/feat");
+        assert_ne!(first.epoch, second.epoch);
+        assert_eq!(first, second);
+
+        let session = Session {
+            id: "s".into(),
+            worktrees: vec![first.clone()],
+            active: 0,
+        };
+        let hydrated = session.clone_for_hydrate();
+        assert_eq!(hydrated.worktrees[0].epoch, first.epoch);
     }
 }
