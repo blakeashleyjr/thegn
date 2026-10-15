@@ -728,7 +728,7 @@ pub fn section_rows(
     {
         return super::gitui::display_map(&ui.git, view, &model.panel).len();
     }
-    if ui.width == crate::layout::PanelWidth::Full
+    if (ui.width == crate::layout::PanelWidth::Full || section == crate::panel::Section::Files)
         && let Some(count) = sections::list_len(
             section,
             &section_ctx(model, ui, cols, rows.saturating_sub(1), 4),
@@ -1293,5 +1293,51 @@ mod tests {
             .find(|row| row.hit == Some(PanelHit::OpenSection(Section::Symbols)))
             .expect("Symbols accordion header is rendered");
         assert!(text_of(&symbols.line).starts_with("  symbols"));
+    }
+
+    #[test]
+    fn files_row_count_matches_render_without_rendering() {
+        let paths = vec![
+            "src/match.rs".to_string(),
+            "src/other.rs".to_string(),
+            "docs/readme.md".to_string(),
+        ];
+        let tree = crate::panel::build_file_tree(&paths);
+        let collapsed = std::collections::HashSet::from(["docs".to_string()]);
+        let expected = crate::panel::file_tree_visible_filtered(&tree, &collapsed, "match").len();
+        let model = model_with(PanelData {
+            file_tree: tree.clone(),
+            ..Default::default()
+        });
+        for width in [
+            crate::layout::PanelWidth::Normal,
+            crate::layout::PanelWidth::Half,
+            crate::layout::PanelWidth::Full,
+        ] {
+            let ui = PanelUi {
+                open: Section::Files,
+                width,
+                files_collapsed: collapsed.clone(),
+                files_filter: "match".into(),
+                ..Default::default()
+            };
+            let ctx = section_ctx(&model, &ui, 100, 30, 4);
+            assert_eq!(sections::list_len(Section::Files, &ctx), Some(expected));
+            let rendered_hits = sections::content(Section::Files, &ctx)
+                .iter()
+                .filter(|row| matches!(row.hit, Some(PanelHit::Row(Section::Files, _))))
+                .count();
+            assert_eq!(section_rows(Section::Files, &model, &ui, 100, 30), expected);
+            assert_eq!(rendered_hits, expected);
+        }
+        let preview_ui = PanelUi {
+            open: Section::Files,
+            file_preview: Some(crate::panel::FilePreview::loading("src/match.rs")),
+            ..Default::default()
+        };
+        assert_eq!(
+            section_rows(Section::Files, &model, &preview_ui, 100, 30),
+            0
+        );
     }
 }

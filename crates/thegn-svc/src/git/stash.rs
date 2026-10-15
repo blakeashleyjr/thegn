@@ -70,12 +70,8 @@ pub trait StashOps: GitBackend {
 
     /// A stash's patch. `-u` includes the untracked third-parent tree that
     /// plain `stash show -p` silently omits.
-    fn stash_show(&self, loc: &GitLoc, index: usize) -> Result<String> {
-        run_w(
-            loc,
-            &[],
-            &["stash", "show", "-p", "-u", "--no-color", &at(index)],
-        )
+    fn stash_show(&self, loc: &GitLoc, rev: &str) -> Result<String> {
+        run_w(loc, &[], &["stash", "show", "-p", "-u", "--no-color", rev])
     }
 }
 
@@ -234,11 +230,28 @@ mod tests {
         let loc = repo.loc();
         CliGit.stash_push(&loc, "with untracked", true).unwrap();
 
-        let patch = CliGit.stash_show(&loc, 0).unwrap();
+        let patch = CliGit.stash_show(&loc, "stash@{0}").unwrap();
         assert!(patch.contains("f.txt"), "{patch}");
         assert!(
             patch.contains("brand-new.txt") && patch.contains("+fresh"),
             "-u must surface the untracked third parent: {patch}"
         );
+    }
+
+    #[test]
+    fn stash_show_by_sha_survives_index_shift() {
+        let repo = TestRepo::new("st-sha");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "base\n", "c0");
+        std::fs::write(repo.dir.join("f.txt"), "stash A\n").unwrap();
+        let loc = repo.loc();
+        CliGit.stash_push(&loc, "stash A", false).unwrap();
+        let sha_a = repo.out(&["rev-parse", "stash@{0}"]).trim().to_string();
+        std::fs::write(repo.dir.join("f.txt"), "stash B\n").unwrap();
+        CliGit.stash_push(&loc, "stash B", false).unwrap();
+
+        let patch = CliGit.stash_show(&loc, &sha_a).unwrap();
+        assert!(patch.contains("stash A"), "{patch}");
+        assert!(!patch.contains("stash B"), "{patch}");
     }
 }
