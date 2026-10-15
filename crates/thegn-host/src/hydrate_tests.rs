@@ -1215,7 +1215,7 @@ fn devcontainer_status_ignores_repo_host_environment_that_weakens_backend() {
 
     let (_, resolved) = cfg.resolve_env_with(
         repo.path(),
-        &thegn_core::placement::GitLoc::Local(repo.path().to_path_buf()),
+        &thegn_core::remote::GitLoc::Local(repo.path().to_path_buf()),
         repo.path(),
         None,
         &thegn_core::config_resolve::Approvals::deny_all(),
