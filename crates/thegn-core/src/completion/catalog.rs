@@ -642,6 +642,7 @@ pub const CATALOG: &[Slot] = &[
     slot("theme import", "file", SourceKind::Structural),
     slot("pr merge", "method", SourceKind::Structural),
     slot("pr review", "state", SourceKind::Structural),
+    slot("pr queue rebind", "worktree", SourceKind::Structural),
     // --- reserved ----------------------------------------------------------
     slot("ci runs", "branch", SourceKind::Reserved(Reserved::Branch)),
     slot("diff", "base", SourceKind::Reserved(Reserved::Branch)),
