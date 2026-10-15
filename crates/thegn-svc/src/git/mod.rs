@@ -1231,6 +1231,7 @@ pub fn typed_totals(entries: Result<&[DiffEntry]>) -> (DiffCount, DiffCount) {
 /// saturate at `u32::MAX`, exactly like the native backend, so the result never
 /// depends on the build profile or backend. Shared by the batched
 /// [`GitBackend::glyph_reads`] sidebar diff-stat reads.
+#[cfg(test)]
 pub(crate) fn sum_numstat(out: &str) -> Result<(u32, u32)> {
     let entries = parse_numstat(out)?;
     Ok(sum_entries(&entries))
@@ -1243,6 +1244,7 @@ pub(crate) fn typed_numstat(out: &str) -> Result<(DiffCount, DiffCount)> {
 }
 
 /// Saturating `(added, deleted)` totals of per-file rows (shared by both backends).
+#[cfg(test)]
 pub(crate) fn sum_entries(entries: &[DiffEntry]) -> (u32, u32) {
     entries.iter().fold((0u32, 0u32), |(a, d), e| {
         (a.saturating_add(e.added), d.saturating_add(e.deleted))
@@ -4088,6 +4090,18 @@ mod tests {
         assert_eq!(
             patch_paths, listed,
             "per-file diff paths must agree with first-parent file list"
+        );
+    }
+    #[test]
+    fn typed_numstat_keeps_binary_and_capped() {
+        assert_eq!(
+            typed_numstat("-\t-\timage.png\n").unwrap(),
+            (DiffCount::Binary, DiffCount::Binary)
+        );
+        let out = format!("{}\t0\ta\n1\t0\tb\n", u32::MAX);
+        assert_eq!(
+            typed_numstat(&out).unwrap(),
+            (DiffCount::Capped, DiffCount::Exact(0))
         );
     }
 }

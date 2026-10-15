@@ -747,7 +747,7 @@ pub(crate) fn compose_detail_line(
             }
             segs.push(seg(Tok::Hue(theme::Hue::Green), format!("+{n}")));
             shown = true;
-        } else if crate::glyph_types::sidebar_count_label(add) == Some("capped") {
+        } else if matches!(add, DiffCount::Capped) {
             if shown {
                 segs.push(sp(1));
             }
@@ -762,7 +762,7 @@ pub(crate) fn compose_detail_line(
             }
             segs.push(seg(Tok::Hue(theme::Hue::Red), format!("-{n}")));
             shown = true;
-        } else if crate::glyph_types::sidebar_count_label(del) == Some("capped") {
+        } else if matches!(del, DiffCount::Capped) {
             if shown {
                 segs.push(sp(1));
             }
@@ -4877,5 +4877,23 @@ mod tests {
             )),
             "the flat layout has nowhere to nest a lane"
         );
+    }
+
+    #[test]
+    fn detail_line_shows_binary_only_branch_diff() {
+        use thegn_svc::git::DiffCount;
+
+        let mut row = SidebarRow::base(RowKind::Worktree, 1, "feat", "app");
+        row.git = Some(GitGlyphs {
+            branch_diff: Some((DiffCount::Binary, DiffCount::Binary)),
+            ..GitGlyphs::default()
+        });
+        let line = compose_detail_line(&row, &crate::sidebar_view::SidebarDisplay::default())
+            .expect("default detail display shows branch stats");
+        let crate::seg::Line::Segs(segs) = line else {
+            panic!("detail line is composed from segments")
+        };
+        let text = segs.into_iter().map(|seg| seg.text).collect::<String>();
+        assert!(text.contains("bin"), "{text:?}");
     }
 }

@@ -206,12 +206,64 @@ impl<'de> Deserialize<'de> for GlyphRow {
     }
 }
 
-/// Sidebar wording for non-exact diff observations. Exact counts remain numeric
-/// at the render sites; unavailable values are not persisted as fresh rows.
-pub(crate) fn sidebar_count_label(count: DiffCount) -> Option<&'static str> {
-    match count {
-        DiffCount::Binary => Some("bin"),
-        DiffCount::Capped => Some("capped"),
-        DiffCount::Exact(_) | DiffCount::Unavailable => None,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(add: DiffCount, del: DiffCount) -> GlyphRow {
+        GlyphRow {
+            dirty: true,
+            ahead: 1,
+            behind: 2,
+            branch: Some("feat".into()),
+            repo_root: "/repo".into(),
+            add,
+            del,
+            branch_diff: Some((DiffCount::Binary, DiffCount::Capped)),
+            submodule_dirty: false,
+        }
+    }
+
+    #[test]
+    fn typed_counts_round_trip_and_legacy_records_still_parse() {
+        let typed = row(DiffCount::Binary, DiffCount::Capped);
+        let encoded = serde_json::to_value(&typed).unwrap();
+        assert_eq!(encoded["add"], "binary");
+        assert_eq!(encoded["del"], "capped");
+        assert_eq!(serde_json::from_value::<GlyphRow>(encoded).unwrap(), typed);
+
+        let exact_row = row(DiffCount::Exact(42), DiffCount::Exact(7));
+        let exact_json = serde_json::to_string(&exact_row).unwrap();
+        assert!(exact_json.contains("\"add\":42"), "{exact_json}");
+        let exact = serde_json::to_value(exact_row).unwrap();
+        assert_eq!(exact["add"], 42);
+        assert_eq!(
+            serde_json::from_value::<GlyphRow>(exact).unwrap().add,
+            DiffCount::Exact(42)
+        );
+
+        let legacy: GlyphRow =
+            serde_json::from_str(r#"[true,1,2,"feat","/repo",42,7,[310,84]]"#).unwrap();
+        assert_eq!(legacy.add, DiffCount::Exact(42));
+        assert_eq!(
+            legacy.branch_diff,
+            Some((DiffCount::Exact(310), DiffCount::Exact(84)))
+        );
+
+        let old_named: GlyphRow = serde_json::from_str(
+            r#"{"dirty":true,"ahead":1,"behind":2,"branch":"feat","repo_root":"/repo","add":42,"del":7,"branch_diff":[310,84]}"#,
+        )
+        .unwrap();
+        assert_eq!(old_named.add, DiffCount::Exact(42));
+        assert_eq!(old_named.del, DiffCount::Exact(7));
+    }
+
+    #[test]
+    fn bogus_named_count_is_rejected() {
+        let error = serde_json::from_str::<GlyphRow>(
+            r#"{"dirty":true,"ahead":0,"behind":0,"branch":null,"repo_root":"/repo","add":"bogus","del":0,"branch_diff":null}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown diff count"));
     }
 }

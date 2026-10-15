@@ -421,8 +421,14 @@ fn glyph_scan_clean_read_updates() {
         Ok(Some((4, 1))),
         Ok(Some("feat".into())),
         "/repo".into(),
-        Ok((42, 7)),
-        Ok(Some((310, 84))),
+        Ok((
+            thegn_svc::git::DiffCount::Exact(42),
+            thegn_svc::git::DiffCount::Exact(7),
+        )),
+        Ok(Some((
+            thegn_svc::git::DiffCount::Exact(310),
+            thegn_svc::git::DiffCount::Exact(84),
+        ))),
         Ok(false),
     );
     assert_eq!(
@@ -444,7 +450,10 @@ fn glyph_scan_no_upstream_is_zero_not_error() {
         Ok(None),
         Ok(Some("feat".into())),
         "/repo".into(),
-        Ok((0, 0)),
+        Ok((
+            thegn_svc::git::DiffCount::Exact(0),
+            thegn_svc::git::DiffCount::Exact(0),
+        )),
         Ok(None),
         Ok(false),
     );
@@ -484,7 +493,10 @@ fn glyph_scan_partial_error_keeps_only_failed_field() {
         Err(()),
         Ok(Some("feat".into())),
         "/repo".into(),
-        Ok((5, 2)),
+        Ok((
+            thegn_svc::git::DiffCount::Exact(5),
+            thegn_svc::git::DiffCount::Exact(2),
+        )),
         Err(()),
         Err(()),
     );
@@ -2456,5 +2468,36 @@ fn branch_list_load_distinguishes_cache_fetch_failure_backoff_and_pending() {
     assert_eq!(
         branch_list_load(false, None, false, false),
         DocLoad::Pending
+    );
+}
+
+#[test]
+fn glyph_scan_preserves_binary_diff_counts() {
+    let (row, clean) = merge_glyph_scan(
+        None,
+        Ok(true),
+        Ok(None),
+        Ok(Some("feat".into())),
+        "/repo".into(),
+        Ok((
+            thegn_svc::git::DiffCount::Binary,
+            thegn_svc::git::DiffCount::Binary,
+        )),
+        Ok(Some((
+            thegn_svc::git::DiffCount::Binary,
+            thegn_svc::git::DiffCount::Binary,
+        ))),
+        Ok(false),
+    );
+
+    assert!(clean);
+    assert_eq!(row.add, thegn_svc::git::DiffCount::Binary);
+    assert_eq!(row.del, thegn_svc::git::DiffCount::Binary);
+    assert_eq!(
+        row.branch_diff,
+        Some((
+            thegn_svc::git::DiffCount::Binary,
+            thegn_svc::git::DiffCount::Binary
+        ))
     );
 }
