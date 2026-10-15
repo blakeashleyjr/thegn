@@ -2184,7 +2184,7 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
 /// numbered section rows with the open section's content), rendered
 /// row-by-row through the seg layer. `build_panel` is the single source of
 /// truth for placement; mouse hit-testing reuses the same pass via
-/// [`panel_hits`], so paint and clicks can never drift apart.
+/// [`panel_hit_at`], so paint and clicks can never drift apart.
 pub fn draw_panel(
     surface: &mut Surface,
     rect: Rect,
@@ -2347,9 +2347,9 @@ pub fn panel_hit_at(
 }
 
 /// Resolve a click against the Full view's slim rail (`1 changes · 2 git · …`).
-/// `panel_hits` is row-granular and the rail packs several sections onto one
-/// row, so the Full view needs this x+y test. Returns the section whose
-/// `N label` span the click landed in, if any.
+/// `panel_hit_at` resolves rows with `col_hits` by x, while the rail packs
+/// several sections onto one row, so the Full view needs this x+y test.
+/// Returns the section whose `N label` span the click landed in, if any.
 pub fn panel_rail_hit(
     model: &FrameModel,
     ui: &crate::panel::PanelUi,
