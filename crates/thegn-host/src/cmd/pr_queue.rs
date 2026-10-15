@@ -259,7 +259,9 @@ fn bind_checkout(
 }
 
 fn rm(number: u64) -> Result<()> {
-    let root = repo_root()?;
+    let root = repo_root()?
+        .canonicalize()
+        .context("canonicalize repo root")?;
     let db = Db::open()?;
     let mut matches: Vec<_> = pr_driver::rows_for_repo(&db, &root)
         .into_iter()
@@ -268,7 +270,12 @@ fn rm(number: u64) -> Result<()> {
     anyhow::ensure!(!matches.is_empty(), "PR #{number} is not in the queue");
     anyhow::ensure!(
         matches.len() == 1,
-        "PR #{number} is ambiguous; remove by identity after rebinding"
+        "PR #{number} is ambiguous; matching queue keys: {}",
+        matches
+            .iter()
+            .map(|row| row.key.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     let key = matches.remove(0).key;
     db.remove_pr_entry(&key)?;
@@ -281,24 +288,7 @@ fn rebind(number: u64, worktree: Option<String>, no_worktree: bool) -> Result<()
         .canonicalize()
         .context("canonicalize repo root")?;
     let db = Db::open()?;
-    let matches: Vec<_> = pr_driver::rows_for_repo(&db, &root)
-        .into_iter()
-        .filter(|row| row.number == number)
-        .collect();
-    anyhow::ensure!(
-        !matches.is_empty(),
-        "PR #{number} is not in the queue; add it before rebinding"
-    );
-    anyhow::ensure!(
-        matches.len() == 1,
-        "PR #{number} has multiple queue identities: {}",
-        matches
-            .iter()
-            .map(|row| row.key.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let old = &matches[0];
+    let old = rebind_target(&pr_driver::rows_for_repo(&db, &root), number)?;
     let explicit = worktree.is_some();
     let wt_path = if no_worktree {
         None
@@ -315,9 +305,7 @@ fn rebind(number: u64, worktree: Option<String>, no_worktree: bool) -> Result<()
     let status = forge
         .pr_status(&loc, thegn_core::forge::PrRef::Number(number))
         .map_err(|error| anyhow::anyhow!("could not resolve PR #{number}: {}", error.describe()))?;
-    let wt_main = wt_path
-        .as_deref()
-        .and_then(|path| integrate::main_checkout(path));
+    let wt_main = wt_path.as_deref().and_then(integrate::main_checkout);
     let wt_branch = wt_path.as_deref().and_then(|path| {
         thegn_core::remote::GitLoc::from_db(&path.to_string_lossy(), None).git_out(&[
             "rev-parse",
@@ -360,6 +348,24 @@ fn rebind(number: u64, worktree: Option<String>, no_worktree: bool) -> Result<()
         rebound.checkout_gen
     );
     Ok(())
+}
+
+fn rebind_target(rows: &[PrQueueRow], number: u64) -> Result<&PrQueueRow> {
+    let matches: Vec<_> = rows.iter().filter(|row| row.number == number).collect();
+    anyhow::ensure!(
+        !matches.is_empty(),
+        "PR #{number} is not in the queue; add it before rebinding"
+    );
+    anyhow::ensure!(
+        matches.len() == 1,
+        "PR #{number} has multiple queue identities: {}",
+        matches
+            .iter()
+            .map(|row| row.key.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(matches[0])
 }
 
 fn clear() -> Result<()> {
@@ -492,6 +498,40 @@ fn drain_json(out: &pr_driver::PrOutcome) -> serde_json::Value {
 #[cfg(test)]
 mod bind_checkout_tests {
     use super::*;
+
+    #[test]
+    fn rebind_requires_an_existing_row_and_a_matching_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let wt = repo.canonicalize().unwrap();
+        let loc = thegn_core::remote::GitLoc::Local(wt.clone());
+        assert!(loc.git_out(&["checkout", "-b", "feat"]).is_none());
+        let branch = loc.git_out(&["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(branch.as_deref(), Some("feat"));
+        let root = integrate::main_checkout(&wt).unwrap();
+        let db = Db::open_at(&dir.path().join("queue.db")).unwrap();
+        assert!(rebind_target(&db.list_pr_queue().unwrap(), 7).is_err());
+
+        db.enqueue_pr(
+            &root.to_string_lossy(),
+            7,
+            Some(&wt.to_string_lossy()),
+            "feat",
+            "main",
+            "github",
+        )
+        .unwrap();
+        let rows = db.list_pr_queue().unwrap();
+        assert_eq!(rebind_target(&rows, 7).unwrap().number, 7);
+        assert_eq!(
+            bind_checkout(&root, &wt, true, Some(&root), branch.as_deref(), "feat")
+                .unwrap()
+                .as_deref(),
+            Some(wt.as_path())
+        );
+    }
 
     #[test]
     fn binding_requires_repo_ownership_and_matches_branch_or_is_number_only() {

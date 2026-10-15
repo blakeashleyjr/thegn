@@ -67,6 +67,7 @@ pub fn attest_pr_identity(
 /// fresh row fences any explicit rebind that happened while the read ran.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueRowSnapshot {
+    pub number: u64,
     pub key: String,
     pub pr_url: Option<String>,
     pub forge: String,
@@ -81,7 +82,10 @@ pub fn attest_queue_row(
     current: Option<&crate::db::PrQueueRow>,
 ) -> Result<(), String> {
     let Some(current) = current else {
-        return Err("queued PR row disappeared; run `thegn pr queue rebind --pr N`".to_owned());
+        return Err(format!(
+            "queued PR row disappeared; run `thegn pr queue rebind --pr {}`",
+            snapshot.number
+        ));
     };
     if current.key != snapshot.key
         || current.pr_url != snapshot.pr_url
@@ -91,9 +95,10 @@ pub fn attest_queue_row(
         || current.checkout_gen != snapshot.checkout_gen
         || matches!(current.status.as_str(), "merged" | "closed")
     {
-        return Err(
-            "queued PR identity or checkout changed; run `thegn pr queue rebind --pr N`".to_owned(),
-        );
+        return Err(format!(
+            "queued PR identity or checkout changed; run `thegn pr queue rebind --pr {}`",
+            current.number
+        ));
     }
     Ok(())
 }
@@ -1215,6 +1220,7 @@ mod tests {
             updated_at: 0,
         };
         let snapshot = QueueRowSnapshot {
+            number: row.number,
             key: row.key.clone(),
             pr_url: row.pr_url.clone(),
             forge: row.forge.clone(),

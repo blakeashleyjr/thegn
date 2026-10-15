@@ -1470,7 +1470,12 @@ pub(crate) fn migrate_v82(conn: &Connection) -> Result<()> {
                 "UPDATE pr_queue SET key=?2,forge_host=?3,project=?4 WHERE key=?1",
                 params![old_key, new_key, host, project],
             )?;
-        } else if !matches!(status.as_str(), "merged" | "closed" | "needs_human") {
+        } else if status == "needs_human" {
+            tx.execute(
+                "UPDATE pr_queue SET detail=?2 WHERE key=?1",
+                params![old_key, format!("verification required (queued before v82 identity keys); run `thegn pr queue rebind --pr {}`", number.max(0))],
+            )?;
+        } else if !matches!(status.as_str(), "merged" | "closed") {
             tx.execute("UPDATE pr_queue SET status='needs_human',blocker='needs_human',detail=?2 WHERE key=?1", params![old_key, format!("verification required (queued before v82 identity keys); run `thegn pr queue rebind --pr {}`", number.max(0))])?;
         }
     }
@@ -3857,7 +3862,9 @@ mod tests {
         conn.execute_batch("CREATE TABLE pr_queue(key TEXT PRIMARY KEY,repo_root TEXT NOT NULL,number INTEGER NOT NULL,forge TEXT,status TEXT NOT NULL,blocker TEXT,detail TEXT,pr_url TEXT);
             INSERT INTO pr_queue VALUES('r#7','r',7,'github','watching',NULL,NULL,'https://github.com/Acme/Repo/pull/7');
             INSERT INTO pr_queue VALUES('r#8','r',8,'github','watching',NULL,NULL,NULL);
-            INSERT INTO pr_queue VALUES('r#9','r',9,'github','merged',NULL,NULL,NULL);").unwrap();
+            INSERT INTO pr_queue VALUES('r#9','r',9,'github','merged',NULL,NULL,NULL);
+            INSERT INTO pr_queue VALUES('r#10','r',10,'github','needs_human',NULL,'old v80 hint',NULL);
+            INSERT INTO pr_queue VALUES('r#11','r',11,'github','watching',NULL,NULL,'https://github.com/acme/repo/pull/12');").unwrap();
         assert!(super::verify_v82_schema(&conn).is_err());
         super::migrate_v82(&conn).unwrap();
         super::migrate_v82(&conn).unwrap();
@@ -3893,5 +3900,20 @@ mod tests {
             })
             .unwrap();
         assert_eq!(settled, "merged");
+        let held_detail: String = conn
+            .query_row("SELECT detail FROM pr_queue WHERE number=10", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(held_detail.contains("thegn pr queue rebind --pr 10"));
+        let mismatch: (String, String) = conn
+            .query_row(
+                "SELECT status,detail FROM pr_queue WHERE number=11",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(mismatch.0, "needs_human");
+        assert!(mismatch.1.contains("thegn pr queue rebind --pr 11"));
     }
 }
