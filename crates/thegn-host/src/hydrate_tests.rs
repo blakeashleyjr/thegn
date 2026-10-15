@@ -602,6 +602,32 @@ fn workspace_list_with_db_lists_current_workspace_once() {
 }
 
 #[test]
+fn workspace_list_keeps_live_fallback_for_non_path_sessions() {
+    let session = Session {
+        id: "s1".into(),
+        worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "/r/app")],
+        active: 0,
+    };
+
+    let rows = workspace_list(&session, None);
+
+    assert!(rows.iter().any(|row| row.0 == "app"));
+}
+
+#[test]
+fn workspace_list_uses_home_prefix_when_db_slug_is_unavailable() {
+    let session = Session {
+        id: "/r/app".into(),
+        worktrees: vec![WorktreeGroup::new("app-2/home", GroupKind::Home, "/r/app")],
+        active: 0,
+    };
+
+    let rows = workspace_list(&session, None);
+
+    assert!(rows.iter().any(|row| row.0 == "app-2"));
+}
+
+#[test]
 fn workspace_list_is_stable_across_active_workspaces_with_foreign_groups() {
     let db = thegn_core::db::Db::open_memory().unwrap();
     db.put_workspace("/r/app", "app", "repo").unwrap();

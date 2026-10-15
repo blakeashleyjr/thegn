@@ -1237,21 +1237,23 @@ impl WorkspaceStore for Db {
 
     fn delete_tab_groups_with_prefix(&self, slug: &str) -> Result<()> {
         let prefix = format!("{slug}/");
-        self.conn().execute(
-            "DELETE FROM group_tabs
-             WHERE EXISTS (
-                 SELECT 1 FROM tab_groups
-                 WHERE tab_groups.session_name = group_tabs.session_name
-                   AND tab_groups.name = group_tabs.group_name
-                   AND substr(tab_groups.name, 1, length(?1)) = ?1
-             )",
-            [&prefix],
-        )?;
-        self.conn().execute(
-            "DELETE FROM tab_groups WHERE substr(name, 1, length(?1)) = ?1",
-            [&prefix],
-        )?;
-        Ok(())
+        self.transaction(|db| {
+            db.conn().execute(
+                "DELETE FROM group_tabs
+                 WHERE EXISTS (
+                     SELECT 1 FROM tab_groups
+                     WHERE tab_groups.session_name = group_tabs.session_name
+                       AND tab_groups.name = group_tabs.group_name
+                       AND substr(tab_groups.name, 1, length(?1)) = ?1
+                 )",
+                [&prefix],
+            )?;
+            db.conn().execute(
+                "DELETE FROM tab_groups WHERE substr(name, 1, length(?1)) = ?1",
+                [&prefix],
+            )?;
+            Ok(())
+        })
     }
 
     /// Wipe a session's whole persisted layout (groups + tabs). The host
