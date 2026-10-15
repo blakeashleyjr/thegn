@@ -150,9 +150,14 @@ fn glyph_row(
         behind,
         branch: branch.map(str::to_string),
         repo_root: repo_root.into(),
-        add,
-        del,
-        branch_diff,
+        add: thegn_svc::git::DiffCount::Exact(add),
+        del: thegn_svc::git::DiffCount::Exact(del),
+        branch_diff: branch_diff.map(|(added, deleted)| {
+            (
+                thegn_svc::git::DiffCount::Exact(added),
+                thegn_svc::git::DiffCount::Exact(deleted),
+            )
+        }),
         submodule_dirty: false,
     }
 }

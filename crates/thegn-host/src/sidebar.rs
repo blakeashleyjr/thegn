@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 
 use crate::session::Session;
+use thegn_svc::git::DiffCount;
 
 /// Which level of the tree a row sits at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,16 +111,16 @@ impl ActivityState {
 
 /// Git status summary for a worktree row (item 18). `dirty` = uncommitted
 /// changes; `ahead`/`behind` are vs the upstream (absent when no upstream);
-/// `add`/`del` are the uncommitted working-tree line stat vs HEAD; `branch_diff`
-/// is the `(added, deleted)` total vs the default branch (`None` when no base).
+/// `add`/`del` are typed uncommitted working-tree counts vs HEAD; `branch_diff`
+/// is the typed `(added, deleted)` total vs the default branch (`None` when no base).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GitGlyphs {
     pub dirty: bool,
     pub ahead: usize,
     pub behind: usize,
-    pub add: u32,
-    pub del: u32,
-    pub branch_diff: Option<(u32, u32)>,
+    pub add: DiffCount,
+    pub del: DiffCount,
+    pub branch_diff: Option<(DiffCount, DiffCount)>,
     /// A submodule gitlink is moved, dirty, untracked, conflicted, unavailable,
     /// or uninitialized. Kept separate from ordinary-file dirtiness.
     pub submodule_dirty: bool,
@@ -732,18 +733,45 @@ pub(crate) fn compose_detail_line(
     // row on the trunk (or freshly branched off it) correctly shows nothing.
     if disp.detail_branch_stat
         && let Some((add, del)) = row.git.and_then(|g| g.branch_diff)
-        && (add > 0 || del > 0)
     {
-        if add > 0 {
-            segs.push(seg(Tok::Hue(theme::Hue::Green), format!("+{add}")));
+        let mut shown = false;
+        if add == DiffCount::Binary || del == DiffCount::Binary {
+            segs.push(seg(Tok::Slot(S::Dim), "bin"));
+            shown = true;
         }
-        if del > 0 {
-            if add > 0 {
+        if let DiffCount::Exact(n) = add
+            && n > 0
+        {
+            if shown {
                 segs.push(sp(1));
             }
-            segs.push(seg(Tok::Hue(theme::Hue::Red), format!("-{del}")));
+            segs.push(seg(Tok::Hue(theme::Hue::Green), format!("+{n}")));
+            shown = true;
+        } else if crate::glyph_types::sidebar_count_label(add) == Some("capped") {
+            if shown {
+                segs.push(sp(1));
+            }
+            segs.push(seg(Tok::Hue(theme::Hue::Green), "+capped"));
+            shown = true;
         }
-        segs.push(sp(1));
+        if let DiffCount::Exact(n) = del
+            && n > 0
+        {
+            if shown {
+                segs.push(sp(1));
+            }
+            segs.push(seg(Tok::Hue(theme::Hue::Red), format!("-{n}")));
+            shown = true;
+        } else if crate::glyph_types::sidebar_count_label(del) == Some("capped") {
+            if shown {
+                segs.push(sp(1));
+            }
+            segs.push(seg(Tok::Hue(theme::Hue::Red), "-capped"));
+            shown = true;
+        }
+        if shown {
+            segs.push(sp(1));
+        }
     }
     let dirty = row.git.is_some_and(|g| g.dirty);
     crate::sidebar_legend::push_row_markers(dirty, &mut segs);
