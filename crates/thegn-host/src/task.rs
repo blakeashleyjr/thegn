@@ -430,10 +430,7 @@ fn run_capped_argv(
                 let mut last_emit = Instant::now();
                 while signal_rx.recv().is_ok() {
                     let until = last_emit + LIVE_EMIT_INTERVAL;
-                    loop {
-                        let Some(delay) = until.checked_duration_since(Instant::now()) else {
-                            break;
-                        };
+                    while let Some(delay) = until.checked_duration_since(Instant::now()) {
                         match signal_rx.recv_timeout(delay) {
                             Ok(()) => {}
                             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
