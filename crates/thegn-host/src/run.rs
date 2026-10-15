@@ -16513,10 +16513,7 @@ async fn event_loop<T: Terminal>(
                         let hit = if model.panel_pending {
                             None
                         } else {
-                            crate::chrome::panel_hits(&model, &panel_ui, r)
-                                .into_iter()
-                                .find(|(y, _)| *y == my)
-                                .map(|(_, h)| h)
+                            crate::chrome::panel_hit_at(&model, &panel_ui, r, mx, my)
                         };
                         match hit {
                             Some(crate::panel::PanelHit::OpenSection(s)) => {

@@ -2308,6 +2308,7 @@ fn draw_panel_hints(surface: &mut Surface, rect: Rect, pairs: &[(String, String)
 /// The `(absolute row y, hit)` targets of the rendered panel — the exact
 /// `build_panel` pass the renderer painted, so a click resolves against what
 /// is actually on screen. Pure; the mouse path calls it on demand.
+#[cfg(test)]
 pub fn panel_hits(
     model: &FrameModel,
     ui: &crate::panel::PanelUi,
@@ -2319,6 +2320,30 @@ pub fn panel_hits(
         .enumerate()
         .filter_map(|(i, r)| r.hit.map(|h| (rect.y + i, h)))
         .collect()
+}
+
+/// Resolve a panel click against the frame built by the same `build_panel`
+/// pass used for painting. Rows with column spans resolve by x only; other
+/// rows use their row hit.
+pub fn panel_hit_at(
+    model: &FrameModel,
+    ui: &crate::panel::PanelUi,
+    rect: Rect,
+    x: usize,
+    y: usize,
+) -> Option<crate::panel::PanelHit> {
+    let frame =
+        crate::panel::frame::build_panel(model, ui, rect.cols, rect.rows, model.panel_focused);
+    let row = y.checked_sub(rect.y)?;
+    let rel_x = x.checked_sub(rect.x)?;
+    if frame.col_hits.iter().any(|span| span.row == row) {
+        return frame
+            .col_hits
+            .iter()
+            .find(|span| span.row == row && span.cols.contains(&rel_x))
+            .map(|span| span.hit);
+    }
+    frame.rows.get(row).and_then(|panel_row| panel_row.hit)
 }
 
 /// Resolve a click against the Full view's slim rail (`1 changes · 2 git · …`).
