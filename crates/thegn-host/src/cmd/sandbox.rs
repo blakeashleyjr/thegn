@@ -116,7 +116,7 @@ fn gc() -> Result<()> {
         }
         outln!(concat!(
             "not removed: no thegn owner label for this profile ",
-            "(older thegn, another profile/user, or compose service). ",
+            "(older thegn, another profile/user, or a remote or pre-label compose service). ",
             "If one is yours and unused, remove it with your runtime's `rm -f <name>`."
         ));
     }

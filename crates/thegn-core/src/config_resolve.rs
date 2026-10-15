@@ -2918,4 +2918,53 @@ mod tests {
         }
         assert_eq!(keys.len(), HINT_FIELDS.len());
     }
+
+    #[test]
+    fn network_allow_intersection_is_case_insensitive() {
+        let mut trusted = base();
+        trusted.network_allow = vec!["*.GitHub.com".into(), "Crates.IO".into()];
+        let mut request = overlay();
+        request.network_allow = Some(vec![
+            "API.github.com.".into(),
+            "crates.io".into(),
+            "EVIL.com".into(),
+        ]);
+        let resolved = classify_repo_overlay(request, &trusted, &Approvals::deny_all());
+        assert_eq!(
+            resolved.sanctioned.network_allow,
+            Some(vec!["API.github.com.".into(), "crates.io".into()])
+        );
+        assert!(resolved.events.iter().any(|event| {
+            event.key == "sandbox.network_allow" && event.requested == json!("EVIL.com")
+        }));
+
+        let mut lowercase_trusted = base();
+        lowercase_trusted.network_allow = vec!["*.github.com".into(), "crates.io".into()];
+        let mut uppercase_request = overlay();
+        uppercase_request.network_allow = Some(vec!["API.GITHUB.COM.".into(), "CRATES.IO".into()]);
+        let reverse = classify_repo_overlay(
+            uppercase_request,
+            &lowercase_trusted,
+            &Approvals::deny_all(),
+        );
+        assert_eq!(
+            reverse.sanctioned.network_allow,
+            Some(vec!["API.GITHUB.COM.".into(), "CRATES.IO".into()])
+        );
+
+        let mut upper_out_of_ceiling = overlay();
+        upper_out_of_ceiling.network_allow = Some(vec!["EVIL.COM".into()]);
+        let denied = classify_repo_overlay(
+            upper_out_of_ceiling,
+            &lowercase_trusted,
+            &Approvals::deny_all(),
+        );
+        assert!(
+            denied
+                .sanctioned
+                .network_block
+                .as_ref()
+                .is_some_and(|blocks| { blocks.iter().any(|block| block == "*") })
+        );
+    }
 }
