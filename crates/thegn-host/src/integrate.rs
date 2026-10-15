@@ -1985,10 +1985,16 @@ fn run_fold_admitted(
                     Err(e) => {
                         let (reason, phase, class) = match e.downcast_ref::<BisectAborted>() {
                             Some(b) => {
-                                let GateVerdict::Error { phase, class, .. } = &b.0 else {
+                                let GateVerdict::Error {
+                                    reason,
+                                    phase,
+                                    class,
+                                    ..
+                                } = &b.0
+                                else {
                                     return Err(e);
                                 };
-                                (b.to_string(), Some(*phase), Some(*class))
+                                (reason.clone(), Some(*phase), Some(*class))
                             }
                             None => return Err(e),
                         };
