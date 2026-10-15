@@ -1478,7 +1478,7 @@ fn plugins_trust_json_reports_trusted_refused_and_ungated() {
         toml::from_str::<thegn_core::plugin_api::PluginSpec>(&format!(
             "id = \"{id}\"\nname = \"{id}\"\nversion = \"1\"\napi = \"0.3.0\"\ncapabilities = [\"{capability}\"]\ncommand = [\"true\"]\ntrusted_native = {trusted_native}"
         ))
-        .unwrap();
+        .unwrap()
     };
     let cfg = Config {
         plugins: vec![
