@@ -22,7 +22,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::chrome::FrameModel;
 use crate::hydrate::RefreshKind;
-use crate::run::{SidebarState, active_worktree_repo, now_secs};
+use crate::run::{SidebarState, now_secs};
 use crate::sidebar::DbWorktree;
 
 /// File the active worktree into `folder` — the thin active-worktree wrapper
@@ -35,11 +35,65 @@ pub(crate) fn file_active_worktree(
     refresh_tx: &UnboundedSender<RefreshKind>,
     waker: &termwiz::terminal::TerminalWaker,
 ) -> Result<String, String> {
-    let (wt_path, repo_path) =
-        active_worktree_repo(session).ok_or("No worktree to file into a folder")?;
-    file_worktree_path(
-        session, sb, model, &wt_path, &repo_path, folder, refresh_tx, waker,
-    )
+    let group = session
+        .active_group()
+        .filter(|group| group.kind == crate::session::GroupKind::Branch && !group.path.is_empty())
+        .ok_or("No worktree to file into a folder")?;
+    let wt_path = group.path.clone();
+    if let Some(repo_path) = repo_for_worktree(&model.sidebar_db_worktrees, &wt_path) {
+        return file_worktree_path(
+            session, sb, model, &wt_path, &repo_path, folder, refresh_tx, waker,
+        );
+    }
+    let folder = folder.trim();
+    if folder.is_empty() {
+        return Err("Folder name is empty".into());
+    }
+    let folder_owned = folder.to_string();
+    let worktree = wt_path.clone();
+    let refresh_tx = refresh_tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = thegn_core::db::Db::open().and_then(|db| {
+            let repo_path = db
+                .repo_root_for(&worktree)?
+                .filter(|repo| !repo.is_empty())
+                .or_else(|| {
+                    thegn_core::repo::main_worktree(std::path::Path::new(&worktree))
+                        .map(|path| path.to_string_lossy().into_owned())
+                });
+            let Some(repo_path) = repo_path else {
+                tracing::warn!(target: "thegn::sidebar", "cannot resolve repository for folder filing");
+                return Ok(());
+            };
+            let (workspace_name, workspace_kind) =
+                crate::workspace_identity::workspace_identity(&repo_path, None);
+            let folder_id = db.ensure_folder(
+                &repo_path,
+                &folder_owned,
+                &workspace_name,
+                workspace_kind,
+            )?;
+            db.set_worktree_folder(&worktree, Some(folder_id))?;
+            Ok(())
+        });
+        if let Err(error) = result {
+            tracing::warn!(target: "thegn::sidebar", %error, "worktree folder filing failed");
+        }
+        if let Err(error) = refresh_tx.send(RefreshKind::Model) {
+            tracing::debug!(target: "thegn::sidebar", %error, "folder filing refresh receiver is gone");
+        } else if let Err(error) = waker.wake() {
+            tracing::debug!(target: "thegn::sidebar", %error, "folder filing refresh wake failed");
+        }
+    });
+    Ok(format!("Filing worktree into \"{folder}\"…"))
+}
+
+fn repo_for_worktree(worktrees: &[DbWorktree], path: &str) -> Option<String> {
+    worktrees
+        .iter()
+        .find(|worktree| worktree.path == path && !worktree.repo_path.is_empty())
+        .map(|worktree| worktree.repo_path.clone())
 }
 
 /// File the worktree at `wt_path` (in `repo_path`'s workspace) into `folder`
@@ -338,6 +392,52 @@ mod tests {
             position,
             created_at: 0,
         }
+    }
+
+    #[test]
+    fn repo_for_worktree_reads_the_sidebar_model() {
+        let worktrees = vec![
+            DbWorktree {
+                path: "/wt/a".into(),
+                repo_path: "/repo/a".into(),
+                ..wt("/wt/a", None)
+            },
+            DbWorktree {
+                path: "/wt/a2".into(),
+                repo_path: "/repo/a2".into(),
+                ..wt("/wt/a2", None)
+            },
+            DbWorktree {
+                path: "/wt/empty".into(),
+                repo_path: String::new(),
+                ..wt("/wt/empty", None)
+            },
+        ];
+        assert_eq!(
+            repo_for_worktree(&worktrees, "/wt/a"),
+            Some("/repo/a".into())
+        );
+        assert_eq!(
+            repo_for_worktree(&worktrees, "/wt/a2"),
+            Some("/repo/a2".into())
+        );
+        assert_eq!(repo_for_worktree(&worktrees, "/wt/a/child"), None);
+        assert_eq!(repo_for_worktree(&worktrees, "/wt/empty"), None);
+    }
+
+    #[test]
+    fn file_active_worktree_hit_moves_optimistically_without_db() {
+        let worktrees = vec![DbWorktree {
+            path: "/repo/wt".into(),
+            repo_path: "/repo".into(),
+            ..wt("/repo/wt", None)
+        }];
+        let repo = repo_for_worktree(&worktrees, "/repo/wt").expect("model hit");
+        let mut folders = vec![folder(7, "Ready", 0)];
+        let mut rows = worktrees;
+        let id = apply_optimistic_move(&mut folders, &mut rows, &repo, "/repo/wt", "Ready", 0);
+        assert_eq!(id, 7);
+        assert_eq!(rows[0].folder_id, Some(7));
     }
 
     #[test]
