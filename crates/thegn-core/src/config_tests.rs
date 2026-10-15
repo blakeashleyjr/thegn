@@ -2646,9 +2646,9 @@ down_command = [\"daytona\", \"delete\", \"{id}\"]
 }
 
 #[test]
-fn env_selection_precedence_repo_over_global_default() {
-    // Global default_env picks "g"; a repo .thegn.toml `env = "r"` wins;
-    // an explicit `selected` beats both.
+fn env_selection_ignores_repo_hint_that_changes_backend() {
+    // Global default_env picks "g". Repo hint "r" changes the backend, so it
+    // is ignored; an explicit `selected` still beats both.
     let cfg: Config = toml::from_str(
         "\
 [sandbox]
@@ -2668,18 +2668,59 @@ backend = \"podman\"
     let dir = tmpdir("env-prec");
     std::fs::write(dir.join(".thegn.toml"), "env = \"r\"\n").unwrap();
     let loc = GitLoc::Local(dir.clone());
-    // No explicit selection → repo overlay "r" wins over global default "g".
-    assert_eq!(cfg.resolve_env(&dir, &loc, &dir, None).name, "r");
-    assert_eq!(
-        cfg.resolve_env(&dir, &loc, &dir, None).sandbox.backend,
-        SandboxBackend::Docker
+    // No explicit selection → the weakening repo hint falls back to "g".
+    let (env, resolved) = cfg.resolve_env_with(
+        &dir,
+        &loc,
+        &dir,
+        None,
+        &crate::config_resolve::Approvals::deny_all(),
     );
+    assert_eq!(env.name, "g");
+    assert_eq!(env.sandbox.backend, SandboxBackend::Bwrap);
+    let event = resolved
+        .events
+        .iter()
+        .find(|event| event.key == "env")
+        .unwrap();
+    assert_eq!(event.rule, crate::config_resolve::RepoFieldRule::Forbidden);
+    assert!(event.reason.contains("r"));
+    assert!(event.reason.contains("sandbox.backend"));
     // Explicit selection beats the repo overlay.
     assert_eq!(cfg.resolve_env(&dir, &loc, &dir, Some("x")).name, "x");
-    // Empty/whitespace selection is ignored (falls through to repo).
-    assert_eq!(cfg.resolve_env(&dir, &loc, &dir, Some("  ")).name, "r");
+    // Empty/whitespace selection is ignored (falls through to the repo hint,
+    // which is then rejected for the same backend change).
+    assert_eq!(cfg.resolve_env(&dir, &loc, &dir, Some("  ")).name, "g");
     // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn env_selection_honours_non_weakening_repo_hint_over_global_default() {
+    let cfg: Config = toml::from_str(
+        "\
+[sandbox]
+default_env = \"g\"
+network = \"nat\"
+[env.g]
+[env.r.sandbox]
+network = \"none\"
+",
+    )
+    .unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join(".thegn.toml"), "env = \"r\"\n").unwrap();
+    let loc = GitLoc::Local(repo.path().to_path_buf());
+    let (env, resolved) = cfg.resolve_env_with(
+        repo.path(),
+        &loc,
+        repo.path(),
+        None,
+        &crate::config_resolve::Approvals::deny_all(),
+    );
+    assert_eq!(env.name, "r");
+    assert_eq!(env.sandbox.network, Network::None);
+    assert!(!resolved.events.iter().any(|event| event.key == "env"));
 }
 
 #[test]
