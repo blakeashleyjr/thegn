@@ -846,7 +846,8 @@ fn branches_region(data: &PanelData, ui: &PanelUi, avail: usize) -> Vec<PanelRow
     }
     let mut out = vec![PanelRow::plain(Line::segs(title_segs))];
     if let Some((_, _, Err(error))) = fetched {
-        let error = thegn_svc::lsp::sanitize_for_terminal(error);
+        let error =
+            thegn_core::pipeline_report::display_cell(error.lines().next().unwrap_or(error));
         out.push(PanelRow::plain(Line::segs(vec![seg(g2(), error)])));
         return out;
     }
@@ -2275,6 +2276,7 @@ mod tests {
             rows: branches_region(&m.panel, &u, 10),
             rail: Vec::new(),
             tab_spans: Vec::new(),
+            col_hits: Vec::new(),
         });
 
         assert!(
@@ -2291,13 +2293,14 @@ mod tests {
         u.git.branch_log = Some((
             "feat/full".into(),
             "sha00aaaaaaaaaa".into(),
-            Err("git log failed\u{1b}[31m".into()),
+            Err("git log failed\nUse '--' to separate paths\u{202e}[31m".into()),
         ));
 
         let rendered = all_text(&PanelFrame {
             rows: branches_region(&m.panel, &u, 10),
             rail: Vec::new(),
             tab_spans: Vec::new(),
+            col_hits: Vec::new(),
         });
 
         assert!(
@@ -2308,6 +2311,10 @@ mod tests {
         assert!(
             !rendered.contains('\u{1b}'),
             "error text must be sanitized: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{202e}'),
+            "error text must not contain format controls: {rendered:?}"
         );
         assert_eq!(
             rendered.lines().count(),
