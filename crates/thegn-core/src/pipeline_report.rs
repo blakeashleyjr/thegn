@@ -110,8 +110,9 @@ pub fn display_clip(s: &str, cells: usize) -> String {
         return output;
     }
 
-    while width + 1 > cells {
-        let Some(last) = output.pop() else { break };
+    while width + 1 > cells
+        && let Some(last) = output.pop()
+    {
         width -= UnicodeWidthChar::width(last).unwrap_or(0);
         if width + 1 > cells {
             while let Some(mark) = output.chars().last()
@@ -885,6 +886,7 @@ mod tests {
         let clipped = display_clip("e\u{301}e\u{301}e\u{301}x", 3);
         assert!(!clipped.ends_with('\u{301}'), "{clipped:?}");
         assert_eq!(clipped, "e\u{301}e\u{301}…");
+        assert_eq!(display_clip("ae\u{301}\u{302}x", 2), "a…");
     }
 
     #[test]

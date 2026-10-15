@@ -255,6 +255,38 @@ mod tests {
     use crate::chrome::FrameModel;
     use crate::panel::{PanelUi, SymbolRow};
 
+    fn assert_safe_rows(rows: &[PanelRow], cols: usize) {
+        fn check(segs: &[crate::seg::Seg], cols: usize) {
+            for segment in segs {
+                assert!(
+                    segment.text.chars().all(|c| {
+                        !c.is_control() && !thegn_core::pipeline_report::is_format_control(c)
+                    }),
+                    "{:?}",
+                    segment.text
+                );
+                if segment.text.contains('…') {
+                    assert!(
+                        unicode_width::UnicodeWidthStr::width(segment.text.as_str()) <= cols,
+                        "clipped segment exceeds {cols} columns: {:?}",
+                        segment.text
+                    );
+                }
+            }
+        }
+
+        for row in rows {
+            match &row.line {
+                Line::Segs(segs) => check(segs, cols),
+                Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
+                    check(l, cols);
+                    check(r, cols);
+                }
+                Line::Blank | Line::Fill { .. } => {}
+            }
+        }
+    }
+
     fn change(path: &str, added: u32, deleted: u32) -> super::super::super::ChangeRow {
         super::super::super::ChangeRow {
             status: "M".into(),
@@ -270,13 +302,21 @@ mod tests {
         }
     }
 
-    fn make_ctx<'a>(model: &'a FrameModel, ui: &'a PanelUi) -> SectionCtx<'a> {
+    fn make_ctx_with_cols<'a>(
+        model: &'a FrameModel,
+        ui: &'a PanelUi,
+        cols: usize,
+    ) -> SectionCtx<'a> {
         SectionCtx {
             model,
             ui,
-            cols: 40,
+            cols,
             rows: 20,
         }
+    }
+
+    fn make_ctx<'a>(model: &'a FrameModel, ui: &'a PanelUi) -> SectionCtx<'a> {
+        make_ctx_with_cols(model, ui, 40)
     }
 
     fn sym(kind: &str, name: &str, line: u64, depth: u16) -> SymbolRow {
@@ -483,27 +523,24 @@ mod tests {
             0,
         )];
         model.panel.symbols_file = "src/\u{202e}a.rs".into();
-        let ui = PanelUi::default();
-        let rows = content(&make_ctx(&model, &ui));
-        let text = rows
-            .iter()
-            .flat_map(|row| match &row.line {
-                crate::seg::Line::Segs(segs) => {
-                    segs.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>()
-                }
-                crate::seg::Line::Split { l, r } => {
-                    l.iter().chain(r).map(|seg| seg.text.as_str()).collect()
-                }
-                crate::seg::Line::SplitMinLeft { l, r, .. } => {
-                    l.iter().chain(r).map(|seg| seg.text.as_str()).collect()
-                }
-                crate::seg::Line::Blank | crate::seg::Line::Fill { .. } => Vec::new(),
-            })
-            .collect::<String>();
-        assert!(
-            text.chars()
-                .all(|c| !c.is_control() && !thegn_core::pipeline_report::is_format_control(c)),
-            "{text:?}"
-        );
+        for (width, cols) in [
+            (crate::layout::PanelWidth::Normal, 39),
+            (crate::layout::PanelWidth::Half, 75),
+            (crate::layout::PanelWidth::Full, 150),
+        ] {
+            let ui = PanelUi {
+                width,
+                symbols_cursor: 0,
+                ..Default::default()
+            };
+            let rows = content(&make_ctx_with_cols(&model, &ui, cols));
+            assert_safe_rows(&rows, cols);
+            let text = format!("{rows:?}");
+            assert!(
+                text.contains("�"),
+                "hostile symbol fields were not rendered: {text}"
+            );
+            assert!(text.contains("pwn"), "symbol name was not rendered: {text}");
+        }
     }
 }

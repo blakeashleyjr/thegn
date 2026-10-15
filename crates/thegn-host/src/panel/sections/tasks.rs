@@ -98,14 +98,12 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         let run = runs.get(&task.name);
         let glyph = kind_glyph(&task.kind);
         let name_w = ctx.cols.saturating_sub(glyph.len() + 1 + 8);
-        // Width-aware, UTF-8-safe clip: byte-slicing `task.name[..n]` panicked
-        // when a task name (or command, below) held a multibyte char.
-        let name = crate::seg::clip_end(&task.name, name_w);
+        let name = display_clip(&task.name, name_w);
 
         let mut segs = vec![
             seg(kind_hue(&task.kind), glyph),
             seg(g3(), " "),
-            seg(if i == cursor { t() } else { d() }, display_cell(name)),
+            seg(if i == cursor { t() } else { d() }, name),
             seg(g3(), " "),
         ];
         segs.extend(status_segs(run));
@@ -148,11 +146,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         let cmd_w = ctx
             .cols
             .saturating_sub(glyph.len() + 1 + task.name.len() + 3 + dur.len() + 2);
-        let cmd = if task.command.len() > cmd_w {
-            crate::seg::clip_end(&task.command, cmd_w)
-        } else {
-            task.command.clone()
-        };
+        let cmd = display_clip(&task.command, cmd_w);
 
         let line1 = Line::segs(vec![
             seg(kind_hue(&task.kind), glyph),
@@ -162,7 +156,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
                 display_cell(&task.name),
             ),
             seg(g3(), " · "),
-            seg(g2(), display_cell(cmd)),
+            seg(g2(), cmd),
         ]);
 
         let mut line2_segs = vec![sp(2)];
@@ -250,16 +244,12 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             let run = runs.get(&task.name);
             let sel = if i == cursor { "▶ " } else { "  " };
             let name_w = list_w.saturating_sub(sel.len() + 2 + 8);
-            let name = if task.name.len() > name_w {
-                crate::seg::clip_end(&task.name, name_w)
-            } else {
-                task.name.clone()
-            };
+            let name = display_clip(&task.name, name_w);
             let mut s = vec![
                 seg(if i == cursor { t() } else { g() }, sel),
                 seg(kind_hue(&task.kind), kind_glyph(&task.kind)),
                 seg(g3(), " "),
-                seg(if i == cursor { t() } else { d() }, display_cell(name)),
+                seg(if i == cursor { t() } else { d() }, name),
                 seg(g3(), " "),
             ];
             s.extend(status_segs(run));
@@ -316,17 +306,14 @@ fn task_detail_segs(
     };
     out.push(vec![
         seg(g2(), "cmd  "),
-        seg(
-            g(),
-            display_clip(&display_cell(&cmd_display), w.saturating_sub(5)),
-        ),
+        seg(g(), display_clip(&cmd_display, w.saturating_sub(5))),
     ]);
 
     // Cwd
     if let Some(cwd) = &task.cwd {
         out.push(vec![
             seg(g2(), "cwd  "),
-            seg(g(), display_clip(&display_cell(cwd), w.saturating_sub(5))),
+            seg(g(), display_clip(cwd, w.saturating_sub(5))),
         ]);
     }
 
@@ -361,6 +348,40 @@ fn task_detail_segs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chrome::FrameModel;
+    use crate::panel::PanelUi;
+
+    fn assert_safe_rows(rows: &[PanelRow], cols: usize) {
+        fn check(segs: &[Seg], cols: usize) {
+            for segment in segs {
+                assert!(
+                    segment.text.chars().all(|c| {
+                        !c.is_control() && !thegn_core::pipeline_report::is_format_control(c)
+                    }),
+                    "{:?}",
+                    segment.text
+                );
+                if segment.text.contains('…') {
+                    assert!(
+                        unicode_width::UnicodeWidthStr::width(segment.text.as_str()) <= cols,
+                        "clipped segment exceeds {cols} columns: {:?}",
+                        segment.text
+                    );
+                }
+            }
+        }
+
+        for row in rows {
+            match &row.line {
+                Line::Segs(segs) => check(segs, cols),
+                Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
+                    check(l, cols);
+                    check(r, cols);
+                }
+                Line::Blank | Line::Fill { .. } => {}
+            }
+        }
+    }
 
     #[test]
     fn kind_glyphs_and_hues_are_defined_for_all_variants() {
@@ -457,5 +478,57 @@ mod tests {
                 .all(|c| !c.is_control() && !thegn_core::pipeline_report::is_format_control(c))),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn hostile_task_rows_render_at_all_panel_widths() {
+        let task = thegn_core::config::Task {
+            name: "\u{1b}]0;pwn\u{7}日本語".repeat(3),
+            command: "echo \u{202e}日本語".repeat(12),
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+            kind: TaskKind::Build,
+            matcher: None,
+            scope: None,
+        };
+        let model = FrameModel {
+            panel: crate::panel::PanelData {
+                task_specs: vec![task],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        for (width, cols) in [
+            (crate::layout::PanelWidth::Normal, 39),
+            (crate::layout::PanelWidth::Half, 75),
+            (crate::layout::PanelWidth::Full, 150),
+        ] {
+            let ui = PanelUi {
+                width,
+                tasks_cursor: 0,
+                ..Default::default()
+            };
+            let rows = content(&SectionCtx {
+                model: &model,
+                ui: &ui,
+                cols,
+                rows: 20,
+            });
+            assert_safe_rows(&rows, cols);
+            let text = format!("{rows:?}");
+            assert!(
+                text.contains("�"),
+                "hostile task row was not rendered: {text}"
+            );
+            assert!(text.contains("pwn"), "task name was not rendered: {text}");
+            if width == crate::layout::PanelWidth::Half {
+                assert!(
+                    text.contains("echo"),
+                    "task command was not rendered: {text}"
+                );
+            }
+        }
     }
 }
