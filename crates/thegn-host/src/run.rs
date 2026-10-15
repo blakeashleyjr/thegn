@@ -11432,7 +11432,11 @@ async fn event_loop<T: Terminal>(
                         &|root| root == active,
                     );
                     if evicted > 0 {
-                        tracing::debug!(evicted, "evicted idle LSP clients");
+                        tracing::debug!(
+                            target: "thegn::lsp",
+                            evicted,
+                            "evicted idle LSP clients"
+                        );
                     }
                 });
             }

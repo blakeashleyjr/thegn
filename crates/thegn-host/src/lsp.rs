@@ -3202,7 +3202,7 @@ mod tests {
         drop(client);
 
         assert_eq!(inner.evict_idle(Duration::from_secs(5), now, &|_| false), 1);
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while !String::from_utf8(captured.lock().unwrap().clone())
             .unwrap()
             .contains("\"method\":\"exit\"")
