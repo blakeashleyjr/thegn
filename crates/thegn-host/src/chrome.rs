@@ -50,11 +50,19 @@ pub fn set_palette(p: theme::Palette) {
     if let Ok(mut g) = RESOLVED.write() {
         *g = resolved;
     }
+    PALETTE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// Snapshot the palette currently used by chrome.
 pub fn palette_snapshot() -> theme::Palette {
     PALETTE.read().expect("palette lock").clone()
+}
+
+static PALETTE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Monotonic version of the palette installed for chrome and embedded apps.
+pub fn palette_generation() -> u64 {
+    PALETTE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// A palette slot, resolvable to a live color via [`col`]. Kept complete even
