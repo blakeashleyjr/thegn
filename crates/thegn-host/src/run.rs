@@ -7343,6 +7343,7 @@ async fn event_loop<T: Terminal>(
         std::collections::HashSet::new();
     // Bumped per root-set change; orders the off-loop reconcile tasks.
     let mut lsp_reconcile_epoch: u64 = 0;
+    let mut lsp_evict_due = std::time::Instant::now();
     {
         let wake_rx = lsp_diag_rx.clone();
         let bridge_waker = waker.clone();
@@ -11418,6 +11419,26 @@ async fn event_loop<T: Terminal>(
                 let lsp = lsp_supervisor.handle();
                 tokio::task::spawn_blocking(move || {
                     let _ = lsp.reconcile_roots(epoch, live_roots); // best-effort: released-slot count is informational
+                });
+            }
+            let now = std::time::Instant::now();
+            if now >= lsp_evict_due {
+                lsp_evict_due = now + crate::lsp::LSP_EVICT_CHECK_EVERY;
+                let active = active_tab_path(&session);
+                let lsp = lsp_supervisor.handle();
+                tokio::task::spawn_blocking(move || {
+                    let evicted = lsp.evict_idle(
+                        crate::lsp::LSP_IDLE_EVICT_AFTER,
+                        std::time::Instant::now(),
+                        &|root| root == active,
+                    );
+                    if evicted > 0 {
+                        tracing::debug!(
+                            target: "thegn::lsp",
+                            evicted,
+                            "evicted idle LSP clients"
+                        );
+                    }
                 });
             }
             let swapped_root = active_tab_path(&session);
