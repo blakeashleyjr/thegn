@@ -453,9 +453,13 @@ pub struct GitUi {
     pub blame_scroll: usize,
     /// The selected stash's fetched patch (`stash show -p -u`), keyed by SHA.
     pub stash_diff: Option<(String, String)>,
-    /// The selected branch's fetched log, keyed by branch name (the branches
-    /// main region falls back to HEAD's list while this is out or absent).
-    pub branch_log: Option<(String, Vec<crate::panel::CommitRow>)>,
+    /// The selected branch's fetched log or read error, keyed by branch name
+    /// and observed tip. The main region falls back to HEAD while this is out.
+    pub branch_log: Option<(
+        String,
+        String,
+        std::result::Result<Vec<crate::panel::CommitRow>, String>,
+    )>,
 }
 
 /// Refuse pull/push shortcuts on another branch row: both operations target

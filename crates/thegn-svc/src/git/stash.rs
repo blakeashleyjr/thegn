@@ -111,10 +111,25 @@ pub trait StashOps: GitBackend {
         stash_mutate(loc, "drop", sha)
     }
 
-    /// A stash's patch. `-u` includes the untracked third-parent tree that
-    /// plain `stash show -p` silently omits.
+    /// Read a stash's patch without taking the mutation lock or running
+    /// repository-configured hooks, external diff drivers, or textconv.
+    /// `-u` includes the untracked third-parent tree that plain
+    /// `stash show -p` silently omits.
     fn stash_show(&self, loc: &GitLoc, rev: &str) -> Result<String> {
-        run_w(loc, &[], &["stash", "show", "-p", "-u", "--no-color", rev])
+        let rev = super::op::revision(rev)?;
+        super::run(
+            loc,
+            &[
+                "stash",
+                "show",
+                "-p",
+                "-u",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                rev,
+            ],
+        )
     }
 }
 
@@ -308,6 +323,62 @@ mod tests {
         let patch = CliGit.stash_show(&loc, &sha_a).unwrap();
         assert!(patch.contains("stash A"), "{patch}");
         assert!(!patch.contains("stash B"), "{patch}");
+    }
+
+    #[test]
+    fn stash_show_never_runs_textconv_or_external_diff() {
+        let repo = TestRepo::new("st-show-textconv");
+        ident(&repo.dir);
+        std::fs::write(repo.dir.join("sample.txt"), "before\n").unwrap();
+        std::fs::write(repo.dir.join(".gitattributes"), "*.txt diff=canary\n").unwrap();
+        git_in(&repo.dir, &["add", "sample.txt", ".gitattributes"]);
+        git_in(&repo.dir, &["commit", "-q", "-m", "initial"]);
+        std::fs::write(repo.dir.join("sample.txt"), "stashed content\n").unwrap();
+        let loc = repo.loc();
+        CliGit.stash_push(&loc, "textconv test", false).unwrap();
+        let sha = repo.out(&["rev-parse", "stash@{0}"]).trim().to_string();
+
+        let marker = repo.dir.join("textconv-ran");
+        let driver = repo.dir.join("textconv.sh");
+        std::fs::write(
+            &driver,
+            format!("#!/bin/sh\ntouch '{}'\ncat \"$1\"\n", marker.display()),
+        )
+        .unwrap();
+        git_in(
+            &repo.dir,
+            &[
+                "config",
+                "diff.canary.textconv",
+                &format!("sh '{}'", driver.display()),
+            ],
+        );
+
+        let plain_patch = repo.out(&["stash", "show", "-p", &sha]);
+        assert!(marker.exists(), "plain git is the positive control");
+        assert!(plain_patch.contains("stashed content"), "{plain_patch}");
+        std::fs::remove_file(&marker).unwrap();
+
+        let patch = CliGit.stash_show(&loc, &sha).unwrap();
+        assert!(patch.contains("stashed content"), "{patch}");
+        assert!(!marker.exists(), "stash display must disable textconv");
+    }
+
+    #[test]
+    fn stash_show_does_not_wait_for_the_mutation_lock() {
+        let repo = TestRepo::new("st-show-no-lock");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "before\n", "initial");
+        std::fs::write(repo.dir.join("f.txt"), "stashed\n").unwrap();
+        let loc = repo.loc();
+        CliGit.stash_push(&loc, "read test", false).unwrap();
+        let sha = repo.out(&["rev-parse", "stash@{0}"]).trim().to_string();
+        let lock_path = thegn_core::util::git_common_dir(&repo.dir).join("thegn-git.lock");
+        std::fs::create_dir(lock_path).unwrap();
+
+        let patch = CliGit.stash_show(&loc, &sha).unwrap();
+
+        assert!(patch.contains("stashed"), "{patch}");
     }
 
     #[test]
