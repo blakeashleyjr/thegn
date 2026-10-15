@@ -11,6 +11,13 @@ use crate::chrome::FrameModel;
 use crate::panes::Panes;
 use crate::voice::{VoiceController, VoiceMessage};
 
+fn should_insert_held(voice: &VoiceController, pane_id: u32, pane_live: bool) -> bool {
+    matches!(voice.state, VoiceState::Idle)
+        && pane_live
+        && pane_id != 0
+        && voice.has_held_transcript()
+}
+
 /// Toggle capture for the currently focused pane. Returns the status line to
 /// show immediately; the actual command starts only through a reducer effect.
 pub(crate) fn toggle(
@@ -24,11 +31,7 @@ pub(crate) fn toggle(
     if matches!(voice.state, VoiceState::Idle) && voice.shutdown_pending() {
         return "Voice shutdown pending".into();
     }
-    if matches!(voice.state, VoiceState::Idle)
-        && pane_live
-        && pane_id != 0
-        && voice.has_held_transcript()
-    {
+    if should_insert_held(voice, pane_id, pane_live) {
         let transcript = voice
             .take_held_transcript()
             .expect("held transcript checked above");
@@ -203,6 +206,7 @@ fn apply_event(
                     .as_ref()
                     .is_some_and(|panes| panes.table.contains_key(&pane_id));
                 match deliver_transcript(voice, pane_id, transcript, focused_pane, pane_present) {
+                    Delivery::Nothing => {}
                     Delivery::Held(status) => {
                         if let Some(model) = model.as_deref_mut() {
                             model.status = status;
@@ -233,6 +237,7 @@ fn apply_event(
 }
 
 enum Delivery {
+    Nothing,
     Inject(String),
     Held(String),
 }
@@ -244,7 +249,10 @@ fn deliver_transcript(
     focused_pane: u32,
     pane_present: bool,
 ) -> Delivery {
-    if transcript.is_empty() || (pane_id == focused_pane && pane_present) {
+    if transcript.is_empty() {
+        return Delivery::Nothing;
+    }
+    if pane_id == focused_pane && pane_present {
         return Delivery::Inject(transcript);
     }
     voice.hold_transcript(transcript.clone());
@@ -258,7 +266,7 @@ fn deliver_transcript(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::sound_process::test_support::test_waker;
+    use crate::platform::sound_process::test_support::{UNIX, test_waker};
     use thegn_core::config::VoiceConfig;
 
     fn voice() -> VoiceController {
@@ -303,6 +311,24 @@ mod tests {
     }
 
     #[test]
+    fn empty_transcript_is_ignored_when_origin_loses_focus() {
+        let mut voice = voice();
+        let delivery = deliver_transcript(&mut voice, 1, String::new(), 2, true);
+        assert!(matches!(delivery, Delivery::Nothing));
+        assert!(!voice.has_held_transcript());
+    }
+
+    #[test]
+    fn held_transcript_selects_insert_without_starting_capture() {
+        let mut voice = voice();
+        voice.hold_transcript("spoken words".into());
+        assert!(should_insert_held(&voice, 1, true));
+        assert!(matches!(voice.state, VoiceState::Idle));
+        assert!(voice.has_held_transcript());
+        assert!(!should_insert_held(&voice, 1, false));
+    }
+
+    #[test]
     fn newer_held_transcript_replaces_older() {
         let mut voice = voice();
         assert!(matches!(
@@ -318,6 +344,9 @@ mod tests {
 
     #[test]
     fn cancel_while_idle_discards_held_transcript() {
+        if !UNIX {
+            return;
+        }
         let mut voice = voice();
         voice.hold_transcript("spoken words".into());
         let (waker, _master, _terminal) = test_waker();
