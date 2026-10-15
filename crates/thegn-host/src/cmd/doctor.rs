@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use thegn_core::capabilities::{Capabilities, IsolationClass};
-use thegn_core::config::{Config, SandboxProfile};
+use thegn_core::config::{Config, FileAccess, SandboxProfile};
 use thegn_core::db::Db;
 use thegn_core::hooks::HookEvent;
 use thegn_core::managed_tool::{ManagedTool, Resolution};
@@ -148,6 +148,12 @@ fn shell_chain(cfg: &Config) -> Vec<String> {
 }
 
 fn sandbox_json(cfg: &Config) -> serde_json::Value {
+    let report = local_backend_report(cfg);
+    let (backend, actual) = effective_first_ready(cfg, &report);
+    sandbox_json_with(cfg, backend, actual)
+}
+
+fn sandbox_json_with(cfg: &Config, backend: Backend, actual: IsolationClass) -> serde_json::Value {
     let chain: Vec<serde_json::Value> = shell_chain(cfg)
         .iter()
         .map(|name| {
@@ -169,6 +175,15 @@ fn sandbox_json(cfg: &Config) -> serde_json::Value {
         "limits": limits_json(cfg),
         "isolation_floor": cfg.sandbox.isolation_floor.as_str(),
         "on_floor_miss": cfg.sandbox.on_floor_miss.as_str(),
+        "containment": thegn_core::sandbox_floor::containment_summary(
+            cfg.sandbox.enabled,
+            actual,
+        )
+        .as_str(),
+        "file_access_enforced": thegn_core::sandbox_floor::file_access_enforced(
+            backend,
+            cfg.sandbox.file_access,
+        ),
         "enforcement_matrix": enforcement_matrix_json(),
         "home": home_json(cfg),
     })
@@ -3553,6 +3568,7 @@ fn enforcement_matrix_report(cfg: &Config) {
         );
     }
     floor_report(cfg);
+    file_access_report(cfg);
     home_report(cfg);
     network_rules_report(cfg);
 }
@@ -3593,7 +3609,7 @@ fn home_report(cfg: &Config) {
         );
     }
     // Sealed tiers drop any `[sandbox] mounts` entry reaching the credential deny
-    // list (the default `~/.gnupg:rw` included). Say which, by path only.
+    // list. Say which, by path only.
     if profile.hides_home()
         && let Ok(home) = std::env::var("HOME")
         && !home.is_empty()
@@ -3649,22 +3665,10 @@ fn network_rules_line(sb: &thegn_core::config::SandboxConfig, backend: Backend) 
 /// pure [`thegn_core::sandbox_floor::decide`] the launch path uses.
 fn floor_report(cfg: &Config) {
     use thegn_core::config::IsolationFloor;
+    use thegn_core::sandbox_floor::{FloorDecision, containment_summary, decide};
     let floor = cfg.sandbox.isolation_floor;
-    if floor == IsolationFloor::Off {
-        outln!("  floor         (none — set [sandbox] isolation_floor to demand a minimum)");
-        return;
-    }
-    let chain = shell_chain(cfg);
-    let report = thegn_core::sandbox_support::support_report(
-        &chain,
-        &Placement::Local,
-        cfg_oci_runtime(cfg),
-    );
-    // What the launch actually enters: the first usable backend's honest class,
-    // or the host process when nothing usable is in the chain.
-    let actual = thegn_core::sandbox_support::first_ready(&report)
-        .and_then(|r| r.isolation)
-        .unwrap_or(IsolationClass::HostProcess);
+    let report = local_backend_report(cfg);
+    let (_, actual) = effective_first_ready(cfg, &report);
     // The strongest class any usable backend could give, for a concrete remedy.
     let best = report
         .iter()
@@ -3672,33 +3676,122 @@ fn floor_report(cfg: &Config) {
         .filter_map(|r| r.isolation)
         .max_by_key(|c| c.rank().unwrap_or(0))
         .unwrap_or(actual);
-    outln!(
-        "  floor         {} (on miss: {})",
-        floor.as_str(),
-        cfg.sandbox.on_floor_miss.as_str()
-    );
-    use thegn_core::sandbox_floor::{FloorDecision, decide};
-    match decide(floor, cfg.sandbox.on_floor_miss, actual, best) {
-        FloorDecision::Ok => outln!(
-            "                met — this host would launch at `{}`",
-            actual
-        ),
-        FloorDecision::BypassProvider => {
-            outln!("                provider-managed placement — floor out of scope")
-        }
-        FloorDecision::Degrade(m) => {
-            outln!(
-                "                MISSED (would degrade + warn): {}",
-                m.message()
-            )
-        }
-        FloorDecision::Fail(m) => {
-            outln!(
-                "                MISSED (would refuse to launch): {}",
-                m.message()
-            )
+    if floor == IsolationFloor::Off {
+        outln!("  floor         (none — set [sandbox] isolation_floor to demand a minimum)");
+    } else {
+        outln!(
+            "  floor         {} (on miss: {})",
+            floor.as_str(),
+            cfg.sandbox.on_floor_miss.as_str()
+        );
+        match decide(floor, cfg.sandbox.on_floor_miss, actual, best) {
+            FloorDecision::Ok => outln!(
+                "                met — this host would launch at `{}`",
+                actual
+            ),
+            FloorDecision::BypassProvider => {
+                outln!("                provider-managed placement — floor out of scope")
+            }
+            FloorDecision::Degrade(m) => {
+                outln!(
+                    "                MISSED (would degrade + warn): {}",
+                    m.message()
+                )
+            }
+            FloorDecision::Fail(m) => {
+                outln!(
+                    "                MISSED (would refuse to launch): {}",
+                    m.refusal()
+                )
+            }
         }
     }
+    outln!(
+        "{}",
+        containment_line(containment_summary(cfg.sandbox.enabled, actual))
+    );
+}
+
+/// The local support report for the shell chain (empty when the sandbox is disabled).
+fn local_backend_report(cfg: &Config) -> Vec<thegn_core::sandbox_support::BackendSupport> {
+    if !cfg.sandbox.enabled {
+        return Vec::new();
+    }
+    thegn_core::sandbox_support::support_report(
+        &shell_chain(cfg),
+        &Placement::Local,
+        cfg_oci_runtime(cfg),
+    )
+}
+
+/// Resolve the backend and class the local shell would actually enter.
+fn effective_first_ready(
+    cfg: &Config,
+    report: &[thegn_core::sandbox_support::BackendSupport],
+) -> (Backend, IsolationClass) {
+    if !cfg.sandbox.enabled {
+        return (Backend::None, IsolationClass::HostProcess);
+    }
+    thegn_core::sandbox_support::first_ready(report)
+        .map(|ready| {
+            (
+                ready.backend,
+                ready.isolation.unwrap_or(IsolationClass::HostProcess),
+            )
+        })
+        .unwrap_or((Backend::None, IsolationClass::HostProcess))
+}
+
+/// The human-readable containment state, kept pure for direct formatter tests.
+fn containment_line(containment: thegn_core::sandbox_floor::Containment) -> String {
+    use thegn_core::sandbox_floor::Containment;
+    match containment {
+        Containment::Uncontained => "  containment   NOT CONTAINED — sandbox is enabled but this host would launch at host-process (no runtime in the chain is ready); install/start podman, docker or bwrap (see the backend table above)".to_string(),
+        Containment::Disabled => "  containment   none — [sandbox] enabled = false: panes run on the host".to_string(),
+        Containment::Contained(class) => format!("  containment   contained at `{}`", class.as_str()),
+        Containment::ProviderManaged => "  containment   provider-managed (unverified by thegn)".to_string(),
+    }
+}
+
+/// Report file-scope enforcement for the backend the local shell would enter.
+fn file_access_report(cfg: &Config) {
+    let report = local_backend_report(cfg);
+    let (backend, _) = effective_first_ready(cfg, &report);
+    if let Some(line) = file_access_line(cfg.sandbox.file_access, backend) {
+        outln!("{line}");
+    }
+}
+
+/// Pure explanation for a requested file scope that the selected backend cannot enforce.
+fn file_access_line(file_access: FileAccess, backend: Backend) -> Option<String> {
+    if thegn_core::sandbox_floor::file_access_enforced(backend, file_access) {
+        return None;
+    }
+    let scope = match file_access {
+        FileAccess::Worktree => "worktree",
+        FileAccess::WorktreePlusCaches => "worktree_plus_caches",
+        FileAccess::Custom => "custom",
+        FileAccess::All => "all",
+        FileAccess::Host => "host",
+        FileAccess::None => "none",
+    };
+    let note = match backend {
+        Backend::None => "the pane runs on the host",
+        Backend::Systemd => {
+            "the pane sees the host root (ProtectSystem/ProtectHome hardening only)"
+        }
+        Backend::WinJobObject => {
+            "the pane runs as a host process; process scoping does not hide filesystem paths"
+        }
+        Backend::WinAppContainer => {
+            "the requested scope is not translated into an AppContainer filesystem policy"
+        }
+        _ => "this backend does not enforce the requested filesystem scope",
+    };
+    Some(format!(
+        "  file access   requested `{scope}` — NOT ENFORCED on {}: {note}",
+        backend.label()
+    ))
 }
 
 /// Machine-readable key for the CPU-cap enforcement mechanism.
@@ -4379,7 +4472,10 @@ mod tests {
         assert_eq!(j["portable_dotfiles_only"], true);
         assert!(j["env_overrides"].is_object());
         // sandbox_json embeds it too.
-        assert_eq!(sandbox_json(&cfg)["home"]["strategy"], "portable");
+        assert_eq!(
+            sandbox_json_with(&cfg, Backend::None, IsolationClass::HostProcess)["home"]["strategy"],
+            "portable"
+        );
     }
 
     #[test]
@@ -4613,7 +4709,11 @@ args = ["--verbose"]
 
     #[test]
     fn sandbox_json_is_well_formed() {
-        let v = sandbox_json(&Config::default());
+        let v = sandbox_json_with(
+            &Config::default(),
+            Backend::None,
+            IsolationClass::HostProcess,
+        );
         assert!(v.get("enabled").is_some());
         assert!(v.get("candidates").unwrap().is_array());
         assert!(v.get("shell_profile").unwrap().get("policy").is_some());
@@ -4751,5 +4851,50 @@ args = ["--verbose"]
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn containment_line_for_each_case() {
+        use thegn_core::sandbox_floor::Containment;
+        assert!(containment_line(Containment::Disabled).contains("enabled = false"));
+        assert!(containment_line(Containment::Uncontained).contains("NOT CONTAINED"));
+        assert_eq!(
+            containment_line(Containment::Contained(IsolationClass::SharedKernel)),
+            "  containment   contained at `shared-kernel`"
+        );
+        assert!(containment_line(Containment::ProviderManaged).contains("provider-managed"));
+    }
+
+    #[test]
+    fn file_access_line_systemd_worktree_not_enforced_and_bwrap_none() {
+        let line = file_access_line(FileAccess::Worktree, Backend::Systemd)
+            .expect("systemd does not enforce a private worktree root");
+        assert!(line.contains("requested `worktree` — NOT ENFORCED on systemd"));
+        assert!(line.contains("host root (ProtectSystem/ProtectHome hardening only)"));
+        assert_eq!(file_access_line(FileAccess::None, Backend::Bwrap), None);
+    }
+
+    #[test]
+    fn sandbox_json_reports_containment_and_file_access() {
+        use thegn_core::config::{IsolationFloor, OnFloorMiss, SandboxBackend, SandboxConfig};
+        let cfg = Config {
+            sandbox: SandboxConfig {
+                backend: SandboxBackend::None,
+                file_access: FileAccess::Worktree,
+                isolation_floor: IsolationFloor::Off,
+                on_floor_miss: OnFloorMiss::Fail,
+                ..SandboxConfig::default()
+            },
+            ..Config::default()
+        };
+        let value = sandbox_json_with(&cfg, Backend::None, IsolationClass::HostProcess);
+        assert_eq!(value["containment"], "not-contained");
+        assert!(!value["file_access_enforced"].as_bool().unwrap());
+        assert!(value["containment"].is_string());
+        assert!(value["file_access_enforced"].is_boolean());
+
+        let contained = sandbox_json_with(&cfg, Backend::Bwrap, IsolationClass::SharedKernel);
+        assert_eq!(contained["containment"], "contained:shared-kernel");
+        assert!(contained["file_access_enforced"].as_bool().unwrap());
     }
 }
