@@ -44,6 +44,9 @@ pub enum IcsDiagnostic {
     MissingEnvelope,
     UnknownTimeZone,
     UnmappedTimeZone,
+    /// An RDATE/EXDATE member that cannot be represented in the DTSTART frame;
+    /// value-free: property, 0-based member index, defect.
+    InvalidRecurrenceValue(super::recur::RecurValueError),
 }
 
 /// Bounded diagnostics from one iCalendar parse.
@@ -1408,6 +1411,12 @@ impl Builder {
                 rdates: self.rdates,
                 exdates: self.exdates,
             });
+        }
+        if let Some(rec) = e.recurrence.as_ref()
+            && let Err(error) = super::recur::diagnose_values(rec, &e.start)
+        {
+            report.record(IcsDiagnostic::InvalidRecurrenceValue(error));
+            return None;
         }
         if validate_event(&e).is_err() {
             return None;
