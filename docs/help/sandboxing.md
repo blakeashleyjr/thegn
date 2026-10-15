@@ -59,18 +59,24 @@ agents, autopilot, cache probes) builds its command through
 `sandbox::enter_argv` (and `ensure` for containers; queue agents only when
 the queue's sandbox opt-in is on), which — for a sealed
 spec — drops every mount whose host path or destination lies inside the
-deny list, whoever added it: `[sandbox] mounts` (the default `~/.gnupg:rw`
-included), a bound identity's git ssh key / `GH_CONFIG_DIR` / `GNUPGHOME`,
-the profile credential mounts, or an agent provider home. A mount whose
-host path is, or contains, a protected path (the worktree being `$HOME`
-itself, a `~` mount) refuses the launch. Compose on OCI backends is refused
-whenever the resolved spec requests `read_only_root`, `no_new_privileges`, a
+deny list, whoever added it: `[sandbox] mounts`, a bound identity's git ssh
+key / `GH_CONFIG_DIR` / `GNUPGHOME`, the profile credential mounts, or an
+agent provider home. There is no default `~/.gnupg` grant; add
+`"~/.gnupg:rw"` to `[sandbox] mounts` yourself if a pane must sign. Mount
+entries accept `path`, `path:rw`, `host:dest`, or `host:dest:rw`; malformed
+entries are ignored with a warning and listed by `thegn config validate`. A
+mount whose host path is, or contains, a protected path (the worktree being
+`$HOME` itself, a `~` mount) refuses the launch. Compose on OCI backends is
+refused whenever the resolved spec requests `read_only_root`, `no_new_privileges`, a
 PID limit, dropped capabilities, sealed home, network-none or network filters,
 an OCI runtime, per-pane CPU/memory limits, or a VPN; Compose cannot enforce
 those restrictions. This applies under every profile, including `open`.
-Compose remains available when none of those restrictions is requested. A kept
-container is reused only if it carries the matching `thegn.seal_home` label and, when sealed, binds
-exactly the required mounts; otherwise it is recreated. The one tolerated extra
+Compose remains available when none of those restrictions is requested. On
+backends that store the label, a kept container is reused only if its
+`thegn.policy` label matches a fingerprint of the whole resolved policy and,
+when sealed, it binds exactly the required mounts; otherwise it is recreated.
+On these backends, a policy change recreates it once, and a container made by
+an older thegn is recreated once after upgrade. The one tolerated extra
 is the devenv `/nix` bind, and only while devenv is still on: turn devenv off and
 the container is recreated. Apple containers carry no seal label, so reuse there
 is judged on mounts alone, and a sealed Apple container whose inspect output has
@@ -242,7 +248,7 @@ what it actually enforces —
 | Cell      | What it means                                                                 |
 | --------- | ----------------------------------------------------------------------------- |
 | `fs`      | filesystem isolation: a separate root, unit-level protection, or the host fs  |
-| `net`     | network isolation: enforceable, only under `network=none`, or the host stack  |
+| `net`     | `netns`; rules DNS-only, or the host stack                                    |
 | `ceiling` | resource cap strength: hard cgroup/VM, soft `nice`, deferred, or none         |
 | `scoping` | process-tree scoping: engine lifecycle, pid namespace, unit, job object, pgid |
 | `class`   | the honest isolation class (below) — what would have to fail for an escape    |
@@ -279,15 +285,22 @@ on_floor_miss   = "fail"           # degrade (default) | fail
 The floor is compared over the **honest class** of what the launch actually
 enters, after backend selection and any `oci_runtime` degrade — so a `krun` that
 fell back to the daemon default counts as `shared-kernel`, and a macOS local OCI
-container counts as `guest-kernel`. On a miss, `degrade` (the default, fail-safe:
-right when you are present to see the warning) launches with the worktree marked
-degraded and a warning; `fail` (fail-closed: right for unattended/agent code)
-refuses to launch — no process spawns on the host — and names the floor, the best
-class available here, and how to satisfy it. A managed provider placement is out
-of scope (reported `provider-managed`, never counted as a tier). A repo-root
-`.thegn.toml` may only **raise** the floor, never lower it. The two queues'
-agent handoff (`[merge_queue]` / `[pr_queue]`) can demand the same floor with
-`agent_sandbox` + `agent_isolation_floor`; a fail-closed miss there is an
+container counts as `guest-kernel`. On a miss, `degrade` (the default)
+launches with the worktree marked degraded and a warning; `fail` refuses to
+launch and names the floor, available class, and how to satisfy it. The refusal
+names the opt-outs: allow host execution, set the backend to `none` and the
+floor to `off`, or install/start a runtime.
+`thegn doctor` prints `containment` and `file access` lines, including a line
+such as `requested <scope> — NOT ENFORCED on <backend>: <note>` when file
+access is not enforced. The floor also
+applies to standalone terminal tabs. If a terminal requests a backend with no
+runtime, `on_floor_miss = "fail"` refuses it; `degrade` launches it labelled
+degraded, and an unset floor produces a warning. Explicit `host`/`none`/empty
+backend choices and ssh/mosh terminals are unchanged. A managed provider
+placement is out of scope (reported `provider-managed`, never counted as a
+tier). A repo-root `.thegn.toml` may only **raise** the floor, never lower it.
+The two queues' agent handoff (`[merge_queue]` / `[pr_queue]`) can demand the same floor
+with `agent_sandbox` + `agent_isolation_floor`; a fail-closed miss there is an
 **infrastructure** failure that holds the entry and never blames the branch.
 
 ## Choosing per worktree
@@ -327,8 +340,9 @@ plain rustc.
 
 By default a `hardened` sandbox keeps networking so fetch, clone, build,
 and debuggers work; `sealed` removes it entirely. `[sandbox]` also
-carries a DNS allow/block filter for the middle ground — see
-[[config-reference]].
+carries DNS-name allow/block rules for the middle ground. These rules are not
+an egress boundary; `network = "none"` is the only enforced deny, and `*` in
+`network_block` means offline — see [[config-reference]].
 
 `[sandbox.vpn]` can put the sandbox on an overlay network (tailscale,
 headscale, wireguard, openvpn, netbird, zerotier). The `mode` decides how:
@@ -356,10 +370,6 @@ instantly; raise or lower the active project's pool target with the
 warm-pool actions (`Ctrl-Alt-=` / `Ctrl-Alt--`, also palette-runnable).
 Pool state shows on the sidebar's project chip, not in this section.
 `[sandbox] default_env` picks the environment new worktrees use.
-
-An environment can keep a **warm spare pool** so new worktrees start
-instantly; the warm-pool actions raise and lower the active project's
-target (palette-runnable and bindable).
 
 ### Worktree toolchains
 
@@ -421,17 +431,17 @@ stats and lifecycle actions on the thegn-owned ones.
 
 Panel and monitor actions apply only to containers proven to belong to this
 profile for a known worktree on its launch backend; cleanup recognizes the
-`thegn-` name family and `thegn.managed`-labelled images and volumes. Cleanup
-commands below use their own rule:
+`thegn-` name family and `thegn.managed`-labelled images and volumes.
 Cleanup is always explicit — thegn never prunes on a schedule.
 
 - `thegn sandbox gc` runs the startup orphan sweep on demand: it removes thegn
-  containers whose worktree no longer exists in the registry, across every
-  available backend, and reports what it removed. Safe to run any time.
-- `thegn sandbox prune` reclaims thegn-owned **stopped** containers and
-  `thegn.managed` images and volumes. On a terminal it lists what it would
-  remove and asks to confirm; `--yes` skips the prompt for scripts and
-  `--dry-run` never removes anything. Narrow it with `--containers`,
+  containers with this install/profile's `thegn.owner` label that are provably
+  orphaned across available backends. Unlabelled containers and containers owned
+  by another profile are listed but never removed. Safe to run any time.
+- `thegn sandbox prune` reclaims **stopped** containers with this profile's
+  `thegn.owner` label, and `thegn.managed` images and volumes. On a terminal it
+  lists what it would remove and asks to confirm; `--yes` skips the prompt for
+  scripts and `--dry-run` never removes anything. Narrow it with `--containers`,
   `--images` or `--volumes`. Volumes that carry a **persistent role** (the
   seeded nix-store / cargo warm caches — potential user state) are always kept
   and named in the listing.

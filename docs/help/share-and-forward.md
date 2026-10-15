@@ -15,8 +15,8 @@ Two ways a worktree's dev server reaches a browser.
 `Alt-Shift-S` (share-worktree-port) exposes a port from the focused
 worktree at a public URL. The [[panel]]'s **system → share** section
 lists every active share: `↵` copies the URL, `o` opens it in the
-browser, and `x` stops the highlighted share (the stop-share action
-stops them all). A failed share shows its reason and can simply be
+browser, `n` starts a share, and `x` stops the highlighted share (the
+stop-share action stops them all). A failed share shows its reason and can simply be
 retried. At the panel's full width the list gains a detail column with
 the untruncated URL (or iroh consumer command), provider, and reach.
 The bottom status bar shows a `⇅` chip while anything is
@@ -28,7 +28,8 @@ shared; activating it opens a detail popup listing the shares (the
 For sandboxed worktrees ([[sandboxing]]), dev-server ports detected
 inside the container are forwarded to the host's loopback automatically
 for local browser preview. The **system → forward** section lists the
-active forwards: `↵` copies the preview URL, `o` opens it.
+active forwards: `↵` copies the preview URL, `o` opens it, `n` starts
+watching a port, and `x` removes a forward.
 
 Reverse tunnels have a per-run connection cap (`forward.reverse_max_connections`,
 default 256) and a process-wide host cap
@@ -46,12 +47,17 @@ read once at startup and again after a worktree switch or config reload; pane
 and sandbox lifecycle events update the target without an idle poll.
 
 The selected target appears at the top of **system → forward** with its port,
-source, URL, and one of three honest states: `up` means a live pane/provider
-event proves reachability, `down` means that watched process or forward ended,
-and `unknown` means the runtime has no event source. `unknown` is not treated as
+source, URL, and one of five honest states: `up` means a live pane/provider
+event proves reachability, `seen` means a port appeared in pane output without
+a reachability probe, `configured` means an explicit config target has no live
+runtime evidence, `down` means a watched process or forward ended, and
+`unknown` means the runtime has no event source. Package-script targets show
+`unknown` until runtime events establish more. `unknown` is not treated as
 a failure: `↵` still copies the URL and `o` still opens it in the configured
-external browser (`[forward] browser`: an argv template with `%s` for the URL, no shell; an explicit value is final, otherwise `$BROWSER`, then the OS opener; only http/https URLs are opened; also used by `open_on_detect`). The active worktree also gets a compact preview token in the
-sidebar.
+external browser (`[forward] browser`: an argv template with `%s` for the URL,
+no shell; an explicit value is final, otherwise `$BROWSER`, then the OS opener;
+only http/https URLs are opened; also used by `open_on_detect`). The active
+worktree also gets a compact preview token in the sidebar.
 
 An in-terminal browser is an optional drawer runtime occupant named `preview`.
 When the installed drawer tool registry provides that occupant, it receives the

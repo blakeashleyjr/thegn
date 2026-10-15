@@ -9,8 +9,10 @@ a POSIX shell script with `printf` is enough.
    `api` (the contract version, currently `"0.3.0"`), `capabilities`
    (`surface:statusbar`, …), `contributions` (extension point + label +
    surface + cadence), `command = ["…"]`, and optional `scopes`, `mode`
-   (`one_shot`/`resident`), `timeout_secs`. Directory plugins default their
-   `cwd` to their own directory.
+   (`one_shot`/`resident`), `timeout_secs` (clamped to 1–3600 seconds with a
+   warning). Directory plugins
+   default their `cwd` to their own directory. Re-invoking a running one-shot
+   reports that the contribution is already running.
 2. **Validate it**: `thegn plugin list` shows what the loader sees;
    `thegn plugin check` negotiates against the host contract and exits
    non-zero on problems. Start from `examples/plugins/hello.sh` +

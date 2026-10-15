@@ -84,7 +84,9 @@ account name). Its contribution `caps` object may declare `comments` and
 is rejected locally without a `provider.call` round trip. The host uses the
 existing issue JSON shapes and maps an RPC `unsupported` reply to the same
 typed unsupported behavior. Unanswered calls time out at the plugin's
-`timeout_secs` and surface like any provider error. `CiProvider`/`ForgeProvider`
+`timeout_secs` (clamped to 1–3600 seconds with a warning) and surface like any
+provider error. Re-invoking a running one-shot reports that the contribution
+is already running. `CiProvider`/`ForgeProvider`
 are reserved wire vocabulary for the same pattern.
 
 The standalone `thegn doctor` does not start resident plugins or inventory

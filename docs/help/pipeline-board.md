@@ -104,7 +104,9 @@ frozen the board also stops re-reading the roster at all.
 
 `x` hides rows whose work has finished (merged, done, abandoned, failed). The
 stage headers keep counting every row, so a stage never under-reports itself
-while you are looking at a filtered view.
+while you are looking at a filtered view. Roster reads retain every active row
+and the newest 2048 finished rows; older finished lanes are dropped. When the
+board hits that limit, its footer says "newest 2048 finished".
 
 Neither toggle is remembered between openings. Both are reading postures for
 the session you are in, not preferences — a board that reopened with finished

@@ -31,7 +31,8 @@ including what you have scrolled back to, not just the live tail.
 
 Text goes out two ways at once, so it works whether or not you are over
 ssh: an **OSC 52** sequence to the outer terminal, and the local system
-clipboard. Anything copied also lands in the default register (`"`).
+clipboard. Anything copied also lands in the default register (`"`). A copy larger than
+the 4 MiB out-of-band limit is refused and reported in the status line.
 The panel's Logs `y` and `Y` use the same system-clipboard and OSC 52 paths.
 
 Selections are anchored to their **content**, not the screen: scroll the
