@@ -2267,6 +2267,21 @@ mod tests {
         );
         assert!(!degraded);
 
+        let mut admit_warnings = vec!["sandbox admission warning".to_string()];
+        let degraded = finish_wrapped_terminal(&wrapped, &mut admit_warnings);
+        assert!(degraded);
+        assert_eq!(admit_warnings.len(), 2);
+        assert!(
+            admit_warnings
+                .iter()
+                .any(|warning| warning == "sandbox admission warning")
+        );
+        assert!(
+            admit_warnings
+                .iter()
+                .any(|warning| warning.contains("DNS-name rules only"))
+        );
+
         let no_note_wrapped = WrappedShell {
             argv: vec!["bwrap".into()],
             isolation: thegn_core::capabilities::IsolationClass::SharedKernel,
