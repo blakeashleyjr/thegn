@@ -7,6 +7,7 @@
 //! thin shell over `thegn_core::db`'s v6 `tab_groups`/`group_tabs`.
 
 use anyhow::Result;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thegn_core::db::Db;
 use thegn_core::models::{GroupTabRow, TabGroupRow};
 use thegn_core::store::WorkspaceStore;
@@ -220,7 +221,7 @@ impl Tab {
 
 /// One worktree in the session: what the sidebar lists and what the tabbar
 /// scopes to. Owns its tabs; always has at least one.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct WorktreeGroup {
     /// Display name, e.g. "app/feat" — unique within the session.
     pub name: String,
@@ -229,6 +230,27 @@ pub struct WorktreeGroup {
     pub path: String,
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
+    /// Process-local identity of this live group: assigned once when the group is created or
+    /// resurrected, copied by clones of the same group, never persisted; stale off-loop results
+    /// compare it to tell a replacement group at the same path from the sampled one.
+    pub epoch: u64,
+}
+
+impl PartialEq for WorktreeGroup {
+    fn eq(&self, other: &Self) -> bool {
+        // Epoch is runtime identity; layout equality intentionally ignores it.
+        self.name == other.name
+            && self.kind == other.kind
+            && self.path == other.path
+            && self.tabs == other.tabs
+            && self.active_tab == other.active_tab
+    }
+}
+
+static NEXT_GROUP_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_group_epoch() -> u64 {
+    NEXT_GROUP_EPOCH.fetch_add(1, Ordering::Relaxed)
 }
 
 impl WorktreeGroup {
@@ -239,6 +261,7 @@ impl WorktreeGroup {
             path: path.into(),
             tabs: vec![Tab::new("1")],
             active_tab: 0,
+            epoch: next_group_epoch(),
         }
     }
 
@@ -251,6 +274,7 @@ impl WorktreeGroup {
             path: String::new(),
             tabs: vec![Tab::new("main")],
             active_tab: 0,
+            epoch: next_group_epoch(),
         }
     }
 
@@ -435,6 +459,7 @@ impl Session {
                     path: g.worktree.clone(),
                     tabs,
                     active_tab,
+                    epoch: next_group_epoch(),
                 }
             })
             .collect();
@@ -676,6 +701,7 @@ impl Session {
                     kind: g.kind,
                     path: g.path.clone(),
                     active_tab: g.active_tab,
+                    epoch: g.epoch,
                     tabs: g
                         .tabs
                         .iter()
@@ -1851,5 +1877,21 @@ mod tests {
             assert_eq!(n, 0, "session id {id:?} adopts nothing");
             assert!(s.worktrees.is_empty());
         }
+    }
+
+    #[test]
+    fn epoch_is_unique_per_group_and_ignored_by_equality() {
+        let first = WorktreeGroup::new("app/feat", GroupKind::Branch, "/wt/feat");
+        let second = WorktreeGroup::new("app/feat", GroupKind::Branch, "/wt/feat");
+        assert_ne!(first.epoch, second.epoch);
+        assert_eq!(first, second);
+
+        let session = Session {
+            id: "s".into(),
+            worktrees: vec![first.clone()],
+            active: 0,
+        };
+        let hydrated = session.clone_for_hydrate();
+        assert_eq!(hydrated.worktrees[0].epoch, first.epoch);
     }
 }
