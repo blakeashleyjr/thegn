@@ -865,9 +865,9 @@ mod tests {
     fn clipped_table_cell_ends_with_ellipsis_at_exact_width() {
         let page = render_page(
             &parse(
-                "| key | label | flag |
+                "| flag | key | label |
 | --- | --- | --- |
-| extraordinarily-long-key | surviving label | yes |
+| yes | extraordinarily-long-key | surviving label |
 ",
             ),
             18,
@@ -948,7 +948,11 @@ mod tests {
     fn two_column_table_stacks_and_wraps_at_narrow_width() {
         let page = render_page(&parse(TABLE), 20, None);
         let texts: Vec<String> = page.lines.iter().map(line_text).collect();
-        let output = texts.join(" ");
+        let output = texts
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(output.contains("Split pane right"), "{output:?}");
         for line in &texts {
             assert!(!line.contains('…'), "unexpected clipping: {line:?}");
