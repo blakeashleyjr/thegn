@@ -474,7 +474,7 @@ impl SessionActor {
             None,
         );
         if !child_exited {
-            self.pty.process.terminate_and_reap();
+            self.pty.process.terminate_and_reap_off_runtime().await;
         }
         drop(pane_rx);
         self.pty.reader.join_off_runtime().await;
@@ -2503,5 +2503,63 @@ mod tests {
                 .get_all_notifications(usize::MAX)
                 .unwrap_or_default();
         assert_eq!(rows.len(), 1, "the read row is retired too: {rows:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn kill_teardown_does_not_block_the_runtime_worker() {
+        let mut harness = spawn_actor("trap '' TERM; sleep 60", None);
+        let largest_gap_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ticker_gap = Arc::clone(&largest_gap_ms);
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        let ticker = tokio::spawn(async move {
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + std::time::Duration::from_millis(5),
+                std::time::Duration::from_millis(5),
+            );
+            let mut previous = tokio::time::Instant::now();
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    _ = interval.tick() => {
+                        let now = tokio::time::Instant::now();
+                        let gap_ms = now.duration_since(previous).as_millis() as u64;
+                        ticker_gap.fetch_max(gap_ms, std::sync::atomic::Ordering::Relaxed);
+                        previous = now;
+                    }
+                }
+            }
+        });
+
+        tokio::task::yield_now().await;
+        harness
+            .msg_tx
+            .send(SessionMsg::Kill)
+            .await
+            .expect("send Kill");
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match harness.feed.recv().await {
+                    Ok(frame)
+                        if matches!(frame.as_ref(), EventFrame::SessionExit { session, .. } if session == "s1") =>
+                    {
+                        break;
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(error) => panic!("session event feed closed before exit: {error}"),
+                }
+            }
+        })
+        .await;
+        assert!(
+            exit.is_ok(),
+            "the killed actor must finish within two seconds"
+        );
+        assert!(stop_tx.send(()).is_ok());
+        ticker.await.expect("ticker task");
+        assert!(
+            largest_gap_ms.load(std::sync::atomic::Ordering::Relaxed) < 150,
+            "one-worker runtime ticker stalled for {} ms during teardown",
+            largest_gap_ms.load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 }
