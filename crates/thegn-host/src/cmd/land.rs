@@ -30,6 +30,20 @@ use thegn_core::{outln, util};
 
 use crate::integrate::{self, AttemptOutcome};
 
+fn gate_error_message(
+    branch: &str,
+    reason: &str,
+    phase: integrate::GatePhase,
+    class: integrate::GateErrorClass,
+) -> String {
+    let context = crate::cmd::integrate::gate_error_context(Some(phase), Some(class));
+    format!(
+        "{branch} was NOT gated{context} — {reason}. The branch was not judged; \
+         fix the gate environment (see `[merge_queue] gate_setup_command`) \
+         and re-run."
+    )
+}
+
 /// Fold `worktree`'s current branch onto the repo target via the fold-actor's
 /// CAS land, forcing the land regardless of the configured `auto_land`. Returns
 /// `(branch, target, outcome)`. Queue bookkeeping is intentionally left to the
@@ -187,14 +201,15 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
             }
             anyhow::bail!("{branch} breaks the build (gate red); not landed:\n{failures}");
         }
-        AttemptOutcome::GateError { reason, .. } => {
+        AttemptOutcome::GateError {
+            reason,
+            phase,
+            class,
+            ..
+        } => {
             // The gate never ran, so this says nothing about the branch. Naming
             // it "breaks the build" would be a false accusation.
-            anyhow::bail!(
-                "{branch} was NOT gated — {reason}. The branch was not judged; \
-                 fix the gate environment (see `[merge_queue] gate_setup_command`) \
-                 and re-run."
-            );
+            anyhow::bail!("{}", gate_error_message(&branch, &reason, phase, class));
         }
         AttemptOutcome::Unreachable { detail } => {
             anyhow::bail!("{branch}: {detail}");
@@ -437,5 +452,21 @@ mod landed_row_tests {
         .unwrap();
 
         assert_eq!(db.list_merge_queue().unwrap().pop().unwrap(), before);
+    }
+
+    #[test]
+    fn gate_error_message_names_phase_and_class() {
+        let message = super::gate_error_message(
+            "feature",
+            "timeout",
+            crate::integrate::GatePhase::Gate,
+            crate::integrate::GateErrorClass::Timeout,
+        );
+        assert_eq!(
+            message,
+            "feature was NOT gated (gate/timeout) — timeout. The branch was not judged; \
+             fix the gate environment (see `[merge_queue] gate_setup_command`) \
+             and re-run."
+        );
     }
 }
