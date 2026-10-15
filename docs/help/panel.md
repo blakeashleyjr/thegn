@@ -154,7 +154,8 @@ commit as a read-only `git show` view. `↵` opens that commit's files with the
 selected file's diff shown read-only. Mark lines with `space` to start a
 custom patch; `W` diffs the selection against the mark. `E` edits
 (interactive rebase stopping at the commit); bare `e` is always the panel
-width cycle.
+width cycle. `B` marks the rebase base for `i` and `r`; see
+[[git-and-diffs]] for the base-mark behavior.
 
 {{keys:commits}}
 
@@ -191,7 +192,8 @@ files), `?` shows that section's own key cheatsheet.
 
 The worktree's file tree; `/` filters it (directories stay while any
 descendant matches; Esc clears), `↵` previews a file inline, `o` pages
-it in bat, `O` opens your editor, `y` reveals it in yazi. See
+it in bat, `O` opens your editor, `y` reveals it in yazi. An unknown binary
+previews as a hex dump of its first 4096 bytes. See
 [[git-and-diffs]].
 
 {{keys:files}}
@@ -314,7 +316,9 @@ projects' problems never bleed in. `↵` opens the editor at file:line.
 
 **jobs** runs configured and auto-discovered tasks, each in its own slot;
 tests run in a separate slot. `↵` or `r` on a running job asks you to press
-again to restart it. `s` stops only the selected job.
+again to restart it. `s` stops only the selected job, which is labelled
+`stopped`. A job killed after `[limits] test_timeout_secs` is labelled
+`timed out after Ns`.
 
 {{keys:jobs}}
 
@@ -352,7 +356,9 @@ message; Full width puts it in the detail column.
 Enter jumps to the row's worktree or section and marks it read; `space`
 expands the whole message in place. **o** opens an HTTP(S) source link.
 `a` clears the inbox and acknowledges live "needs you" signals. It asks
-for confirmation and ignores an active filter. `g` toggles scope between
+for confirmation. With a non-empty filter, a menu offers "only the N
+filtered" first and "all in scope" second; with no filter it stays a plain
+confirm. `g` toggles scope between
 this repo and every worktree. The popup's `a` also asks for confirmation;
 see [[bars]].
 
@@ -392,8 +398,10 @@ When sandboxing is off, a one-line banner says so. See [[sandboxing]]. **hosts**
 machines: `n` adds one, `p` provisions, `r` re-probes, `m` opens the
 action menu (which holds removal), `c` grants install consent, `x`
 forgets cached state. **environments** lists `[env.*]`: `↵` (re)binds the
-env to this worktree, `t` tests provider env tokens only, `n` adds, `x`
-removes (confirmed).
+env to this worktree. If placement changes, it asks first; new panes move
+to the new placement while running panes stay where they are. A same-placement
+bind is immediate. `t` tests provider env tokens only, `n` adds, `x` removes
+(confirmed).
 The environment currently bound to the worktree carries a visible bound marker.
 
 At Full width, hosts shows the host list beside the highlighted host's

@@ -337,6 +337,13 @@ pub struct LayoutSnapshot {
     pub now: i64,
 }
 
+/// Plain session rows prepared on the DB writer and installed by the loop.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedWorkspaceSwitch {
+    pub(crate) worktrees: Vec<WorktreeGroup>,
+    pub(crate) active: usize,
+}
+
 /// Adopt every registry row belonging to `session`'s workspace that `worktrees`
 /// does not already carry, appending each in the order `db.worktrees()` returns
 /// them. Returns the `worktree path → registry position` map the caller needs
@@ -854,34 +861,62 @@ impl Session {
     /// absolute path: a non-path session id (the legacy `"default"`, or an empty
     /// id) must adopt nothing rather than mint a bogus slug and pull in rows
     /// that merely share a legacy `session_name`.
+    #[cfg(test)]
     pub(crate) fn adopt_missing_registered(
         &mut self,
         db: &Db,
         cfg: &thegn_core::config::Config,
     ) -> usize {
-        let id = self.id.clone();
-        let path = std::path::Path::new(&id);
+        let worktrees = Self::prepare_registered_adoption(&self.id, &self.worktrees, db, cfg);
+        self.apply_registered_adoption(worktrees)
+    }
+
+    /// Build registry adoption data off-loop, keeping the live focus index.
+    pub(crate) fn prepare_registered_adoption(
+        session_id: &str,
+        existing: &[WorktreeGroup],
+        db: &Db,
+        cfg: &thegn_core::config::Config,
+    ) -> Vec<WorktreeGroup> {
+        let mut worktrees = existing.to_vec();
+        let before = worktrees.len();
+        let path = std::path::Path::new(session_id);
         if !path.is_absolute() {
-            return 0;
+            return Vec::new();
         }
         let slug = thegn_core::repo::repo_slug_with(db, path);
-        let before = self.worktrees.len();
         let registry_rows = match db.worktrees() {
             Ok(rows) => Some(rows),
             Err(error) => {
-                tracing::debug!(%error, session = %id, "worktree registry read failed during warm adoption");
+                tracing::debug!(%error, session = %session_id, "worktree registry read failed during warm adoption");
                 None
             }
         };
         adopt_registered_worktrees(
             db,
             cfg,
-            &id,
+            session_id,
             &slug,
             registry_rows.as_deref(),
-            &mut self.worktrees,
+            &mut worktrees,
         );
-        self.worktrees.len() - before
+        worktrees.split_off(before)
+    }
+
+    /// Install prepared registry rows without changing the active index.
+    pub(crate) fn apply_registered_adoption(&mut self, worktrees: Vec<WorktreeGroup>) -> usize {
+        let mut adopted = 0;
+        for group in worktrees {
+            if !self
+                .worktrees
+                .iter()
+                .any(|existing| existing.name == group.name)
+            {
+                self.worktrees.push(group);
+                adopted += 1;
+            }
+        }
+        adopted
     }
 
     /// Focus a (group, tab) pair, clamped.
@@ -897,10 +932,10 @@ impl Session {
     pub fn switch_to_workspace(&mut self, repo_path: &str, db: &thegn_core::db::Db) -> Result<()> {
         let now = crate::run::now_secs();
         self.persist(db, &self.id, now)?;
-        // The non-hot callers (workspace create/remove, tests) have no loaded
-        // config in scope — `land_after_workspace_removed` only gets a `Db` —
-        // so this wrapper keeps the default-config fallback. The hot path
-        // (`run::switch_workspace`) threads the real config; see THE-73.
+        // Workspace create/remove callers have no loaded config in scope, so
+        // this synchronous wrapper keeps the default-config fallback. The UI
+        // loop's prepare job threads the loaded config through
+        // `prepare_workspace_switch` (THE-73).
         self.switch_to_workspace_deferred(repo_path, db, &thegn_core::config::Config::default())?;
         self.persist(db, &self.id, now)?;
         // Record the workspace we just entered as the global "last active" so
@@ -909,15 +944,12 @@ impl Session {
         Ok(())
     }
 
-    /// The workspace-switch hot-path variant (`run::switch_workspace`): swaps
-    /// the in-memory session WITHOUT any full-layout write. The caller has
-    /// already queued the outgoing layout persist on the `db_task` writer (and
-    /// flushed it before this read), and takes responsibility for persisting
-    /// the resurrected layout + the active-workspace pointer afterwards — it
-    /// enqueues both AFTER `remap_cold_workspace_ids`, which also fixes a
-    /// long-standing wrinkle where the inline persist recorded pre-remap pane
-    /// ids. The plain [`Self::switch_to_workspace`] above keeps the synchronous
-    /// persists for the non-hot callers (workspace create/remove, tests).
+    /// Synchronous deferred variant for callers outside the event loop and for
+    /// tests. It swaps the in-memory session without full-layout writes; the
+    /// loop uses `prepare_workspace_switch` on the FIFO DB writer and applies
+    /// its result after the outgoing layout persist.
+    /// The plain [`Self::switch_to_workspace`] above keeps synchronous persists
+    /// for workspace create/remove callers.
     /// `cfg` is the loaded config, threaded through to
     /// [`Self::resurrect_with_cfg`] so a worktree with a non-local placement
     /// (ssh/k8s/provider, including one inherited from the repo's ambient env)
@@ -930,20 +962,30 @@ impl Session {
         db: &thegn_core::db::Db,
         cfg: &thegn_core::config::Config,
     ) -> Result<()> {
-        // Switching *to* a workspace is unambiguous intent to keep it, so lift
-        // any prior removal tombstone (see `WorkspaceStore::tombstone_workspace`)
-        // — an explicit reopen must resurrect it into the sidebar again.
-        let _ = db.clear_workspace_tombstone(repo_path); // best-effort: cache write: the tombstone drives sidebar resurrection only
+        // Preserve A→B→A layout-read ordering for off-loop synchronous callers.
+        if !crate::db_task::flush(std::time::Duration::from_millis(300)) {
+            tracing::debug!(target: "thegn::workspace_switch", "workspace switch layout barrier timed out");
+        }
+        let prepared = Self::prepare_workspace_switch(repo_path, db, cfg)?;
+        self.apply_workspace_switch(repo_path, prepared);
+        Ok(())
+    }
 
-        // Layout persists ride the db_task writer queue now; a queued write
-        // for the TARGET session (A→B→A faster than the writer drains) must
-        // land before resurrect reads its rows back. Bounded wait — the queue
-        // is normally empty, so this is a µs barrier round-trip.
-        let _ = crate::db_task::flush(std::time::Duration::from_millis(300)); // best-effort: bounded barrier: a missed flush just races a fast A→B→A layout read (comment above)
+    /// Read and seed a cold workspace on the DB writer. FIFO ordering after the
+    /// outgoing layout persist replaces the old loop-side flush barrier.
+    pub(crate) fn prepare_workspace_switch(
+        repo_path: &str,
+        db: &thegn_core::db::Db,
+        cfg: &thegn_core::config::Config,
+    ) -> Result<PreparedWorkspaceSwitch> {
+        // Switching to a workspace is explicit intent to keep it, so remove a
+        // prior removal tombstone and let the workspace reappear in the tree.
+        if let Err(error) = db.clear_workspace_tombstone(repo_path) {
+            tracing::debug!(target: "thegn::workspace_switch", %error, "failed to clear workspace tombstone");
+        }
         let new_session = Session::resurrect_with_cfg(db, repo_path, cfg)?;
         let mut worktrees = new_session.worktrees;
         let active = new_session.active;
-
         if worktrees.is_empty() {
             let base = std::path::Path::new(repo_path)
                 .file_name()
@@ -967,14 +1009,25 @@ impl Session {
             } else {
                 "dir"
             };
-            let _ = db.put_workspace(repo_path, &base, kind); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-            let _ = db.touch_repo(repo_path, &base); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            if let Err(error) = db.put_workspace(repo_path, &base, kind) {
+                tracing::debug!(target: "thegn::workspace_switch", %error, "failed to seed workspace row");
+            }
+            if let Err(error) = db.touch_repo(repo_path, &base) {
+                tracing::debug!(target: "thegn::workspace_switch", %error, "failed to seed workspace repo row");
+            }
         }
+        Ok(PreparedWorkspaceSwitch { worktrees, active })
+    }
 
+    /// Install prepared rows without performing DB work.
+    pub(crate) fn apply_workspace_switch(
+        &mut self,
+        repo_path: &str,
+        prepared: PreparedWorkspaceSwitch,
+    ) {
         self.id = repo_path.to_string();
-        self.worktrees = worktrees;
-        self.active = active;
-        Ok(())
+        self.worktrees = prepared.worktrees;
+        self.active = prepared.active;
     }
 
     /// Cycle to the next tab within the active group (wraps).
@@ -2062,5 +2115,162 @@ mod tests {
         };
         let hydrated = session.clone_for_hydrate();
         assert_eq!(hydrated.worktrees[0].epoch, first.epoch);
+    }
+
+    #[test]
+    fn prepare_then_apply_matches_resurrected_second_workspace() {
+        let scratch = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&scratch.path().join("db.sqlite")).unwrap();
+        let first_repo = scratch.path().join("prepared-switch-a");
+        let repo = scratch.path().join("prepared-switch-b");
+        std::fs::create_dir(&first_repo).unwrap();
+        std::fs::create_dir(&repo).unwrap();
+        let first_repo = first_repo.to_string_lossy().into_owned();
+        let repo = repo.to_string_lossy().into_owned();
+        let first_slug = thegn_core::repo::repo_slug_with(&db, std::path::Path::new(&first_repo));
+        let slug = thegn_core::repo::repo_slug_with(&db, std::path::Path::new(&repo));
+        let first = Session {
+            id: first_repo.clone(),
+            worktrees: vec![WorktreeGroup::new(
+                format!("{first_slug}/main"),
+                GroupKind::Home,
+                &first_repo,
+            )],
+            active: 0,
+        };
+        first.persist(&db, &first_repo, 10).unwrap();
+        let second = Session {
+            id: repo.clone(),
+            worktrees: vec![WorktreeGroup::new(
+                format!("{slug}/main"),
+                GroupKind::Home,
+                &repo,
+            )],
+            active: 0,
+        };
+        second.persist(&db, &repo, 11).unwrap();
+
+        let mut split = first;
+        let prepared =
+            Session::prepare_workspace_switch(&repo, &db, &thegn_core::config::Config::default())
+                .unwrap();
+        split.apply_workspace_switch(&repo, prepared);
+        let expected =
+            Session::resurrect_with_cfg(&db, &repo, &thegn_core::config::Config::default())
+                .unwrap();
+        assert_eq!(split.id, repo);
+        assert_eq!(split.worktrees, expected.worktrees);
+        assert_eq!(split.active, expected.active);
+    }
+
+    #[test]
+    fn prepare_empty_workspace_seeds_workspace_row_and_slug_home_group() {
+        let scratch = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&scratch.path().join("db.sqlite")).unwrap();
+        let repo = scratch.path().join("empty-workspace");
+        std::fs::create_dir(&repo).unwrap();
+        let repo = repo.to_string_lossy().into_owned();
+        let slug = thegn_core::repo::repo_slug_with(&db, std::path::Path::new(&repo));
+        let prepared =
+            Session::prepare_workspace_switch(&repo, &db, &thegn_core::config::Config::default())
+                .unwrap();
+        assert_eq!(
+            prepared.worktrees[0].name,
+            thegn_core::repo::home_tab(&slug)
+        );
+        assert!(
+            db.workspaces()
+                .unwrap()
+                .iter()
+                .any(|row| row.repo_path == repo)
+        );
+    }
+
+    #[test]
+    fn adopt_prepare_apply_matches_adopt_missing_registered() {
+        let scratch = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&scratch.path().join("db.sqlite")).unwrap();
+        let repo = "/home/me/code/adopt-prepared";
+        let slug = thegn_core::repo::repo_slug_with(&db, std::path::Path::new(repo));
+        let worktree = scratch.path().join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        let worktree = worktree.to_string_lossy().into_owned();
+        db.put_worktree(
+            &format!("{slug}/extra"),
+            repo,
+            &worktree,
+            "extra",
+            None,
+            None,
+        )
+        .unwrap();
+        let original = Session {
+            id: repo.into(),
+            worktrees: vec![WorktreeGroup::new(
+                format!("{slug}/main"),
+                GroupKind::Home,
+                repo,
+            )],
+            active: 0,
+        };
+        let mut direct = original.clone();
+        direct.adopt_missing_registered(&db, &thegn_core::config::Config::default());
+        let prepared = Session::prepare_registered_adoption(
+            &original.id,
+            &original.worktrees,
+            &db,
+            &thegn_core::config::Config::default(),
+        );
+        let mut split = original;
+        split.apply_registered_adoption(prepared);
+        assert_eq!(split.worktrees, direct.worktrees);
+        assert_eq!(split.active, direct.active);
+    }
+
+    #[test]
+    fn adoption_does_not_resurrect_a_group_removed_between_prepare_and_apply() {
+        let scratch = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&scratch.path().join("db.sqlite")).unwrap();
+        let repo = "/home/me/code/adopt-race";
+        let slug = thegn_core::repo::repo_slug_with(&db, std::path::Path::new(repo));
+        let worktree = scratch.path().join("registered");
+        std::fs::create_dir(&worktree).unwrap();
+        let worktree = worktree.to_string_lossy().into_owned();
+        db.put_worktree(
+            &format!("{slug}/registered"),
+            repo,
+            &worktree,
+            "registered",
+            None,
+            None,
+        )
+        .unwrap();
+        let prepared_existing = vec![
+            WorktreeGroup::new(format!("{slug}/home"), GroupKind::Home, repo),
+            WorktreeGroup::new("removed/branch", GroupKind::Branch, "/gone"),
+        ];
+        let rows = Session::prepare_registered_adoption(
+            repo,
+            &prepared_existing,
+            &db,
+            &thegn_core::config::Config::default(),
+        );
+        let mut live = Session {
+            id: repo.into(),
+            worktrees: vec![prepared_existing[0].clone()],
+            active: 0,
+        };
+        live.apply_registered_adoption(rows);
+        assert!(
+            !live
+                .worktrees
+                .iter()
+                .any(|group| group.name == "removed/branch")
+        );
+        assert!(
+            live.worktrees
+                .iter()
+                .any(|group| group.name == format!("{slug}/registered"))
+        );
     }
 }

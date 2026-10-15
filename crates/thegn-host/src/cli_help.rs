@@ -79,6 +79,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "theme",
             "skills",
             "doctor",
+            "db",
             "setup",
             "completions",
         ],

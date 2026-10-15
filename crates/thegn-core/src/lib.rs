@@ -115,6 +115,12 @@ mod db_semantic;
 mod db_session_migration;
 mod db_trust;
 mod db_usage;
+mod db_vacuum;
+pub use db_vacuum::{
+    AUTO_CONVERT_MAX_LIVE_BYTES, AutoVacuum, ConvertOutcome, DbSpace, INCREMENTAL_PAGES_PER_ROUND,
+    MaintenanceReport, MaintenanceStep, NOTIFICATION_READ_RETENTION_SECS, VacuumError,
+    plan_maintenance,
+};
 mod db_workspace;
 mod db_worktree_identity;
 mod db_zones;

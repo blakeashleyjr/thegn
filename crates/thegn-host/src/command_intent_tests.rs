@@ -47,6 +47,7 @@ fn every_configured_top_level_variant_parses_without_static_authority() {
     case!(Command::Land { .. }, ["land"]);
     case!(Command::Merge { .. }, ["merge", "list"]);
     case!(Command::Disk { .. }, ["disk"]);
+    case!(Command::Db { .. }, ["db", "vacuum", "--dry-run"]);
     case!(Command::Clean { .. }, ["clean"]);
     case!(Command::Repos { .. }, ["repos"]);
     case!(Command::Recent { .. }, ["recent"]);

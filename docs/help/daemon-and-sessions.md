@@ -54,7 +54,8 @@ Recordings are terminal output and can contain whatever secrets a tool printed,
 so files are written `0600` under a `0700` directory (`[recording] dir`, default
 `$XDG_STATE_HOME/thegn/recordings`), the API returns only the path — never the
 contents — and a `[recording] max_bytes` cap finalizes a valid file instead of
-filling the disk. Under disk pressure, recording drops output into marked gaps;
+filling the disk. When the recording writer falls behind and its queue or the
+shared in-flight byte budget is full, recording drops output into marked gaps;
 status reports how many bytes were dropped. This is separate from the
 client-side whole-UI recorder (`Ctrl-Alt-r`) and from per-pane time-travel
 replay.

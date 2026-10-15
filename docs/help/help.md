@@ -24,7 +24,7 @@ Everything here ships inside the binary — no network, no external docs.
   with copying as fallback.
 - `/` searches every page. Titles match fuzzily, bodies by substring;
   `↵` jumps to the matching section. Long contents show overflow markers.
-- `Esc` closes.
+- `Esc`, `q`, `F1`, Ctrl-C, or your rebound `[keybinds] help` key closes.
 
 ## Where the content comes from
 

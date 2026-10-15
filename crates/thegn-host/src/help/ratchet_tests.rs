@@ -38,7 +38,6 @@ fn known_unadvertised_panel_key(section: crate::panel::Section, chord: char) -> 
             | (crate::panel::Section::Logs, 'Y')
             | (crate::panel::Section::Media, '+' | '-' | '[' | ']' | 'f')
             | (crate::panel::Section::PrQueue, 'h')
-            | (crate::panel::Section::Environments, 't')
     )
 }
 
@@ -190,7 +189,7 @@ fn help_section_keys_ratchet_update() {
         "# help-section-keys-ratchet — `panel:<section>:<chord>` prose entries".to_string(),
         "# containing real chords omitted from the subsection's section tables. Shrink only."
             .to_string(),
-        "# notifications A and /; logs Y; environments t; media + - [ ] f; PR queue h.".to_string(),
+        "# notifications A and /; logs Y; media + - [ ] f; PR queue h.".to_string(),
     ];
     let body = source
         .split_once("---\n")

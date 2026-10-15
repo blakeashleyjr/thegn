@@ -119,6 +119,7 @@ fn classify_command(command: &Command) -> CommandIntent<'_> {
         | Command::SandboxArgv { .. }
         | Command::Sandbox { .. }
         | Command::Keys { .. }
+        | Command::Db { .. }
         | Command::Setup
         | Command::Serve { .. }
         | Command::Session { .. }
