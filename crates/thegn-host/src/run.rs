@@ -378,8 +378,8 @@ fn toggle_recorder(
 }
 
 /// Fetch the git section's heat/velocity/log payload off the loop (skipped
-/// while the per-worktree cache is warm). The result rides `tx` + a waker
-/// pulse; the body shows "loading…" until it lands.
+/// while the per-worktree cache is warm). Failed payloads remain renderable
+/// and retry on the next sync. The result rides `tx` + a waker pulse.
 fn kick_git_docs_fetch(
     generation: u64,
     session: &crate::session::Session,
@@ -387,8 +387,8 @@ fn kick_git_docs_fetch(
     tx: &tokio_mpsc::UnboundedSender<(u64, crate::panel::docs::DocsPayload)>,
     waker: &TerminalWaker,
 ) {
-    use crate::panel::docs::{DocsPayload, GitDocs};
-    if panel_ui.docs.git.is_some() {
+    use crate::panel::docs::{DocsPayload, git_docs_from, needs_git_fetch};
+    if !needs_git_fetch(panel_ui.docs.git.as_ref()) {
         return;
     }
     const WEEKS: usize = 36;
@@ -400,12 +400,9 @@ fn kick_git_docs_fetch(
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
         let git = thegn_svc::git::CliGit;
         let now = thegn_core::util::now();
-        let epochs = git.commit_times(&loc, WEEKS).unwrap_or_default();
-        let data = GitDocs {
-            weekly: thegn_core::gitviz::weekly_counts(&epochs, now, WEEKS),
-            log: git.log_graph(&loc, 40).unwrap_or_default(),
-            total: epochs.len() as u32,
-        };
+        let epochs = git.commit_times(&loc, WEEKS);
+        let log = git.log_graph(&loc, 40);
+        let data = git_docs_from(epochs, log, now, WEEKS);
         if tx.send((generation, DocsPayload::Git(data))).is_ok() {
             let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
@@ -21454,7 +21451,15 @@ async fn event_loop<T: Terminal>(
                                         });
                                     model.status = format!("Copied {sha}");
                                 }
-                                None => model.status = "No commit data yet".into(),
+                                None => {
+                                    model.status = panel_ui
+                                        .docs
+                                        .git
+                                        .as_ref()
+                                        .and_then(|docs| docs.error.as_ref())
+                                        .map(|reason| format!("No commit data: {reason}"))
+                                        .unwrap_or_else(|| "No commit data yet".into());
+                                }
                             }
                             true
                         }
