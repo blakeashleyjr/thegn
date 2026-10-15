@@ -209,6 +209,8 @@ uninitialized, or otherwise unavailable; it does not turn on the ordinary
 dirty dot. Set `[ui] sidebar_show_submodules = false` to hide only this marker.
 The setting is trusted user/workspace configuration and cannot be supplied by
 repo-local `.thegn.toml`.
+The +/- line counts show a dim `bin` when the change includes binary files, and
+`+capped`/`-capped` in place of a count when the diff cap is reached.
 
 ## Act
 
