@@ -134,6 +134,8 @@ pub mod disk_fill;
 pub mod disk_reclaim;
 pub mod dns_filter;
 pub mod editor;
+pub mod egress_nft;
+pub mod egress_ranges;
 pub mod env;
 pub mod envbuild;
 pub mod envplan;
