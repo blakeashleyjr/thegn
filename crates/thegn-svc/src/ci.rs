@@ -148,8 +148,17 @@ pub fn client_for_system(system: CiSystem) -> Option<CiClient> {
 /// System → client factory carrying provider configuration and resolving any
 /// configured token once, at construction. The value is injected into the
 /// child environment (never argv) for every `glab` call.
-fn client_for_system_with_config(system: CiSystem, cfg: &CiConfig) -> Option<CiClient> {
+pub fn client_for_system_with_config(system: CiSystem, cfg: &CiConfig) -> Option<CiClient> {
     client_for_system_with_config_and_cancel(system, cfg, Arc::new(AtomicBool::new(false)))
+}
+
+/// Value-free credential mode suitable for an `auto` doctor probe.
+pub fn gitlab_credential_note(cfg: &CiConfig) -> &'static str {
+    GitlabCredential::from_resolution(
+        &cfg.gitlab.token,
+        crate::secret::resolve_outcome(&cfg.gitlab.token, BareAs::Literal, "ci:gitlab"),
+    )
+    .mode_note()
 }
 
 fn client_for_system_with_config_and_cancel(
@@ -1471,6 +1480,25 @@ impl std::fmt::Debug for GitlabCredential {
 }
 
 impl GitlabCredential {
+    fn mode_note(&self) -> &'static str {
+        match self {
+            Self::CliManaged => {
+                "credential: CLI-managed (`glab auth login`); [ci.gitlab] token unset or the default env:GITLAB_TOKEN is not set"
+            }
+            Self::Configured {
+                explicit: false, ..
+            } => {
+                "credential: env:GITLAB_TOKEN (shipped default) for local worktrees; remote/provider worktrees use the remote glab login"
+            }
+            Self::Configured { explicit: true, .. } => {
+                "credential: configured [ci.gitlab] token (resolved); refused for remote/provider worktrees"
+            }
+            Self::Unavailable => {
+                "credential: configured [ci.gitlab] token reference could not be resolved; every GitLab CI call is refused"
+            }
+        }
+    }
+
     fn from_resolution(raw: &str, resolution: crate::secret::SecretResolution) -> Self {
         match resolution {
             crate::secret::SecretResolution::Absent => Self::CliManaged,
@@ -1506,13 +1534,17 @@ pub struct GitlabCi {
 
 impl thegn_core::seam::Probe for GitlabCi {
     fn probe(&self) -> thegn_core::seam::ProbeReport {
-        thegn_core::seam::ProbeReport::new(
-            "ci",
-            "gitlab",
-            crate::seam::registry::binary_availability("glab"),
-        )
-        .with_caps(&self.caps())
-        .note("GitLab CI via `glab api`")
+        let availability = if matches!(&self.credential, GitlabCredential::Unavailable) {
+            thegn_core::seam::Availability::Unavailable(
+                "configured [ci.gitlab] token reference could not be resolved; fix it, or set token = \"\" to use glab's own login".into(),
+            )
+        } else {
+            crate::seam::registry::binary_availability("glab")
+        };
+        thegn_core::seam::ProbeReport::new("ci", "gitlab", availability)
+            .with_caps(&self.caps())
+            .note("GitLab CI via `glab api`")
+            .note(self.credential.mode_note())
     }
 }
 
@@ -3267,6 +3299,43 @@ esac
             explicit: true,
         };
         assert_eq!(format!("{credential:?}"), "Configured(<redacted>)");
+    }
+
+    #[test]
+    fn gitlab_probe_reports_credential_mode_without_the_value() {
+        use thegn_core::seam::Probe;
+
+        let mut cfg = CiConfig::default();
+        cfg.gitlab.token = "fixture-secret-token".into();
+        let configured = GitlabCi::from_config(&cfg, Arc::new(AtomicBool::new(false))).probe();
+        assert!(configured.notes.iter().any(|note| {
+            note.contains("configured [ci.gitlab] token") && note.contains("resolved")
+        }));
+        assert!(
+            configured
+                .notes
+                .iter()
+                .all(|note| !note.contains("fixture-secret-token"))
+        );
+        assert!(!format!("{:?}", configured.availability).contains("fixture-secret-token"));
+
+        cfg.gitlab.token.clear();
+        let cli_managed = GitlabCi::from_config(&cfg, Arc::new(AtomicBool::new(false))).probe();
+        assert!(
+            cli_managed
+                .notes
+                .iter()
+                .any(|note| note.contains("credential: CLI-managed"))
+        );
+
+        assert!(std::env::var_os("THE541_SURELY_UNSET_VAR").is_none());
+        cfg.gitlab.token = "env:THE541_SURELY_UNSET_VAR".into();
+        let unavailable = GitlabCi::from_config(&cfg, Arc::new(AtomicBool::new(false))).probe();
+        assert!(matches!(
+            unavailable.availability,
+            thegn_core::seam::Availability::Unavailable(ref reason)
+                if reason.contains("[ci.gitlab] token")
+        ));
     }
 
     #[test]
