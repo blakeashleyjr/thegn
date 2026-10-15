@@ -176,7 +176,12 @@ fn log_issues_velocity(ctx: &SectionCtx) -> Vec<PanelRow> {
     if deep {
         rows.push(PanelRow::blank());
         match &ctx.ui.docs.git {
-            Some(docs) if docs.error.is_some() => {
+            Some(docs)
+                if docs
+                    .error
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("commit calendar:")) =>
+            {
                 let reason = docs.error.as_deref().unwrap_or_default();
                 rows.push(PanelRow::plain(Line::split(
                     vec![seg(g2(), "VELOCITY").bold()],
@@ -564,9 +569,11 @@ mod tests {
 
     fn render_velocity(docs: GitDocs) -> String {
         let model = FrameModel::default();
-        let mut ui = PanelUi::default();
-        ui.open = Section::Pr;
-        ui.width = PanelWidth::Half;
+        let mut ui = PanelUi {
+            open: Section::Pr,
+            width: PanelWidth::Half,
+            ..Default::default()
+        };
         ui.docs.git = Some(docs);
         let ctx = SectionCtx {
             model: &model,
@@ -616,5 +623,23 @@ mod tests {
 
         assert!(rendered.contains("commits/wk"), "rendered: {rendered}");
         assert!(rendered.contains("108 commits"), "rendered: {rendered}");
+    }
+
+    #[test]
+    fn log_failure_does_not_hide_successful_velocity_data() {
+        let docs = GitDocs {
+            weekly: vec![3; 36],
+            log: Vec::new(),
+            total: 108,
+            error: Some("commit log: git failed".into()),
+        };
+        let rendered = render_velocity(docs);
+
+        assert!(rendered.contains("commits/wk"), "rendered: {rendered}");
+        assert!(rendered.contains("108 commits"), "rendered: {rendered}");
+        assert!(
+            !rendered.contains("history unavailable"),
+            "rendered: {rendered}"
+        );
     }
 }
