@@ -90,11 +90,11 @@ impl FloorMiss {
         )
     }
 
-    /// An actionable refusal that names both supported floor opt-outs.
+    /// An actionable refusal that names the supported floor opt-outs.
     /// `message()` remains the concise warning used by degrade paths.
     pub fn refusal(&self) -> String {
         format!(
-            "{}; to launch on the host set [sandbox] isolation_floor = \"off\"; with no explicit floor, enabled = false, backend = \"none\", or \"run on host\" also opts out",
+            "{}; to launch on the host set [sandbox] isolation_floor = \"off\"; with no explicit floor, enabled = false, backend = \"none\", or \"run on host\" also opts out; for an explicit floor, on_floor_miss = \"degrade\" permits a warned launch",
             self.message()
         )
     }
@@ -397,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn refusal_names_both_opt_outs_and_preserves_message() {
+    fn refusal_names_opt_outs_and_explicit_floor_degrade_and_preserves_message() {
         let FloorDecision::Fail(miss) = decide(
             IsolationFloor::SharedKernel,
             OnFloorMiss::Fail,
@@ -410,6 +410,10 @@ mod tests {
         let message = miss.message();
         assert!(refusal.contains(message.as_str()));
         assert!(refusal.contains("isolation_floor = \"off\""));
+        assert!(refusal.contains("enabled = false"));
+        assert!(refusal.contains("backend = \"none\""));
+        assert!(refusal.contains("run on host"));
+        assert!(refusal.contains("on_floor_miss = \"degrade\""));
     }
 
     #[test]

@@ -719,7 +719,7 @@ pub fn prepare_sandbox_env(
             // enter (after the runtime degrade `finalize_*` just applied) against
             // the demanded floor. A fail-closed miss must abort BEFORE anything
             // spawns on the host — so this sits ahead of `attach_vpn`/`ensure`.
-            let floor = thegn_core::sandbox_floor::floor_in_force(&sb, false);
+            let floor = candidate_floor_in_force(&sb, worktree);
             if floor != thegn_core::config::IsolationFloor::Off {
                 let actual = spec.capabilities().isolation;
                 match thegn_core::sandbox_floor::decide(
@@ -1811,6 +1811,14 @@ pub(crate) fn force_host_requested(worktree: &str) -> bool {
         .lock()
         .map(|s| s.contains(worktree))
         .unwrap_or(false)
+}
+
+/// Floor used while considering each resolved sandbox candidate.
+fn candidate_floor_in_force(
+    sandbox: &thegn_core::config::SandboxConfig,
+    worktree: &str,
+) -> thegn_core::config::IsolationFloor {
+    thegn_core::sandbox_floor::floor_in_force(sandbox, force_host_requested(worktree))
 }
 
 /// Whether an unavailable sandbox may intentionally become a host shell.

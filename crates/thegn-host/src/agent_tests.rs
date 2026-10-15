@@ -22,6 +22,17 @@ fn sandbox_resolution_does_not_authorize_implicit_host_fallback() {
 }
 
 #[test]
+fn pinned_worktree_candidate_check_uses_off_floor_by_default() {
+    let sandbox = thegn_core::config::SandboxConfig::default();
+    let worktree = "candidate-floor-host-pin-regression";
+    request_force_host(worktree);
+    let floor = candidate_floor_in_force(&sandbox, worktree);
+    clear_force_host(worktree);
+
+    assert_eq!(floor, thegn_core::config::IsolationFloor::Off);
+}
+
+#[test]
 fn on_missing_fail_refuses_the_pane_instead_of_exiting() {
     with_temp_state("auto-host-on-missing-fail", || {
         let mut cfg = cfg_with(&[], &[]);

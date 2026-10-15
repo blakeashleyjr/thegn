@@ -1906,6 +1906,7 @@ mod tests {
         use crate::config::OnFloorMiss;
         // A base that explicitly permits degradation can be hardened to fail.
         let mut permissive = base();
+        permissive.isolation_floor = Some(crate::config::IsolationFloor::SharedKernel);
         permissive.on_floor_miss = OnFloorMiss::Degrade;
         let mut o = overlay();
         o.on_floor_miss = Some(OnFloorMiss::Fail);
@@ -1914,6 +1915,7 @@ mod tests {
 
         // fail → degrade is a softening: denied.
         let mut strict = base();
+        strict.isolation_floor = Some(crate::config::IsolationFloor::SharedKernel);
         strict.on_floor_miss = OnFloorMiss::Fail;
         let mut o = overlay();
         o.on_floor_miss = Some(OnFloorMiss::Degrade);
