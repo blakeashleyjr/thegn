@@ -2630,7 +2630,8 @@ mod tests {
                 ..Default::default()
             },
             ChangeRow {
-                path: "ab/outside.rs".into(),
+                // A path whose name merely starts with "ab" is not under "a" or "ab".
+                path: "abc/outside.rs".into(),
                 added: 9,
                 deleted: 9,
                 ..Default::default()
