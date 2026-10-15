@@ -4956,6 +4956,7 @@ heartbeat_secs = 10
 # scopes = []                           # host.call scope ceiling; default empty (read/write/git/merge_add/exec/admin).
 # mode = "one_shot"                     # Process mode; default is one_shot (or resident).
 # enabled = true                        # Whether the plugin may run; default is true.
+# trusted_native = false                # Required (true) for non-surface capabilities or scopes: runs as native code with full user authority; capabilities are protocol checks, not a sandbox.
 # [[plugins.contributions]]
 # id = "example-status"                 # Stable contribution identifier (required).
 # extension_point = "StatusBarSegment"  # Host extension point (required).
