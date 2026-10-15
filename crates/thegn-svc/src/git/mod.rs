@@ -1926,7 +1926,7 @@ pub(crate) fn run_w(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Resul
     }
     // Remote locs do not have a local repository lock; local mutations must
     // fail closed when the advisory lock cannot be acquired.
-    let _lock = if loc.is_remote() {
+    let lock = if loc.is_remote() {
         None
     } else {
         Some(require_mutation_lock(
@@ -1934,7 +1934,7 @@ pub(crate) fn run_w(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Resul
             args,
         )?)
     };
-    match _lock.as_ref() {
+    match lock.as_ref() {
         Some(held) => run_w_locked(loc, envs, args, held),
         None => run_w_unlocked(loc, envs, args),
     }
