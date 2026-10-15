@@ -141,7 +141,6 @@ impl EgressProxyLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::SocketAddrV4;
 
     #[test]
     fn proxy_only_render_is_deterministic_and_accepts_only_the_proxy() {
@@ -213,40 +212,31 @@ mod tests {
     #[test]
     fn proxy_limits_validate_bounds() {
         EgressProxyLimits::default().validate().unwrap();
-        for field in [
-            "connect_timeout_ms",
-            "header_timeout_ms",
-            "idle_timeout_ms",
-            "max_lifetime_ms",
-        ] {
+        let timeout_setters: [fn(&mut EgressProxyLimits, u64); 4] = [
+            |limits, value| limits.connect_timeout_ms = value,
+            |limits, value| limits.header_timeout_ms = value,
+            |limits, value| limits.idle_timeout_ms = value,
+            |limits, value| limits.max_lifetime_ms = value,
+        ];
+        for set_timeout in timeout_setters {
             let mut limits = EgressProxyLimits::default();
-            match field {
-                "connect_timeout_ms" => limits.connect_timeout_ms = 0,
-                "header_timeout_ms" => limits.header_timeout_ms = 0,
-                "idle_timeout_ms" => limits.idle_timeout_ms = 0,
-                "max_lifetime_ms" => limits.max_lifetime_ms = 0,
-                _ => unreachable!(),
+            for (value, valid) in [
+                (0, false),
+                (MAX_PROXY_TIMEOUT_MS + 1, false),
+                (MAX_PROXY_TIMEOUT_MS, true),
+            ] {
+                set_timeout(&mut limits, value);
+                if valid {
+                    limits.validate().unwrap();
+                } else {
+                    assert!(limits.validate().is_err(), "timeout value {value}");
+                }
             }
-            assert!(limits.validate().is_err(), "{field} zero");
-            match field {
-                "connect_timeout_ms" => limits.connect_timeout_ms = MAX_PROXY_TIMEOUT_MS + 1,
-                "header_timeout_ms" => limits.header_timeout_ms = MAX_PROXY_TIMEOUT_MS + 1,
-                "idle_timeout_ms" => limits.idle_timeout_ms = MAX_PROXY_TIMEOUT_MS + 1,
-                "max_lifetime_ms" => limits.max_lifetime_ms = MAX_PROXY_TIMEOUT_MS + 1,
-                _ => unreachable!(),
-            }
-            assert!(limits.validate().is_err(), "{field} above maximum");
-            match field {
-                "connect_timeout_ms" => limits.connect_timeout_ms = MAX_PROXY_TIMEOUT_MS,
-                "header_timeout_ms" => limits.header_timeout_ms = MAX_PROXY_TIMEOUT_MS,
-                "idle_timeout_ms" => limits.idle_timeout_ms = MAX_PROXY_TIMEOUT_MS,
-                "max_lifetime_ms" => limits.max_lifetime_ms = MAX_PROXY_TIMEOUT_MS,
-                _ => unreachable!(),
-            }
-            limits.validate().unwrap();
         }
-        let mut limits = EgressProxyLimits::default();
-        limits.max_connections = 0;
+        let mut limits = EgressProxyLimits {
+            max_connections: 0,
+            ..Default::default()
+        };
         assert!(limits.validate().is_err());
         limits.max_connections = MAX_PROXY_CONNECTIONS + 1;
         assert!(limits.validate().is_err());
