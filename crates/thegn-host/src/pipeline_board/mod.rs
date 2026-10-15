@@ -570,7 +570,7 @@ impl PipelineBoard {
                 ),
                 None => "stale".to_string(),
             })
-        } else if self.history_truncated {
+        } else if self.history_truncated && !self.frozen {
             Some(format!(
                 "newest {} finished",
                 thegn_core::db::Db::ROSTER_HISTORY_LIMIT
