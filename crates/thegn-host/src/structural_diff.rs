@@ -431,7 +431,11 @@ mod tests {
         }
         // Regression: an accidental smaller stdout cap must not truncate a
         // valid structural diff before the documented 8 MiB ceiling.
-        let lines = capture_with("yes x | head -c 6291456 #", Duration::from_secs(10)).unwrap();
+        let lines = capture_with(
+            "head -c 6291456 /dev/zero | tr '\\000' x #",
+            Duration::from_secs(10),
+        )
+        .unwrap();
         let length: usize = lines
             .iter()
             .flat_map(|line| line.iter())
@@ -459,39 +463,54 @@ mod tests {
 
     #[test]
     fn structural_diff_has_only_read_only_callers_and_owns_external_diff_env() {
-        let implementation = include_str!("structural_diff.rs");
-        let actions = include_str!("actions.rs");
-        let cli = include_str!("cmd/diff.rs");
-        let staging = [
-            include_str!("gitmut.rs"),
-            include_str!("panel/staging.rs"),
-            include_str!("panel/gitui.rs"),
-        ];
+        fn rust_sources(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    rust_sources(&path, files);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    files.push(path);
+                }
+            }
+        }
 
-        assert!(implementation.contains("GIT_EXTERNAL_DIFF"));
-        assert!(!actions.contains("GIT_EXTERNAL_DIFF"));
-        assert!(!cli.contains("GIT_EXTERNAL_DIFF"));
-        assert!(
-            staging
-                .iter()
-                .all(|source| !source.contains("GIT_EXTERNAL_DIFF"))
+        let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&source_dir, &mut files);
+        let own_path = source_dir.join("structural_diff.rs");
+        let actions_path = source_dir.join("actions.rs");
+        let cli_path = source_dir.join("cmd/diff.rs");
+        let mut capture_callers = Vec::new();
+        let mut cli_callers = Vec::new();
+        for path in files {
+            let source = std::fs::read_to_string(&path).unwrap();
+            if path == own_path {
+                assert!(source.contains("GIT_EXTERNAL_DIFF"));
+                continue;
+            }
+            assert!(
+                !source.contains("GIT_EXTERNAL_DIFF"),
+                "{} contains GIT_EXTERNAL_DIFF outside structural_diff.rs",
+                path.display()
+            );
+            if source.contains("structural_diff::capture") {
+                capture_callers.push(path.clone());
+                assert_eq!(path, actions_path, "unexpected structural capture caller");
+                assert!(source.contains("fn spawn_diff_view_fetch("));
+            }
+            if source.contains("structural_diff::run_cli") {
+                cli_callers.push(path);
+                assert_eq!(
+                    cli_callers.last(),
+                    Some(&cli_path),
+                    "unexpected structural CLI caller"
+                );
+            }
+        }
+        assert_eq!(
+            capture_callers.as_slice(),
+            std::slice::from_ref(&actions_path)
         );
-        assert!(actions.contains("structural_diff::capture"));
-        assert_eq!(actions.matches("structural_diff::capture").count(), 1);
-        assert!(actions.contains("fn spawn_diff_view_fetch("));
-        assert!(!cli.contains("structural_diff::capture"));
-        assert!(
-            !staging
-                .iter()
-                .any(|source| source.contains("structural_diff::capture"))
-        );
-        assert!(cli.contains("structural_diff::run_cli"));
-        assert_eq!(cli.matches("structural_diff::run_cli").count(), 1);
-        assert!(!actions.contains("structural_diff::run_cli"));
-        assert!(
-            !staging
-                .iter()
-                .any(|source| source.contains("structural_diff::run_cli"))
-        );
+        assert_eq!(cli_callers.as_slice(), std::slice::from_ref(&cli_path));
     }
 }

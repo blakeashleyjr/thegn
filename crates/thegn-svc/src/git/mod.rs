@@ -4210,6 +4210,14 @@ mod read_fence_tests {
             ],
         );
 
+        let plain_diff = super::run(&loc, &["diff", "HEAD", "--", "sample.txt"]).unwrap();
+        assert!(
+            marker.exists(),
+            "plain git diff positive control did not run external diff"
+        );
+        assert!(plain_diff.contains("not a patch"));
+        std::fs::remove_file(&marker).unwrap();
+
         let hunks = CliGit.diff_hunks(&loc, "HEAD", "sample.txt", 40).unwrap();
         let unstaged = CliGit.unstaged_diff(&loc, "sample.txt").unwrap();
         let staged = CliGit.staged_diff(&loc, "sample.txt").unwrap();

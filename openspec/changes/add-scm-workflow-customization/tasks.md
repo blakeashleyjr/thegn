@@ -88,17 +88,17 @@ Run tests with `cargo nextest run -p <crate> <filter>`, never bare
 
 ## 7. Structural diff (thegn-core + thegn-host)
 
-- [x] 7.1 Pure SGR-subset → styled-cell-run parser in `thegn-core` (new
+- [ ] 7.1 Pure SGR-subset → styled-cell-run parser in `thegn-core` (new
       module; substrate-free; fixture-driven tests from recorded difft
       output; unknown escapes stripped). 95% gate applies.
-- [x] 7.2 `difft` as a managed tool (`Source::GithubRelease`, pinned,
+- [ ] 7.2 `difft` as a managed tool (`Source::GithubRelease`, pinned,
       `path_fallbacks: ["difft"]`) registered in host `known()`; Probe in
       doctor.
-- [x] 7.3 DiffView modal structural route: off-loop subprocess with width /
+- [ ] 7.3 DiffView modal structural route: off-loop subprocess with width /
       `--color always` / `--background` from theme / byte+graph limits /
       timeout; fallback to internal unified with a notice on any failure.
       Toggle key + new action id.
-- [x] 7.4 `thegn diff --structural` (flag on the existing verb; catalog row
+- [ ] 7.4 `thegn diff --structural` (flag on the existing verb; catalog row
       unchanged).
 - [x] 7.5 Guard test: stageable-diff call sites still pin `SANITIZED_DIFF`
       (`--no-ext-diff`) regardless of `structural_diff`.
