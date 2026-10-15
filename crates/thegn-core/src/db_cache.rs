@@ -491,7 +491,9 @@ mod tests {
         db.put_ci_log(&entry).unwrap();
         let got = db.get_ci_log("/wt/a", "run-1", "job-1").unwrap().unwrap();
         assert!(got.redacted);
-        assert!(!got.text.contains("plain-secret"));
+        assert!(!got.text.contains("secret"));
+        assert!(!got.text.contains("token=secret"));
+        assert!(got.text.contains("ordinary"));
         assert_eq!(db.list_ci_logs("/wt/a").unwrap().len(), 1);
         assert!(
             db.claim_ci_autofix(&CiLogCandidate {

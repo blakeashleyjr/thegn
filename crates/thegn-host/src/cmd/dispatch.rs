@@ -1651,11 +1651,11 @@ fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
             match &r.verdict {
                 pipeline_reap::ReapVerdict::Live => outln!("  {} live", r.id),
                 pipeline_reap::ReapVerdict::Unknown { why } => {
-                    outln!("  {} unknown: {why}", r.id);
+                    outln!("  {} unknown: {}", r.id, reap_human_why(why));
                 }
                 pipeline_reap::ReapVerdict::MarkFailed { why }
                 | pipeline_reap::ReapVerdict::NeedsDecision { why } => {
-                    outln!("  {} {}: {why}", r.id, r.verdict.token());
+                    outln!("  {} {}: {}", r.id, r.verdict.token(), reap_human_why(why));
                 }
                 v => outln!("  {} {}", r.id, v.token()),
             }
@@ -1804,7 +1804,11 @@ fn verify(id: i64, json: bool) -> Result<()> {
         v["id"] = serde_json::json!(id);
         super::emit_json(&v)?;
     } else {
-        let a = report.artifact.as_deref().unwrap_or("-");
+        let (a, warnings, reasons) = verify_human_text(
+            report.artifact.as_deref(),
+            &report.warnings,
+            &report.reasons,
+        );
         outln!(
             "dispatch {id}  artifact {a}  exists={} tracked={} dirty={} worktree={} report={}  ok={}",
             yes_no(report.exists),
@@ -1814,10 +1818,10 @@ fn verify(id: i64, json: bool) -> Result<()> {
             yes_no(report.report_present),
             yes_no(report.ok)
         );
-        for warning in &report.warnings {
+        for warning in &warnings {
             outln!("  warning: {warning}");
         }
-        for r in &report.reasons {
+        for r in &reasons {
             outln!("  - {r}");
         }
     }
@@ -1836,6 +1840,37 @@ fn worktree_state_name(state: Option<&pipeline_run::WorktreeState>) -> &'static 
         Some(pipeline_run::WorktreeState::Unknown) => "unknown",
         None => "not_observed",
     }
+}
+
+fn reap_human_why(why: &str) -> String {
+    pipeline_report::display_cell(why)
+}
+
+fn verify_human_text(
+    artifact: Option<&str>,
+    warnings: &[String],
+    reasons: &[String],
+) -> (String, Vec<String>, Vec<String>) {
+    (
+        pipeline_report::display_cell(artifact.unwrap_or("-")),
+        warnings
+            .iter()
+            .map(|warning| pipeline_report::display_cell(warning))
+            .collect(),
+        reasons
+            .iter()
+            .map(|reason| pipeline_report::display_cell(reason))
+            .collect(),
+    )
+}
+
+fn wait_human_text(stage: &str, report: Option<&str>) -> (String, Option<String>) {
+    (
+        pipeline_report::display_cell(stage),
+        report
+            .filter(|text| !text.trim().is_empty())
+            .map(display_multiline),
+    )
 }
 
 /// `dispatch report <id> --text <text>` — write/overwrite the worker's
@@ -2355,7 +2390,8 @@ async fn wait_wake(
             }
             return Ok(());
         }
-        let stage = t.target.stage.as_deref().unwrap_or("-");
+        let (stage, report) =
+            wait_human_text(t.target.stage.as_deref().unwrap_or("-"), report.as_deref());
         match (gone, exit_code) {
             (true, _) => outln!(
                 "dispatch {} ({}) session is gone: {}",
@@ -2370,7 +2406,7 @@ async fn wait_wake(
         // Print the report under the exited line — the Lead reads it and
         // nothing else. A missing/blank report prints nothing: the empty
         // line keeps the human output one event per wake.
-        if let Some(text) = report.as_deref().filter(|t| !t.trim().is_empty()) {
+        if let Some(text) = report.as_deref() {
             outln!("report:");
             outln!("{text}");
         }
@@ -2735,6 +2771,52 @@ mod tests {
             line.chars()
                 .all(|c| !c.is_control() && !pipeline_report::is_format_control(c))
         }));
+    }
+
+    #[test]
+    fn wait_human_output_sanitizes_stage_and_report() {
+        let (stage, report) = wait_human_text(
+            "build\x1b]0;x\x07",
+            Some("PASS\x1b[2J\n\u{202e}gate\u{0085}"),
+        );
+        let report = report.unwrap();
+        assert_eq!(report.lines().count(), 2);
+        assert!(
+            std::iter::once(stage.as_str())
+                .chain(report.lines())
+                .all(|line| {
+                    line.chars()
+                        .all(|c| !c.is_control() && !pipeline_report::is_format_control(c))
+                })
+        );
+    }
+
+    #[test]
+    fn reap_human_output_sanitizes_why() {
+        let why = reap_human_why("why\x1b]0;x\x07\u{202e}\u{0085}");
+        assert!(
+            why.chars()
+                .all(|c| !c.is_control() && !pipeline_report::is_format_control(c))
+        );
+    }
+
+    #[test]
+    fn verify_human_output_sanitizes_artifact_warnings_and_reasons() {
+        let (artifact, warnings, reasons) = verify_human_text(
+            Some("artifact\x1b]0;x\x07"),
+            &["warning\u{202e}\u{0085}".into()],
+            &["reason\x1b[2J".into()],
+        );
+        for value in std::iter::once(&artifact)
+            .chain(warnings.iter())
+            .chain(reasons.iter())
+        {
+            assert!(
+                value
+                    .chars()
+                    .all(|c| !c.is_control() && !pipeline_report::is_format_control(c))
+            );
+        }
     }
 
     #[test]
