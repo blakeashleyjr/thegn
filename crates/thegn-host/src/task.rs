@@ -430,17 +430,15 @@ fn run_capped_argv(
                 let mut last_emit = Instant::now();
                 while signal_rx.recv().is_ok() {
                     let until = last_emit + LIVE_EMIT_INTERVAL;
-                    if let Some(delay) = until.checked_duration_since(Instant::now()) {
+                    loop {
+                        let Some(delay) = until.checked_duration_since(Instant::now()) else {
+                            break;
+                        };
                         match signal_rx.recv_timeout(delay) {
-                            Ok(()) => continue,
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                            Ok(()) => {}
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                         }
-                    }
-                    match signal_rx.try_recv() {
-                        Ok(()) => continue,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
                     }
                     let tail = state.lock().map(|state| state.tail());
                     if let Ok(tail) = tail {
@@ -1654,7 +1652,6 @@ mod tests {
     fn private_temp_dir() -> tempfile::TempDir {
         tempfile::Builder::new()
             .prefix("thegn-task-runner-")
-            .permissions(0o700)
             .tempdir()
             .unwrap()
     }
@@ -2514,6 +2511,54 @@ mod tests {
     }
 
     #[test]
+    fn live_sink_flushes_output_that_arrives_during_coalescing_wait() {
+        let dir = private_temp_dir();
+        let wt = dir.path().to_path_buf();
+        let messages = Arc::new(Mutex::new(Vec::<JobLive>::new()));
+        let sink_messages = messages.clone();
+        let sink: JobLiveSink = Arc::new(move |msg| {
+            sink_messages.lock().unwrap().push(msg);
+        });
+        let run_wt = wt.clone();
+        let handle = std::thread::spawn(move || {
+            run_job(
+                run_wt.clone(),
+                &GitLoc::Local(run_wt),
+                95,
+                TestTask::new(
+                    "coalesced",
+                    "printf 'a\\n'; sleep 0.02; printf 'b\\n'; sleep 5",
+                    "generic",
+                ),
+                &uncapped(),
+                Some(sink),
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut saw_b_while_running = false;
+        while Instant::now() < deadline {
+            if messages
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|msg| msg.tail.contains("b\n"))
+                && !handle.is_finished()
+            {
+                saw_b_while_running = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            saw_b_while_running,
+            "the second line should be flushed while the job is still running"
+        );
+        cancel_job(&wt, "coalesced");
+        assert_eq!(handle.join().unwrap().end, RunEnd::Stopped);
+    }
+
+    #[test]
     fn live_tail_is_bounded_and_keeps_the_end() {
         let dir = private_temp_dir();
         let wt = dir.path().to_path_buf();
@@ -2581,7 +2626,7 @@ mod tests {
         assert_eq!(outcome.exit_code, Some(0));
         assert!(emits >= 1, "a non-silent job should emit live output");
         assert!(
-            emits <= elapsed_ms / 100 + 2,
+            u128::from(emits) <= elapsed_ms / 100 + 2,
             "{emits} emits in {elapsed_ms}ms"
         );
     }

@@ -374,9 +374,10 @@ fn task_detail_segs(
         && !r.output_tail.is_empty()
     {
         let label = if r.running {
-            "─── live output ──────────────────────"
+            let rule = crate::caps::active_glyphs().box_h;
+            format!("{} live output {}", rule.repeat(3), rule.repeat(22))
         } else {
-            "─── output ───────────────────────────"
+            "─── output ───────────────────────────".to_string()
         };
         out.push(vec![seg(g3(), label)]);
         let lines: Vec<&str> = r.output_tail.lines().collect();
