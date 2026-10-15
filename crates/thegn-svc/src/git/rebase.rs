@@ -369,6 +369,33 @@ pub trait RebaseOps: GitBackend {
         todo_for(loc, &base_for(loc, oldest_sha)?)
     }
 
+    /// Build the interactive TODO for commits after an explicitly marked base.
+    /// Unlike `rebase_todo_for`, the base may be any ancestor, not only the
+    /// parent of the oldest selected commit.
+    fn rebase_todo_since(&self, loc: &GitLoc, base_sha: &str) -> Result<Vec<TodoEntry>> {
+        op::revision(base_sha)?;
+        let base = run_read(
+            loc,
+            &["rev-parse", "--verify", &format!("{base_sha}^{{commit}}")],
+        )
+        .with_context(|| "marked base no longer exists; press B to re-mark")?;
+        let head = run_read(loc, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+        if base.trim() == head.trim() {
+            bail!("marked base is HEAD: no commits to rebase");
+        }
+        let (status, merge_base) = run_status(loc, &["merge-base", base.trim(), "HEAD"])?;
+        if status == 1 {
+            bail!("marked base is not an ancestor of HEAD; press B to re-mark");
+        }
+        if status != 0 {
+            bail!("git merge-base failed with exit status {status}");
+        }
+        if merge_base.trim() != base.trim() {
+            bail!("marked base is not an ancestor of HEAD; press B to re-mark");
+        }
+        todo_for(loc, base.trim())
+    }
+
     /// Run an interactive rebase of `<base>..HEAD` with a caller-edited todo.
     fn rebase_interactive(
         &self,
@@ -784,6 +811,51 @@ mod tests {
         // The branch is untouched — c5 is still there.
         assert_eq!(r.out(&["rev-parse", "HEAD"]), head_before);
         assert_eq!(r.subjects(), ["c5", "c4", "c3", "c2", "c1"]);
+    }
+
+    #[test]
+    fn rebase_todo_since_plans_commits_after_the_mark() {
+        let r = repo("marked-base-todo");
+        r.commit_file("c0.txt", "0\n", "c0");
+        r.commit_file("c1.txt", "1\n", "c1");
+        r.commit_file("c2.txt", "2\n", "c2");
+        r.commit_file("c3.txt", "3\n", "c3");
+        let c1 = r.sha_of("c1");
+        let todo = CliGit.rebase_todo_since(&r.loc(), &c1).unwrap();
+        assert_eq!(
+            todo.iter()
+                .map(|entry| entry.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["c2", "c3"]
+        );
+    }
+
+    #[test]
+    fn rebase_todo_since_refuses_head_and_non_ancestors() {
+        let r = linear("marked-base-invalid");
+        let head = r.out(&["rev-parse", "HEAD"]);
+        let head_error = CliGit.rebase_todo_since(&r.loc(), &head).unwrap_err();
+        assert!(head_error.to_string().contains("marked base is HEAD"));
+
+        let c1 = r.sha_of("c1");
+        git_in(&r.dir, &["checkout", "-b", "sibling", &c1]);
+        r.commit_file("sibling.txt", "sibling\n", "sibling");
+        let sibling = r.out(&["rev-parse", "HEAD"]);
+        git_in(&r.dir, &["checkout", "-"]);
+        let sibling_error = CliGit.rebase_todo_since(&r.loc(), &sibling).unwrap_err();
+        assert!(sibling_error.to_string().contains("not an ancestor"));
+    }
+
+    #[test]
+    fn rebase_todo_since_explains_when_the_mark_is_missing() {
+        let r = linear("marked-base-missing");
+        let missing = "0123456789012345678901234567890123456789";
+        let error = CliGit.rebase_todo_since(&r.loc(), missing).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("marked base no longer exists; press B to re-mark")
+        );
     }
 
     #[test]

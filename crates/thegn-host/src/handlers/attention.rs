@@ -352,7 +352,7 @@ pub(crate) fn mark_all_read(
 pub(crate) fn clear_all_confirm(
     model: &FrameModel,
     scope_all: bool,
-    filter_active: bool,
+    filtered: &[i64],
 ) -> Option<crate::menu::MenuOverlay> {
     let unread = model
         .panel
@@ -369,20 +369,114 @@ pub(crate) fn clear_all_confirm(
     } else {
         "this repo"
     };
-    let filter_note = if filter_active {
-        " · the /filter is ignored"
-    } else {
-        ""
-    };
-    Some(crate::menu::confirm_menu(
-        "clear all notifications?",
-        format!(
-            "marks {unread} unread read and acks {needs_you} needs-you signal(s) · scope: {scope}{filter_note}"
-        ),
-        "notifications-clear-all",
-        String::new(),
-        true,
+    if filtered.is_empty() {
+        return Some(crate::menu::confirm_menu(
+            "clear all notifications?",
+            format!(
+                "marks {unread} unread read and acks {needs_you} needs-you signal(s) · scope: {scope}"
+            ),
+            "notifications-clear-all",
+            String::new(),
+            true,
+        ));
+    }
+    let ids = filtered
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(crate::menu::MenuOverlay::new_with_default(
+        crate::menu::MenuKindTag::Confirm,
+        format!("clear notifications? · {unread} unread · scope: {scope}"),
+        vec![
+            crate::menu::MenuItem {
+                key: Some('f'),
+                label: format!("only the {} filtered", filtered.len()),
+                note: Some("leaves needs-you signals alone".into()),
+                choice: crate::menu::MenuChoice::Confirm {
+                    tag: "notifications-clear-filtered",
+                    arg: ids,
+                },
+                danger: false,
+            },
+            crate::menu::MenuItem {
+                key: Some('y'),
+                label: "all in scope".into(),
+                note: Some(format!(
+                    "marks {unread} unread read and acks {needs_you} needs-you"
+                )),
+                choice: crate::menu::MenuChoice::Confirm {
+                    tag: "notifications-clear-all",
+                    arg: String::new(),
+                },
+                danger: true,
+            },
+            crate::menu::MenuItem {
+                key: Some('n'),
+                label: "cancel".into(),
+                note: None,
+                choice: crate::menu::MenuChoice::Dismiss,
+                danger: false,
+            },
+        ],
+        0,
     ))
+}
+
+/// Visible unread inbox ids, preserving display order. `None` means no filter
+/// is active; `Some(Vec::new())` means the active filter has no unread matches.
+pub(crate) fn filtered_unread_ids(
+    panel: &crate::panel::PanelData,
+    ui: &crate::panel::PanelUi,
+) -> Option<Vec<i64>> {
+    if ui.notifications_filter.is_empty() {
+        return None;
+    }
+    Some(
+        crate::panel::sections::notifications::visible_indices(panel, ui)
+            .into_iter()
+            .filter_map(|index| panel.notifications.get(index))
+            .filter(|notification| !notification.read)
+            .map(|notification| notification.id)
+            .collect(),
+    )
+}
+
+/// Mark only the confirmed filtered rows read. Live needs-you signals are
+/// deliberately untouched by this subset operation.
+pub(crate) fn mark_read_ids(
+    model: &mut FrameModel,
+    ids: &[i64],
+    tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+) {
+    let ids = ids.to_vec();
+    model
+        .panel
+        .mark_read_where(|notification| ids.contains(&notification.id));
+    let worker_ids = ids.clone();
+    let tx = tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        match thegn_core::db::Db::open() {
+            Ok(db) => {
+                for id in worker_ids {
+                    if let Err(error) = db.mark_notification_read(id) {
+                        tracing::debug!(target: "thegn::attention", %error, id, "could not mark filtered notification read");
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::debug!(target: "thegn::attention", %error, "could not open database for filtered notification clear");
+            }
+        }
+        if tx.send(RefreshKind::Model).is_ok()
+            && let Err(error) = waker.wake()
+        {
+            tracing::debug!(target: "thegn::attention", %error, "could not wake loop after filtered notification clear");
+        }
+    });
+    model.status = format!("Marked {} filtered as read", ids.len());
 }
 
 #[cfg(test)]
@@ -392,7 +486,7 @@ mod tests {
 
     #[test]
     fn clear_all_confirm_is_absent_for_empty_inbox() {
-        assert!(clear_all_confirm(&FrameModel::default(), false, false).is_none());
+        assert!(clear_all_confirm(&FrameModel::default(), false, &[]).is_none());
     }
 
     #[test]
@@ -410,7 +504,83 @@ mod tests {
                 read: false,
                 worktree_path: String::new(),
             });
-        let mut menu = clear_all_confirm(&model, false, false).expect("confirm menu");
+        let mut menu = clear_all_confirm(&model, false, &[]).expect("confirm menu");
+        assert_eq!(
+            menu.handle_key(
+                &termwiz::input::KeyCode::Char('y'),
+                termwiz::input::Modifiers::NONE,
+            ),
+            crate::menu::MenuOutcome::Pick(crate::menu::MenuChoice::Confirm {
+                tag: "notifications-clear-all",
+                arg: String::new(),
+            })
+        );
+    }
+
+    fn notification(id: i64, message: &str, read: bool) -> thegn_core::notification::Notification {
+        thegn_core::notification::Notification {
+            id,
+            kind: thegn_core::notification::NotificationKind::Assigned,
+            source_ref: String::new(),
+            message: message.into(),
+            created_at_ms: id,
+            read,
+            worktree_path: String::new(),
+        }
+    }
+
+    #[test]
+    fn filtered_unread_ids_matches_visible_unread_rows() {
+        let mut model = FrameModel::default();
+        model.panel.notifications = vec![
+            notification(1, "needle first", false),
+            notification(2, "needle read", true),
+            notification(3, "unrelated", false),
+            notification(4, "needle last", false),
+        ];
+        let ui = crate::panel::PanelUi {
+            notifications_filter: "needle".into(),
+            ..Default::default()
+        };
+        assert_eq!(filtered_unread_ids(&model.panel, &ui), Some(vec![1, 4]));
+    }
+
+    #[test]
+    fn filtered_unread_ids_preserves_active_filter_with_no_unread_matches() {
+        let mut model = FrameModel::default();
+        model.panel.notifications = vec![
+            notification(1, "needle read", true),
+            notification(2, "unrelated unread", false),
+        ];
+        let ui = crate::panel::PanelUi {
+            notifications_filter: "needle".into(),
+            ..Default::default()
+        };
+        assert_eq!(filtered_unread_ids(&model.panel, &ui), Some(Vec::new()));
+
+        let unfiltered_ui = crate::panel::PanelUi::default();
+        assert_eq!(filtered_unread_ids(&model.panel, &unfiltered_ui), None);
+    }
+
+    #[test]
+    fn clear_all_confirm_offers_filtered_subset_first() {
+        let mut model = FrameModel::default();
+        model.panel.notifications = vec![
+            notification(11, "one", false),
+            notification(12, "two", false),
+        ];
+        let mut menu = clear_all_confirm(&model, false, &[11, 12]).expect("confirm menu");
+        assert_eq!(menu.selected(), 0);
+        assert_eq!(
+            menu.handle_key(
+                &termwiz::input::KeyCode::Enter,
+                termwiz::input::Modifiers::NONE,
+            ),
+            crate::menu::MenuOutcome::Pick(crate::menu::MenuChoice::Confirm {
+                tag: "notifications-clear-filtered",
+                arg: "11,12".into(),
+            })
+        );
         assert_eq!(
             menu.handle_key(
                 &termwiz::input::KeyCode::Char('y'),

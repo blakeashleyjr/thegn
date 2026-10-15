@@ -3162,8 +3162,7 @@ fn spawn_rebase_status_fetch(
 fn spawn_rebase_plan_fetch(
     generation: u64,
     session: &crate::session::Session,
-    oldest: String,
-    base: String,
+    from: gitui::PlanFrom,
     tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
     waker: &TerminalWaker,
 ) {
@@ -3173,9 +3172,20 @@ fn spawn_rebase_plan_fetch(
     tokio::task::spawn_blocking(move || {
         use thegn_svc::git::RebaseOps;
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-        let result = thegn_svc::git::CliGit
-            .rebase_todo_for(&loc, &oldest)
-            .map_err(|error| error.to_string());
+        let (base, result) = match from {
+            gitui::PlanFrom::Target { oldest, base } => (
+                base,
+                thegn_svc::git::CliGit
+                    .rebase_todo_for(&loc, &oldest)
+                    .map_err(|error| error.to_string()),
+            ),
+            gitui::PlanFrom::Mark(base) => (
+                base.clone(),
+                thegn_svc::git::CliGit
+                    .rebase_todo_since(&loc, &base)
+                    .map_err(|error| error.to_string()),
+            ),
+        };
         if tx
             .send((generation, GitDoc::RebasePlan { base, result }))
             .is_ok()
@@ -4502,30 +4512,24 @@ fn handle_git_msg(
             // it rather than clobbering the live flow with a fresh plan.
             if matches!(&panel_ui.git.flow, GitFlow::Rebase(r) if r.running) {
                 panel_ui.git.focus = GitView::RebaseTodo;
-            } else if let Some((oldest, _)) = gitui::commit_selection(&panel_ui.git, &model.panel) {
-                if let Some(commit) = model
-                    .panel
-                    .commits
-                    .iter()
-                    .find(|commit| commit.sha == oldest)
-                {
-                    let base = if commit.parents.is_empty() {
-                        "--root".to_string()
-                    } else {
-                        format!("{}^", commit.sha)
-                    };
-                    spawn_rebase_plan_fetch(
-                        panel_ui.git.op_gen,
-                        wires.session,
-                        oldest,
-                        base,
-                        wires.doc_tx,
-                        wires.waker,
-                    );
-                    model.status = "planning interactive rebase…".into();
-                } else {
-                    model.status = "no commit selected".into();
-                }
+            } else if let Some(from) = gitui::interactive_anchor(&panel_ui.git, &model.panel) {
+                let status = match &from {
+                    gitui::PlanFrom::Target { .. } => "planning interactive rebase…".to_owned(),
+                    gitui::PlanFrom::Mark(sha) => {
+                        format!(
+                            "planning interactive rebase from mark {}…",
+                            &sha[..sha.len().min(7)]
+                        )
+                    }
+                };
+                spawn_rebase_plan_fetch(
+                    panel_ui.git.op_gen,
+                    wires.session,
+                    from,
+                    wires.doc_tx,
+                    wires.waker,
+                );
+                model.status = status;
             } else {
                 model.status = "no commit selected".into();
             }
@@ -4570,7 +4574,8 @@ fn handle_git_msg(
                 panel_ui.git.mark_base = match panel_ui.git.mark_base.take() {
                     Some(m) if m == c.sha => None,
                     _ => {
-                        model.status = format!("rebase base marked: {}", c.short);
+                        model.status =
+                            format!("rebase base marked: {} (r onto · i interactive)", c.short);
                         Some(c.sha)
                     }
                 };
@@ -17429,7 +17434,7 @@ async fn event_loop<T: Terminal>(
                             active_menu = crate::handlers::attention::clear_all_confirm(
                                 &model,
                                 crate::panel::scope::system_all(),
-                                false,
+                                &[],
                             );
                             if active_menu.is_none() {
                                 model.status = "inbox already clear".into();
@@ -18504,6 +18509,35 @@ async fn event_loop<T: Terminal>(
                             {
                                 crate::handlers::attention::mark_all_read(
                                     &mut model,
+                                    &refresh_tx,
+                                    &waker,
+                                );
+                                hydration_gen += 1;
+                                crate::hydrate::spawn_model_hydration(
+                                    model_tx.clone(),
+                                    hydration_gen,
+                                    session.clone_for_hydrate(),
+                                    Some(waker.clone()),
+                                    crate::hydrate::HydrateHints {
+                                        open: panel_ui.open,
+                                        expanded: panel_ui.width.is_expanded(),
+                                        ..Default::default()
+                                    },
+                                    None,
+                                );
+                                dirty = true;
+                                continue;
+                            }
+                            if let menu::MenuChoice::Confirm {
+                                tag: "notifications-clear-filtered",
+                                arg,
+                            } = &choice
+                            {
+                                let ids: Vec<i64> =
+                                    arg.split(',').filter_map(|id| id.parse().ok()).collect();
+                                crate::handlers::attention::mark_read_ids(
+                                    &mut model,
+                                    &ids,
                                     &refresh_tx,
                                     &waker,
                                 );
@@ -22521,13 +22555,22 @@ async fn event_loop<T: Terminal>(
                         // `a` asks for confirmation before clearing the inbox
                         // and acknowledging live needs-you signals.
                         (Section::Notifications, KeyCode::Char('a')) => {
-                            match crate::handlers::attention::clear_all_confirm(
-                                &model,
-                                crate::panel::scope::system_all(),
-                                !panel_ui.notifications_filter.is_empty(),
-                            ) {
-                                Some(menu) => active_menu = Some(menu),
-                                None => model.status = "inbox already clear".into(),
+                            let filtered = crate::handlers::attention::filtered_unread_ids(
+                                &model.panel,
+                                &panel_ui,
+                            );
+                            if matches!(&filtered, Some(ids) if ids.is_empty()) {
+                                model.status = "no unread notifications match the filter".into();
+                            } else {
+                                let ids = filtered.as_deref().unwrap_or(&[]);
+                                match crate::handlers::attention::clear_all_confirm(
+                                    &model,
+                                    crate::panel::scope::system_all(),
+                                    ids,
+                                ) {
+                                    Some(menu) => active_menu = Some(menu),
+                                    None => model.status = "inbox already clear".into(),
+                                }
                             }
                             true
                         }
