@@ -2797,9 +2797,9 @@ mod tests {
         };
         let baseline_ptmx = ptmx_count();
         let sh = thegn_core::util::which_path("sh").unwrap_or_else(|| "/bin/sh".into());
-        let spawned = super::fork::spawn_session(
+        let spawned = crate::daemon::fork::spawn_session(
             &svc,
-            super::fork::SpawnRequest {
+            crate::daemon::fork::SpawnRequest {
                 id: "shutdown-reap".into(),
                 argv: vec![
                     sh,
