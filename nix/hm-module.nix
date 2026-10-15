@@ -79,8 +79,8 @@ self: {
         # the binary's own default for anyone who enables the module.
         # "apple" is macOS's `container` CLI and is probed only on macOS; the
         # win/linux-native entries are likewise inert off their own OS.
-        default = ["podman-rootless" "podman-rootful" "docker" "apple" "bwrap" "jobobject" "host"];
-        description = "Auto-detection order; \"host\" = run uncontained on the host.";
+        default = ["podman-rootless" "podman-rootful" "docker" "apple" "bwrap" "jobobject"];
+        description = "Auto-detection order; add \"host\" only with isolationFloor = \"off\".";
       };
       image = lib.mkOption {
         type = lib.types.str;

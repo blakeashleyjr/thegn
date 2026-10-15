@@ -99,7 +99,7 @@ fn stronger_runtime_preflight_failure_rechecks_final_host_floor() {
                 mounts: Vec::new(),
                 env_passthrough: Vec::new(),
                 devcontainer: DevcontainerMode::Off,
-                isolation_floor: floor,
+                isolation_floor: Some(floor),
                 on_floor_miss: policy,
                 ..Default::default()
             },

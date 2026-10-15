@@ -3333,7 +3333,7 @@ fn universal_block_lowers_to_network_none() {
         enabled: true,
         backend: crate::config::SandboxBackend::Bwrap,
         network_block: vec!["*".into()],
-        isolation_floor: crate::config::IsolationFloor::Off,
+        isolation_floor: Some(crate::config::IsolationFloor::Off),
         on_floor_miss: crate::config::OnFloorMiss::Degrade,
         ..Default::default()
     };
@@ -3475,7 +3475,7 @@ fn universal_block_suppresses_vpn_sidecar() {
             vpn.mode = VpnMode::Proxy;
             vpn
         },
-        isolation_floor: crate::config::IsolationFloor::Off,
+        isolation_floor: Some(crate::config::IsolationFloor::Off),
         on_floor_miss: crate::config::OnFloorMiss::Degrade,
         ..Default::default()
     };

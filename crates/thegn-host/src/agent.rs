@@ -199,10 +199,10 @@ impl std::error::Error for DevcontainerLaunchRefused {}
 impl std::fmt::Display for SandboxHalt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let allow = if self.ask {
-            "choose \"run on host\", or explicitly set the sandbox backend to `none` (with an isolation floor set also set `isolation_floor = \"off\"`), or install/start a container runtime (`thegn doctor` shows which)"
+            "choose \"run on host\", set `backend = \"none\"`, disable sandboxing, or set `isolation_floor = \"off\"`; otherwise install/start a container runtime (`thegn doctor` shows which)"
         } else {
-            "explicitly select host execution (`backend = \"none\"`, or list \"host\" in \
-             `backend_chain`; with an isolation floor set also set `isolation_floor = \"off\"`), \
+            "explicitly select host execution (`backend = \"none\"`, disable sandboxing, \
+             set `isolation_floor = \"off\"`, or choose \"run on host\"), \
              or install/start a container runtime (`thegn doctor` shows which)"
         };
         write!(
@@ -651,6 +651,7 @@ pub fn prepare_sandbox_env(
                     &sb,
                     spec.capabilities().isolation,
                     worktree,
+                    force_host_requested(worktree),
                     &mut warnings,
                 )?;
                 ssh_none_guard(
@@ -718,11 +719,12 @@ pub fn prepare_sandbox_env(
             // enter (after the runtime degrade `finalize_*` just applied) against
             // the demanded floor. A fail-closed miss must abort BEFORE anything
             // spawns on the host — so this sits ahead of `attach_vpn`/`ensure`.
-            if sb.isolation_floor != thegn_core::config::IsolationFloor::Off {
+            let floor = thegn_core::sandbox_floor::floor_in_force(&sb, false);
+            if floor != thegn_core::config::IsolationFloor::Off {
                 let actual = spec.capabilities().isolation;
                 match thegn_core::sandbox_floor::decide(
-                    sb.isolation_floor,
-                    sb.on_floor_miss,
+                    floor,
+                    thegn_core::sandbox_floor::miss_policy_in_force(&sb),
                     actual,
                     actual,
                 ) {
@@ -898,10 +900,8 @@ pub fn prepare_sandbox_env(
     }
     // Reaching here means no candidate produced a runnable sandbox. A requested
     // sandbox must halt with the existing actionable error instead of becoming a
-    // host login shell, regardless of failover mode — unless this is a local
-    // `auto` walk whose configured chain itself names the host: landing there
-    // is the chain's configured outcome, not a fallback (the default chain ends
-    // in `host`, so refusing here would refuse every pane on a runtime-less box).
+    // host login shell, regardless of failover mode. A chain-listed host is only
+    // a fallback preference; the floor admission below still applies.
     if !degrade_allowed && !(placement.is_local() && auto_chain_names_host(&sb)) {
         let reachable = sandbox::placement_reachable(&exec_placement, &sb.backend_chain);
         return Err(SandboxHalt {
@@ -980,6 +980,7 @@ pub fn prepare_sandbox_env(
         &sb,
         thegn_core::capabilities::IsolationClass::HostProcess,
         worktree,
+        force_host_requested(worktree),
         &mut warnings,
     )?;
     // Every candidate is spent and we are opening a bare host shell. Say it once
