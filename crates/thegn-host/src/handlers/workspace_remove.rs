@@ -383,6 +383,41 @@ mod tests {
     const PANE_EVENT_CHANNEL_CAPACITY: usize = 256;
 
     #[test]
+    fn forget_workspace_in_db_prunes_other_sessions_directly() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_workspace("/r/lib", "lib", "repo").unwrap();
+        let group = thegn_core::models::TabGroupRow {
+            name: "lib/stale".into(),
+            kind: "branch".into(),
+            worktree: "/wt/stale".into(),
+            ordinal: 0,
+            active_tab: 0,
+        };
+        let tab = thegn_core::models::GroupTabRow {
+            group_name: "lib/stale".into(),
+            ordinal: 0,
+            title: "1".into(),
+            pane_tree: r#"{"leaf":0}"#.into(),
+            focused_pane: 0,
+            pane_cwds: String::new(),
+            pane_cmds: String::new(),
+            pane_sessions: String::new(),
+            scrollback_snapshot: String::new(),
+        };
+        db.put_tab_group("other-session", &group).unwrap();
+        db.put_group_tab("other-session", &tab).unwrap();
+
+        forget_workspace_in_db(&db, "active-session", "/r/lib", "lib");
+
+        assert!(db.groups_for_session("other-session").unwrap().is_empty());
+        assert!(
+            db.group_tabs_for_session("other-session")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn workspace_worktree_dirs_skips_home_and_other_workspaces() {
         // The destructive "delete from disk" selection MUST exclude the home
         // checkout (path == repo_path — deleting it would nuke the main repo)

@@ -1058,24 +1058,27 @@ pub(crate) fn workspace_list(
         }
     }
     let mut live: Vec<(String, String, String, String)> = Vec::new();
-    let own_slug = db
-        .and_then(|db| {
-            session
-                .repo_root()
-                .map(|root| thegn_core::repo::repo_slug_with(db, root))
-        })
-        .or_else(|| {
-            session
-                .repo_root()
-                .and_then(std::path::Path::file_name)
-                .map(|name| thegn_core::util::slugify(&name.to_string_lossy()))
-        })
-        .or_else(|| (!session.id.is_empty()).then(|| thegn_core::util::slugify(&session.id)));
+    let own_slug = session.repo_root().map(|root| {
+        db.map(|db| thegn_core::repo::repo_slug_with(db, root))
+            .or_else(|| {
+                session
+                    .worktrees
+                    .iter()
+                    .find(|group| group.kind == crate::session::GroupKind::Home)
+                    .and_then(|group| crate::sidebar::split_tab(&group.name))
+                    .map(|(prefix, _)| thegn_core::util::slugify(&prefix))
+            })
+            .unwrap_or_else(|| {
+                root.file_name()
+                    .map(|name| thegn_core::util::slugify(&name.to_string_lossy()))
+                    .unwrap_or_default()
+            })
+    });
     for g in &session.worktrees {
         if let Some((repo, _)) = crate::sidebar::split_tab(&g.name)
             && own_slug
                 .as_ref()
-                .is_some_and(|slug| thegn_core::util::slugify(&repo) == *slug)
+                .is_none_or(|slug| thegn_core::util::slugify(&repo) == *slug)
             && !live.iter().any(|(s, _, _, _)| *s == repo)
         {
             // Live worktrees always belong to a git repo workspace. The empty
