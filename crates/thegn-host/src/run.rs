@@ -56,6 +56,8 @@ use thegn_core::store::{
 
 #[path = "run_palette_db.rs"]
 mod run_palette_db;
+#[path = "run_pending_db.rs"]
+mod run_pending_db;
 #[path = "run_test_cache.rs"]
 mod run_test_cache;
 
@@ -1886,30 +1888,6 @@ fn request_preview_scan(
 fn persist_share_event(ev: &crate::share::ShareEvent) {
     let op = crate::share::share_persist_for(ev);
     crate::db_task::persist(move |db| crate::share::apply_share_persist(db, op));
-}
-
-/// The active worktree's `(worktree_path, workspace_repo_path)`, or `None` when
-/// there's nothing fileable (no active group, the home tab, a terminal, or no
-/// resolvable repo). The repo path is the DB workspace root so the folder we
-/// create lines up with the sidebar's per-workspace folder filter.
-pub(crate) fn active_worktree_repo(session: &crate::session::Session) -> Option<(String, String)> {
-    use crate::session::GroupKind;
-    let g = session.active_group()?;
-    if g.kind != GroupKind::Branch || g.path.is_empty() {
-        return None;
-    }
-    let wt_path = g.path.clone();
-    let db = thegn_core::db::Db::open().ok()?;
-    let repo_path = db
-        .repo_root_for(&wt_path)
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            thegn_core::repo::main_worktree(std::path::Path::new(&wt_path))
-                .map(|p| p.to_string_lossy().into_owned())
-        })?;
-    Some((wt_path, repo_path))
 }
 
 /// DELETE these worktree groups from disk (`git worktree remove`, branch
@@ -7055,6 +7033,9 @@ async fn event_loop<T: Terminal>(
     let (palette_db_tx, mut palette_db_rx) =
         tokio_mpsc::unbounded_channel::<run_palette_db::PaletteDbResult>();
     let mut palette_db_cache = run_palette_db::PaletteDbCache::default();
+    let (pending_db_tx, mut pending_db_rx) =
+        tokio_mpsc::unbounded_channel::<run_pending_db::PendingDbResult>();
+    let mut pending_db_fence = run_pending_db::RequestFence::default();
     // Test-explorer open-by-name results (Tests `o`/`b`): locating a test with
     // ripgrep/grep runs off the loop and completes over this channel.
     let (test_open_tx, mut test_open_rx) = tokio_mpsc::unbounded_channel::<TestOpenOutcome>();
@@ -10076,6 +10057,120 @@ async fn event_loop<T: Terminal>(
                 }
             }
         }
+        while let Ok(result) = pending_db_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            match result {
+                run_pending_db::PendingDbResult::AccountAdded {
+                    seq: _,
+                    pane,
+                    provider,
+                    name,
+                    dir,
+                } => {
+                    if let Some(provider_info) = thegn_core::account::provider(&provider) {
+                        let login_line = format!(
+                            "{}={} {}\n",
+                            provider_info.home_env,
+                            dir,
+                            provider_info.login_argv.join(" ")
+                        );
+                        let queued = panes.table.get_mut(&pane).is_some_and(|target| {
+                            target.write_input(login_line.as_bytes()).is_ok()
+                        });
+                        model.status = if panes.table.contains_key(&pane) {
+                            injected_command_status(
+                                queued,
+                                format!("Logging into {provider}:{name} — finish in the terminal"),
+                            )
+                        } else {
+                            run_pending_db::account_gone_pane_status(&provider, &name)
+                        };
+                        dirty = true;
+                    }
+                }
+                run_pending_db::PendingDbResult::ApplyLayout {
+                    seq,
+                    tab,
+                    name,
+                    spec,
+                } => {
+                    match run_pending_db::plan_apply_layout(
+                        pending_db_fence.accepts_layout(seq),
+                        session.active_group().map(|group| group.name.as_str()),
+                        &tab,
+                        spec,
+                    ) {
+                        run_pending_db::ApplyLayoutPlan::Stale => {}
+                        run_pending_db::ApplyLayoutPlan::ChangedTab => {
+                            model.status =
+                                format!("Layout \"{name}\" not applied: the tab changed");
+                            dirty = true;
+                        }
+                        run_pending_db::ApplyLayoutPlan::Missing => {
+                            model.status = format!("No saved layout named \"{name}\"");
+                            dirty = true;
+                        }
+                        run_pending_db::ApplyLayoutPlan::Apply(spec) => {
+                            if apply_layout_to_active_tab(
+                                &spec,
+                                &mut session,
+                                &mut panes,
+                                keymap.config(),
+                                chrome.center,
+                            )
+                            .is_some()
+                            {
+                                persist_session_layout(&mut session, &panes);
+                                need_relayout = true;
+                                model.status = format!("Applied layout \"{name}\"");
+                            } else {
+                                model.status = "Apply layout: nothing spawned".into();
+                            }
+                            dirty = true;
+                        }
+                    }
+                }
+                run_pending_db::PendingDbResult::Template {
+                    generation: _,
+                    tab,
+                    fallback_commands,
+                    spec,
+                } => {
+                    if let Some(target) =
+                        session.worktrees.iter().position(|group| group.name == tab)
+                    {
+                        let previous = session.active;
+                        let plan = run_pending_db::template_tab_plan(previous, target);
+                        session.switch_to(plan.target);
+                        if let Some(spec) = run_pending_db::template_spec(spec, &fallback_commands)
+                        {
+                            apply_layout_to_active_tab(
+                                &spec,
+                                &mut session,
+                                &mut panes,
+                                keymap.config(),
+                                chrome.center,
+                            );
+                            need_relayout = true;
+                        }
+                        if let Some(restore) = plan.restore
+                            && restore < session.worktrees.len()
+                        {
+                            session.switch_to(restore);
+                        }
+                        refresh_tab_model(&mut model, &session, &mut sb);
+                        persist_session_layout(&mut session, &panes);
+                        dirty = true;
+                    }
+                }
+                run_pending_db::PendingDbResult::Dropped { seq } => {
+                    if pending_db_fence.accepts_layout(seq) {
+                        model.status = run_pending_db::dropped_layout_status().into();
+                        dirty = true;
+                    }
+                }
+            }
+        }
         let active_tests_wt = active_tab_path(&session).to_string_lossy().into_owned();
         let ready_discoveries = if test_cache_load.is_pending(&active_tests_wt) {
             Vec::new()
@@ -11741,18 +11836,16 @@ async fn event_loop<T: Terminal>(
                 // The inbox is opt-in for the same reason, one surface further
                 // out: it feeds the attention chip and, via [notifications],
                 // the desktop.
-                if alert_cfg.notify
-                    && ev.level != thegn_core::resource_alert::AlertLevel::Ok
-                    && let Ok(db) = thegn_core::db::Db::open()
-                {
-                    crate::notify::record(
-                        &db,
-                        &notify_state,
-                        thegn_core::notification::NotificationKind::ResourceAlert.as_str(),
-                        ev.metric.key(),
-                        &msg,
-                        "",
-                    );
+                if alert_cfg.notify && ev.level != thegn_core::resource_alert::AlertLevel::Ok {
+                    let notify_state = notify_state.clone();
+                    let kind = thegn_core::notification::NotificationKind::ResourceAlert
+                        .as_str()
+                        .to_string();
+                    let key = ev.metric.key().to_string();
+                    let message = msg.clone();
+                    crate::db_task::persist(move |db| {
+                        crate::notify::record(db, &notify_state, &kind, &key, &message, "");
+                    });
                 }
                 if ev.level != thegn_core::resource_alert::AlertLevel::Ok
                     && matches!(
@@ -12368,17 +12461,13 @@ async fn event_loop<T: Terminal>(
                     // template's pins. The layout replaces the default agent pane;
                     // pins are orthogonal strip/float daemons.
                     if let Some(tmpl) = pending_template.remove(&generation) {
-                        // The template layout is applied to the active tab, so we
-                        // must make the new worktree active for the duration — but
-                        // only *restore* the user's tab afterward when they've
-                        // navigated away (audit run.rs:9288): switching
-                        // unconditionally yanks the visible center mid-typing,
-                        // defeating the `is_active_new` guard computed above.
-                        let prev_active = session.active;
-                        if let Some(gi) =
-                            session.worktrees.iter().position(|g| g.name == payload.tab)
+                        let previous_active = session.active;
+                        if let Some(target) = session
+                            .worktrees
+                            .iter()
+                            .position(|group| group.name == payload.tab)
                         {
-                            session.switch_to(gi);
+                            session.switch_to(target);
                         }
                         // A template `preset` ref (item 165) supplies the initial
                         // shape in place of the template's own layout/commands
@@ -12427,21 +12516,19 @@ async fn event_loop<T: Terminal>(
                             },
                             None => (tmpl.layout.clone(), tmpl.commands.clone()),
                         };
-                        let spec = eff_layout
-                            .as_ref()
-                            .filter(|n| !n.is_empty())
-                            .and_then(|n| {
-                                thegn_core::db::Db::open()
-                                    .ok()
-                                    .and_then(|db| db.get_layout(n).ok().flatten())
-                            })
-                            .and_then(|json| crate::layout_spec::LayoutSpec::from_json(&json).ok())
-                            .or_else(|| {
-                                (!eff_commands.is_empty()).then(|| {
-                                    crate::layout_spec::LayoutSpec::even_split(&eff_commands)
-                                })
-                            });
-                        if let Some(spec) = spec {
+                        let named_layout = eff_layout.filter(|name| !name.trim().is_empty());
+                        let has_named_layout = named_layout.is_some();
+                        if named_layout.is_some() {
+                            run_pending_db::queue_template(
+                                generation,
+                                payload.tab.clone(),
+                                named_layout,
+                                eff_commands.clone(),
+                                &pending_db_tx,
+                                &waker,
+                            );
+                        } else if !eff_commands.is_empty() {
+                            let spec = crate::layout_spec::LayoutSpec::even_split(&eff_commands);
                             apply_layout_to_active_tab(
                                 &spec,
                                 &mut session,
@@ -12499,14 +12586,13 @@ async fn event_loop<T: Terminal>(
                                 );
                             }
                         }
-                        // Restore the user's tab unless the new worktree is still
-                        // the one they're looking at (audit run.rs:9288). We only
-                        // switched to apply the layout to the correct tab.
-                        if !is_active_new && prev_active < session.worktrees.len() {
-                            session.switch_to(prev_active);
+                        if !is_active_new && previous_active < session.worktrees.len() {
+                            session.switch_to(previous_active);
                         }
-                        refresh_tab_model(&mut model, &session, &mut sb);
-                        persist_session_layout(&mut session, &panes);
+                        if !has_named_layout {
+                            refresh_tab_model(&mut model, &session, &mut sb);
+                            persist_session_layout(&mut session, &panes);
+                        }
                     }
                     // Fresh worktree + agent pane: re-hydrate so the sidebar
                     // and panel reflect it immediately.
@@ -18125,38 +18211,19 @@ async fn event_loop<T: Terminal>(
                                     }
                                     HostInputKind::ApplyLayout => {
                                         let name = text.trim().to_string();
-                                        let spec = thegn_core::db::Db::open()
-                                            .ok()
-                                            .and_then(|db| db.get_layout(&name).ok().flatten())
-                                            .and_then(|json| {
-                                                crate::layout_spec::LayoutSpec::from_json(&json)
-                                                    .ok()
-                                            });
-                                        match spec {
-                                            Some(spec) => {
-                                                if apply_layout_to_active_tab(
-                                                    &spec,
-                                                    &mut session,
-                                                    &mut panes,
-                                                    keymap.config(),
-                                                    chrome.center,
-                                                )
-                                                .is_some()
-                                                {
-                                                    persist_session_layout(&mut session, &panes);
-                                                    need_relayout = true;
-                                                    model.status =
-                                                        format!("Applied layout \"{name}\"");
-                                                } else {
-                                                    model.status =
-                                                        "Apply layout: nothing spawned".into();
-                                                }
-                                            }
-                                            None => {
-                                                model.status =
-                                                    format!("No saved layout named \"{name}\"");
-                                            }
-                                        }
+                                        let seq = pending_db_fence.begin_layout();
+                                        let tab = session
+                                            .active_group()
+                                            .map(|group| group.name.clone())
+                                            .unwrap_or_default();
+                                        run_pending_db::queue_apply_layout(
+                                            seq,
+                                            tab,
+                                            name.clone(),
+                                            &pending_db_tx,
+                                            &waker,
+                                        );
+                                        model.status = format!("Applying layout \"{name}\"…");
                                     }
                                     HostInputKind::ExportLayout => {
                                         let path = text.trim().to_string();
@@ -19555,48 +19622,16 @@ async fn event_loop<T: Terminal>(
                                     // credential dir and run the provider's login in
                                     // the focused pane, with its credential-home env
                                     // pointed at that dir (item 656).
-                                    if let Some(p) = thegn_core::account::provider(provider) {
-                                        let db = thegn_core::db::Db::open().ok(); // best-effort: best-effort cache: naming and lookups fall back locally when the DB is out
-                                        let n = db
-                                            .as_ref()
-                                            .and_then(|db| db.list_accounts(provider).ok())
-                                            .map(|v| v.len())
-                                            .unwrap_or(0)
-                                            + 1;
-                                        let name = format!("acct{n}");
-                                        let dir = thegn_core::account::managed_dir(provider, &name);
-                                        let dir_s = dir.to_string_lossy().into_owned();
-                                        let _ = std::fs::create_dir_all(&dir); // best-effort: dir prep: a later write reports the real failure
-                                        if let Some(db) = &db {
-                                            // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                                            let _ = db.put_account(
-                                                provider,
-                                                &name,
-                                                &dir_s,
-                                                true,
-                                                thegn_core::util::now(),
-                                            );
-                                        }
-                                        let queued = if let Some(focused_pane) =
-                                            panes.table.get_mut(&focused)
-                                        {
-                                            let cmd = format!(
-                                                "{}={} {}\n",
-                                                p.home_env,
-                                                dir_s,
-                                                p.login_argv.join(" ")
-                                            );
-                                            focused_pane.write_input(cmd.as_bytes()).is_ok()
-                                        } else {
-                                            false
-                                        };
-                                        model.status = injected_command_status(
-                                            queued,
-                                            format!(
-                                                "Logging into {provider}:{name} — \
-                                                 finish in the terminal"
-                                            ),
+                                    if thegn_core::account::provider(provider).is_some() {
+                                        let seq = pending_db_fence.next();
+                                        run_pending_db::queue_account_add(
+                                            seq,
+                                            focused,
+                                            provider.to_string(),
+                                            &pending_db_tx,
+                                            &waker,
                                         );
+                                        model.status = format!("Adding {provider} account…");
                                     }
                                     palette = None;
                                     dirty = true;
@@ -19608,35 +19643,12 @@ async fn event_loop<T: Terminal>(
                                     if let Some((provider, name)) = rest.split_once(':') {
                                         let wt = active_tab_path(&session);
                                         let wt_s = wt.to_string_lossy().into_owned();
-                                        if let Ok(db) = thegn_core::db::Db::open() {
-                                            let slug = db
-                                                .repo_root_for(&wt_s)
-                                                .ok()
-                                                .flatten()
-                                                .filter(|s| !s.is_empty())
-                                                .and_then(|root| {
-                                                    let base = std::path::Path::new(&root)
-                                                        .file_name()?
-                                                        .to_string_lossy()
-                                                        .into_owned();
-                                                    db.slug_for_repo(&root, &base).ok()
-                                                });
-                                            let bind = if slug.is_some() {
-                                                thegn_core::account::Bind::Workspace
-                                            } else {
-                                                thegn_core::account::Bind::Global
-                                            };
-                                            let _ = thegn_core::account::set_active(
-                                                // best-effort: cache write: the recorded binding is advisory state; the status line right after reports the action
-                                                &db,
-                                                bind,
-                                                &wt_s,
-                                                slug.as_deref(),
-                                                provider,
-                                                name,
-                                            );
-                                            model.status = format!("Account → {provider}:{name}");
-                                        }
+                                        run_pending_db::persist_account_binding(
+                                            wt_s,
+                                            provider.to_string(),
+                                            name.to_string(),
+                                        );
+                                        model.status = format!("Account → {provider}:{name}");
                                     }
                                     palette = None;
                                     dirty = true;
@@ -19650,34 +19662,12 @@ async fn event_loop<T: Terminal>(
                                     // hot-swap semantics as the account switcher).
                                     let wt = active_tab_path(&session);
                                     let wt_s = wt.to_string_lossy().into_owned();
-                                    if let Ok(db) = thegn_core::db::Db::open() {
-                                        let slug = bundle_scope_slug(&db, &wt_s);
-                                        let bind = if slug.is_some() {
-                                            thegn_core::bundle::Bind::Workspace
-                                        } else {
-                                            thegn_core::bundle::Bind::Global
-                                        };
-                                        if let Some(name) = key.strip_prefix("bundle:") {
-                                            let _ = thegn_core::bundle::set_active(
-                                                // best-effort: cache write: the recorded binding is advisory state; the status line right after reports the action
-                                                &db,
-                                                bind,
-                                                &wt_s,
-                                                slug.as_deref(),
-                                                name,
-                                            );
-                                            model.status = format!("Bundle → {name}");
-                                        } else {
-                                            let _ = thegn_core::bundle::clear_active(
-                                                // best-effort: cache write: the recorded binding is advisory state; the status line right after reports the action
-                                                &db,
-                                                bind,
-                                                &wt_s,
-                                                slug.as_deref(),
-                                            );
-                                            model.status = "Bundle cleared".to_string();
-                                        }
-                                    }
+                                    let selected = key.strip_prefix("bundle:").map(str::to_string);
+                                    run_pending_db::persist_bundle_binding(wt_s, selected.clone());
+                                    model.status = selected.map_or_else(
+                                        || "Bundle cleared".to_string(),
+                                        |name| format!("Bundle → {name}"),
+                                    );
                                     palette = None;
                                     dirty = true;
                                     continue;
@@ -19690,34 +19680,16 @@ async fn event_loop<T: Terminal>(
                                     // *after* the switch; unset tools fall through.
                                     let wt = active_tab_path(&session);
                                     let wt_s = wt.to_string_lossy().into_owned();
-                                    if let Ok(db) = thegn_core::db::Db::open() {
-                                        let slug = bundle_scope_slug(&db, &wt_s);
-                                        let bind = if slug.is_some() {
-                                            thegn_core::bundle::Bind::Workspace
-                                        } else {
-                                            thegn_core::bundle::Bind::Global
-                                        };
-                                        if let Some(name) = key.strip_prefix("identity:") {
-                                            let _ = thegn_core::identity::set_active(
-                                                // best-effort: cache write: the recorded binding is advisory state; the status line right after reports the action
-                                                &db,
-                                                bind,
-                                                &wt_s,
-                                                slug.as_deref(),
-                                                name,
-                                            );
-                                            model.status = format!("Identity → {name}");
-                                        } else {
-                                            let _ = thegn_core::identity::clear_active(
-                                                // best-effort: cache write: the recorded binding is advisory state; the status line right after reports the action
-                                                &db,
-                                                bind,
-                                                &wt_s,
-                                                slug.as_deref(),
-                                            );
-                                            model.status = "Identity cleared".to_string();
-                                        }
-                                    }
+                                    let selected =
+                                        key.strip_prefix("identity:").map(str::to_string);
+                                    run_pending_db::persist_identity_binding(
+                                        wt_s,
+                                        selected.clone(),
+                                    );
+                                    model.status = selected.map_or_else(
+                                        || "Identity cleared".to_string(),
+                                        |name| format!("Identity → {name}"),
+                                    );
                                     palette = None;
                                     dirty = true;
                                     continue;
