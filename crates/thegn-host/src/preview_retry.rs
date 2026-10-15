@@ -117,6 +117,7 @@ impl PendingCornerOob {
 #[derive(Debug, Default)]
 pub(crate) struct PendingClipboardOob {
     pending: Option<Vec<u8>>,
+    oversized: Option<usize>,
 }
 
 impl PendingClipboardOob {
@@ -126,6 +127,7 @@ impl PendingClipboardOob {
         submit: impl FnMut(Vec<u8>) -> Result<(), Vec<u8>>,
     ) {
         if bytes.len() > crate::frame_writer::OOB_QUEUE_BYTES {
+            self.oversized = Some(bytes.len());
             tracing::warn!(
                 target: "thegn::frame",
                 bytes = bytes.len(),
@@ -153,6 +155,59 @@ impl PendingClipboardOob {
 
     pub(crate) fn is_pending(&self) -> bool {
         self.pending.is_some()
+    }
+
+    pub(crate) fn take_oversized(&mut self) -> Option<usize> {
+        self.oversized.take()
+    }
+}
+
+pub(crate) fn oversized_copy_status(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = KIB * KIB;
+    let size = if bytes >= 1024 * 1024 {
+        let whole = bytes / MIB;
+        let tenths = ((bytes % MIB) * 10).div_ceil(MIB);
+        if tenths == 10 {
+            format!("{}.0 MiB", whole + 1)
+        } else {
+            format!("{whole}.{tenths} MiB")
+        }
+    } else if bytes >= KIB {
+        let whole = bytes / KIB;
+        let tenths = ((bytes % KIB) * 10 + KIB / 2) / KIB;
+        if tenths == 10 {
+            format!("{}.0 KiB", whole + 1)
+        } else {
+            format!("{whole}.{tenths} KiB")
+        }
+    } else {
+        format!("{bytes} bytes")
+    };
+    let limit_mib = crate::frame_writer::OOB_QUEUE_BYTES / MIB;
+    format!("Nothing copied: {size} is over the {limit_mib} MiB terminal clipboard limit")
+}
+
+/// Coalesces refused bells into one retained BEL.
+#[derive(Debug, Default)]
+pub(crate) struct PendingBellOob {
+    pending: bool,
+}
+
+impl PendingBellOob {
+    pub(crate) fn offer(&mut self, submit: impl FnMut(Vec<u8>) -> Result<(), Vec<u8>>) {
+        self.pending = true;
+        self.retry(submit);
+    }
+
+    pub(crate) fn retry(&mut self, mut submit: impl FnMut(Vec<u8>) -> Result<(), Vec<u8>>) {
+        if self.pending && submit(b"\x07".to_vec()).is_ok() {
+            self.pending = false;
+        }
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pending
     }
 }
 
@@ -341,20 +396,72 @@ mod tests {
     fn oversized_clipboard_is_dropped_without_replacing_pending_copy() {
         let mut slot = PendingClipboardOob::default();
         let submitted = RefCell::new(Vec::new());
-        slot.offer(vec![2; crate::frame_writer::OOB_QUEUE_BYTES + 1], |bytes| {
+        let oversized_len = crate::frame_writer::OOB_QUEUE_BYTES + 1;
+        slot.offer(vec![2; oversized_len], |bytes| {
             submitted.borrow_mut().push(bytes);
             Ok(())
         });
         assert!(submitted.borrow().is_empty());
         assert_eq!(slot.pending(), None);
+        assert_eq!(slot.take_oversized(), Some(oversized_len));
+        assert_eq!(slot.take_oversized(), None);
 
         slot.offer(vec![1], Err);
-        slot.offer(vec![2; crate::frame_writer::OOB_QUEUE_BYTES + 1], |bytes| {
+        slot.offer(vec![2; oversized_len], |bytes| {
             submitted.borrow_mut().push(bytes);
             Ok(())
         });
         assert!(submitted.borrow().is_empty());
         assert_eq!(slot.pending(), Some([1].as_slice()));
+        assert_eq!(slot.take_oversized(), Some(oversized_len));
+        assert_eq!(slot.pending(), Some([1].as_slice()));
+    }
+
+    #[test]
+    fn oversized_copy_status_names_size_and_limit() {
+        let status = oversized_copy_status(5 * 1024 * 1024 + 205 * 1024);
+        assert!(status.contains("Nothing copied"));
+        assert!(status.contains("5.3 MiB"));
+        assert!(status.contains("4 MiB"));
+
+        let just_over_limit = oversized_copy_status(crate::frame_writer::OOB_QUEUE_BYTES + 1);
+        assert!(!just_over_limit.contains("4.0 MiB"));
+    }
+
+    #[test]
+    fn refused_bell_is_retained_and_sent_once() {
+        let mut bell = PendingBellOob::default();
+        bell.offer(Err);
+        assert!(bell.is_pending());
+
+        let submitted = RefCell::new(Vec::new());
+        bell.retry(|bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        bell.retry(|bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert_eq!(*submitted.borrow(), vec![b"\x07".to_vec()]);
+        assert!(!bell.is_pending());
+    }
+
+    #[test]
+    fn bells_while_refused_coalesce_into_one() {
+        let mut bell = PendingBellOob::default();
+        bell.offer(Err);
+        bell.offer(Err);
+        bell.offer(Err);
+        assert!(bell.is_pending());
+
+        let submitted = RefCell::new(Vec::new());
+        bell.retry(|bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert_eq!(*submitted.borrow(), vec![b"\x07".to_vec()]);
+        assert!(!bell.is_pending());
     }
 
     #[test]
