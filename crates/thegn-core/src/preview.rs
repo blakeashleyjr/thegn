@@ -527,11 +527,20 @@ pub fn parse_pane_port_hints_wrapped(input: &str, cols: Option<u16>) -> Vec<Port
             continue;
         }
         if ch == '\r' {
+            // A bare CR after an exactly-full row starts a new visual row: the
+            // cursor was parked at the right margin, so what follows is not a
+            // continuation of the full row.
+            if cols.is_some_and(|columns| width == columns as usize) {
+                joined.push('\n');
+                width = 0;
+                continue;
+            }
             let previous = joined.chars().next_back();
             let next = chars.peek().copied();
             if previous.is_some_and(|value| !value.is_whitespace())
                 && next.is_some_and(|value| !value.is_whitespace())
             {
+                width = 0;
                 continue;
             }
             joined.push(ch);
