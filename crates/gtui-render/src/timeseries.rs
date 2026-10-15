@@ -450,6 +450,110 @@ mod tests {
     }
 
     #[test]
+    fn irregular_timestamp_buffer_matches_raw_timestamp_golden() {
+        let times = vec![0.0, 1.0, 4.0, 10.0];
+        let values = vec![1.0, 4.0, 3.0, 8.0];
+        let frame = Frame::new(vec![
+            Field::new("time", FieldType::Time, times.clone()),
+            Field::new("value", FieldType::Float64, values.clone()),
+        ]);
+        let colors = crate::RenderColors::default();
+        let area = Rect::new(0, 0, 14, 8);
+        let bounds = [0.0, 10.0, 0.0, 10.0];
+        let mut actual = Buffer::empty(area);
+        TimeseriesRenderer::render_in_window(&frame, "irregular", bounds, None, 14, &colors)
+            .render(area, &mut actual);
+
+        // Golden contract: the short irregular series reaches Canvas in its
+        // actual timestamp coordinates and retains every sample in order.
+        let expected = Canvas::default()
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(colors.border))
+                    .title_style(Style::default().fg(colors.title))
+                    .title("irregular"),
+            )
+            .x_bounds([0.0, 10.0])
+            .y_bounds([0.0, 10.0])
+            .paint(move |ctx| {
+                for pair in times.windows(2).zip(values.windows(2)) {
+                    let (t, v) = pair;
+                    ctx.draw(&Line {
+                        x1: t[0],
+                        y1: v[0],
+                        x2: t[1],
+                        y2: v[1],
+                        color: colors.series,
+                    });
+                }
+            });
+        let mut golden = Buffer::empty(area);
+        expected.render(area, &mut golden);
+        assert_eq!(actual, golden);
+    }
+
+    #[test]
+    fn seeded_timestamp_sweeps_keep_extrema_domain_order_and_width_bound() {
+        let mut seed = 0x6a09_e667_f3bc_c909_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for _case in 0..160 {
+            let count = 40 + (next() as usize % 661);
+            let width = 1 + (next() as usize % 20);
+            let times: Vec<f64> = (0..count).map(|_| (next() % 101) as f64).collect();
+            let mut values: Vec<f64> = (0..count).map(|index| index as f64).collect();
+            values[count / 3] = -10_000.0;
+            values[count * 2 / 3] = 10_000.0;
+
+            let (points, domain) = plot_time_points(&times, &values, width);
+            let [min_time, max_time] = domain.expect("generated timestamps have a domain");
+            assert!(points.len() <= 5 * 2 * width);
+            assert!(
+                points
+                    .iter()
+                    .all(|(time, _)| *time >= min_time && *time <= max_time)
+            );
+            assert!(points.iter().any(|(_, value)| *value == -10_000.0));
+            assert!(points.iter().any(|(_, value)| *value == 10_000.0));
+
+            let input_indices: Vec<usize> = points
+                .iter()
+                .map(|(_, value)| {
+                    if *value == -10_000.0 {
+                        count / 3
+                    } else if *value == 10_000.0 {
+                        count * 2 / 3
+                    } else {
+                        *value as usize
+                    }
+                })
+                .collect();
+            assert!(input_indices.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+    }
+
+    #[test]
+    fn flat_sparse_and_duplicate_timestamp_inputs_keep_their_samples() {
+        let flat_times: Vec<f64> = (0..200).map(|index| index as f64).collect();
+        let flat_values = vec![7.0; flat_times.len()];
+        let (flat_points, _) = plot_time_points(&flat_times, &flat_values, 2);
+        assert!(flat_points.len() <= 20);
+        assert!(flat_points.iter().all(|(_, value)| *value == 7.0));
+
+        let sparse = plot_time_points_in(&[1.0, 90.0], &[2.0, 3.0], 80, Some([0.0, 100.0]));
+        assert_eq!(sparse, (vec![(1.0, 2.0), (90.0, 3.0)], Some([0.0, 100.0])));
+
+        let duplicate = plot_time_points(&[5.0, 5.0, 2.0], &[10.0, 20.0, 30.0], 20);
+        assert_eq!(duplicate.0, vec![(5.0, 10.0), (5.0, 20.0), (2.0, 30.0)]);
+    }
+
+    #[test]
     fn long_series_is_bounded_and_keeps_extrema_and_gaps() {
         let mut vals: Vec<f64> = (0..1_000_000).map(|i| (i % 100) as f64).collect();
         vals[500_000] = 9999.0;
