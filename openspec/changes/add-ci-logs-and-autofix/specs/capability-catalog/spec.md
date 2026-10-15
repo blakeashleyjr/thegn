@@ -13,9 +13,9 @@ surface-coverage rules: HTTP and CLI implemented (`thegn ci runs --json`,
 parameterised state
 tools (`ci_runs`, `ci_logs`), and gRPC/plugin excused in `SURFACE_GAPS` until
 mirrored. Both rows answer from the state-DB caches via the daemon —
-unparseable cache rows are skipped, and a `ci.logs` cache miss MUST return a
-distinct not-cached error rather than invoking a provider CLI from the
-daemon. Their scope is `required_scope(verb)` like every row; no second
+unparseable cache rows are skipped, and a `ci.logs` cache miss falls back
+to a provider fetch on the daemon's blocking provider lane. Their scope is
+`required_scope(verb)` like every row; no second
 policy table. `ci.logs` arguments SHALL default so that a call naming only a
 worktree resolves to the latest failed run's first failing job.
 
@@ -24,8 +24,8 @@ worktree resolves to the latest failed run's first failing job.
 - **WHEN** an MCP client with the read scope calls `ci_logs` with only a
   worktree argument
 - **THEN** it receives the latest failed run's first failing job's redacted
-  cached log with its first-failure line, or a not-cached error naming how
-  the cache gets populated
+  cached log with its first-failure line, or a provider fetch result on a
+  cache miss
 
 #### Scenario: Scope gating matches the catalog
 
@@ -34,7 +34,8 @@ worktree resolves to the latest failed run's first failing job.
 - **THEN** the call is refused naming the missing scope, per the same
   `required_scope` table every door checks
 
-#### Scenario: The daemon never shells out for a log
+#### Scenario: A cache miss fetches the log off the daemon event loop
 
 - **WHEN** `ci.logs` is requested for a job that is not in the cache
-- **THEN** the daemon returns the not-cached error and spawns no vendor CLI
+- **THEN** the daemon fetches the log on its blocking provider lane, keeping
+  provider I/O off the event loop

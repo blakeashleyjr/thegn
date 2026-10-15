@@ -39,7 +39,8 @@
      terminal runs from cache, live-fetch only on miss; `truncated`/redacted
      indicators rendered
 - [x] 10. Daemon handlers — `ci.runs` (parse `ci_runs_cache`, skip bad rows,
-      carry `fetched_at`) and `ci.logs` (cache read + not-cached error;
+      carry `fetched_at`) and `ci.logs` (cache read; as built, a cache miss
+      falls back to an off-loop provider fetch, with no not-cached error;
       argument defaulting to latest failed run / first failing job), modeled
       on `pr_status`; control HTTP route + client
 - [x] 11. MCP `ci_runs`/`ci_logs` state tools on the parameterised-tool
