@@ -19,10 +19,6 @@ fn skip() -> bool {
         || std::env::var("PODMAN_E2E_FORCE").is_err()
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "opt-in Podman e2e removes its test container"
-)]
 fn force_rm(name: &str) {
     // best-effort: test scratch: best-effort by design
     let _ = std::process::Command::new("podman")
@@ -67,10 +63,6 @@ fn spec_with_network_block(name: &str, block: Vec<String>) -> SandboxSpec {
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "opt-in Podman e2e executes a command in its test container"
-)]
 fn run_in(spec: &SandboxSpec, cmd: &str) -> String {
     let argv = enter_argv(spec, cmd).expect("valid volume names");
     let out = std::process::Command::new(&argv[0])
@@ -123,10 +115,6 @@ fn g3_allow_list_does_not_inject_dns_flag() {
 
 // G2: a resolved universal deny is the runtime's offline network boundary.
 #[test]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "opt-in Podman e2e checks its offline test container"
-)]
 fn g2_universal_block_runs_offline() {
     if skip() {
         return;
