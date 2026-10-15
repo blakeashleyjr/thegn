@@ -287,7 +287,7 @@ fn merge(
     }
     match forges()
         .for_loc(&loc)
-        .merge_pr(&loc, PrRef::Current, method, delete_branch, auto)
+        .merge_pr(&loc, PrRef::Current, method, delete_branch, None, auto)
     {
         Ok(()) => msg::info("PR merged"),
         Err(e) => msg::die(&format!("pr merge failed: {}", e.describe())),

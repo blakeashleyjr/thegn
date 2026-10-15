@@ -1003,20 +1003,11 @@ impl Forge for GithubCli {
         pr: PrRef,
         method: MergeMethod,
         delete_branch: bool,
+        expected_head: Option<&str>,
         auto: bool,
     ) -> Result<(), GhError> {
-        let num = pr.number().map(|n| n.to_string());
-        let mut args: Vec<&str> = vec!["pr", "merge"];
-        if let Some(n) = num.as_deref() {
-            args.push(n);
-        }
-        args.push(method.flag());
-        if delete_branch {
-            args.push("--delete-branch");
-        }
-        if auto {
-            args.push("--auto");
-        }
+        let args = merge_args(pr, method, delete_branch, expected_head, auto);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
         gh_run(loc, &args)
     }
     fn set_draft(&self, loc: &GitLoc, pr: PrRef, draft: bool) -> Result<(), GhError> {
@@ -1184,6 +1175,30 @@ impl Forge for GithubCli {
         authorship_transport::fetch(loc, self.id(), number)
     }
 }
+
+fn merge_args(
+    pr: PrRef,
+    method: MergeMethod,
+    delete_branch: bool,
+    expected_head: Option<&str>,
+    auto: bool,
+) -> Vec<String> {
+    let mut args = vec!["pr".into(), "merge".into()];
+    if let Some(number) = pr.number() {
+        args.push(number.to_string());
+    }
+    args.push(method.flag().into());
+    if delete_branch {
+        args.push("--delete-branch".into());
+    }
+    if let Some(head) = expected_head {
+        args.extend(["--match-head-commit".into(), head.into()]);
+    }
+    if auto {
+        args.push("--auto".into());
+    }
+    args
+}
 #[cfg(test)]
 mod numbered_rerun_tests {
     use super::GhError;
@@ -1248,5 +1263,46 @@ mod numbered_rerun_tests {
             |_| panic!("must not rerun after lookup failure"),
         );
         assert!(error.is_err());
+    }
+}
+
+#[cfg(test)]
+mod merge_args_tests {
+    use super::merge_args;
+    use crate::forge::PrRef;
+    use crate::forge::model::MergeMethod;
+
+    #[test]
+    fn merge_args_carry_match_head_commit() {
+        assert_eq!(
+            merge_args(
+                PrRef::Number(42),
+                MergeMethod::Squash,
+                true,
+                Some("deadbeef"),
+                true,
+            ),
+            vec![
+                "pr".to_owned(),
+                "merge".to_owned(),
+                "42".to_owned(),
+                "--squash".to_owned(),
+                "--delete-branch".to_owned(),
+                "--match-head-commit".to_owned(),
+                "deadbeef".to_owned(),
+                "--auto".to_owned(),
+            ]
+        );
+        assert_eq!(
+            merge_args(PrRef::Number(42), MergeMethod::Squash, true, None, true),
+            vec![
+                "pr".to_owned(),
+                "merge".to_owned(),
+                "42".to_owned(),
+                "--squash".to_owned(),
+                "--delete-branch".to_owned(),
+                "--auto".to_owned(),
+            ]
+        );
     }
 }

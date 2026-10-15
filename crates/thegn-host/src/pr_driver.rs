@@ -73,6 +73,8 @@ pub(crate) struct PrOutcome {
     pub merged: Vec<u64>,
     /// Auto-merge was enabled; the forge may merge these after its own rules pass.
     pub auto_merge_armed: Vec<u64>,
+    /// The forge accepted or may have accepted a merge request, pending confirmation.
+    pub merge_requested: Vec<u64>,
     /// Green and mergeable, held for a human (`merge_mode = "ready"`).
     pub ready: Vec<u64>,
     /// Still blocked; will be re-examined next pass.
@@ -392,49 +394,130 @@ pub(crate) fn drive_queue(
                     PrRef::Number(item.number),
                     method,
                     cfg.delete_branch_on_merge,
+                    Some(&head),
                     !direct,
                 );
-                match res {
-                    Ok(()) => {
-                        // Direct merge is done; auto-merge is *armed* — the forge
-                        // merges it when its own rules allow, and the next poll
-                        // observes that. Saying "merged" now would be a lie.
-                        let (status, detail) = if direct {
-                            (PrqStatus::Merged, "merged".to_string())
-                        } else {
-                            (
-                                PrqStatus::Ready,
-                                "auto-merge enabled — the forge will merge it".to_string(),
-                            )
-                        };
-                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                        let _ = db.update_pr_status(
+                let mut after_unavailable = None;
+                let after = match forge.pr_status(&loc, PrRef::Number(item.number)) {
+                    Ok(status) => match pr_queue::attest_pr_identity(
+                        item.pr_url.as_deref(),
+                        item.number,
+                        &status.url,
+                        status.number,
+                    ) {
+                        Ok(()) => Some(status),
+                        Err(reason) => {
+                            after_unavailable =
+                                Some(format!("PR identity could not be re-attested: {reason}"));
+                            tracing::warn!(target: "thegn::prq", "PR #{} merge re-read identity mismatch: {reason}", item.number);
+                            None
+                        }
+                    },
+                    Err(error) => {
+                        after_unavailable =
+                            Some(format!("could not re-read PR status: {}", describe(&error)));
+                        tracing::debug!(target: "thegn::prq", %error, "could not re-read PR after merge request");
+                        None
+                    }
+                };
+                let outcome = match (after_unavailable, &res) {
+                    (Some(reason), Ok(())) => {
+                        thegn_core::pr_merge_outcome::MergeOutcome::Unknown(reason)
+                    }
+                    (_, result) => thegn_core::pr_merge_outcome::classify_merge(
+                        direct,
+                        result,
+                        after.as_ref(),
+                        Some(&head),
+                    ),
+                };
+                match outcome {
+                    thegn_core::pr_merge_outcome::MergeOutcome::Confirmed => {
+                        let detail = "merged";
+                        if let Err(error) = db.update_pr_status(
                             &item.key,
-                            status.as_str(),
+                            PrqStatus::Merged.as_str(),
+                            Some(blocker.as_str()),
+                            Some(detail),
+                            Some(&head),
+                        ) {
+                            tracing::debug!(target: "thegn::prq", %error, "could not persist confirmed merge");
+                        }
+                        step(PrqStatus::Merged.as_str(), detail, &mut progress);
+                        out.merged.push(item.number);
+                    }
+                    thegn_core::pr_merge_outcome::MergeOutcome::AutoMergeArmed => {
+                        let detail = "auto-merge enabled — the forge will merge it";
+                        if let Err(error) = db.update_pr_status(
+                            &item.key,
+                            PrqStatus::Ready.as_str(),
+                            Some(blocker.as_str()),
+                            Some(detail),
+                            Some(&head),
+                        ) {
+                            tracing::debug!(target: "thegn::prq", %error, "could not persist armed auto-merge");
+                        }
+                        step(PrqStatus::Ready.as_str(), detail, &mut progress);
+                        out.auto_merge_armed.push(item.number);
+                    }
+                    thegn_core::pr_merge_outcome::MergeOutcome::Requested => {
+                        let detail = "merge requested; waiting for the forge to confirm";
+                        if let Err(error) = db.update_pr_status(
+                            &item.key,
+                            PrqStatus::Merging.as_str(),
+                            Some(blocker.as_str()),
+                            Some(detail),
+                            Some(&head),
+                        ) {
+                            tracing::debug!(target: "thegn::prq", %error, "could not persist pending merge request");
+                        }
+                        step(PrqStatus::Merging.as_str(), detail, &mut progress);
+                        out.merge_requested.push(item.number);
+                    }
+                    thegn_core::pr_merge_outcome::MergeOutcome::StaleHead { observed } => {
+                        let old = head.chars().take(7).collect::<String>();
+                        let new = observed.chars().take(7).collect::<String>();
+                        let detail =
+                            format!("head moved from {old} to {new} before the merge; refreshing");
+                        if let Err(error) = db.update_pr_status(
+                            &item.key,
+                            PrqStatus::Watching.as_str(),
+                            Some(blocker.as_str()),
+                            Some(&detail),
+                            Some(&observed),
+                        ) {
+                            tracing::debug!(target: "thegn::prq", %error, "could not persist stale-head refresh");
+                        }
+                        step(PrqStatus::Watching.as_str(), &detail, &mut progress);
+                        out.blocked.push(item.number);
+                    }
+                    thegn_core::pr_merge_outcome::MergeOutcome::Unknown(why) => {
+                        let detail = format!("merge outcome unknown: {why}; re-checking next pass");
+                        tracing::warn!(target: "thegn::prq", "PR #{}: {detail}", item.number);
+                        if let Err(error) = db.update_pr_status(
+                            &item.key,
+                            PrqStatus::Merging.as_str(),
                             Some(blocker.as_str()),
                             Some(&detail),
                             Some(&head),
-                        );
-                        step(status.as_str(), &detail, &mut progress);
-                        if direct {
-                            out.merged.push(item.number);
-                        } else {
-                            out.auto_merge_armed.push(item.number);
+                        ) {
+                            tracing::debug!(target: "thegn::prq", %error, "could not persist unknown merge outcome");
                         }
+                        step(PrqStatus::Merging.as_str(), &detail, &mut progress);
+                        out.merge_requested.push(item.number);
+                        out.warnings.push(format!("PR #{}: {detail}", item.number));
                     }
-                    Err(e) => {
-                        // A refused merge is usually the forge enforcing a rule
-                        // thegn cannot see (a required check, a CODEOWNERS
-                        // review). That is a human's problem, not a retry.
-                        let detail = format!("merge refused: {}", describe(&e));
-                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                        let _ = db.update_pr_status(
+                    thegn_core::pr_merge_outcome::MergeOutcome::Rejected(why) => {
+                        let detail = format!("merge refused: {why}");
+                        if let Err(error) = db.update_pr_status(
                             &item.key,
                             PrqStatus::NeedsHuman.as_str(),
                             Some(blocker.as_str()),
                             Some(&detail),
                             Some(&head),
-                        );
+                        ) {
+                            tracing::debug!(target: "thegn::prq", %error, "could not persist refused merge");
+                        }
                         step(PrqStatus::NeedsHuman.as_str(), &detail, &mut progress);
                         out.needs_human.push(item.number);
                     }
@@ -1433,6 +1516,9 @@ mod tests {
         calls: std::sync::Mutex<Vec<String>>,
         rerun_count: std::sync::atomic::AtomicU32,
         rerun_error: std::sync::atomic::AtomicBool,
+        merge_error: std::sync::Mutex<Option<ForgeError>>,
+        merge_head_after: std::sync::Mutex<Option<String>>,
+        confirm_direct: std::sync::atomic::AtomicBool,
     }
     impl FakeForge {
         fn new(pr: Option<PrStatus>) -> Self {
@@ -1442,6 +1528,9 @@ mod tests {
                 calls: Default::default(),
                 rerun_count: std::sync::atomic::AtomicU32::new(0),
                 rerun_error: std::sync::atomic::AtomicBool::new(false),
+                merge_error: Default::default(),
+                merge_head_after: Default::default(),
+                confirm_direct: std::sync::atomic::AtomicBool::new(true),
             }
         }
         fn with_conversation(self, conversation: thegn_core::forge::model::PrConversation) -> Self {
@@ -1463,6 +1552,19 @@ mod tests {
         fn with_rerun_error(self) -> Self {
             self.rerun_error
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+        fn with_merge_error(self, error: ForgeError) -> Self {
+            *self.merge_error.lock().unwrap() = Some(error);
+            self
+        }
+        fn with_merge_head_after(self, head: &str) -> Self {
+            *self.merge_head_after.lock().unwrap() = Some(head.into());
+            self
+        }
+        fn without_direct_confirmation(self) -> Self {
+            self.confirm_direct
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             self
         }
         fn record(&self, s: impl Into<String>) {
@@ -1505,11 +1607,28 @@ mod tests {
             pr: PrRef,
             method: MergeMethod,
             delete_branch: bool,
+            expected_head: Option<&str>,
             auto: bool,
         ) -> Result<(), ForgeError> {
             self.record(format!(
-                "merge {pr:?} {method:?} del={delete_branch} auto={auto}"
+                "merge {pr:?} {method:?} del={delete_branch} head={expected_head:?} auto={auto}"
             ));
+            if let Some(head) = self.merge_head_after.lock().unwrap().take()
+                && let Some(status) = self.pr.lock().unwrap().as_mut()
+            {
+                status.head_ref_oid = head;
+            }
+            if let Some(error) = self.merge_error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            if !auto
+                && self
+                    .confirm_direct
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                && let Some(status) = self.pr.lock().unwrap().as_mut()
+            {
+                status.state = "MERGED".into();
+            }
             Ok(())
         }
         fn rerun_failed(&self, _: &GitLoc, pr: PrRef) -> Result<u32, ForgeError> {
@@ -2305,5 +2424,188 @@ mod tests {
         assert_eq!(row.status, "blocked_ci");
         assert!(row.detail.unwrap().contains("template"));
         assert_eq!(row.agent_attempts, 0);
+    }
+
+    #[test]
+    fn direct_merge_passes_the_reviewed_head() {
+        let (_dir, db) = temp_db("prq-reviewed-head");
+        let forge = FakeForge::new(Some(green_pr()));
+        let mut config = cfg();
+        config.merge_mode = thegn_core::config::PrMergeMode::Thegn;
+        let out = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![item()],
+            |_| {},
+        );
+        assert_eq!(out.merged, vec![7]);
+        assert!(forge.calls().iter().any(|call| {
+            call.starts_with("merge Number(7)") && call.contains("head=Some(\"abc\")")
+        }));
+    }
+
+    #[test]
+    fn direct_merge_without_confirmation_is_requested_not_merged() {
+        let (_dir, db) = temp_db("prq-merge-requested");
+        let forge = FakeForge::new(Some(green_pr())).without_direct_confirmation();
+        let mut config = cfg();
+        config.merge_mode = thegn_core::config::PrMergeMode::Thegn;
+        let mut steps = Vec::new();
+        let out = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![item()],
+            |step| steps.push(step.status.to_owned()),
+        );
+        assert!(out.merged.is_empty());
+        assert_eq!(out.merge_requested, vec![7]);
+        assert!(steps.contains(&PrqStatus::Merging.as_str().to_owned()));
+    }
+
+    #[test]
+    fn stale_head_refusal_is_refresh_required_not_needs_human() {
+        let (_dir, db) = temp_db("prq-stale-head");
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            Some("/w/feat"),
+            "feat",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/7",
+        )
+        .unwrap();
+        db.update_pr_status("/repo#7", "ready", None, None, Some("abc"))
+            .unwrap();
+        db.set_pr_agent_attempts("/repo#7", 3).unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let forge = FakeForge::new(Some(green_pr()))
+            .with_merge_error(ForgeError::Other("head mismatch".into()))
+            .with_merge_head_after("new-head");
+        let mut config = cfg();
+        config.merge_mode = thegn_core::config::PrMergeMode::Thegn;
+        let mut steps = Vec::new();
+        let out = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |step| steps.push(step.status.to_owned()),
+        );
+        let row_after = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(out.blocked, vec![7]);
+        assert!(out.needs_human.is_empty());
+        assert_eq!(steps.last().map(String::as_str), Some("watching"));
+        assert_eq!(row_after.agent_attempts, 3);
+        assert_eq!(row_after.status, PrqStatus::Watching.as_str());
+        let observed = forge.pr.lock().unwrap().clone().unwrap();
+        assert_eq!(observed.state, "OPEN");
+        assert_eq!(observed.head_ref_oid, "new-head");
+        assert!(
+            forge
+                .calls()
+                .iter()
+                .any(|call| call.contains("head=Some(\"abc\")"))
+        );
+    }
+
+    #[test]
+    fn ambiguous_network_error_keeps_merging_and_reports_unknown() {
+        let (_dir, db) = temp_db("prq-merge-unknown");
+        let forge = FakeForge::new(Some(green_pr())).with_merge_error(ForgeError::Offline);
+        let mut config = cfg();
+        config.merge_mode = thegn_core::config::PrMergeMode::Thegn;
+        let mut steps = Vec::new();
+        let out = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![item()],
+            |step| steps.push(step.status.to_owned()),
+        );
+        assert!(out.merged.is_empty());
+        assert_eq!(out.merge_requested, vec![7]);
+        assert!(
+            out.warnings
+                .iter()
+                .any(|warning| warning.contains("merge outcome unknown"))
+        );
+        assert_eq!(steps.last().map(String::as_str), Some("merging"));
+    }
+
+    #[test]
+    fn armed_then_cancelled_is_rearmed_next_pass_and_never_merged() {
+        let (_dir, db) = temp_db("prq-auto-cancelled");
+        let forge = FakeForge::new(Some(green_pr()));
+        let config = cfg();
+        let first = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![item()],
+            |_| {},
+        );
+        let second = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![item()],
+            |_| {},
+        );
+        assert_eq!(first.auto_merge_armed, vec![7]);
+        assert_eq!(second.auto_merge_armed, vec![7]);
+        assert!(first.merged.is_empty() && second.merged.is_empty());
+        assert_eq!(
+            forge
+                .calls()
+                .iter()
+                .filter(|call| call.ends_with("auto=true"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn requested_merge_is_confirmed_by_a_later_poll() {
+        let (_dir, db) = temp_db("prq-later-confirmation");
+        let forge = FakeForge::new(Some(green_pr())).without_direct_confirmation();
+        let mut config = cfg();
+        config.merge_mode = thegn_core::config::PrMergeMode::Thegn;
+        let first = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![item()],
+            |_| {},
+        );
+        assert_eq!(first.merge_requested, vec![7]);
+        forge.pr.lock().unwrap().as_mut().unwrap().state = "MERGED".into();
+        let second = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![item()],
+            |_| {},
+        );
+        assert_eq!(second.dropped, vec![7]);
+        assert!(second.merged.is_empty());
     }
 }

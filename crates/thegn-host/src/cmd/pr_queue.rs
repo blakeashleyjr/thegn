@@ -353,8 +353,9 @@ fn drain(cfg: &Config, json: bool) -> Result<()> {
         outln!("Warning: {w}");
     }
     outln!(
-        "Done: {} merged, {} auto-merge armed, {} ready, {} still blocked, {} need a human, {} left the queue.",
+        "Done: {} merged, {} merge requested, {} auto-merge armed, {} ready, {} still blocked, {} need a human, {} left the queue.",
         out.merged.len(),
+        out.merge_requested.len(),
         out.auto_merge_armed.len(),
         out.ready.len(),
         out.blocked.len(),
@@ -369,6 +370,7 @@ fn drain(cfg: &Config, json: bool) -> Result<()> {
 fn drain_json(out: &pr_driver::PrOutcome) -> serde_json::Value {
     serde_json::json!({
         "merged": out.merged,
+        "merge_requested": out.merge_requested,
         "auto_merge_armed": out.auto_merge_armed,
         "ready": out.ready,
         "blocked": out.blocked,
@@ -519,5 +521,16 @@ mod drain_json_tests {
         let json = drain_json(&out);
         assert_eq!(json["merged"], serde_json::json!([]));
         assert_eq!(json["auto_merge_armed"], serde_json::json!([42]));
+    }
+
+    #[test]
+    fn merge_requested_is_additive_in_drain_json() {
+        let out = PrOutcome {
+            merge_requested: vec![42],
+            ..Default::default()
+        };
+        let json = drain_json(&out);
+        assert_eq!(json["merge_requested"], serde_json::json!([42]));
+        assert_eq!(json["merged"], serde_json::json!([]));
     }
 }
