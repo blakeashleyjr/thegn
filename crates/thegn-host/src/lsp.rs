@@ -27,10 +27,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::lsp_admission::{AdmittedClient, RootAdmission};
 use thegn_core::config::Config;
 use thegn_svc::lsp::{
-    DiagnosticKey, DiagnosticsReceiver, DiagnosticsSender, LspClient, LspDiagnostic, LspError,
-    LspHealth, LspSeverity, PublishedDiagnostics, Registry, StreamKey, limits,
+    CancelToken, DiagnosticKey, DiagnosticsReceiver, DiagnosticsSender, LspClient, LspDiagnostic,
+    LspError, LspHealth, LspSeverity, PublishedDiagnostics, Registry, StreamKey, limits,
 };
 
 use crate::panel::{DiagnosticItem, Severity};
@@ -174,6 +175,7 @@ pub struct LspInner {
     /// across every off-loop request task.
     registry: Registry,
     diag_tx: DiagnosticsSender,
+    admission: RootAdmission,
     clients: Mutex<ClientState>,
 }
 
@@ -186,6 +188,7 @@ impl LspSupervisor {
                 enabled: cfg.lsp.enabled,
                 registry: Registry::build(&cfg.lsp.servers),
                 diag_tx,
+                admission: RootAdmission::new(),
                 clients: Mutex::new(ClientState::default()),
             }),
             raw_rx: Some(raw_rx),
@@ -213,6 +216,10 @@ impl Drop for LspSupervisor {
 const LSP_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 /// One synchronous shutdown budget for all clients during host quit.
 const LSP_QUIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+/// Stop idle language servers after thirty minutes, except the active worktree.
+pub(crate) const LSP_IDLE_EVICT_AFTER: Duration = Duration::from_secs(30 * 60);
+/// Check for idle language servers at most once per minute during hydration.
+pub(crate) const LSP_EVICT_CHECK_EVERY: Duration = Duration::from_secs(60);
 
 /// Gracefully close and drop clients on a worker thread, never the render/input
 /// thread.
@@ -287,8 +294,17 @@ impl LspInner {
 
     /// Get the warm client for `(root, key)`, lazily spawning+initializing it on
     /// first use. **Blocks** (spawn + initialize) — call off the event loop.
-    pub fn client(&self, root: &Path, key: &str) -> Result<Arc<LspClient>, LspError> {
-        self.client_with(root, key, |root, key, diagnostics, generation| {
+    pub fn client(&self, root: &Path, key: &str) -> Result<AdmittedClient, LspError> {
+        self.client_with_cancel(root, key, None)
+    }
+
+    pub(crate) fn client_with_cancel(
+        &self,
+        root: &Path,
+        key: &str,
+        cancel: Option<&CancelToken>,
+    ) -> Result<AdmittedClient, LspError> {
+        self.admitted_with(root, key, cancel, |root, key, diagnostics, generation| {
             let Some(spec) = self.registry.resolve(key) else {
                 return Err(LspError::NotAvailable);
             };
@@ -319,6 +335,21 @@ impl LspInner {
             client.initialize(root)?;
             Ok(Arc::new(client))
         })
+    }
+
+    fn admitted_with(
+        &self,
+        root: &Path,
+        key: &str,
+        cancel: Option<&CancelToken>,
+        start: impl FnOnce(&Path, &str, DiagnosticsSender, u64) -> Result<Arc<LspClient>, LspError>,
+    ) -> Result<AdmittedClient, LspError> {
+        let permit = self.admission.admit(root, cancel)?;
+        if cancel.is_some_and(CancelToken::is_cancelled) {
+            return Err(LspError::Cancelled);
+        }
+        let client = self.client_with(root, key, start)?;
+        Ok(AdmittedClient::new(permit, client))
     }
 
     /// [`LspInner::client`] with an injectable starter (tests drive the
@@ -552,13 +583,19 @@ impl LspInner {
         }
     }
 
-    /// Retire live clients that have not been used within `idle`. Usage is
-    /// refreshed when `client_with` returns a cached client; requests made
-    /// through a held `Arc<LspClient>` do not refresh it, so long sessions
-    /// using a retained handle can still be evicted. The caller supplies `now`
-    /// so the sweep can be tested without sleeping.
-    #[allow(dead_code)] // the run-loop-2 lane owns periodic sweep wiring
-    pub fn evict_idle(&self, idle: Duration, now: Instant) -> usize {
+    /// Retire live clients unused for at least `idle`, unless their root is
+    /// exempt (the host exempts the active worktree) or a request still holds
+    /// a client handle. The caller supplies `now` for deterministic tests.
+    /// This sweep runs only after hydration applies, at most once per minute;
+    /// a fully idle session therefore evicts at its next hydration apply. It
+    /// never changes Starting, Failed, or Unavailable slots. Evicted clients
+    /// are shut down and reaped off-loop.
+    pub fn evict_idle(
+        &self,
+        idle: Duration,
+        now: Instant,
+        exempt: &dyn Fn(&Path) -> bool,
+    ) -> usize {
         let mut teardown = Vec::new();
         let mut removed_count = 0;
         if let Ok(mut state) = self.clients.lock() {
@@ -566,8 +603,11 @@ impl LspInner {
                 .map
                 .iter()
                 .filter_map(|(key, slot)| match slot {
-                    ClientSlot::Live { last_used, .. }
-                        if now.saturating_duration_since(*last_used) >= idle =>
+                    ClientSlot::Live {
+                        client, last_used, ..
+                    } if now.saturating_duration_since(*last_used) >= idle
+                        && !exempt(&key.0)
+                        && Arc::strong_count(client) == 1 =>
                     {
                         Some(key.clone())
                     }
@@ -1937,7 +1977,8 @@ mod tests {
             }
         }
 
-        assert_eq!(inner.evict_idle(Duration::from_secs(5), now), 1);
+        drop((idle_client, active_client));
+        assert_eq!(inner.evict_idle(Duration::from_secs(5), now, &|_| false), 1);
         assert!(
             !inner
                 .clients
@@ -1954,7 +1995,6 @@ mod tests {
                 .map
                 .contains_key(&(active_root.to_path_buf(), "rust".into()))
         );
-        drop((idle_client, active_client));
     }
 
     #[test]
@@ -3029,5 +3069,196 @@ mod tests {
         store.retain_streams(&HashSet::new());
         let f = assert_store_conserved(&store);
         assert_eq!((f.loss_bytes, store.active_loss(Path::new("/p"))), (0, 0));
+    }
+
+    #[test]
+    fn client_holds_a_permit_until_the_guard_drops() {
+        let (inner, _rx) = enabled_inner();
+        let root = Path::new("/admitted");
+        let client = inner
+            .admitted_with(root, "rust", None, fake_client)
+            .unwrap();
+        assert_eq!(inner.admission.in_flight(root), 1);
+        drop(client);
+        assert_eq!(inner.admission.in_flight(root), 0);
+    }
+
+    #[test]
+    fn idle_eviction_skips_the_exempt_active_root() {
+        let (inner, _rx) = enabled_inner();
+        let idle_root = Path::new("/idle");
+        let active_root = Path::new("/active");
+        let idle_client = inner
+            .client_with(idle_root, "rust", live_fake_client)
+            .unwrap();
+        let active_client = inner
+            .client_with(active_root, "rust", live_fake_client)
+            .unwrap();
+        let now = Instant::now();
+        {
+            let mut state = inner.clients.lock().unwrap();
+            for root in [idle_root, active_root] {
+                if let Some(ClientSlot::Live { last_used, .. }) =
+                    state.map.get_mut(&(root.to_path_buf(), "rust".into()))
+                {
+                    *last_used = now - Duration::from_secs(10);
+                } else {
+                    panic!("test client must be live");
+                }
+            }
+        }
+        drop((idle_client, active_client));
+
+        assert_eq!(
+            inner.evict_idle(Duration::from_secs(5), now, &|root| root == active_root),
+            1
+        );
+        let state = inner.clients.lock().unwrap();
+        assert!(
+            !state
+                .map
+                .contains_key(&(idle_root.to_path_buf(), "rust".into()))
+        );
+        assert!(
+            state
+                .map
+                .contains_key(&(active_root.to_path_buf(), "rust".into()))
+        );
+    }
+
+    #[test]
+    fn idle_eviction_skips_a_client_held_by_a_request() {
+        let (inner, _rx) = enabled_inner();
+        let root = Path::new("/held");
+        let client = inner.client_with(root, "rust", live_fake_client).unwrap();
+        let held_by_request = client.clone();
+        let now = Instant::now();
+        if let Some(ClientSlot::Live { last_used, .. }) = inner
+            .clients
+            .lock()
+            .unwrap()
+            .map
+            .get_mut(&(root.to_path_buf(), "rust".into()))
+        {
+            *last_used = now - Duration::from_secs(10);
+        } else {
+            panic!("test client must be live");
+        }
+        drop(client);
+
+        assert_eq!(inner.evict_idle(Duration::from_secs(5), now, &|_| false), 0);
+        assert!(
+            inner
+                .clients
+                .lock()
+                .unwrap()
+                .map
+                .contains_key(&(root.to_path_buf(), "rust".into()))
+        );
+        drop(held_by_request);
+        assert_eq!(inner.evict_idle(Duration::from_secs(5), now, &|_| false), 1);
+    }
+
+    #[test]
+    fn idle_eviction_never_touches_starting_failed_or_unavailable_slots() {
+        let (inner, _rx) = enabled_inner();
+        {
+            let mut state = inner.clients.lock().unwrap();
+            state.map.insert(
+                (PathBuf::from("/starting"), "rust".into()),
+                ClientSlot::Starting {
+                    cell: Arc::new(StartCell::new()),
+                    generation: 1,
+                },
+            );
+            state.map.insert(
+                (PathBuf::from("/failed"), "rust".into()),
+                ClientSlot::Failed {
+                    until: Instant::now() - Duration::from_secs(1),
+                    failures: 1,
+                },
+            );
+            state.map.insert(
+                (PathBuf::from("/unavailable"), "rust".into()),
+                ClientSlot::Unavailable,
+            );
+        }
+
+        assert_eq!(
+            inner.evict_idle(Duration::ZERO, Instant::now(), &|_| false),
+            0
+        );
+        let state = inner.clients.lock().unwrap();
+        assert!(
+            state
+                .map
+                .contains_key(&(PathBuf::from("/starting"), "rust".into()))
+        );
+        assert!(
+            state
+                .map
+                .contains_key(&(PathBuf::from("/failed"), "rust".into()))
+        );
+        assert!(
+            state
+                .map
+                .contains_key(&(PathBuf::from("/unavailable"), "rust".into()))
+        );
+    }
+
+    #[test]
+    fn evicted_client_is_shut_down_off_loop() {
+        let (inner, _rx) = enabled_inner();
+        let (reader, server_writer) = std::io::pipe().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_writer = captured.clone();
+        let root = Path::new("/evict-shutdown");
+        let client = inner
+            .client_with(root, "rust", move |root, key, diagnostics, generation| {
+                Ok(Arc::new(LspClient::from_io_with_identity(
+                    Box::new(reader),
+                    Box::new(CapturingWriter(captured_writer)),
+                    key,
+                    root,
+                    diagnostics,
+                    key.to_string(),
+                    generation,
+                )?))
+            })
+            .unwrap();
+        let now = Instant::now();
+        if let Some(ClientSlot::Live { last_used, .. }) = inner
+            .clients
+            .lock()
+            .unwrap()
+            .map
+            .get_mut(&(root.to_path_buf(), "rust".into()))
+        {
+            *last_used = now - Duration::from_secs(10);
+        } else {
+            panic!("test client must be live");
+        }
+        drop(client);
+
+        assert_eq!(inner.evict_idle(Duration::from_secs(5), now, &|_| false), 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !String::from_utf8(captured.lock().unwrap().clone())
+            .unwrap()
+            .contains("\"method\":\"exit\"")
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let bytes = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        let shutdown = bytes.find("\"method\":\"shutdown\"").unwrap();
+        let exit = bytes.find("\"method\":\"exit\"").unwrap();
+        assert!(shutdown < exit, "shutdown request must precede exit");
+        drop(server_writer);
+    }
+
+    #[test]
+    fn eviction_constants_match_the_owner_decision() {
+        assert_eq!(LSP_IDLE_EVICT_AFTER, Duration::from_secs(30 * 60));
+        assert_eq!(LSP_EVICT_CHECK_EVERY, Duration::from_secs(60));
     }
 }

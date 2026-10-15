@@ -1,4 +1,2 @@
 # help-section-keys-ratchet — `panel:<section>:<chord>` prose entries
 # containing real chords omitted from the subsection's section tables. Shrink only.
-# Remaining debt: environments t (system-followups owns the ENVIRONMENTS table).
-panel:environments:t

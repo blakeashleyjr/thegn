@@ -136,9 +136,11 @@ including runtime paths; those modes do not hide the control socket.
 
 ## Backends
 
-`[sandbox] backend = "auto"` walks the chain until one works: `podman` →
-`docker` → `apple` → `bwrap` → `none`. Pin one to skip the probing —
-`podman-rootless`, `podman-rootful`, `docker`, `bwrap`, `systemd`,
+`[sandbox] backend = "auto"` walks the chain until one works:
+`podman-rootless` → `podman-rootful` → `docker` → `apple` → `bwrap` →
+`jobobject` (Windows). There is no host fallback: with no usable backend, a
+sandboxed launch is refused under the default floor. Pin one to skip the
+probing — `podman-rootless`, `podman-rootful`, `docker`, `bwrap`, `systemd`,
 `apple`, `wsl`, `none`.
 
 One chain serves every OS: each OS-native entry is probed only on its own OS.
@@ -148,8 +150,10 @@ One chain serves every OS: each OS-native entry is probed only on its own OS.
 
 > **macOS tip:** `apple` is Apple's `container` CLI. Each container gets its
 > own Linux VM, so it is the strongest isolation any backend here offers.
-> Without it — and without podman/docker — a Mac lands on `none` and panes
-> run directly on the host; `bwrap`/`systemd` are Linux-only.
+> Without `apple`, podman, or docker, a Mac has no backend meeting the default
+> floor, so sandboxed panes are refused. Opt out with
+> `isolation_floor = "off"`, `backend = "none"`, `enabled = false`, or run on
+> host; `bwrap`/`systemd` are Linux-only.
 
 `thegn doctor` reports which backends this machine actually has.
 
@@ -278,25 +282,35 @@ container — it satisfies no floor at `shared-kernel` or above.
 
 ```toml
 [sandbox]
-isolation_floor = "guest-kernel"   # "" | shared-kernel | userspace-kernel | guest-kernel
-on_floor_miss   = "fail"           # degrade (default) | fail
+isolation_floor = "guest-kernel"   # off | shared-kernel | userspace-kernel | guest-kernel; unset = default
+on_floor_miss   = "fail"           # degrade | fail; applies only to an explicit floor
 ```
+
+With `[sandbox] enabled = true` and no explicit floor, the floor is
+`shared-kernel` and a miss always refuses. `enabled = false`,
+`backend = "none"`, and the run-on-host pin bypass only that default floor.
+An explicit floor from any layer always wins, even over those settings. A
+`backend_chain` that lists `host` is not a host opt-out.
 
 The floor is compared over the **honest class** of what the launch actually
 enters, after backend selection and any `oci_runtime` degrade — so a `krun` that
 fell back to the daemon default counts as `shared-kernel`, and a macOS local OCI
-container counts as `guest-kernel`. On a miss, `degrade` (the default)
-launches with the worktree marked degraded and a warning; `fail` refuses to
-launch and names the floor, available class, and how to satisfy it. The refusal
-names the opt-outs: set `[sandbox] on_floor_miss = "degrade"` (warn and mark
-degraded) or `isolation_floor = "off"`.
-`thegn doctor` prints `containment` and `file access` lines, including a line
-such as `requested <scope> — NOT ENFORCED on <backend>: <note>` when file
-access is not enforced. The floor also
-applies to standalone terminal tabs. If a terminal requests a backend with no
-runtime, `on_floor_miss = "fail"` refuses it; `degrade` launches it labelled
-degraded, and an unset floor produces a warning. Explicit `host`/`none`/empty
-backend choices and ssh/mosh terminals are unchanged. A managed provider
+container counts as `guest-kernel`. On a miss, `degrade` launches with the
+worktree marked degraded and a warning; `fail` refuses to launch and names the
+floor, available class, and how to satisfy it. The refusal names the opt-outs:
+`isolation_floor = "off"`; with no explicit floor, `enabled = false`,
+`backend = "none"`, or `run on host` also opts out; for an explicit floor,
+`on_floor_miss = "degrade"` opts out of refusal.
+`thegn doctor` prints the effective floor, miss policy, and source, for example
+`floor         shared-kernel (on miss: fail; default)`, or the reason the
+default floor was not applied. It also prints `containment` and `file access`
+lines, including a line such as
+`requested <scope> — NOT ENFORCED on <backend>: <note>` when file access is not
+enforced. The floor also applies to standalone terminal tabs. If a terminal
+requests a backend with no runtime, it is refused under the default floor or
+an explicit `fail` floor; an explicit floor with `degrade` launches it
+labelled degraded. Explicit `host`/`none`/empty backend choices and ssh/mosh
+terminals are unchanged. A managed provider
 placement is out of scope (reported `provider-managed`, never counted as a
 tier). A repo-root `.thegn.toml` may only **raise** the floor, never lower it.
 The two queues' agent handoff (`[merge_queue]` / `[pr_queue]`) can demand the same floor
@@ -343,6 +357,8 @@ and debuggers work; `sealed` removes it entirely. `[sandbox]` also
 carries DNS-name allow/block rules for the middle ground. These rules are not
 an egress boundary; `network = "none"` is the only enforced deny, and `*` in
 `network_block` means offline — see [[config-reference]].
+Standalone sandboxed terminals also warn when DNS-name rules apply, because
+those rules are not an egress boundary.
 
 `[sandbox.vpn]` can put the sandbox on an overlay network (tailscale,
 headscale, wireguard, openvpn, netbird, zerotier). The `mode` decides how:
@@ -438,8 +454,12 @@ Cleanup is always explicit — thegn never prunes on a schedule.
 
 - `thegn sandbox gc` runs the startup orphan sweep on demand: it removes thegn
   containers with this install/profile's `thegn.owner` label that are provably
-  orphaned across available backends. Unlabelled containers and containers owned
-  by another profile are listed but never removed. Safe to run any time.
+  orphaned across available backends. Local compose services carry the owner
+  label through a generated override; each is recreated once on its next `up`,
+  so gc can reclaim services from a dead worktree. Remote and profile-gated
+  compose services stay unlabelled and are kept as unverified. Unlabelled
+  containers and containers owned by another profile are listed but never
+  removed. Safe to run any time.
 - `thegn sandbox prune` reclaims **thegn-owned (`thegn-` name family) stopped
   containers**, and `thegn.managed` images and volumes. On a terminal it
   lists what it would remove and asks to confirm; `--yes` skips the prompt for

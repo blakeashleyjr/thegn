@@ -45,6 +45,7 @@ fn plugin(cfg: &mut Config, value: Value) {
         scopes: Vec::new(),
         mode: PluginMode::OneShot,
         enabled: false,
+        trusted_native: false,
     });
 }
 

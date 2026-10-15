@@ -3307,3 +3307,62 @@ fn fixed_net_icon_overrides_per_medium_glyphs() {
             .starts_with("NET")
     );
 }
+
+#[test]
+fn panel_hit_at_resolves_main_column_drill_click() {
+    use crate::layout::PanelWidth;
+    use crate::panel::gitui::GitView;
+    use crate::panel::{CommitRow, PanelHit, PanelTab, PanelUi, Section};
+
+    let rect = Rect {
+        x: 7,
+        y: 4,
+        cols: 120,
+        rows: 40,
+    };
+    let mut model = panel_model();
+    model.panel.commits = vec![CommitRow {
+        sha: "abcdef0123456789".into(),
+        short: "abcdef0".into(),
+        subject: "feat: click drill row".into(),
+        author: "Author".into(),
+        date: 1_700_000_000,
+        refs: String::new(),
+        parents: vec![],
+    }];
+    let mut ui = PanelUi {
+        width: PanelWidth::Full,
+        open: Section::Commits,
+        tab: PanelTab::Git,
+        ..Default::default()
+    };
+    ui.git.focus = GitView::CommitFiles;
+    ui.git.drilled_commit = Some(model.panel.commits[0].sha.clone());
+    ui.git.commit_files_load = crate::panel::gitui::DocLoad::Ready;
+    ui.git.commit_files = vec![("src/a.rs".into(), 2, 1)];
+
+    let frame =
+        crate::panel::frame::build_panel(&model, &ui, rect.cols, rect.rows, model.panel_focused);
+    let drill = frame
+        .col_hits
+        .iter()
+        .find(|span| span.hit == PanelHit::GitDrill(0))
+        .expect("real panel frame contains the drilled file row");
+    let main_x = rect.x + drill.cols.start;
+    let side = frame
+        .col_hits
+        .iter()
+        .find(|span| span.row == drill.row && span.cols.end <= drill.cols.start);
+    let side_hit = side.map(|span| span.hit);
+    assert!(side_hit.is_some(), "Commits row 0 has a side-column hit");
+    let side_x = rect.x + side.map_or(0, |span| span.cols.start);
+    let divider_x = rect.x + drill.cols.start - 1;
+    let click_y = rect.y + drill.row;
+
+    assert_eq!(
+        panel_hit_at(&model, &ui, rect, main_x, click_y),
+        Some(PanelHit::GitDrill(0))
+    );
+    assert_eq!(panel_hit_at(&model, &ui, rect, side_x, click_y), side_hit);
+    assert_eq!(panel_hit_at(&model, &ui, rect, divider_x, click_y), None);
+}

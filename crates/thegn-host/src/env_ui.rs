@@ -23,6 +23,8 @@ pub struct EnvSnapshot {
     /// `Some(true/false)` whether a token resolves for a provider env; `None` for
     /// non-provider placements (which need no token).
     pub token: Option<bool>,
+    /// Sanitized-at-render config details. Never contains secret values or identity paths.
+    pub detail: Vec<(String, String)>,
 }
 
 /// Build the display list for every configured env (sorted by name). Cheap: a
@@ -49,6 +51,95 @@ pub fn env_snapshots(cfg: &Config, bound: Option<&str>) -> Vec<EnvSnapshot> {
                 // Presence-memoized: this runs per provider env per hydration.
                 !key.is_empty() && crate::secret::resolve_present_cached(&key)
             });
+            let mut detail = Vec::new();
+            let mode = e
+                .placement_mode
+                .map(|mode| format!(" ({mode})"))
+                .unwrap_or_else(String::new);
+            push_detail(
+                &mut detail,
+                "placement",
+                format!("{}{mode}", e.placement.as_str()),
+            );
+            push_detail(&mut detail, "host", e.host.clone());
+            let target = match e.placement {
+                PlacementMode::Ssh => {
+                    let mut target = e.ssh.host.clone();
+                    if !target.is_empty() && e.ssh.port != 22 {
+                        target.push_str(&format!(":{}", e.ssh.port));
+                    }
+                    if !e.ssh.jump_host.is_empty() {
+                        target.push_str(if target.is_empty() { "" } else { " via " });
+                        target.push_str(&e.ssh.jump_host);
+                    }
+                    target
+                }
+                PlacementMode::K8s => [
+                    e.k8s.context.as_str(),
+                    e.k8s.namespace.as_str(),
+                    e.k8s.pod.as_str(),
+                ]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("/"),
+                PlacementMode::Provider => {
+                    let mut target = [
+                        e.provider.provider.as_str(),
+                        e.provider.region.as_str(),
+                        e.provider.size.as_str(),
+                    ]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                    if !e.provider.template.is_empty() {
+                        target.push_str(if target.is_empty() { "" } else { " " });
+                        target.push_str("template ");
+                        target.push_str(&e.provider.template);
+                    }
+                    target
+                }
+                PlacementMode::Local => String::new(),
+            };
+            push_detail(&mut detail, "target", target);
+            push_detail(&mut detail, "data", e.data.as_str().to_string());
+            let overlay = [
+                e.sandbox.backend.map(|value| value.as_str().to_string()),
+                e.sandbox.image.clone(),
+                e.sandbox.profile.map(|value| value.as_str().to_string()),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+            push_detail(&mut detail, "sandbox", overlay);
+            push_detail(
+                &mut detail,
+                "failover",
+                e.failover
+                    .map(|value| value.as_str().to_string())
+                    .unwrap_or_else(|| "inherit".to_string()),
+            );
+            let key = effective_token_env(&e.provider);
+            if is_provider && !key.is_empty() {
+                push_detail(
+                    &mut detail,
+                    "token",
+                    format!(
+                        "{key} {}",
+                        if token == Some(true) {
+                            "present"
+                        } else {
+                            "missing"
+                        }
+                    ),
+                );
+            }
+            if bound == Some(name.as_str()) {
+                push_detail(&mut detail, "bound", "this worktree".to_string());
+            }
             EnvSnapshot {
                 name: name.clone(),
                 kind,
@@ -57,11 +148,18 @@ pub fn env_snapshots(cfg: &Config, bound: Option<&str>) -> Vec<EnvSnapshot> {
                 size: e.provider.size.clone(),
                 bound: bound == Some(name.as_str()),
                 token,
+                detail,
             }
         })
         .collect();
     v.sort_by(|a, b| a.name.cmp(&b.name));
     v
+}
+
+fn push_detail(detail: &mut Vec<(String, String)>, label: &str, value: String) {
+    if !value.is_empty() {
+        detail.push((label.to_string(), value));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -435,6 +533,7 @@ mod tests {
             size: String::new(),
             bound,
             token: None,
+            detail: Vec::new(),
         }
     }
 
@@ -534,6 +633,55 @@ mod tests {
     }
 
     #[test]
+    fn env_snapshot_detail_names_target_and_token_env_never_the_value() {
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "ssh".into(),
+            thegn_core::config::EnvConfig {
+                placement: PlacementMode::Ssh,
+                ssh: thegn_core::config::EnvSshConfig {
+                    host: "box".into(),
+                    port: 2222,
+                    jump_host: "bastion".into(),
+                    identity: "/home/u/.ssh/id_x".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        cfg.env.insert(
+            "provider".into(),
+            provider_env("fly", "THEGN_ENV_DETAIL_TEST_TOKEN_810", "west"),
+        );
+        cfg.env.insert("local".into(), Default::default());
+
+        let snapshots = env_snapshots(&cfg, None);
+        let ssh = snapshots.iter().find(|env| env.name == "ssh").unwrap();
+        assert!(
+            ssh.detail
+                .iter()
+                .any(|row| row == &("target".into(), "box:2222 via bastion".into()))
+        );
+        let provider = snapshots.iter().find(|env| env.name == "provider").unwrap();
+        let token = provider
+            .detail
+            .iter()
+            .find(|(label, _)| label == "token")
+            .unwrap();
+        assert!(matches!(
+            token.1.as_str(),
+            "THEGN_ENV_DETAIL_TEST_TOKEN_810 missing" | "THEGN_ENV_DETAIL_TEST_TOKEN_810 present"
+        ));
+        assert!(
+            !ssh.detail
+                .iter()
+                .any(|(_, value)| value.contains("/home/u/.ssh/id_x"))
+        );
+        let local = snapshots.iter().find(|env| env.name == "local").unwrap();
+        assert!(!local.detail.iter().any(|(label, _)| label == "target"));
+    }
+
+    #[test]
     fn bind_decision_skips_the_already_bound_env() {
         let env = EnvSnapshot {
             name: "dev".into(),
@@ -543,6 +691,7 @@ mod tests {
             size: String::new(),
             bound: true,
             token: None,
+            detail: Vec::new(),
         };
         assert_eq!(bind_decision(&env, "/wt"), BindDecision::AlreadyBound);
         assert_eq!(bind_decision(&env, ""), BindDecision::NoWorktree);
@@ -558,6 +707,7 @@ mod tests {
             size: String::new(),
             bound: true,
             token: None,
+            detail: Vec::new(),
         };
 
         assert_eq!(

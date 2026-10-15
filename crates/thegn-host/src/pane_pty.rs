@@ -88,20 +88,10 @@ impl PtyProcessOwner {
         if state.complete {
             return state.exit_code;
         }
-        if let Some(group) = &state.group {
-            group.terminate();
-        } else if let Some(child) = state.child.as_mut() {
-            let _ = child.kill();
-        }
-        std::thread::sleep(crate::platform::pty_term_grace());
-        if let Some(group) = &state.group {
-            force_kill_group(group);
-        }
-        let code = state
-            .child
-            .as_mut()
-            .and_then(|child| child.wait().ok())
-            .map(|status| status.exit_code() as i32);
+        let code = {
+            let PtyProcessState { child, group, .. } = &mut *state;
+            terminate_and_reap_parts(child.as_mut(), group.as_ref())
+        };
         state.child.take();
         state.exit_code = code;
         state.complete = true;
@@ -131,19 +121,51 @@ impl Drop for PtyProcessState {
         if self.complete {
             return;
         }
-        if let Some(group) = &self.group {
-            group.terminate();
-        } else if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-        }
-        std::thread::sleep(crate::platform::pty_term_grace());
-        if let Some(group) = &self.group {
-            force_kill_group(group);
-        }
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.wait();
+        let child = self.child.take();
+        let group = self.group.take();
+        let teardown = Arc::new(Mutex::new(Some((child, group))));
+        let worker_teardown = Arc::clone(&teardown);
+        let spawn = std::thread::Builder::new()
+            .name("thegn-pty-reap".into())
+            .spawn(move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                let parts = worker_teardown
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take();
+                if let Some((mut child, group)) = parts {
+                    terminate_and_reap_parts(child.as_mut(), group.as_ref());
+                }
+            });
+        if let Err(error) = spawn {
+            tracing::debug!(target: "thegn::pty", %error, "unable to spawn PTY reaper; reaping inline");
+            let parts = teardown
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take();
+            if let Some((mut child, group)) = parts {
+                terminate_and_reap_parts(child.as_mut(), group.as_ref());
+            }
         }
     }
+}
+
+fn terminate_and_reap_parts(
+    mut child: Option<&mut Box<dyn portable_pty::Child + Send + Sync>>,
+    group: Option<&crate::platform::GroupHandle>,
+) -> Option<i32> {
+    if let Some(group) = group {
+        group.terminate();
+    } else if let Some(child) = child.as_deref_mut() {
+        let _ = child.kill();
+    }
+    std::thread::sleep(crate::platform::pty_term_grace());
+    if let Some(group) = group {
+        force_kill_group(group);
+    }
+    child
+        .and_then(|child| child.wait().ok())
+        .map(|status| status.exit_code() as i32)
 }
 
 /// Force-terminate the whole owned group, unconditionally.
@@ -420,6 +442,53 @@ mod tests {
             "a pane whose consumer vanished left {} child process(es) behind \
              (before={before}, after={}): {after:?}",
             after.len().saturating_sub(before),
+            after.len()
+        );
+    }
+
+    #[test]
+    fn dropping_an_unreaped_owner_returns_without_the_grace_sleep() {
+        if !std::path::Path::new("/proc/self/stat").exists()
+            || crate::platform::pty_term_grace().is_zero()
+        {
+            return;
+        }
+        let before = own_children().len();
+        let pty = portable_pty::native_pty_system();
+        let pair = pty
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open test PTY");
+        let mut command = CommandBuilder::new("sh");
+        command.args(["-c", "exec sleep 10"]);
+        let child = pair.slave.spawn_command(command).expect("spawn test child");
+        drop(pair.slave);
+        drop(pair.master);
+        let owner = PtyProcessOwner::new(child, None);
+        let started = std::time::Instant::now();
+        drop(owner);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(150),
+            "dropping an owner blocked for {:?}",
+            started.elapsed()
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            let children = own_children();
+            if children.len() <= before {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let after = own_children();
+        assert!(
+            after.len() <= before,
+            "background PTY reaper left a child behind (before={before}, after={}): {after:?}",
             after.len()
         );
     }

@@ -155,6 +155,7 @@ pub(crate) fn spawn_scan(
         // otherwise inflate the statusbar total forever — and turning badges off
         // is not a reason to stop reclaiming them.
         let reaped = sweep_orphans(&db);
+        crate::db_maintain::run_round(&db);
         crate::hook_run::prune_logs(&crate::hook_run::log_root(), thegn_core::util::now());
 
         // `show_sizes` hides the badges; it is not a reason to stop reclaiming

@@ -204,6 +204,7 @@ const HOSTS: &[SectionKey] = &[
 const ENVIRONMENTS: &[SectionKey] = &[
     nav("j/k", "row"),
     nav("↵", "rebind"),
+    k('t', "t", "test"),
     k('n', "n", "new"),
     danger('x', "x", "remove"),
 ];

@@ -18,6 +18,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use thegn_svc::lsp::CancelToken;
 
 /// Maximum visible rows for async-mode result lists (Files/Content/Git/Symbols).
 const MAX_ASYNC_ITEMS: usize = 8;
@@ -293,6 +294,7 @@ pub struct PaletteSession {
     pub result_rx: UnboundedReceiver<AsyncSearchResult>,
     pub result_tx: UnboundedSender<AsyncSearchResult>,
     pub search_gen: u64,
+    pub(crate) symbol_search: CancelOnDrop,
     pub searching: bool,
     pub(crate) db_pending: bool,
     pub(crate) db_key: Option<String>,
@@ -309,6 +311,22 @@ pub struct PaletteSession {
     waker: Option<termwiz::terminal::TerminalWaker>,
 }
 
+pub(crate) struct CancelOnDrop(pub(crate) CancelToken);
+
+impl CancelOnDrop {
+    pub(crate) fn replace(&mut self) -> CancelToken {
+        self.0.cancel();
+        self.0 = CancelToken::new();
+        self.0.clone()
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 impl PaletteSession {
     pub fn new(items: Vec<PaletteItem>) -> Self {
         let (tx, rx) = unbounded_channel();
@@ -323,6 +341,7 @@ impl PaletteSession {
             result_rx: rx,
             result_tx: tx,
             search_gen: 0,
+            symbol_search: CancelOnDrop(CancelToken::new()),
             searching: false,
             db_pending: false,
             db_key: None,
@@ -1210,16 +1229,22 @@ pub fn spawn_git_search(
     });
 }
 
-pub fn spawn_symbol_search(
+pub(crate) struct SymbolSearchContext {
+    tx: UnboundedSender<AsyncSearchResult>,
+    waker: termwiz::terminal::TerminalWaker,
+    cancel: CancelToken,
+}
+
+pub(crate) fn spawn_symbol_search(
     root: PathBuf,
     query: String,
     sg: u64,
     max_results: usize,
     lsp: std::sync::Arc<crate::lsp::LspInner>,
-    tx: UnboundedSender<AsyncSearchResult>,
-    waker: termwiz::terminal::TerminalWaker,
+    context: SymbolSearchContext,
 ) {
     tokio::task::spawn_blocking(move || {
+        let SymbolSearchContext { tx, waker, cancel } = context;
         // 1. Fast path (LSP-less): the tree-sitter entity index, ahead of the
         //    regex sweep, so a worktree crawled by the index answers structurally
         //    before the coarse grep — then the regex sweep fills any gaps. Both
@@ -1241,7 +1266,10 @@ pub fn spawn_symbol_search(
 
         // 2. Upgrade: query each present language's server (lazily starting it)
         //    for workspace symbols, and re-send LSP-first results when richer.
-        let lsp_hits = lsp_workspace_symbols(&lsp, &root, &query, &keys);
+        if cancel.is_cancelled() {
+            return;
+        }
+        let lsp_hits = lsp_workspace_symbols(&lsp, &root, &query, &keys, &cancel);
         if !lsp_hits.is_empty() {
             let merged = merge_symbol_hits(lsp_hits.into_iter().chain(non_lsp), max_results);
             // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
@@ -1405,13 +1433,17 @@ fn lsp_workspace_symbols(
     root: &std::path::Path,
     query: &str,
     keys: &std::collections::HashSet<String>,
+    cancel: &CancelToken,
 ) -> Vec<SymbolMatch> {
     let mut hits = Vec::new();
     for key in keys {
-        let Ok(client) = lsp.client(root, key) else {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let Ok(client) = lsp.client_with_cancel(root, key, Some(cancel)) else {
             continue;
         };
-        let Ok(syms) = client.workspace_symbols(query) else {
+        let Ok(syms) = client.workspace_symbols_with(query, cancel) else {
             continue;
         };
         for s in syms {
@@ -1496,6 +1528,10 @@ pub fn kick_palette_search(
     let max_sym = cfg.palette.symbol_max_results;
     let hidden = cfg.palette.content_search_hidden;
 
+    if mode != PaletteMode::Symbols {
+        session.symbol_search.0.cancel();
+    }
+
     match mode {
         PaletteMode::All => {
             // Already updated synchronously in apply_query; nothing to do.
@@ -1548,10 +1584,22 @@ pub fn kick_palette_search(
             spawn_git_search(worktree_root, query, sg, tx, waker.clone());
         }
         PaletteMode::Symbols => {
+            let cancel = session.symbol_search.replace();
             if query.is_empty() {
                 return;
             }
-            spawn_symbol_search(worktree_root, query, sg, max_sym, lsp, tx, waker.clone());
+            spawn_symbol_search(
+                worktree_root,
+                query,
+                sg,
+                max_sym,
+                lsp,
+                SymbolSearchContext {
+                    tx,
+                    waker: waker.clone(),
+                    cancel,
+                },
+            );
         }
         // Local providers (item 523): filtered synchronously from in-memory
         // panel state — no async worker, no generation tag.

@@ -1510,6 +1510,9 @@ impl Db {
             && verification_key
                 .as_ref()
                 .is_some_and(db_open_memo::is_verified);
+        if ver == 0 {
+            conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        }
         if !verified {
             conn.pragma_update(None, "journal_mode", "WAL")?;
         }

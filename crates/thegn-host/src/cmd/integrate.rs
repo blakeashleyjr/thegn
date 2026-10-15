@@ -17,6 +17,25 @@ use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::outln;
 
+pub(crate) fn gate_error_context(
+    phase: Option<integrate::GatePhase>,
+    class: Option<integrate::GateErrorClass>,
+) -> String {
+    match (phase, class) {
+        (Some(phase), Some(class)) => format!(" ({}/{})", phase.as_str(), class.as_str()),
+        _ => String::new(),
+    }
+}
+
+fn gate_error_line(
+    reason: &str,
+    phase: Option<integrate::GatePhase>,
+    class: Option<integrate::GateErrorClass>,
+) -> String {
+    let context = gate_error_context(phase, class);
+    format!("Gate could NOT RUN{context} — {reason}")
+}
+
 fn short(oid: &str) -> &str {
     &oid[..oid.len().min(12)]
 }
@@ -189,9 +208,14 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
             Some(b) => outln!("Gate failed — isolated {b}; {target} not advanced by this fold."),
             None => outln!("Gate failed — {target} not advanced by this fold."),
         },
-        GateOutcome::Errored { reason } => {
+        GateOutcome::Errored {
+            reason,
+            phase,
+            class,
+        } => {
             // Not a verdict about any branch — say so, and say what to fix.
-            outln!("Gate could NOT RUN — {reason}; {target} not advanced by this fold.");
+            let line = gate_error_line(reason, *phase, *class);
+            outln!("{line}; {target} not advanced by this fold.");
             outln!("  No branch was blamed. Check `[merge_queue] gate_command`");
             outln!("  and `gate_setup_command` — the gate worktree is a bare");
             outln!("  checkout with no dependencies installed.");
@@ -236,4 +260,59 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
         }
     }
     report.request_result()
+}
+
+#[cfg(test)]
+mod truth_surface_tests {
+    use super::*;
+
+    #[test]
+    fn gate_error_line_renders_phase_and_class() {
+        let line = gate_error_line(
+            "unavailable",
+            Some(integrate::GatePhase::Setup),
+            Some(integrate::GateErrorClass::SetupFailed),
+        );
+        assert_eq!(
+            line,
+            "Gate could NOT RUN (setup/setup_failed) — unavailable"
+        );
+        assert_eq!(gate_error_context(None, None), "");
+    }
+
+    #[test]
+    fn fold_request_result_preserves_gate_phase_and_class() {
+        let report = integrate::FoldReport {
+            target_branch: "main".into(),
+            original: "base".into(),
+            final_tip: "base".into(),
+            advanced: false,
+            landed: Vec::new(),
+            gated_sources: Vec::new(),
+            prepared: Vec::new(),
+            unprepared: Vec::new(),
+            deferred: Vec::new(),
+            gate: GateOutcome::Errored {
+                reason: "setup command failed".into(),
+                phase: Some(integrate::GatePhase::Setup),
+                class: Some(integrate::GateErrorClass::SetupFailed),
+            },
+            diagnostics: String::new(),
+            bookkeeping_error: None,
+            cas_attempts: 0,
+            resyncs: Vec::new(),
+        };
+        let error = report.request_result().unwrap_err().to_string();
+        assert!(error.contains("setup/setup_failed"), "{error}");
+
+        let mut cas_report = report;
+        cas_report.gate = GateOutcome::Errored {
+            reason: "CAS retry budget exhausted".into(),
+            phase: None,
+            class: None,
+        };
+        let error = cas_report.request_result().unwrap_err().to_string();
+        assert!(error.contains("CAS retry budget exhausted"));
+        assert!(!error.contains('('), "{error}");
+    }
 }

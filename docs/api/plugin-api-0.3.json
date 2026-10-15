@@ -474,6 +474,11 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "trusted_native": {
+          "default": false,
+          "description": "Explicitly opts this plugin into running as unsandboxed native code with the user's full authority. Declared capabilities and scopes are protocol checks, not executable containment.",
+          "type": "boolean"
+        },
         "version": {
           "type": "string"
         }

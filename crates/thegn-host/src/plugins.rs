@@ -29,6 +29,9 @@ pub(crate) enum PluginMsg {
     /// Discovery finished: every enabled plugin that negotiated cleanly, in
     /// discovery order. Sent exactly once per `spawn_plugins_host`.
     Loaded(Vec<LoadedState>),
+    /// Enabled plugins refused because declared protocol grants require
+    /// explicit trust for their unsandboxed native execution.
+    Refused(Vec<thegn_svc::plugin::loader::SpecProblem>),
     /// One resident session's stdout produced a line (or the session exited).
     Event { plugin: String, event: SessionEvent },
     /// One completed `spawn_ndjson` run of a one-shot plugin.
@@ -438,6 +441,10 @@ fn setup_and_schedule_with_waker(
             return;
         }
     };
+    let (discovered, refusals) = partition_native_trust(discovered);
+    for problem in &refusals {
+        tracing::warn!(target: "thegn::plugin", error = %problem, "native plugin refused without explicit trust");
+    }
     let mut loaded: Vec<LoadedState> = Vec::new();
     let now = Instant::now();
     for plugin in discovered {
@@ -496,12 +503,9 @@ fn setup_and_schedule_with_waker(
         timeout: Duration,
     }
     let mut initial_runs: Vec<InitialRun> = Vec::new();
+    let initial_run_ids = initial_run_ids(&loaded, &sched);
     for st in &loaded {
-        if st.plugin.spec.mode == PluginMode::OneShot
-            && !sched
-                .iter()
-                .any(|e| e.plugin == st.plugin.spec.manifest.id.as_str())
-        {
+        if initial_run_ids.contains(st.plugin.spec.manifest.id.as_str()) {
             initial_runs.push(InitialRun {
                 plugin: st.plugin.spec.manifest.id.as_str().to_string(),
                 command: st.plugin.spec.command.clone(),
@@ -516,6 +520,17 @@ fn setup_and_schedule_with_waker(
     let _ = tx.send(PluginMsg::Loaded(loaded));
     if let Some(waker) = &waker {
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+    }
+
+    if !refusals.is_empty() {
+        if let Err(error) = tx.send(PluginMsg::Refused(refusals)) {
+            tracing::debug!(target: "thegn::plugin", %error, "refusal message consumer is gone");
+        }
+        if let Some(waker) = &waker
+            && let Err(error) = waker.wake()
+        {
+            tracing::debug!(target: "thegn::plugin", %error, "refusal message waker pulse failed");
+        }
     }
 
     for r in initial_runs {
@@ -592,6 +607,37 @@ fn setup_and_schedule_with_waker(
     }
 }
 
+fn partition_native_trust(
+    plugins: Vec<LoadedPlugin>,
+) -> (
+    Vec<LoadedPlugin>,
+    Vec<thegn_svc::plugin::loader::SpecProblem>,
+) {
+    let mut admitted = Vec::new();
+    let mut refused = Vec::new();
+    for plugin in plugins {
+        if let Some(problem) = thegn_svc::plugin::loader::native_trust_refusal(&plugin) {
+            refused.push(problem);
+        } else {
+            admitted.push(plugin);
+        }
+    }
+    (admitted, refused)
+}
+
+fn initial_run_ids(loaded: &[LoadedState], sched: &[SchedEntry]) -> BTreeSet<String> {
+    loaded
+        .iter()
+        .filter(|state| {
+            state.plugin.spec.mode == PluginMode::OneShot
+                && !sched
+                    .iter()
+                    .any(|entry| entry.plugin == state.plugin.spec.manifest.id.as_str())
+        })
+        .map(|state| state.plugin.spec.manifest.id.as_str().to_string())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,10 +647,23 @@ mod tests {
         toml::from_str(include_str!("../../../examples/plugins/hello/plugin.toml")).unwrap()
     }
 
+    fn capability_spec(id: &str, capability: &str) -> PluginSpec {
+        let mut spec = example_spec();
+        spec.manifest.id = PluginId::new(id);
+        let (kind, target) = capability.split_once(':').expect("kind:target fixture");
+        spec.manifest.capabilities = vec![thegn_core::plugin_api::Capability::new(kind, target)];
+        spec.manifest.contributions.clear();
+        spec
+    }
+
     fn loaded_state(spec: PluginSpec) -> LoadedState {
         let accepted_contributions = spec.manifest.contributions.clone();
         LoadedState {
-            plugin: LoadedPlugin { spec, dir: None },
+            plugin: LoadedPlugin {
+                spec,
+                dir: None,
+                trusted_native_ignored: false,
+            },
             negotiated: NegotiatedManifest {
                 accepted_contributions,
                 ..Default::default()
@@ -717,6 +776,7 @@ mod tests {
         let plugin = LoadedPlugin {
             spec,
             dir: Some(tmp.path().to_path_buf()),
+            trusted_native_ignored: false,
         };
 
         assert_eq!(host.run_one_shot(plugin.clone()), OneShotStart::Started);
@@ -771,6 +831,47 @@ mod tests {
     }
 
     #[test]
+    fn partition_native_trust_drops_only_untrusted_gated_plugins() {
+        let mut refused = capability_spec("refused", "run:git");
+        refused.mode = PluginMode::OneShot;
+        let mut trusted = capability_spec("trusted", "run:git");
+        trusted.mode = PluginMode::OneShot;
+        trusted.trusted_native = true;
+        let hello = example_spec();
+        let plugins = [refused, trusted, hello]
+            .into_iter()
+            .map(|spec| LoadedPlugin {
+                spec,
+                dir: None,
+                trusted_native_ignored: false,
+            })
+            .collect();
+
+        let (kept, refused) = partition_native_trust(plugins);
+
+        assert_eq!(kept.len(), 2);
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].plugin, "refused");
+        let states = kept
+            .into_iter()
+            .map(|plugin| {
+                let negotiated = thegn_svc::plugin::loader::negotiate(&plugin.spec)
+                    .expect("kept plugin negotiates");
+                LoadedState {
+                    plugin,
+                    negotiated,
+                    writer: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let sched = build_schedule(&states, Instant::now());
+        let initial = initial_run_ids(&states, &sched);
+        assert!(sched.iter().all(|entry| entry.plugin != "refused"));
+        assert!(!initial.contains("refused"));
+        assert!(initial.contains("trusted"));
+    }
+
+    #[test]
     fn startup_publishes_empty_set_and_does_not_run_duplicate_one_shots() {
         let tmp = tempfile::tempdir().unwrap();
         let marker = tmp.path().join("ran");
@@ -813,5 +914,55 @@ mod tests {
         assert!(lock(&sessions).is_empty());
         assert!(!marker.exists());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn startup_refuses_untrusted_gated_one_shot_without_running_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("ran");
+        let mut refused = capability_spec("untrusted-runner", "run:git");
+        refused.mode = PluginMode::OneShot;
+        refused.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "touch \"$1\"".into(),
+            "plugin".into(),
+            marker.display().to_string(),
+        ];
+        refused.manifest.contributions.clear();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+
+        setup_and_schedule_with_waker(
+            supervisor,
+            vec![refused],
+            tmp.path().to_path_buf(),
+            sessions,
+            disabled,
+            stop,
+            tx,
+            None,
+        );
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            PluginMsg::Loaded(loaded)
+                if loaded.iter().all(|state| state.plugin.spec.manifest.id.as_str() != "untrusted-runner")
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            PluginMsg::Refused(problems)
+                if problems.iter().any(|problem| problem.plugin == "untrusted-runner")
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(!marker.exists());
     }
 }

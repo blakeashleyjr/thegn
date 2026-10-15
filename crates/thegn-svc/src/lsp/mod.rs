@@ -284,6 +284,10 @@ pub enum LspError {
     Protocol(String),
     /// A local resource bound rejected a server publication or response.
     Bounded(String),
+    /// The per-worktree admission queue is full or its bounded wait elapsed.
+    Overloaded,
+    /// The caller cancelled the request.
+    Cancelled,
 }
 
 impl std::fmt::Display for LspError {
@@ -294,11 +298,72 @@ impl std::fmt::Display for LspError {
             LspError::Timeout => write!(f, "language server request timed out"),
             LspError::Protocol(e) => write!(f, "language server protocol error: {e}"),
             LspError::Bounded(e) => write!(f, "language server resource limit: {e}"),
+            LspError::Overloaded => write!(
+                f,
+                "language server busy: too many queued requests for this worktree"
+            ),
+            LspError::Cancelled => write!(f, "language server request cancelled"),
         }
     }
 }
 
 impl std::error::Error for LspError {}
+
+#[derive(Default)]
+struct CancelState {
+    cancelled: bool,
+    waiters: Vec<Box<dyn FnOnce() + Send>>,
+}
+
+/// Cloneable caller-owned cancellation signal for one blocking LSP operation.
+///
+/// A token is per operation, not long-lived: registered callbacks remain owned
+/// by the token until it is cancelled or dropped.
+#[derive(Clone, Default)]
+pub struct CancelToken(Arc<Mutex<CancelState>>);
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        let waiters = {
+            let mut state = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.cancelled {
+                return;
+            }
+            state.cancelled = true;
+            std::mem::take(&mut state.waiters)
+        };
+        for waiter in waiters {
+            waiter();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancelled
+    }
+
+    /// Register an immediate callback; callbacks run exactly once on cancel.
+    pub fn on_cancel(&self, waiter: impl FnOnce() + Send + 'static) -> Result<(), LspError> {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.cancelled {
+            return Err(LspError::Cancelled);
+        }
+        state.waiters.push(Box::new(waiter));
+        Ok(())
+    }
+}
 
 // ─── protocol value types (0-based, LSP-native, until the UI boundary) ──────
 
@@ -2015,10 +2080,32 @@ impl LspClient {
 
     /// Workspace-wide symbol search.
     pub fn workspace_symbols(&self, query: &str) -> Result<Vec<SymbolInfo>, LspError> {
+        self.workspace_symbols_inner(query, None)
+    }
+
+    pub fn workspace_symbols_with(
+        &self,
+        query: &str,
+        cancel: &CancelToken,
+    ) -> Result<Vec<SymbolInfo>, LspError> {
+        self.workspace_symbols_inner(query, Some(cancel))
+    }
+
+    fn workspace_symbols_inner(
+        &self,
+        query: &str,
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<SymbolInfo>, LspError> {
         if !self.supports(LspMethod::WorkspaceSymbol) {
             return Err(LspError::NotAvailable);
         }
-        let res = self.request("workspace/symbol", json!({ "query": query }))?;
+        let deadline = std::time::Instant::now() + self.timeout;
+        let res = self.request_until(
+            "workspace/symbol",
+            json!({ "query": query }),
+            deadline,
+            cancel,
+        )?;
         let mut health = ProjectionHealth::default();
         let symbols = project_symbols(&res, "", &mut health);
         health.record(&self.diagnostics);
@@ -2117,7 +2204,7 @@ impl LspClient {
     /// Send a request and block (up to `timeout`) for its correlated response.
     fn request(&self, method: &str, params: Value) -> Result<Value, LspError> {
         let deadline = std::time::Instant::now() + self.timeout;
-        self.request_until(method, params, deadline)
+        self.request_until(method, params, deadline, None)
     }
 
     fn request_until(
@@ -2125,7 +2212,11 @@ impl LspClient {
         method: &str,
         params: Value,
         deadline: std::time::Instant,
+        cancel: Option<&CancelToken>,
     ) -> Result<Value, LspError> {
+        if cancel.is_some_and(CancelToken::is_cancelled) {
+            return Err(LspError::Cancelled);
+        }
         self.ensure_open()?;
         let id = self
             .next_id
@@ -2135,7 +2226,10 @@ impl LspClient {
             .map_err(|_| LspError::Bounded("LSP request id space exhausted".into()))?;
         let (tx, rx) = mpsc::channel();
         {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // Reader closure uses this same lock to latch closed and drain.
             // A late requester cannot insert after the terminal drain.
             self.ensure_open()?;
@@ -2145,26 +2239,72 @@ impl LspClient {
             pending.insert(id, tx);
         }
 
+        if let Some(cancel) = cancel {
+            let cancel_tx = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| LspError::Protocol("pending request disappeared".into()))?;
+            if let Err(error) = cancel.on_cancel(move || {
+                if let Err(send_error) = cancel_tx.send(Err(LspError::Cancelled)) {
+                    tracing::debug!(target: "thegn::lsp", %send_error, "cancelled LSP waiter was already gone");
+                }
+            }) {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id);
+                return Err(error);
+            }
+        }
+
         let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         let body = match serialize_bounded(&body, limits::MAX_OUTBOUND_BODY_BYTES) {
             Ok(body) => body,
             Err(error) => {
-                self.pending.lock().unwrap().remove(&id);
+                self.pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id);
                 return Err(error);
             }
         };
-        if let Err(e) = self.write_until(&body, Some(deadline)) {
-            self.pending.lock().unwrap().remove(&id);
-            if matches!(e, LspError::Timeout) {
+        if cancel.is_some_and(CancelToken::is_cancelled) {
+            self.pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+            self.send_cancel(id);
+            return Err(LspError::Cancelled);
+        }
+        if let Err(e) = self.write_until(&body, Some(deadline), cancel) {
+            self.pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+            if matches!(e, LspError::Timeout | LspError::Cancelled) {
                 self.send_cancel(id);
             }
             return Err(e);
         }
 
         match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(Err(LspError::Cancelled)) => {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id);
+                self.send_cancel(id);
+                Err(LspError::Cancelled)
+            }
             Ok(res) => res,
             Err(_) => {
-                self.pending.lock().unwrap().remove(&id);
+                self.pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id);
                 self.send_cancel(id);
                 Err(LspError::Timeout)
             }
@@ -2194,13 +2334,26 @@ impl LspClient {
         &self,
         body: &str,
         deadline: Option<std::time::Instant>,
+        cancel: Option<&CancelToken>,
     ) -> Result<(), LspError> {
         self.ensure_open()?;
         if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
             return Err(LspError::Timeout);
         }
         let (done_tx, done_rx) = mpsc::channel();
-        enqueue_body(&self.writer, &self.queued_bytes, body, Some(done_tx))?;
+        enqueue_body(
+            &self.writer,
+            &self.queued_bytes,
+            body,
+            Some(done_tx.clone()),
+        )?;
+        if let Some(cancel) = cancel {
+            cancel.on_cancel(move || {
+                if let Err(error) = done_tx.send(Err(LspError::Cancelled)) {
+                    tracing::debug!(target: "thegn::lsp", %error, "cancelled write waiter was already gone");
+                }
+            })?;
+        }
         let wait = deadline.map_or(Duration::from_secs(365 * 24 * 60 * 60), |at| {
             at.saturating_duration_since(std::time::Instant::now())
         });
@@ -2226,7 +2379,7 @@ impl LspClient {
     pub fn shutdown(&self, grace: Duration) {
         if !self.is_closed() {
             let deadline = std::time::Instant::now() + grace;
-            if let Err(error) = self.request_until("shutdown", Value::Null, deadline) {
+            if let Err(error) = self.request_until("shutdown", Value::Null, deadline, None) {
                 tracing::debug!(target: "thegn::lsp", %error, "LSP shutdown request did not complete");
             }
             if let Err(error) = self.notify("exit", Value::Null) {
@@ -4308,5 +4461,167 @@ mod tests {
         ));
         // Any other escape is not decoded here (the loss falls back to the stream).
         assert_eq!(unescape_solidus(br"file:\u002Fx"), None);
+    }
+
+    struct CapturingBlockingWriter {
+        entered: Option<Sender<()>>,
+        release: Receiver<()>,
+        captured: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CapturingBlockingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+            self.captured.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cancel_completes_a_pending_request_and_sends_cancel_request() {
+        let (reader, mut server_writer) = std::io::pipe().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturingBlockingWriter {
+            entered: Some(entered_tx),
+            release: release_rx,
+            captured: captured.clone(),
+        };
+        let (diag_tx, _) = diagnostics_channel();
+        let client = Arc::new(
+            LspClient::from_io(
+                Box::new(reader),
+                Box::new(writer),
+                "fixture",
+                Path::new("/fixture"),
+                diag_tx,
+            )
+            .unwrap(),
+        );
+        let cancel = CancelToken::new();
+        let request_client = client.clone();
+        let request_cancel = cancel.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let request_thread = thread::spawn(move || {
+            let result = request_client.request_until(
+                "blocked",
+                Value::Null,
+                std::time::Instant::now() + Duration::from_secs(10),
+                Some(&request_cancel),
+            );
+            result_tx.send(result).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancel.cancel();
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(500)).unwrap(),
+            Err(LspError::Cancelled)
+        ));
+        let queued = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+        assert!(
+            queued.is_empty(),
+            "blocked request has not reached the transport writer"
+        );
+        assert!(
+            client.queued_bytes.load(Ordering::SeqCst) > 0,
+            "request and cancellation frames are queued"
+        );
+        release_tx.send(()).unwrap();
+        request_thread.join().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let bytes = captured.lock().unwrap().clone();
+            if String::from_utf8_lossy(&bytes).contains("$/cancelRequest") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancellation frame is written before the deadline"
+            );
+            thread::yield_now();
+        }
+        let bytes = captured.lock().unwrap().clone();
+        let mut decoder = framing::FrameDecoder::new();
+        decoder.push(&bytes).unwrap();
+        let mut saw_cancel = false;
+        while let Some(message) = decoder.next_message().unwrap() {
+            let value: Value = serde_json::from_str(&message).unwrap();
+            if value["method"] == "$/cancelRequest" {
+                assert_eq!(value["params"]["id"], 1);
+                saw_cancel = true;
+            }
+        }
+        assert!(saw_cancel, "cancellation frame contains the request id");
+        let late = framing::encode(r#"{"jsonrpc":"2.0","id":1,"result":null}"#);
+        server_writer.write_all(&late).unwrap();
+        server_writer.flush().unwrap();
+
+        let second_client = client.clone();
+        let (second_tx, second_rx) = mpsc::channel();
+        let second_thread = thread::spawn(move || {
+            second_tx
+                .send(second_client.request_until(
+                    "second",
+                    Value::Null,
+                    std::time::Instant::now() + Duration::from_secs(2),
+                    None,
+                ))
+                .unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let bytes = captured.lock().unwrap().clone();
+            if String::from_utf8_lossy(&bytes).contains("\"method\":\"second\"") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "second request is written before the deadline"
+            );
+            thread::yield_now();
+        }
+        let response = framing::encode(r#"{"jsonrpc":"2.0","id":2,"result":"second-result"}"#);
+        server_writer.write_all(&response).unwrap();
+        server_writer.flush().unwrap();
+        assert_eq!(
+            second_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            json!("second-result")
+        );
+        second_thread.join().unwrap();
+        assert!(
+            !client.is_closed(),
+            "late response does not close the reader"
+        );
+        drop(server_writer);
+    }
+
+    #[test]
+    fn cancelled_token_refuses_new_requests_without_writing() {
+        let (client, release, _entered, _server_writer) = blocked_client(Duration::from_secs(5));
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            client.request_until(
+                "never",
+                Value::Null,
+                std::time::Instant::now() + Duration::from_secs(1),
+                Some(&cancel)
+            ),
+            Err(LspError::Cancelled)
+        ));
+        assert_eq!(client.queued_bytes.load(Ordering::SeqCst), 0);
+        assert!(client.pending.lock().unwrap().is_empty());
+        release.send(()).unwrap();
     }
 }

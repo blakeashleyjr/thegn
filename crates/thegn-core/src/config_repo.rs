@@ -286,6 +286,28 @@ pub fn repo_command_collector_warnings_for_overlay(
         .unwrap_or_default()
 }
 
+/// Return launch-parity warnings for malformed repo overlay sandbox mounts.
+/// These entries are advisory because launch currently drops malformed mounts.
+pub fn repo_overlay_mount_warnings(body: &str, format: OverlayFormat) -> Vec<String> {
+    let Ok(overlay) = parse_repo_config(body, format) else {
+        return Vec::new();
+    };
+    overlay
+        .sandbox
+        .mounts
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(index, spec)| {
+            crate::sandbox_mounts::parse_mount_checked(&spec)
+                .err()
+                .map(|error| {
+                    format!("sandbox.mounts[{index}] `{spec}`: {error} — the entry is ignored")
+                })
+        })
+        .collect()
+}
+
 /// Validate a repo overlay against the actual `RepoConfigFile` schema.
 ///
 /// Loading remains tolerant: callers that only need effective values may keep
@@ -586,5 +608,31 @@ mod tests {
             discovery.unreadable_candidates()[0].error,
             "candidate is not a regular file"
         );
+    }
+
+    #[test]
+    fn repo_overlay_mount_warnings_reports_malformed_entries() {
+        assert!(repo_overlay_mount_warnings("[sandbox\n", OverlayFormat::Toml).is_empty());
+        for (format, body) in [
+            (
+                OverlayFormat::Toml,
+                "[sandbox]\nmounts = [\"/x:rw:extra\", \"/x:relative:ro\", \"/data:/data:ro\"]\n",
+            ),
+            (
+                OverlayFormat::Yaml,
+                "sandbox:\n  mounts: [\"/x:rw:extra\", \"/x:relative:ro\", \"/data:/data:ro\"]\n",
+            ),
+        ] {
+            let warnings = repo_overlay_mount_warnings(body, format);
+            assert_eq!(warnings.len(), 2, "{format}: {warnings:?}");
+            assert!(warnings[0].contains("sandbox.mounts[0] `/x:rw:extra`"));
+            assert!(warnings[0].contains("entry is ignored"));
+            assert!(warnings[1].contains("sandbox.mounts[1] `/x:relative:ro`"));
+            assert!(
+                warnings
+                    .iter()
+                    .all(|warning| !warning.contains("/data:/data:ro"))
+            );
+        }
     }
 }
