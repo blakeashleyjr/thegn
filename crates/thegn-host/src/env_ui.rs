@@ -643,6 +643,7 @@ mod tests {
                     host: "box".into(),
                     port: 2222,
                     jump_host: "bastion".into(),
+                    identity: "/home/u/.ssh/id_x".into(),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -667,12 +668,14 @@ mod tests {
             .iter()
             .find(|(label, _)| label == "token")
             .unwrap();
-        assert!(token.1.starts_with("THEGN_ENV_DETAIL_TEST_TOKEN_810 "));
+        assert!(matches!(
+            token.1.as_str(),
+            "THEGN_ENV_DETAIL_TEST_TOKEN_810 missing" | "THEGN_ENV_DETAIL_TEST_TOKEN_810 present"
+        ));
         assert!(
-            !provider
-                .detail
+            !ssh.detail
                 .iter()
-                .any(|(_, value)| value == "secret-value")
+                .any(|(_, value)| value.contains("/home/u/.ssh/id_x"))
         );
         let local = snapshots.iter().find(|env| env.name == "local").unwrap();
         assert!(!local.detail.iter().any(|(label, _)| label == "target"));

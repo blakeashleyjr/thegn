@@ -92,7 +92,11 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
                 let mut line = vec![
                     seg(
                         if selected { t() } else { g() },
-                        if selected { glyphs.arrow_right } else { "  " },
+                        if selected {
+                            format!("{} ", glyphs.arrow_right)
+                        } else {
+                            "  ".to_string()
+                        },
                     ),
                     glyph(env),
                     seg(
@@ -142,7 +146,6 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
                 ]);
             }
         }
-        rows.push(PanelRow::plain(Line::segs(vec![seg(d(), "ENVIRONMENTS")])));
         rows.push(rule());
         rows.extend(list_detail(
             Section::Environments,
@@ -390,6 +393,12 @@ mod tests {
             rows: 20,
         };
         let rows = content(&ctx);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row_text(row) == "ENVIRONMENTS")
+                .count(),
+            1
+        );
         assert!(rows.iter().any(|row| {
             let text = row_text(row);
             text.contains("one") && text.contains("placement")
