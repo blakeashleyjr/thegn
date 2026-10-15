@@ -1621,7 +1621,7 @@ mod tests {
         };
         legacy.persist(&db, repo, 1).unwrap();
 
-        let mut loaded = Session::resurrect(&db, repo).unwrap();
+        let loaded = Session::resurrect(&db, repo).unwrap();
         let names: Vec<_> = loaded.worktrees.iter().map(|g| g.name.as_str()).collect();
         assert!(
             names.contains(&"washu/home"),
