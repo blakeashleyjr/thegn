@@ -42,6 +42,17 @@ fn hue(h: Hue) -> Tok {
     Tok::Hue(h)
 }
 
+/// Whether the active sidebar worktree is colocated with jj.
+pub(crate) fn active_worktree_jj(model: &crate::chrome::FrameModel) -> bool {
+    model
+        .sidebar_rows
+        .iter()
+        .find(|row| row.kind == crate::sidebar::RowKind::Worktree && row.active)
+        .and_then(|row| row.worktree_path.as_ref())
+        .and_then(|path| model.sidebar_status.git.get(path))
+        .is_some_and(|glyphs| glyphs.jj)
+}
+
 /// The range-highlight tint (the cursor itself gets [`Tok::SelAccent`] when
 /// the panel is focused).
 fn range_tint() -> Tok {
@@ -395,6 +406,61 @@ mod tests {
             Line::Segs(v) => v.iter().map(|s| s.text.clone()).collect(),
             _ => String::new(),
         }
+    }
+
+    #[test]
+    fn active_worktree_jj_reads_the_active_rows_glyphs() {
+        let active = crate::sidebar::SidebarRow {
+            active: true,
+            worktree_path: Some("/repo/wt".into()),
+            ..crate::sidebar::SidebarRow::base(crate::sidebar::RowKind::Worktree, 1, "wt", "repo")
+        };
+        let inactive = crate::sidebar::SidebarRow {
+            worktree_path: Some("/repo/other".into()),
+            ..crate::sidebar::SidebarRow::base(
+                crate::sidebar::RowKind::Worktree,
+                1,
+                "other",
+                "repo",
+            )
+        };
+        let status = crate::sidebar::GitGlyphs {
+            jj: true,
+            ..Default::default()
+        };
+        let model = crate::chrome::FrameModel {
+            sidebar_rows: vec![inactive.clone(), active],
+            sidebar_status: crate::sidebar::SidebarStatus {
+                git: [("/repo/wt".into(), status), ("/repo/other".into(), status)]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(active_worktree_jj(&model));
+
+        let model = crate::chrome::FrameModel {
+            sidebar_rows: vec![inactive],
+            sidebar_status: model.sidebar_status.clone(),
+            ..Default::default()
+        };
+        assert!(!active_worktree_jj(&model));
+
+        let model = crate::chrome::FrameModel {
+            sidebar_rows: vec![crate::sidebar::SidebarRow {
+                active: true,
+                worktree_path: Some("/repo/missing".into()),
+                ..crate::sidebar::SidebarRow::base(
+                    crate::sidebar::RowKind::Worktree,
+                    1,
+                    "missing",
+                    "repo",
+                )
+            }],
+            ..Default::default()
+        };
+        assert!(!active_worktree_jj(&model));
     }
 
     #[test]
