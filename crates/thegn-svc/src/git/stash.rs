@@ -112,7 +112,9 @@ pub trait StashOps: GitBackend {
     }
 
     /// Read a stash's patch without taking the mutation lock or running
-    /// repository-configured hooks, external diff drivers, or textconv.
+    /// repository-configured hooks, external diff drivers, or textconv. Porcelain
+    /// `stash show` is textconv-off by default, so these flags are defense in depth
+    /// against user-level `diff.*`/alias config; the read runner is the real fence.
     /// `-u` includes the untracked third-parent tree that plain
     /// `stash show -p` silently omits.
     fn stash_show(&self, loc: &GitLoc, rev: &str) -> Result<String> {
@@ -354,8 +356,8 @@ mod tests {
             ],
         );
 
-        let plain_patch = repo.out(&["stash", "show", "-p", &sha]);
-        assert!(marker.exists(), "plain git is the positive control");
+        let plain_patch = repo.out(&["stash", "show", "-p", "--textconv", &sha]);
+        assert!(marker.exists(), "explicit textconv is the positive control");
         assert!(plain_patch.contains("stashed content"), "{plain_patch}");
         std::fs::remove_file(&marker).unwrap();
 
@@ -374,6 +376,9 @@ mod tests {
         CliGit.stash_push(&loc, "read test", false).unwrap();
         let sha = repo.out(&["rev-parse", "stash@{0}"]).trim().to_string();
         let lock_path = thegn_core::util::git_common_dir(&repo.dir).join("thegn-git.lock");
+        if lock_path.exists() {
+            std::fs::remove_file(&lock_path).unwrap();
+        }
         std::fs::create_dir(lock_path).unwrap();
 
         let patch = CliGit.stash_show(&loc, &sha).unwrap();
