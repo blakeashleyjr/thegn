@@ -248,7 +248,7 @@ what it actually enforces —
 | Cell      | What it means                                                                 |
 | --------- | ----------------------------------------------------------------------------- |
 | `fs`      | filesystem isolation: a separate root, unit-level protection, or the host fs  |
-| `net`     | `netns`; rules DNS-only, or the host stack                                    |
+| `net`     | `netns; rules DNS-only`, `only when network=none`, or `none (host net)`       |
 | `ceiling` | resource cap strength: hard cgroup/VM, soft `nice`, deferred, or none         |
 | `scoping` | process-tree scoping: engine lifecycle, pid namespace, unit, job object, pgid |
 | `class`   | the honest isolation class (below) — what would have to fail for an escape    |
@@ -288,8 +288,8 @@ fell back to the daemon default counts as `shared-kernel`, and a macOS local OCI
 container counts as `guest-kernel`. On a miss, `degrade` (the default)
 launches with the worktree marked degraded and a warning; `fail` refuses to
 launch and names the floor, available class, and how to satisfy it. The refusal
-names the opt-outs: allow host execution, set the backend to `none` and the
-floor to `off`, or install/start a runtime.
+names the opt-outs: set `[sandbox] on_floor_miss = "degrade"` (warn and mark
+degraded) or `isolation_floor = "off"`.
 `thegn doctor` prints `containment` and `file access` lines, including a line
 such as `requested <scope> — NOT ENFORCED on <backend>: <note>` when file
 access is not enforced. The floor also
@@ -370,6 +370,8 @@ instantly; raise or lower the active project's pool target with the
 warm-pool actions (`Ctrl-Alt-=` / `Ctrl-Alt--`, also palette-runnable).
 Pool state shows on the sidebar's project chip, not in this section.
 `[sandbox] default_env` picks the environment new worktrees use.
+A repo's `env =` setting is only a hint; if that environment would weaken
+user policy, it is ignored with a warning.
 
 ### Worktree toolchains
 
@@ -438,8 +440,8 @@ Cleanup is always explicit — thegn never prunes on a schedule.
   containers with this install/profile's `thegn.owner` label that are provably
   orphaned across available backends. Unlabelled containers and containers owned
   by another profile are listed but never removed. Safe to run any time.
-- `thegn sandbox prune` reclaims **stopped** containers with this profile's
-  `thegn.owner` label, and `thegn.managed` images and volumes. On a terminal it
+- `thegn sandbox prune` reclaims **thegn-owned (`thegn-` name family) stopped
+  containers**, and `thegn.managed` images and volumes. On a terminal it
   lists what it would remove and asks to confirm; `--yes` skips the prompt for
   scripts and `--dry-run` never removes anything. Narrow it with `--containers`,
   `--images` or `--volumes`. Volumes that carry a **persistent role** (the
