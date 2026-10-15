@@ -1235,6 +1235,25 @@ impl WorkspaceStore for Db {
         Ok(())
     }
 
+    fn delete_tab_groups_with_prefix(&self, slug: &str) -> Result<()> {
+        let prefix = format!("{slug}/");
+        self.conn().execute(
+            "DELETE FROM group_tabs
+             WHERE EXISTS (
+                 SELECT 1 FROM tab_groups
+                 WHERE tab_groups.session_name = group_tabs.session_name
+                   AND tab_groups.name = group_tabs.group_name
+                   AND substr(tab_groups.name, 1, length(?1)) = ?1
+             )",
+            [&prefix],
+        )?;
+        self.conn().execute(
+            "DELETE FROM tab_groups WHERE substr(name, 1, length(?1)) = ?1",
+            [&prefix],
+        )?;
+        Ok(())
+    }
+
     /// Wipe a session's whole persisted layout (groups + tabs). The host
     /// persists snapshots as clear-then-insert inside one transaction so
     /// closed/renamed entries can't linger.
@@ -1715,6 +1734,49 @@ mod tests {
             "app/other"
         );
         assert!(db.group_tabs_for_session("session-b").unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_tab_groups_with_prefix_cleans_every_session_and_child_tabs() {
+        use crate::models::{GroupTabRow, TabGroupRow};
+        let db = Db::open_memory().unwrap();
+        let group = |name: &str| TabGroupRow {
+            name: name.into(),
+            kind: "branch".into(),
+            worktree: format!("/wt/{name}"),
+            ordinal: 0,
+            active_tab: 0,
+        };
+        let tab = |group_name: &str| GroupTabRow {
+            group_name: group_name.into(),
+            ordinal: 0,
+            title: "1".into(),
+            pane_tree: r#"{"leaf":0}"#.into(),
+            focused_pane: 0,
+            pane_cwds: String::new(),
+            pane_cmds: String::new(),
+            pane_sessions: String::new(),
+            scrollback_snapshot: String::new(),
+        };
+        for (session, name) in [
+            ("app-session", "lib/home"),
+            ("other-session", "lib/feat"),
+            ("other-session", "library/feat"),
+        ] {
+            db.put_tab_group(session, &group(name)).unwrap();
+            db.put_group_tab(session, &tab(name)).unwrap();
+        }
+
+        db.delete_tab_groups_with_prefix("lib").unwrap();
+
+        assert!(db.groups_for_session("app-session").unwrap().is_empty());
+        let remaining = db.groups_for_session("other-session").unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, "library/feat");
+        assert_eq!(db.group_tabs_for_session("app-session").unwrap().len(), 0);
+        let remaining_tabs = db.group_tabs_for_session("other-session").unwrap();
+        assert_eq!(remaining_tabs.len(), 1);
+        assert_eq!(remaining_tabs[0].group_name, "library/feat");
     }
 
     #[test]

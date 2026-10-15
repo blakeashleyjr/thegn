@@ -477,6 +477,29 @@ impl Session {
                     }
                 }
             }
+
+            // A path-keyed session owns only groups under its canonical slug.
+            // Older layouts could retain groups from a workspace that was
+            // removed elsewhere; they then leak into the sidebar as live
+            // fallback workspaces. Keep legacy raw-basename prefixes when
+            // they normalize to this slug, and keep registered worktrees even
+            // if their tab name has an older prefix.
+            let registered_paths: std::collections::HashSet<String> = db
+                .worktrees()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|wt| wt.repo_root == session)
+                .map(|wt| wt.worktree)
+                .collect();
+            worktrees.retain(|g| {
+                if matches!(g.kind, GroupKind::Terminal | GroupKind::Home) {
+                    return true;
+                }
+                let Some((prefix, _)) = crate::sidebar::split_tab(&g.name) else {
+                    return true;
+                };
+                thegn_core::util::slugify(&prefix) == *slug || registered_paths.contains(&g.path)
+            });
         }
 
         // Order worktrees in three tiers so a freshly-created worktree always
@@ -1527,6 +1550,41 @@ mod tests {
             s.active_group().unwrap().name,
             "washu/home",
             "active group (home) survives the rename"
+        );
+    }
+
+    #[test]
+    fn resurrect_drops_foreign_workspace_groups_and_keeps_legacy_home_and_terminals() {
+        let db = temp_db();
+        let repo = "/r/WASHU";
+        let legacy = Session {
+            id: repo.into(),
+            worktrees: vec![
+                WorktreeGroup::new("WASHU/home", GroupKind::Home, repo),
+                WorktreeGroup::new("lib/feat", GroupKind::Branch, "/wt/lib-feat"),
+                WorktreeGroup::new("terminals/ops", GroupKind::Terminal, ""),
+            ],
+            active: 0,
+        };
+        legacy.persist(&db, repo, 1).unwrap();
+
+        let mut loaded = Session::resurrect(&db, repo).unwrap();
+        let names: Vec<_> = loaded.worktrees.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            names.contains(&"washu/home"),
+            "legacy home prefix is renamed"
+        );
+        assert!(
+            names.contains(&"terminals/ops"),
+            "terminal group is preserved"
+        );
+        assert!(!names.contains(&"lib/feat"), "foreign group is pruned");
+
+        loaded.persist(&db, repo, 2).unwrap();
+        let round_trip = Session::resurrect(&db, repo).unwrap();
+        assert!(
+            round_trip.worktrees.iter().all(|g| g.name != "lib/feat"),
+            "persist after pruning must not restore the foreign group"
         );
     }
 

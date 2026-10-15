@@ -602,6 +602,37 @@ fn workspace_list_with_db_lists_current_workspace_once() {
 }
 
 #[test]
+fn workspace_list_is_stable_across_active_workspaces_with_foreign_groups() {
+    let db = thegn_core::db::Db::open_memory().unwrap();
+    db.put_workspace("/r/app", "app", "repo").unwrap();
+    db.put_workspace("/r/beta", "beta", "repo").unwrap();
+    let app = Session {
+        id: "/r/app".into(),
+        worktrees: vec![
+            WorktreeGroup::new("app/home", GroupKind::Home, "/r/app"),
+            WorktreeGroup::new("ghost/feat", GroupKind::Branch, "/wt/ghost"),
+        ],
+        active: 0,
+    };
+    let beta = Session {
+        id: "/r/beta".into(),
+        worktrees: vec![WorktreeGroup::new("beta/home", GroupKind::Home, "/r/beta")],
+        active: 0,
+    };
+
+    let app_slugs: Vec<_> = workspace_list(&app, Some(&db))
+        .into_iter()
+        .map(|row| row.0)
+        .collect();
+    let beta_slugs: Vec<_> = workspace_list(&beta, Some(&db))
+        .into_iter()
+        .map(|row| row.0)
+        .collect();
+    assert_eq!(app_slugs, beta_slugs);
+    assert!(!app_slugs.iter().any(|slug| slug == "ghost"));
+}
+
+#[test]
 fn ticker_pr_cadence_is_a_multiple_of_the_model_cadence() {
     // The ticker emits `RefreshKind::Pr` only from inside the `model_every`
     // block, so PR auto-refresh silently stops unless model_every divides
