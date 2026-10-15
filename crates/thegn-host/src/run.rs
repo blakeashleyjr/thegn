@@ -13065,26 +13065,35 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 RefreshKind::VanishedTabs(result) => {
-                    let paths = fence_vanished_paths(&session, &creating_tabs, &result.paths);
-                    let gone: Vec<&str> = paths.iter().map(String::as_str).collect();
-                    let landing = crate::handlers::worktree_delete::Landing::plan(
-                        &model, &session, &sb, &gone,
-                    );
-                    if crate::merge_lifecycle::apply_vanished_tabs(
-                        &mut session,
-                        &mut panes,
-                        &paths,
-                        &landing,
-                    ) {
-                        model.status = format!(
-                            "Worktree dir gone: {} — removed from session",
-                            paths.join(", ")
+                    let current = result.still_current(&session);
+                    let candidate_paths: Vec<String> =
+                        current.iter().map(|group| group.path.clone()).collect();
+                    let paths = fence_vanished_paths(&session, &creating_tabs, &candidate_paths);
+                    let groups: Vec<crate::merge_lifecycle::VanishedGroup> = current
+                        .into_iter()
+                        .filter(|group| paths.contains(&group.path))
+                        .collect();
+                    if !groups.is_empty() {
+                        let gone: Vec<&str> = paths.iter().map(String::as_str).collect();
+                        let landing = crate::handlers::worktree_delete::Landing::plan(
+                            &model, &session, &sb, &gone,
                         );
-                        refresh_tab_model(&mut model, &session, &mut sb);
-                        landing.place_cursor(&mut model, &mut sb);
-                        need_relayout = true;
-                        dirty = true;
-                        want_model_refresh = true;
+                        if crate::merge_lifecycle::apply_vanished_tabs(
+                            &mut session,
+                            &mut panes,
+                            &groups,
+                            &landing,
+                        ) {
+                            model.status = format!(
+                                "Worktree dir gone: {} — removed from session",
+                                paths.join(", ")
+                            );
+                            refresh_tab_model(&mut model, &session, &mut sb);
+                            landing.place_cursor(&mut model, &mut sb);
+                            need_relayout = true;
+                            dirty = true;
+                            want_model_refresh = true;
+                        }
                     }
                 }
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),

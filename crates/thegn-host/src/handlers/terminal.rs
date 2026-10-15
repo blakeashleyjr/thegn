@@ -220,6 +220,7 @@ pub(crate) fn finish_restore(
         path: String::new(),
         tabs,
         active_tab,
+        epoch: crate::session::next_group_epoch(),
     };
     crate::workspace_pool::remap_group_ids(&mut group, panes);
     (Some(donor), group)
