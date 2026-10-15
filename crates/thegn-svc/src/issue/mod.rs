@@ -42,6 +42,10 @@ pub use capabilities::IssueCaps;
 /// Errors from any issue backend.
 pub enum IssueError {
     NotConfigured,
+    AmbiguousAccount {
+        provider: String,
+        accounts: Vec<String>,
+    },
     Unsupported(&'static str),
     UnsupportedPatchFields(Vec<&'static str>),
     EmptyPatch,
@@ -70,6 +74,11 @@ impl std::fmt::Debug for IssueError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotConfigured => f.write_str("IssueError::NotConfigured"),
+            Self::AmbiguousAccount { provider, accounts } => f
+                .debug_struct("IssueError::AmbiguousAccount")
+                .field("provider", provider)
+                .field("accounts", accounts)
+                .finish(),
             Self::Unsupported(op) => f.debug_tuple("IssueError::Unsupported").field(op).finish(),
             Self::UnsupportedPatchFields(fields) => f
                 .debug_tuple("IssueError::UnsupportedPatchFields")
@@ -115,6 +124,11 @@ impl std::fmt::Display for IssueError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             IssueError::NotConfigured => write!(f, "no issue provider configured"),
+            IssueError::AmbiguousAccount { provider, accounts } => write!(
+                f,
+                "{provider} issue id is ambiguous across accounts: {}; disable all but one {provider} account to use by-ID actions",
+                accounts.join(", ")
+            ),
             IssueError::Unsupported(op) => write!(f, "{op} is not supported by this provider"),
             IssueError::UnsupportedPatchFields(fields) => write!(
                 f,
@@ -188,6 +202,7 @@ impl SeamError for IssueError {
                 ErrorClass::Unsupported
             }
             IssueError::NotConfigured => ErrorClass::NotConfigured,
+            IssueError::AmbiguousAccount { .. } => ErrorClass::Other,
             IssueError::Auth(_) => ErrorClass::Auth,
             IssueError::Network(e) if e.is_connect() || e.is_timeout() => ErrorClass::Transient,
             IssueError::Timeout(_) => ErrorClass::Transient,
@@ -597,7 +612,7 @@ impl IssueRouter {
     /// longest registered prefix so `plugin:demo:key` reaches `plugin:demo`.
     /// A bare legacy id is accepted only when there is exactly one backend;
     /// namespaced ids never fall through to another provider.
-    fn backend_for_id(&self, id: &str) -> Option<&dyn IssueBackend> {
+    fn backend_for_id(&self, id: &str) -> Result<Option<&dyn IssueBackend>, IssueError> {
         let matches = |b: &&AccountBackend| {
             id == b.inner.provider_id()
                 || id
@@ -611,20 +626,25 @@ impl IssueRouter {
             .map(|b| b.inner.provider_id().len())
             .max();
         if let Some(longest) = longest {
-            // `find` deliberately preserves the established first-account
-            // behavior when equal-length provider namespaces are duplicated.
-            return self
+            let matching: Vec<&AccountBackend> = self
                 .inner
                 .iter()
-                .find(|b| matches(b) && b.inner.provider_id().len() == longest)
-                .map(|b| b.inner.as_ref());
+                .filter(|b| matches(b) && b.inner.provider_id().len() == longest)
+                .collect();
+            if matching.len() > 1 {
+                return Err(IssueError::AmbiguousAccount {
+                    provider: matching[0].inner.provider_id().to_string(),
+                    accounts: matching.iter().map(|b| b.account.clone()).collect(),
+                });
+            }
+            return Ok(matching.first().map(|b| b.inner.as_ref()));
         }
         // Preserve the audited legacy bare-id compatibility only at the
         // unambiguous sole-backend boundary. A namespaced id never falls back.
         if !id.contains(':') && self.inner.len() == 1 {
-            return self.inner.first().map(|b| b.inner.as_ref());
+            return Ok(self.inner.first().map(|b| b.inner.as_ref()));
         }
-        None
+        Ok(None)
     }
 
     /// The error for an id that routed nowhere. An empty router is genuinely
@@ -749,11 +769,12 @@ impl IssueRouter {
     pub async fn get_issue(&self, id: &str) -> Result<IssueDetail, IssueError> {
         validate_control_issue_id(id)?;
         match self.backend_for_id(id) {
-            Some(b) => b.get_issue(id).await.and_then(|detail| {
+            Ok(Some(b)) => b.get_issue(id).await.and_then(|detail| {
                 validate_issue_identity(&detail.issue)?;
                 Ok(detail)
             }),
-            None => Err(self.id_miss(id)),
+            Ok(None) => Err(self.id_miss(id)),
+            Err(error) => Err(error),
         }
     }
 
@@ -771,14 +792,15 @@ impl IssueRouter {
     pub async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue, IssueError> {
         validate_control_issue_id(id)?;
         match self.backend_for_id(id) {
-            Some(b) => {
+            Ok(Some(b)) => {
                 validate_patch_capabilities(b.caps(), patch)?;
                 b.update_issue(id, patch).await.and_then(|issue| {
                     validate_issue_identity(&issue)?;
                     Ok(issue)
                 })
             }
-            None => Err(self.id_miss(id)),
+            Ok(None) => Err(self.id_miss(id)),
+            Err(error) => Err(error),
         }
     }
 
@@ -786,8 +808,9 @@ impl IssueRouter {
     pub async fn add_comment(&self, id: &str, body: &str) -> Result<(), IssueError> {
         validate_control_issue_id(id)?;
         match self.backend_for_id(id) {
-            Some(b) => b.add_comment(id, body).await,
-            None => Err(IssueError::NotConfigured),
+            Ok(Some(b)) => b.add_comment(id, body).await,
+            Ok(None) => Err(IssueError::NotConfigured),
+            Err(error) => Err(error),
         }
     }
 
@@ -795,8 +818,9 @@ impl IssueRouter {
     pub async fn attach_label(&self, id: &str, label: &str) -> Result<(), IssueError> {
         validate_control_issue_id(id)?;
         match self.backend_for_id(id) {
-            Some(b) => b.attach_label(id, label).await,
-            None => Err(IssueError::NotConfigured),
+            Ok(Some(b)) => b.attach_label(id, label).await,
+            Ok(None) => Err(IssueError::NotConfigured),
+            Err(error) => Err(error),
         }
     }
 
@@ -804,8 +828,9 @@ impl IssueRouter {
     pub async fn detach_label(&self, id: &str, label: &str) -> Result<(), IssueError> {
         validate_control_issue_id(id)?;
         match self.backend_for_id(id) {
-            Some(b) => b.detach_label(id, label).await,
-            None => Err(IssueError::NotConfigured),
+            Ok(Some(b)) => b.detach_label(id, label).await,
+            Ok(None) => Err(IssueError::NotConfigured),
+            Err(error) => Err(error),
         }
     }
 
@@ -1015,22 +1040,28 @@ mod spec {
             IssueProviderKind::Kaneo,
         ]));
         assert_eq!(
-            r.backend_for_id("jira:PROJ-1").map(|b| b.provider_id()),
+            r.backend_for_id("jira:PROJ-1")
+                .unwrap()
+                .map(|b| b.provider_id()),
             Some("jira")
         );
         assert_eq!(
-            r.backend_for_id("linear:ABC-9").map(|b| b.provider_id()),
+            r.backend_for_id("linear:ABC-9")
+                .unwrap()
+                .map(|b| b.provider_id()),
             Some("linear")
         );
         assert_eq!(
-            r.backend_for_id("kaneo:abc123").map(|b| b.provider_id()),
+            r.backend_for_id("kaneo:abc123")
+                .unwrap()
+                .map(|b| b.provider_id()),
             Some("kaneo")
         );
         // An id for a provider that isn't configured routes nowhere.
-        assert!(r.backend_for_id("github:42").is_none());
+        assert!(r.backend_for_id("github:42").unwrap().is_none());
         // A bare id with no prefix also routes nowhere — three backends, so
         // the single-backend fallback below does not apply.
-        assert!(r.backend_for_id("nonsense").is_none());
+        assert!(r.backend_for_id("nonsense").unwrap().is_none());
     }
 
     #[test]
@@ -1038,12 +1069,14 @@ mod spec {
         let r = IssueRouter::from_config(&cfg_with(vec![IssueProviderKind::Linear]));
         // `wt new --from-issue THE-72` on a single-tracker machine.
         assert_eq!(
-            r.backend_for_id("THE-72").map(|b| b.provider_id()),
+            r.backend_for_id("THE-72").unwrap().map(|b| b.provider_id()),
             Some("linear")
         );
         // An explicit prefix still wins outright (same backend here).
         assert_eq!(
-            r.backend_for_id("linear:THE-72").map(|b| b.provider_id()),
+            r.backend_for_id("linear:THE-72")
+                .unwrap()
+                .map(|b| b.provider_id()),
             Some("linear")
         );
     }
@@ -1054,11 +1087,13 @@ mod spec {
             IssueProviderKind::Linear,
             IssueProviderKind::Jira,
         ]));
-        assert!(r.backend_for_id("THE-72").is_none());
+        assert!(r.backend_for_id("THE-72").unwrap().is_none());
         // …but an explicit prefix wins over the (absent) fallback, and picks
         // the named provider rather than the first configured one.
         assert_eq!(
-            r.backend_for_id("jira:THE-72").map(|b| b.provider_id()),
+            r.backend_for_id("jira:THE-72")
+                .unwrap()
+                .map(|b| b.provider_id()),
             Some("jira")
         );
     }
@@ -1066,7 +1101,7 @@ mod spec {
     #[test]
     fn single_backend_does_not_fallback_foreign_namespace() {
         let r = IssueRouter::from_config(&cfg_with(vec![IssueProviderKind::Linear]));
-        assert!(r.backend_for_id("jira:PROJ-1").is_none());
+        assert!(r.backend_for_id("jira:PROJ-1").unwrap().is_none());
     }
 
     #[test]
@@ -1768,16 +1803,23 @@ mod spec {
         assert_eq!(
             router
                 .backend_for_id("plugin:demo:opaque/key#7")
+                .unwrap()
                 .map(|b| b.provider_id()),
             Some("plugin:demo")
         );
         assert_eq!(
             router
                 .backend_for_id("plugin:demo:opaque:key")
+                .unwrap()
                 .map(|b| b.provider_id()),
             Some("plugin:demo")
         );
-        assert!(router.backend_for_id("plugin:other:opaque").is_none());
+        assert!(
+            router
+                .backend_for_id("plugin:other:opaque")
+                .unwrap()
+                .is_none()
+        );
         assert!(validate_control_issue_id("plugin:demo:opaque/key#7").is_ok());
     }
 
@@ -1839,7 +1881,7 @@ mod spec {
     }
 
     #[test]
-    fn duplicate_provider_ids_keep_the_first_account_for_mutations() {
+    fn duplicate_provider_ids_reject_by_id_mutations() {
         let first = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let second = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut router = IssueRouter::from_config(&IssuesConfig::default());
@@ -1868,8 +1910,8 @@ mod spec {
             ..Default::default()
         };
         let result = runtime.block_on(router.update_issue("linear:ABC-9", &patch));
-        assert!(result.is_err());
-        assert_eq!(first.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(result, Err(IssueError::AmbiguousAccount { .. })));
+        assert_eq!(first.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(second.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
@@ -1968,5 +2010,129 @@ mod spec {
         // Garbage => None.
         assert_eq!(parse_due_date_ms("someday"), None);
         assert_eq!(parse_due_date_ms(""), None);
+    }
+
+    struct GitHubCallCounter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl IssueBackend for GitHubCallCounter {
+        fn provider_id(&self) -> &str {
+            "github"
+        }
+
+        fn caps(&self) -> IssueCaps {
+            IssueCaps {
+                patch_status: true,
+                comments: true,
+                ..Default::default()
+            }
+        }
+
+        fn list_issues<'a>(
+            &'a self,
+            _filter: &'a IssueFilter,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn get_issue<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Err(IssueError::Api("fake get called".into())) })
+        }
+
+        fn create_issue<'a>(
+            &'a self,
+            _draft: &'a IssueDraft,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("unused fake create".into())) })
+        }
+
+        fn update_issue<'a>(
+            &'a self,
+            _id: &'a str,
+            _patch: &'a IssuePatch,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Err(IssueError::Api("fake update called".into())) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn add_comment<'a>(
+            &'a self,
+            _id: &'a str,
+            _body: &'a str,
+        ) -> BoxFuture<'a, Result<(), IssueError>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Err(IssueError::Api("fake comment called".into())) })
+        }
+    }
+
+    #[test]
+    fn duplicate_github_accounts_fail_closed_for_by_id_actions() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let first = std::sync::Arc::new(AtomicUsize::new(0));
+        let second = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        router
+            .push_backend(
+                "personal".into(),
+                Box::new(GitHubCallCounter(first.clone())),
+            )
+            .unwrap();
+        router
+            .push_backend("work".into(), Box::new(GitHubCallCounter(second.clone())))
+            .unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let id = "github:owner/repo#1";
+        let patch = IssuePatch {
+            status: Some(thegn_core::issue::IssueStatus::Todo),
+            ..Default::default()
+        };
+        let results = runtime.block_on(async {
+            (
+                router.get_issue(id).await,
+                router.update_issue(id, &patch).await,
+                router.add_comment(id, "hello").await,
+            )
+        });
+        assert!(matches!(
+            results.0,
+            Err(IssueError::AmbiguousAccount { .. })
+        ));
+        assert!(matches!(
+            results.1,
+            Err(IssueError::AmbiguousAccount { .. })
+        ));
+        assert!(matches!(
+            results.2,
+            Err(IssueError::AmbiguousAccount { .. })
+        ));
+        assert_eq!(first.load(Ordering::SeqCst), 0);
+        assert_eq!(second.load(Ordering::SeqCst), 0);
+
+        let error = match router.backend_for_id(id) {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate provider prefix unexpectedly routed"),
+        };
+        assert!(matches!(
+            &error,
+            IssueError::AmbiguousAccount { provider, accounts }
+                if provider == "github"
+                    && accounts.iter().map(String::as_str).eq(["personal", "work"])
+        ));
+        let message = error.to_string();
+        assert!(message.contains("personal, work"), "{message}");
+        assert!(message.contains("disable all but one"), "{message}");
     }
 }
