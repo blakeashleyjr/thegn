@@ -1804,8 +1804,11 @@ command = "git diff"
 # Every outcome parks the roster row `waiting_human` with a `note` — the daemon
 # can park a row but never finish one (it writes neither `done` nor `failed`),
 # and a usage LIMIT parks immediately at any attempt: spending money is never
-# the daemon's call. The retry is the SAME roster row cycling through attempts
-# (session + artifact re-stamped per relaunch), not a chain of rows.
+# the daemon's call. Only the last 8 non-empty screen lines are classified.
+# Limit signatures are checked before transport, so a matching limit wins; the
+# default limit signatures include `http 429`, which therefore parks as a limit.
+# The retry is the SAME roster row cycling through attempts (session + artifact
+# re-stamped per relaunch), not a chain of rows.
 #
 #   enabled               master switch (default true; false = today's behavior)
 #   max_attempts          bounded relaunches per row (default 3); beyond it the
@@ -2706,8 +2709,9 @@ default_env = ""
 #   main_env    = "host"        # `[env.host]`     placement = "local"
 #   default_env = "machine0"    # `[env.machine0]` placement = "provider"
 # Applies below explicit worktree/workspace/repo selections. A repo `.thegn.toml`
-# may NOT set this (like `default_env`) — a repo picks its env via the top-level
-# `env = "…"` key instead.
+# `env =` is only a hint: a repo env that would weaken user policy is ignored
+# with a warning. A repo may NOT set `main_env` (or `default_env`) directly; it
+# picks its env via the top-level `env = "…"` key instead.
 main_env = ""
 
 # Probe order for "auto". First backend that is installed and usable wins.
@@ -2755,7 +2759,7 @@ ports = []
 # lowers the sandbox to network = "none" (offline).
 network_allow = []
 network_block = []
-# Log all outbound DNS queries and connection attempts to the audit table.
+# Log outbound DNS queries to the audit table (not a connection log).
 network_audit = false
 
 # ── Filesystem ───────────────────────────────────────────────────────────────
@@ -3414,6 +3418,7 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # one by name. Selection precedence (most specific wins):
 #   worktree `env_name` (DB) → workspace `env_name` (DB) → repo `.thegn.*`
 #   `env = "…"` → global `default_env` (below) → the implicit `"default"`.
+#   Repo env hints that would weaken user policy are ignored with a warning.
 # The `"default"` env is this `[sandbox]` + `[sandbox.remote]` block — so with
 # no `[env.*]` defined, nothing changes. Manage selections with `thegn env`.
 #
