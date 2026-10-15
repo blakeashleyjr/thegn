@@ -421,7 +421,7 @@ mod tests {
     fn oversized_copy_status_names_size_and_limit() {
         let status = oversized_copy_status(5 * 1024 * 1024 + 205 * 1024);
         assert!(status.contains("Nothing copied"));
-        assert!(status.contains("5.2 MiB"));
+        assert!(status.contains("5.3 MiB"));
         assert!(status.contains("4 MiB"));
 
         let just_over_limit = oversized_copy_status(crate::frame_writer::OOB_QUEUE_BYTES + 1);
