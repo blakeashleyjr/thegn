@@ -5,7 +5,7 @@
 //! loop over a channel. That keeps command execution off the render/input loop
 //! while avoiding a daemon or polling thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -157,7 +157,20 @@ pub fn job_slot(worktree: &Path, name: &str) -> String {
 pub(crate) use crate::panel::confirm::TwoPress as RestartArm;
 
 pub fn cancel_job(worktree: &Path, name: &str) {
-    cancel_slot(&job_slot(worktree, name));
+    let slot = job_slot(worktree, name);
+    if let Ok(map) = registry().lock()
+        && let Some((generation, group)) = map.get(&slot)
+    {
+        if let Ok(mut stopped) = stopped_runs().lock() {
+            stopped.insert((slot.clone(), *generation));
+        }
+        group.terminate();
+    }
+}
+
+fn stopped_runs() -> &'static Mutex<HashSet<(String, u64)>> {
+    static S: OnceLock<Mutex<HashSet<(String, u64)>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 /// Outcome of one capped child run.
@@ -166,6 +179,8 @@ struct CapOutput {
     truncated: bool,
     /// True iff the watchdog killed the process group at the deadline.
     timed_out: bool,
+    /// True iff this exact slot generation was cancelled by the user.
+    stopped: bool,
     text: String,
 }
 
@@ -280,6 +295,7 @@ fn run_capped_argv(
                 exit_code: None,
                 truncated: false,
                 timed_out: false,
+                stopped: false,
                 text: format!("failed to spawn task: {e}"),
             };
         }
@@ -343,21 +359,38 @@ fn run_capped_argv(
         buf.truncate(MAX_CAPTURE_BYTES);
     }
 
-    // Deregister iff we still own the slot (a newer job may have replaced us).
-    if let Ok(mut map) = registry().lock()
-        && map
-            .get(slot)
-            .map(|(g, _)| *g == generation)
-            .unwrap_or(false)
-    {
-        map.remove(slot);
-    }
+    let stopped = finish_slot(slot, generation);
 
     CapOutput {
         exit_code: status.ok().and_then(|s| s.code()),
         truncated,
         timed_out: timed_out.load(Ordering::Relaxed),
+        stopped,
         text: String::from_utf8_lossy(&buf).into_owned(),
+    }
+}
+
+/// Consume this run's stop mark while holding the registry lock used to decide
+/// whether it may deregister its slot. `cancel_job` takes these locks in the
+/// same order, so a cancellation cannot leave a mark behind after this run
+/// exits.
+fn finish_slot(slot: &str, generation: u64) -> bool {
+    if let Ok(mut map) = registry().lock() {
+        let owns_slot = map
+            .get(slot)
+            .map(|(current, _)| *current == generation)
+            .unwrap_or(false);
+        let marked_stopped = if let Ok(mut marks) = stopped_runs().lock() {
+            marks.remove(&(slot.to_string(), generation))
+        } else {
+            false
+        };
+        if owns_slot {
+            map.remove(slot);
+        }
+        owns_slot && marked_stopped
+    } else {
+        false
     }
 }
 
@@ -365,6 +398,16 @@ fn run_capped_argv(
 /// `Duration` the watchdog understands.
 fn secs_to_timeout(secs: u64) -> Option<Duration> {
     (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RunEnd {
+    #[default]
+    Exited,
+    TimedOut {
+        secs: u64,
+    },
+    Stopped,
 }
 
 #[derive(Debug, Clone)]
@@ -376,6 +419,7 @@ pub struct TaskOutcome {
     pub duration_ms: u128,
     pub truncated: bool,
     pub stdout_stderr: String,
+    pub end: RunEnd,
 }
 
 pub fn failed_test_run_outcome(
@@ -392,6 +436,7 @@ pub fn failed_test_run_outcome(
         duration_ms: 0,
         truncated: false,
         stdout_stderr: format!("test run did not complete: {error}"),
+        end: RunEnd::Exited,
     }
 }
 
@@ -769,7 +814,7 @@ pub fn run_task(
     task: TestTask,
     limits: &LimitsConfig,
 ) -> TaskOutcome {
-    run_task_in(
+    let mut outcome = run_task_in(
         worktree.clone(),
         loc,
         generation,
@@ -777,7 +822,14 @@ pub fn run_task(
         limits,
         test_slot(&worktree),
         secs_to_timeout(limits.test_timeout_secs),
-    )
+    );
+    if let RunEnd::TimedOut { secs } = outcome.end {
+        outcome.stdout_stderr = format!(
+            "test run exceeded {secs}s and was stopped\n{}",
+            outcome.stdout_stderr
+        );
+    }
+    outcome
 }
 
 pub fn run_job(
@@ -788,7 +840,7 @@ pub fn run_job(
     limits: &LimitsConfig,
 ) -> TaskOutcome {
     let slot = job_slot(&worktree, &task.name);
-    run_task_in(
+    let mut outcome = run_task_in(
         worktree,
         loc,
         generation,
@@ -796,7 +848,20 @@ pub fn run_job(
         limits,
         slot,
         secs_to_timeout(limits.test_timeout_secs),
-    )
+    );
+    match outcome.end {
+        RunEnd::TimedOut { secs } => {
+            outcome.stdout_stderr = format!(
+                "job exceeded {secs}s ([limits] test_timeout_secs) and was stopped\n{}",
+                outcome.stdout_stderr
+            );
+        }
+        RunEnd::Stopped => {
+            outcome.stdout_stderr = format!("stopped by user\n{}", outcome.stdout_stderr);
+        }
+        RunEnd::Exited => {}
+    }
+    outcome
 }
 
 pub(crate) fn job_outcome_is_stale(
@@ -825,13 +890,14 @@ fn run_task_in(
         generation,
         timeout,
     );
-    let stdout_stderr = if out.timed_out {
-        format!(
-            "test run exceeded {}s and was stopped\n{}",
-            limits.test_timeout_secs, out.text
-        )
+    let end = if out.timed_out {
+        RunEnd::TimedOut {
+            secs: limits.test_timeout_secs,
+        }
+    } else if out.stopped {
+        RunEnd::Stopped
     } else {
-        out.text
+        RunEnd::Exited
     };
     TaskOutcome {
         worktree: worktree.to_string_lossy().into_owned(),
@@ -845,7 +911,17 @@ fn run_task_in(
         },
         duration_ms: started.elapsed().as_millis(),
         truncated: out.truncated,
-        stdout_stderr,
+        stdout_stderr: out.text,
+        end,
+    }
+}
+
+pub(crate) fn job_status_line(name: &str, end: RunEnd, exit: i32, elapsed_s: f64) -> String {
+    match end {
+        RunEnd::Exited if exit == 0 => format!("Task '{name}' done in {elapsed_s:.1}s"),
+        RunEnd::Exited => format!("Task '{name}' failed (exit {exit}) in {elapsed_s:.1}s"),
+        RunEnd::TimedOut { secs } => format!("Task '{name}' timed out after {secs}s"),
+        RunEnd::Stopped => format!("Task '{name}' stopped after {elapsed_s:.1}s"),
     }
 }
 
@@ -1609,6 +1685,7 @@ mod tests {
             duration_ms: 1,
             truncated: false,
             stdout_stderr: "error at src/lib.rs:7:1".into(),
+            end: RunEnd::Exited,
         };
         let nodes = parse_task_outcome(&outcome);
         assert!(nodes.iter().any(|n| n.state == TestState::Fail));
@@ -1833,6 +1910,7 @@ mod tests {
             duration_ms: 1,
             truncated: false,
             stdout_stderr: String::new(),
+            end: RunEnd::Exited,
         };
         let nodes = parse_task_outcome(&outcome);
         assert!(
@@ -2152,7 +2230,127 @@ mod tests {
         );
 
         assert_eq!(outcome.exit_code, Some(124));
+        assert_eq!(outcome.end, RunEnd::TimedOut { secs: 1 });
+        assert!(outcome.stdout_stderr.starts_with("job exceeded 1s"));
+    }
+
+    #[test]
+    fn test_run_timeout_keeps_test_run_prefix() {
+        let dir = private_temp_dir();
+        let wt = dir.path().to_path_buf();
+        let limits = LimitsConfig {
+            test_timeout_secs: 1,
+            ..uncapped()
+        };
+        let outcome = run_task(
+            wt.clone(),
+            &GitLoc::Local(wt),
+            2,
+            TestTask::new("slow", "sleep 2", "generic"),
+            &limits,
+        );
+        assert_eq!(outcome.end, RunEnd::TimedOut { secs: 1 });
         assert!(outcome.stdout_stderr.starts_with("test run exceeded 1s"));
+    }
+
+    #[test]
+    fn stopped_job_reports_stopped_not_failed() {
+        let dir = private_temp_dir();
+        let wt = dir.path().to_path_buf();
+        let wt2 = wt.clone();
+        let handle = std::thread::spawn(move || {
+            run_job(
+                wt2.clone(),
+                &GitLoc::Local(wt2),
+                71,
+                TestTask::new("slow", "sleep 30", "generic"),
+                &uncapped(),
+            )
+        });
+        for _ in 0..100 {
+            if slot_active(&wt) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            slot_active(&wt),
+            "job should register before it is cancelled"
+        );
+        cancel_job(&wt, "slow");
+        let outcome = handle.join().unwrap();
+        assert_eq!(outcome.end, RunEnd::Stopped);
+        assert!(outcome.stdout_stderr.starts_with("stopped by user"));
+        assert!(!slot_active(&wt), "cancelled job should be reaped");
+        assert!(
+            !stopped_runs()
+                .lock()
+                .unwrap()
+                .contains(&(job_slot(&wt, "slow"), 71))
+        );
+    }
+
+    #[test]
+    fn superseded_run_is_not_marked_stopped() {
+        let dir = private_temp_dir();
+        let wt = dir.path().to_path_buf();
+        let wt2 = wt.clone();
+        let slot = job_slot(&wt, "slow");
+        let slot2 = slot.clone();
+        let handle = std::thread::spawn(move || {
+            run_job(
+                wt2.clone(),
+                &GitLoc::Local(wt2),
+                72,
+                TestTask::new("slow", "sleep 30", "generic"),
+                &uncapped(),
+            )
+        });
+        for _ in 0..100 {
+            if slot_active(&wt) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(slot_active(&wt), "job should register before supersede");
+        cancel_slot(&slot);
+        let outcome = handle.join().unwrap();
+        assert_eq!(outcome.end, RunEnd::Exited);
+        assert!(!stopped_runs().lock().unwrap().contains(&(slot2, 72)));
+    }
+
+    #[test]
+    fn finishing_superseded_generation_clears_its_stop_mark_without_stopping_newer_run() {
+        let dir = private_temp_dir();
+        let slot = job_slot(dir.path(), "slow");
+        registry().lock().unwrap().insert(
+            slot.clone(),
+            (73, crate::platform::GroupHandle::from_pid(4242)),
+        );
+        stopped_runs().lock().unwrap().insert((slot.clone(), 72));
+
+        assert!(!finish_slot(&slot, 72));
+        assert!(registry().lock().unwrap().contains_key(&slot));
+        assert!(!stopped_runs().lock().unwrap().contains(&(slot.clone(), 72)));
+
+        registry().lock().unwrap().remove(&slot);
+    }
+
+    #[test]
+    fn job_status_line_formats_each_end_kind() {
+        let cases = [
+            (RunEnd::Exited, 0, "Task 'build' done in 1.2s"),
+            (RunEnd::Exited, 2, "Task 'build' failed (exit 2) in 1.2s"),
+            (
+                RunEnd::TimedOut { secs: 1800 },
+                124,
+                "Task 'build' timed out after 1800s",
+            ),
+            (RunEnd::Stopped, -1, "Task 'build' stopped after 1.2s"),
+        ];
+        for (end, exit, expected) in cases {
+            assert_eq!(job_status_line("build", end, exit, 1.2), expected);
+        }
     }
 
     /// Metadata-based cargo discovery parses targets without compiling.
