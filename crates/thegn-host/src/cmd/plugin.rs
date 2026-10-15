@@ -135,6 +135,8 @@ struct PluginListRow {
     mode: thegn_core::plugin_api::PluginMode,
     enabled: bool,
     source: Option<String>,
+    trust: &'static str,
+    gated_by: Vec<String>,
     status: String,
     #[serde(flatten)]
     health: PluginHealth,
@@ -152,6 +154,24 @@ fn negotiation_status(plugin: &LoadedPlugin) -> String {
 }
 
 fn list_row(plugin: &LoadedPlugin) -> PluginListRow {
+    let native_trust = plugin.spec.native_trust();
+    let trust = native_trust.status_token();
+    let status = if plugin.spec.enabled
+        && matches!(
+            native_trust,
+            thegn_core::plugin_api::NativeTrust::Refused { .. }
+        ) {
+        thegn_svc::plugin::loader::native_trust_refusal(plugin)
+            .map(|problem| problem.problem)
+            .unwrap_or_else(|| "refused-untrusted".to_string())
+    } else {
+        negotiation_status(plugin)
+    };
+    let status = if plugin.trusted_native_ignored {
+        format!("{status}; trusted_native in plugin.toml ignored")
+    } else {
+        status
+    };
     PluginListRow {
         id: plugin.spec.manifest.id.as_str().to_string(),
         name: plugin.spec.manifest.name.clone(),
@@ -159,7 +179,9 @@ fn list_row(plugin: &LoadedPlugin) -> PluginListRow {
         mode: plugin.spec.mode,
         enabled: plugin.spec.enabled,
         source: plugin.dir.as_ref().map(|dir| dir.display().to_string()),
-        status: negotiation_status(plugin),
+        trust,
+        gated_by: plugin.spec.gated_by(),
+        status,
         health: PluginHealth::from_config(plugin.spec.enabled),
     }
 }
@@ -205,17 +227,37 @@ fn config_dir(config_path: &Path) -> PathBuf {
 
 fn inspection_lines(plugin: &LoadedPlugin) -> Vec<String> {
     let id = plugin.spec.manifest.id.as_str();
+    let gated_by = plugin.spec.gated_by();
+    let verdict = match plugin.spec.native_trust() {
+        thegn_core::plugin_api::NativeTrust::Ungated => "ungated".to_string(),
+        thegn_core::plugin_api::NativeTrust::Trusted => "trusted-native".to_string(),
+        thegn_core::plugin_api::NativeTrust::Refused { .. } => "refused-untrusted".to_string(),
+    };
+    let mut native_line = format!(
+        "  native: trusted_native={}; gated by [{}]; {verdict}",
+        plugin.spec.trusted_native,
+        gated_by.join(", ")
+    );
+    if plugin.trusted_native_ignored {
+        native_line.push_str("; trusted_native in plugin.toml ignored");
+    }
     if !plugin.spec.enabled {
-        return vec![format!("plugin {id}: disabled (not negotiated)")];
+        return vec![
+            format!("plugin {id}: disabled (not negotiated)"),
+            native_line,
+        ];
     }
     let negotiated = match negotiate(&plugin.spec) {
         Ok(negotiated) => negotiated,
         Err(error) => {
-            return vec![format!(
-                "plugin {id}: api {} rejected by host {}: {error}",
-                plugin.spec.manifest.api,
-                thegn_core::plugin_api::API_VERSION
-            )];
+            return vec![
+                format!(
+                    "plugin {id}: api {} rejected by host {}: {error}",
+                    plugin.spec.manifest.api,
+                    thegn_core::plugin_api::API_VERSION
+                ),
+                native_line,
+            ];
         }
     };
     let mut granted = negotiated
@@ -237,6 +279,7 @@ fn inspection_lines(plugin: &LoadedPlugin) -> Vec<String> {
         thegn_core::plugin_api::API_VERSION,
         scopes
     )];
+    lines.push(native_line);
     lines.push(format!(
         "  capabilities: granted [{}]; missing [{}]",
         granted.join(","),
@@ -284,11 +327,13 @@ pub fn run(cfg: &Config, action: Action, config_path: &Path) -> Result<()> {
                     .map(|d| d.display().to_string())
                     .unwrap_or_else(|| "[[plugins]]".into());
                 outln!(
-                    "{:<20} {:<10} {:<18} {:<30} {} | {}",
+                    "{:<20} {:<10} {:<18} {:<22} {:<30} gated by [{}] {} | {}",
                     row.id,
                     format!("{:?}", row.mode).to_lowercase(),
                     row.health.state.as_str(),
+                    row.trust,
                     row.status,
+                    row.gated_by.join(", "),
                     source,
                     human_health(&row.health),
                 );
@@ -302,7 +347,12 @@ pub fn run(cfg: &Config, action: Action, config_path: &Path) -> Result<()> {
                     outln!("{line}");
                 }
             }
-            let problems = thegn_svc::plugin::loader::check_loaded(&loaded, broken);
+            let mut problems = thegn_svc::plugin::loader::check_loaded(&loaded, broken);
+            problems.extend(
+                loaded
+                    .iter()
+                    .filter_map(thegn_svc::plugin::loader::native_trust_refusal),
+            );
             if problems.is_empty() {
                 outln!("plugins: ok ({} discovered)", loaded.len());
                 return Ok(());
@@ -361,8 +411,10 @@ mod tests {
                 scopes: vec![thegn_core::control::Scope::Exec],
                 mode: PluginMode::Resident,
                 enabled: true,
+                trusted_native: false,
             },
             dir: None,
+            trusted_native_ignored: false,
         }
     }
 
@@ -387,6 +439,46 @@ mod tests {
             text.contains("rejected unsupported extension point PanelSection: reserved by THE-108"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn list_row_labels_trust_states_and_json_fields() {
+        let mut trusted = inspected_plugin(ExtensionPoint::PaletteAction, &["network:example.com"]);
+        trusted.spec.scopes.clear();
+        trusted.spec.trusted_native = true;
+        let mut refused = inspected_plugin(ExtensionPoint::PaletteAction, &["network:example.com"]);
+        refused.spec.scopes.clear();
+        let mut ungated = inspected_plugin(ExtensionPoint::PaletteAction, &["surface:palette"]);
+        ungated.spec.scopes.clear();
+
+        let rows = [list_row(&trusted), list_row(&refused), list_row(&ungated)];
+        assert_eq!(rows[0].trust, "trusted-native");
+        assert_eq!(rows[1].trust, "refused-untrusted");
+        assert!(
+            rows[1]
+                .status
+                .contains("refused: declares network:example.com")
+        );
+        assert_eq!(rows[2].trust, "ungated");
+        let json = serde_json::to_value(&rows[1]).unwrap();
+        assert_eq!(json["trust"], "refused-untrusted");
+        assert_eq!(json["gated_by"], serde_json::json!(["network:example.com"]));
+    }
+
+    #[test]
+    fn refused_directory_list_status_explains_how_to_grant_trust() {
+        let mut plugin = inspected_plugin(ExtensionPoint::PaletteAction, &["network:example.com"]);
+        plugin.spec.scopes.clear();
+        plugin.dir = Some(std::path::PathBuf::from("/tmp/plugins/untrusted"));
+
+        let row = list_row(&plugin);
+
+        assert!(
+            row.status
+                .contains("move this plugin directory out of plugins/")
+        );
+        assert!(row.status.contains("absolute command and cwd paths"));
+        assert!(row.status.contains("trusted_native = true"));
     }
 
     #[test]
@@ -424,7 +516,8 @@ mod tests {
 
     #[test]
     fn json_list_row_keeps_config_and_health_fields_in_one_stable_projection() {
-        let plugin = inspected_plugin(ExtensionPoint::PaletteAction, &["surface:palette"]);
+        let mut plugin = inspected_plugin(ExtensionPoint::PaletteAction, &["surface:palette"]);
+        plugin.spec.trusted_native = true;
         let json = serde_json::to_value(list_row(&plugin)).unwrap();
         assert_eq!(json["id"], "inspect");
         assert_eq!(json["name"], "Inspect");

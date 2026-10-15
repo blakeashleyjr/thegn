@@ -468,7 +468,10 @@ pub(crate) fn drain(
                 Ok(run) => run.messages.len().max(1),
                 Err(_) => 1,
             },
-            PluginMsg::Event { .. } | PluginMsg::Loaded(_) | PluginMsg::Respawned { .. } => 1,
+            PluginMsg::Event { .. }
+            | PluginMsg::Loaded(_)
+            | PluginMsg::Refused(_)
+            | PluginMsg::Respawned { .. } => 1,
         });
         match msg {
             PluginMsg::Loaded(list) => {
@@ -484,6 +487,20 @@ pub(crate) fn drain(
                     }
                 }
                 sync_provider_registry(state);
+                damage.merge(PluginDamage::Structural);
+            }
+            PluginMsg::Refused(problems) => {
+                if let Some(first) = problems.first() {
+                    model.status = if problems.len() > 1 {
+                        format!(
+                            "{} (+{} more; see thegn plugin check)",
+                            first,
+                            problems.len() - 1
+                        )
+                    } else {
+                        first.to_string()
+                    };
+                }
                 damage.merge(PluginDamage::Structural);
             }
             PluginMsg::Event { plugin, event } => match event {
@@ -1226,13 +1243,18 @@ mod tests {
             scopes,
             mode: PluginMode::Resident,
             enabled: true,
+            trusted_native: false,
         }
     }
 
     fn loaded_state(spec: PluginSpec) -> LoadedState {
         let negotiated = thegn_svc::plugin::loader::negotiate(&spec).expect("negotiates");
         LoadedState {
-            plugin: LoadedPlugin { spec, dir: None },
+            plugin: LoadedPlugin {
+                spec,
+                dir: None,
+                trusted_native_ignored: false,
+            },
             negotiated,
             writer: None,
         }
@@ -2092,5 +2114,30 @@ mod tests {
             Span::styled("b", StyleRole::Default),
         ]);
         assert_eq!(v.text_content(), "ab");
+    }
+
+    #[test]
+    fn refused_message_sets_status_naming_plugin_and_flag() {
+        let mut state = PluginsState::new(thegn_core::config::Config::default());
+        let mut model = FrameModel::default();
+        let damage = drain_one(
+            &mut state,
+            &mut model,
+            PluginMsg::Refused(vec![
+                thegn_svc::plugin::loader::SpecProblem {
+                    plugin: "untrusted-plugin".into(),
+                    problem: "refused: declares network:example.com; add trusted_native = true"
+                        .into(),
+                },
+                thegn_svc::plugin::loader::SpecProblem {
+                    plugin: "second-plugin".into(),
+                    problem: "refused: declares run:git; add trusted_native = true".into(),
+                },
+            ]),
+        );
+        assert!(model.status.contains("untrusted-plugin"));
+        assert!(model.status.contains("trusted_native = true"));
+        assert!(model.status.contains("(+1 more; see thegn plugin check)"));
+        assert_ne!(damage, PluginDamage::None);
     }
 }

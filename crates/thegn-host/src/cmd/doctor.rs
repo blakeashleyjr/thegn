@@ -1397,6 +1397,108 @@ fn harness_report(cfg: &Config) {
     }
 }
 
+fn plugin_trust_rows(cfg: &Config, config_path: &std::path::Path) -> Vec<serde_json::Value> {
+    let config_dir = config_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    let (plugins, _) = thegn_svc::plugin::discover(cfg, &config_dir);
+    plugins
+        .into_iter()
+        .filter(|plugin| plugin.spec.enabled)
+        .map(|plugin| {
+            let trust = plugin.spec.native_trust().status_token();
+            let source = if let Some(dir) = &plugin.dir {
+                let mut source = dir.display().to_string();
+                if plugin.trusted_native_ignored {
+                    source.push_str(" (trusted_native in plugin.toml ignored)");
+                }
+                source
+            } else {
+                "[[plugins]]".to_string()
+            };
+            serde_json::json!({
+                "id": plugin.spec.manifest.id.as_str(),
+                "source": source,
+                "trust": trust,
+                "gated_by": plugin.spec.gated_by(),
+            })
+        })
+        .collect()
+}
+
+fn plugins_trust_json(cfg: &Config, config_path: &std::path::Path) -> serde_json::Value {
+    serde_json::Value::Array(plugin_trust_rows(cfg, config_path))
+}
+
+fn plugins_trust_report(cfg: &Config, config_path: &std::path::Path) {
+    outln!("Plugins (native code; capabilities are not a sandbox)");
+    let rows = plugin_trust_rows(cfg, config_path);
+    if rows.is_empty() {
+        let config_dir = config_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let (all_plugins, _) = thegn_svc::plugin::discover(cfg, &config_dir);
+        if all_plugins.is_empty() {
+            outln!("  no plugins configured");
+        } else {
+            outln!("  no enabled plugins ({} configured)", all_plugins.len());
+        }
+        return;
+    }
+    for row in rows {
+        let gated_by = match row["gated_by"].as_array() {
+            Some(values) => values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+            None => String::new(),
+        };
+        let trust = if row["trust"] == "refused-untrusted" {
+            "refused-untrusted (needs trusted_native = true)"
+        } else {
+            row["trust"].as_str().unwrap_or("")
+        };
+        outln!(
+            "  {}  {}  gated by [{}]  {}",
+            row["id"].as_str().unwrap_or(""),
+            trust,
+            gated_by,
+            row["source"].as_str().unwrap_or(""),
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn plugins_trust_json_reports_trusted_refused_and_ungated() {
+    let spec = |id: &str, capability: &str, trusted_native: bool| {
+        toml::from_str::<thegn_core::plugin_api::PluginSpec>(&format!(
+            "id = \"{id}\"\nname = \"{id}\"\nversion = \"1\"\napi = \"0.3.0\"\ncapabilities = [\"{capability}\"]\ncommand = [\"true\"]\ntrusted_native = {trusted_native}"
+        ))
+        .unwrap()
+    };
+    let cfg = Config {
+        plugins: vec![
+            spec("trusted", "network:example.com", true),
+            spec("refused", "network:example.com", false),
+            spec("ungated", "surface:statusbar", false),
+        ],
+        ..Default::default()
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let rows = plugins_trust_json(&cfg, &tmp.path().join("config.toml"));
+    assert_eq!(rows[0]["trust"], "trusted-native");
+    assert_eq!(rows[1]["trust"], "refused-untrusted");
+    assert_eq!(rows[2]["trust"], "ungated");
+    assert_eq!(
+        rows[1]["gated_by"],
+        serde_json::json!(["network:example.com"])
+    );
+}
+
 /// The effective launch view of every `[[agents]]` entry (harness, model, env
 /// overlay keys, permissions) — `doctor --json`'s `agents`.
 fn agents_json(cfg: &Config) -> serde_json::Value {
@@ -2134,14 +2236,9 @@ pub fn run(
 ) -> Result<()> {
     let health = super::config_health::collect(&config_path, repo_context.as_deref());
     if json {
-        outln!(
-            "{}",
-            serde_json::to_string_pretty(&doctor_json_with_health_and_overrides(
-                cfg,
-                &health,
-                cli_overrides,
-            ))?
-        );
+        let mut report = doctor_json_with_health_and_overrides(cfg, &health, cli_overrides);
+        report["plugins"] = plugins_trust_json(cfg, &config_path);
+        outln!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
 
@@ -2256,6 +2353,9 @@ pub fn run(
 
     outln!("");
     harness_report(cfg);
+
+    outln!("");
+    plugins_trust_report(cfg, &config_path);
 
     outln!("");
     super::skills_doctor::print(&super::skills_doctor::inspect(
