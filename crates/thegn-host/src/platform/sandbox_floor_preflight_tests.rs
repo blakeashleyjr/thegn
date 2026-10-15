@@ -9,7 +9,7 @@ use thegn_core::remote::GitLoc;
 
 const IMAGE: &str = "fixture.invalid/the617:inert";
 const PREFLIGHT_FAILURE: &str = "THE617_OWNED_EXEC_PREFLIGHT_FAILURE";
-const INSPECT_FORMAT: &str = "{{if .State.Running}}RUNNING{{end}}\n{{index .Config.Labels \"thegn.seal_home\"}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
+const INSPECT_FORMAT: &str = "{{if .State.Running}}RUNNING{{end}}\n{{index .Config.Labels \"thegn.seal_home\"}}\n{{index .Config.Labels \"thegn.policy\"}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
 
 /// Availability caches otherwise outlive PATH restoration. Clear both sides of
 /// the private invocation while the existing environment guard is held.
@@ -61,38 +61,15 @@ fn stronger_runtime_preflight_failure_rechecks_final_host_floor() {
         let name = thegn_core::sandbox::container_name_with_profile(worktree_text, Some("default"));
         let journal = root.join("commands");
         let q = thegn_core::util::sh_quote;
-        // No forwarded command is ever executed. Four complete argv shapes are
-        // admitted, with all image/name/format/body values pinned to the fixture.
-        // Even accidental create/pull/remove/interactive-exec requests fail.
-        let script = format!(
-            r#"#!/bin/sh
-set -eu
-journal={journal}
-if [ "$#" -eq 1 ] && [ "$1" = version ]; then
-    printf 'version\n' >> "$journal"
-    printf 'fixture runtime available\n'
-elif [ "$#" -eq 3 ] && [ "$1" = image ] && [ "$2" = exists ] && [ "$3" = {image} ]; then
-    printf 'image-present\n' >> "$journal"
-elif [ "$#" -eq 5 ] && [ "$1" = container ] && [ "$2" = inspect ] && [ "$3" = --format ] && [ "$4" = {inspect} ] && [ "$5" = {name} ]; then
-    printf 'ensure-running\n' >> "$journal"
-    printf 'RUNNING\n'
-elif [ "$#" -eq 5 ] && [ "$1" = exec ] && [ "$2" = {name} ] && [ "$3" = /bin/sh ] && [ "$4" = -lc ] && [ "$5" = true ]; then
-    printf 'preflight-failed\n' >> "$journal"
-    printf '%s\n' {failure} >&2
-    exit 37
-else
-    printf 'UNEXPECTED\n' >> "$journal"
-    exit 98
-fi
-"#,
-            journal = q(journal.to_str().unwrap()),
-            image = q(IMAGE),
-            inspect = q(INSPECT_FORMAT),
-            name = q(&name),
-            failure = q(PREFLIGHT_FAILURE),
-        );
         let executable = bin.join("podman");
-        std::fs::write(&executable, script).unwrap();
+        // Bootstrap just enough of the fixture to resolve the same Podman spec
+        // that prepare_sandbox_env will use. The final fake below returns that
+        // spec's policy label, so ensure exercises reuse instead of recreation.
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nif [ \"$1\" = version ]; then printf 'fixture runtime available\\n'; else exit 98; fi\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let shell_env = root.join("empty-shell-env");
         std::fs::write(&shell_env, "").unwrap();
@@ -132,6 +109,52 @@ fi
         cfg.placement.enabled = false;
         cfg.daemon.enabled = false;
         let loc = GitLoc::for_worktree(&worktree);
+        let candidate = thegn_core::config::SandboxConfig {
+            backend: SandboxBackend::Podman,
+            ..cfg.sandbox.clone()
+        };
+        let resolved = thegn_core::sandbox::resolve_placed_exact(
+            &candidate,
+            &loc,
+            &name,
+            cfg.sandbox.profile,
+            thegn_core::placement::Placement::Local,
+        )
+        .expect("fixture Podman candidate resolves");
+        let sealed = thegn_core::sandbox::sealed_view(&resolved);
+        let policy = thegn_core::sandbox_policy_fp::policy_fingerprint(&sealed, false);
+        // The resolution probe is setup, not part of the behavior under test.
+        thegn_core::sandbox_backend::clear_probe_cache();
+        std::fs::write(&journal, "").unwrap();
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+journal={journal}
+if [ "$#" -eq 1 ] && [ "$1" = version ]; then
+    printf 'version\n' >> "$journal"
+    printf 'fixture runtime available\n'
+elif [ "$#" -eq 3 ] && [ "$1" = image ] && [ "$2" = exists ] && [ "$3" = {image} ]; then
+    printf 'image-present\n' >> "$journal"
+elif [ "$#" -eq 5 ] && [ "$1" = container ] && [ "$2" = inspect ] && [ "$3" = --format ] && [ "$4" = {inspect} ] && [ "$5" = {name} ]; then
+    printf 'ensure-running\n' >> "$journal"
+    printf 'RUNNING\n0\n{policy}\n'
+elif [ "$#" -eq 5 ] && [ "$1" = exec ] && [ "$2" = {name} ] && [ "$3" = /bin/sh ] && [ "$4" = -lc ] && [ "$5" = true ]; then
+    printf 'preflight-failed\n' >> "$journal"
+    printf '%s\n' {failure} >&2
+    exit 37
+else
+    printf 'UNEXPECTED\n' >> "$journal"
+    exit 98
+fi
+"#,
+            journal = q(journal.to_str().unwrap()),
+            image = q(IMAGE),
+            inspect = q(INSPECT_FORMAT),
+            name = q(&name),
+            policy = q(&policy),
+            failure = q(PREFLIGHT_FAILURE),
+        );
+        std::fs::write(&executable, script).unwrap();
         let result =
             crate::agent::prepare_sandbox_env(&cfg, root, worktree_text, &loc, None, false, None);
         assert_eq!(
