@@ -112,6 +112,12 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
         ));
     }
     rows.push(PanelRow::blank());
+    if super::super::staging::active_worktree_jj(ctx.model) {
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            hue(Hue::Amber),
+            "jj colocated: staging here does not change jj's working copy",
+        )])));
+    }
     rows.push(if ui.impact_open {
         // On the footer row Enter collapses; on an entity row it opens the def.
         hint_row(&[("↵", "open/close"), ("j/k", "entity")])
@@ -1204,5 +1210,64 @@ mod tests {
         let d = clip_dir_left("longname/", 5, 8);
         // Shows "…e/" or the bare "…/" marker — never empty for a nested dir.
         assert!(d.starts_with('…'), "got: {d}");
+    }
+
+    #[test]
+    fn jj_notice_appears_only_for_colocated_dirty_changes() {
+        let colocated_model = |dirty: bool| {
+            let mut model = model_with(PanelData {
+                changes: if dirty {
+                    vec![change("src/a.rs", Stage::Unstaged)]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            });
+            model.sidebar_rows = vec![crate::sidebar::SidebarRow {
+                active: true,
+                worktree_path: Some("/repo/wt".into()),
+                ..crate::sidebar::SidebarRow::base(
+                    crate::sidebar::RowKind::Worktree,
+                    1,
+                    "wt",
+                    "repo",
+                )
+            }];
+            model.sidebar_status.git.insert(
+                "/repo/wt".into(),
+                crate::sidebar::GitGlyphs {
+                    jj: true,
+                    ..Default::default()
+                },
+            );
+            model
+        };
+        let ui = PanelUi {
+            open: Section::Changes,
+            width: crate::layout::PanelWidth::Normal,
+            ..Default::default()
+        };
+        fn context<'a>(model: &'a FrameModel, ui: &'a PanelUi) -> SectionCtx<'a> {
+            SectionCtx {
+                model,
+                ui,
+                cols: 44,
+                rows: 28,
+            }
+        }
+
+        let dirty_model = colocated_model(true);
+        let dirty = flat(&content(&context(&dirty_model, &ui)));
+        assert!(dirty.contains("jj colocated: staging here does not change jj's working copy"));
+        let clean_model = colocated_model(false);
+        let clean = flat(&content(&context(&clean_model, &ui)));
+        assert!(!clean.contains("jj colocated:"));
+
+        let plain = model_with(PanelData {
+            changes: vec![change("src/a.rs", Stage::Unstaged)],
+            ..Default::default()
+        });
+        let plain = flat(&content(&context(&plain, &ui)));
+        assert!(!plain.contains("jj colocated:"));
     }
 }
