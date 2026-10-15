@@ -101,7 +101,7 @@ self: {
       mounts = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = ["~/.gitconfig:ro"];
-        description = "Extra bind mounts (\"host\", \"host:ro\", \"host:dest\", \"host:dest:ro\").";
+        description = "Extra bind mounts (\"host\", \"host:ro|rw|cache\", \"host:dest\", \"host:dest:ro|rw|cache\").";
       };
       initScript = lib.mkOption {
         type = lib.types.str;
