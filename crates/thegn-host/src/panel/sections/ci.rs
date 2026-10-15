@@ -276,7 +276,9 @@ mod tests {
     fn hostile_ci_run_fields_render_without_terminal_controls() {
         let mut model = FrameModel::default();
         model.panel.ci_runs = vec![CiRun {
-            name: "\u{1b}]0;pwn\u{7}日本語".repeat(12),
+            // Keep the run row within the Full view's 45-column list budget
+            // long enough to exercise the title field as well as the hostile name.
+            name: "\u{1b}]0;pwn\u{7}日本語".into(),
             title: "\u{202e}title日本語".repeat(12),
             event: "\u{1b}[31mevent".into(),
             jobs: vec![thegn_core::ci::CiJob {
