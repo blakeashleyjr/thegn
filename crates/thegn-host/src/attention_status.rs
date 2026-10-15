@@ -943,13 +943,7 @@ mod tests {
             })
             .unwrap();
         db.update_dispatch_status(waiting, S::WaitingHuman).unwrap();
-        db.conn()
-            .execute(
-                "UPDATE agent_dispatches SET dispatched_at_ms=1 WHERE id=?1",
-                [waiting],
-            )
-            .unwrap();
-        for index in 0..thegn_core::db::Db::ROSTER_HISTORY_LIMIT + 5 {
+        for _ in 0..thegn_core::db::Db::ROSTER_HISTORY_LIMIT + 5 {
             let id = db
                 .put_agent_dispatch(NewDispatch {
                     issue_id: "THE-259",
@@ -963,12 +957,6 @@ mod tests {
                 })
                 .unwrap();
             db.update_dispatch_status(id, S::Done).unwrap();
-            db.conn()
-                .execute(
-                    "UPDATE agent_dispatches SET dispatched_at_ms=?1 WHERE id=?2",
-                    [index as i64 + 10, id],
-                )
-                .unwrap();
         }
         let (window, truncated) = db
             .list_dispatch_roster_window(
