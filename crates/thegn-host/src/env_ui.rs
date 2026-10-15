@@ -71,6 +71,60 @@ pub(crate) enum BindDecision {
     Bind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BindAction {
+    Confirm {
+        name: String,
+        from: String,
+        to: String,
+    },
+    Bind {
+        name: String,
+        worktree: String,
+    },
+    Status(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfirmBindDecision {
+    Bind { worktree: String, name: String },
+    Status(String),
+}
+
+pub(crate) fn placement_change(
+    envs: &[EnvSnapshot],
+    target: &EnvSnapshot,
+) -> Option<(String, String)> {
+    let from = envs
+        .iter()
+        .find(|env| env.bound)
+        .map_or("local", |env| env.placement.as_str());
+    (from != target.placement).then(|| (from.to_string(), target.placement.clone()))
+}
+
+pub(crate) fn bind_action(envs: &[EnvSnapshot], cursor: usize, worktree: &str) -> BindAction {
+    let Some(env) = envs.get(cursor) else {
+        return BindAction::Status("no environment selected".to_string());
+    };
+    match bind_decision(env, worktree) {
+        BindDecision::NoWorktree => {
+            BindAction::Status("no active worktree to bind (open one first)".to_string())
+        }
+        BindDecision::AlreadyBound => BindAction::Status(already_bound_status(env)),
+        BindDecision::Bind => match placement_change(envs, env) {
+            Some((from, to)) => BindAction::Confirm {
+                name: env.name.clone(),
+                from,
+                to,
+            },
+            None => BindAction::Bind {
+                name: env.name.clone(),
+                worktree: worktree.to_string(),
+            },
+        },
+    }
+}
+
 pub(crate) fn bind_decision(env: &EnvSnapshot, worktree: &str) -> BindDecision {
     if worktree.trim().is_empty() {
         BindDecision::NoWorktree
@@ -86,6 +140,82 @@ fn already_bound_status(env: &EnvSnapshot) -> String {
         "env '{}' is already this worktree's effective env",
         env.name
     )
+}
+
+pub(crate) fn spawn_bind(
+    worktree: String,
+    name: String,
+    refresh_tx: tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    waker: termwiz::terminal::TerminalWaker,
+) {
+    let toast = refresh_tx.clone();
+    let refresh = refresh_tx;
+    drop(tokio::task::spawn_blocking(move || {
+        use thegn_core::notification::Priority;
+        let (message, priority) = match thegn_core::db::Db::open() {
+            Ok(db) => bind_env_blocking(&db, &worktree, &name),
+            Err(error) => (format!("bind failed: {error}"), Priority::Alert),
+        };
+        if let Err(error) = toast.send(crate::hydrate::RefreshKind::Toast { message, priority }) {
+            tracing::debug!(target: "thegn::env", %error, "bind toast consumer is gone");
+        }
+        if let Err(error) = refresh.send(crate::hydrate::RefreshKind::Model) {
+            tracing::debug!(target: "thegn::env", %error, "bind model refresh consumer is gone");
+        }
+        if let Err(error) = waker.wake() {
+            tracing::debug!(target: "thegn::env", %error, "bind wake failed");
+        }
+    }));
+}
+
+pub(crate) fn confirm_bind(
+    arg: &str,
+    envs: &[EnvSnapshot],
+    active_worktree: &str,
+    refresh_tx: tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    waker: termwiz::terminal::TerminalWaker,
+) -> String {
+    match confirm_bind_decision(arg, envs, active_worktree) {
+        ConfirmBindDecision::Status(status) => status,
+        ConfirmBindDecision::Bind { worktree, name } => {
+            spawn_bind(worktree, name.clone(), refresh_tx, waker);
+            format!("binding env '{name}'…")
+        }
+    }
+}
+
+fn confirm_bind_decision(
+    arg: &str,
+    envs: &[EnvSnapshot],
+    active_worktree: &str,
+) -> ConfirmBindDecision {
+    let (worktree, name) = match arg.split_once('\u{1f}') {
+        Some((worktree, name))
+            if !worktree.is_empty() && !name.is_empty() && !name.contains('\u{1f}') =>
+        {
+            (worktree, name)
+        }
+        _ => {
+            return ConfirmBindDecision::Status(
+                "cannot bind env: invalid confirmation".to_string(),
+            );
+        }
+    };
+    if worktree != active_worktree {
+        return ConfirmBindDecision::Status("cannot bind env: active worktree changed".to_string());
+    }
+    let Some(env) = envs.iter().find(|env| env.name == name) else {
+        return ConfirmBindDecision::Status(format!(
+            "cannot bind env '{name}': it is no longer configured"
+        ));
+    };
+    if env.bound {
+        return ConfirmBindDecision::Status(already_bound_status(env));
+    }
+    ConfirmBindDecision::Bind {
+        worktree: worktree.to_string(),
+        name: name.to_string(),
+    }
 }
 
 pub(crate) fn bind_env_blocking(
@@ -192,38 +322,22 @@ pub fn panel_key(
     };
     match key {
         KeyCode::Enter => {
-            match bind_decision(&env, worktree) {
-                BindDecision::NoWorktree => {
-                    model.status = "no active worktree to bind (open one first)".into();
+            match bind_action(&model.panel.environments, cursor, worktree) {
+                BindAction::Status(status) => model.status = status,
+                BindAction::Bind { name, worktree } => {
+                    model.status = format!("binding env '{name}'…");
+                    spawn_bind(worktree, name, refresh_tx.clone(), waker.clone());
                 }
-                BindDecision::AlreadyBound => {
-                    model.status = already_bound_status(&env);
-                }
-                BindDecision::Bind => {
-                    model.status = format!("binding env '{}'…", env.name);
-                    let wt = worktree.to_string();
-                    let name = env.name.clone();
-                    let toast = refresh_tx.clone();
-                    let refresh = refresh_tx.clone();
-                    let wk = waker.clone();
-                    drop(tokio::task::spawn_blocking(move || {
-                        use thegn_core::notification::Priority;
-                        let (message, priority) = match thegn_core::db::Db::open() {
-                            Ok(db) => bind_env_blocking(&db, &wt, &name),
-                            Err(error) => (format!("bind failed: {error}"), Priority::Alert),
-                        };
-                        if let Err(error) =
-                            toast.send(crate::hydrate::RefreshKind::Toast { message, priority })
-                        {
-                            tracing::debug!(target: "thegn::env", %error, "bind toast consumer is gone");
-                        }
-                        if let Err(error) = refresh.send(crate::hydrate::RefreshKind::Model) {
-                            tracing::debug!(target: "thegn::env", %error, "bind model refresh consumer is gone");
-                        }
-                        if let Err(error) = wk.wake() {
-                            tracing::debug!(target: "thegn::env", %error, "bind wake failed");
-                        }
-                    }));
+                BindAction::Confirm { name, from, to } => {
+                    *active_menu = Some(crate::menu::confirm_menu(
+                        format!("bind env '{name}'?"),
+                        format!(
+                            "Moves this worktree's new panes from {from} to {to} placement. Running panes stay where they are."
+                        ),
+                        "env-bind",
+                        format!("{worktree}\u{1f}{name}"),
+                        false,
+                    ));
                 }
             };
             true
@@ -310,6 +424,61 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    fn snapshot(name: &str, placement: &str, bound: bool) -> EnvSnapshot {
+        EnvSnapshot {
+            name: name.to_string(),
+            kind: placement.to_string(),
+            placement: placement.to_string(),
+            region: String::new(),
+            size: String::new(),
+            bound,
+            token: None,
+        }
+    }
+
+    #[test]
+    fn placement_change_detects_local_to_provider_and_ignores_same_placement() {
+        let provider = snapshot("provider", "provider", false);
+        assert_eq!(
+            placement_change(&[], &provider),
+            Some(("local".into(), "provider".into()))
+        );
+        let envs = [
+            snapshot("bound", "local", true),
+            snapshot("local", "local", false),
+        ];
+        assert_eq!(placement_change(&envs, &envs[1]), None);
+    }
+
+    #[test]
+    fn enter_on_placement_changing_env_opens_bind_confirm() {
+        let envs = [
+            snapshot("a", "local", true),
+            snapshot("b", "provider", false),
+        ];
+        assert_eq!(
+            bind_action(&envs, 1, "/worktree"),
+            BindAction::Confirm {
+                name: "b".into(),
+                from: "local".into(),
+                to: "provider".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn confirm_bind_refuses_a_vanished_env_or_switched_worktree() {
+        let envs = [snapshot("a", "local", false)];
+        assert!(matches!(
+            confirm_bind_decision("/worktree\u{1f}gone", &envs, "/worktree"),
+            ConfirmBindDecision::Status(message) if message.contains("no longer configured")
+        ));
+        assert!(matches!(
+            confirm_bind_decision("/old\u{1f}a", &envs, "/new"),
+            ConfirmBindDecision::Status(message) if message.contains("worktree changed")
+        ));
     }
 
     #[test]

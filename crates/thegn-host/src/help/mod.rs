@@ -87,19 +87,24 @@ pub fn open(
     focus: &crate::focus::FocusState,
     panel_ui: &crate::panel::PanelUi,
 ) -> Option<HelpOverlay> {
-    let badge = crate::keymap::chord_hint_for(cfg, "help").unwrap_or_else(|| "help".to_string());
+    let close_chord = crate::keymap::chord_hint_for(cfg, "help");
+    let badge = close_chord.clone().unwrap_or_else(|| "help".to_string());
     if focus.panel() && panel_ui.open == crate::panel::Section::Help {
         let page = if panel_ui.help.page.is_empty() {
             "index"
         } else {
             panel_ui.help.page.as_str()
         };
-        return Some(HelpOverlay::new_at(
-            reg.clone(),
-            page.to_string(),
-            crate::panel::sections::help::anchor_at(panel_ui).map(overlay::OverlayTarget::Anchor),
-            badge,
-        ));
+        return Some(
+            HelpOverlay::new_at(
+                reg.clone(),
+                page.to_string(),
+                crate::panel::sections::help::anchor_at(panel_ui)
+                    .map(overlay::OverlayTarget::Anchor),
+                badge,
+            )
+            .with_close_chord(close_chord.as_deref()),
+        );
     }
     let context_key = context::resolve(focus, panel_ui);
     let page = reg.page_for_context(&context_key)?.to_string();
@@ -108,15 +113,18 @@ pub fn open(
         .map(crate::panel::Section::label)
         .unwrap_or("");
     let anchor = reg.anchor_for_context(&context_key);
-    Some(HelpOverlay::new_at(
-        reg.clone(),
-        page,
-        Some(overlay::OverlayTarget::Heading {
-            key: anchor.unwrap_or(section_key).to_string(),
-            label: anchor.unwrap_or(label).to_string(),
-        }),
-        badge,
-    ))
+    Some(
+        HelpOverlay::new_at(
+            reg.clone(),
+            page,
+            Some(overlay::OverlayTarget::Heading {
+                key: anchor.unwrap_or(section_key).to_string(),
+                label: anchor.unwrap_or(label).to_string(),
+            }),
+            badge,
+        )
+        .with_close_chord(close_chord.as_deref()),
+    )
 }
 
 /// Open the overlay at the page claiming `context_key` (falls back to
@@ -130,8 +138,9 @@ pub fn open_at(
     context_key: &str,
 ) -> Option<HelpOverlay> {
     let page = reg.page_for_context(context_key)?.to_string();
-    let badge = crate::keymap::chord_hint_for(cfg, "help").unwrap_or_else(|| "help".to_string());
-    Some(HelpOverlay::new(reg.clone(), page, badge))
+    let close_chord = crate::keymap::chord_hint_for(cfg, "help");
+    let badge = close_chord.clone().unwrap_or_else(|| "help".to_string());
+    Some(HelpOverlay::new(reg.clone(), page, badge).with_close_chord(close_chord.as_deref()))
 }
 
 #[cfg(test)]
