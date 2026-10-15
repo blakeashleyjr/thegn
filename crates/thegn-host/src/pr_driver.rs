@@ -1412,11 +1412,25 @@ mod tests {
 
     /// Persist the authorization used by driver tests, then pass the exact row
     /// snapshot the production queue loader would construct.
-    fn saved_bound_item(db: &Db, item: PrItem) -> PrItem {
+    fn saved_bound_item(dir: &tempfile::TempDir, db: &Db, mut item: PrItem) -> PrItem {
+        let checkout = dir.path().join("checkout-feat");
+        if item.worktree.is_some() {
+            if !checkout.exists() {
+                std::fs::create_dir(&checkout).unwrap();
+                git_repo_on_branch(&checkout, &item.branch);
+            }
+            item.worktree = Some(
+                checkout
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
         db.enqueue_bound_pr(
             "/repo",
             item.number,
-            None,
+            item.worktree.as_deref(),
             &item.branch,
             "main",
             &item.forge,
@@ -1911,21 +1925,15 @@ mod tests {
         (dir, db)
     }
 
-    fn enqueue_merge_test_row(db: &Db) -> PrQueueRow {
-        db.enqueue_bound_pr(
-            "/repo",
-            7,
-            Some("/w/feat"),
-            "feat",
-            "main",
-            "github",
-            "https://github.com/me/repo/pull/7",
-        )
-        .unwrap();
-        let row = db.list_pr_queue().unwrap().remove(0);
-        db.update_pr_status(&row.key, "ready", None, None, Some("abc"))
+    fn enqueue_merge_test_row(dir: &tempfile::TempDir, db: &Db) -> PrQueueRow {
+        let item = saved_bound_item(dir, db, item());
+        db.update_pr_status(&item.key, "ready", None, None, Some("abc"))
             .unwrap();
-        db.list_pr_queue().unwrap().remove(0)
+        db.list_pr_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.key == item.key)
+            .unwrap()
     }
 
     #[test]
@@ -2424,7 +2432,7 @@ mod tests {
 
     #[test]
     fn fake_forge_fetch_failure_is_a_warning_not_a_verdict() {
-        let (_dir, db) = temp_db("prq-gone");
+        let (dir, db) = temp_db("prq-gone");
         let forge = FakeForge::new(None); // every fetch → NoPr
         let out = drive_queue(
             &cfg(),
@@ -2432,7 +2440,7 @@ mod tests {
             &forge,
             Path::new("/repo"),
             &db,
-            vec![saved_bound_item(&db, item())],
+            vec![saved_bound_item(&dir, &db, item())],
             |_| {},
         );
         assert!(out.merged.is_empty());
@@ -2445,7 +2453,7 @@ mod tests {
 
     #[test]
     fn explicit_review_watch_is_required_for_deep_fetch() {
-        let (_dir, db) = temp_db("prq-review-filter");
+        let (dir, db) = temp_db("prq-review-filter");
         let forge = FakeForge::new(Some(requested_pr()))
             .with_conversation(review_conversation("rename this"));
         let mut cfg = cfg();
@@ -2456,7 +2464,7 @@ mod tests {
             &forge,
             Path::new("/repo"),
             &db,
-            vec![saved_bound_item(&db, item())],
+            vec![saved_bound_item(&dir, &db, item())],
             |_| {},
         );
         assert!(
@@ -2469,7 +2477,7 @@ mod tests {
 
     #[test]
     fn per_thread_task_suppresses_the_generic_review_agent() {
-        let (_dir, db) = temp_db("prq-review-dedupe");
+        let (dir, db) = temp_db("prq-review-dedupe");
         let forge = FakeForge::new(Some(requested_pr()))
             .with_conversation(review_conversation("rename this"));
         let mut cfg = cfg();
@@ -2481,7 +2489,7 @@ mod tests {
             &forge,
             Path::new("/repo"),
             &db,
-            vec![saved_bound_item(&db, item())],
+            vec![saved_bound_item(&dir, &db, item())],
             |step| statuses.push(step.status.to_string()),
         );
         assert_eq!(db.list_review_tasks().unwrap().len(), 1);
@@ -2498,7 +2506,7 @@ mod tests {
             &forge,
             Path::new("/repo"),
             &db,
-            vec![saved_bound_item(&db, item())],
+            vec![saved_bound_item(&dir, &db, item())],
             |_| {},
         );
         assert!(unchanged.review_events.is_empty());
@@ -2511,7 +2519,7 @@ mod tests {
             &revised_forge,
             Path::new("/repo"),
             &db,
-            vec![saved_bound_item(&db, item())],
+            vec![saved_bound_item(&dir, &db, item())],
             |_| {},
         );
         assert_eq!(revised.review_events.len(), 1);
@@ -2519,7 +2527,7 @@ mod tests {
 
     #[test]
     fn by_number_review_task_keeps_missing_worktree_human_only() {
-        let (_dir, db) = temp_db("prq-review-by-number");
+        let (dir, db) = temp_db("prq-review-by-number");
         let forge = FakeForge::new(Some(requested_pr()))
             .with_conversation(review_conversation("rename this"));
         let mut cfg = cfg();
@@ -2533,7 +2541,7 @@ mod tests {
             &forge,
             Path::new("/repo"),
             &db,
-            vec![saved_bound_item(&db, number_only)],
+            vec![saved_bound_item(&dir, &db, number_only)],
             |step| statuses.push(step.status.to_string()),
         );
         let task = db.list_review_tasks().unwrap().pop().unwrap();
@@ -2545,7 +2553,7 @@ mod tests {
 
     #[test]
     fn transient_review_failure_keeps_the_durable_task_stale() {
-        let (_dir, db) = temp_db("prq-review-stale");
+        let (dir, db) = temp_db("prq-review-stale");
         let first = FakeForge::new(Some(requested_pr()))
             .with_conversation(review_conversation("first revision"));
         drive_queue(
@@ -2554,7 +2562,7 @@ mod tests {
             &first,
             Path::new("/repo"),
             &db,
-            vec![saved_bound_item(&db, item())],
+            vec![saved_bound_item(&dir, &db, item())],
             |_| {},
         );
         let before = db.list_review_tasks().unwrap();
@@ -2567,7 +2575,7 @@ mod tests {
             &failed,
             Path::new("/repo"),
             &db,
-            vec![saved_bound_item(&db, item())],
+            vec![saved_bound_item(&dir, &db, item())],
             |_| {},
         );
         assert_eq!(db.list_review_tasks().unwrap(), before);
@@ -2897,8 +2905,8 @@ mod tests {
 
     #[test]
     fn direct_merge_passes_the_reviewed_head() {
-        let (_dir, db) = temp_db("prq-reviewed-head");
-        let row = enqueue_merge_test_row(&db);
+        let (dir, db) = temp_db("prq-reviewed-head");
+        let row = enqueue_merge_test_row(&dir, &db);
         let forge = FakeForge::new(Some(green_pr()));
         let mut config = cfg();
         config.merge_mode = thegn_core::config::PrMergeMode::Thegn;
@@ -2919,8 +2927,8 @@ mod tests {
 
     #[test]
     fn direct_merge_without_confirmation_is_requested_not_merged() {
-        let (_dir, db) = temp_db("prq-merge-requested");
-        let row = enqueue_merge_test_row(&db);
+        let (dir, db) = temp_db("prq-merge-requested");
+        let row = enqueue_merge_test_row(&dir, &db);
         let forge = FakeForge::new(Some(green_pr())).without_direct_confirmation();
         let mut config = cfg();
         config.merge_mode = thegn_core::config::PrMergeMode::Thegn;
@@ -2941,8 +2949,8 @@ mod tests {
 
     #[test]
     fn stale_head_refusal_is_refresh_required_not_needs_human() {
-        let (_dir, db) = temp_db("prq-stale-head");
-        let row = enqueue_merge_test_row(&db);
+        let (dir, db) = temp_db("prq-stale-head");
+        let row = enqueue_merge_test_row(&dir, &db);
         db.set_pr_agent_attempts(&row.key, 3).unwrap();
         let row = db.list_pr_queue().unwrap().remove(0);
         let forge = FakeForge::new(Some(green_pr()))
@@ -3015,8 +3023,8 @@ mod tests {
 
     #[test]
     fn ambiguous_network_error_keeps_merging_and_reports_unknown() {
-        let (_dir, db) = temp_db("prq-merge-unknown");
-        let row = enqueue_merge_test_row(&db);
+        let (dir, db) = temp_db("prq-merge-unknown");
+        let row = enqueue_merge_test_row(&dir, &db);
         let forge = FakeForge::new(Some(green_pr())).with_merge_error(ForgeError::Offline);
         let mut config = cfg();
         config.merge_mode = thegn_core::config::PrMergeMode::Thegn;
@@ -3042,8 +3050,8 @@ mod tests {
 
     #[test]
     fn armed_auto_merge_is_rearmed_each_pass_and_never_counted_merged() {
-        let (_dir, db) = temp_db("prq-auto-cancelled");
-        let row = enqueue_merge_test_row(&db);
+        let (dir, db) = temp_db("prq-auto-cancelled");
+        let row = enqueue_merge_test_row(&dir, &db);
         let forge = FakeForge::new(Some(green_pr()));
         let config = cfg();
         let first = drive_queue(
@@ -3079,8 +3087,8 @@ mod tests {
 
     #[test]
     fn requested_merge_is_confirmed_by_a_later_poll() {
-        let (_dir, db) = temp_db("prq-later-confirmation");
-        let row = enqueue_merge_test_row(&db);
+        let (dir, db) = temp_db("prq-later-confirmation");
+        let row = enqueue_merge_test_row(&dir, &db);
         let forge = FakeForge::new(Some(green_pr())).without_direct_confirmation();
         let mut config = cfg();
         config.merge_mode = thegn_core::config::PrMergeMode::Thegn;
