@@ -17,7 +17,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::IpAddr;
@@ -1213,9 +1213,11 @@ fn direct_client_env(
     ambient
         .into_iter()
         .filter(|(key, _)| {
-            DIRECT_CLIENT_ENV_KEYS
-                .iter()
-                .any(|allowed| key == OsStr::new(allowed))
+            key.to_str().is_some_and(|key| {
+                DIRECT_CLIENT_ENV_KEYS
+                    .iter()
+                    .any(|allowed| key.eq_ignore_ascii_case(allowed))
+            })
         })
         .collect()
 }
