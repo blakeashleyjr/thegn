@@ -1105,6 +1105,7 @@ mod tests {
 
     #[test]
     fn vanish_result_removes_only_the_sampled_epoch() {
+        let _isolation = TestIsolation::new();
         let sampled = crate::session::WorktreeGroup::new(
             "repo/feature",
             crate::session::GroupKind::Branch,
@@ -1140,6 +1141,7 @@ mod tests {
 
     #[test]
     fn vanish_result_still_removes_the_sampled_group() {
+        let _isolation = TestIsolation::new();
         let sampled = crate::session::WorktreeGroup::new(
             "repo/feature",
             crate::session::GroupKind::Branch,
