@@ -46,13 +46,6 @@ pub(crate) struct PaletteDbResult {
     pub(crate) rows: Option<PaletteRows>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PaletteOpenPlan {
-    pub(crate) generation: u64,
-    pub(crate) rows: PaletteRows,
-    pub(crate) load_requested: bool,
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct PaletteDbCache {
     entries: HashMap<PaletteKey, PaletteRows>,
@@ -62,21 +55,7 @@ pub(crate) struct PaletteDbCache {
 }
 
 impl PaletteDbCache {
-    pub(crate) fn contains(&self, key: &PaletteKey) -> bool {
-        self.entries.contains_key(key)
-    }
-
     pub(crate) fn begin(&mut self, key: PaletteKey, fallback: PaletteRows) -> (u64, PaletteRows) {
-        let plan = self.plan_open(key, fallback);
-        if plan.load_requested {
-            (plan.generation, plan.rows)
-        } else {
-            self.current = None;
-            (plan.generation, plan.rows)
-        }
-    }
-
-    pub(crate) fn plan_open(&mut self, key: PaletteKey, fallback: PaletteRows) -> PaletteOpenPlan {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let rows = self.entries.get(&key).cloned().unwrap_or(fallback);
@@ -85,11 +64,7 @@ impl PaletteDbCache {
             self.move_folder_lru.push_back(key.clone());
         }
         self.current = Some((key, generation));
-        PaletteOpenPlan {
-            generation,
-            rows,
-            load_requested: true,
-        }
+        (generation, rows)
     }
 
     pub(crate) fn apply(&mut self, result: PaletteDbResult) -> Option<PaletteRows> {
@@ -124,6 +99,27 @@ impl PaletteDbCache {
     }
 }
 
+pub(crate) fn move_to_folder_parts(rows: PaletteRows) -> (Vec<PaletteItem>, Option<String>) {
+    match rows {
+        PaletteRows::Items(items) => (items, None),
+        PaletteRows::MoveToFolder { items, repo_path } => (items, Some(repo_path)),
+        _ => unreachable!("move-to-folder cache stores folder rows"),
+    }
+}
+
+pub(crate) fn layout_names_state(names: &[String], is_fresh: bool) -> (bool, String) {
+    if names.is_empty() && is_fresh {
+        (
+            true,
+            "No saved layouts yet — use \"Save layout as…\" first".into(),
+        )
+    } else if names.is_empty() {
+        (false, "Apply layout — loading saved layouts".into())
+    } else {
+        (false, format!("Apply layout — saved: {}", names.join(", ")))
+    }
+}
+
 pub(crate) fn spawn_load(
     key: PaletteKey,
     generation: u64,
@@ -154,8 +150,8 @@ pub(crate) fn spawn_load(
         }
     });
     tokio::spawn(async move {
-        if done_rx.await.is_err() {
-            if let Err(error) = fallback_tx.send(dropped_job_result(fallback_key, generation)) {
+        if let Some(result) = dropped_job_fallback(done_rx, fallback_key, generation).await {
+            if let Err(error) = fallback_tx.send(result) {
                 tracing::debug!(target: "thegn::db", %error, "palette DB fallback receiver is gone");
             }
             if let Err(error) = fallback_wake.wake() {
@@ -163,6 +159,18 @@ pub(crate) fn spawn_load(
             }
         }
     });
+}
+
+async fn dropped_job_fallback(
+    done_rx: tokio::sync::oneshot::Receiver<()>,
+    key: PaletteKey,
+    generation: u64,
+) -> Option<PaletteDbResult> {
+    if done_rx.await.is_err() {
+        Some(dropped_job_result(key, generation))
+    } else {
+        None
+    }
 }
 
 fn dropped_job_result(key: PaletteKey, generation: u64) -> PaletteDbResult {
@@ -190,13 +198,13 @@ mod tests {
         let address = key(PaletteKind::Main, "session");
         let rows = PaletteRows::Items(vec![PaletteItem::new("cached", "Cached")]);
         cache.entries.insert(address.clone(), rows.clone());
-        let plan = cache.plan_open(address.clone(), PaletteRows::Items(Vec::new()));
-        assert_eq!(plan.rows, rows);
-        assert!(plan.load_requested);
+        let (generation, cached_rows) =
+            cache.begin(address.clone(), PaletteRows::Items(Vec::new()));
+        assert_eq!(cached_rows, rows);
         let mut session = crate::search_everywhere::PaletteSession::new(vec![PaletteItem::new(
             "cached", "Cached",
         )]);
-        session.mark_db_pending(address, plan.generation);
+        session.mark_db_pending(address.cache_id(), generation);
         assert!(session.db_pending);
     }
 
@@ -239,13 +247,63 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dropped_job_fallback_is_a_fenced_pending_clear_result() {
+    #[tokio::test]
+    async fn dropped_job_fallback_is_a_fenced_pending_clear_result() {
         let mut cache = PaletteDbCache::default();
         let address = key(PaletteKind::Main, "session");
         let (generation, _) = cache.begin(address.clone(), PaletteRows::Items(Vec::new()));
-        let fallback = dropped_job_result(address.clone(), generation);
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        drop(done_tx);
+        if let Some(fallback) = dropped_job_fallback(done_rx, address, generation).await {
+            result_tx.send(fallback).unwrap();
+        }
+        let fallback = result_rx.recv().await.unwrap();
         assert!(cache.is_current(&fallback.key, fallback.generation));
         assert!(fallback.rows.is_none());
+        assert!(cache.apply(fallback).is_none());
+    }
+
+    #[test]
+    fn move_to_folder_applied_variant_is_accepted_on_reopen() {
+        let mut cache = PaletteDbCache::default();
+        let address = key(PaletteKind::MoveToFolder, "wt:/repo/worktree");
+        let (generation, _) = cache.begin(address.clone(), PaletteRows::Items(Vec::new()));
+        let loaded = PaletteRows::MoveToFolder {
+            items: vec![PaletteItem::new("move-to-folder:ready", "Ready")],
+            repo_path: "/repo".into(),
+        };
+        assert_eq!(
+            cache.apply(PaletteDbResult {
+                key: address.clone(),
+                generation,
+                rows: Some(loaded.clone()),
+            }),
+            Some(loaded.clone())
+        );
+        let (_, reopened) = cache.begin(address, PaletteRows::Items(Vec::new()));
+        assert!(matches!(&reopened, PaletteRows::MoveToFolder { .. }));
+        let (items, repo_path) = move_to_folder_parts(reopened);
+        let Some(repo_path) = repo_path else {
+            panic!("applied move-to-folder variant was not cached")
+        };
+        assert_eq!(repo_path, "/repo");
+        assert_eq!(items[0].key, "move-to-folder:ready");
+    }
+
+    #[test]
+    fn empty_cached_layout_names_stay_loading_until_a_fresh_result() {
+        let names = Vec::new();
+        assert_eq!(
+            layout_names_state(&names, false),
+            (false, "Apply layout — loading saved layouts".into())
+        );
+        assert_eq!(
+            layout_names_state(&names, true),
+            (
+                true,
+                "No saved layouts yet — use \"Save layout as…\" first".into()
+            )
+        );
     }
 }
