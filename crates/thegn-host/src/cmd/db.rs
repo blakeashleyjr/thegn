@@ -7,7 +7,7 @@ use std::time::Duration;
 use thegn_core::db::Db;
 use thegn_core::outln;
 use thegn_core::{
-    AutoVacuum, DbSpace, MaintenanceStep, NOTIFICATION_READ_RETENTION_SECS, plan_maintenance,
+    AutoVacuum, DbSpace, MaintenanceStep, NOTIFICATION_READ_RETENTION_SECS, msg, plan_maintenance,
 };
 
 const CHUNK_PAGES: u32 = 1024;
@@ -66,7 +66,10 @@ pub fn run(action: Action) -> Result<()> {
             let mut report = vacuum_report(&db, dry_run)?;
             report.pruned_notifications += startup_pruned;
             if json && dry_run {
-                eprintln!("plan: {}", plan_name(plan_maintenance(&before, 1)));
+                msg::info(&format!(
+                    "plan: {}",
+                    plan_name(plan_maintenance(&before, 1))
+                ));
             }
             if json {
                 return super::emit_json(&report);
@@ -106,8 +109,8 @@ pub fn vacuum_report(db: &Db, dry_run: bool) -> Result<VacuumReport> {
     }
 
     let (after, pruned_notifications) = if before.auto_vacuum != AutoVacuum::Incremental {
-        eprintln!(
-            "converting to incremental auto-vacuum (full VACUUM; a running thegn pauses DB writes until it finishes)..."
+        msg::info(
+            "converting to incremental auto-vacuum (full VACUUM; a running thegn pauses DB writes until it finishes)...",
         );
         let pruned = db.prune_notifications(NOTIFICATION_READ_RETENTION_SECS)?;
         let conversion = db
@@ -142,7 +145,7 @@ pub fn vacuum_report(db: &Db, dry_run: bool) -> Result<VacuumReport> {
             if chunk == 0 {
                 break;
             }
-            eprintln!("freed {freed}/{total} pages");
+            msg::info(&format!("freed {freed}/{total} pages"));
         }
         (db.space()?, pruned)
     };
