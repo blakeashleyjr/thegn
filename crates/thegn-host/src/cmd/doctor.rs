@@ -3669,7 +3669,7 @@ fn network_rules_line(sb: &thegn_core::config::SandboxConfig, backend: Backend) 
 /// the launch this host would actually pick meets it — computed with the same
 /// pure [`thegn_core::sandbox_floor::decide`] the launch path uses.
 fn floor_report(cfg: &Config) {
-    use thegn_core::config::{IsolationFloor, SandboxBackend};
+    use thegn_core::config::IsolationFloor;
     use thegn_core::sandbox_floor::{
         FloorDecision, containment_summary, decide, floor_in_force, miss_policy_in_force,
     };
