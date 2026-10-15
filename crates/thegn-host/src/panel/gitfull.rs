@@ -1279,17 +1279,20 @@ fn tint_segs(mut segs: Vec<Seg>, w: usize, bg: Option<Tok>) -> Vec<Seg> {
     segs
 }
 
-/// Zip the side and main columns into single rows across a `│` seam; the
-/// fused row inherits the side row's hit target.
+/// Zip the side and main columns into single rows across a `│` seam. The
+/// fused row keeps the side hit for row-based consumers and returns x spans
+/// for click resolution in either column.
 fn fuse(
     side: &[PanelRow],
     main: &[PanelRow],
     body: usize,
     side_w: usize,
     main_w: usize,
-) -> Vec<PanelRow> {
+    base: usize,
+) -> (Vec<PanelRow>, Vec<super::frame::ColHit>) {
     let blank = PanelRow::blank();
-    (0..body)
+    let mut col_hits = Vec::new();
+    let rows = (0..body)
         .map(|i| {
             let s = side.get(i).unwrap_or(&blank);
             let m = main.get(i).unwrap_or(&blank);
@@ -1299,12 +1302,25 @@ fn fuse(
             segs.push(seg(g3(), "│"));
             segs.extend(tint_segs(flatten(&m.line, main_w), main_w, m.bg));
             let mut row = PanelRow::plain(Line::Segs(segs));
-            if let Some(h) = s.hit {
-                row = row.with_hit(h);
+            if let Some(hit) = s.hit {
+                row = row.with_hit(hit);
+                col_hits.push(super::frame::ColHit {
+                    row: base + i,
+                    cols: 0..side_w,
+                    hit,
+                });
+            }
+            if let Some(hit) = m.hit {
+                col_hits.push(super::frame::ColHit {
+                    row: base + i,
+                    cols: side_w + 1..side_w + 1 + main_w,
+                    hit,
+                });
             }
             row
         })
-        .collect()
+        .collect();
+    (rows, col_hits)
 }
 
 /// One dim help row from the focused context's key table (the same data that
@@ -1391,6 +1407,7 @@ pub(super) fn build_git_full(
             return PanelFrame {
                 rows: out,
                 rail: Vec::new(),
+                col_hits: Vec::new(),
                 tab_spans: Vec::new(),
             };
         }
@@ -1398,13 +1415,23 @@ pub(super) fn build_git_full(
         let main_w = cols.saturating_sub(side_w + 1);
         let side = side_rows(model, ui, focused, body, side_w);
         let main = main_rows(model, ui, focused, main_w, body);
-        out.extend(fuse(&side, &main, body, side_w, main_w));
+        let base = out.len();
+        let (fused, col_hits) = fuse(&side, &main, body, side_w, main_w, base);
+        out.extend(fused);
         out.push(help_row(ui.git.focus));
+        out.truncate(rows);
+        return PanelFrame {
+            rows: out,
+            rail: Vec::new(),
+            col_hits,
+            tab_spans: Vec::new(),
+        };
     }
     out.truncate(rows);
     PanelFrame {
         rows: out,
         rail: Vec::new(),
+        col_hits: Vec::new(),
         tab_spans: Vec::new(),
     }
 }
@@ -2236,5 +2263,79 @@ mod tests {
         plain.sidebar_rows = colocated.sidebar_rows;
         let rendered = text_of(&status_rows(&plain, &ui(GitView::Files), true)[0].line);
         assert!(!rendered.contains("jj: git index ignored"), "{rendered}");
+    }
+
+    #[test]
+    fn wide_half_drill_rows_get_column_hits() {
+        let m = model();
+        let mut u = ui(GitView::CommitFiles);
+        u.width = PanelWidth::Half;
+        u.git.drilled_commit = Some(m.panel.commits[0].sha.clone());
+        u.git.commit_files_load = crate::panel::gitui::DocLoad::Ready;
+        u.git.commit_files = vec![("src/a.rs".into(), 2, 1)];
+        let frame = build_git_full(&m, &u, 100, 40, true);
+        let drill = frame
+            .col_hits
+            .iter()
+            .find(|span| span.hit == PanelHit::GitDrill(0))
+            .expect("wide Half main column retains the drill hit");
+        assert_eq!(drill.cols.start, SIDE_W);
+        assert!(
+            !frame.col_hits.iter().any(|span| {
+                span.row == drill.row
+                    && span.hit != PanelHit::GitDrill(0)
+                    && span.cols.contains(&drill.cols.start)
+            }),
+            "main-column hit must not overlap the side span"
+        );
+    }
+
+    #[test]
+    fn full_blame_and_staging_rows_get_column_hits() {
+        let m = model();
+        let mut blame = ui(GitView::Blame);
+        blame.git.blame_rows = (1..=3)
+            .map(|lineno| crate::panel::BlameRow {
+                sha: "abcdef0".into(),
+                author: "Author".into(),
+                date: 1_700_000_000,
+                lineno,
+                content: format!("line {lineno}"),
+            })
+            .collect();
+        let blame_frame = build_git_full(&m, &blame, 120, 40, true);
+        for index in 0..3 {
+            assert!(blame_frame.col_hits.iter().any(|span| {
+                span.hit == PanelHit::GitDrill(index)
+                    && span.cols.start == SIDE_W
+                    && span.cols.end == 120
+            }));
+        }
+
+        let mut staging = ui(GitView::Staging);
+        let stage = StagingUi::new("src/a.rs");
+        staging.git.staging = Some(stage.clone());
+        staging.git.stage_doc = Some(crate::panel::gitui::StageDocState {
+            path: "src/a.rs".into(),
+            pane: stage.pane,
+            doc: crate::panel::staging::StageDoc {
+                path: "src/a.rs".into(),
+                lines: vec![crate::panel::staging::StageLine {
+                    kind: thegn_core::patch::LineKind::Add,
+                    hunk: 0,
+                    line: 0,
+                    old_no: None,
+                    new_no: Some(1),
+                    text: "added".into(),
+                    is_header: false,
+                }],
+                binary: false,
+            },
+            diff: String::new(),
+        });
+        let staging_frame = build_git_full(&m, &staging, 120, 40, true);
+        assert!(staging_frame.col_hits.iter().any(|span| {
+            matches!(span.hit, PanelHit::GitDrill(_)) && span.cols.start == SIDE_W
+        }));
     }
 }
