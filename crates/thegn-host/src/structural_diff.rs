@@ -391,4 +391,107 @@ mod tests {
         assert!(env.contains(&("DFT_WIDTH".into(), "20".into())));
         assert!(env.contains(&("DFT_BACKGROUND".into(), "light".into())));
     }
+
+    #[test]
+    fn binary_external_diff_output_is_lossy_decoded_without_panicking() {
+        if !shell_available() {
+            return;
+        }
+        let dir = fixture();
+        let binary = dir.path().join("binary.dat");
+        std::fs::write(&binary, [0_u8, 0xff, 0xfe, b'\n']).unwrap();
+        git(&dir, &["add", "binary.dat"]);
+        git(&dir, &["commit", "-q", "-m", "add binary fixture"]);
+        std::fs::write(&binary, [0_u8, 0xff, 0xfd, b'\n']).unwrap();
+
+        // Regression: external output containing NUL/invalid UTF-8 must survive
+        // the lossy decoder and reach styled cells instead of panicking.
+        let lines = capture(
+            &GitLoc::Local(dir.path().to_path_buf()),
+            "HEAD",
+            Some("binary.dat"),
+            "cat \"$5\" #",
+            &CaptureOpts::default(),
+        )
+        .unwrap();
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.iter().map(|run| run.text.as_str()))
+            .collect();
+        assert!(
+            text.contains('\u{fffd}'),
+            "invalid bytes were not lossy-decoded"
+        );
+    }
+
+    #[test]
+    fn large_structural_output_retains_the_full_below_cap_length() {
+        if !shell_available() {
+            return;
+        }
+        // Regression: an accidental smaller stdout cap must not truncate a
+        // valid structural diff before the documented 8 MiB ceiling.
+        let lines = capture_with("yes x | head -c 6291456 #", Duration::from_secs(10)).unwrap();
+        let length: usize = lines
+            .iter()
+            .flat_map(|line| line.iter())
+            .map(|run| run.text.len())
+            .sum();
+        assert_eq!(length, 6 * 1024 * 1024);
+    }
+
+    #[test]
+    fn stderr_flood_is_drained_while_stdout_is_collected() {
+        if !shell_available() {
+            return;
+        }
+        // Regression: reading stdout to completion before stderr deadlocks when
+        // stderr exceeds the operating system pipe capacity.
+        let start = Instant::now();
+        let lines = capture_with(
+            "head -c 2097152 /dev/zero | tr '\\000' e >&2; echo ok #",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(lines[0][0].text, "ok");
+    }
+
+    #[test]
+    fn structural_diff_has_only_read_only_callers_and_owns_external_diff_env() {
+        let implementation = include_str!("structural_diff.rs");
+        let actions = include_str!("actions.rs");
+        let cli = include_str!("cmd/diff.rs");
+        let staging = [
+            include_str!("gitmut.rs"),
+            include_str!("panel/staging.rs"),
+            include_str!("panel/gitui.rs"),
+        ];
+
+        assert!(implementation.contains("GIT_EXTERNAL_DIFF"));
+        assert!(!actions.contains("GIT_EXTERNAL_DIFF"));
+        assert!(!cli.contains("GIT_EXTERNAL_DIFF"));
+        assert!(
+            staging
+                .iter()
+                .all(|source| !source.contains("GIT_EXTERNAL_DIFF"))
+        );
+        assert!(actions.contains("structural_diff::capture"));
+        assert_eq!(actions.matches("structural_diff::capture").count(), 1);
+        assert!(actions.contains("fn spawn_diff_view_fetch("));
+        assert!(!cli.contains("structural_diff::capture"));
+        assert!(
+            !staging
+                .iter()
+                .any(|source| source.contains("structural_diff::capture"))
+        );
+        assert!(cli.contains("structural_diff::run_cli"));
+        assert_eq!(cli.matches("structural_diff::run_cli").count(), 1);
+        assert!(!actions.contains("structural_diff::run_cli"));
+        assert!(
+            !staging
+                .iter()
+                .any(|source| source.contains("structural_diff::run_cli"))
+        );
+    }
 }

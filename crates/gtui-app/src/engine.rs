@@ -1388,4 +1388,130 @@ mod tests {
             drop(cmd);
         }
     }
+
+    struct LiveQueryGuard {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        hung_active: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    }
+
+    impl LiveQueryGuard {
+        fn new(
+            active: Arc<std::sync::atomic::AtomicUsize>,
+            peak: &std::sync::atomic::AtomicUsize,
+            hung_active: Option<Arc<std::sync::atomic::AtomicUsize>>,
+            hung_peak: &std::sync::atomic::AtomicUsize,
+        ) -> Self {
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            if let Some(hung) = &hung_active {
+                let now = hung.fetch_add(1, Ordering::SeqCst) + 1;
+                hung_peak.fetch_max(now, Ordering::SeqCst);
+            }
+            Self {
+                active,
+                hung_active,
+            }
+        }
+    }
+
+    impl Drop for LiveQueryGuard {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            if let Some(hung) = &self.hung_active {
+                hung.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    struct SustainedRefreshSource {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+        hung_active: Arc<std::sync::atomic::AtomicUsize>,
+        hung_peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DataSource for SustainedRefreshSource {
+        fn query(
+            &self,
+            queries: Vec<Query>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>, QueryError>> + Send>> {
+            let is_hung = queries[0].expr == "hang";
+            let guard = LiveQueryGuard::new(
+                self.active.clone(),
+                &self.peak,
+                is_hung.then(|| self.hung_active.clone()),
+                &self.hung_peak,
+            );
+            Box::pin(async move {
+                let _guard = guard;
+                if is_hung {
+                    std::future::pending::<()>().await;
+                }
+                Ok(Vec::new())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn sustained_refresh_with_hung_endpoint_stays_bounded() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hung_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hung_peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = Arc::new(SustainedRefreshSource {
+            active,
+            peak: peak.clone(),
+            hung_active,
+            hung_peak: hung_peak.clone(),
+        });
+        let mut panel_dashboard = dashboard(4);
+        panel_dashboard.panels[0].targets[0].expr = "hang".into();
+        for (index, panel) in panel_dashboard.panels.iter_mut().enumerate().skip(1) {
+            panel.targets[0].expr = format!("fast-{index}");
+        }
+        let sources = HashMap::from([("test".to_string(), source as Arc<dyn DataSource>)]);
+        let (cmd, mut updates) = QueryEngine::spawn_with_window(
+            Handle::current(),
+            panel_dashboard,
+            sources,
+            RelativeWindow::new(std::time::Duration::from_secs(60)),
+            Duration::from_secs(3600),
+            Arc::new(Utc::now),
+            Arc::new(|| {}),
+            WakeGate::new(true),
+        );
+        let mut fast_deliveries = [0_usize; 4];
+        let mut peak_queued = 0;
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(1500) {
+            cmd.send(EngineCmd::Requery).unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            peak_queued = peak_queued.max(updates.len());
+            if start.elapsed() >= Duration::from_millis(700) {
+                while let Ok(update) = updates.try_recv() {
+                    if update.panel_id > 0 {
+                        fast_deliveries[update.panel_id as usize] += 1;
+                    }
+                }
+            }
+        }
+        drop(cmd);
+
+        assert!(
+            hung_peak.load(Ordering::SeqCst) <= 1,
+            "refreshes accumulated more than one live hung panel future"
+        );
+        assert!(
+            peak.load(Ordering::SeqCst) <= MAX_CONCURRENT_PANELS,
+            "refreshes exceeded the live panel-query concurrency cap"
+        );
+        assert!(
+            peak_queued <= RESULT_CHANNEL_CAPACITY,
+            "undrained frame queue exceeded its fixed capacity"
+        );
+        assert!(
+            fast_deliveries[1..].iter().all(|count| *count > 1),
+            "fast sibling panels stopped delivering during sustained hung refreshes: {fast_deliveries:?}"
+        );
+    }
 }
