@@ -11,7 +11,17 @@ gracefully across the available container/sandbox runtimes.
 
 ### Requirement: Graceful backend selection
 
-The sandbox SHALL select an isolation backend by preference order podman -> docker -> bwrap -> none, and MUST fall back to the next when a runtime is unavailable. When no backend is runnable, an `auto` selection on a LOCAL placement MUST fall back to `none` (run on the host) only when the user's configured `backend_chain` itself names `host`/`none` (the default chain does); otherwise, and for every explicit backend of a worktree pane, dropped env selection, or non-local placement, the launch MUST halt with an actionable error instead of opening a host shell. `failover = "auto"` MUST NOT authorize host execution. Every fallback MUST be reported truthfully: the containment reported for a launch MUST describe what that launch actually entered, never what was requested.
+The default backend chain SHALL be `podman-rootless` -> `podman-rootful` ->
+`docker` -> `apple` -> `bwrap` -> `jobobject`, with no host fallback, and
+selection MUST fall back to the next backend when a runtime is unavailable.
+An `auto` selection MUST reach the host only when the configured chain names
+`host`/`none` and the floor in force is `off` (sandboxing is disabled,
+`backend = "none"`, the run-on-host pin is set, or `isolation_floor = "off"`).
+When sandboxing is enabled and no floor is configured, the default floor SHALL
+be `shared-kernel` and a miss MUST refuse the launch. `failover = "auto"` MUST
+NOT authorize host execution. Every fallback MUST be reported truthfully: the
+containment reported for a launch MUST describe what that launch actually
+entered, never what was requested.
 
 #### Scenario: Preferred runtime missing
 
@@ -20,10 +30,18 @@ The sandbox SHALL select an isolation backend by preference order podman -> dock
 
 #### Scenario: No runtime available
 
-- **WHEN** none of podman, docker, or bwrap is available and `backend_chain`
-  names `host` (the default)
+- **WHEN** no runtime is available, `backend_chain` names `host`, and
+  `isolation_floor = "off"`
 - **THEN** the process runs with backend `none` on the host and the worktree is
   still usable
+
+#### Scenario: Default floor refuses the host
+
+- **WHEN** no runtime is available and the default configuration has no
+  explicit floor
+- **THEN** the launch is refused under the default `shared-kernel` floor, with
+  the opt-outs named: `isolation_floor = "off"`, `enabled = false`,
+  `backend = "none"`, or run on host
 
 #### Scenario: Chain without host refuses
 
@@ -38,7 +56,8 @@ The sandbox SHALL select an isolation backend by preference order podman -> dock
 
 #### Scenario: Fallback is reported, not hidden
 
-- **WHEN** a terminal tab's explicit backend pick cannot be honoured and the tab degrades to the host
+- **WHEN** an explicit floor has `on_floor_miss = "degrade"` (or the floor is
+  `off`) and a terminal tab's backend pick cannot be honoured
 - **THEN** the launch is labelled `host`, is flagged as degraded, and carries a warning naming the
   backend that was unavailable
 

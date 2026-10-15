@@ -9,9 +9,12 @@ actions: [voice-toggle, voice-cancel]
 
 Voice mode is an experimental, opt-in toggle-to-talk feature. Press `Alt v` to
 start recording from the focused pane, press it again to stop and transcribe,
-or press `Esc`/`Alt V` to cancel and discard the utterance. The transcript is
-inserted into the same pane only while it is still focused. It is pasted
-without a newline and is never auto-submitted.
+or press `Esc`/`Alt V` to cancel and discard the utterance. If focus moved or
+the pane died before transcription finished, the transcript is held in memory
+and the status shows a preview. `Alt v` inserts it into the focused pane;
+`Alt V` discards it. A newer transcript replaces it; it is never saved and a
+config change clears it. Text is pasted without a newline and is never
+auto-submitted.
 Line breaks and control characters in a transcript are inserted as spaces.
 
 thegn ships no microphone integration, audio library, speech-to-text engine,

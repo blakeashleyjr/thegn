@@ -41,7 +41,10 @@ says so; if commit files cannot be read, it reports that state. `E` edits
 (interactive rebase stopping at the commit); bare `e` is always the panel
 width cycle. Rebase `s` (squash), `f` (fixup), and `d` (drop) ask for
 confirmation first; `i` plans from the selected commit and refuses merge
-ranges.
+ranges. `B` marks the selected commit as a rebase base; press it again to
+clear the mark. With a mark, `i` plans the commits after it up to HEAD and
+refuses if the mark is HEAD, is not an ancestor, or is gone (press `B` to
+re-mark). Without a mark, `i` plans from the selected commit.
 
 ### branches
 
@@ -50,18 +53,23 @@ each row. At Normal width, `↵` widens to Half. The selected branch's recent
 commits appear at Half and Full width. `p` pulls and `P` pushes HEAD only;
 both refuse when another row is selected. `n` opens the new-branch name input.
 The menu's pull and push actions also operate on HEAD only.
+With a rebase base marked, `r` rebases the commits after the mark onto the
+selected branch.
 
 ### stash
 
 Apply, pop, and drop stash entries. At Normal width, `↵` widens to Half to
 show the stash diff, including untracked files. It follows the entry by its
 object ID and can be scrolled at both Half and Full widths.
+Apply, pop, and drop act on the selected entry by object ID even if stashes
+were pushed meanwhile; a stash that no longer exists is refused.
 
 ### files
 
 The worktree's file tree; `/` filters it (directories stay while any
 descendant matches; Esc clears), `↵` previews a file inline, `o` pages it
-in bat, `O` opens your editor, `y` reveals it in yazi.
+in bat, `O` opens your editor, `y` reveals it in yazi. An unknown binary
+previews as a hex dump of its first 4096 bytes.
 
 Inside the git-family sections (changes/commits/branches/stash — not
 files), `?` shows that section's own key cheatsheet only after entering row
@@ -130,9 +138,11 @@ merge-queue fold's floor, jj colocation, and any custom merge drivers).
 In a repo colocated with [jujutsu](https://jj-vcs.github.io/) (a `.jj/`
 beside `.git/`), thegn stays out of the way rather than fighting it:
 worktree rows carry a jj marker, detached `HEAD` (jj's normal state) is
-not shown as an error, successful staging and commit actions add a
-status-line note that jj ignores the git index, and background `auto_fetch`
-skips the repo unless
+not shown as an error, and the panel header reads `HEAD (jj working copy)`.
+The Full git view shows a `jj: git index ignored` chip, and the Changes section
+ends with "jj colocated: staging here does not change jj's working copy."
+Successful staging and commit actions add a status-line note that jj ignores
+the git index, and background `auto_fetch` skips the repo unless
 `[git] auto_fetch_colocated = true`. Reads are unchanged; mutations are
 warned about, not blocked.
 
