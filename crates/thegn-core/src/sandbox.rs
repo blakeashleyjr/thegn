@@ -4004,6 +4004,11 @@ pub fn run_gc_detailed(db_worktrees: &[String]) -> GcReport {
         SystemTime::now(),
         SECRET_ENV_FILE_MAX_AGE,
     );
+    crate::sandbox_compose::sweep_stale_label_files_in(
+        &state_home,
+        SystemTime::now(),
+        SECRET_ENV_FILE_MAX_AGE,
+    );
     let mut removed_report = Vec::new();
     let mut unverified_report = Vec::new();
     for backend in Backend::all_oci() {
