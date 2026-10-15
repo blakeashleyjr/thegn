@@ -721,9 +721,29 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     // short of the session's last output.
                     outln!("recording TRUNCATED → {where_} ({reason})");
                 } else if st.recording {
-                    outln!("recording {session} → {where_} ({} bytes)", st.bytes);
+                    if st.dropped_bytes > 0 {
+                        outln!(
+                            "recording {session} → {where_} ({} bytes; {} bytes dropped in gaps; see cast markers)",
+                            st.bytes,
+                            st.dropped_bytes
+                        );
+                    } else {
+                        outln!("recording {session} → {where_} ({} bytes)", st.bytes);
+                    }
                 } else if st.capped {
-                    outln!("recording stopped at size cap → {where_}");
+                    if st.dropped_bytes > 0 {
+                        outln!(
+                            "recording stopped at size cap → {where_} ({} bytes dropped in gaps; see cast markers)",
+                            st.dropped_bytes
+                        );
+                    } else {
+                        outln!("recording stopped at size cap → {where_}");
+                    }
+                } else if st.dropped_bytes > 0 {
+                    outln!(
+                        "recording saved → {where_} ({} bytes dropped in gaps; see cast markers)",
+                        st.dropped_bytes
+                    );
                 } else {
                     outln!(
                         "not recording{}",
