@@ -478,12 +478,12 @@ mod tests {
             .y_bounds([0.0, 10.0])
             .paint(move |ctx| {
                 for pair in times.windows(2).zip(values.windows(2)) {
-                    let ([x1, x2], [y1, y2]) = pair;
+                    let (t, v) = pair;
                     ctx.draw(&Line {
-                        x1: *x1,
-                        y1: *y1,
-                        x2: *x2,
-                        y2: *y2,
+                        x1: t[0],
+                        y1: v[0],
+                        x2: t[1],
+                        y2: v[1],
                         color: colors.series,
                     });
                 }

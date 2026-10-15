@@ -1147,18 +1147,24 @@ mod tests {
     }
 
     #[test]
-    fn light_palette_reaches_running_tile() {
+    fn sync_visibility_delivers_current_palette_theme_once() {
+        let (mut slot, themes, _) = theme_slot();
+        slot.theme_told = Some(u64::MAX);
+        let mut host = AppHost::new(vec![slot]);
+        let expected = kit_theme(&crate::chrome::palette_snapshot());
+
+        host.sync_visibility();
+        assert_eq!(themes.lock().unwrap().as_slice(), &[expected]);
+
+        host.sync_visibility();
+        assert_eq!(themes.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn light_palette_conversion_differs_from_prism() {
         let light = thegn_core::theme::preset("light").expect("light preset exists");
         let expected = kit_theme(&light);
-        let (mut slot, themes, _) = theme_slot();
-        slot.theme_told = Some(1);
-        notify_slot_theme(&mut slot, 2, &mut || expected.clone());
-
-        let delivered = themes.lock().unwrap();
-        assert_eq!(delivered.as_slice(), &[expected.clone()]);
-        assert_eq!(delivered[0].accent, expected.accent);
-        assert_eq!(delivered[0].text, expected.text);
-        assert_ne!(delivered[0], Theme::prism());
+        assert_ne!(expected, Theme::prism());
     }
 
     #[test]
