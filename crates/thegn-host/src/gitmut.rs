@@ -178,13 +178,13 @@ pub enum GitOp {
         message: String,
     },
     StashApply {
-        index: usize,
+        sha: String,
     },
     StashPop {
-        index: usize,
+        sha: String,
     },
     StashDrop {
-        index: usize,
+        sha: String,
     },
     // bisect
     BisectStart {
@@ -633,9 +633,9 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
         GitOp::Fetch => done(g.fetch(loc)),
         GitOp::Nuke => done(g.nuke_working_tree(loc)),
         GitOp::StashPush { message } => done(g.stash_push(loc, &message, true)),
-        GitOp::StashApply { index } => done(g.stash_apply(loc, index)),
-        GitOp::StashPop { index } => done(g.stash_pop(loc, index)),
-        GitOp::StashDrop { index } => done(g.stash_drop(loc, index)),
+        GitOp::StashApply { sha } => done(g.stash_apply(loc, &sha)),
+        GitOp::StashPop { sha } => done(g.stash_pop(loc, &sha)),
+        GitOp::StashDrop { sha } => done(g.stash_drop(loc, &sha)),
         GitOp::BisectStart { bad, good } => {
             match g.bisect_start(loc, bad.as_deref(), good.as_deref()) {
                 Ok(Some(culprit)) => GitOpResult::Culprit(culprit),
@@ -1393,5 +1393,38 @@ timeout_secs = 1
         if let Err(error) = std::fs::remove_dir_all(&dir) {
             tracing::debug!(%error, "custom failure redaction test repo cleanup failed");
         }
+    }
+
+    #[test]
+    fn execute_stash_drop_by_sha_drops_the_selected_stash() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        git_out(dir, &["init", "-q", "-b", "main"]);
+        git_out(dir, &["config", "user.name", "t"]);
+        git_out(dir, &["config", "user.email", "t@e"]);
+        git_out(dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("f.txt"), "base\n").unwrap();
+        git_out(dir, &["add", "f.txt"]);
+        git_out(dir, &["commit", "-q", "-m", "initial"]);
+        let loc = GitLoc::Local(dir.to_path_buf());
+        std::fs::write(dir.join("f.txt"), "stash A\n").unwrap();
+        git_out(dir, &["stash", "push", "-m", "stash A"]);
+        let sha_a = git_out(dir, &["rev-parse", "stash@{0}"]);
+        std::fs::write(dir.join("f.txt"), "stash B\n").unwrap();
+        git_out(dir, &["stash", "push", "-m", "stash B"]);
+        let sha_b = git_out(dir, &["rev-parse", "stash@{0}"]);
+
+        match execute(GitOp::StashDrop { sha: sha_a }, &loc, false) {
+            GitOpResult::Ok(_) => {}
+            other => panic!("expected stash drop success, got {other:?}"),
+        }
+
+        assert_eq!(git_out(dir, &["rev-parse", "stash@{0}"]), sha_b);
+        assert_eq!(
+            git_out(dir, &["stash", "list", "--format=%H"])
+                .lines()
+                .count(),
+            1
+        );
     }
 }

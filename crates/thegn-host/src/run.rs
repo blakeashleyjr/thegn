@@ -4805,22 +4805,23 @@ fn handle_git_msg(
         }
         GitMsg::StashApply => {
             if let Some(s) = sel_stash(panel_ui, model) {
-                enqueue(panel_ui, model, GitOp::StashApply { index: s.index });
+                enqueue(panel_ui, model, GitOp::StashApply { sha: s.sha.clone() });
             }
         }
         GitMsg::StashPop => {
             if let Some(s) = sel_stash(panel_ui, model) {
-                enqueue(panel_ui, model, GitOp::StashPop { index: s.index });
+                enqueue(panel_ui, model, GitOp::StashPop { sha: s.sha.clone() });
             }
         }
         GitMsg::StashDrop => {
             if let Some(s) = sel_stash(panel_ui, model) {
+                let short: String = s.sha.chars().take(7).collect();
                 confirm_git_op(
                     ov,
                     "drop stash?",
-                    format!("drops stash@{{{}}}: {}", s.index, s.message),
+                    format!("drops stash@{{{}}} ({short}): {}", s.index, s.message),
                     true,
-                    GitOp::StashDrop { index: s.index },
+                    GitOp::StashDrop { sha: s.sha.clone() },
                 );
             }
         }
