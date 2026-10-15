@@ -2850,8 +2850,12 @@ enum GitDoc {
     },
     /// The selected stash's patch (`stash show -p -u`), keyed by SHA.
     StashDiff(String, String),
-    /// The selected branch's log, keyed by branch name.
-    BranchLog(String, Vec<crate::panel::CommitRow>),
+    /// The selected branch's log, keyed by its name and observed tip.
+    BranchLog {
+        name: String,
+        tip: String,
+        result: std::result::Result<Vec<crate::panel::CommitRow>, String>,
+    },
 }
 
 fn apply_rebase_doc(
@@ -2948,6 +2952,7 @@ fn spawn_branch_log_fetch(
     generation: u64,
     session: &crate::session::Session,
     name: String,
+    tip: String,
     tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
     waker: &TerminalWaker,
 ) {
@@ -2957,21 +2962,27 @@ fn spawn_branch_log_fetch(
     tokio::task::spawn_blocking(move || {
         use thegn_svc::git::GitBackend;
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-        let rows: Vec<crate::panel::CommitRow> = thegn_svc::git::CliGit
-            .log_commits_ref(&loc, &name, 60)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|c| crate::panel::CommitRow {
-                sha: c.sha,
-                short: c.short,
-                subject: c.subject,
-                author: c.author,
-                date: c.date,
-                refs: c.refs,
-                parents: c.parents,
+        let result = thegn_svc::git::CliGit
+            .log_commits_ref(&loc, &tip, 60)
+            .map(|commits| {
+                commits
+                    .into_iter()
+                    .map(|c| crate::panel::CommitRow {
+                        sha: c.sha,
+                        short: c.short,
+                        subject: c.subject,
+                        author: c.author,
+                        date: c.date,
+                        refs: c.refs,
+                        parents: c.parents,
+                    })
+                    .collect()
             })
-            .collect();
-        if tx.send((generation, GitDoc::BranchLog(name, rows))).is_ok() {
+            .map_err(|error| error.to_string());
+        if tx
+            .send((generation, GitDoc::BranchLog { name, tip, result }))
+            .is_ok()
+        {
             let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
@@ -6719,7 +6730,7 @@ async fn event_loop<T: Terminal>(
     // `(op_gen, key)` of the read that's out, so the per-frame demand check
     // re-kicks on selection change or worktree switch but never duplicates.
     let mut stash_diff_inflight: Option<(u64, String)> = None;
-    let mut branch_log_inflight: Option<(u64, String)> = None;
+    let mut branch_log_inflight: Option<(u64, String, String)> = None;
     let mut commit_show_inflight: Option<(u64, gitui::CommitDetailKey)> = None;
     let mut commit_file_inflight: Option<(u64, String, String)> = None;
     // A computed undo/redo plan awaiting its confirm pick.
@@ -11323,9 +11334,9 @@ async fn event_loop<T: Terminal>(
                     stash_diff_inflight = None;
                     panel_ui.git.stash_diff = Some((sha, text));
                 }
-                GitDoc::BranchLog(name, rows) => {
+                GitDoc::BranchLog { name, tip, result } => {
                     branch_log_inflight = None;
-                    panel_ui.git.branch_log = Some((name, rows));
+                    panel_ui.git.branch_log = Some((name, tip, result));
                 }
             }
             dirty = true;
@@ -15030,17 +15041,17 @@ async fn event_loop<T: Terminal>(
                     spawn_stash_diff_fetch(opgen, &session, sha, &gitdoc_tx, &waker);
                 }
                 if panel_ui.git.focus == GitView::Branches
-                    && let Some(name) =
+                    && let Some((name, tip)) =
                         crate::panel::gitfull::selected_branch(&panel_ui, &model.panel)
                     && panel_ui
                         .git
                         .branch_log
                         .as_ref()
-                        .is_none_or(|(n, _)| *n != name)
-                    && branch_log_inflight.as_ref() != Some(&(opgen, name.clone()))
+                        .is_none_or(|(n, t, _)| *n != name || *t != tip)
+                    && branch_log_inflight.as_ref() != Some(&(opgen, name.clone(), tip.clone()))
                 {
-                    branch_log_inflight = Some((opgen, name.clone()));
-                    spawn_branch_log_fetch(opgen, &session, name, &gitdoc_tx, &waker);
+                    branch_log_inflight = Some((opgen, name.clone(), tip.clone()));
+                    spawn_branch_log_fetch(opgen, &session, name, tip, &gitdoc_tx, &waker);
                 }
                 if panel_ui.git.focus == GitView::Commits
                     && let Some(commit) = sel_commit(&panel_ui, &model)
