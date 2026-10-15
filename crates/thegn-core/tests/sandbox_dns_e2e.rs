@@ -1,8 +1,8 @@
 //! Suite A — DNS filter E2E (Tier 1, no external deps).
 //!
-//! Tests send raw UDP DNS packets to the filter proxy and verify RCODE in the
-//! response. The dns_filter singleton is process-local per integration-test
-//! binary, so the policy set on the first call persists for all tests.
+//! Tests send raw UDP DNS packets to policy-specific filter proxies and verify
+//! RCODE in the response. Allowed queries use a test-owned loopback resolver;
+//! the suite never sends DNS traffic outside the process.
 //!
 //! Policy used here: block "evil.test", allow everything else. Tests acquire a
 //! module-level mutex to prevent ring-buffer contamination between concurrent
@@ -10,21 +10,68 @@
 
 use std::net::UdpSocket;
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use thegn_core::dns_filter::{DnsEvent, DnsPolicy, drain_events, get_or_start};
 
-// ── singleton initialisation ────────────────────────────────────────────────
+// ── shared fixtures ────────────────────────────────────────────────────────
 
 static DNS_PORT: OnceLock<u16> = OnceLock::new();
 static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+struct TestUpstream {
+    addr: std::net::SocketAddr,
+    _thread: JoinHandle<()>,
+}
+
+static UPSTREAM: OnceLock<TestUpstream> = OnceLock::new();
+
+fn upstream_addr() -> std::net::SocketAddr {
+    UPSTREAM
+        .get_or_init(|| {
+            let socket = UdpSocket::bind("127.0.0.1:0").expect("test upstream bind");
+            socket
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .expect("test upstream timeout");
+            let addr = socket.local_addr().expect("test upstream address");
+            let thread = std::thread::spawn(move || {
+                let mut packet = [0u8; 512];
+                loop {
+                    match socket.recv_from(&mut packet) {
+                        Ok((length, source)) => {
+                            if length < 12 {
+                                continue;
+                            }
+                            packet[2] = 0x81;
+                            packet[3] = 0x80;
+                            if socket.send_to(&packet[..length], source).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+            TestUpstream {
+                addr,
+                _thread: thread,
+            }
+        })
+        .addr
+}
 
 fn dns_port() -> u16 {
     *DNS_PORT.get_or_init(|| {
         get_or_start(DnsPolicy {
             block: vec!["evil.test".into()],
             allow: vec![],
-            upstream: None,
+            upstream: Some(upstream_addr()),
         })
         .expect("dns filter start failed")
     })
@@ -144,33 +191,73 @@ fn a2_drain_clears_ring() {
     );
 }
 
-// ── A3: singleton reuse — second get_or_start returns same port ──────────────
+// ── A3: each distinct policy gets its own server ────────────────────────────
 
 #[test]
-fn a3_singleton_reuses_port() {
+fn a3_distinct_policies_get_distinct_servers() {
     let _g = test_lock();
-    // Initialise the singleton through the CANONICAL policy FIRST. Otherwise a3
-    // could win the init race and start the shared per-binary server with a
-    // block-list that omits `evil.test` (the policy of the FIRST `get_or_start`
-    // wins for the whole process), silently making a1/a4 fail — the actual
-    // contention flake this test file had.
+    // Initialise the canonical policy before exercising a distinct policy.
     let canonical = dns_port();
-    let p1 = get_or_start(DnsPolicy {
-        block: vec!["a.test".into()],
-        allow: vec![],
-        upstream: None,
-    });
-    let p2 = get_or_start(DnsPolicy {
+    let policy = DnsPolicy {
         block: vec!["b.test".into()],
         allow: vec![],
-        upstream: None,
-    });
-    assert_eq!(
-        p1,
-        Some(canonical),
-        "get_or_start must reuse the canonical singleton, not start a new one"
+        upstream: Some(upstream_addr()),
+    };
+    let p1 = get_or_start(policy.clone()).expect("first policy server");
+    let p2 = get_or_start(policy).expect("reused policy server");
+    assert_eq!(p1, p2, "the same policy must reuse its server");
+    assert_ne!(
+        p1, canonical,
+        "a distinct policy must get a distinct server"
     );
-    assert_eq!(p1, p2, "second get_or_start must reuse the existing server");
+    let response = query(p1, "b.test").expect("no response from b.test policy");
+    assert_eq!(rcode(&response), 3, "the b.test policy must block b.test");
+    let response = query(canonical, "b.test").expect("no response from canonical policy");
+    assert_eq!(
+        rcode(&response),
+        0,
+        "the canonical policy must allow b.test"
+    );
+    let response = query(p1, "evil.test").expect("no response from b.test policy");
+    assert_eq!(
+        rcode(&response),
+        0,
+        "the b.test policy must allow evil.test"
+    );
+    let response = query(canonical, "evil.test").expect("no response from canonical policy");
+    assert_eq!(
+        rcode(&response),
+        3,
+        "canonical policy must still block evil.test"
+    );
+}
+
+// ── A6: deny-all remains effective after an allow-list policy ────────────────
+
+#[test]
+fn a6_deny_all_after_allow_list_is_honoured() {
+    let _g = test_lock();
+    let allow_port = get_or_start(DnsPolicy {
+        allow: vec!["allowed.test".into()],
+        block: vec![],
+        upstream: Some(upstream_addr()),
+    })
+    .expect("allow-list policy server");
+    let deny_port = get_or_start(DnsPolicy {
+        allow: vec![],
+        block: vec!["*".into()],
+        upstream: Some(upstream_addr()),
+    })
+    .expect("deny-all policy server");
+    assert_ne!(allow_port, deny_port);
+    let response = query(deny_port, "allowed.test").expect("no response from deny-all policy");
+    assert_eq!(rcode(&response), 3, "deny-all policy must return NXDOMAIN");
+    let response = query(allow_port, "allowed.test").expect("no response from allow-list policy");
+    assert_eq!(
+        rcode(&response),
+        0,
+        "allow-list policy must allow allowed.test"
+    );
 }
 
 // ── A4: multiple queries → events captured per query ────────────────────────
@@ -204,13 +291,9 @@ fn a4_multiple_queries_all_logged() {
     );
 }
 
-// ── A5: non-blocked domain — response is NOT NXDOMAIN ───────────────────────
-//
-// Requires an outbound DNS resolver. Skipped in CI when network is unavailable.
-// Run manually: cargo test --test sandbox_dns_e2e -- --include-ignored
+// ── A5: allowed domain — response is NOT NXDOMAIN ──────────────────────────
 
 #[test]
-#[ignore]
 fn a5_allowed_domain_not_nxdomain() {
     let _g = test_lock();
     let port = dns_port();
@@ -219,11 +302,7 @@ fn a5_allowed_domain_not_nxdomain() {
     // QR bit (byte 2 bit 7) should be set (it's a response).
     let qr_set = resp.get(2).copied().unwrap_or(0) & 0x80 != 0;
     assert!(qr_set, "expected a DNS response (QR bit set)");
-    // rcode may be 0 (NOERROR) or something other than NXDOMAIN if the
-    // domain exists — either way, it was forwarded (not immediately blocked).
+    // The test-owned loopback upstream answers with RCODE 0.
     let rc = rcode(&resp);
-    assert_ne!(
-        rc, 3,
-        "allowed domain should not get NXDOMAIN; got rcode={rc}"
-    );
+    assert_eq!(rc, 0, "loopback upstream should answer with NOERROR");
 }
