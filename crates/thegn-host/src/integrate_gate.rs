@@ -6,7 +6,7 @@
 
 #[cfg(test)]
 use super::gate_base_for_repo;
-use super::{GateVerdict, gate_base, tail};
+use super::{GateErrorClass, GatePhase, GateVerdict, gate_base, tail};
 use crate::platform::gate_path::{Directory, Lock, Regular, read_regular};
 use anyhow::{Context, Result, ensure};
 use std::path::{Component, Path, PathBuf};
@@ -1157,6 +1157,8 @@ fn capture_verdict(
                         .map_or_else(|| "signal".into(), |code| code.to_string())
                 ),
                 log,
+                phase: GatePhase::Setup,
+                class: GateErrorClass::SetupFailed,
             },
             false,
         ),
@@ -1170,6 +1172,12 @@ fn capture_verdict(
                 gate::GateClass::Error => GateVerdict::Error {
                     reason: gate::error_reason(status.code(), false).into(),
                     log,
+                    phase: GatePhase::Gate,
+                    class: match status.code() {
+                        Some(126 | 127) => GateErrorClass::Spawn,
+                        None => GateErrorClass::Killed,
+                        _ => GateErrorClass::Capture,
+                    },
                 },
             },
             false,
@@ -1183,11 +1191,54 @@ fn capture_verdict(
                 }
                 .into(),
                 log,
+                phase: if setup {
+                    GatePhase::Setup
+                } else {
+                    GatePhase::Gate
+                },
+                class: GateErrorClass::Timeout,
             },
             false,
         ),
-        Capture::Infrastructure { reason, log } => (GateVerdict::Error { reason, log }, false),
-        Capture::Poisoned { reason, log } => (GateVerdict::Error { reason, log }, true),
+        Capture::SpawnFailed { reason, log } => (
+            GateVerdict::Error {
+                reason,
+                log,
+                phase: if setup {
+                    GatePhase::Setup
+                } else {
+                    GatePhase::Gate
+                },
+                class: GateErrorClass::Spawn,
+            },
+            false,
+        ),
+        Capture::Infrastructure { reason, log } => (
+            GateVerdict::Error {
+                reason,
+                log,
+                phase: if setup {
+                    GatePhase::Setup
+                } else {
+                    GatePhase::Gate
+                },
+                class: GateErrorClass::Capture,
+            },
+            false,
+        ),
+        Capture::Poisoned { reason, log } => (
+            GateVerdict::Error {
+                reason,
+                log,
+                phase: if setup {
+                    GatePhase::Setup
+                } else {
+                    GatePhase::Gate
+                },
+                class: GateErrorClass::Poisoned,
+            },
+            true,
+        ),
     }
 }
 
