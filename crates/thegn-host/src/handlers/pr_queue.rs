@@ -502,6 +502,7 @@ pub(crate) fn drain_msgs(rx: &mut PrqRx, ctx: &mut PrqDrainCtx) {
                         .info_ttl(w.clone(), now, std::time::Duration::from_secs(8));
                 }
                 let total = out.merged.len()
+                    + out.merge_requested.len()
                     + out.auto_merge_armed.len()
                     + out.ready.len()
                     + out.blocked.len()
@@ -511,15 +512,16 @@ pub(crate) fn drain_msgs(rx: &mut PrqRx, ctx: &mut PrqDrainCtx) {
                     "PR queue: nothing to refresh".to_string()
                 } else {
                     format!(
-                        "PR queue: {} merged, {} auto-merge armed, {} ready, {} blocked, {} need a human",
+                        "PR queue: {} merged, {} merge requested, {} auto-merge armed, {} ready, {} blocked, {} need a human",
                         out.merged.len(),
+                        out.merge_requested.len(),
                         out.auto_merge_armed.len(),
                         out.ready.len(),
                         out.blocked.len(),
                         out.needs_human.len()
                     )
                 };
-                if out.needs_human.is_empty() {
+                if out.needs_human.is_empty() && out.merge_requested.is_empty() {
                     ctx.toasts.success(msg, now);
                 } else {
                     ctx.toasts
