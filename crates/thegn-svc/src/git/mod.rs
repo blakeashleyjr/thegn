@@ -72,7 +72,13 @@ const READ_ONLY_CONFIG: &[&str] = &[
     "core.hooksPath=/dev/null",
 ];
 
-fn read_argv<'a>(args: &[&'a str]) -> Vec<&'a str> {
+fn read_argv<'a>(loc: &GitLoc, args: &[&'a str]) -> Vec<&'a str> {
+    // Remote and provider locations run git on the remote host through their
+    // own exec contract, which expects the caller's argv unchanged; the fence
+    // protects the local host's git, so it applies to local locations only.
+    if loc.is_remote() {
+        return args.to_vec();
+    }
     let mut argv: Vec<&'a str> = Vec::with_capacity(READ_ONLY_CONFIG.len() + args.len());
     argv.extend(READ_ONLY_CONFIG.iter().copied());
     argv.extend(args.iter().copied());
@@ -727,7 +733,7 @@ fn run(loc: &GitLoc, args: &[&str]) -> Result<String> {
     if let Some(b) = crate::bridge::for_loc(loc) {
         return run_bridge(&b, loc, args, &[], true);
     }
-    let guarded_args = read_argv(args);
+    let guarded_args = read_argv(loc, args);
     let out = output_bounded(loc.git_command(&guarded_args), args)
         .with_context(|| format!("git {}", args.join(" ")))?;
     if !out.status.success() {
@@ -753,7 +759,7 @@ fn run_status(loc: &GitLoc, args: &[&str]) -> Result<(i32, String)> {
         let r = b.exec_read(&refs, None, &[])?; // read: no-upstream/absent-ref probes
         return Ok((r.exit, r.stdout));
     }
-    let guarded_args = read_argv(args);
+    let guarded_args = read_argv(loc, args);
     let out = output_bounded(loc.git_command(&guarded_args), args)
         .with_context(|| format!("git {}", args.join(" ")))?;
     Ok((
@@ -2665,9 +2671,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn read_argv_leaves_remote_and_provider_argv_bare() {
+        let loc = GitLoc::provider(vec!["sh".into()], "/remote/repo");
+        assert_eq!(
+            read_argv(&loc, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            vec!["rev-parse", "--abbrev-ref", "HEAD"]
+        );
+    }
+
+    #[test]
     fn read_argv_prefixes_guard_and_keeps_args() {
         assert_eq!(
-            read_argv(&["status", "--porcelain=v1"]),
+            read_argv(
+                &GitLoc::Local(std::path::PathBuf::from("/tmp/repo")),
+                &["status", "--porcelain=v1"]
+            ),
             vec![
                 "-c",
                 "core.fsmonitor=false",
