@@ -691,10 +691,10 @@ impl IsolationFloor {
 }
 config_enum! {
     /// `[sandbox] on_floor_miss` — what happens when the resolved launch cannot
-    /// meet [`IsolationFloor`]. `fail` (default) refuses to launch before any
-    /// process spawns on the host (the VPN `on_error = "fail"` precedent).
-    /// `degrade` applies only to an explicitly configured `isolation_floor`; the
-    /// default floor always refuses.
+    /// meet [`IsolationFloor`]. `degrade` (default) applies only to an explicitly
+    /// configured `isolation_floor`; the default floor always refuses. `fail`
+    /// refuses to launch before any process spawns on the host (the VPN
+    /// `on_error = "fail"` precedent).
     pub enum OnFloorMiss: "on_floor_miss" {
         Degrade = "degrade", Fail = "fail",
     } default = Degrade;

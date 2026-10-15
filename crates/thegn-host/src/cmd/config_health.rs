@@ -225,6 +225,11 @@ fn collect_repo(health: &mut ConfigHealth, discovery: &RepoOverlayDiscovery) {
     ) {
         add_warning(health, &candidate.path, warning);
     }
+    for warning in
+        thegn_core::config_repo::repo_overlay_mount_warnings(&candidate.body, candidate.format)
+    {
+        add_warning(health, &candidate.path, warning);
+    }
 }
 
 fn active_profile_path() -> Option<PathBuf> {
@@ -470,6 +475,40 @@ mod tests {
         assert_eq!(health.repo_problems, 1);
         assert!(health.findings().any(|finding| {
             finding.path == unreadable && finding.message.starts_with("cannot read repo overlay:")
+        }));
+    }
+
+    #[test]
+    fn malformed_repo_mount_is_a_path_owned_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay_path = dir.path().join(".thegn.toml");
+        std::fs::write(
+            &overlay_path,
+            "[sandbox]\nmounts = [\"/x:rw:extra\", \"/x:relative:ro\"]\n",
+        )
+        .unwrap();
+
+        let discovery = thegn_core::config_repo::discover_repo_overlay(dir.path());
+        let mut health = ConfigHealth {
+            main_path: dir.path().join("config.toml"),
+            profile_path: None,
+            repo_path: None,
+            main_present: false,
+            findings: Vec::new(),
+            main_problems: 0,
+            profile_problems: 0,
+            repo_problems: 0,
+            warnings: 0,
+        };
+        collect_repo(&mut health, &discovery);
+
+        assert_eq!(health.repo_problems, 0);
+        assert_eq!(health.warnings, 2);
+        assert!(health.findings().all(|finding| {
+            finding.warning
+                && finding.path == overlay_path
+                && finding.message.contains("sandbox.mounts[")
+                && finding.message.contains("entry is ignored")
         }));
     }
 }
