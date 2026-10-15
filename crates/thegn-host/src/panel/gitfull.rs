@@ -241,7 +241,7 @@ fn status_rows(model: &FrameModel, ui: &PanelUi, _focused: bool) -> Vec<PanelRow
         right.push(seg(g2(), format!("{} changed", data.changes.len())));
         right.push(sp(1));
     }
-    let mut l = vec![sp(1), seg(g2(), "1").bold(), sp(1), seg(d(), "STATUS")];
+    let mut l = vec![sp(3), seg(d(), "STATUS")];
     l.extend(flow_chips(&ui.git.flow, data.merge.is_some()));
     if let Some(snapshot) = &data.review_snapshot {
         let unresolved = snapshot
@@ -777,17 +777,27 @@ fn diff_text_rows(text: &str, scroll: usize, body: usize) -> Vec<PanelRow> {
         .collect()
 }
 
-/// The selected stash's `stash@{N}` index (filter-aware) — the loop's
-/// demand-driven stash-diff fetch keys on this, so it MUST mirror
-/// [`stash_region`]'s selection exactly.
-pub(crate) fn selected_stash(ui: &PanelUi, data: &PanelData) -> Option<usize> {
+/// The selected stash's display index and stable SHA (filter-aware) — this
+/// MUST mirror [`stash_region`]'s selection exactly.
+pub(crate) fn selected_stash(ui: &PanelUi, data: &PanelData) -> Option<(usize, String)> {
     let ix = list_indices(ui, data, GitView::Stash);
     let cur = ui
         .git
         .cur
         .get(GitView::Stash)
         .min(ix.len().saturating_sub(1));
-    ix.get(cur).map(|&s| data.stashes[s].index)
+    ix.get(cur)
+        .map(|&s| (data.stashes[s].index, data.stashes[s].sha.clone()))
+}
+
+/// The selected stash SHA when its patch is absent or belongs to another row.
+pub(crate) fn stash_diff_wanted(ui: &PanelUi, data: &PanelData) -> Option<String> {
+    let (_, sha) = selected_stash(ui, data)?;
+    ui.git
+        .stash_diff
+        .as_ref()
+        .is_none_or(|(key, _)| key != &sha)
+        .then_some(sha)
 }
 
 /// The selected branch's name (filter-aware) — the loop's demand-driven
@@ -874,7 +884,7 @@ fn stash_region(data: &PanelData, ui: &PanelUi, avail: usize) -> Vec<PanelRow> {
         PanelRow::plain(Line::segs(vec![seg(d(), s.message.clone())])),
         PanelRow::blank(),
     ];
-    match ui.git.stash_diff.as_ref().filter(|(i, _)| *i == s.index) {
+    match ui.git.stash_diff.as_ref().filter(|(sha, _)| *sha == s.sha) {
         Some((_, text)) => {
             let body = avail.saturating_sub(out.len()).max(1);
             out.extend(diff_text_rows(text, ui.scroll, body));
@@ -2167,5 +2177,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn external_stash_push_invalidates_cached_diff() {
+        let mut model = model();
+        model.panel.stashes[0].sha = "new".into();
+        let mut ui = ui(GitView::Stash);
+        ui.git.stash_diff = Some(("old".into(), "OLD PATCH".into()));
+
+        let stale = all_text(&build_git_full(&model, &ui, 120, 40, true));
+        assert!(!stale.contains("OLD PATCH"), "{stale}");
+        assert!(stale.contains("stash diff"), "{stale}");
+        assert_eq!(stash_diff_wanted(&ui, &model.panel).as_deref(), Some("new"));
+
+        ui.git.stash_diff = Some(("new".into(), "CURRENT PATCH".into()));
+        let current = all_text(&build_git_full(&model, &ui, 120, 40, true));
+        assert!(current.contains("CURRENT PATCH"), "{current}");
+        assert_eq!(stash_diff_wanted(&ui, &model.panel), None);
+    }
+
+    #[test]
+    fn status_strip_has_no_digit() {
+        let rendered = all_text(&build_git_full(
+            &model(),
+            &ui(GitView::Files),
+            120,
+            40,
+            true,
+        ));
+        assert!(!rendered.contains("1 STATUS"), "{rendered}");
+        assert!(rendered.contains("1 FILES"), "{rendered}");
     }
 }

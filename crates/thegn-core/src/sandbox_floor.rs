@@ -20,7 +20,8 @@
 //! the floor and is reported as `provider-managed`, never counted as a tier.
 
 use crate::capabilities::IsolationClass;
-use crate::config::{IsolationFloor, OnFloorMiss};
+use crate::config::{FileAccess, IsolationFloor, OnFloorMiss};
+use crate::sandbox::{Backend, BackendFamily};
 
 /// The outcome of comparing a resolved launch's honest class against the floor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +61,64 @@ impl FloorMiss {
             self.best_available.as_str(),
             self.floor.remedy(),
         )
+    }
+
+    /// An actionable refusal that names both supported floor opt-outs.
+    /// `message()` remains the concise warning used by degrade paths.
+    pub fn refusal(&self) -> String {
+        format!(
+            "{}; to launch anyway set [sandbox] on_floor_miss = \"degrade\" (warn and mark degraded) or isolation_floor = \"off\"",
+            self.message()
+        )
+    }
+}
+
+/// Whether the backend enforces the requested filesystem scope. Host-root
+/// execution and Windows process scoping do not hide narrower file scopes.
+pub fn file_access_enforced(backend: Backend, file_access: FileAccess) -> bool {
+    if matches!(file_access, FileAccess::All | FileAccess::Host) {
+        return true;
+    }
+    !matches!(
+        backend.profile().family,
+        BackendFamily::Systemd
+            | BackendFamily::Host
+            | BackendFamily::WinJobObject
+            | BackendFamily::WinAppContainer
+    )
+}
+
+/// What the enabled launch actually says about its containment boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Containment {
+    Disabled,
+    Uncontained,
+    Contained(IsolationClass),
+    ProviderManaged,
+}
+
+impl Containment {
+    /// Stable machine-readable spelling, including the honest class when
+    /// contained.
+    pub fn as_str(self) -> String {
+        match self {
+            Self::Disabled => "disabled".to_string(),
+            Self::Uncontained => "not-contained".to_string(),
+            Self::Contained(class) => format!("contained:{}", class.as_str()),
+            Self::ProviderManaged => "provider-managed".to_string(),
+        }
+    }
+}
+
+/// Summarize whether the selected class is a genuine boundary.
+pub fn containment_summary(enabled: bool, actual: IsolationClass) -> Containment {
+    if !enabled {
+        return Containment::Disabled;
+    }
+    match actual {
+        IsolationClass::HostProcess => Containment::Uncontained,
+        IsolationClass::ProviderManaged => Containment::ProviderManaged,
+        class => Containment::Contained(class),
     }
 }
 
@@ -237,6 +296,95 @@ pub fn agent_task_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_access_enforced_table_covers_each_backend_and_scope() {
+        let scopes = [
+            FileAccess::Worktree,
+            FileAccess::WorktreePlusCaches,
+            FileAccess::Custom,
+            FileAccess::All,
+            FileAccess::Host,
+            FileAccess::None,
+        ];
+        for backend in Backend::ALL {
+            for scope in scopes {
+                let expected = match scope {
+                    FileAccess::All | FileAccess::Host => true,
+                    FileAccess::Worktree
+                    | FileAccess::WorktreePlusCaches
+                    | FileAccess::Custom
+                    | FileAccess::None => !matches!(
+                        backend,
+                        Backend::Systemd
+                            | Backend::None
+                            | Backend::WinJobObject
+                            | Backend::WinAppContainer
+                    ),
+                };
+                assert_eq!(
+                    file_access_enforced(backend, scope),
+                    expected,
+                    "{backend:?} / {scope:?}"
+                );
+            }
+        }
+        assert!(!file_access_enforced(
+            Backend::Systemd,
+            FileAccess::Worktree
+        ));
+        assert!(file_access_enforced(Backend::Bwrap, FileAccess::Worktree));
+        assert!(!file_access_enforced(Backend::None, FileAccess::Worktree));
+        assert!(file_access_enforced(Backend::Podman, FileAccess::None));
+        assert!(!file_access_enforced(
+            Backend::WinJobObject,
+            FileAccess::Worktree
+        ));
+    }
+
+    #[test]
+    fn containment_summary_cases() {
+        assert_eq!(
+            containment_summary(false, IsolationClass::SharedKernel),
+            Containment::Disabled
+        );
+        assert_eq!(Containment::Disabled.as_str(), "disabled");
+        assert_eq!(
+            containment_summary(true, IsolationClass::HostProcess),
+            Containment::Uncontained
+        );
+        assert_eq!(Containment::Uncontained.as_str(), "not-contained");
+        assert_eq!(
+            containment_summary(true, IsolationClass::SharedKernel),
+            Containment::Contained(IsolationClass::SharedKernel)
+        );
+        assert_eq!(
+            containment_summary(true, IsolationClass::ProviderManaged),
+            Containment::ProviderManaged
+        );
+        assert_eq!(Containment::ProviderManaged.as_str(), "provider-managed");
+        assert_eq!(
+            Containment::Contained(IsolationClass::GuestKernel).as_str(),
+            "contained:guest-kernel"
+        );
+    }
+
+    #[test]
+    fn refusal_names_both_opt_outs_and_preserves_message() {
+        let FloorDecision::Fail(miss) = decide(
+            IsolationFloor::SharedKernel,
+            OnFloorMiss::Fail,
+            IsolationClass::HostProcess,
+            IsolationClass::HostProcess,
+        ) else {
+            panic!("expected floor miss");
+        };
+        let refusal = miss.refusal();
+        let message = miss.message();
+        assert!(refusal.contains(message.as_str()));
+        assert!(refusal.contains("on_floor_miss = \"degrade\""));
+        assert!(refusal.contains("isolation_floor = \"off\""));
+    }
 
     #[test]
     fn no_floor_is_always_met() {

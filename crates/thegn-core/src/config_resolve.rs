@@ -1182,12 +1182,6 @@ pub fn resolve_repo_sandbox(
     }
 }
 
-/// Resolve the full execution [`Environment`], honouring `approvals`. Env-name
-/// precedence (most specific wins): `selected` → repo `.thegn.*` `env =` → the
-/// branch-aware global default (`[sandbox] main_env` on the repo's primary
-/// branch, else `default_env`) → implicit `"default"`. The named-env overlay is
-/// trusted (globally defined) and applies unclamped on top of the clamped repo
-/// base.
 /// Whether a resolved env should default its sandbox backend to `none` because
 /// the *placement itself* is the isolation boundary. A managed sandbox (provider
 /// microVM / k8s pod) brings its own isolation, so unless the env EXPLICITLY opts
@@ -1251,6 +1245,259 @@ fn worktree_on_primary_branch(repo_root: &Path, worktree: &Path, loc: &GitLoc) -
     branch.trim() == crate::worktree::default_branch(repo_root).trim()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvPick {
+    Selected,
+    RepoHint,
+    Default,
+    Implicit,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum HintRule {
+    Forbidden,
+    Floor,
+    AllowList,
+    BlockList,
+    AddedList,
+    Limits,
+    Opaque,
+    Neutral,
+}
+
+// Keep every serialized SandboxConfig key classified here. Repo hints are
+// checked after the named env overlay, while these rules describe whether that
+// result can safely sit on top of the already-clamped base.
+const HINT_FIELDS: &[(&str, HintRule)] = &[
+    ("enabled", HintRule::Floor),
+    ("backend", HintRule::Forbidden),
+    ("default_backend", HintRule::Forbidden),
+    ("default_env", HintRule::Neutral),
+    ("main_env", HintRule::Neutral),
+    ("backend_chain", HintRule::Forbidden),
+    ("devcontainer", HintRule::Floor),
+    ("image", HintRule::Opaque),
+    ("profile", HintRule::Floor),
+    ("network", HintRule::Floor),
+    ("file_access", HintRule::Floor),
+    ("ports", HintRule::AddedList),
+    ("gpu", HintRule::Opaque),
+    ("limits", HintRule::Limits),
+    ("volumes", HintRule::AddedList),
+    ("compose", HintRule::Opaque),
+    ("env_passthrough", HintRule::AddedList),
+    ("auto_caches", HintRule::Opaque),
+    ("compiler_cache", HintRule::Opaque),
+    ("mounts", HintRule::AddedList),
+    ("init_script", HintRule::Opaque),
+    ("prepare", HintRule::Neutral),
+    ("warm_direnv", HintRule::Neutral),
+    ("devenv", HintRule::Neutral),
+    ("inject_devshell", HintRule::Neutral),
+    ("devshell", HintRule::Neutral),
+    ("nix_daemon", HintRule::Opaque),
+    ("shell", HintRule::Neutral),
+    ("on_missing", HintRule::Floor),
+    ("failover", HintRule::Opaque),
+    ("on_dormant", HintRule::Floor),
+    ("oci_host", HintRule::Opaque),
+    ("oci_runtime", HintRule::Opaque),
+    ("isolation_floor", HintRule::Floor),
+    ("on_floor_miss", HintRule::Floor),
+    ("remote", HintRule::Opaque),
+    ("network_allow", HintRule::AllowList),
+    ("network_block", HintRule::BlockList),
+    ("network_audit", HintRule::Neutral),
+    ("vpn", HintRule::Opaque),
+    ("home", HintRule::Opaque),
+];
+
+fn limit_is_not_raised(
+    base: &Option<String>,
+    hinted: &Option<String>,
+    parse: fn(&str) -> Option<u64>,
+) -> bool {
+    match (base.as_deref(), hinted.as_deref()) {
+        (None, None) => true,
+        (None, Some(hinted)) => parse(hinted).is_some(),
+        (Some(_), None) => false,
+        (Some(base), Some(hinted)) if base == hinted => true,
+        (Some(base), Some(hinted)) => match (parse(base), parse(hinted)) {
+            (Some(base), Some(hinted)) => hinted <= base,
+            _ => false,
+        },
+    }
+}
+
+fn serialized_field_changed<T: serde::Serialize>(base: &T, hinted: &T) -> bool {
+    match (serde_json::to_value(base), serde_json::to_value(hinted)) {
+        (Ok(base), Ok(hinted)) => base != hinted,
+        _ => true,
+    }
+}
+
+fn hint_field_key(field: &str) -> &'static str {
+    match field {
+        "enabled" => "sandbox.enabled",
+        "backend" => "sandbox.backend",
+        "default_backend" => "sandbox.default_backend",
+        "backend_chain" => "sandbox.backend_chain",
+        "default_env" => "sandbox.default_env",
+        "main_env" => "sandbox.main_env",
+        "devcontainer" => "sandbox.devcontainer",
+        "image" => "sandbox.image",
+        "profile" => "sandbox.profile",
+        "network" => "sandbox.network",
+        "file_access" => "sandbox.file_access",
+        "ports" => "sandbox.ports",
+        "gpu" => "sandbox.gpu",
+        "limits" => "sandbox.limits",
+        "volumes" => "sandbox.volumes",
+        "compose" => "sandbox.compose",
+        "env_passthrough" => "sandbox.env_passthrough",
+        "auto_caches" => "sandbox.auto_caches",
+        "compiler_cache" => "sandbox.compiler_cache",
+        "mounts" => "sandbox.mounts",
+        "init_script" => "sandbox.init_script",
+        "prepare" => "sandbox.prepare",
+        "warm_direnv" => "sandbox.warm_direnv",
+        "devenv" => "sandbox.devenv",
+        "inject_devshell" => "sandbox.inject_devshell",
+        "devshell" => "sandbox.devshell",
+        "nix_daemon" => "sandbox.nix_daemon",
+        "shell" => "sandbox.shell",
+        "on_missing" => "sandbox.on_missing",
+        "failover" => "sandbox.failover",
+        "on_dormant" => "sandbox.on_dormant",
+        "oci_host" => "sandbox.oci_host",
+        "oci_runtime" => "sandbox.oci_runtime",
+        "isolation_floor" => "sandbox.isolation_floor",
+        "on_floor_miss" => "sandbox.on_floor_miss",
+        "remote" => "sandbox.remote",
+        "network_allow" => "sandbox.network_allow",
+        "network_block" => "sandbox.network_block",
+        "network_audit" => "sandbox.network_audit",
+        "vpn" => "sandbox.vpn",
+        "home" => "sandbox.home",
+        _ => "sandbox",
+    }
+}
+
+fn repo_hint_weakens(
+    base: &SandboxConfig,
+    hinted: &SandboxConfig,
+    hinted_placement_is_local: bool,
+) -> Option<&'static str> {
+    if !hinted_placement_is_local {
+        return Some("placement");
+    }
+    for (field, rule) in HINT_FIELDS {
+        let weakens = match rule {
+            HintRule::Forbidden => match *field {
+                "backend" => base.backend != hinted.backend,
+                "default_backend" => base.default_backend != hinted.default_backend,
+                "backend_chain" => base.backend_chain != hinted.backend_chain,
+                _ => false,
+            },
+            HintRule::Floor => match *field {
+                "enabled" => base.enabled && !hinted.enabled,
+                "profile" => profile_rank(hinted.profile) < profile_rank(base.profile),
+                "network" => network_rank(hinted.network) < network_rank(base.network),
+                "file_access" => !matches!(
+                    file_access_cmp(hinted.file_access, base.file_access),
+                    Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
+                ),
+                "devcontainer" => {
+                    base.devcontainer == crate::config::DevcontainerMode::Off
+                        && hinted.devcontainer == crate::config::DevcontainerMode::Auto
+                }
+                "on_missing" => {
+                    on_missing_rank(hinted.on_missing) < on_missing_rank(base.on_missing)
+                }
+                "on_dormant" => {
+                    on_dormant_rank(hinted.on_dormant) < on_dormant_rank(base.on_dormant)
+                }
+                "isolation_floor" => {
+                    isolation_floor_rank(hinted.isolation_floor)
+                        < isolation_floor_rank(base.isolation_floor)
+                }
+                "on_floor_miss" => {
+                    on_floor_miss_rank(hinted.on_floor_miss)
+                        < on_floor_miss_rank(base.on_floor_miss)
+                }
+                _ => false,
+            },
+            HintRule::AllowList => hinted
+                .network_allow
+                .iter()
+                .any(|entry| !allow_entry_covered(entry, &base.network_allow)),
+            HintRule::BlockList => base
+                .network_block
+                .iter()
+                .any(|entry| !hinted.network_block.contains(entry)),
+            HintRule::AddedList => match *field {
+                "ports" => hinted.ports.iter().any(|entry| !base.ports.contains(entry)),
+                "volumes" => hinted
+                    .volumes
+                    .iter()
+                    .any(|(key, value)| base.volumes.get(key) != Some(value)),
+                "mounts" => hinted
+                    .mounts
+                    .iter()
+                    .any(|entry| !base.mounts.contains(entry)),
+                "env_passthrough" => hinted
+                    .env_passthrough
+                    .iter()
+                    .any(|entry| !base.env_passthrough.contains(entry)),
+                _ => false,
+            },
+            HintRule::Limits => {
+                !limit_is_not_raised(&base.limits.cpu, &hinted.limits.cpu, parse_cpu_millis)
+                    || !limit_is_not_raised(&base.limits.memory, &hinted.limits.memory, parse_bytes)
+                    || !limit_is_not_raised(
+                        &base.limits.cpu_total,
+                        &hinted.limits.cpu_total,
+                        parse_cpu_millis,
+                    )
+                    || (base.limits.cpu_total.is_none() && hinted.limits.cpu_total.is_some())
+                    || !limit_is_not_raised(
+                        &base.limits.memory_total,
+                        &hinted.limits.memory_total,
+                        parse_bytes,
+                    )
+            }
+            HintRule::Opaque => match *field {
+                "image" => base.image != hinted.image,
+                "gpu" => base.gpu != hinted.gpu,
+                "compose" => base.compose != hinted.compose,
+                "auto_caches" => !base.auto_caches && hinted.auto_caches,
+                "compiler_cache" => base.compiler_cache != hinted.compiler_cache,
+                "init_script" => base.init_script != hinted.init_script,
+                "nix_daemon" => base.nix_daemon != hinted.nix_daemon,
+                "failover" => base.failover != hinted.failover,
+                "oci_host" => base.oci_host != hinted.oci_host,
+                "oci_runtime" => base.oci_runtime != hinted.oci_runtime,
+                "remote" => serialized_field_changed(&base.remote, &hinted.remote),
+                "vpn" => serialized_field_changed(&base.vpn, &hinted.vpn),
+                "home" => serialized_field_changed(&base.home, &hinted.home),
+                _ => false,
+            },
+            HintRule::Neutral => false,
+        };
+        if weakens {
+            return Some(hint_field_key(field));
+        }
+    }
+    None
+}
+
+/// Resolve the full execution [`Environment`], honouring `approvals`. Env-name
+/// precedence (most specific wins): `selected` → repo `.thegn.*` `env =` → the
+/// branch-aware global default (`[sandbox] main_env` on the repo's primary
+/// branch, else `default_env`) → implicit `"default"`. A repo `env =` is a
+/// hint, honoured only when it does not weaken the clamped base; otherwise the
+/// default env applies and a clamp event is recorded. The named-env overlay is
+/// user-configured and applies on top of the clamped repo base.
 pub fn resolve_environment(
     cfg: &Config,
     repo_root: &Path,
@@ -1259,7 +1506,7 @@ pub fn resolve_environment(
     selected: Option<&str>,
     approvals: &Approvals,
 ) -> (Environment, ResolvedRepoSandbox) {
-    let resolved = resolve_repo_sandbox(cfg, repo_root, approvals);
+    let mut resolved = resolve_repo_sandbox(cfg, repo_root, approvals);
     let base = resolved.sandbox.clone();
     let pick = |s: &str| {
         let t = s.trim();
@@ -1280,13 +1527,17 @@ pub fn resolve_environment(
         && worktree_on_primary_branch(repo_root, worktree, loc);
     let on_primary = worktree_uses_main_env(&base.main_env, is_root_checkout, on_primary_branch);
     let default_env = pick_default_env(&base.main_env, &base.default_env, on_primary);
-    let name = selected
-        .and_then(pick)
-        .or_else(|| pick(&cfg.repo_env_name(repo_root)))
-        .or_else(|| pick(&default_env))
-        .unwrap_or_else(|| "default".to_string());
+    let (name, source) = if let Some(name) = selected.and_then(pick) {
+        (name, EnvPick::Selected)
+    } else if let Some(name) = pick(&cfg.repo_env_name(repo_root)) {
+        (name, EnvPick::RepoHint)
+    } else if let Some(name) = pick(&default_env) {
+        (name, EnvPick::Default)
+    } else {
+        ("default".to_string(), EnvPick::Implicit)
+    };
 
-    let env = match cfg.env.get(&name) {
+    let resolve_named = |name: String| match cfg.env.get(&name) {
         None => {
             // Two cases share the Local fallback but must NOT be conflated:
             //   * `name == "default"` — nothing was selected. The implicit env;
@@ -1309,13 +1560,13 @@ pub fn resolve_environment(
             Environment {
                 name: if unresolved { name } else { "default".into() },
                 placement: crate::sandbox::placement_from_loc(&base, loc),
-                sandbox: base,
+                sandbox: base.clone(),
                 data,
                 unresolved_selection: unresolved,
             }
         }
         Some(envc) => {
-            let mut sb = base;
+            let mut sb = base.clone();
             let env_set_backend = envc.sandbox.backend.is_some();
             envc.sandbox.clone().apply(&mut sb);
             let mut placement =
@@ -1344,6 +1595,27 @@ pub fn resolve_environment(
                 unresolved_selection: false,
             }
         }
+    };
+    let env = resolve_named(name.clone());
+    let env = if source == EnvPick::RepoHint
+        && Some(&name) != pick(&default_env).as_ref()
+        && cfg.env.contains_key(&name)
+        && let Some(key) = repo_hint_weakens(&base, &env.sandbox, env.placement.is_local())
+    {
+        let reason = format!(
+            "repo env `{name}` would weaken {key}; ignored — select it for this worktree explicitly, or grant it in your own config"
+        );
+        resolved.events.push(ClampEvent::deny(
+            TrustLevel::Repo,
+            "env",
+            RepoFieldRule::Forbidden,
+            json!(name),
+            reason.clone(),
+        ));
+        crate::config::config_warn(&reason);
+        resolve_named(pick(&default_env).unwrap_or_else(|| "default".to_string()))
+    } else {
+        env
     };
     (env, resolved)
 }
@@ -2408,5 +2680,242 @@ mod tests {
         assert_eq!(TrustLevel::Workspace.as_str(), "workspace");
         assert_eq!(TrustLevel::Repo.as_str(), "repo");
         assert_eq!(TrustLevel::Runtime.as_str(), "runtime");
+    }
+
+    fn sandbox_with_overlay(base: &SandboxConfig, source: &str) -> SandboxConfig {
+        let overlay: SandboxOverlay = toml::from_str(source).unwrap();
+        let mut sandbox = base.clone();
+        overlay.apply(&mut sandbox);
+        sandbox
+    }
+
+    fn repo_env_fixture(config: &str, hint: &str) -> (tempfile::TempDir, Config) {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join(".thegn.toml"), format!("env = {hint:?}\n")).unwrap();
+        (repo, toml::from_str(config).unwrap())
+    }
+
+    fn resolve_fixture(
+        repo: &Path,
+        cfg: &Config,
+        selected: Option<&str>,
+    ) -> (Environment, ResolvedRepoSandbox) {
+        let loc = GitLoc::Local(repo.to_path_buf());
+        resolve_environment(cfg, repo, &loc, repo, selected, &Approvals::deny_all())
+    }
+
+    #[test]
+    fn repo_env_hint_cannot_weaken_sealed_global() {
+        let config = r#"
+            [sandbox]
+            enabled = true
+            backend = "auto"
+            backend_chain = ["podman"]
+            profile = "sealed"
+            network = "none"
+            isolation_floor = "shared-kernel"
+            on_floor_miss = "fail"
+            [env.hostdev]
+            placement = "local"
+            [env.hostdev.sandbox]
+            backend = "none"
+            profile = "open"
+            network = "host"
+            isolation_floor = "off"
+            on_floor_miss = "degrade"
+        "#;
+        let (repo, cfg) = repo_env_fixture(config, "hostdev");
+        let (env, resolved) = resolve_fixture(repo.path(), &cfg, None);
+        assert_eq!(env.name, "default");
+        assert_eq!(env.sandbox.profile, crate::config::SandboxProfile::Sealed);
+        assert_eq!(env.sandbox.network, crate::config::Network::None);
+        assert_eq!(
+            env.sandbox.isolation_floor,
+            crate::config::IsolationFloor::SharedKernel
+        );
+        assert_eq!(env.sandbox.on_floor_miss, crate::config::OnFloorMiss::Fail);
+        let event = resolved
+            .events
+            .iter()
+            .find(|event| event.key == "env" && event.rule == RepoFieldRule::Forbidden)
+            .unwrap();
+        assert!(event.reason.contains("hostdev"));
+        assert!(event.reason.contains("sandbox.backend"));
+        assert!(
+            event
+                .reason
+                .contains("select it for this worktree explicitly")
+        );
+    }
+
+    #[test]
+    fn repo_env_hint_changing_placement_is_ignored() {
+        let (repo, cfg) = repo_env_fixture(
+            r#"
+                [sandbox]
+                isolation_floor = "off"
+                on_floor_miss = "degrade"
+                backend_chain = ["podman"]
+                [env.box]
+                placement = "ssh"
+            "#,
+            "box",
+        );
+        let (env, resolved) = resolve_fixture(repo.path(), &cfg, None);
+        assert_ne!(env.name, "box");
+        assert!(resolved.events.iter().any(|event| event.key == "env"));
+    }
+
+    #[test]
+    fn repo_env_hint_changing_backend_is_ignored() {
+        let (repo, cfg) = repo_env_fixture(
+            r#"
+                [sandbox]
+                isolation_floor = "off"
+                on_floor_miss = "degrade"
+                backend = "auto"
+                backend_chain = ["podman"]
+                [env.box.sandbox]
+                backend = "none"
+            "#,
+            "box",
+        );
+        let (env, resolved) = resolve_fixture(repo.path(), &cfg, None);
+        assert_ne!(env.name, "box");
+        assert!(resolved.events.iter().any(|event| event.key == "env"));
+    }
+
+    #[test]
+    fn repo_env_hint_that_only_narrows_is_honoured() {
+        let (repo, cfg) = repo_env_fixture(
+            r#"
+                [sandbox]
+                network = "nat"
+                isolation_floor = "off"
+                on_floor_miss = "degrade"
+                backend_chain = ["podman"]
+                [env.box.sandbox]
+                network = "none"
+            "#,
+            "box",
+        );
+        let (env, resolved) = resolve_fixture(repo.path(), &cfg, None);
+        assert_eq!(env.name, "box");
+        assert_eq!(env.sandbox.network, crate::config::Network::None);
+        assert!(!resolved.events.iter().any(|event| event.key == "env"));
+    }
+
+    #[test]
+    fn explicit_selected_weaker_env_still_applies() {
+        let (repo, cfg) = repo_env_fixture(
+            r#"
+                [sandbox]
+                profile = "sealed"
+                isolation_floor = "shared-kernel"
+                on_floor_miss = "fail"
+                backend_chain = ["podman"]
+                [env.hostdev.sandbox]
+                profile = "open"
+            "#,
+            "unselected",
+        );
+        let (env, _) = resolve_fixture(repo.path(), &cfg, Some("hostdev"));
+        assert_eq!(env.name, "hostdev");
+        assert_eq!(env.sandbox.profile, crate::config::SandboxProfile::Open);
+    }
+
+    #[test]
+    fn repo_hint_matching_default_env_is_user_selected() {
+        let (repo, cfg) = repo_env_fixture(
+            r#"
+                [sandbox]
+                default_env = "hostdev"
+                profile = "sealed"
+                isolation_floor = "shared-kernel"
+                on_floor_miss = "fail"
+                backend_chain = ["podman"]
+                [env.hostdev.sandbox]
+                profile = "open"
+            "#,
+            "hostdev",
+        );
+        let (env, resolved) = resolve_fixture(repo.path(), &cfg, None);
+        assert_eq!(env.name, "hostdev");
+        assert_eq!(env.sandbox.profile, crate::config::SandboxProfile::Open);
+        assert!(!resolved.events.iter().any(|event| event.key == "env"));
+    }
+
+    #[test]
+    fn repo_hint_weakens_each_dimension() {
+        let defaults = SandboxConfig::default();
+        let base = sandbox_with_overlay(
+            &defaults,
+            "devcontainer = 'off'\nnetwork_allow = ['*.example.com']\nnetwork_block = ['blocked.example']\nauto_caches = false\nisolation_floor = 'shared-kernel'\non_floor_miss = 'fail'\non_missing = 'fail'\nlimits.cpu = '2'",
+        );
+        let cases = [
+            ("backend = 'none'", "sandbox.backend"),
+            ("default_backend = 'none'", "sandbox.default_backend"),
+            ("backend_chain = ['none']", "sandbox.backend_chain"),
+            ("enabled = false", "sandbox.enabled"),
+            ("profile = 'open'", "sandbox.profile"),
+            ("network = 'host'", "sandbox.network"),
+            ("isolation_floor = 'off'", "sandbox.isolation_floor"),
+            ("on_floor_miss = 'degrade'", "sandbox.on_floor_miss"),
+            ("on_missing = 'warn'", "sandbox.on_missing"),
+            ("on_dormant = 'host'", "sandbox.on_dormant"),
+            ("file_access = 'host'", "sandbox.file_access"),
+            ("devcontainer = 'auto'", "sandbox.devcontainer"),
+            ("network_allow = ['evil.test']", "sandbox.network_allow"),
+            ("network_block = []", "sandbox.network_block"),
+            ("ports = ['8080:8080']", "sandbox.ports"),
+            ("volumes = { cache = '/cache' }", "sandbox.volumes"),
+            ("mounts = ['/tmp:/tmp:rw']", "sandbox.mounts"),
+            ("env_passthrough = ['SECRET']", "sandbox.env_passthrough"),
+            ("limits.cpu = '4'", "sandbox.limits"),
+            ("limits.cpu_total = '64'", "sandbox.limits"),
+            ("limits.cpu = 'lots'", "sandbox.limits"),
+            ("image = 'custom'", "sandbox.image"),
+            ("init_script = 'true'", "sandbox.init_script"),
+            ("compose = 'compose.yml'", "sandbox.compose"),
+            ("gpu = 'nvidia'", "sandbox.gpu"),
+            ("nix_daemon = true", "sandbox.nix_daemon"),
+            ("vpn.provider = 'tailscale'", "sandbox.vpn"),
+            ("home.tools = ['fd']", "sandbox.home"),
+            ("remote.host = 'box'", "sandbox.remote"),
+            ("auto_caches = true", "sandbox.auto_caches"),
+            ("compiler_cache = 'auto'", "sandbox.compiler_cache"),
+        ];
+        for (source, expected) in cases {
+            let hinted = sandbox_with_overlay(&base, source);
+            assert_eq!(
+                repo_hint_weakens(&base, &hinted, true),
+                Some(expected),
+                "{source}"
+            );
+        }
+        let no_limits = sandbox_with_overlay(&base, "limits = {}");
+        assert_eq!(
+            repo_hint_weakens(&base, &no_limits, true),
+            Some("sandbox.limits")
+        );
+        assert_eq!(repo_hint_weakens(&base, &base, false), Some("placement"));
+        let neutral = sandbox_with_overlay(
+            &base,
+            "default_env = 'local'\nmain_env = 'local'\nnetwork_audit = true\nprepare = ['true']\nwarm_direnv = 'auto'\ndevenv = true\ninject_devshell = false\ndevshell = 'sandbox'\nshell = 'bash'",
+        );
+        assert_eq!(repo_hint_weakens(&base, &neutral, true), None);
+    }
+
+    #[test]
+    fn repo_hint_fields_cover_every_sandbox_key() {
+        let value = serde_json::to_value(SandboxConfig::default()).unwrap();
+        let keys = value.as_object().unwrap();
+        for key in keys.keys() {
+            assert!(
+                HINT_FIELDS.iter().any(|(field, _)| *field == key.as_str()),
+                "unclassified SandboxConfig key: {key}"
+            );
+        }
+        assert_eq!(keys.len(), HINT_FIELDS.len());
     }
 }

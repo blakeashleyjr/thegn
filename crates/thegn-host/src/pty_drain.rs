@@ -652,11 +652,12 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8], admit_generation: bo
         .map(|(gi, _, _)| {
             let worktree = ctx.session.worktrees[gi].path.clone();
             let session = ctx.panes.table.get(&id).and_then(|pane| pane.session_id());
-            (worktree, session)
+            let cols = ctx.panes.table.get(&id).map(|pane| pane.size().1);
+            (worktree, session, cols)
         });
-    if let Some((worktree, session)) = preview_meta
+    if let Some((worktree, session, cols)) = preview_meta
         && !worktree.is_empty()
-        && ctx.preview.pane_output(id, &worktree, session, b)
+        && ctx.preview.pane_output(id, &worktree, session, b, cols)
     {
         *ctx.dirty = true;
     }

@@ -14,6 +14,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use unicode_width::UnicodeWidthChar;
 
 /// The render route a previewed file takes.
 ///
@@ -380,8 +381,11 @@ fn parsed_port(raw: &str) -> Option<u16> {
     raw.parse::<u16>().ok().filter(|port| valid_port(*port))
 }
 
-fn captured_port(captures: &regex::Captures<'_>, input: &str) -> Option<u16> {
+fn captured_port(captures: &regex::Captures<'_>, input: &str, accept_end: bool) -> Option<u16> {
     let capture = captures.name("port")?;
+    if !accept_end && capture.end() == input.len() {
+        return None;
+    }
     if input[capture.end()..]
         .chars()
         .next()
@@ -431,12 +435,17 @@ struct FoundHint {
     hint: PortHint,
 }
 
-fn parse_explicit_hints(input: &str, source: PortHintSource, urls: bool) -> Vec<PortHint> {
+fn parse_explicit_hints(
+    input: &str,
+    source: PortHintSource,
+    urls: bool,
+    accept_end: bool,
+) -> Vec<PortHint> {
     let clean = sanitize_port_hint_text(input);
     let mut found = Vec::new();
     if urls {
         for captures in LOOPBACK_PORT_RE.captures_iter(&clean) {
-            let Some(port) = captured_port(&captures, &clean) else {
+            let Some(port) = captured_port(&captures, &clean, accept_end) else {
                 continue;
             };
             let host = captures
@@ -451,7 +460,7 @@ fn parse_explicit_hints(input: &str, source: PortHintSource, urls: bool) -> Vec<
     }
     for regex in [&*FLAG_PORT_RE, &*ENV_PORT_RE] {
         for captures in regex.captures_iter(&clean) {
-            let Some(port) = captured_port(&captures, &clean) else {
+            let Some(port) = captured_port(&captures, &clean, accept_end) else {
                 continue;
             };
             found.push(FoundHint {
@@ -479,12 +488,79 @@ fn parse_explicit_hints(input: &str, source: PortHintSource, urls: bool) -> Vec<
 
 /// Parse bounded pane output for explicit loopback URLs, port flags, or `PORT=`.
 pub fn parse_port_hints(input: &str) -> Vec<PortHint> {
-    parse_explicit_hints(input, PortHintSource::PaneOutput, true)
+    parse_explicit_hints(input, PortHintSource::PaneOutput, true, true)
 }
 
 /// More explicit alias used by host-side pane plumbing.
 pub fn parse_pane_port_hints(input: &str) -> Vec<PortHint> {
-    parse_port_hints(input)
+    parse_pane_port_hints_wrapped(input, None)
+}
+
+/// Parse pane output while treating terminal right-margin redraws and visual
+/// wraps as continuations. A trailing port remains incomplete until a later
+/// byte terminates it.
+pub fn parse_pane_port_hints_wrapped(input: &str, cols: Option<u16>) -> Vec<PortHint> {
+    let clean = sanitize_port_hint_text(input);
+    let mut chars = clean.chars().peekable();
+    let mut joined = String::with_capacity(clean.len());
+    let mut width = 0usize;
+    while let Some(ch) = chars.next() {
+        if ch == '\r' && chars.peek() == Some(&'\n') {
+            if cols.is_some_and(|columns| width == columns as usize) {
+                chars.next();
+                width = 0;
+                continue;
+            }
+            joined.push('\r');
+            joined.push('\n');
+            chars.next();
+            width = 0;
+            continue;
+        }
+        if ch == '\n' {
+            if cols.is_some_and(|columns| width == columns as usize) {
+                width = 0;
+                continue;
+            }
+            joined.push(ch);
+            width = 0;
+            continue;
+        }
+        if ch == '\r' {
+            // A bare CR after an exactly-full row starts a new visual row: the
+            // cursor was parked at the right margin, so what follows is not a
+            // continuation of the full row.
+            if cols.is_some_and(|columns| width == columns as usize) {
+                joined.push('\n');
+                width = 0;
+                continue;
+            }
+            let previous = joined.chars().next_back();
+            let next = chars.peek().copied();
+            if previous.is_some_and(|value| !value.is_whitespace())
+                && next.is_some_and(|value| !value.is_whitespace())
+            {
+                width = 0;
+                continue;
+            }
+            joined.push(ch);
+            width = 0;
+            continue;
+        }
+        if ch == ' ' && chars.peek() == Some(&'\r') {
+            let previous = joined.chars().next_back();
+            let next = chars.clone().nth(1);
+            if previous.is_some_and(|value| !value.is_whitespace())
+                && next.is_some_and(|value| !value.is_whitespace())
+            {
+                chars.next();
+                continue;
+            }
+        }
+        joined.push(ch);
+        width += UnicodeWidthChar::width(ch).unwrap_or(0);
+    }
+    parse_explicit_hints(&joined, PortHintSource::PaneOutput, true, false)
 }
 
 /// Parse only `scripts.dev` and `scripts.start` from supplied `package.json`.
@@ -508,7 +584,7 @@ pub fn parse_package_script_hints(package_json: &str) -> Result<Vec<PortHint>, S
         let Some(script) = scripts.get(name).and_then(serde_json::Value::as_str) else {
             continue;
         };
-        for hint in parse_explicit_hints(script, PortHintSource::PackageScript, false) {
+        for hint in parse_explicit_hints(script, PortHintSource::PackageScript, false, true) {
             if !hints
                 .iter()
                 .any(|existing: &PortHint| existing.port == hint.port)
@@ -569,6 +645,7 @@ pub fn merge_port_hints(
 #[serde(rename_all = "lowercase")]
 pub enum PreviewStatus {
     Up,
+    Seen,
     Down,
     Unknown,
 }
@@ -577,9 +654,19 @@ impl PreviewStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Up => "up",
+            Self::Seen => "seen",
             Self::Down => "down",
             Self::Unknown => "unknown",
         }
+    }
+}
+
+/// Human-facing state label, including source-specific static facts.
+pub fn status_label(status: PreviewStatus, source: PortHintSource) -> &'static str {
+    if status == PreviewStatus::Unknown && source == PortHintSource::Config {
+        "configured"
+    } else {
+        status.as_str()
     }
 }
 
@@ -615,14 +702,15 @@ impl PreviewTarget {
     }
 }
 
-/// Choose an active target: reachable first, then unknown, then down; within a
+/// Choose an active target: reachable first, then seen, unknown, and down; within a
 /// lifecycle class use source precedence and ascending port order.
 pub fn select_target(targets: &[PreviewTarget]) -> Option<&PreviewTarget> {
     fn status_rank(status: PreviewStatus) -> u8 {
         match status {
             PreviewStatus::Up => 0,
-            PreviewStatus::Unknown => 1,
-            PreviewStatus::Down => 2,
+            PreviewStatus::Seen => 1,
+            PreviewStatus::Unknown => 2,
+            PreviewStatus::Down => 3,
         }
     }
     targets.iter().min_by(|left, right| {
@@ -755,6 +843,102 @@ pub fn validate_preview_redirect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_hints_need_a_terminator() {
+        assert!(parse_pane_port_hints_wrapped("http://localhost:87", None).is_empty());
+        assert_eq!(
+            parse_pane_port_hints_wrapped("http://localhost:8765/\n", None)
+                .iter()
+                .map(|hint| hint.port)
+                .collect::<Vec<_>>(),
+            vec![8765]
+        );
+    }
+
+    #[test]
+    fn margin_redraw_is_joined() {
+        for input in ["localhost:87 \r65/\n", "localhost:87\r65/\n"] {
+            assert_eq!(
+                parse_pane_port_hints_wrapped(input, None)
+                    .iter()
+                    .map(|hint| hint.port)
+                    .collect::<Vec<_>>(),
+                vec![8765]
+            );
+        }
+    }
+
+    #[test]
+    fn cols_exact_wrap_is_joined() {
+        assert_eq!(
+            parse_pane_port_hints_wrapped("1234567 localhost:87\r\n65/\n", Some(20))
+                .iter()
+                .map(|hint| hint.port)
+                .collect::<Vec<_>>(),
+            vec![8765]
+        );
+        assert_eq!(
+            parse_pane_port_hints_wrapped("123456 localhost:87\r\n65/\n", Some(20))
+                .iter()
+                .map(|hint| hint.port)
+                .collect::<Vec<_>>(),
+            vec![87]
+        );
+        assert_eq!(
+            parse_pane_port_hints_wrapped("1234567 localhost:87\n65/\n", Some(20))
+                .iter()
+                .map(|hint| hint.port)
+                .collect::<Vec<_>>(),
+            vec![8765]
+        );
+        assert_eq!(
+            parse_pane_port_hints_wrapped(
+                "12345678901234567890\r1234567 localhost:87\n65/\n",
+                Some(20)
+            )
+            .iter()
+            .map(|hint| hint.port)
+            .collect::<Vec<_>>(),
+            vec![8765]
+        );
+    }
+
+    #[test]
+    fn status_label_cases() {
+        assert_eq!(
+            status_label(PreviewStatus::Unknown, PortHintSource::Config),
+            "configured"
+        );
+        assert_eq!(
+            status_label(PreviewStatus::Unknown, PortHintSource::PaneOutput),
+            "unknown"
+        );
+        assert_eq!(
+            status_label(PreviewStatus::Seen, PortHintSource::PaneOutput),
+            "seen"
+        );
+    }
+
+    #[test]
+    fn select_target_ranks_seen_between_up_and_unknown() {
+        let target = |port, status| PreviewTarget {
+            worktree: "repo".into(),
+            port,
+            url: format!("http://localhost:{port}/"),
+            source: PortHintSource::Config,
+            pane: None,
+            session: None,
+            status,
+        };
+        let targets = vec![
+            target(3000, PreviewStatus::Unknown),
+            target(4000, PreviewStatus::Seen),
+            target(5000, PreviewStatus::Up),
+        ];
+        assert_eq!(select_target(&targets).unwrap().port, 5000);
+        assert_eq!(select_target(&targets[..2]).unwrap().port, 4000);
+    }
     use std::path::PathBuf;
 
     fn p(s: &str) -> PathBuf {

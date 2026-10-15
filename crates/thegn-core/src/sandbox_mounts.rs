@@ -578,8 +578,8 @@ pub fn keep_cfg_mount(existing: &[Mount], m: &Mount) -> bool {
     }
 }
 
-/// Parse one `[sandbox].mounts` entry — `"host"`, `"host:ro"`, `"host:dest"`,
-/// `"host:dest:ro"`, or the `cache` variants — into a [`Mount`]. `~/`-prefixed
+/// Parse one `[sandbox].mounts` entry — `"host"`, suffix or destination forms,
+/// with `ro`, `rw`, and `cache` variants — into a [`Mount`]. `~/`-prefixed
 /// paths are tilde-expanded so the spec is a valid filesystem path (bwrap does
 /// no shell expansion). Extracted from `sandbox.rs` (god-file ratchet ceiling).
 pub(crate) fn parse_mount(spec: &str) -> Mount {
@@ -607,6 +607,12 @@ pub(crate) fn parse_mount(spec: &str) -> Mount {
             ro: false,
             cache: true,
         },
+        [host, "rw"] => Mount {
+            host: expand(host),
+            dest: expand(host),
+            ro: false,
+            cache: false,
+        },
         [host, dest] => Mount {
             host: expand(host),
             dest: expand(dest),
@@ -617,6 +623,12 @@ pub(crate) fn parse_mount(spec: &str) -> Mount {
             host: expand(host),
             dest: expand(dest),
             ro: true,
+            cache: false,
+        },
+        [host, dest, "rw"] => Mount {
+            host: expand(host),
+            dest: expand(dest),
+            ro: false,
             cache: false,
         },
         [host, dest, "cache"] => Mount {
@@ -632,6 +644,82 @@ pub(crate) fn parse_mount(spec: &str) -> Mount {
             cache: false,
         },
     }
+}
+
+/// A mount string that cannot be interpreted without silently changing its meaning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MountSpecError {
+    Empty,
+    EmptySegment,
+    TooManyFields,
+    UnknownSuffix(String),
+    RelativeHost(String),
+    RelativeDest(String),
+}
+
+impl std::fmt::Display for MountSpecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(
+                f,
+                "empty mount spec (use host, host:ro|rw|cache, or host:dest:ro|rw|cache)"
+            ),
+            Self::EmptySegment => write!(
+                f,
+                "empty mount field (use host, host:ro|rw|cache, or host:dest:ro|rw|cache)"
+            ),
+            Self::TooManyFields => write!(
+                f,
+                "too many mount fields (use host, host:ro|rw|cache, or host:dest:ro|rw|cache)"
+            ),
+            Self::UnknownSuffix(suffix) => {
+                write!(
+                    f,
+                    "unknown suffix `{suffix}` (accepted forms: host, host:ro|rw|cache, host:dest:ro|rw|cache)"
+                )
+            }
+            Self::RelativeHost(host) => write!(
+                f,
+                "host `{host}` is relative (use an absolute path or ~/…; accepted forms: host, host:ro|rw|cache, host:dest:ro|rw|cache)"
+            ),
+            Self::RelativeDest(dest) => write!(
+                f,
+                "destination `{dest}` is relative (use an absolute path or ~/…; accepted forms: host, host:ro|rw|cache, host:dest:ro|rw|cache)"
+            ),
+        }
+    }
+}
+
+/// Parse a mount only when its field count and path roles are unambiguous.
+pub(crate) fn parse_mount_checked(spec: &str) -> Result<Mount, MountSpecError> {
+    if spec.trim().is_empty() {
+        return Err(MountSpecError::Empty);
+    }
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.iter().any(|part| part.is_empty()) {
+        return Err(MountSpecError::EmptySegment);
+    }
+    let expand = |path: &str| crate::util::expand_tilde(path);
+    let host = expand(parts[0]);
+    if !std::path::Path::new(&host).is_absolute() {
+        return Err(MountSpecError::RelativeHost(parts[0].to_string()));
+    }
+    let suffix = |field: &str| matches!(field, "ro" | "rw" | "cache");
+    let dest_field = match parts.as_slice() {
+        [_] => None,
+        [_, field] if suffix(field) => None,
+        [_, field] => Some(*field),
+        [_, _, field] if suffix(field) => Some(parts[1]),
+        [_, _, field] => return Err(MountSpecError::UnknownSuffix((*field).to_string())),
+        _ => return Err(MountSpecError::TooManyFields),
+    };
+    if let Some(dest) = dest_field {
+        let expanded = expand(dest);
+        if !std::path::Path::new(&expanded).is_absolute() {
+            return Err(MountSpecError::RelativeDest(dest.to_string()));
+        }
+    }
+    Ok(parse_mount(spec))
 }
 
 /// How much of the host `$HOME` a resolved sandbox can see. Reported by
@@ -1072,7 +1160,7 @@ pub fn sealed_mount_covers_deny(m: &Mount, home: &Path) -> bool {
 pub fn sealed_dropped_cfg_mounts(cfg_mounts: &[String], home: &Path) -> Vec<String> {
     cfg_mounts
         .iter()
-        .map(|m| parse_mount(m))
+        .filter_map(|m| parse_mount_checked(m).ok())
         .filter(|m| sealed_denies_mount(m, home))
         .map(|m| m.host)
         .collect()
@@ -1853,5 +1941,116 @@ mod tests {
             cache: false,
         };
         assert!(!keep_cfg_mount(existing, &ghost));
+    }
+
+    #[test]
+    fn rw_suffix_is_same_path_writable() {
+        let mount = parse_mount("~/.gnupg:rw");
+        let expected = crate::util::expand_tilde("~/.gnupg");
+        assert_eq!(mount.host, expected);
+        assert_eq!(mount.dest, expected);
+        assert!(!mount.ro);
+    }
+
+    #[test]
+    fn three_field_rw_suffix() {
+        let mount = parse_mount("/a:/b:rw");
+        assert_eq!(mount.host, "/a");
+        assert_eq!(mount.dest, "/b");
+        assert!(!mount.ro);
+    }
+
+    #[test]
+    fn checked_rejects_malformed() {
+        let cases = [
+            ("", "empty"),
+            ("  ", "empty"),
+            ("/a::ro", "empty-segment"),
+            ("/a:rel", "relative-dest"),
+            ("/a:rel:ro", "relative-dest"),
+            ("/a:/b:bogus", "unknown-suffix"),
+            ("/a:/b:rw:x", "too-many-fields"),
+            ("rel:/b", "relative-host"),
+        ];
+        for (spec, expected) in cases {
+            let error = parse_mount_checked(spec).expect_err(spec);
+            let kind = match error {
+                MountSpecError::Empty => "empty",
+                MountSpecError::EmptySegment => "empty-segment",
+                MountSpecError::TooManyFields => "too-many-fields",
+                MountSpecError::UnknownSuffix(ref token) => {
+                    assert_eq!(token, "bogus");
+                    "unknown-suffix"
+                }
+                MountSpecError::RelativeHost(ref token) => {
+                    assert_eq!(token, "rel");
+                    "relative-host"
+                }
+                MountSpecError::RelativeDest(ref token) => {
+                    assert!(token == "rel");
+                    "relative-dest"
+                }
+            };
+            assert_eq!(kind, expected, "{spec}");
+            let message = error.to_string();
+            assert!(
+                message.contains("host"),
+                "missing accepted forms: {message}"
+            );
+            if spec.contains("bogus") || spec.contains("rel") {
+                assert!(message.contains(if spec.contains("bogus") {
+                    "bogus"
+                } else {
+                    "rel"
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn checked_accepts_every_documented_form() {
+        for spec in [
+            "/a",
+            "/a:ro",
+            "/a:rw",
+            "/a:/b",
+            "/a:/b:ro",
+            "/a:/b:rw",
+            "/a:/b:cache",
+            "~/x:~/y:ro",
+        ] {
+            assert_eq!(
+                parse_mount_checked(spec).unwrap(),
+                parse_mount(spec),
+                "{spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_mounts_parse_cleanly_and_carry_no_gpg() {
+        for spec in crate::config::SandboxConfig::default().mounts {
+            assert!(!spec.contains(".gnupg"), "{spec}");
+            let mount = parse_mount_checked(&spec).unwrap();
+            assert!(
+                Path::new(&mount.dest).is_absolute(),
+                "{spec}: {}",
+                mount.dest
+            );
+            assert!(
+                mount.dest != "rw" && mount.dest != "/rw",
+                "{spec}: {}",
+                mount.dest
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sealed_dropped_skips_malformed() {
+        let home = private_tempdir();
+        let malformed_denied_host = format!("{}:relative", home.path().join(".ssh").display());
+        let specs = [malformed_denied_host];
+        assert!(sealed_dropped_cfg_mounts(&specs, home.path()).is_empty());
     }
 }

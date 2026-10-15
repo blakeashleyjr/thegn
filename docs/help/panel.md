@@ -86,7 +86,7 @@ off banner when its feature is unavailable.
 | `problems` | compiler, linter, and test diagnostics                               |
 | `jobs`     | configured shell jobs (build, test, run)                             |
 | `tests`    | test results and the pass/fail rollup                                |
-| `symbols`  | the LSP / tree-sitter outline for the selected file                  |
+| `symbols`  | the LSP / tree-sitter outline for the file you edit or pick          |
 
 **system**
 
@@ -132,10 +132,14 @@ those workflows.
 
 ### changes — the working diff
 
-The working diff, hunk by hunk, for the focused worktree. `↵` on a file
-inlines its hunks (binary and mode-only changes say so instead of a
-diff); `space` stages; `e` widens to the full-screen git frame, where
-`↵` drills into **staging** (line-level stage/unstage).
+The working diff, hunk by hunk, for the focused worktree. Binary and
+mode-only changes say so instead of showing hunks. `↵` on a file opens
+line-level **staging** at every width; at Normal width it widens to Half,
+and Esc retracts that drill. At Half, the inline preview follows the cursor.
+`space` stages, and `e` cycles panel width. Untracked files preview as all
+additions and are intent-added (`add -N`) only on the first stage. In staging,
+line discard is refused in the STAGED pane (unstage with `space`) and on an
+untracked file (`d` on its Changes row deletes the file).
 
 {{keys:changes}}
 
@@ -160,7 +164,8 @@ See [[git-and-diffs]].
 
 Local branches: check out, create, delete; open-PR badges ride each row.
 At Normal width, `↵` widens to Half; the selected branch's recent commits
-appear at Half and Full width.
+appear at Half and Full width. Before the first load, the list says
+"loading…"; a failed read names the error instead of appearing empty.
 
 {{keys:branches}}
 
@@ -171,6 +176,8 @@ See [[git-and-diffs]].
 At Normal width, `↵` widens to Half. The stash diff appears and scrolls at
 Half and Full width, including untracked files. Apply, pop, and drop remain
 available from the stash list. See [[git-and-diffs]].
+Before the first load, the list says "loading…"; a failed read names the
+error instead of appearing empty.
 
 {{keys:stash}}
 
@@ -196,6 +203,10 @@ assigned to you (every configured `[issues]` provider), PRs where your
 review is requested or that you authored (via `gh search`), and
 high-priority notifications. Scoped to the active repo by default; `a`
 widens to every repo. A `◈` marks a row already linked to a worktree.
+Enter opens the linked worktree when present, otherwise the PR view in-app
+for a PR in this repo, otherwise the browser. `b` branches only from issue
+rows and refuses when there is no local checkout, including in all-repos
+scope.
 
 {{keys:mine}}
 
@@ -207,7 +218,8 @@ the section says so rather than silently searching every repo.
 A read-mostly stream of things needing attention in your _other_
 worktrees — currently each worktree's failing CI (latest run per
 workflow), grouped by worktree. Scoped to the active project by
-default; `a` widens to every project. `↵` jumps to that worktree's tab.
+default; `a` widens to every project. `↵` jumps to that worktree's tab,
+or opens the registered worktree if it has no open tab.
 
 {{keys:across}}
 
@@ -219,10 +231,13 @@ repo's other open PRs (`◈` = that branch already has a local worktree),
 so the section answers "what's open on this repo", not only "what's open
 on this branch".
 
-`M` asks for a merge method (squash by default) and lists blockers. `c`
+OPEN PRS rows are selectable. Enter on one jumps to its worktree when
+available, or opens a read-only view of that PR; write actions are refused
+there. `w` creates or jumps to a worktree on that PR's head branch. `M`
+asks for a merge method (squash by default) and lists blockers. `c`
 comments when a PR exists and asks before creating one otherwise; `r` needs
-a PR. Enter opens the PR view. At Full width it shows a two-column page:
-header and checks beside threads and OPEN PRS.
+a PR. Enter on the branch PR opens its view. At Full width it shows a
+two-column page: header and checks beside threads and OPEN PRS.
 
 {{keys:pr}}
 
@@ -254,7 +269,7 @@ jobs, and **c** cancels after a second press.
 
 The fold-actor's per-branch land/defer status. Scoped to the active
 project by default; `g` widens to every project. `c` sweeps landed rows
-after a second press.
+after a second press. Enter widens to the Full detail.
 
 {{keys:merge}}
 
@@ -266,6 +281,7 @@ The queued pull requests on the forge and what blocks each one — the
 merge queue's counterpart for a **shared** repo. Hidden until
 `[pr_queue] enabled = true`; listing it in `[panel] sections` while disabled
 shows a one-line off banner with no live keys.
+Enter widens to the Full detail.
 
 {{keys:prq}}
 
@@ -276,7 +292,9 @@ handoff for a selected queued PR.
 
 ### issues — the repo's tracker
 
-Issues from the configured `[issues]` providers for this repo.
+Issues from the configured `[issues]` providers for this repo. Before the
+first load, the list says "loading…"; a failed read names the error instead
+of appearing empty. A Busy tracker refresh is retried.
 
 {{keys:issues}}
 
@@ -308,8 +326,11 @@ package selection, debug launch, editor opening, and output peeking.
 
 ### symbols — outline & references
 
-A document-symbol outline of the selected changed file (language server
-first, tree-sitter fallback).
+The outline targets the focused editor pane's file when it was opened from
+thegn, otherwise a changed file you pick with `f`, otherwise the file
+picker. Language server first, tree-sitter fallback. `r` opens references;
+Esc returns to the outline. With no language server, references say so;
+`h` reports when hover is off.
 
 {{keys:symbols}}
 
@@ -325,6 +346,8 @@ message; Full width puts it in the detail column.
 
 {{keys:notifications}}
 
+Enter jumps to the row's worktree or section and marks it read; `space`
+expands the whole message in place. **o** opens an HTTP(S) source link.
 `a` clears the inbox and acknowledges live "needs you" signals. It asks
 for confirmation and ignores an active filter. `g` toggles scope between
 this repo and every worktree. The popup's `a` also asks for confirmation;
@@ -343,17 +366,25 @@ The live thegn log stream, scoped to this worktree + host-global lines by
 default. `/` filters by text (Esc clears), `l` cycles the minimum level,
 `y` copies the highlighted line and `Y` every visible line, `a` toggles
 tail-follow, `g` widens to every worktree, and `w` exports visible lines
-to a file. What you see is exactly what copy/export operate on.
+to a file. Moving up in the rows pauses tail-follow; `a` resumes it. Rows
+show `HH:MM:SS` below Full width, and Half adds the target and worktree.
+Copies go to the system clipboard and via OSC 52; a failed system copy is
+reported. The summary counts the live stream.
 Requires logging to be on (`THEGN_LOG`, or `[log] file = true`).
 
 {{keys:logs}}
 
 ### sandbox, hosts, environments
 
-**sandbox** shows the focused worktree's sandbox state. Containers thegn
-did not create are listed read-only: `s` and `r` are refused with a status,
-while `l` still opens their logs. `s` and `r` on thegn's own containers ask
-first. `g` scopes the full table too; Half-width `g` rows are selectable.
+**sandbox** shows the focused worktree's sandbox state. Containers not
+proven to belong to this profile are listed read-only: ownership requires
+this profile's expected name (or its recognized `-tgvpn`/`-tgagent`
+companion) for a known worktree, on that worktree's launch backend.
+A user's `thegn-foo`, another profile's container, or the same name in the
+other Podman store is foreign; a new container may appear foreign until the
+next refresh. `s` and `r` are refused with a status for foreign containers,
+while `l` still opens their logs. Actions on owned containers ask first.
+`g` scopes the full table too; Half-width `g` rows are selectable.
 When sandboxing is off, a one-line banner says so. See [[sandboxing]]. **hosts** manages `[host.*]`
 machines: `n` adds one, `p` provisions, `r` re-probes, `m` opens the
 action menu (which holds removal), `c` grants install consent, `x`

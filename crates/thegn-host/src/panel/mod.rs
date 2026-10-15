@@ -754,6 +754,9 @@ pub struct PanelData {
     /// re-sorting the whole `ls-files` output on every frame and keypress
     /// (which visibly stalled the loop on monorepos).
     pub file_tree: Vec<FileEntry>,
+    /// Per-directory change totals, computed once alongside `changes` during
+    /// hydration so the Files renderer does no dirs-by-changes scans.
+    pub dir_changes: std::collections::HashMap<String, DirChange>,
     /// Local branches with upstream/divergence + PR badges (branches section).
     pub branches: Vec<BranchRow>,
     /// Load state for the demand-fetched local branch list.
@@ -1002,6 +1005,37 @@ pub fn build_file_tree(paths: &[String]) -> Vec<FileEntry> {
     out
 }
 
+/// Aggregated changed-file counts and diffstat for a directory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DirChange {
+    pub files: usize,
+    pub added: u32,
+    pub deleted: u32,
+}
+
+/// Credit each changed file to every directory ancestor in one pass.
+pub fn dir_change_counts(changes: &[ChangeRow]) -> std::collections::HashMap<String, DirChange> {
+    let mut counts = std::collections::HashMap::new();
+    for change in changes {
+        let mut path = String::new();
+        let mut parts = change.path.split('/').peekable();
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() {
+                break;
+            }
+            if !path.is_empty() {
+                path.push('/');
+            }
+            path.push_str(part);
+            let count: &mut DirChange = counts.entry(path.clone()).or_default();
+            count.files += 1;
+            count.added += change.added;
+            count.deleted += change.deleted;
+        }
+    }
+    counts
+}
+
 /// Filter a full file tree to only the rows visible given the collapsed set.
 /// A row is hidden when any ancestor directory path is in `collapsed`.
 /// Returns pairs of `(original_index, entry_ref)` in display order.
@@ -1199,6 +1233,10 @@ pub struct PanelUi {
     pub logs_filter: String,
     /// True while the Logs section's filter field is being edited.
     pub logs_filter_editing: bool,
+    /// Active free-text filter query for the Keys section (`/` mode).
+    pub keys_filter: String,
+    /// True while the Keys section's filter field is being edited.
+    pub keys_filter_editing: bool,
     /// Level gate: `None` = all levels; `Some(L)` shows lines at L and above.
     pub logs_level: Option<thegn_core::log_view::LogLevel>,
     /// When true, the cursor auto-jumps to the newest line on each arrival.
@@ -1248,6 +1286,8 @@ impl Default for PanelUi {
             logs_cursor: 0,
             logs_filter: String::new(),
             logs_filter_editing: false,
+            keys_filter: String::new(),
+            keys_filter_editing: false,
             logs_level: None,
             logs_tail: true,
             files_filter: String::new(),
@@ -2578,5 +2618,48 @@ mod tests {
                 < 10
         );
         assert_eq!(system.get(10), Some(&Section::Usage));
+    }
+
+    #[test]
+    fn dir_change_counts_credit_every_ancestor() {
+        let changes = vec![
+            ChangeRow {
+                path: "a/b/c.rs".into(),
+                added: 2,
+                deleted: 1,
+                ..Default::default()
+            },
+            ChangeRow {
+                path: "a/d.rs".into(),
+                added: 1,
+                deleted: 0,
+                ..Default::default()
+            },
+            ChangeRow {
+                // A path whose name merely starts with "ab" is not under "a" or "ab".
+                path: "abc/outside.rs".into(),
+                added: 9,
+                deleted: 9,
+                ..Default::default()
+            },
+        ];
+        let counts = dir_change_counts(&changes);
+        assert_eq!(
+            counts.get("a"),
+            Some(&DirChange {
+                files: 2,
+                added: 3,
+                deleted: 1
+            })
+        );
+        assert_eq!(
+            counts.get("a/b"),
+            Some(&DirChange {
+                files: 1,
+                added: 2,
+                deleted: 1
+            })
+        );
+        assert!(!counts.contains_key("ab"));
     }
 }
