@@ -4053,24 +4053,16 @@ mod tests {
     }
 }
 
-#[cfg(all(test, unix))]
-mod read_fence_unix_tests {
+#[cfg(test)]
+mod read_fence_tests {
     use super::{CliGit, GitBackend};
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
     use thegn_core::remote::GitLoc;
 
     fn private_repo() -> (tempfile::TempDir, GitLoc) {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         super::testutil::git_in(dir.path(), &["init", "-q", "-b", "main"]);
         let loc = GitLoc::for_worktree(dir.path());
         (dir, loc)
-    }
-
-    fn executable(path: &Path, contents: &str) {
-        std::fs::write(path, contents).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
@@ -4081,16 +4073,21 @@ mod read_fence_unix_tests {
         super::testutil::git_in(dir.path(), &["commit", "-q", "-m", "initial"]);
         let marker = dir.path().join("fsmonitor-ran");
         let hook = dir.path().join("fsmonitor.sh");
-        executable(
+        std::fs::write(
             &hook,
-            &format!(
+            format!(
                 "#!/bin/sh\ntouch '{}'\nprintf 'token\\n'\n",
                 marker.display()
             ),
-        );
+        )
+        .unwrap();
         super::testutil::git_in(
             dir.path(),
-            &["config", "core.fsmonitor", hook.to_str().unwrap()],
+            &[
+                "config",
+                "core.fsmonitor",
+                &format!("sh '{}'", hook.display()),
+            ],
         );
 
         CliGit.status(&loc).unwrap();
@@ -4115,13 +4112,18 @@ mod read_fence_unix_tests {
         std::fs::write(dir.path().join("sample.txt"), "worktree change\n").unwrap();
         let marker = dir.path().join("textconv-ran");
         let driver = dir.path().join("textconv.sh");
-        executable(
+        std::fs::write(
             &driver,
-            &format!("#!/bin/sh\ntouch '{}'\ncat \"$1\"\n", marker.display()),
-        );
+            format!("#!/bin/sh\ntouch '{}'\ncat \"$1\"\n", marker.display()),
+        )
+        .unwrap();
         super::testutil::git_in(
             dir.path(),
-            &["config", "diff.canary.textconv", driver.to_str().unwrap()],
+            &[
+                "config",
+                "diff.canary.textconv",
+                &format!("sh '{}'", driver.display()),
+            ],
         );
         CliGit.diff_hunks(&loc, "HEAD", "sample.txt", 40).unwrap();
         CliGit.unstaged_diff(&loc, "sample.txt").unwrap();
