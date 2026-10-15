@@ -34,6 +34,7 @@ pub(crate) mod repo_trust;
 pub(crate) mod ring;
 pub(crate) mod sandbox_panel;
 pub(crate) mod session_fork;
+pub(crate) mod share_panel;
 pub(crate) mod sidebar_actions;
 pub(crate) mod sidebar_activate;
 pub(crate) mod sidebar_collapse;
