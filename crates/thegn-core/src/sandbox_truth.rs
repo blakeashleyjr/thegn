@@ -19,10 +19,9 @@
 //! backend matches — so a new backend, or a change to how one is spelled, fails
 //! the build instead of quietly re-opening the lie.
 //!
-//! **Limit, stated rather than papered over:** the two native-Windows backends
-//! contain a process through the spawn syscall (job object / AppContainer), not
-//! through the argv, so no argv inspection can see them. [`reconcile`] takes
-//! them at their word and says so here.
+//! **Limit, stated rather than papered over:** the Windows Job Object contains
+//! a process through the spawn syscall, not through the argv, so no argv
+//! inspection can see it. [`reconcile`] takes it at its word and says so here.
 
 use crate::sandbox::Backend;
 
@@ -176,8 +175,8 @@ fn requests_containment(requested: &str) -> bool {
 ///
 /// The returned [`Truth::label`] is derived from `argv` in every case where the
 /// argv can show containment — callers must record and display THAT, never the
-/// request. See the module docs for the one exception (native-Windows
-/// backends, whose isolation is invisible to argv inspection).
+/// request. See the module docs for the one exception (the Windows Job Object,
+/// whose scoping is invisible to argv inspection).
 ///
 /// **Call this for LOCAL placements.** A remote placement (ssh/k8s/provider)
 /// runs its container on another machine behind a transport whose argv shape is
@@ -188,12 +187,9 @@ pub fn reconcile(requested: &str, argv: &[String]) -> Truth {
     let want = crate::config::SandboxBackend::from_str_validated(requested.trim())
         .ok()
         .and_then(Backend::from_config);
-    // Native-Windows containment happens in the spawn syscall, so the argv is a
-    // plain shell either way and observation cannot confirm or deny it.
-    if matches!(
-        want,
-        Some(Backend::WinAppContainer) | Some(Backend::WinJobObject)
-    ) {
+    // Job Object containment happens in the spawn syscall, so argv inspection
+    // cannot see it. AppContainer is reserved and must be reported as host.
+    if want == Some(Backend::WinJobObject) {
         return Truth {
             label: want.map(|b| b.label().to_string()).unwrap_or_default(),
             degraded: false,
@@ -209,7 +205,7 @@ pub fn reconcile(requested: &str, argv: &[String]) -> Truth {
             warning: None,
         };
     }
-    let warning = if got == Backend::None {
+    let mut warning = if got == Backend::None {
         format!(
             "sandbox '{}' unavailable — this pane is running on the host (no kernel boundary)",
             requested.trim()
@@ -221,6 +217,9 @@ pub fn reconcile(requested: &str, argv: &[String]) -> Truth {
             label
         )
     };
+    if want == Some(Backend::WinAppContainer) {
+        warning.push_str(" (appcontainer is reserved and not implemented)");
+    }
     Truth {
         label,
         degraded: true,
