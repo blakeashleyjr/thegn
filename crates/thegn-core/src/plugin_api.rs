@@ -331,9 +331,8 @@ fn default_timeout_secs() -> u64 {
     30
 }
 
-/// Maximum wall-clock duration for one plugin run. Larger manifest values are
-/// clamped to this limit with a warning; the serialized manifest is unchanged.
-pub const MAX_PLUGIN_TIMEOUT_SECS: u64 = 600;
+/// Maximum admitted wall-clock duration for one plugin run.
+pub const MAX_PLUGIN_TIMEOUT_SECS: u64 = 3600;
 
 fn default_true() -> bool {
     true
