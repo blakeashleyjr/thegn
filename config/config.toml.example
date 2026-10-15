@@ -38,8 +38,9 @@
 #     gives each container its own Linux VM (a real kernel boundary, unlike
 #     podman/docker's shared one). It needs `container system start`. podman and
 #     docker both need their VM running too (`podman machine start`,
-#     `colima start` or Docker Desktop); with none of them up, panes run on the
-#     host with no kernel boundary and thegn says so.
+#     `colima start` or Docker Desktop); with none of them usable, enabled
+#     sandboxed panes refuse before opening a host process. Opt in with
+#     `isolation_floor = "off"`, `backend = "none"`, or the run-on-host choice.
 #  4. NO CPU CAPS. [sandbox] cpu / the aggregate cap are cgroup features; macOS
 #     has no equivalent, so they degrade to `nice` (soft) or nothing.
 
@@ -469,7 +470,7 @@ refresh_secs = 2           # Polling interval in seconds
 # leaves a gap between the icon and its value.
 # cpu_icon = "CPU"
 # mem_icon = "MEM"
-# net_icon = "NET"      # shipped default auto-selects Ethernet/Wi-Fi/generic from default route; any other value is fixed
+# net_icon = "NET"      # shipped default auto-selects per-medium glyphs below; any other value is a fixed override
 # gpu_icon = "GPU"              # shows only if a GPU is detected
 # temp_icon = "TMP"             # CPU/package temperature
 # swap_icon = "SWP"             # swap usage
@@ -484,6 +485,13 @@ disk_free_warn = 15             # disk widget turns amber at/below this free %
 disk_free_critical = 10         # disk widget turns red at/below this free %
 # disk_path = "~/projects"      # fs the disk widget measures; "" = worktrees_dir's fs
 refresh_rates = [1, 2, 5, 10]  # Click the top-right stats block to cycle
+
+# Per-medium network icons, used only while net_icon is its shipped default.
+# Empty values use built-in glyphs, which degrade to ASCII on limited terminals.
+# [stats.net_icons]
+# wifi = ""
+# ethernet = ""
+# generic = ""
 
 # Threshold alerts on system metrics. A metric must stay past a threshold for
 # `sustain_secs` before firing (so a one-sample spike is silent), and a standing
@@ -1796,8 +1804,11 @@ command = "git diff"
 # Every outcome parks the roster row `waiting_human` with a `note` — the daemon
 # can park a row but never finish one (it writes neither `done` nor `failed`),
 # and a usage LIMIT parks immediately at any attempt: spending money is never
-# the daemon's call. The retry is the SAME roster row cycling through attempts
-# (session + artifact re-stamped per relaunch), not a chain of rows.
+# the daemon's call. Only the last 8 non-empty screen lines are classified.
+# Limit signatures are checked before transport, so a matching limit wins; the
+# default limit signatures include `http 429`, which therefore parks as a limit.
+# The retry is the SAME roster row cycling through attempts (session + artifact
+# re-stamped per relaunch), not a chain of rows.
 #
 #   enabled               master switch (default true; false = today's behavior)
 #   max_attempts          bounded relaunches per row (default 3); beyond it the
@@ -1883,7 +1894,7 @@ command = "git diff"
 # test_mem_max = "4G"        # memory cap for a test run; "" = uncapped
 # test_nice = 10             # niceness for test runs (0 disables)
 # test_max_parallel = 1      # max concurrent test/discovery jobs across worktrees
-# test_timeout_secs = 1800   # kill a wedged test run after N seconds (0 disables)
+# test_timeout_secs = 1800   # kill a wedged test run or job after N seconds (0 disables)
 # discover_timeout_secs = 45 # discovery should be instant; cap it so a held
 #                            #   cargo build-lock surfaces an error, not a spinner
 # isolated_target_dir = true # run thegn's cargo under <worktree>/target/thegn
@@ -2677,8 +2688,10 @@ profile = "hardened"
 # (bwrap on macOS, apple on Linux) are skipped without probing at all.
 #
 # When nothing in the chain is usable, panes run on the host with NO kernel
-# boundary and thegn says so once, naming any runtime that is installed but not
-# running. `thegn doctor` shows the full per-backend state and how to fix it.
+# boundary. Enabled sandboxed launches refuse before opening a host process;
+# choose `isolation_floor = "off"`, `backend = "none"`, disable sandboxing, or
+# use the one-shot run-on-host choice to opt in. `thegn doctor` shows each
+# backend and how to install or start it.
 backend = "auto"
 
 # Pre-selected backend in the new-worktree picker ("auto" = use backend_chain).
@@ -2696,22 +2709,25 @@ default_env = ""
 #   main_env    = "host"        # `[env.host]`     placement = "local"
 #   default_env = "machine0"    # `[env.machine0]` placement = "provider"
 # Applies below explicit worktree/workspace/repo selections. A repo `.thegn.toml`
-# may NOT set this (like `default_env`) — a repo picks its env via the top-level
-# `env = "…"` key instead.
+# `env =` is only a hint: a repo env that would weaken user policy is ignored
+# with a warning. A repo may NOT set `main_env` (or `default_env`) directly; it
+# picks its env via the top-level `env = "…"` key instead.
 main_env = ""
 
 # Probe order for "auto". First backend that is installed and usable wins.
-# "none"/"host" anywhere in the list = uncontained fallback from that point on.
+# A chain-listed "host" is only a fallback preference; the default isolation
+# floor still refuses an uncontained launch.
 # One list serves every OS: each OS-native entry probes Absent off its own OS.
 # NixOS users: move "bwrap" first if podman isn't installed.
 # macOS: "apple" is Apple's `container` CLI (each container gets its own Linux
 # VM, so it is the strongest isolation any backend offers). It is probed only on
 # macOS; "bwrap"/"systemd" are Linux-only, so a Mac with no runtime installed
-# lands on "host" and panes just run directly.
+# refuses enabled sandboxed panes until a runtime is installed or the floor is
+# explicitly set to "off".
 # Native Windows: the OCI entries decline (Linux containers can't bind-mount
 # the worktree at its real path — use WSL2 for container sandboxes); panes are
 # scoped by "jobobject" (kill-on-close Job Objects) instead.
-backend_chain = ["podman-rootless", "podman-rootful", "docker", "apple", "bwrap", "jobobject", "host"]
+backend_chain = ["podman-rootless", "podman-rootful", "docker", "apple", "bwrap", "jobobject"]
 
 # ── OCI image (podman / docker only) ────────────────────────────────────────
 # Empty  = thegn's built-in default: debian:stable, PINNED BY DIGEST so the
@@ -2743,7 +2759,7 @@ ports = []
 # lowers the sandbox to network = "none" (offline).
 network_allow = []
 network_block = []
-# Log all outbound DNS queries and connection attempts to the audit table.
+# Log outbound DNS queries to the audit table (not a connection log).
 network_audit = false
 
 # ── Filesystem ───────────────────────────────────────────────────────────────
@@ -2899,8 +2915,8 @@ nix_daemon = false
 
 # ── Missing backend behaviour ─────────────────────────────────────────────────
 # What to do when no sandbox backend in backend_chain is available and the
-# chain itself names `host` (a chain without `host` always refuses instead):
-#   warn   — open the pane on the host and show a banner (default).
+# chain itself names `host` (the default floor still refuses a host launch):
+#   warn   — open the pane on the host and show a banner (legacy explicit policy).
 #   prompt — currently behaves like warn (the picker layer may offer choices).
 #   fail   — worktree panes: refuse that pane with a halt modal. (Terminal tabs
 #            and queue agent handoffs still use the older behaviour and exit
@@ -2936,13 +2952,13 @@ failover = "halt"
 #   "start"  — run the start command unattended, then re-probe and retry. Falls
 #              back to "ask" for a runtime with no unattended start (rootful
 #              podman needs a password, which a launch path will not prompt for).
-#   "host"   — proceed on the host. The pane is labelled `host`, never the
-#              runtime you asked for.
+#   "host"   — request the host. The default isolation floor still refuses an
+#              uncontained launch unless the floor is explicitly set to "off".
+#              The pane is labelled `host`, never the runtime you asked for.
 #   "cancel" — refuse to launch rather than run without a kernel boundary.
 # Only applies when the launch made an EXPLICIT pick — `backend = "podman-rootless"`
 # here, or the per-worktree/terminal choice from the wizard. `backend = "auto"`
-# means "walk backend_chain and land wherever", so landing on the host is the
-# configured outcome, not a degradation, and never prompts.
+# means "walk backend_chain"; a host entry still has to meet the isolation floor.
 # Also skipped when the worktree is pinned to the host — a standing answer to
 # this same question. (`failover = "auto"` no longer is one.)
 on_dormant = "ask"
@@ -2971,11 +2987,13 @@ oci_runtime = ""
 
 # ── Isolation floor (demandable minimum boundary) ─────────────────────────────
 # Demand that whatever a launch actually enters is at least this strong. Unlike
-# `backend_chain` (a PREFERENCE that silently degrades to the host), this is a
+# `backend_chain` (a preference that may list host as a fallback), this is a
 # DEMAND, compared over the HONEST isolation class after backend selection and any
 # `oci_runtime` degrade — so a `krun` that fell back to the daemon default counts
 # as `shared-kernel`, and a macOS local OCI container counts as `guest-kernel`.
-#   ""               — (default) no floor; the chain degrades freely, as today.
+# When omitted, enabled sandboxed launches require `shared-kernel`, unless
+# sandbox is disabled, `backend = "none"`, or run-on-host is chosen.
+#   "off"             — explicit opt-in to an uncontained launch.
 #   "shared-kernel"   — a namespaced container (podman/docker/bwrap/systemd). A
 #                       Windows Job Object is host-process class and does NOT meet it.
 #   "userspace-kernel"— gVisor (`oci_runtime = "runsc"`) or stronger.
@@ -2983,20 +3001,22 @@ oci_runtime = ""
 #                       the `apple` backend, or macOS VM-mediated podman/docker).
 # `host-process` is not a valid floor — it is always met. A managed provider
 # placement is out of scope (reported `provider-managed`, never counted as a tier).
+# Explicit floor values always apply, even to deliberate host choices.
 # A repo-root `.thegn.toml` may only RAISE this, never lower it.
 # `thegn doctor` shows the enforcement matrix and whether the floor is met.
-isolation_floor = ""
+# isolation_floor = "shared-kernel"
 
 # What to do when the resolved launch cannot meet `isolation_floor`:
-#   "degrade" — (default) launch anyway, mark the worktree degraded, and warn
+#   "degrade" — launch anyway for an explicitly configured floor, mark the
+#               worktree degraded, and warn
 #               naming the floor and the class actually provided (fail-safe: right
 #               for interactive work, where you are present to see the warning).
-#   "fail"    — refuse to launch; NO process spawns on the host. The error names
+#   "fail"    — (default) refuse to launch; NO process spawns on the host. The error names
 #               the floor, the best class available here, and how to satisfy it
 #               (fail-closed: right for unattended/agent workloads and explicit
 #               demands — the VPN `on_error = "fail"` precedent).
 # A repo-root `.thegn.toml` may only HARDEN this (`degrade` → `fail`).
-on_floor_miss = "degrade"
+on_floor_miss = "fail"
 
 # ── Personal environment layer ────────────────────────────────────────────────
 # [sandbox.home] makes a sandbox/remote feel like LOCAL by reproducing *your*
@@ -3398,6 +3418,7 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # one by name. Selection precedence (most specific wins):
 #   worktree `env_name` (DB) → workspace `env_name` (DB) → repo `.thegn.*`
 #   `env = "…"` → global `default_env` (below) → the implicit `"default"`.
+#   Repo env hints that would weaken user policy are ignored with a warning.
 # The `"default"` env is this `[sandbox]` + `[sandbox.remote]` block — so with
 # no `[env.*]` defined, nothing changes. Manage selections with `thegn env`.
 #

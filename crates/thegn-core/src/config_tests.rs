@@ -1852,7 +1852,7 @@ fn env_overlay_covers_every_knob() {
     assert_eq!(c.sandbox.warm_direnv, WarmDirenv::AllowedOnly);
     assert_eq!(
         c.sandbox.isolation_floor,
-        crate::config::IsolationFloor::GuestKernel
+        Some(crate::config::IsolationFloor::GuestKernel)
     );
     assert_eq!(c.sandbox.on_floor_miss, crate::config::OnFloorMiss::Fail);
     assert_eq!(c.theme.focus_border, "#111111");
@@ -4029,4 +4029,59 @@ fn config_enum_reserved_marker_emits_kind_and_lenient_default() {
     assert_eq!(cfg.ci.provider, CiProviderKind::Auto);
     // Serialization of an implemented kind is unchanged.
     assert_eq!(CiProviderKind::Gitlab.as_str(), "gitlab");
+}
+
+#[test]
+fn sandbox_default_is_fail_closed_and_online() {
+    use crate::config::{IsolationFloor, Network, OnFloorMiss, SandboxBackend};
+
+    let defaults = Config::default();
+    assert_eq!(defaults.sandbox.isolation_floor, None);
+    assert!(
+        !toml::to_string(&defaults.sandbox)
+            .unwrap()
+            .contains("isolation_floor")
+    );
+    assert_eq!(defaults.sandbox.on_floor_miss, OnFloorMiss::Fail);
+    assert_eq!(defaults.sandbox.network, Network::Nat);
+    assert!(defaults.sandbox.backend_chain.iter().all(|name| {
+        SandboxBackend::from_str_validated(name)
+            .is_ok_and(|backend| backend != SandboxBackend::None)
+    }));
+    assert!(
+        !defaults
+            .sandbox
+            .backend_chain
+            .iter()
+            .any(|name| name == "host")
+    );
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("empty.toml");
+    std::fs::write(&path, "").unwrap();
+    let empty = Config::load_layered(&MapEnv::default(), &[], Some(path.clone()));
+    assert_eq!(empty.sandbox.isolation_floor, None);
+    assert_eq!(empty.sandbox.on_floor_miss, OnFloorMiss::Fail);
+
+    let env = map_env(&[("THEGN_SANDBOX_ISOLATION_FLOOR", "off")]);
+    let from_env = Config::load_layered(&env, &[], Some(path.clone()));
+    assert_eq!(from_env.sandbox.isolation_floor, Some(IsolationFloor::Off));
+
+    std::fs::write(&path, "[sandbox]\nisolation_floor = \"\"\n").unwrap();
+    let from_file = Config::load_layered(&MapEnv::default(), &[], Some(path));
+    assert_eq!(from_file.sandbox.isolation_floor, Some(IsolationFloor::Off));
+}
+
+#[test]
+fn stats_net_icons_default_empty_and_parse() {
+    let defaults = StatsConfig::default().net_icons;
+    assert_eq!(defaults, NetIconsConfig::default());
+    assert!(defaults.wifi.is_empty());
+    assert!(defaults.ethernet.is_empty());
+    assert!(defaults.generic.is_empty());
+
+    let cfg: Config = toml::from_str("[stats.net_icons]\nethernet = \"ETH\"\n").unwrap();
+    assert_eq!(cfg.stats.net_icons.ethernet, "ETH");
+    assert!(cfg.stats.net_icons.wifi.is_empty());
+    assert!(cfg.stats.net_icons.generic.is_empty());
 }

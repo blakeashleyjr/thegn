@@ -1232,6 +1232,28 @@ pub fn commit_selection(
     (!targets.is_empty()).then_some((oldest, targets))
 }
 
+/// How an interactive rebase gets its starting point. An explicit `B` mark
+/// overrides the ordinary selected-commit range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanFrom {
+    Target { oldest: String, base: String },
+    Mark(String),
+}
+
+pub fn interactive_anchor(ui: &GitUi, data: &crate::panel::PanelData) -> Option<PlanFrom> {
+    if let Some(mark) = &ui.mark_base {
+        return Some(PlanFrom::Mark(mark.clone()));
+    }
+    let (oldest, _) = commit_selection(ui, data)?;
+    let commit = data.commits.iter().find(|commit| commit.sha == oldest)?;
+    let base = if commit.parents.is_empty() {
+        "--root".to_owned()
+    } else {
+        format!("{}^", commit.sha)
+    };
+    Some(PlanFrom::Target { oldest, base })
+}
+
 /// The selected `(hunk, line)` pairs of a staging doc over an inclusive
 /// flattened range (headers / context / markers drop silently).
 pub fn sel_pairs(doc: &StageDoc, range: std::ops::RangeInclusive<usize>) -> Vec<(usize, usize)> {
@@ -2964,6 +2986,48 @@ mod tests {
         assert!(
             keys.iter()
                 .any(|key| key.chord == "P" && key.label == "push HEAD")
+        );
+    }
+
+    #[test]
+    fn interactive_anchor_prefers_the_mark_over_the_selection() {
+        let data = data_with_commits(5);
+        let mut ui = GitUi {
+            focus: GitView::Commits,
+            mark_base: Some("marked-base".into()),
+            ..Default::default()
+        };
+        ui.cur.set(GitView::Commits, 1);
+        assert_eq!(
+            interactive_anchor(&ui, &data),
+            Some(PlanFrom::Mark("marked-base".into()))
+        );
+    }
+
+    #[test]
+    fn interactive_anchor_without_mark_keeps_the_oldest_selection_rule() {
+        let mut data = data_with_commits(5);
+        data.commits[3].parents = vec!["parent-sha".into()];
+        let mut ui = GitUi {
+            focus: GitView::Commits,
+            ..Default::default()
+        };
+        ui.cur.set(GitView::Commits, 1);
+        ui.sel_anchor = Some(3);
+        assert_eq!(
+            interactive_anchor(&ui, &data),
+            Some(PlanFrom::Target {
+                oldest: data.commits[3].sha.clone(),
+                base: format!("{}^", data.commits[3].sha),
+            })
+        );
+        data.commits[3].parents.clear();
+        assert_eq!(
+            interactive_anchor(&ui, &data),
+            Some(PlanFrom::Target {
+                oldest: data.commits[3].sha.clone(),
+                base: "--root".into(),
+            })
         );
     }
 }

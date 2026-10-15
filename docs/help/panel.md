@@ -164,7 +164,9 @@ See [[git-and-diffs]].
 
 Local branches: check out, create, delete; open-PR badges ride each row.
 At Normal width, `↵` widens to Half; the selected branch's recent commits
-appear at Half and Full width. Before the first load, the list says
+appear at Half and Full width. `p` pulls and `P` pushes HEAD only, refusing
+when another row is selected; `n` opens the new-branch name input. Menu
+pull and push also operate on HEAD only. Before the first load, the list says
 "loading…"; a failed read names the error instead of appearing empty.
 
 {{keys:branches}}
@@ -174,8 +176,9 @@ See [[git-and-diffs]].
 ### stash — stash list
 
 At Normal width, `↵` widens to Half. The stash diff appears and scrolls at
-Half and Full width, including untracked files. Apply, pop, and drop remain
-available from the stash list. See [[git-and-diffs]].
+Half and Full width, including untracked files. The diff follows the stash
+entry by its object ID. Apply, pop, and drop remain available from the stash
+list. See [[git-and-diffs]].
 Before the first load, the list says "loading…"; a failed read names the
 error instead of appearing empty.
 
@@ -338,7 +341,7 @@ Esc returns to the outline. With no language server, references say so;
 
 ### notifications
 
-The inbox. In row mode, `x` marks the row read and `d` **deletes** it. `/` searches
+The inbox. In row mode, `x` marks the row read and `d` **deletes** it. **/** searches
 every unread row; a committed filter stays visible. The header counts alert,
 unread, low-priority, and shown rows. The inbox retains every unread row and
 the newest 50 read rows. At Half width the highlighted row shows its whole
@@ -353,7 +356,7 @@ for confirmation and ignores an active filter. `g` toggles scope between
 this repo and every worktree. The popup's `a` also asks for confirmation;
 see [[bars]].
 
-Additional keys: `A` shows read rows · `/` searches the inbox.
+Additional keys: **A** shows read rows · **/** searches the inbox.
 
 An agent's `OSC 9` / `OSC 777` "I need you" is not a row here: it is live
 state, shown as the sidebar dot and the `✋` chip and cleared when you
@@ -364,7 +367,7 @@ audit trail (one current row per session, not one per turn).
 
 The live thegn log stream, scoped to this worktree + host-global lines by
 default. `/` filters by text (Esc clears), `l` cycles the minimum level,
-`y` copies the highlighted line and `Y` every visible line, `a` toggles
+`y` copies the highlighted line and **Y** every visible line, `a` toggles
 tail-follow, `g` widens to every worktree, and `w` exports visible lines
 to a file. Moving up in the rows pauses tail-follow; `a` resumes it. Rows
 show `HH:MM:SS` below Full width, and Half adds the target and worktree.
@@ -405,14 +408,16 @@ details, including its SSH/reach target.
 ### share, forward, media, telemetry, keys
 
 **share** and **forward** list the worktree's tunnels and port forwards
-(`↵` copy · `o` browser · share's `x` stops) — see [[share-and-forward]].
+(`↵` copy · `o` browser · share's `x` stops). In **share**, `n` starts a
+share; in **forward**, `n` watches a port and `x` removes a forward — see
+[[share-and-forward]].
 **media** is the docked now-playing view ([[media]]): `Alt-m` and the media
 badge focus the same System section. Its Normal/Half/Full widths progressively
 show track, controls, and queue/artwork.
 
 {{keys:media}}
 
-Additional keys: `+`/`-` adjust volume · `[`/`]` move chapters · `f`
+Additional keys: **+**/**-** adjust volume · **[**/**]** move chapters · **f**
 toggles fullscreen.
 
 {{keys:share}}
@@ -425,7 +430,8 @@ one row per device with used percent.
 {{keys:telemetry}}
 
 **keys** is a cheatsheet with the first chord per action plus panel keys;
-[[keybindings]] has the complete list.
+rows are grouped by section. `/` filters, and Enter reports where an action
+is bound. [[keybindings]] has the complete list.
 
 {{keys:keys}}
 

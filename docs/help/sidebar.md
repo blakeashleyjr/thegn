@@ -158,7 +158,9 @@ another one.
 These folders are **derived, not real folders**. They come from the dispatch
 roster — its rows of **any** status, not only the live ones — so they survive a
 restart and a finished lane stays until its rows are removed from the roster.
-A worktree no roster row references stays exactly where it was. A pipeline
+Every active roster row is retained, along with the newest 2048 finished rows.
+Older finished lanes drop out of the sidebar. A worktree no roster row references
+stays exactly where it was. A pipeline
 folder only ever hangs under a project: a lane whose worktree is not registered
 anywhere is filed by the directory its siblings live in, and one thegn cannot
 tie to any project at all is left out of the tree rather than opening a second,

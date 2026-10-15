@@ -201,10 +201,22 @@ pub(crate) fn kill_orphaned_daemon_sessions(
     dcfg: thegn_core::config::DaemonConfig,
     sids: Vec<String>,
 ) {
+    kill_orphaned_daemon_sessions_on(tokio::runtime::Handle::try_current().ok(), dcfg, sids);
+}
+
+/// Fire-and-forget kill of daemon sessions orphaned by worker-thread cleanup.
+/// The caller captures the loop runtime handle before leaving it; a missing
+/// handle remains an explicit no-op. The sids stay latched until the kill
+/// attempt completes so a quit can flush them ([`flush_orphan_kills`]).
+pub(crate) fn kill_orphaned_daemon_sessions_on(
+    rt: Option<tokio::runtime::Handle>,
+    dcfg: thegn_core::config::DaemonConfig,
+    sids: Vec<String>,
+) {
     if sids.is_empty() {
         return;
     }
-    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+    let Some(rt) = rt else {
         return;
     };
     latch_orphan_kills(&dcfg, &sids);
@@ -215,7 +227,7 @@ pub(crate) fn kill_orphaned_daemon_sessions(
                 target: "thegn::daemon",
                 killed,
                 of = sids.len(),
-                "stopped daemon sessions orphaned by the disabled daemon route"
+                "stopped orphaned daemon sessions"
             );
         }
         unlatch_orphan_kills(&sids);
@@ -536,5 +548,44 @@ mod tests {
         );
         // No runtime ⇒ returned before latching; nothing pending to flush.
         // (Asserted indirectly: the latch is only ever filled under a runtime.)
+    }
+
+    #[test]
+    fn kill_on_explicit_handle_latches_from_a_plain_thread() {
+        let sid = format!("explicit-handle-{}", std::process::id());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        let sid_for_thread = sid.clone();
+        std::thread::spawn(move || {
+            kill_orphaned_daemon_sessions_on(
+                Some(handle),
+                thegn_core::config::DaemonConfig::default(),
+                vec![sid_for_thread],
+            );
+        })
+        .join()
+        .unwrap();
+
+        let pending = PENDING_ORPHAN_KILLS.lock().unwrap();
+        let (_, latched) = pending.as_ref().unwrap();
+        assert!(latched.contains(&sid));
+        drop(pending);
+        unlatch_orphan_kills(std::slice::from_ref(&sid));
+
+        let absent_sid = format!("missing-handle-{}", std::process::id());
+        kill_orphaned_daemon_sessions_on(
+            None,
+            thegn_core::config::DaemonConfig::default(),
+            vec![absent_sid.clone()],
+        );
+        let pending = PENDING_ORPHAN_KILLS.lock().unwrap();
+        assert!(
+            !pending
+                .as_ref()
+                .is_some_and(|(_, sids)| sids.contains(&absent_sid))
+        );
     }
 }

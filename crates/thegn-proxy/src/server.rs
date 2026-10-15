@@ -384,3 +384,247 @@ async fn stats(State(state): State<SharedState>, Query(q): Query<StatsQuery>) ->
     });
     json_response(200, serde_json::to_vec(&body).unwrap_or_default())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tempfile::Builder;
+    use thegn_core::config_model_proxy::{
+        BudgetBreach, BudgetLimit, ModelProviderKind, ModelProxyConfig, ProviderEntry,
+        RouteBackend, RouteEntry,
+    };
+    use thegn_core::db::Db;
+    use thegn_core::proxy::attribution::{self, AttributionScope};
+    use thegn_core::store::ModelProxyStore;
+
+    const SCOPE: &str = "worktree:/test/worktree";
+    const WORKSPACE: &str = "workspace:/test";
+
+    #[derive(Clone, Copy, Debug)]
+    enum RefusalSetup {
+        None,
+        KillSwitch,
+        WorkspaceCap,
+    }
+
+    async fn mock_upstream() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = accepted.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let header_end = loop {
+                        if let Some(index) =
+                            request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                        {
+                            break index + 4;
+                        }
+                        let mut chunk = [0_u8; 4096];
+                        let read = socket.read(&mut chunk).await.unwrap();
+                        assert!(read > 0, "upstream request ended before its headers");
+                        request.extend_from_slice(&chunk[..read]);
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    while request.len() < header_end + content_length {
+                        let mut chunk = [0_u8; 4096];
+                        let read = socket.read(&mut chunk).await.unwrap();
+                        assert!(read > 0, "upstream request ended before its body");
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    let body = r#"{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        (format!("http://{address}/v1"), accepted, task)
+    }
+
+    fn test_key(secret: &[u8], expiry: i64) -> String {
+        attribution::encode_signed(
+            &AttributionScope {
+                scope: SCOPE.into(),
+                workspace: Some(WORKSPACE.into()),
+                nonce: "server-test".into(),
+                ..Default::default()
+            },
+            secret,
+            expiry,
+        )
+    }
+
+    fn edited_payload_key() -> String {
+        let token = test_key(
+            crate::budget::TEST_ATTRIBUTION_SECRET,
+            crate::shared::now_ms() + 60_000,
+        );
+        token.replacen(
+            &hex("worktree:/test/worktree"),
+            &hex("worktrEE:/test/worktree"),
+            1,
+        )
+    }
+
+    fn hex(value: &str) -> String {
+        value.bytes().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    async fn request_status(
+        upstream: &str,
+        endpoint: &str,
+        credential: Option<String>,
+        setup: RefusalSetup,
+    ) -> StatusCode {
+        let dir = Builder::new()
+            .prefix("thegn-proxy-test-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(dir.path().join("provider-key"), "test-upstream-key\n").unwrap();
+        let mut raw = ModelProxyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        raw.providers.push(ProviderEntry {
+            name: "test".into(),
+            kind: ModelProviderKind::Openai,
+            base_url: upstream.into(),
+            api_key: format!("file:{}", dir.path().join("provider-key").display()),
+            ..Default::default()
+        });
+        raw.routes.push(RouteEntry {
+            name: "standard".into(),
+            backends: vec![RouteBackend {
+                provider: "test".into(),
+                model: "test-model".into(),
+            }],
+            ..Default::default()
+        });
+        if matches!(setup, RefusalSetup::WorkspaceCap) {
+            raw.budget.enabled = true;
+            raw.budget.on_breach = BudgetBreach::Refuse;
+            raw.budget.scopes.insert(
+                WORKSPACE.into(),
+                BudgetLimit {
+                    tokens: Some(1),
+                    cost_usd: None,
+                },
+            );
+        }
+        let config = crate::config::build(&raw).unwrap();
+        let db = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+        crate::budget::install_test_attribution_secret();
+        match setup {
+            RefusalSetup::None => {}
+            RefusalSetup::KillSwitch => db
+                .lock()
+                .unwrap()
+                .set_model_proxy_kill_switch(SCOPE, true)
+                .unwrap(),
+            RefusalSetup::WorkspaceCap => {
+                let identity = crate::budget::Identity {
+                    scope: SCOPE.into(),
+                    workspace: Some(WORKSPACE.into()),
+                    ..Default::default()
+                };
+                crate::budget::record_spend(
+                    &db,
+                    &config.budget,
+                    &identity,
+                    1,
+                    0.0,
+                    crate::shared::now_ms(),
+                );
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app(crate::state::AppState::new(
+                    config,
+                    db,
+                    crate::shared::now_ms(),
+                )),
+            )
+            .await
+            .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let mut request = client
+            .post(format!("http://{address}{endpoint}"))
+            .header("content-type", "application/json");
+        if let Some(key) = credential {
+            request = if endpoint == "/v1/messages" {
+                request.header("x-api-key", key)
+            } else {
+                request.bearer_auth(key)
+            };
+        }
+        let body = if endpoint == "/v1/messages" {
+            json!({"model":"standard","max_tokens":16,"messages":[{"role":"user","content":"hello"}]})
+        } else {
+            json!({"model":"standard","messages":[{"role":"user","content":"hello"}]})
+        };
+        let response = request.json(&body).send().await.unwrap();
+        let status = response.status();
+        service.abort();
+        status
+    }
+
+    #[tokio::test]
+    async fn both_protocol_surfaces_refuse_bad_credentials_and_budgets_before_upstream() {
+        use crate::budget::TEST_ATTRIBUTION_SECRET;
+
+        let (upstream, accepted, upstream_task) = mock_upstream().await;
+        for endpoint in ["/v1/chat/completions", "/v1/messages"] {
+            let valid = test_key(TEST_ATTRIBUTION_SECRET, crate::shared::now_ms() + 60_000);
+            let wrong_secret = test_key(b"another-test-secret", crate::shared::now_ms() + 60_000);
+            let expired = test_key(TEST_ATTRIBUTION_SECRET, 0);
+            let cases = [
+                (None, RefusalSetup::None),
+                (Some(edited_payload_key()), RefusalSetup::None),
+                (Some(expired), RefusalSetup::None),
+                (Some(wrong_secret), RefusalSetup::None),
+                (Some(valid.clone()), RefusalSetup::KillSwitch),
+                (Some(valid.clone()), RefusalSetup::WorkspaceCap),
+            ];
+            for (credential, setup) in cases {
+                let before = accepted.load(Ordering::SeqCst);
+                let status = request_status(&upstream, endpoint, credential, setup).await;
+                assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{endpoint} {setup:?}");
+                assert_eq!(
+                    accepted.load(Ordering::SeqCst),
+                    before,
+                    "refused {endpoint} request reached the upstream"
+                );
+            }
+
+            let before = accepted.load(Ordering::SeqCst);
+            let status = request_status(&upstream, endpoint, Some(valid), RefusalSetup::None).await;
+            assert_eq!(status, StatusCode::OK, "positive control for {endpoint}");
+            assert_eq!(accepted.load(Ordering::SeqCst), before + 1);
+        }
+        upstream_task.abort();
+    }
+}

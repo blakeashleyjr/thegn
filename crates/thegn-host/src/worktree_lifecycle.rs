@@ -694,6 +694,7 @@ pub fn spawn_workspace_destroy(
     paths: Vec<String>,
     waker: Option<termwiz::terminal::TerminalWaker>,
 ) -> std::io::Result<()> {
+    let runtime_handle = tokio::runtime::Handle::try_current().ok();
     std::thread::Builder::new()
         .name("thegn-workspace-destroy".into())
         .spawn(move || {
@@ -753,11 +754,16 @@ pub fn spawn_workspace_destroy(
             if failed_paths.is_empty()
                 && let Some(db) = db.as_ref()
             {
-                crate::handlers::workspace_remove::forget_workspace_in_db(
+                let orphaned_sids = crate::handlers::workspace_remove::forget_workspace_in_db(
                     db,
                     &session_id,
                     &repo_root.to_string_lossy(),
                     &slug,
+                );
+                crate::handlers::daemon_lifecycle::kill_orphaned_daemon_sessions_on(
+                    runtime_handle,
+                    cfg.daemon.clone(),
+                    orphaned_sids,
                 );
             }
             complete(

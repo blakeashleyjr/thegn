@@ -1971,13 +1971,32 @@ fn compose_row_lines(
                     right.push(seg(Tok::Hue(theme::Hue::Purple), gl.submodule));
                 }
                 if disp.show_diff_stat {
-                    if g.add > 0 {
+                    use thegn_svc::git::DiffCount;
+                    if g.add == DiffCount::Binary || g.del == DiffCount::Binary {
                         push_sp(&mut right);
-                        right.push(seg(Tok::Hue(theme::Hue::Green), format!("+{}", g.add)));
+                        right.push(seg(Tok::Slot(S::Dim), "bin"));
                     }
-                    if g.del > 0 {
-                        push_sp(&mut right);
-                        right.push(seg(Tok::Hue(theme::Hue::Red), format!("-{}", g.del)));
+                    match g.add {
+                        DiffCount::Exact(n) if n > 0 => {
+                            push_sp(&mut right);
+                            right.push(seg(Tok::Hue(theme::Hue::Green), format!("+{n}")));
+                        }
+                        DiffCount::Capped => {
+                            push_sp(&mut right);
+                            right.push(seg(Tok::Hue(theme::Hue::Green), "+capped"));
+                        }
+                        DiffCount::Exact(_) | DiffCount::Binary | DiffCount::Unavailable => {}
+                    }
+                    match g.del {
+                        DiffCount::Exact(n) if n > 0 => {
+                            push_sp(&mut right);
+                            right.push(seg(Tok::Hue(theme::Hue::Red), format!("-{n}")));
+                        }
+                        DiffCount::Capped => {
+                            push_sp(&mut right);
+                            right.push(seg(Tok::Hue(theme::Hue::Red), "-capped"));
+                        }
+                        DiffCount::Exact(_) | DiffCount::Binary | DiffCount::Unavailable => {}
                     }
                 }
                 if disp.show_ahead_behind {
@@ -3536,5 +3555,56 @@ mod tests {
             ws_hidden.chars().count(),
             "the suppressed digit is replaced by an equal-width gutter",
         );
+    }
+
+    #[test]
+    fn right_cluster_renders_typed_diff_counts_without_sentinels() {
+        use crate::sidebar::{GitGlyphs, SidebarRow};
+        use thegn_svc::git::DiffCount;
+
+        let render = |add, del| {
+            let mut row = SidebarRow::base(RowKind::Worktree, 1, "feat", "app");
+            row.git = Some(GitGlyphs {
+                add,
+                del,
+                ..GitGlyphs::default()
+            });
+            compose_row_lines(
+                &row,
+                None,
+                None,
+                false,
+                false,
+                true,
+                None,
+                None,
+                40,
+                &mut None,
+                &SidebarDisplay::default(),
+            )
+            .into_iter()
+            .flat_map(|line| match line {
+                crate::seg::Line::Segs(segs) => segs,
+                crate::seg::Line::Split { l, r } | crate::seg::Line::SplitMinLeft { l, r, .. } => {
+                    l.into_iter().chain(r).collect()
+                }
+                _ => Vec::new(),
+            })
+            .map(|seg| seg.text)
+            .collect::<String>()
+        };
+
+        let binary = render(DiffCount::Binary, DiffCount::Binary);
+        assert!(binary.contains("bin"), "{binary:?}");
+        assert!(!binary.contains("+0"), "{binary:?}");
+
+        let capped = render(DiffCount::Capped, DiffCount::Capped);
+        assert!(capped.contains("+capped"), "{capped:?}");
+        assert!(capped.contains("-capped"), "{capped:?}");
+        assert!(!capped.contains("4294967295"), "{capped:?}");
+
+        let exact = render(DiffCount::Exact(42), DiffCount::Exact(7));
+        assert!(exact.contains("+42"), "{exact:?}");
+        assert!(exact.contains("-7"), "{exact:?}");
     }
 }

@@ -54,6 +54,12 @@ pub trait AppTile {
     /// Render the current view into `area` of `buf`. Pure and synchronous.
     fn render(&mut self, area: Rect, buf: &mut Buffer);
 
+    /// Receive a new semantic theme after the host palette changes. The host
+    /// delivers this once per palette generation; the startup palette is
+    /// supplied by the tile constructor. Implementations must not block, reload
+    /// configuration, or restart query engines. The host re-renders afterward.
+    fn on_theme(&mut self, _theme: &crate::theme::Theme) {}
+
     /// The text-input caret position, relative to the tile's `area`, if the
     /// tile wants a visible hardware cursor. `None` hides it.
     fn cursor(&self) -> Option<(u16, u16)> {

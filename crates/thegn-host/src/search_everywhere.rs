@@ -294,6 +294,9 @@ pub struct PaletteSession {
     pub result_tx: UnboundedSender<AsyncSearchResult>,
     pub search_gen: u64,
     pub searching: bool,
+    pub(crate) db_pending: bool,
+    pub(crate) db_key: Option<String>,
+    pub(crate) db_generation: u64,
     /// True while a file-index build is in flight (cold picker). Guards against
     /// spawning one full worktree scan per keystroke: `file_index` stays `None`
     /// until the loop installs it, so without this flag every keystroke typed
@@ -321,8 +324,48 @@ impl PaletteSession {
             result_tx: tx,
             search_gen: 0,
             searching: false,
+            db_pending: false,
+            db_key: None,
+            db_generation: 0,
             index_building: false,
             waker: None,
+        }
+    }
+
+    pub(crate) fn mark_db_pending(&mut self, key: String, generation: u64) {
+        self.db_key = Some(key);
+        self.db_generation = generation;
+        self.db_pending = true;
+    }
+
+    pub(crate) fn apply_db_items(
+        &mut self,
+        key: &str,
+        generation: u64,
+        mut items: Vec<crate::palette::PaletteItem>,
+    ) -> bool {
+        if !self.db_pending
+            || self.db_key.as_deref() != Some(key)
+            || self.db_generation != generation
+        {
+            return false;
+        }
+        items.extend(
+            self.palette
+                .items()
+                .iter()
+                .filter(|item| item.key.starts_with("plugin:"))
+                .cloned(),
+        );
+        self.palette.replace_items(items);
+        self.selected = self.palette.selected_idx();
+        self.db_pending = false;
+        true
+    }
+
+    pub(crate) fn clear_db_pending(&mut self, key: &str, generation: u64) {
+        if self.db_key.as_deref() == Some(key) && self.db_generation == generation {
+            self.db_pending = false;
         }
     }
 
@@ -620,6 +663,12 @@ impl PaletteSession {
         }
         if self.searching {
             prompt.push(seg(Tok::Slot(S::Ghost2), "  …"));
+        }
+        if self.db_pending {
+            prompt.push(seg(
+                Tok::Slot(S::Ghost2),
+                format!("  {}", crate::caps::active_glyphs().ellipsis),
+            ));
         }
         seg::draw_line(
             surface,
@@ -1903,5 +1952,39 @@ mod tests {
             },
         );
         // no panic = pass
+    }
+
+    #[test]
+    fn result_keeps_query_and_selected_key() {
+        let key = "Main:session";
+        let mut session = PaletteSession::new(vec![
+            crate::palette::PaletteItem::new("alpha", "Alpha"),
+            crate::palette::PaletteItem::new("beta", "Beta"),
+        ]);
+        session.push_char('a');
+        session.palette.move_down();
+        session.selected = session.palette.selected_idx();
+        let selected = session.palette.selected_item().unwrap().key.clone();
+        session.mark_db_pending(key.into(), 7);
+        assert!(session.apply_db_items(
+            key,
+            7,
+            vec![
+                crate::palette::PaletteItem::new("beta", "Beta refreshed"),
+                crate::palette::PaletteItem::new("alpha", "Alpha refreshed"),
+            ],
+        ));
+        assert_eq!(session.palette.query(), "a");
+        assert_eq!(session.palette.selected_item().unwrap().key, selected);
+        assert!(!session.db_pending);
+    }
+
+    #[test]
+    fn dropped_job_fallback_clears_pending() {
+        let key = "Main:session";
+        let mut session = PaletteSession::new(Vec::new());
+        session.mark_db_pending(key.into(), 9);
+        session.clear_db_pending(key, 9);
+        assert!(!session.db_pending);
     }
 }

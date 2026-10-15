@@ -47,13 +47,15 @@ ranges.
 
 Branches are local: check out, create, and delete them; open-PR badges ride
 each row. At Normal width, `↵` widens to Half. The selected branch's recent
-commits appear at Half and Full width.
+commits appear at Half and Full width. `p` pulls and `P` pushes HEAD only;
+both refuse when another row is selected. `n` opens the new-branch name input.
+The menu's pull and push actions also operate on HEAD only.
 
 ### stash
 
 Apply, pop, and drop stash entries. At Normal width, `↵` widens to Half to
-show the stash diff, including untracked files. It appears and can be scrolled
-at both Half and Full widths.
+show the stash diff, including untracked files. It follows the entry by its
+object ID and can be scrolled at both Half and Full widths.
 
 ### files
 

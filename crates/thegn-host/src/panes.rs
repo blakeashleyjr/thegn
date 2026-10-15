@@ -209,7 +209,7 @@ pub(crate) fn terminal_launch_spec(
     // every caller of this builder runs off-thread.
     let backend = sandbox_backend.trim();
     if connection.is_empty() && !backend.is_empty() && backend != "host" && backend != "none" {
-        let (wrapped, isolation) = match sandbox_wrap_shell(cfg, backend, &argv) {
+        let wrapped = match sandbox_wrap_shell(cfg, backend, &argv) {
             Err(error) => return Err(error.context("sandbox entry refused")),
             Ok(Some(wrapped)) => wrapped,
             Ok(None) => {
@@ -241,22 +241,26 @@ pub(crate) fn terminal_launch_spec(
         // requested runtime that isn't running (no podman machine, dockerd down)
         // comes back as a plain host shell — and stamping the request here is
         // what made a bare `sh -lc` claim to be rootless podman.
-        let truth = thegn_core::sandbox_truth::reconcile(backend, &wrapped);
+        let truth = thegn_core::sandbox_truth::reconcile(backend, &wrapped.argv);
         if !truth.degraded {
             let mut warnings = Vec::new();
             admit_terminal(
                 &cfg.sandbox,
                 backend,
-                TerminalOutcome::Wrapped(isolation),
+                TerminalOutcome::Wrapped(wrapped.isolation),
                 &mut warnings,
             )
             .map_err(|error| error.context("sandbox entry refused"))?;
+            if let Some(note) = wrapped.network_note.as_deref() {
+                thegn_core::msg::warn(note);
+            }
+            let degraded = finish_wrapped_terminal(&wrapped, &mut warnings);
             return Ok(crate::agent::LaunchSpec {
-                argv: wrapped,
+                argv: wrapped.argv,
                 cwd: None,
                 env: vec![],
                 backend: truth.label,
-                degraded: !warnings.is_empty(),
+                degraded,
                 warnings,
                 remote: false,
             });
@@ -306,6 +310,14 @@ pub(crate) fn terminal_launch_spec(
     })
 }
 
+fn finish_wrapped_terminal(wrapped: &WrappedShell, warnings: &mut Vec<String>) -> bool {
+    let degraded = !warnings.is_empty();
+    if let Some(note) = &wrapped.network_note {
+        warnings.push(note.clone());
+    }
+    degraded
+}
+
 #[derive(Clone, Copy)]
 enum TerminalOutcome {
     HostFallback,
@@ -325,7 +337,7 @@ fn admit_terminal(
         }
         TerminalOutcome::Wrapped(class) => class,
     };
-    crate::sandbox_admission::admit(sb, actual, "terminal", warnings)
+    crate::sandbox_admission::admit(sb, actual, "terminal", false, warnings)
         .map_err(|error| error.context(format!("requested terminal sandbox `{requested}`")))
 }
 
@@ -348,6 +360,13 @@ fn cap_local_shell(connection: &str, argv: Vec<String>) -> Vec<String> {
     thegn_core::sandbox_cpucap::wrap_uncontained_pane_argv(argv)
 }
 
+#[derive(Debug)]
+struct WrappedShell {
+    argv: Vec<String>,
+    isolation: thegn_core::capabilities::IsolationClass,
+    network_note: Option<String>,
+}
+
 /// Build the sandbox-wrapping argv for a local terminal shell: force the chosen
 /// `backend` into a [`thegn_core::sandbox::SandboxSpec`] anchored at `$HOME`
 /// and `exec` the shell inside it (via
@@ -365,16 +384,14 @@ fn sandbox_wrap_shell(
     cfg: &thegn_core::config::Config,
     backend: &str,
     shell_argv: &[String],
-) -> anyhow::Result<Option<(Vec<String>, thegn_core::capabilities::IsolationClass)>> {
+) -> anyhow::Result<Option<WrappedShell>> {
     // Invalid configured sources remain a refusal even when HOME or the
     // requested backend is unavailable; neither may produce a host fallback.
     thegn_core::sandbox::admit_volume_sources(cfg.sandbox.volumes.keys().map(String::as_str))?;
     // THE-215: a sealed profile never degrades to a host shell. Every
     // "no sandbox" outcome below becomes a visible refusal instead.
     let sealed = cfg.sandbox.profile.hides_home();
-    let refuse = |why: &str| -> anyhow::Result<
-        Option<(Vec<String>, thegn_core::capabilities::IsolationClass)>,
-    > {
+    let refuse = |why: &str| -> anyhow::Result<Option<WrappedShell>> {
         anyhow::bail!(
             "profile `{}` requires a sandbox that hides $HOME, but {why}; refusing a host shell",
             cfg.sandbox.profile.as_str()
@@ -424,10 +441,12 @@ fn sandbox_wrap_shell(
     // argv (path + login flags) is the interactive shell that owns the pane.
     let inner = shell_words_join(shell_argv);
     let isolation = spec.capabilities().isolation;
-    Ok(Some((
-        thegn_core::sandbox::enter_argv(&spec, &inner)?,
+    let network_note = thegn_core::sandbox::hostname_rules_note(&spec);
+    Ok(Some(WrappedShell {
+        argv: thegn_core::sandbox::enter_argv(&spec, &inner)?,
         isolation,
-    )))
+        network_note,
+    }))
 }
 
 /// Join a shell argv into a single command string for `sh -lc` execution,
@@ -1611,7 +1630,7 @@ mod tests {
         // sandbox backends happen to be installed on the host.
         let mut cfg = thegn_core::config::Config::default();
         cfg.sandbox.enabled = true;
-        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::Off;
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
         let spec = terminal_launch_spec(&cfg, "", "bwrap").expect("valid volume names");
         assert!(!spec.argv.is_empty());
         // When bwrap is the runtime that actually resolved, it must front the
@@ -2134,7 +2153,7 @@ mod tests {
     #[test]
     fn terminal_unknown_backend_with_fail_floor_refuses() {
         let mut cfg = thegn_core::config::Config::default();
-        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::SharedKernel);
         cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
 
         let error = terminal_launch_spec(&cfg, "", "nonsense-backend")
@@ -2145,7 +2164,7 @@ mod tests {
     #[test]
     fn terminal_unknown_backend_with_degrade_floor_is_labelled_degraded() {
         let mut cfg = thegn_core::config::Config::default();
-        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::SharedKernel);
         cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Degrade;
 
         let spec = terminal_launch_spec(&cfg, "", "nonsense-backend")
@@ -2158,7 +2177,7 @@ mod tests {
     #[test]
     fn terminal_unknown_backend_without_floor_is_not_silent() {
         let mut cfg = thegn_core::config::Config::default();
-        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::Off;
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
         cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
 
         let spec = terminal_launch_spec(&cfg, "", "nonsense-backend")
@@ -2172,7 +2191,7 @@ mod tests {
     #[test]
     fn admit_terminal_refuses_weaker_wrapped_class_under_fail() {
         let mut cfg = thegn_core::config::Config::default();
-        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::SharedKernel);
         cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
         let mut warnings = Vec::new();
         assert!(
@@ -2214,7 +2233,7 @@ mod tests {
     #[test]
     fn terminal_explicit_host_and_ssh_unchanged_under_fail_floor() {
         let mut cfg = thegn_core::config::Config::default();
-        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::SharedKernel);
         cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
 
         for backend in ["", "host", "none"] {
@@ -2231,5 +2250,47 @@ mod tests {
         assert_eq!(remote.backend, "host");
         assert!(!remote.degraded);
         assert!(remote.warnings.is_empty());
+    }
+
+    #[test]
+    fn wrapped_terminal_carries_dns_only_note_without_degrading() {
+        let wrapped = WrappedShell {
+            argv: vec!["bwrap".into()],
+            isolation: thegn_core::capabilities::IsolationClass::SharedKernel,
+            network_note: Some("DNS-name rules only; not an egress boundary".into()),
+        };
+        let mut warnings = Vec::new();
+        let degraded = finish_wrapped_terminal(&wrapped, &mut warnings);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("DNS-name rules only"))
+        );
+        assert!(!degraded);
+
+        let mut admit_warnings = vec!["sandbox admission warning".to_string()];
+        let degraded = finish_wrapped_terminal(&wrapped, &mut admit_warnings);
+        assert!(degraded);
+        assert_eq!(admit_warnings.len(), 2);
+        assert!(
+            admit_warnings
+                .iter()
+                .any(|warning| warning == "sandbox admission warning")
+        );
+        assert!(
+            admit_warnings
+                .iter()
+                .any(|warning| warning.contains("DNS-name rules only"))
+        );
+
+        let no_note_wrapped = WrappedShell {
+            argv: vec!["bwrap".into()],
+            isolation: thegn_core::capabilities::IsolationClass::SharedKernel,
+            network_note: None,
+        };
+        let mut no_note_warnings = Vec::new();
+        let no_note_degraded = finish_wrapped_terminal(&no_note_wrapped, &mut no_note_warnings);
+        assert!(no_note_warnings.is_empty());
+        assert!(!no_note_degraded);
     }
 }

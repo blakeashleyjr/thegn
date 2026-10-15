@@ -776,9 +776,12 @@ fn sidebar_worktree_row_shows_diff_stat_pr_chip_and_focus_detail() {
         dirty: true,
         ahead: 2,
         behind: 1,
-        add: 42,
-        del: 7,
-        branch_diff: Some((310, 84)),
+        add: thegn_svc::git::DiffCount::Exact(42),
+        del: thegn_svc::git::DiffCount::Exact(7),
+        branch_diff: Some((
+            thegn_svc::git::DiffCount::Exact(310),
+            thegn_svc::git::DiffCount::Exact(84),
+        )),
         submodule_dirty: false,
         jj: false,
     });
@@ -830,7 +833,10 @@ fn sidebar_worktree_detail_hidden_when_sidebar_unfocused() {
     ws.collapsed = false;
     let mut wt = row(RowKind::Worktree, "feat");
     wt.git = Some(GitGlyphs {
-        branch_diff: Some((310, 84)),
+        branch_diff: Some((
+            thegn_svc::git::DiffCount::Exact(310),
+            thegn_svc::git::DiffCount::Exact(84),
+        )),
         ..Default::default()
     });
     let model = FrameModel {
@@ -3223,4 +3229,81 @@ fn weather_sheds_right_after_date() {
     assert!(!no_weather.iter().any(|&i| parts[i].0 == "weather"));
     assert!(no_weather.iter().any(|&i| parts[i].0 == "clock"));
     assert!(no_weather.iter().any(|&i| parts[i].0 == "cpu"));
+}
+
+#[test]
+fn net_widget_uses_configured_medium_glyphs_in_auto_mode() {
+    use thegn_core::config::{NetIconsConfig, StatsConfig};
+    use thegn_metrics::NetMedium;
+
+    let glyphs = crate::caps::active_glyphs();
+    let mut model = FrameModel {
+        stats_icons: StatsConfig {
+            net_icons: NetIconsConfig {
+                wifi: String::new(),
+                ethernet: "ETH".into(),
+                generic: "?".into(),
+            },
+            ..StatsConfig::default()
+        },
+        ..FrameModel::default()
+    };
+    model.stats.net_bps = Some((1536, 1024));
+
+    model.stats.net_medium = NetMedium::Ethernet;
+    assert!(
+        masthead_widget("net", &model)
+            .unwrap()
+            .text
+            .starts_with("ETH")
+    );
+    model.stats.net_medium = NetMedium::Wifi;
+    assert!(
+        masthead_widget("net", &model)
+            .unwrap()
+            .text
+            .starts_with(glyphs.net_wifi)
+    );
+    model.stats.net_medium = NetMedium::Unknown;
+    assert!(
+        masthead_widget("net", &model)
+            .unwrap()
+            .text
+            .starts_with('?')
+    );
+
+    model.stats_icons.net_icons.ethernet = "  \t".into();
+    model.stats.net_medium = NetMedium::Ethernet;
+    assert!(
+        masthead_widget("net", &model)
+            .unwrap()
+            .text
+            .starts_with(glyphs.net_wired)
+    );
+}
+
+#[test]
+fn fixed_net_icon_overrides_per_medium_glyphs() {
+    use thegn_core::config::{NetIconsConfig, StatsConfig};
+    use thegn_metrics::NetMedium;
+
+    let mut model = FrameModel {
+        stats_icons: StatsConfig {
+            net_icon: "NET".into(),
+            net_icons: NetIconsConfig {
+                ethernet: "ETH".into(),
+                ..NetIconsConfig::default()
+            },
+            ..StatsConfig::default()
+        },
+        ..FrameModel::default()
+    };
+    model.stats.net_bps = Some((1536, 1024));
+    model.stats.net_medium = NetMedium::Ethernet;
+    assert!(
+        masthead_widget("net", &model)
+            .unwrap()
+            .text
+            .starts_with("NET")
+    );
 }

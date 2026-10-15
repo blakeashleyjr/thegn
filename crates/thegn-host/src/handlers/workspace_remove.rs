@@ -149,8 +149,15 @@ pub(crate) fn remove_workspace(
     let session_id = session.id.clone();
     let repo_path_owned = repo_path.to_string();
     let slug_owned = slug.to_string();
+    let runtime_handle = tokio::runtime::Handle::try_current().ok();
+    let daemon_config = cfg.daemon.clone();
     crate::db_task::persist_critical(move |db| {
-        forget_workspace_in_db(db, &session_id, &repo_path_owned, &slug_owned);
+        let orphaned_sids = forget_workspace_in_db(db, &session_id, &repo_path_owned, &slug_owned);
+        crate::handlers::daemon_lifecycle::kill_orphaned_daemon_sessions_on(
+            runtime_handle,
+            daemon_config,
+            orphaned_sids,
+        );
     });
 
     // Removing the active workspace leaves the session pointing at nothing;
@@ -329,7 +336,7 @@ pub(crate) fn forget_workspace_in_db(
     session_id: &str,
     repo_path: &str,
     slug: &str,
-) {
+) -> Vec<String> {
     if let Ok(groups) = db.groups_for_session(session_id) {
         for group in groups.into_iter().filter(|group| {
             crate::sidebar::split_tab(&group.name).is_some_and(|(group_slug, _)| group_slug == slug)
@@ -337,8 +344,20 @@ pub(crate) fn forget_workspace_in_db(
             let _ = db.delete_tab_group(session_id, &group.name); // best-effort: cache write: layout is resurrection state
         }
     }
-    if let Err(error) = db.delete_tab_groups_with_prefix(slug) {
-        tracing::debug!(%error, slug, "workspace removal could not prune matching groups from every persisted session");
+    let mut orphaned_sids = Vec::new();
+    match db.delete_tab_groups_with_prefix(slug) {
+        Ok(deleted_tabs) => {
+            for (deleted_session, pane_sessions) in deleted_tabs {
+                if deleted_session != session_id {
+                    orphaned_sids.extend(daemon_sids_from_pane_sessions(&pane_sessions));
+                }
+            }
+            orphaned_sids.sort_unstable();
+            orphaned_sids.dedup();
+        }
+        Err(error) => {
+            tracing::debug!(%error, slug, "workspace removal could not prune matching groups from every persisted session");
+        }
     }
     let _ = db.del_worktrees_for_repo(repo_path); // best-effort: cache write: git is the source of truth
     let _ = db.del_workspace(repo_path); // best-effort: cache write: git is the source of truth
@@ -349,6 +368,25 @@ pub(crate) fn forget_workspace_in_db(
     }
     del_ui_state_segment(db, SIDEBAR_SCOPE, "collapse", slug);
     del_ui_state_segment(db, SIDEBAR_SCOPE, "pin", slug);
+    orphaned_sids
+}
+
+fn daemon_sids_from_pane_sessions(json: &str) -> Vec<String> {
+    let pane_sessions = match serde_json::from_str::<
+        std::collections::BTreeMap<u32, crate::session::ProviderSession>,
+    >(json)
+    {
+        Ok(pane_sessions) => pane_sessions,
+        Err(error) => {
+            tracing::debug!(%error, "could not parse deleted tab pane sessions while removing workspace");
+            return Vec::new();
+        }
+    };
+    pane_sessions
+        .into_values()
+        .filter(|provider_session| provider_session.provider == "daemon")
+        .map(|provider_session| provider_session.session)
+        .collect()
 }
 
 /// Segment-anchored delete of a `{prefix}:{name}` ui_state key family: removes
@@ -407,7 +445,7 @@ mod tests {
         db.put_tab_group("other-session", &group).unwrap();
         db.put_group_tab("other-session", &tab).unwrap();
 
-        forget_workspace_in_db(&db, "active-session", "/r/lib", "lib");
+        assert!(forget_workspace_in_db(&db, "active-session", "/r/lib", "lib").is_empty());
 
         assert!(db.groups_for_session("other-session").unwrap().is_empty());
         assert!(
@@ -415,6 +453,60 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn forget_workspace_in_db_returns_foreign_daemon_sids() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_workspace("/r/lib", "lib", "repo").unwrap();
+        let group = |name: &str| thegn_core::models::TabGroupRow {
+            name: name.into(),
+            kind: "branch".into(),
+            worktree: format!("/wt/{name}"),
+            ordinal: 0,
+            active_tab: 0,
+        };
+        let tab = |name: &str, pane_sessions: &str| thegn_core::models::GroupTabRow {
+            group_name: name.into(),
+            ordinal: 0,
+            title: "1".into(),
+            pane_tree: r#"{"leaf":0}"#.into(),
+            focused_pane: 0,
+            pane_cwds: String::new(),
+            pane_cmds: String::new(),
+            pane_sessions: pane_sessions.into(),
+            scrollback_snapshot: String::new(),
+        };
+        db.put_tab_group("other-session", &group("lib/stale"))
+            .unwrap();
+        db.put_group_tab(
+            "other-session",
+            &tab(
+                "lib/stale",
+                r#"{"0":{"provider":"daemon","id":"x","session":"sid-a"},"1":{"provider":"sprites","id":"y","session":"sid-b"}}"#,
+            ),
+        )
+        .unwrap();
+        db.put_tab_group("active-session", &group("lib/home"))
+            .unwrap();
+        db.put_group_tab(
+            "active-session",
+            &tab(
+                "lib/home",
+                r#"{"0":{"provider":"daemon","id":"x","session":"sid-c"}}"#,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            forget_workspace_in_db(&db, "active-session", "/r/lib", "lib"),
+            vec!["sid-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn daemon_sids_from_malformed_pane_sessions_is_empty() {
+        assert!(daemon_sids_from_pane_sessions("not json").is_empty());
     }
 
     #[test]

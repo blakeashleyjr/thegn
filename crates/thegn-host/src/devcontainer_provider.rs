@@ -124,7 +124,11 @@ pub(crate) fn can_honor_sandbox(sb: &thegn_core::config::SandboxConfig) -> bool 
         && sb.network_block.is_empty()
         && !sb.network_audit
         && !sb.vpn.is_enabled()
-        && sb.isolation_floor == thegn_core::config::IsolationFloor::Off
+        && matches!(
+            thegn_core::sandbox_floor::floor_in_force(sb, false),
+            thegn_core::config::IsolationFloor::Off
+                | thegn_core::config::IsolationFloor::SharedKernel
+        )
         // The CLI has no equivalent for thegn's remote daemon or OCI runtime
         // selection. Falling through preserves both the user's endpoint and
         // any stronger userspace/guest-kernel isolation they requested.
@@ -830,6 +834,9 @@ mod tests {
 
         sb.profile = thegn_core::config::SandboxProfile::Open;
         assert!(can_honor_sandbox(&sb));
+        sb.isolation_floor = Some(thegn_core::config::IsolationFloor::GuestKernel);
+        assert!(!can_honor_sandbox(&sb));
+        sb.isolation_floor = None;
 
         sb.network = thegn_core::config::Network::None;
         assert!(!can_honor_sandbox(&sb));
