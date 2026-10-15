@@ -360,6 +360,7 @@ fn cap_local_shell(connection: &str, argv: Vec<String>) -> Vec<String> {
     thegn_core::sandbox_cpucap::wrap_uncontained_pane_argv(argv)
 }
 
+#[derive(Debug)]
 struct WrappedShell {
     argv: Vec<String>,
     isolation: thegn_core::capabilities::IsolationClass,
