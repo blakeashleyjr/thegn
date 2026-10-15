@@ -84,8 +84,8 @@ mod tests {
                 behind,
                 branch: None,
                 repo_root: String::new(),
-                add: 0,
-                del: 0,
+                add: thegn_svc::git::DiffCount::Exact(0),
+                del: thegn_svc::git::DiffCount::Exact(0),
                 branch_diff: None,
                 submodule_dirty: false,
             },
@@ -115,18 +115,24 @@ mod tests {
             behind: 0,
             branch: None,
             repo_root: String::new(),
-            add: 42,
-            del: 7,
-            branch_diff: Some((310, 84)),
+            add: thegn_svc::git::DiffCount::Exact(42),
+            del: thegn_svc::git::DiffCount::Exact(7),
+            branch_diff: Some((
+                thegn_svc::git::DiffCount::Exact(310),
+                thegn_svc::git::DiffCount::Exact(84),
+            )),
             submodule_dirty: false,
         };
         assert_eq!(
             glyphs_from_row(&r),
             GitGlyphs {
                 dirty: true,
-                add: 42,
-                del: 7,
-                branch_diff: Some((310, 84)),
+                add: thegn_svc::git::DiffCount::Exact(42),
+                del: thegn_svc::git::DiffCount::Exact(7),
+                branch_diff: Some((
+                    thegn_svc::git::DiffCount::Exact(310),
+                    thegn_svc::git::DiffCount::Exact(84)
+                )),
                 ..Default::default()
             }
         );
@@ -197,8 +203,8 @@ mod tests {
                     behind: 0,
                     branch: Some("tg/live".to_string()),
                     repo_root: String::new(),
-                    add: 0,
-                    del: 0,
+                    add: thegn_svc::git::DiffCount::Exact(0),
+                    del: thegn_svc::git::DiffCount::Exact(0),
                     branch_diff: None,
                     submodule_dirty: false,
                 },

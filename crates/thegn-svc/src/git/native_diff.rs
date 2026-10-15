@@ -414,11 +414,14 @@ pub(crate) fn diff_entries(
     }
 }
 
-/// `(added, deleted)` totals for `spec` — the [`super::sum_numstat`] of
-/// [`diff_entries`], without materialising the rows.
-pub(crate) fn totals(path: impl AsRef<std::path::Path>, spec: &str) -> Result<(u32, u32)> {
+/// Typed `(added, deleted)` totals for `spec`, without dropping binary or
+/// capped observations.
+pub(crate) fn totals(
+    path: impl AsRef<std::path::Path>,
+    spec: &str,
+) -> Result<(super::DiffCount, super::DiffCount)> {
     let entries = diff_entries(path, spec)?;
-    Ok(super::sum_entries(&entries))
+    Ok(super::typed_totals(Ok(&entries)))
 }
 
 /// The tree-to-tree case: one gix walk, line-counting each changed blob.

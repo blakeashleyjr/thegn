@@ -1971,13 +1971,32 @@ fn compose_row_lines(
                     right.push(seg(Tok::Hue(theme::Hue::Purple), gl.submodule));
                 }
                 if disp.show_diff_stat {
-                    if g.add > 0 {
+                    use thegn_svc::git::DiffCount;
+                    if g.add == DiffCount::Binary || g.del == DiffCount::Binary {
                         push_sp(&mut right);
-                        right.push(seg(Tok::Hue(theme::Hue::Green), format!("+{}", g.add)));
+                        right.push(seg(Tok::Slot(S::Dim), "bin"));
                     }
-                    if g.del > 0 {
-                        push_sp(&mut right);
-                        right.push(seg(Tok::Hue(theme::Hue::Red), format!("-{}", g.del)));
+                    match g.add {
+                        DiffCount::Exact(n) if n > 0 => {
+                            push_sp(&mut right);
+                            right.push(seg(Tok::Hue(theme::Hue::Green), format!("+{n}")));
+                        }
+                        DiffCount::Capped => {
+                            push_sp(&mut right);
+                            right.push(seg(Tok::Hue(theme::Hue::Green), "+capped"));
+                        }
+                        DiffCount::Exact(_) | DiffCount::Binary | DiffCount::Unavailable => {}
+                    }
+                    match g.del {
+                        DiffCount::Exact(n) if n > 0 => {
+                            push_sp(&mut right);
+                            right.push(seg(Tok::Hue(theme::Hue::Red), format!("-{n}")));
+                        }
+                        DiffCount::Capped => {
+                            push_sp(&mut right);
+                            right.push(seg(Tok::Hue(theme::Hue::Red), "-capped"));
+                        }
+                        DiffCount::Exact(_) | DiffCount::Binary | DiffCount::Unavailable => {}
                     }
                 }
                 if disp.show_ahead_behind {
