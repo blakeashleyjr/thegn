@@ -835,8 +835,8 @@ mod tests {
         cfg.ci.provider = thegn_core::config::CiProviderKind::Gitlab;
         assert!(std::env::var_os("THE541_SURELY_UNSET_VAR").is_none());
         cfg.ci.gitlab.token = "env:THE541_SURELY_UNSET_VAR".into();
-        let reports = probes(&cfg);
-        let ci = reports.iter().find(|report| report.seam == "ci").unwrap();
+        let reports = ci_probes(&cfg);
+        let ci = &reports[0];
         assert!(matches!(
             &ci.availability,
             Availability::Unavailable(reason) if reason.contains("[ci.gitlab] token")
@@ -844,8 +844,8 @@ mod tests {
 
         cfg.ci.provider = thegn_core::config::CiProviderKind::Auto;
         cfg.ci.gitlab.token = "fixture-secret-token".into();
-        let reports = probes(&cfg);
-        let auto = reports.iter().find(|report| report.seam == "ci").unwrap();
+        let reports = ci_probes(&cfg);
+        let auto = &reports[0];
         assert!(
             auto.notes
                 .iter()
