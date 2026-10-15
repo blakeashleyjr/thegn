@@ -80,6 +80,56 @@ pub fn display_fit(s: &str, cells: usize) -> String {
     output
 }
 
+/// Render untrusted text clipped to at most `cells` display columns.
+/// Controls and format characters are replaced, leading zero-width characters
+/// are dropped, and a truncated value ends in an ellipsis without padding.
+pub fn display_clip(s: &str, cells: usize) -> String {
+    if cells == 0 {
+        return String::new();
+    }
+
+    let safe = display_cell(s);
+    let mut output = String::new();
+    let mut width = 0;
+    let mut truncated = false;
+
+    for c in safe.chars() {
+        let char_width = UnicodeWidthChar::width(c).unwrap_or(0);
+        if output.is_empty() && char_width == 0 {
+            continue;
+        }
+        if width + char_width > cells {
+            truncated = true;
+            break;
+        }
+        output.push(c);
+        width += char_width;
+    }
+
+    if !truncated {
+        return output;
+    }
+
+    while width + 1 > cells
+        && let Some(last) = output.pop()
+    {
+        width -= UnicodeWidthChar::width(last).unwrap_or(0);
+        if width + 1 > cells {
+            while let Some(mark) = output.chars().last()
+                && UnicodeWidthChar::width(mark).unwrap_or(0) == 0
+            {
+                output.pop();
+            }
+            if let Some(base) = output.pop() {
+                width -= UnicodeWidthChar::width(base).unwrap_or(0);
+            }
+        }
+    }
+    output = output.trim_end().to_string();
+    output.push('…');
+    output
+}
+
 /// A report that cannot be stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReportError {
@@ -821,5 +871,36 @@ mod tests {
         assert!(!pass_without_gate_evidence(
             "PASS\ngate: just ci — exit 0\n"
         ));
+    }
+
+    #[test]
+    fn display_clip_cuts_by_display_width() {
+        let clipped = display_clip("日本語テキスト", 6);
+        assert!(UnicodeWidthStr::width(clipped.as_str()) <= 6, "{clipped:?}");
+        assert!(clipped.ends_with('…'), "{clipped:?}");
+        assert_eq!(display_clip("ab日", 3), "ab…");
+    }
+
+    #[test]
+    fn display_clip_keeps_combining_marks_with_their_base() {
+        let clipped = display_clip("e\u{301}e\u{301}e\u{301}x", 3);
+        assert!(!clipped.ends_with('\u{301}'), "{clipped:?}");
+        assert_eq!(clipped, "e\u{301}e\u{301}…");
+        assert_eq!(display_clip("ae\u{301}\u{302}x", 2), "a…");
+    }
+
+    #[test]
+    fn display_clip_does_not_pad_and_matches_ascii_truncate() {
+        assert_eq!(display_clip("short", 10), "short");
+        assert_eq!(display_clip("hello world", 8), "hello w…");
+        assert_eq!(display_clip("ab", 1), "…");
+        assert_eq!(display_clip("anything", 0), "");
+    }
+
+    #[test]
+    fn display_clip_replaces_controls() {
+        let clipped = display_clip("\x1b]52;c;AAAA\x07\u{202e}\u{200b}", 40);
+        assert_eq!(clipped, "�]52;c;AAAA���");
+        assert!(clipped.chars().all(|c| !c.is_control()));
     }
 }
