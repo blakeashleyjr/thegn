@@ -18587,6 +18587,25 @@ async fn event_loop<T: Terminal>(
                                 continue;
                             }
                             if let menu::MenuChoice::Confirm {
+                                tag: "env-bind",
+                                arg,
+                            } = &choice
+                            {
+                                let active_worktree = session
+                                    .active_group()
+                                    .map(|group| group.path.as_str())
+                                    .unwrap_or("");
+                                model.status = crate::env_ui::confirm_bind(
+                                    arg,
+                                    &model.panel.environments,
+                                    active_worktree,
+                                    refresh_tx.clone(),
+                                    waker.clone(),
+                                );
+                                dirty = true;
+                                continue;
+                            }
+                            if let menu::MenuChoice::Confirm {
                                 tag: "sidebar-sort",
                                 arg,
                             } = &choice
