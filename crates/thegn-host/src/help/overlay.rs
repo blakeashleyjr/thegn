@@ -73,6 +73,8 @@ pub struct HelpOverlay {
     /// time and shown as the layer badge — so a rebind of `help` is reflected
     /// instead of the badge always claiming `F1`.
     badge: String,
+    /// Single-key help chord resolved when this overlay was opened.
+    close_key: Option<crate::sequence::Key>,
     /// Where things were painted on the last render, for mouse hit-testing.
     /// `None` before the first render, when a click can't mean anything yet.
     hits: Option<HitAreas>,
@@ -186,12 +188,27 @@ impl HelpOverlay {
             fwd: Vec::new(),
             last_dims: (72, 20),
             badge,
+            close_key: None,
             hits: None,
             rendered_cache: None,
             pending_target: target,
             search_cache: HashMap::new(),
             search_cache_order: VecDeque::new(),
         }
+    }
+
+    pub fn with_close_chord(mut self, chord: Option<&str>) -> Self {
+        self.close_key = chord.and_then(|chord| {
+            let Ok(keys) = crate::keymap::parse_chord(chord) else {
+                return None;
+            };
+            if keys.len() == 1 {
+                keys.into_iter().next()
+            } else {
+                None
+            }
+        });
+        self
     }
 
     pub fn page_id(&self) -> &str {
@@ -382,6 +399,10 @@ impl HelpOverlay {
                 _ => {}
             }
             return HelpOutcome::Pending;
+        }
+
+        if self.close_key.as_ref() == Some(&crate::sequence::Key::modified(*key, mods)) {
+            return HelpOutcome::Close;
         }
 
         match key {
@@ -905,6 +926,23 @@ mod tests {
             ov.handle_key(&KeyCode::Char('c'), Modifiers::CTRL),
             HelpOutcome::Close
         );
+    }
+
+    #[test]
+    fn rebound_help_chord_closes_the_overlay() {
+        let mut without_builder = overlay();
+        assert_ne!(
+            key(&mut without_builder, KeyCode::Function(2)),
+            HelpOutcome::Close
+        );
+        let mut ov = overlay().with_close_chord(Some("F2"));
+        assert_eq!(key(&mut ov, KeyCode::Function(2)), HelpOutcome::Close);
+    }
+
+    #[test]
+    fn multi_key_close_chord_is_ignored() {
+        let ov = overlay().with_close_chord(Some("Ctrl-x h"));
+        assert!(ov.close_key.is_none());
     }
 
     #[test]
