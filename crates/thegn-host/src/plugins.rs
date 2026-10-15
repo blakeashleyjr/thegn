@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::plugin_api::{
-    CadenceHint, ContributionId, MAX_PLUGIN_TIMEOUT_SECS, NegotiatedManifest, PluginCallback,
-    PluginMode, PluginSpec, SurfaceId,
+    CadenceHint, ContributionId, NegotiatedManifest, PluginCallback, PluginMode, PluginSpec,
+    SurfaceId,
 };
 use thegn_svc::plugin::{
     LoadedPlugin, PluginError, PluginRun, ResidentSession, ResidentSupervisor, SessionEvent,
@@ -42,6 +42,13 @@ pub(crate) enum PluginMsg {
         plugin: String,
         writer: Option<SessionWriter>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OneShotStart {
+    Started,
+    Busy,
+    Failed,
 }
 
 /// One discovered + negotiated plugin, ready for the loop to build state from.
@@ -209,10 +216,10 @@ impl PluginsHost {
     /// Run a one-shot plugin once, now, off-loop (a palette action was
     /// invoked). The result lands as [`PluginMsg::OneShot`] like a scheduled
     /// run.
-    pub(crate) fn run_one_shot(&self, plugin: LoadedPlugin) -> bool {
+    pub(crate) fn run_one_shot(&self, plugin: LoadedPlugin) -> OneShotStart {
         let id = plugin.spec.manifest.id.as_str().to_string();
         let Some(ticket) = self.one_shot_gate.try_begin(&id) else {
-            return false;
+            return OneShotStart::Busy;
         };
         let tx = self.tx.clone();
         let waker = self.waker.clone();
@@ -234,10 +241,10 @@ impl PluginsHost {
                 let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             });
         match spawn {
-            Ok(_) => true,
+            Ok(_) => OneShotStart::Started,
             Err(e) => {
                 tracing::warn!(target: "thegn::plugin", error = %e, "one-shot thread failed to start");
-                true
+                OneShotStart::Failed
             }
         }
     }
@@ -435,9 +442,6 @@ fn setup_and_schedule_with_waker(
     let now = Instant::now();
     for plugin in discovered {
         let id = plugin.spec.manifest.id.as_str().to_string();
-        if plugin.spec.timeout_secs > MAX_PLUGIN_TIMEOUT_SECS {
-            tracing::warn!(target: "thegn::plugin", plugin = %id, key = "timeout_secs", requested = plugin.spec.timeout_secs, max = MAX_PLUGIN_TIMEOUT_SECS, "timeout_secs above the ceiling; clamped");
-        }
         if !plugin.spec.enabled {
             tracing::debug!(target: "thegn::plugin", plugin = %id, "disabled in config; skipped");
             continue;
@@ -591,7 +595,7 @@ fn setup_and_schedule_with_waker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thegn_core::plugin_api::{ContributionId, PluginId, PluginSpec};
+    use thegn_core::plugin_api::{ContributionId, MAX_PLUGIN_TIMEOUT_SECS, PluginId, PluginSpec};
 
     fn example_spec() -> PluginSpec {
         toml::from_str(include_str!("../../../examples/plugins/hello/plugin.toml")).unwrap()
@@ -688,6 +692,7 @@ mod tests {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(tmp.path()).unwrap();
         let (waker, _master, _terminal) =
             crate::platform::sound_process::test_support::test_waker();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -714,12 +719,12 @@ mod tests {
             dir: Some(tmp.path().to_path_buf()),
         };
 
-        assert!(host.run_one_shot(plugin.clone()));
-        assert!(!host.run_one_shot(plugin.clone()));
+        assert_eq!(host.run_one_shot(plugin.clone()), OneShotStart::Started);
+        assert_eq!(host.run_one_shot(plugin.clone()), OneShotStart::Busy);
         assert!(
             matches!(rx.blocking_recv(), Some(PluginMsg::OneShot { plugin, .. }) if plugin == "single-flight")
         );
-        assert!(host.run_one_shot(plugin));
+        assert_eq!(host.run_one_shot(plugin), OneShotStart::Started);
         assert!(
             matches!(rx.blocking_recv(), Some(PluginMsg::OneShot { plugin, .. }) if plugin == "single-flight")
         );
