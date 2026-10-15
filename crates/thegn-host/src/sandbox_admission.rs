@@ -54,6 +54,9 @@ mod tests {
         .expect_err("host process must miss shared-kernel floor");
         assert!(error.to_string().contains("isolation_floor = \"off\""));
         assert!(error.to_string().contains("enabled = false"));
+        assert!(error.to_string().contains("backend = \"none\""));
+        assert!(error.to_string().contains("run on host"));
+        assert!(error.to_string().contains("on_floor_miss = \"degrade\""));
     }
 
     #[test]

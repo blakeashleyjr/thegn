@@ -3691,10 +3691,8 @@ fn floor_report(cfg: &Config) {
     if floor == IsolationFloor::Off && source == "default" {
         let bypass = if !cfg.sandbox.enabled {
             "sandbox disabled"
-        } else if cfg.sandbox.backend == SandboxBackend::None {
-            "backend = \"none\""
         } else {
-            "host pinned"
+            "backend = \"none\""
         };
         outln!("  floor         off (default floor not applied: {bypass})");
     } else if floor == IsolationFloor::Off {

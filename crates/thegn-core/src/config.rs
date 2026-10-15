@@ -693,6 +693,8 @@ config_enum! {
     /// `[sandbox] on_floor_miss` — what happens when the resolved launch cannot
     /// meet [`IsolationFloor`]. `fail` (default) refuses to launch before any
     /// process spawns on the host (the VPN `on_error = "fail"` precedent).
+    /// `degrade` applies only to an explicitly configured `isolation_floor`; the
+    /// default floor always refuses.
     pub enum OnFloorMiss: "on_floor_miss" {
         Degrade = "degrade", Fail = "fail",
     } default = Degrade;
@@ -4346,7 +4348,8 @@ pub struct SandboxConfig {
     /// What happens when the effective isolation floor cannot be met: `fail`
     /// (default — refuse before any host spawn) or `degrade` (warn and launch
     /// with a degraded flag). A repo overlay may only HARDEN it
-    /// (`degrade` → `fail`).
+    /// (`degrade` → `fail`). `degrade` applies only to an explicitly configured
+    /// `isolation_floor`; the default floor always refuses.
     pub on_floor_miss: OnFloorMiss,
     pub remote: RemoteConfig,
     /// Allow-only these hostnames for outbound connections (empty = allow all).
