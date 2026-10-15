@@ -51,7 +51,7 @@ use crate::recorder::Recorder;
 use crate::wizard;
 use crate::workspace_create::complete_workspace_create;
 use thegn_core::store::{
-    AccountStore, CacheStore, NotificationStore, PoolStore, WorkspaceStore, WorktreeAuxStore,
+    CacheStore, NotificationStore, PoolStore, WorkspaceStore, WorktreeAuxStore,
 };
 
 #[path = "run_palette_db.rs"]
@@ -1604,32 +1604,11 @@ fn worktree_landing(session: &crate::session::Session, last_w: Option<&str>) -> 
         .or_else(|| session.worktrees.iter().position(is_worktree))
 }
 
-fn restore_failed_region_switch(
-    session: &mut crate::session::Session,
-    prior_active: usize,
-    region_last_w: &mut Option<String>,
-    prior_last_w: Option<String>,
-    region_last_t: &mut Option<String>,
-    prior_last_t: Option<String>,
-) {
-    session.switch_to(prior_active);
-    *region_last_w = prior_last_w;
-    *region_last_t = prior_last_t;
-}
-
 fn is_project_activation_target(target: &crate::sidebar::RowTarget) -> bool {
     matches!(
         target,
         crate::sidebar::RowTarget::Workspace { repo_path, .. } if repo_path != "terminal"
     )
-}
-
-fn should_restore_failed_activation(
-    project_target: bool,
-    landed: bool,
-    same_session: bool,
-) -> bool {
-    project_target && !landed && same_session
 }
 
 /// Worktree group indices in the order the sidebar DISPLAYS them (home-first
@@ -1705,24 +1684,6 @@ pub(crate) fn visible_index_of_workspace(model: &FrameModel, slug: &str) -> Opti
         .iter()
         .filter(|r| r.visible)
         .position(|r| r.kind == crate::sidebar::RowKind::Workspace && r.workspace_slug == slug)
-}
-
-fn switch_to_workspace_tab(
-    session: &mut crate::session::Session,
-    db: &thegn_core::db::Db,
-    cfg: &thegn_core::config::Config,
-    repo_path: &str,
-    group_name: &str,
-) -> Result<bool> {
-    // Deferred variant: the caller (`switch_workspace`'s cold path) queued the
-    // outgoing persist before this and enqueues the resurrected layout (which
-    // captures the `switch_to` landing below) after — no inline layout writes.
-    session.switch_to_workspace_deferred(repo_path, db, cfg)?;
-    let Some(idx) = session.worktrees.iter().position(|g| g.name == group_name) else {
-        return Ok(false);
-    };
-    session.switch_to(idx);
-    Ok(true)
 }
 
 /// The panel's current geometry for content building, falling back to the
@@ -2181,16 +2142,21 @@ pub(crate) use crate::workspace_pool::{
     ResidentWorkspace, WorkspacePool, remap_cold_workspace_ids,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwitchStart {
+    Switched,
+    NeedsCold,
+}
+
 /// Switch the active workspace to `target` (optionally landing on the named
-/// group), keeping the outgoing workspace's panes alive in `pool`. Returns
-/// whether the switch happened.
+/// group), keeping the outgoing workspace's panes alive in `pool`.
 ///
 /// - **Same workspace:** just re-focus the requested group.
 /// - **Warm (target resident):** park the current trees, restore the target's
 ///   live trees from the pool — no DB resurrect, no respawn, processes intact.
-/// - **Cold (first visit):** resurrect from the DB via the existing path, then
-///   remap its ids off the live range so it can't alias a parked workspace.
-// Threads the loop's workspace-switch state (session, panes, pool, db, two
+/// - **Cold (first visit):** return `NeedsCold` without changing loop state;
+///   the result drain prepares and applies it after the DB writer responds.
+// Threads the loop's workspace-switch state (session, panes, pool, two
 // dirty/clear flags) — splitting it into a struct would only obscure the flow.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn switch_workspace(
@@ -2199,11 +2165,9 @@ pub(crate) fn switch_workspace(
     session: &mut crate::session::Session,
     panes: &mut Panes,
     pool: &mut WorkspacePool,
-    db: &thegn_core::db::Db,
-    cfg: &thegn_core::config::Config,
     need_relayout: &mut bool,
     clear_on_next_frame: &mut bool,
-) -> bool {
+) -> SwitchStart {
     let land_on = |session: &mut crate::session::Session, group: Option<&str>| {
         if let Some(name) = group
             && let Some(idx) = session.worktrees.iter().position(|g| g.name == name)
@@ -2217,15 +2181,16 @@ pub(crate) fn switch_workspace(
         // a group this live session never adopted, and for the ACTIVE workspace
         // this arm is the whole activation — landing silently on nothing was the
         // one outcome the user couldn't diagnose. Re-read the registry on the
-        // miss and retry; the residual "still no such group" is reported by the
-        // caller (`handlers::sidebar_activate`).
-        if let Some(name) = group
-            && !session.land_on_group(name)
-        {
-            session.adopt_missing_registered(db, cfg);
+        // miss; the caller queues registry adoption and reports a stale row if
+        // the DB writer cannot provide it.
+        if let Some(name) = group {
             session.land_on_group(name);
         }
-        return true;
+        return SwitchStart::Switched;
+    }
+
+    if !pool.contains(target) {
+        return SwitchStart::NeedsCold;
     }
 
     *need_relayout = true;
@@ -2246,89 +2211,25 @@ pub(crate) fn switch_workspace(
     persist_session_layout(session, panes);
     let prev_id = session.id.clone();
 
-    if pool.contains(target) {
-        // Warm: swap the live trees in; the outgoing trees' panes stay live.
-        let parked = ResidentWorkspace {
-            worktrees: std::mem::take(&mut session.worktrees),
-            active: session.active,
-        };
-        let rw = pool.take(target).expect("contains() just checked");
-        session.id = target.to_string();
-        session.worktrees = rw.worktrees;
-        session.active = rw.active;
-        // The parked tree is a snapshot; worktrees registered while this
-        // workspace was in the pool (`thegn wt new` from another shell) are only
-        // in the DB. The cold arm below re-reads the registry via
-        // `resurrect_with_cfg`; the warm arm must too, or a warm switch keeps
-        // replaying a stale tree (THE-73). That is one extra SELECT on a
-        // user-initiated switch — the cold arm already pays strictly more (a
-        // full resurrect plus a `db_task::flush` barrier), and this is not idle
-        // work, so it stays inline: no timer, no thread, no channel.
-        session.adopt_missing_registered(db, cfg);
-        pool.stash(prev_id, parked, panes);
-        land_on(session, group);
-        // Off-loop: a single-row write, but any write can stall behind the
-        // WAL write lock while the switch fan-out's background workers hold
-        // it. FIFO after the layout persist queued above.
-        let t = target.to_string();
-        crate::db_task::persist(move |db| {
-            let _ = db.set_active_workspace(&t); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-        });
-        return true;
-    }
-
-    // Cold: clone the outgoing trees for the pool (their panes stay live), then
-    // resurrect the target in place via the existing path. The deferred
-    // switch leaves `session` untouched if resurrect fails, so the clone is
-    // only committed on success. (The queued outgoing-layout write is flushed
-    // by `switch_to_workspace_deferred` itself, right before its resurrect.)
-    let snapshot = ResidentWorkspace {
-        worktrees: session.worktrees.clone(),
+    // Warm: swap the live trees in; the outgoing trees' panes stay live.
+    let parked = ResidentWorkspace {
+        worktrees: std::mem::take(&mut session.worktrees),
         active: session.active,
     };
-    let landed = match group {
-        Some(name) => switch_to_workspace_tab(session, db, cfg, target, name).unwrap_or(false),
-        None => false,
-    };
-    if !landed
-        && session
-            .switch_to_workspace_deferred(target, db, cfg)
-            .is_err()
-    {
-        return false;
-    }
-    pool.stash(prev_id, snapshot, panes);
-    // The cold arm lands on whatever group the target's PERSISTED layout named
-    // as active, which is a terminal whenever the user last left that project
-    // from the terminals region. Same rule as the warm arm's park-time
-    // sanitisation (`WorkspacePool::stash`): a workspace resumes on one of its
-    // worktrees, never on a terminal that merely resided in its session. An
-    // explicit `group` request is honoured as asked and left alone.
-    if group.is_none()
-        && session
-            .worktrees
-            .get(session.active)
-            .is_some_and(|g| g.kind == crate::session::GroupKind::Terminal)
-        && let Some(gi) = session
-            .worktrees
-            .iter()
-            .position(|g| g.kind != crate::session::GroupKind::Terminal)
-    {
-        session.switch_to(gi);
-    }
-    remap_cold_workspace_ids(session, panes);
-    // Persist the resurrected layout + the active-workspace pointer off-loop.
-    // Snapshotting AFTER `remap_cold_workspace_ids` also means the persisted
-    // pane ids are the remapped (live) ones — the old inline persist inside
-    // `switch_to_workspace` recorded the pre-remap ids.
-    let snap = session.layout_snapshot(&session.id, now_secs());
+    let rw = pool.take(target).expect("contains() just checked");
+    session.id = target.to_string();
+    session.worktrees = rw.worktrees;
+    session.active = rw.active;
+    pool.stash(prev_id, parked, panes);
+    land_on(session, group);
+    // Off-loop: a single-row write, FIFO after the outgoing layout persist.
+    let t = target.to_string();
     crate::db_task::persist_critical(move |db| {
-        let _ = crate::session::Session::write_layout(db, &snap); // best-effort: cache write: the DB is a cache; the layout rows are resurrection state
-        // Record the workspace we just entered as the global "last active" so
-        // the next cold start reopens it.
-        let _ = db.set_active_workspace(&snap.session); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        if let Err(error) = db.set_active_workspace(&t) {
+            tracing::debug!(target: "thegn::workspace_switch", %error, "failed to persist active workspace");
+        }
     });
-    true
+    SwitchStart::Switched
 }
 
 use crate::panel_util::{
@@ -7961,6 +7862,11 @@ async fn event_loop<T: Terminal>(
     // Tab/worktree-switch action time; the first post-switch frame records
     // switch→frame latency (`switch_us`) — the perceived switch cost.
     let mut switch_at: Option<(std::time::Instant, crate::perf::SwitchKind)> = None;
+    let mut pending_switch = crate::workspace_switch_prep::PendingSwitch::default();
+    let (switch_result_tx, mut switch_result_rx) = tokio_mpsc::unbounded_channel();
+    let mut deferred_preset: Option<(u64, thegn_core::store::IntentRow)> = None;
+    let mut open_merge_queue_on_pending = false;
+    let mut applied_switch_seq: Option<u64> = None;
     // Last-seen OSC-title generation (emulator::title_generation): the render
     // block skips the every-pane title sweep while it is unchanged.
     let mut last_title_gen: u64 = u64::MAX;
@@ -8065,38 +7971,85 @@ async fn event_loop<T: Terminal>(
         };
     }
 
-    /// Sanitize terminal focus for a project switch, but commit that mutation
-    /// only when the switch succeeds. Several non-sidebar doors switch projects
-    /// directly (focus intents, picker, connect); they need the same rollback
-    /// guarantee as `activate_row!`.
+    /// Queue or apply a non-sidebar workspace switch after sanitizing terminal
+    /// focus. Cold requests defer the sanitization until their result applies.
     macro_rules! switch_workspace_from_region {
-        ($target:expr, $group:expr, $db:expr) => {{
-            let prior_active = session.active;
-            let prior_last_w = region_last_w.clone();
-            let prior_last_t = region_last_t.clone();
-            leave_terminal_region!();
-            let switched = switch_workspace(
-                $target,
-                $group,
-                &mut session,
-                &mut panes,
-                &mut workspace_pool,
-                $db,
-                keymap.config(),
-                &mut need_relayout,
-                &mut clear_on_next_frame,
-            );
-            if !switched {
-                restore_failed_region_switch(
-                    &mut session,
-                    prior_active,
-                    &mut region_last_w,
-                    prior_last_w,
-                    &mut region_last_t,
-                    prior_last_t,
+        ($target:expr, $group:expr, $after:expr) => {{
+            let target = $target.to_string();
+            let group = $group.map(str::to_string);
+            let after_switch = $after;
+            if session.id != target && !workspace_pool.contains(&target) {
+                let request = crate::workspace_switch_prep::SwitchRequestSpec {
+                    target: target.clone(),
+                    group,
+                    after: after_switch.clone(),
+                };
+                let request = crate::workspace_switch_prep::request_workspace_switch(
+                    request,
+                    &mut pending_switch,
+                    &switch_result_tx,
+                    &waker,
+                    keymap.config(),
                 );
+                let name = std::path::Path::new(&target)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| target.clone());
+                model.status = format!("{} Opening {}…", crate::loading::plan::spinner_now(), name);
+                pending_switch.set_spinner(request.seq, model.status.clone());
+                switch_at = None;
+                false
+            } else {
+                pending_switch.supersede();
+                leave_terminal_region!();
+                let previous_session = session.id.clone();
+                let switched = matches!(
+                    switch_workspace(
+                        &target,
+                        group.as_deref(),
+                        &mut session,
+                        &mut panes,
+                        &mut workspace_pool,
+                        &mut need_relayout,
+                        &mut clear_on_next_frame,
+                    ),
+                    SwitchStart::Switched
+                );
+                if switched {
+                    let effects = crate::workspace_switch_prep::after_switch_effects(
+                        &after_switch,
+                        &session,
+                    );
+                    if effects.focus_center {
+                        focus.zone = crate::focus::Zone::Center;
+                    }
+                    if let Some(bookmark) = effects.region_last_w {
+                        region_last_w = bookmark;
+                    }
+                    if let Some(bookmark) = effects.region_last_t {
+                        region_last_t = bookmark;
+                    }
+                    if effects.reveal_active {
+                        sb.reveal_active_worktree(&mut model, &session);
+                    }
+                }
+                if switched
+                    && (previous_session != target
+                        || group.as_deref().is_some_and(|name| {
+                            !session.worktrees.iter().any(|item| item.name == name)
+                        }))
+                {
+                    crate::workspace_switch_prep::request_registered_adoption(
+                        &session,
+                        group,
+                        &mut pending_switch,
+                        &switch_result_tx,
+                        &waker,
+                        keymap.config(),
+                    );
+                }
+                switched
             }
-            switched
         }};
     }
 
@@ -8119,21 +8072,34 @@ async fn event_loop<T: Terminal>(
             let target = $target;
             let was_terminal = active_is_terminal(&session);
             let project_target = is_project_activation_target(&target);
-            let prior_session = session.id.clone();
-            let prior_active = session.active;
-            let prior_last_w = region_last_w.clone();
-            let prior_last_t = region_last_t.clone();
+            let previous_session = session.id.clone();
+            let (adoption_target, adoption_group) = match &target {
+                crate::sidebar::RowTarget::Workspace { repo_path, group }
+                    if repo_path != "terminal" =>
+                {
+                    (Some(repo_path.clone()), group.clone())
+                }
+                _ => (None, None),
+            };
             let here = session
                 .worktrees
                 .get(session.active)
                 .map(|g| g.name.clone());
-            // A row that switches PROJECT leaves the terminals region first, so
-            // this workspace parks on a worktree (see `leave_terminal_region!`).
-            // The `"terminal"` sentinel is not such a row — it stays in-region.
-            if project_target {
+            let cold_target = match &target {
+                crate::sidebar::RowTarget::Workspace { repo_path, .. }
+                    if repo_path != "terminal" && repo_path != &session.id =>
+                {
+                    !workspace_pool.contains(repo_path)
+                }
+                _ => false,
+            };
+            if !cold_target {
+                pending_switch.supersede();
+            }
+            if project_target && !cold_target {
                 leave_terminal_region!();
             }
-            let landed = activate_row_target(
+            let activation = activate_row_target(
                 target,
                 &mut session,
                 &mut model,
@@ -8147,43 +8113,81 @@ async fn event_loop<T: Terminal>(
                 &mut clear_on_next_frame,
                 Some((&terminal_restore_tx, &waker)),
             );
-            if should_restore_failed_activation(project_target, landed, session.id == prior_session)
-            {
-                // Project activation sanitizes a terminal focus before the
-                // cold switch so a successfully parked workspace resumes on a
-                // worktree. That mutation is provisional: if DB open/resurrect
-                // fails, the user never left this workspace and must remain in
-                // the terminal they were using, with both region bookmarks
-                // unchanged.
-                restore_failed_region_switch(
-                    &mut session,
-                    prior_active,
-                    &mut region_last_w,
-                    prior_last_w,
-                    &mut region_last_t,
-                    prior_last_t,
-                );
-            }
-            // Refresh both bookmarks: the region we ended in records its new
-            // place, and the region we left (only when we actually crossed)
-            // records the place we left it at.
-            let now = session
-                .worktrees
-                .get(session.active)
-                .map(|g| g.name.clone());
-            if landed && active_is_terminal(&session) {
-                if !was_terminal {
-                    region_last_w = here;
+            let activation_pending = matches!(
+                &activation,
+                crate::handlers::sidebar_activate::Activation::Pending(_)
+            );
+            let workspace_switched = match activation {
+                crate::handlers::sidebar_activate::Activation::Pending(mut spec) => {
+                    spec.after.open_merge_queue = open_merge_queue_on_pending;
+                    spec.after.region_bookmark = Some((was_terminal, here));
+                    spec.after.set_region_last_w = true;
+                    spec.after.reveal_active = true;
+                    spec.after.focus_active_row = true;
+                    let request = crate::workspace_switch_prep::request_workspace_switch(
+                        spec.clone(),
+                        &mut pending_switch,
+                        &switch_result_tx,
+                        &waker,
+                        keymap.config(),
+                    );
+                    let name = std::path::Path::new(&spec.target)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| spec.target.clone());
+                    model.status =
+                        format!("{} Opening {}…", crate::loading::plan::spinner_now(), name);
+                    pending_switch.set_spinner(request.seq, model.status.clone());
+                    switch_at = None;
+                    false
                 }
-                region_last_t = now;
-            } else if landed {
-                if was_terminal {
-                    region_last_t = here;
+                crate::handlers::sidebar_activate::Activation::Failed => false,
+                crate::handlers::sidebar_activate::Activation::Landed { workspace_switched } => {
+                    if workspace_switched
+                        && adoption_target.as_deref().is_some_and(|target| {
+                            previous_session != target
+                                || adoption_group.as_deref().is_some_and(|name| {
+                                    !session.worktrees.iter().any(|item| item.name == name)
+                                })
+                        })
+                    {
+                        crate::workspace_switch_prep::request_registered_adoption(
+                            &session,
+                            adoption_group,
+                            &mut pending_switch,
+                            &switch_result_tx,
+                            &waker,
+                            keymap.config(),
+                        );
+                    }
+                    let now = session
+                        .worktrees
+                        .get(session.active)
+                        .map(|g| g.name.clone());
+                    if active_is_terminal(&session) {
+                        if !was_terminal {
+                            region_last_w = here;
+                        }
+                        region_last_t = now;
+                    } else {
+                        if was_terminal {
+                            region_last_t = here;
+                        }
+                        region_last_w = now;
+                    }
+                    workspace_switched
                 }
-                region_last_w = now;
-            }
-            landed
+            };
+            (workspace_switched, activation_pending)
         }};
+    }
+
+    macro_rules! set_jump_status {
+        ($pending:expr, $status:expr) => {
+            if crate::workspace_switch_prep::should_replace_jump_status($pending) {
+                model.status = $status;
+            }
+        };
     }
 
     // Land a pipeline-board row's jump. Resolves it to a sidebar row target and
@@ -8202,7 +8206,7 @@ async fn event_loop<T: Terminal>(
                 Some(target) => {
                     board = None;
                     focus.zone = crate::focus::Zone::Center;
-                    if activate_row!(target) {
+                    if activate_row!(target).0 {
                         kick_model_hydration!();
                     }
                     need_relayout = true;
@@ -8344,7 +8348,7 @@ async fn event_loop<T: Terminal>(
                 SidebarOutcome::Activate(target) => {
                     let kind = crate::handlers::sidebar_activate::switch_kind(&target, &session.id);
                     switch_at = Some((std::time::Instant::now(), kind));
-                    if activate_row!(target) {
+                    if activate_row!(target).0 {
                         kick_model_hydration!();
                     }
                     dirty = true;
@@ -8363,10 +8367,13 @@ async fn event_loop<T: Terminal>(
                             crate::perf::SwitchKind::Workspace
                         },
                     ));
+                    open_merge_queue_on_pending = true;
                     let activated = activate_row!(crate::sidebar::RowTarget::Workspace {
                         repo_path: repo_path.clone(),
                         group: None,
-                    });
+                    })
+                    .0;
+                    open_merge_queue_on_pending = false;
                     if !activated {
                         // Activation reports a user-visible status on DB/path
                         // failure. Do not replace that diagnostic with a
@@ -9998,6 +10005,321 @@ async fn event_loop<T: Terminal>(
             }
             dirty = true;
         }
+        while let Ok(result) = switch_result_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            if let crate::workspace_switch_prep::SwitchResult::Cold { request, result } = &result {
+                let decision = crate::workspace_switch_prep::cold_result_decision(
+                    request.seq,
+                    pending_switch.seq(),
+                    &session.id,
+                    &request.target,
+                    result.is_ok(),
+                );
+                if decision == crate::workspace_switch_prep::ColdResultDecision::Drop
+                    || !pending_switch.current(request.seq)
+                {
+                    pending_switch.clear_spinner_if_matches(request.seq, &mut model.status);
+                    pending_switch.clear(request.seq);
+                    if deferred_preset
+                        .as_ref()
+                        .is_some_and(|(seq, _)| *seq == request.seq)
+                    {
+                        deferred_preset = None;
+                    }
+                    continue;
+                }
+                match result {
+                    Err(_) => {
+                        model.status = format!(
+                            "Can't open project — {} is gone or unreadable",
+                            request.target
+                        );
+                        if deferred_preset
+                            .as_ref()
+                            .is_some_and(|(seq, _)| *seq == request.seq)
+                        {
+                            deferred_preset = None;
+                        }
+                    }
+                    Ok(prepared) => {
+                        model.status.clear();
+                        if std::env::var_os("THEGN_WS_CLEAR").is_some() {
+                            clear_on_next_frame = true;
+                        }
+                        leave_terminal_region!();
+                        persist_session_layout(&mut session, &panes);
+                        let previous = crate::workspace_pool::ResidentWorkspace {
+                            worktrees: session.worktrees.clone(),
+                            active: session.active,
+                        };
+                        let previous_id = session.id.clone();
+                        session.apply_workspace_switch(&request.target, prepared.clone());
+                        if let Some(group) = request.group.as_deref()
+                            && !session.land_on_group(group)
+                        {
+                            model.status =
+                                format!("'{group}' isn't loaded — its registry row may be stale");
+                        }
+                        workspace_pool.stash(previous_id, previous, &mut panes);
+                        if request.group.is_none()
+                            && session
+                                .worktrees
+                                .get(session.active)
+                                .is_some_and(|g| g.kind == crate::session::GroupKind::Terminal)
+                            && let Some(index) = session
+                                .worktrees
+                                .iter()
+                                .position(|g| g.kind != crate::session::GroupKind::Terminal)
+                        {
+                            session.switch_to(index);
+                        }
+                        let after = crate::workspace_switch_prep::after_switch_effects(
+                            &request.after,
+                            &session,
+                        );
+                        remap_cold_workspace_ids(&mut session, &mut panes);
+                        let snapshot = session.layout_snapshot(&session.id, now_secs());
+                        crate::db_task::persist_critical(move |db| {
+                            if let Err(error) = crate::session::Session::write_layout(db, &snapshot)
+                            {
+                                tracing::debug!(target: "thegn::workspace_switch", %error, "failed to persist resurrected layout");
+                            }
+                            if let Err(error) = db.set_active_workspace(&snapshot.session) {
+                                tracing::debug!(target: "thegn::workspace_switch", %error, "failed to persist active workspace");
+                            }
+                        });
+                        if let Some(bookmark) = after.region_last_w {
+                            region_last_w = bookmark;
+                        }
+                        if let Some(bookmark) = after.region_last_t {
+                            region_last_t = bookmark;
+                        }
+                        if after.focus_center {
+                            focus.zone = crate::focus::Zone::Center;
+                        }
+                        if let Some(tab) = session.active_tab_mut() {
+                            crate::handlers::sidebar_activate::repair_stale_focus(
+                                tab,
+                                chrome.center,
+                            );
+                        }
+                        refresh_tab_model(&mut model, &session, &mut sb);
+                        if after.reveal_active {
+                            sb.reveal_active_worktree(&mut model, &session);
+                        }
+                        if after.focus_active_row {
+                            sb.focus_active_row(&mut model);
+                        }
+                        reconcile_drawer_runtime(
+                            &session,
+                            &mut panes,
+                            &mut drawer,
+                            &mut drawer_runtime,
+                            &mut drawer_home,
+                            keymap.config(),
+                            chrome.center,
+                        );
+                        kick_model_hydration!();
+                        need_relayout = true;
+                        if after.open_merge_queue {
+                            panel_auto_revealed = None;
+                            if chrome.panel.is_none() {
+                                want_panel = true;
+                                panel_forced = cols < layout::PANEL_MIN_COLS;
+                                chrome = recompute_chrome!();
+                                need_relayout = true;
+                            }
+                            panel_ui.switch_tab(crate::panel::PanelTab::Work);
+                            open_panel_section(
+                                crate::panel::Section::MergeQueue,
+                                &mut panel_ui,
+                                &mut hydration_gen,
+                                &model_tx,
+                                &session,
+                                &waker,
+                                PanelDocsWiring {
+                                    generation: docs_gen,
+                                    tx: &docs_tx,
+                                },
+                            );
+                            focus.zone = crate::focus::Zone::Panel;
+                            sidebar_dirty = true;
+                            bars_dirty = true;
+                        }
+                        switch_at =
+                            Some((request.requested_at, crate::perf::SwitchKind::Workspace));
+                        applied_switch_seq = Some(request.seq);
+                    }
+                }
+                pending_switch.clear(request.seq);
+                dirty = true;
+            }
+            if let crate::workspace_switch_prep::SwitchResult::Adopted {
+                seq,
+                session_id,
+                rows,
+                land_on,
+            } = &result
+            {
+                if session.id == *session_id {
+                    session.apply_registered_adoption(rows.clone());
+                    if let Some(name) = land_on.as_deref() {
+                        let current = pending_switch.current(*seq);
+                        let found = session.worktrees.iter().any(|group| group.name == name);
+                        match crate::workspace_switch_prep::adoption_decision(current, found) {
+                            crate::workspace_switch_prep::AdoptionDecision::Ignore => {}
+                            crate::workspace_switch_prep::AdoptionDecision::Land => {
+                                session.land_on_group(name);
+                                persist_active_focus(&session);
+                            }
+                            crate::workspace_switch_prep::AdoptionDecision::ReportStale => {
+                                model.status = format!(
+                                    "'{name}' isn't loaded — its registry row may be stale"
+                                );
+                            }
+                        }
+                    }
+                    refresh_tab_model(&mut model, &session, &mut sb);
+                    reconcile_drawer_runtime(
+                        &session,
+                        &mut panes,
+                        &mut drawer,
+                        &mut drawer_runtime,
+                        &mut drawer_home,
+                        keymap.config(),
+                        chrome.center,
+                    );
+                    need_relayout = true;
+                    dirty = true;
+                }
+                pending_switch.clear(*seq);
+            }
+            if let crate::workspace_switch_prep::SwitchResult::ConnectRoot {
+                seq,
+                session_id,
+                root,
+                cwd,
+                group_paths,
+                result,
+            } = result
+            {
+                if pending_switch.current(seq) && session.id == session_id {
+                    match result {
+                        Err(_) => model.status = "Connect to root: state DB unavailable".into(),
+                        Ok((db_worktrees, workspaces)) => {
+                            match crate::nav::connect_target(
+                                root.as_deref(),
+                                cwd.as_deref(),
+                                &group_paths,
+                                &db_worktrees,
+                                &workspaces,
+                            ) {
+                                Some(crate::nav::ConnectTarget::CurrentTab(index)) => {
+                                    let current_paths: Vec<String> = session
+                                        .worktrees
+                                        .iter()
+                                        .map(|group| group.path.clone())
+                                        .collect();
+                                    if let Some(current_index) =
+                                        crate::workspace_switch_prep::resolve_connect_tab_index(
+                                            session.id == session_id,
+                                            index,
+                                            &group_paths,
+                                            &current_paths,
+                                        )
+                                    {
+                                        session.switch_to(current_index);
+                                        refresh_tab_model(&mut model, &session, &mut sb);
+                                        need_relayout = true;
+                                        reconcile_drawer_runtime(
+                                            &session,
+                                            &mut panes,
+                                            &mut drawer,
+                                            &mut drawer_runtime,
+                                            &mut drawer_home,
+                                            keymap.config(),
+                                            chrome.center,
+                                        );
+                                    }
+                                }
+                                Some(crate::nav::ConnectTarget::Workspace { repo_path, tab }) => {
+                                    switch_at = Some((
+                                        std::time::Instant::now(),
+                                        crate::perf::SwitchKind::Workspace,
+                                    ));
+                                    if switch_workspace_from_region!(
+                                        &repo_path,
+                                        tab.as_deref(),
+                                        crate::workspace_switch_prep::AfterSwitch {
+                                            focus_center: true,
+                                            set_region_last_w: true,
+                                            reveal_active: true,
+                                            ..Default::default()
+                                        }
+                                    ) {
+                                        refresh_tab_model(&mut model, &session, &mut sb);
+                                        kick_model_hydration!();
+                                        need_relayout = true;
+                                        reconcile_drawer_runtime(
+                                            &session,
+                                            &mut panes,
+                                            &mut drawer,
+                                            &mut drawer_runtime,
+                                            &mut drawer_home,
+                                            keymap.config(),
+                                            chrome.center,
+                                        );
+                                    }
+                                }
+                                Some(crate::nav::ConnectTarget::OfferAdd(path)) => {
+                                    let key = run_palette_db::PaletteKey {
+                                        kind: run_palette_db::PaletteKind::WorkspacePickerSeed,
+                                        context: session.id.clone(),
+                                    };
+                                    let (generation, rows) = palette_db_cache.begin(
+                                        key.clone(),
+                                        run_palette_db::PaletteRows::PickerSeed(
+                                            Vec::new(),
+                                            std::collections::HashSet::new(),
+                                        ),
+                                    );
+                                    let run_palette_db::PaletteRows::PickerSeed(seed, excluded) =
+                                        rows
+                                    else {
+                                        unreachable!("picker cache stores picker seed rows")
+                                    };
+                                    let mut picker = crate::workspace_picker::WorkspacePicker::new(
+                                        seed, excluded,
+                                    );
+                                    picker.start_manual(path.clone());
+                                    picker.mark_db_pending(key.cache_id(), generation);
+                                    workspace_picker = Some(picker);
+                                    run_palette_db::spawn_load(
+                                        key,
+                                        generation,
+                                        &palette_db_tx,
+                                        &waker,
+                                        move |db| {
+                                            let (seed, excluded) =
+                                                crate::workspace_picker::picker_seed(db);
+                                            run_palette_db::PaletteRows::PickerSeed(seed, excluded)
+                                        },
+                                    );
+                                    model.status = format!(
+                                        "{path} is not a registered project — Enter adds it"
+                                    );
+                                }
+                                None => {
+                                    model.status = "Connect to root: no working directory".into();
+                                }
+                            }
+                        }
+                    }
+                }
+                pending_switch.clear(seq);
+                dirty = true;
+            }
+        }
         while let Ok((worktree, seq, cache)) = test_cache_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Other);
             if test_cache_load.accept(&worktree, seq, &loaded_tests_worktree, &mut panel_ui, cache)
@@ -11067,7 +11389,10 @@ async fn event_loop<T: Terminal>(
 
         let mut pending_focus: Option<thegn_core::store::IntentRow> = None;
         // `open --preset` mailbox rows, applied right after the focus intent.
-        let mut pending_preset: Option<thegn_core::store::IntentRow> = None;
+        let mut pending_preset = crate::workspace_switch_prep::seed_deferred_preset(
+            applied_switch_seq.take(),
+            &mut deferred_preset,
+        );
         // `sessions.open --adopt` mailbox rows. A Vec, not an Option: these are
         // ALL applied (a fan-out expects one pane per row), unlike the two
         // last-wins intents above.
@@ -11539,8 +11864,8 @@ async fn event_loop<T: Terminal>(
         }
 
         // Apply the last `thegn open` focus intent: same switch path as a
-        // sidebar click. The ad-hoc Db::open is the delete_groups precedent —
-        // a sub-ms WAL read on a user-initiated action, not a hot path.
+        // sidebar click. The registry read and any cold restore stay on the
+        // DB writer, with the intent held until the switch applies.
         if let Some(row) = pending_focus
             && let Ok(fi) = serde_json::from_str::<thegn_core::models::FocusIntent>(&row.payload)
         {
@@ -11551,11 +11876,24 @@ async fn event_loop<T: Terminal>(
                 ));
             }
             if fi.repo != session.id
-                && let Ok(db) = thegn_core::db::Db::open()
-                && switch_workspace_from_region!(&fi.repo, None, &db)
+                && switch_workspace_from_region!(
+                    &fi.repo,
+                    None,
+                    crate::workspace_switch_prep::AfterSwitch {
+                        focus_center: true,
+                        set_region_last_w: true,
+                        ..Default::default()
+                    }
+                )
             {
                 refresh_tab_model(&mut model, &session, &mut sb);
                 kick_model_hydration!();
+            }
+            if fi.repo != session.id
+                && pending_switch.request_target() == Some(fi.repo.as_str())
+                && let Some(row) = pending_preset.take()
+            {
+                deferred_preset = Some((pending_switch.seq(), row));
             }
             dirty = true;
         }
@@ -16491,7 +16829,7 @@ async fn event_loop<T: Terminal>(
                                         &session.id,
                                     ),
                                 ));
-                                let hydrate = activate_row!(target);
+                                let hydrate = activate_row!(target).0;
                                 // A switch from the sidebar keeps the user in
                                 // the center terminal if that's where they were
                                 // typing (matching keyboard NextTab/PrevTab);
@@ -17445,7 +17783,7 @@ async fn event_loop<T: Terminal>(
                             crate::detail::DetailAction::ActivateTarget(target),
                         ) => {
                             bar_detail = None;
-                            if activate_row!(target) {
+                            if activate_row!(target).0 {
                                 kick_model_hydration!();
                             }
                             sb.focus_active_row(&mut model);
@@ -19908,11 +20246,10 @@ async fn event_loop<T: Terminal>(
                                         crate::perf::SwitchKind::Workspace,
                                     ));
                                     if let Some((repo_path, tab_name)) = payload.split_once('\t')
-                                        && let Ok(db) = thegn_core::db::Db::open()
                                         && switch_workspace_from_region!(
                                             repo_path,
                                             Some(tab_name),
-                                            &db
+                                            crate::workspace_switch_prep::AfterSwitch::default()
                                         )
                                     {
                                         refresh_tab_model(&mut model, &session, &mut sb);
@@ -19933,9 +20270,11 @@ async fn event_loop<T: Terminal>(
                                         std::time::Instant::now(),
                                         crate::perf::SwitchKind::Workspace,
                                     ));
-                                    if let Ok(db) = thegn_core::db::Db::open()
-                                        && switch_workspace_from_region!(repo_path, None, &db)
-                                    {
+                                    if switch_workspace_from_region!(
+                                        repo_path,
+                                        None,
+                                        crate::workspace_switch_prep::AfterSwitch::default()
+                                    ) {
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         kick_model_hydration!();
                                         need_relayout = true;
@@ -20910,9 +21249,9 @@ async fn event_loop<T: Terminal>(
                                                             )
                                                         });
                                                     if let Some(target) = linked {
-                                                        let hydrate = activate_row!(target);
+                                                        let (hydrate, pending) = activate_row!(target);
                                                         sb.focus_active_row(&mut model);
-                                                        model.status = format!("Jumped to {}", p.head_ref);
+                                                        set_jump_status!(pending, format!("Jumped to {}", p.head_ref));
                                                         if hydrate {
                                                             kick_model_hydration!();
                                                         }
@@ -21064,9 +21403,9 @@ async fn event_loop<T: Terminal>(
                                                     active_repo,
                                                 ) {
                                                     crate::panel::sections::my_work::EnterTarget::Jump(target) => {
-                                                        let hydrate = activate_row!(target);
+                                                        let (hydrate, pending) = activate_row!(target);
                                                         sb.focus_active_row(&mut model);
-                                                        model.status = format!("Jumped to {}", row.number);
+                                                        set_jump_status!(pending, format!("Jumped to {}", row.number));
                                                         if hydrate {
                                                             kick_model_hydration!();
                                                         }
@@ -21131,7 +21470,7 @@ async fn event_loop<T: Terminal>(
                                                 let target = crate::handlers::take_me_there::notification_target(&notification, &groups, &model.sidebar_db_worktrees);
                                                 let mark_read = !matches!(&target, crate::handlers::take_me_there::NotificationTarget::Nothing);
                                                 match target {
-                                                    crate::handlers::take_me_there::NotificationTarget::Jump(target) => { let hydrate = activate_row!(target); sb.focus_active_row(&mut model); model.status = format!("Jumped to {}", notification.worktree_path); if hydrate { kick_model_hydration!(); } }
+                                                    crate::handlers::take_me_there::NotificationTarget::Jump(target) => { let (hydrate, pending) = activate_row!(target); sb.focus_active_row(&mut model); set_jump_status!(pending, format!("Jumped to {}", notification.worktree_path)); if hydrate { kick_model_hydration!(); } }
                                                     crate::handlers::take_me_there::NotificationTarget::Browser(url) => model.status = crate::actions::open_status(open_url_detached(&url), || format!("Opened {} in browser", notification.source_ref)),
                                                     crate::handlers::take_me_there::NotificationTarget::Nothing => model.status = "nothing to jump to — space expands".into(),
                                                 }
@@ -21485,11 +21824,15 @@ async fn event_loop<T: Terminal>(
                                                     &model.sidebar_db_worktrees,
                                                 ) {
                                                     Some(target) => {
-                                                        let hydrate = activate_row!(target);
+                                                        let (hydrate, pending) =
+                                                            activate_row!(target);
                                                         sb.focus_active_row(&mut model);
-                                                        model.status = format!(
-                                                            "Jumped to {}",
-                                                            e.worktree_label
+                                                        set_jump_status!(
+                                                            pending,
+                                                            format!(
+                                                                "Jumped to {}",
+                                                                e.worktree_label
+                                                            )
                                                         );
                                                         if hydrate {
                                                             kick_model_hydration!();
@@ -21724,9 +22067,12 @@ async fn event_loop<T: Terminal>(
                                             )
                                         });
                                     if let Some(target) = linked {
-                                        let hydrate = activate_row!(target);
+                                        let (hydrate, pending) = activate_row!(target);
                                         sb.focus_active_row(&mut model);
-                                        model.status = format!("Jumped to {}", p.head_ref);
+                                        set_jump_status!(
+                                            pending,
+                                            format!("Jumped to {}", p.head_ref)
+                                        );
                                         if hydrate {
                                             kick_model_hydration!();
                                         }
@@ -24722,9 +25068,17 @@ async fn event_loop<T: Terminal>(
                                                     chrome.center,
                                                 );
                                                 persist_active_focus(&session);
-                                            } else if let (Some(target), Ok(db)) =
-                                                (repo_path, thegn_core::db::Db::open())
-                                                && switch_workspace_from_region!(&target, None, &db)
+                                            } else if let Some(target) = repo_path
+                                                && switch_workspace_from_region!(
+                                                    &target,
+                                                    None,
+                                                    crate::workspace_switch_prep::AfterSwitch {
+                                                        focus_center: true,
+                                                        set_region_last_w: true,
+                                                        reveal_active: true,
+                                                        ..Default::default()
+                                                    }
+                                                )
                                             {
                                                 focus.zone = crate::focus::Zone::Center;
                                                 // The new session re-indexes groups;
@@ -24875,8 +25229,15 @@ async fn event_loop<T: Terminal>(
                                     ));
                                 }
                                 if let Some(target) = summoned
-                                    && let Ok(db) = thegn_core::db::Db::open()
-                                    && switch_workspace_from_region!(&target, None, &db)
+                                    && switch_workspace_from_region!(
+                                        &target,
+                                        None,
+                                        crate::workspace_switch_prep::AfterSwitch {
+                                            focus_center: true,
+                                            set_region_last_w: true,
+                                            ..Default::default()
+                                        }
+                                    )
                                 {
                                     focus.zone = crate::focus::Zone::Center;
                                     region_last_w = session
@@ -25533,90 +25894,16 @@ async fn event_loop<T: Terminal>(
                                     .and_then(thegn_core::repo::worktree_root_for_cwd);
                                 let group_paths: Vec<String> =
                                     session.worktrees.iter().map(|g| g.path.clone()).collect();
-                                let (db_wts, wss) = thegn_core::db::Db::open()
-                                    .map(|db| {
-                                        (
-                                            db.worktrees()
-                                                .unwrap_or_default()
-                                                .into_iter()
-                                                .map(|w| (w.worktree, w.repo_root, w.tab_name))
-                                                .collect::<Vec<_>>(),
-                                            db.workspaces()
-                                                .unwrap_or_default()
-                                                .into_iter()
-                                                .map(|w| w.repo_path)
-                                                .collect::<Vec<_>>(),
-                                        )
-                                    })
-                                    .unwrap_or_default();
-                                match crate::nav::connect_target(
-                                    root.as_deref(),
-                                    cwd.as_deref(),
-                                    &group_paths,
-                                    &db_wts,
-                                    &wss,
-                                ) {
-                                    Some(crate::nav::ConnectTarget::CurrentTab(i)) => {
-                                        session.switch_to(i);
-                                        refresh_tab_model(&mut model, &session, &mut sb);
-                                        need_relayout = true;
-                                        reconcile_drawer_runtime(
-                                            &session,
-                                            &mut panes,
-                                            &mut drawer,
-                                            &mut drawer_runtime,
-                                            &mut drawer_home,
-                                            keymap.config(),
-                                            chrome.center,
-                                        );
-                                    }
-                                    Some(crate::nav::ConnectTarget::Workspace {
-                                        repo_path,
-                                        tab,
-                                    }) => {
-                                        switch_at = Some((
-                                            std::time::Instant::now(),
-                                            crate::perf::SwitchKind::Workspace,
-                                        ));
-                                        if let Ok(db) = thegn_core::db::Db::open()
-                                            && switch_workspace_from_region!(
-                                                &repo_path,
-                                                tab.as_deref(),
-                                                &db
-                                            )
-                                        {
-                                            refresh_tab_model(&mut model, &session, &mut sb);
-                                            kick_model_hydration!();
-                                            need_relayout = true;
-                                            reconcile_drawer_runtime(
-                                                &session,
-                                                &mut panes,
-                                                &mut drawer,
-                                                &mut drawer_runtime,
-                                                &mut drawer_home,
-                                                keymap.config(),
-                                                chrome.center,
-                                            );
-                                        }
-                                    }
-                                    Some(crate::nav::ConnectTarget::OfferAdd(path)) => {
-                                        let (seed, excluded) = thegn_core::db::Db::open()
-                                            .map(|db| crate::workspace_picker::picker_seed(&db))
-                                            .unwrap_or_default();
-                                        let mut p = crate::workspace_picker::WorkspacePicker::new(
-                                            seed, excluded,
-                                        );
-                                        p.start_manual(path.clone());
-                                        workspace_picker = Some(p);
-                                        model.status = format!(
-                                            "{path} is not a registered project — Enter adds it"
-                                        );
-                                    }
-                                    None => {
-                                        model.status =
-                                            "Connect to root: no working directory".into();
-                                    }
-                                }
+                                crate::workspace_switch_prep::request_connect_root(
+                                    root,
+                                    cwd,
+                                    group_paths,
+                                    &session.id,
+                                    &mut pending_switch,
+                                    &switch_result_tx,
+                                    &waker,
+                                );
+                                model.status = "Resolving root…".into();
                             }
                             Action::CloneOpen => {
                                 let key = run_palette_db::PaletteKey {
@@ -26516,9 +26803,9 @@ async fn event_loop<T: Terminal>(
                             Action::JumpAttention => {
                                 match crate::handlers::attention::next_target(&model, &session) {
                                     Some((t, status)) => {
-                                        let hydrate = activate_row!(t);
+                                        let (hydrate, pending) = activate_row!(t);
                                         sb.focus_active_row(&mut model);
-                                        model.status = status;
+                                        set_jump_status!(pending, status);
                                         if hydrate {
                                             kick_model_hydration!();
                                         }
