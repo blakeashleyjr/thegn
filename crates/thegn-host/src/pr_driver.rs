@@ -21,7 +21,7 @@ use thegn_core::db::{Db, PrQueueRow};
 use thegn_core::forge::model::{MergeMethod, ReviewThreadRow, owner_repo_from_url};
 use thegn_core::forge::{FetchedPr, Forge, ForgeError, PrRef, RepoRef};
 use thegn_core::issue::AgentDispatchStatus;
-use thegn_core::pr_queue::{self, Blocker, PrQueueFacts, PrqStatus, QueueAction};
+use thegn_core::pr_queue::{self, Blocker, PrQueueFacts, PrqStatus, QueueAction, QueueRowSnapshot};
 use thegn_core::pr_review_tasks::{
     ExistingReviewTask, PrReviewTaskContext, ReviewTaskEvent, reconcile_review_tasks,
 };
@@ -39,6 +39,7 @@ pub(crate) struct PrItem {
     pub last_head_oid: Option<String>,
     pub forge: String,
     pub pr_url: Option<String>,
+    pub checkout_gen: i64,
 }
 
 impl From<&PrQueueRow> for PrItem {
@@ -52,6 +53,7 @@ impl From<&PrQueueRow> for PrItem {
             last_head_oid: r.last_head_oid.clone(),
             forge: r.forge.clone(),
             pr_url: r.pr_url.clone(),
+            checkout_gen: r.checkout_gen,
         }
     }
 }
@@ -296,7 +298,6 @@ pub(crate) fn drive_queue(
         let mut attempts = item.agent_attempts;
         if moved && pr_queue::attempts_reset(item.last_head_oid.as_deref(), &head, cfg) {
             attempts = 0;
-            let _ = db.set_pr_agent_attempts(&item.key, 0); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
 
         let facts = PrQueueFacts {
@@ -374,6 +375,28 @@ pub(crate) fn drive_queue(
             QueueAction::EnableAutoMerge | QueueAction::Merge => {
                 let direct = matches!(action, QueueAction::Merge);
                 let method = merge_method(cfg.merge_method);
+                if let Err(reason) = reattest(db, forge, &loc, &item, &fetched) {
+                    let detail = effect_detail(reason, "merge");
+                    let moved = detail.contains("head moved before merge");
+                    let status = if moved {
+                        PrqStatus::Watching
+                    } else {
+                        PrqStatus::NeedsHuman
+                    };
+                    if let Err(error) =
+                        db.update_pr_status(&item.key, status.as_str(), None, Some(&detail), None)
+                    {
+                        tracing::debug!(target: "thegn::prq", %error, "could not persist pre-merge attestation hold");
+                    }
+                    out.warnings.push(format!("PR #{}: {detail}", item.number));
+                    if moved {
+                        out.blocked.push(item.number);
+                    } else {
+                        out.needs_human.push(item.number);
+                    }
+                    step(status.as_str(), &detail, &mut progress);
+                    continue;
+                }
                 // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let _ = db.update_pr_status(
                     &item.key,
@@ -490,6 +513,52 @@ pub(crate) fn drive_queue(
                 // lot of red CI is a flake, and a re-run costs nothing but a
                 // little wall-clock.
                 if kind == TaskKind::PrCiFailure && attempts == 0 {
+                    if let Err(reason) = reattest(db, forge, &loc, &item, &fetched) {
+                        let detail = effect_detail(reason, "CI rerun");
+                        let moved = detail.contains("head moved before CI rerun");
+                        let status = if moved {
+                            PrqStatus::Watching
+                        } else {
+                            PrqStatus::NeedsHuman
+                        };
+                        if let Err(error) = db.update_pr_status(
+                            &item.key,
+                            status.as_str(),
+                            None,
+                            Some(&detail),
+                            None,
+                        ) {
+                            tracing::debug!(target: "thegn::prq", %error, "could not persist pre-rerun attestation hold");
+                        }
+                        out.warnings.push(format!("PR #{}: {detail}", item.number));
+                        if moved {
+                            out.blocked.push(item.number);
+                        } else {
+                            out.needs_human.push(item.number);
+                        }
+                        step(status.as_str(), &detail, &mut progress);
+                        continue;
+                    }
+                    if item.agent_attempts != attempts
+                        && let Err(error) = db.set_pr_agent_attempts(&item.key, attempts)
+                    {
+                        let detail = format!(
+                            "could not reset the PR agent budget after a verified head change: {error}"
+                        );
+                        if let Err(write_error) = db.update_pr_status(
+                            &item.key,
+                            PrqStatus::NeedsHuman.as_str(),
+                            None,
+                            Some(&detail),
+                            None,
+                        ) {
+                            tracing::debug!(target: "thegn::prq", %write_error, "could not persist failed CI budget reset hold");
+                        }
+                        out.warnings.push(format!("PR #{}: {detail}", item.number));
+                        out.needs_human.push(item.number);
+                        step(PrqStatus::NeedsHuman.as_str(), &detail, &mut progress);
+                        continue;
+                    }
                     // Spend the durable per-head allowance before the network
                     // mutation. An error may mean the provider accepted the
                     // request but its response was lost; keep it spent and
@@ -624,6 +693,28 @@ pub(crate) fn drive_queue(
                     step(PrqStatus::NeedsHuman.as_str(), &reason, &mut progress);
                     continue;
                 }
+                if let Err(reason) = reattest(db, forge, &loc, &item, &fetched) {
+                    let detail = effect_detail(reason, "agent dispatch");
+                    let moved = detail.contains("head moved before agent dispatch");
+                    let status = if moved {
+                        PrqStatus::Watching
+                    } else {
+                        PrqStatus::NeedsHuman
+                    };
+                    if let Err(error) =
+                        db.update_pr_status(&item.key, status.as_str(), None, Some(&detail), None)
+                    {
+                        tracing::debug!(target: "thegn::prq", %error, "could not persist pre-dispatch attestation hold");
+                    }
+                    out.warnings.push(format!("PR #{}: {detail}", item.number));
+                    if moved {
+                        out.blocked.push(item.number);
+                    } else {
+                        out.needs_human.push(item.number);
+                    }
+                    step(status.as_str(), &detail, &mut progress);
+                    continue;
+                }
                 let next = attempts + 1;
                 let _ = db.set_pr_agent_attempts(&item.key, next); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let note = format!("agent fixing ({next}/{})", cfg.agent_max_attempts);
@@ -659,6 +750,75 @@ pub(crate) fn drive_queue(
 
 fn checkout_matches(actual: Option<&str>, expected: &str) -> bool {
     actual.is_some_and(|branch| branch == expected)
+}
+
+/// Re-read both durable queue authorization and forge identity immediately
+/// before a mutation. A stale read cannot authorize an effect after a rebind.
+pub(crate) fn reattest(
+    db: &Db,
+    forge: &dyn Forge,
+    loc: &GitLoc,
+    item: &PrItem,
+    expected: &FetchedPr,
+) -> Result<(), String> {
+    let fresh = forge
+        .pr_status(loc, PrRef::Number(item.number))
+        .map_err(|error| format!("could not re-attest PR before effect: {}", describe(&error)))?;
+    pr_queue::attest_pr_identity(
+        item.pr_url.as_deref(),
+        item.number,
+        &fresh.url,
+        fresh.number,
+    )?;
+    if fresh.head_ref_oid != expected.pr.head_ref_oid
+        || fresh.head_ref_name != expected.pr.head_ref_name
+    {
+        return Err("head moved before effect; refreshing".to_owned());
+    }
+    if let Some(worktree) = item.worktree.as_deref() {
+        let actual_root = loc.git_out(&["rev-parse", "--show-toplevel"])
+            .ok_or_else(|| "queued checkout is missing or no longer a Git worktree; run `thegn pr queue rebind --pr N`".to_owned())?;
+        let expected_root = Path::new(worktree).canonicalize().map_err(|_| {
+            "queued checkout path no longer exists; run `thegn pr queue rebind --pr N`".to_owned()
+        })?;
+        let actual_root = Path::new(&actual_root).canonicalize().map_err(|_| {
+            "queued checkout identity could not be verified; run `thegn pr queue rebind --pr N`"
+                .to_owned()
+        })?;
+        if actual_root != expected_root {
+            return Err("queued checkout now resolves to another repository; run `thegn pr queue rebind --pr N`".to_owned());
+        }
+        let branch = loc
+            .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .ok_or_else(|| {
+                "queued checkout branch could not be verified; run `thegn pr queue rebind --pr N`"
+                    .to_owned()
+            })?;
+        if !checkout_matches(Some(&branch), &expected.pr.head_ref_name) {
+            return Err(
+                "queued checkout branch changed; run `thegn pr queue rebind --pr N`".to_owned(),
+            );
+        }
+    }
+    let current = db
+        .list_pr_queue()
+        .map_err(|error| format!("could not re-read PR queue row: {error}"))?
+        .into_iter()
+        .find(|row| row.key == item.key);
+    let snapshot = QueueRowSnapshot {
+        key: item.key.clone(),
+        pr_url: item.pr_url.clone(),
+        forge: item.forge.clone(),
+        worktree: item.worktree.clone(),
+        branch: item.branch.clone(),
+        checkout_gen: item.checkout_gen,
+    };
+    pr_queue::attest_queue_row(&snapshot, current.as_ref())?;
+    Ok(())
+}
+
+fn effect_detail(reason: String, effect: &str) -> String {
+    reason.replace("before effect", &format!("before {effect}"))
 }
 
 /// Reconcile the complete THE-27 review snapshot for one explicitly watched
@@ -1168,6 +1328,7 @@ mod tests {
             last_head_oid: Some("abc".into()),
             forge: "github".into(),
             pr_url: Some("https://github.com/me/repo/pull/7".into()),
+            checkout_gen: 0,
         }
     }
 
@@ -1431,6 +1592,7 @@ mod tests {
         pr: std::sync::Mutex<Option<PrStatus>>,
         conversation: std::sync::Mutex<Option<thegn_core::forge::model::PrConversation>>,
         calls: std::sync::Mutex<Vec<String>>,
+        status_sequence: std::sync::Mutex<Vec<PrStatus>>,
         rerun_count: std::sync::atomic::AtomicU32,
         rerun_error: std::sync::atomic::AtomicBool,
     }
@@ -1440,6 +1602,7 @@ mod tests {
                 pr: std::sync::Mutex::new(pr),
                 conversation: std::sync::Mutex::new(Some(Default::default())),
                 calls: Default::default(),
+                status_sequence: Default::default(),
                 rerun_count: std::sync::atomic::AtomicU32::new(0),
                 rerun_error: std::sync::atomic::AtomicBool::new(false),
             }
@@ -1458,6 +1621,10 @@ mod tests {
         fn with_rerun_count(self, count: u32) -> Self {
             self.rerun_count
                 .store(count, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+        fn with_status_sequence(self, sequence: Vec<PrStatus>) -> Self {
+            *self.status_sequence.lock().unwrap() = sequence;
             self
         }
         fn with_rerun_error(self) -> Self {
@@ -1490,6 +1657,13 @@ mod tests {
         }
         fn pr_status(&self, _: &GitLoc, pr: PrRef) -> Result<PrStatus, ForgeError> {
             self.record(format!("pr_status {pr:?}"));
+            let status = {
+                let mut sequence = self.status_sequence.lock().unwrap();
+                (!sequence.is_empty()).then(|| sequence.remove(0))
+            };
+            if let Some(status) = status {
+                return Ok(status);
+            }
             self.pr.lock().unwrap().clone().ok_or(ForgeError::NoPr)
         }
         fn pr_list(
@@ -1713,6 +1887,17 @@ mod tests {
     #[test]
     fn fake_forge_drives_a_green_pr_to_auto_merge() {
         let (_dir, db) = temp_db("prq-auto");
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            None,
+            "feat",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/7",
+        )
+        .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
         let forge = FakeForge::new(Some(green_pr()));
         let cfg = cfg(); // merge_mode = auto_merge (default)
         let out = drive_queue(
@@ -1721,7 +1906,7 @@ mod tests {
             &forge,
             Path::new("/repo"),
             &db,
-            vec![item()],
+            vec![PrItem::from(&row)],
             |_| {},
         );
         assert!(out.merged.is_empty(), "{out:?}");
@@ -1746,6 +1931,17 @@ mod tests {
     #[test]
     fn fake_forge_direct_mode_merges_now() {
         let (_dir, db) = temp_db("prq-direct");
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            None,
+            "feat",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/7",
+        )
+        .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
         let forge = FakeForge::new(Some(green_pr()));
         let mut cfg = cfg();
         cfg.merge_mode = thegn_core::config::PrMergeMode::Thegn;
@@ -1755,7 +1951,7 @@ mod tests {
             &forge,
             Path::new("/repo"),
             &db,
-            vec![item()],
+            vec![PrItem::from(&row)],
             |_| {},
         );
         assert_eq!(out.merged, vec![7], "{out:?}");
@@ -2305,5 +2501,76 @@ mod tests {
         assert_eq!(row.status, "blocked_ci");
         assert!(row.detail.unwrap().contains("template"));
         assert_eq!(row.agent_attempts, 0);
+    }
+
+    #[test]
+    fn identity_change_between_read_and_merge_holds_without_merge() {
+        let (_dir, db) = temp_db("prq-read-effect-identity");
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            None,
+            "feature",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/7",
+        )
+        .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let mut changed = green_pr();
+        changed.url = "https://github.com/other/repo/pull/7".into();
+        let forge =
+            FakeForge::new(Some(green_pr())).with_status_sequence(vec![green_pr(), changed]);
+        let mut config = cfg();
+        config.merge_mode = thegn_core::config::PrMergeMode::Thegn;
+        let out = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+        assert!(out.needs_human.contains(&7));
+        assert!(!forge.calls().iter().any(|call| call.starts_with("merge")));
+    }
+
+    #[test]
+    fn moved_head_between_read_and_rerun_spends_no_allowance() {
+        let (_dir, db) = temp_db("prq-read-effect-head");
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            None,
+            "feature",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/7",
+        )
+        .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let original = failing_ci_pr("head-a");
+        let mut moved = original.clone();
+        moved.head_ref_oid = "head-b".into();
+        let forge =
+            FakeForge::new(Some(original.clone())).with_status_sequence(vec![original, moved]);
+        let mut config = cfg();
+        config.watch = vec![PrWatchKind::Ci];
+        config.agent_command = "true {prompt}".into();
+        let out = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+        assert!(out.blocked.contains(&7));
+        assert!(!forge.calls().iter().any(|call| call.starts_with("rerun")));
+        let current = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(current.ci_rerun_head, None);
+        assert_eq!(current.agent_attempts, 0);
     }
 }

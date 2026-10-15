@@ -342,6 +342,22 @@ fn consider_candidate_with_forge(
         notify(reason.into());
         return;
     }
+    if let Err(reason) = crate::pr_driver::reattest(db, provider, &loc, &item, &fetched) {
+        let detail = reason.replace("before effect", "before agent dispatch");
+        let moved = detail.contains("head moved before agent dispatch");
+        let status = if moved {
+            PrqStatus::Watching
+        } else {
+            PrqStatus::NeedsHuman
+        };
+        if let Err(error) =
+            db.update_pr_status(&item.key, status.as_str(), None, Some(&detail), None)
+        {
+            tracing::debug!(target: "thegn::ci_autofix", %error, "could not persist pre-dispatch attestation hold");
+        }
+        notify(format!("CI autofix for PR #{} held: {detail}", item.number));
+        return;
+    }
     if !db.claim_ci_autofix(&candidate).unwrap_or(false) {
         return;
     }
