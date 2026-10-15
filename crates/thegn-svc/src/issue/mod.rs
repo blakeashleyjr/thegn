@@ -126,7 +126,7 @@ impl std::fmt::Display for IssueError {
             IssueError::NotConfigured => write!(f, "no issue provider configured"),
             IssueError::AmbiguousAccount { provider, accounts } => write!(
                 f,
-                "{provider} issue id is ambiguous across accounts: {}; disable all but one {provider} account to use by-ID actions",
+                "{provider} issue id is ambiguous across accounts: {}; set enabled = false on all but one [[issues.issue_accounts]] entry for {provider}, or restrict this repo with accounts = [\"<name>\"]",
                 accounts.join(", ")
             ),
             IssueError::Unsupported(op) => write!(f, "{op} is not supported by this provider"),
@@ -2133,6 +2133,15 @@ mod spec {
         ));
         let message = error.to_string();
         assert!(message.contains("personal, work"), "{message}");
-        assert!(message.contains("disable all but one"), "{message}");
+        assert!(
+            message.contains(
+                "set enabled = false on all but one [[issues.issue_accounts]] entry for github"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("restrict this repo with accounts = [\"<name>\"]"),
+            "{message}"
+        );
     }
 }
