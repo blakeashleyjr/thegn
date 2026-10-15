@@ -1192,7 +1192,8 @@ fn merge_args(
         args.push("--delete-branch".into());
     }
     if let Some(head) = expected_head {
-        args.extend(["--match-head-commit".into(), head.into()]);
+        args.push("--match-head-commit".to_owned());
+        args.push(head.to_owned());
     }
     if auto {
         args.push("--auto".into());
