@@ -264,6 +264,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let mut panes = Panes::new(tx);
         let mut session = crate::session::Session::default();
+        let before = session.id.clone();
         let mut model = FrameModel::default();
         let mut sidebar = SidebarState::default();
         let mut drawer = DrawerRuntime::default();
@@ -293,6 +294,6 @@ mod tests {
             None,
         );
         assert!(matches!(activation, Activation::Pending(_)));
-        assert_eq!(session.id, "default");
+        assert_eq!(session.id, before);
     }
 }

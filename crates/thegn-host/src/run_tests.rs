@@ -2043,14 +2043,14 @@ fn palette_worktree_switch_persists_active_tab_for_target_workspace() {
         active: 0,
     };
 
-    switch_to_workspace_tab(
-        &mut session,
+    let prepared = Session::prepare_workspace_switch(
+        "/tmp/repo-b",
         &db,
         &thegn_core::config::Config::default(),
-        "/tmp/repo-b",
-        "repo-b/feature-x",
     )
     .unwrap();
+    session.apply_workspace_switch("/tmp/repo-b", prepared);
+    assert!(session.land_on_group("repo-b/feature-x"));
 
     assert_eq!(session.id, "/tmp/repo-b");
     assert_eq!(session.active_group().unwrap().name, "repo-b/feature-x");
@@ -4442,8 +4442,6 @@ fn cold_request_changes_nothing_until_apply() {
     let original_worktrees = session.worktrees.clone();
     let mut pool = WorkspacePool::default();
     let (mut need_relayout, mut clear_on_next_frame) = (false, false);
-    let region_last_w = Some("home".to_string());
-    let region_last_t = Some("terminal".to_string());
 
     assert_eq!(
         switch_workspace(
@@ -4462,6 +4460,4 @@ fn cold_request_changes_nothing_until_apply() {
     assert_eq!(session.worktrees, original_worktrees);
     assert!(!need_relayout);
     assert!(!clear_on_next_frame);
-    assert_eq!(region_last_w.as_deref(), Some("home"));
-    assert_eq!(region_last_t.as_deref(), Some("terminal"));
 }
