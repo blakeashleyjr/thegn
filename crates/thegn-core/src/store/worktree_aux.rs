@@ -236,12 +236,13 @@ pub trait WorktreeAuxStore {
 
     // --- PR queue (v50) ---------------------------------------------------
     //
-    // Keyed by repo + PR number rather than worktree: a queued pull request need
-    // not have a local checkout, so `worktree` is optional throughout.
+    // Keyed by repo + provider/project identity + PR number rather than worktree:
+    // a queued pull request need not have a local checkout.
 
     /// Queue (or re-queue) a pull request. Re-queueing resets it to `watching`
     /// and clears the prior blocker/detail/attempts, so "I fixed it, watch again"
-    /// starts clean — the same gesture as `retry_merge_entry`.
+    /// starts clean — the same gesture as `retry_merge_entry`. This legacy
+    /// number-only path has no executable identity and is held for verification.
     fn enqueue_pr(
         &self,
         repo_root: &str,
@@ -252,8 +253,8 @@ pub trait WorktreeAuxStore {
         forge: &str,
     ) -> Result<()>;
 
-    /// Queue a PR with the canonical URL fetched from the forge. Re-adding a
-    /// bound PR replaces both its identity and checkout binding.
+    /// Queue a PR with the canonical URL fetched from the forge. Changed checkout
+    /// bindings require the explicit `rebind_pr` operation.
     #[allow(clippy::too_many_arguments)] // mirrors enqueue_pr plus the bound URL
     fn enqueue_bound_pr(
         &self,
@@ -300,6 +301,9 @@ pub trait WorktreeAuxStore {
 
     /// Every queued pull request, oldest-queued first.
     fn list_pr_queue(&self) -> Result<Vec<PrQueueRow>>;
+
+    /// Explicitly change a queued PR's authority or checkout binding.
+    fn rebind_pr(&self, old_key: &str, binding: &crate::db::PrRebind) -> Result<String>;
 
     /// `(size_bytes, target_bytes, fetched_at)` for one worktree, or `None`.
     fn get_worktree_disk(&self, worktree: &str) -> Result<Option<(i64, i64, i64)>>;
