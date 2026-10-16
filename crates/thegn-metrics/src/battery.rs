@@ -205,8 +205,8 @@ mod linux {
                     {
                         self.counters.adapter_reads += 1;
                     }
-                    if read_file(&adapter.online, &mut buffer, &mut self.counters)?
-                        .is_some_and(|bytes| parse_u64(bytes) == Some(1))
+                    if parse_u64(read_open(&adapter.online, &mut buffer, &mut self.counters)?)
+                        == Some(1)
                     {
                         online = true;
                         break;
@@ -340,19 +340,27 @@ mod linux {
         Ok(read_file(file, buffer, counters)?.unwrap_or(&[]))
     }
 
-    #[cfg_attr(not(test), allow(unused_variables))]
     fn read_file<'a>(
         file: &Option<File>,
         buffer: &'a mut [u8],
         counters: &mut Counters,
     ) -> Result<Option<&'a [u8]>, ()> {
         let Some(file) = file else { return Ok(None) };
+        read_open(file, buffer, counters).map(Some)
+    }
+
+    #[cfg_attr(not(test), allow(unused_variables))]
+    fn read_open<'a>(
+        file: &File,
+        buffer: &'a mut [u8],
+        counters: &mut Counters,
+    ) -> Result<&'a [u8], ()> {
         #[cfg(test)]
         {
             counters.reads += 1;
         }
         let count = file.read_at(buffer, 0).map_err(|_| ())?;
-        Ok(Some(&buffer[..count]))
+        Ok(&buffer[..count])
     }
 
     fn read_num(
