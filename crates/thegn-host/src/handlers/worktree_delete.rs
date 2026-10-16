@@ -274,18 +274,16 @@ fn perform_delete(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
 /// vs delete-from-disk). Exposed so the loop's confirm arm delegates here
 /// instead of re-inlining `delete_groups` + refresh.
 ///
-/// This only *schedules* the teardown: the groups stay in the session until the
-/// destroy worker reports success, so neither focus nor the sidebar cursor
-/// moves here. The landing happens when the group actually leaves —
-/// `worktree_lifecycle::apply_completions` plans a [`Landing`] against the rows
-/// on screen at that moment.
+/// Teardown is scheduled in the background. Its row is hidden and focus/cursor
+/// land immediately; the session group remains until worker success, so a
+/// failure can restore the row in place without moving focus again.
 pub(crate) fn confirm_delete_worktrees(
     cx: &mut DeleteCtx<'_>,
     targets: Vec<usize>,
     keep_files: bool,
     force: bool,
 ) {
-    cx.model.status = crate::run::delete_groups_with_mode(
+    let (status, scheduled) = crate::run::delete_groups_with_mode(
         cx.session,
         cx.panes,
         targets,
@@ -293,9 +291,82 @@ pub(crate) fn confirm_delete_worktrees(
         crate::worktree_lifecycle::mode_for_user(force, false),
         Some(cx.waker.clone()),
     );
+    cx.model.status = status;
+    if begin_optimistic_delete(cx.session, cx.model, cx.sb, &scheduled) {
+        crate::run::persist_session_layout_cached(cx.session);
+        if let Some(dir) = crate::run::active_cwd(cx.session) {
+            cx.drawer_runtime
+                .reconcile(cx.cfg, &dir, cx.panes, cx.center);
+        }
+    }
     cx.sb.marked.clear();
     crate::run::refresh_tab_model(cx.model, cx.session, cx.sb);
     *cx.need_relayout = true;
+}
+
+/// Hide pending worktree rows and their pipeline mirrors without changing
+/// their session or sidebar index.
+pub(crate) fn hide_pending_deletes(
+    rows: &mut [crate::sidebar::SidebarRow],
+    deleting: &std::collections::HashSet<String>,
+) {
+    if deleting.is_empty() {
+        return;
+    }
+    for row in rows {
+        if matches!(
+            row.kind,
+            crate::sidebar::RowKind::Worktree | crate::sidebar::RowKind::PipelineWorktree
+        ) && let Some(path) = &row.worktree_path
+            && deleting.contains(path)
+        {
+            row.visible = false;
+        }
+    }
+}
+
+/// Mark scheduled paths pending and move focus/cursor once, based on the rows
+/// currently shown. Returns whether the active group moved.
+pub(crate) fn begin_optimistic_delete(
+    session: &mut crate::session::Session,
+    model: &mut crate::chrome::FrameModel,
+    sb: &mut crate::run::SidebarState,
+    scheduled: &[String],
+) -> bool {
+    if scheduled.is_empty() {
+        return false;
+    }
+    let removed: Vec<&str> = scheduled.iter().map(String::as_str).collect();
+    let landing = Landing::plan(model, session, sb, &removed);
+    let active_name = session.active_group().map(|group| group.name.clone());
+    let active_scheduled = session
+        .active_group()
+        .is_some_and(|group| scheduled.iter().any(|path| path == &group.path));
+    sb.deleting.extend(scheduled.iter().cloned());
+    if active_scheduled {
+        landing.land(session);
+        if session
+            .active_group()
+            .is_some_and(|group| sb.deleting.contains(&group.path))
+            && let Some(index) = active_name.as_ref().and_then(|name| {
+                session
+                    .worktrees
+                    .iter()
+                    .position(|group| &group.name == name)
+            })
+        {
+            session.switch_to(index);
+        }
+    }
+    let active_moved = active_scheduled
+        && active_name.as_ref().is_some_and(|name| {
+            session
+                .active_group()
+                .is_some_and(|group| &group.name != name)
+        });
+    crate::run::refresh_tab_model(model, session, sb);
+    landing.place_cursor(model, sb);
+    active_moved
 }
 
 /// Where focus goes when worktree rows leave the tree, planned against the
@@ -653,5 +724,52 @@ mod tests {
             group("term", GroupKind::Terminal),
         ]);
         assert_eq!(landing_for_slug(&s, Some("app")), Some(1));
+    }
+
+    #[test]
+    fn hide_pending_deletes_hides_only_the_pending_worktree_rows() {
+        let mut rows = vec![
+            crate::sidebar::SidebarRow::base(crate::sidebar::RowKind::Worktree, 1, "first", "app"),
+            crate::sidebar::SidebarRow::base(
+                crate::sidebar::RowKind::PipelineWorktree,
+                1,
+                "pipeline mirror",
+                "app",
+            ),
+            crate::sidebar::SidebarRow::base(
+                crate::sidebar::RowKind::Workspace,
+                0,
+                "workspace",
+                "app",
+            ),
+            crate::sidebar::SidebarRow::base(crate::sidebar::RowKind::Worktree, 1, "second", "app"),
+        ];
+        rows[0].worktree_path = Some("/tmp/app-alpha".into());
+        rows[1].worktree_path = Some("/tmp/app-alpha".into());
+        rows[2].worktree_path = Some("/tmp/app-alpha".into());
+        rows[3].worktree_path = Some("/tmp/app-zeta".into());
+        let deleting = HashSet::from(["/tmp/app-alpha".to_string()]);
+        let original_rows = rows.clone();
+        let original_labels = rows
+            .iter()
+            .filter(|row| row.visible)
+            .map(|row| row.label.clone())
+            .collect::<Vec<_>>();
+
+        super::hide_pending_deletes(&mut rows, &deleting);
+        assert_eq!(
+            rows.iter().map(|row| row.visible).collect::<Vec<_>>(),
+            [false, false, true, true]
+        );
+        let mut rebuilt_rows = original_rows;
+        super::hide_pending_deletes(&mut rebuilt_rows, &HashSet::new());
+        assert_eq!(
+            rebuilt_rows
+                .iter()
+                .filter(|row| row.visible)
+                .map(|row| row.label.clone())
+                .collect::<Vec<_>>(),
+            original_labels
+        );
     }
 }
