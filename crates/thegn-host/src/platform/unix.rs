@@ -182,7 +182,7 @@ pub fn proxy_process_start_time(pid: u32) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn parse_proc_start_time(stat: &str) -> Option<u64> {
+pub(super) fn parse_proc_start_time(stat: &str) -> Option<u64> {
     // Field 3 (state) is the first token after field 2 (comm); field 22 is
     // therefore token 19 in this suffix.
     stat.rsplit_once(')')?
@@ -483,7 +483,8 @@ pub fn terminate_proxy_pid(pid: u32, expected_start_time: Option<u64>) -> bool {
     nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM).is_ok()
 }
 
-/// Deliver `sig` to `pid`, surfacing the outcome. Unlike [`terminate_pid`] the
+/// Deliver `sig` to `pid` after the caller's identity check, surfacing the
+/// outcome. Unlike [`terminate_pid`] the
 /// result is returned rather than swallowed, so the monitor's Processes tab can
 /// show a `no such process` / `permission denied` failure instead of pretending
 /// the signal landed. Refuses pid 0 (`kill(0, …)` would hit the whole process
