@@ -1175,6 +1175,7 @@ impl ControlApi for DaemonService {
                         // actor already logged/reported any finalize failure.
                         truncated: None,
                         dropped_bytes: 0,
+                        stopping: false,
                     });
                 }
                 Lookup::Unknown => return Err(Self::not_found(session)),

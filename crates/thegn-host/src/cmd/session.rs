@@ -720,6 +720,15 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     // Never report a truncated recording as saved: the file is
                     // short of the session's last output.
                     outln!("recording TRUNCATED → {where_} ({reason})");
+                } else if st.stopping {
+                    if st.dropped_bytes > 0 {
+                        outln!(
+                            "recording stopping → {where_} (finalizing; run status again; {} bytes dropped in gaps; see cast markers)",
+                            st.dropped_bytes
+                        );
+                    } else {
+                        outln!("recording stopping → {where_} (finalizing; run status again)");
+                    }
                 } else if st.recording {
                     if st.dropped_bytes > 0 {
                         outln!(
