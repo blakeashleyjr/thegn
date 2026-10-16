@@ -96,6 +96,8 @@ pub struct StatsSampler {
     last_disk_io: Option<(u64, u64)>,
     last_temps: Vec<(String, f32)>,
     last_net_medium: NetMedium,
+    net_classes: std::collections::BTreeMap<String, crate::net_kind::IfaceClass>,
+    net_up: std::collections::BTreeMap<String, bool>,
 }
 
 /// Parse Linux `/proc/net/route`, returning every interface tied for the
@@ -128,47 +130,40 @@ pub(crate) fn parse_default_route(contents: &str) -> Vec<String> {
 
 #[cfg(target_os = "linux")]
 pub fn probe_net_path() -> crate::MediumSelection {
-    use crate::{IfaceFact, MediumSelection, NetMedium, select_medium_explained};
-    use std::collections::BTreeSet;
-    use std::path::Path;
+    let mut cache = std::collections::BTreeMap::new();
+    probe_net_links(&mut cache).0
+}
 
-    let routes = match std::fs::read_to_string("/proc/net/route") {
-        Ok(text) => parse_default_route(&text),
-        Err(_) => return MediumSelection::probe_unavailable(),
-    };
-    let mut names = BTreeSet::new();
-    if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
-        for entry in entries.flatten() {
-            names.insert(entry.file_name().to_string_lossy().into_owned());
+#[cfg(target_os = "linux")]
+fn probe_net_links(
+    cache: &mut std::collections::BTreeMap<String, crate::net_kind::IfaceClass>,
+) -> (
+    crate::MediumSelection,
+    std::collections::BTreeMap<String, bool>,
+) {
+    match std::fs::read_to_string("/proc/net/route") {
+        Ok(routes) => {
+            let routes = parse_default_route(&routes);
+            crate::net_kind::probe_links_at(std::path::Path::new("/sys/class/net"), &routes, cache)
         }
+        Err(_) => (
+            crate::MediumSelection::probe_unavailable(),
+            std::collections::BTreeMap::new(),
+        ),
     }
-    names.extend(routes.iter().cloned());
+}
 
-    let facts = names
-        .into_iter()
-        .map(|name| {
-            let root = Path::new("/sys/class/net").join(&name);
-            let medium = if root.join("wireless").exists() || root.join("phy80211").exists() {
-                NetMedium::Wifi
-            } else if std::fs::read_to_string(root.join("type"))
-                .is_ok_and(|kind| kind.trim() == "1")
-                && root.join("device").exists()
-            {
-                NetMedium::Ethernet
-            } else {
-                NetMedium::Unknown
-            };
-            let up = std::fs::read_to_string(root.join("operstate"))
-                .is_ok_and(|state| state.trim() == "up");
-            IfaceFact {
-                default_route: routes.iter().any(|route| route == &name),
-                name,
-                medium,
-                up,
-            }
-        })
-        .collect::<Vec<_>>();
-    select_medium_explained(&facts)
+#[cfg(not(target_os = "linux"))]
+fn probe_net_links(
+    _cache: &mut std::collections::BTreeMap<String, crate::net_kind::IfaceClass>,
+) -> (
+    crate::MediumSelection,
+    std::collections::BTreeMap<String, bool>,
+) {
+    (
+        crate::MediumSelection::probe_unavailable(),
+        std::collections::BTreeMap::new(),
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -218,6 +213,8 @@ impl StatsSampler {
             last_disk_io: None,
             last_temps: Vec::new(),
             last_net_medium: NetMedium::Unknown,
+            net_classes: std::collections::BTreeMap::new(),
+            net_up: std::collections::BTreeMap::new(),
         }
     }
 
@@ -306,21 +303,27 @@ impl StatsSampler {
         self.nets.refresh(false);
         let dt_net = now.duration_since(self.prev_net).as_secs_f64().max(0.001);
         self.prev_net = now;
-        let mut sum_rx = 0u64;
-        let mut sum_tx = 0u64;
-        for (name, data) in self.nets.iter() {
-            if name == "lo" || name.starts_with("lo") {
-                continue;
-            }
-            let rx = (data.received() as f64 / dt_net) as u64;
-            let tx = (data.transmitted() as f64 / dt_net) as u64;
-            sum_rx += rx;
-            sum_tx += tx;
-            if rx > 0 || tx > 0 {
-                snap.net_ifaces.push((name.to_string(), rx, tx));
-            }
+        #[cfg(target_os = "linux")]
+        if self.net_classes.is_empty() {
+            let (network, up) = probe_net_links(&mut self.net_classes);
+            self.last_net_medium = network.medium;
+            self.net_up = up;
         }
-        snap.net_bps = Some((sum_rx, sum_tx));
+        let (ifaces, physical, all) = crate::net_kind::aggregate(
+            self.nets.iter().map(|(name, data)| {
+                (
+                    name.as_str(),
+                    (data.received() as f64 / dt_net) as u64,
+                    (data.transmitted() as f64 / dt_net) as u64,
+                )
+            }),
+            &self.net_classes,
+            &self.net_up,
+            cfg!(target_os = "linux"),
+        );
+        snap.net_ifaces = ifaces;
+        snap.net_bps = Some(physical);
+        snap.net_bps_all = Some(all);
 
         // --- Battery + GPU + disk-free ---
         // Battery and disk-free are cheap file reads every tick. GPU depends on
@@ -347,7 +350,9 @@ impl StatsSampler {
 
         // --- Slow tier (every SLOW_EVERY-th tick): frequency, temps, disks ---
         if slow {
-            self.last_net_medium = probe_net_path().medium;
+            let (network, up) = probe_net_links(&mut self.net_classes);
+            self.last_net_medium = network.medium;
+            self.net_up = up;
             // Apple silicon publishes no SMC components, so `Components` comes
             // back empty there and the temperature row silently vanished. Ask
             // whichever backend the probe selected; `Components` stays the
