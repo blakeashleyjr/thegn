@@ -2384,15 +2384,30 @@ impl LspClient {
             self.send_cancel(id);
             return Err(LspError::Cancelled);
         }
-        if let Err(e) = self.write_until(&body, Some(deadline), cancel) {
+        if std::time::Instant::now() >= deadline {
             self.pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&id);
-            if matches!(e, LspError::Timeout | LspError::Cancelled) {
-                self.send_cancel(id);
+            self.send_cancel(id);
+            return Err(LspError::Timeout);
+        }
+        if let Err(error) = self.ensure_open() {
+            self.pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+            return Err(error);
+        }
+        if let Err(error) = enqueue_body(&self.writer, &self.queued_bytes, &body, None) {
+            self.pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+            if let Ok(result) = rx.try_recv() {
+                return result;
             }
-            return Err(e);
+            return Err(error);
         }
 
         match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
@@ -2433,42 +2448,6 @@ impl LspClient {
     fn write(&self, body: &str) -> Result<(), LspError> {
         self.ensure_open()?;
         enqueue_body(&self.writer, &self.queued_bytes, body, None)
-    }
-
-    fn write_until(
-        &self,
-        body: &str,
-        deadline: Option<std::time::Instant>,
-        cancel: Option<&CancelToken>,
-    ) -> Result<(), LspError> {
-        self.ensure_open()?;
-        if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
-            return Err(LspError::Timeout);
-        }
-        let (done_tx, done_rx) = mpsc::channel();
-        enqueue_body(
-            &self.writer,
-            &self.queued_bytes,
-            body,
-            Some(done_tx.clone()),
-        )?;
-        if let Some(cancel) = cancel {
-            cancel.on_cancel(move || {
-                if let Err(error) = done_tx.send(Err(LspError::Cancelled)) {
-                    tracing::debug!(target: "thegn::lsp", %error, "cancelled write waiter was already gone");
-                }
-            })?;
-        }
-        let wait = deadline.map_or(Duration::from_secs(365 * 24 * 60 * 60), |at| {
-            at.saturating_duration_since(std::time::Instant::now())
-        });
-        match done_rx.recv_timeout(wait) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(LspError::Timeout),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(LspError::Protocol("LSP writer closed".into()))
-            }
-        }
     }
 
     fn send_cancel(&self, id: i64) {
@@ -4840,5 +4819,103 @@ mod tests {
         ));
         thread::sleep(Duration::from_millis(20));
         assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reader_eof_fails_a_request_blocked_in_write_promptly() {
+        let (client, release, entered, server_writer) = blocked_client(Duration::from_secs(5));
+        let client = Arc::new(client);
+        let result = start_blocked_request(&client);
+        entered
+            .recv_timeout(Duration::from_secs(1))
+            .expect("request entered blocked writer");
+        drop(server_writer);
+
+        assert!(matches!(
+            result.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(LspError::Protocol(message))) if message == "server stream closed"
+        ));
+        assert!(client.pending.lock().unwrap().is_empty());
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn reader_eof_fails_a_request_queued_behind_a_blocked_write_promptly() {
+        let (client, release, entered, server_writer) = blocked_client(Duration::from_secs(5));
+        let client = Arc::new(client);
+        let first = start_blocked_request(&client);
+        entered
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first request entered blocked writer");
+        let second = start_blocked_request(&client);
+        let first_request =
+            json!({"jsonrpc":"2.0", "id":1, "method":"blocked", "params":null}).to_string();
+        let first_frame_bytes = framing::encode(&first_request).len();
+        let queued_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while client.queued_bytes.load(Ordering::SeqCst) <= first_frame_bytes
+            && std::time::Instant::now() < queued_deadline
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            client.queued_bytes.load(Ordering::SeqCst) > first_frame_bytes,
+            "second request queued behind blocked write"
+        );
+        drop(server_writer);
+
+        for result in [first, second] {
+            assert!(matches!(
+                result.recv_timeout(Duration::from_secs(1)),
+                Ok(Err(LspError::Protocol(message))) if message == "server stream closed"
+            ));
+        }
+        assert!(client.pending.lock().unwrap().is_empty());
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn duplicate_response_resolves_once_and_later_frames_still_dispatch() {
+        let (reader, mut server_writer) = std::io::pipe().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let (diag_tx, _) = diagnostics_channel();
+        let client = LspClient::from_io(
+            Box::new(reader),
+            Box::new(CapturingWriter(captured)),
+            "fixture",
+            Path::new("/fixture"),
+            diag_tx,
+        )
+        .unwrap();
+        let (response_tx, response_rx) = mpsc::channel();
+        let (sentinel_tx, sentinel_rx) = mpsc::channel();
+        client
+            .pending
+            .lock()
+            .unwrap()
+            .extend([(7, response_tx), (99, sentinel_tx)]);
+
+        let mut responses = framing::encode(r#"{"jsonrpc":"2.0","id":7,"result":"first"}"#);
+        responses.extend(framing::encode(
+            r#"{"jsonrpc":"2.0","id":7,"result":"duplicate"}"#,
+        ));
+        responses.extend(framing::encode(
+            r#"{"jsonrpc":"2.0","id":99,"result":"sentinel"}"#,
+        ));
+        server_writer.write_all(&responses).unwrap();
+
+        assert_eq!(
+            response_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(json!("first"))
+        );
+        assert_eq!(
+            sentinel_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(json!("sentinel"))
+        );
+        assert!(matches!(
+            response_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(client.pending.lock().unwrap().is_empty());
+        drop(server_writer);
     }
 }

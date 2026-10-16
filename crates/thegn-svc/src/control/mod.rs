@@ -475,6 +475,9 @@ pub struct RecordStatus {
     /// marker in the cast; non-zero means the file is valid but incomplete.
     #[serde(default)]
     pub dropped_bytes: u64,
+    /// Admission is closed and the worker has not reported completion; the file is not yet final.
+    #[serde(default)]
+    pub stopping: bool,
 }
 
 /// One changed file in a worktree (the mobile stage/commit contract).

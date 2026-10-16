@@ -32,6 +32,7 @@ use super::tombstone::Tombstone;
 /// Normal actor teardown needs about 300 ms of PTY TERM grace, 2 s for
 /// recording finish, and 500 ms of output drain; the rest is scheduling slack.
 const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+const SHUTDOWN_REAP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// One live session in the daemon's table.
 pub(crate) struct SessionEntry {
@@ -41,6 +42,9 @@ pub(crate) struct SessionEntry {
     /// The resolved source recipe used to create this live session. It is
     /// deliberately absent only on test/legacy stubs and is never persisted.
     pub recipe: Option<thegn_core::session_fork::DaemonRecipe>,
+    /// Last-resort shutdown owner; signals only the PTY process group acquired
+    /// with the child, never a pid recovered from session metadata.
+    pub process: Option<crate::pane_pty::PtyProcessOwner>,
 }
 
 /// What a session id resolves to.
@@ -122,9 +126,13 @@ impl DaemonService {
     /// join their receipts. Safe to call from RPC and from daemon signal/idle
     /// shutdown paths; repeated calls are idempotent.
     pub(crate) async fn shutdown_sessions(&self) {
+        self.shutdown_sessions_within(SHUTDOWN_DRAIN_DEADLINE).await;
+    }
+
+    async fn shutdown_sessions_within(&self, drain_deadline: std::time::Duration) {
         self.accepting
             .store(false, std::sync::atomic::Ordering::Release);
-        let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_DEADLINE;
+        let deadline = tokio::time::Instant::now() + drain_deadline;
         let senders = self
             .sessions
             .lock()
@@ -164,6 +172,48 @@ impl DaemonService {
                 ?session_ids,
                 "session shutdown drain deadline expired; aborting remaining actors"
             );
+            let owned = self
+                .sessions
+                .lock()
+                .await
+                .iter()
+                .filter_map(|(id, entry)| entry.process.clone().map(|owner| (id.clone(), owner)))
+                .collect::<Vec<_>>();
+            let mut unreaped_ids = owned
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            let reap = async {
+                let mut tasks = tokio::task::JoinSet::new();
+                for (id, owner) in owned {
+                    tasks.spawn(async move {
+                        let code = owner.terminate_and_reap_off_runtime().await;
+                        (id, code)
+                    });
+                }
+                while let Some(result) = tasks.join_next().await {
+                    match result {
+                        Ok((id, Some(_))) => {
+                            unreaped_ids.remove(&id);
+                        }
+                        Ok((id, None)) => {
+                            tracing::warn!(session_id = %id, "session process group was not reaped");
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "session process reap task failed");
+                        }
+                    }
+                }
+            };
+            if tokio::time::timeout(SHUTDOWN_REAP_DEADLINE, reap)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    session_ids = ?unreaped_ids,
+                    "session process reap deadline expired"
+                );
+            }
             for task in tasks {
                 task.abort();
             }
@@ -1175,6 +1225,7 @@ impl ControlApi for DaemonService {
                         // actor already logged/reported any finalize failure.
                         truncated: None,
                         dropped_bytes: 0,
+                        stopping: false,
                     });
                 }
                 Lookup::Unknown => return Err(Self::not_found(session)),
@@ -2707,6 +2758,7 @@ mod tests {
                 ..Default::default()
             })),
             recipe: None,
+            process: None,
         }
     }
 
@@ -4054,6 +4106,7 @@ mod tests {
                     ..Default::default()
                 })),
                 recipe: None,
+                process: None,
             },
         );
 
@@ -4697,6 +4750,7 @@ mod tests {
                 meta,
                 live,
                 recipe: None,
+                process: None,
             },
         );
         tokio::spawn(async move {
@@ -5688,6 +5742,141 @@ mod tests {
         }
         pipeline_retry::spawn(svc.clone(), rx);
         wait_parked(&svc, &[id]).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_deadline_kills_the_process_group_of_an_aborted_actor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::Builder::new()
+            .prefix("thegn-shutdown-deadline-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("private shutdown fixture directory");
+        let sh = thegn_core::util::which_path("sh").unwrap_or_else(|| "/bin/sh".into());
+        let (pane_tx, _pane_rx) = mpsc::channel(256);
+        let pty = crate::pane_pty::open_pty(
+            0,
+            &[
+                sh,
+                "-c".into(),
+                "trap '' TERM HUP; echo $$ > c.pid; exec sleep 30".into(),
+            ],
+            Some(temp.path()),
+            &[],
+            24,
+            80,
+            pane_tx,
+            None,
+            None,
+        )
+        .expect("open silent PTY child");
+        let child_pid_file = temp.path().join("c.pid");
+        let pid_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let child_pid = loop {
+            if let Ok(contents) = std::fs::read_to_string(&child_pid_file)
+                && let Ok(pid) = contents.trim().parse::<i64>()
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < pid_deadline,
+                "PTY child did not publish its pid"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+
+        let (svc, _events) = service(0);
+        let (msg_tx, _msg_rx) = mpsc::channel(1);
+        assert!(msg_tx.try_send(SessionMsg::Kill).is_ok());
+        svc.sessions.lock().await.insert(
+            "s1".into(),
+            SessionEntry {
+                process: Some(pty.process.clone()),
+                ..shutdown_test_entry(msg_tx)
+            },
+        );
+        svc.actor_tasks.lock().await.push(tokio::spawn(async {
+            std::future::pending::<()>().await;
+        }));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50)
+                + SHUTDOWN_REAP_DEADLINE
+                + std::time::Duration::from_secs(1),
+            svc.shutdown_sessions_within(std::time::Duration::from_millis(50)),
+        )
+        .await;
+        let child_died = awaited_process_death(child_pid).await;
+        let _exit_code = pty.process.terminate_and_reap();
+        assert!(
+            result.is_ok(),
+            "shutdown exceeded its bounded reap deadline"
+        );
+        assert!(child_died, "owned PTY child {child_pid} survived shutdown");
+        assert!(svc.sessions.lock().await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_refused_after_open_reaps_the_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::Builder::new()
+            .prefix("thegn-refused-spawn-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("private spawn fixture directory");
+        let sh = thegn_core::util::which_path("sh").unwrap_or_else(|| "/bin/sh".into());
+        let (svc, _events) = service(0);
+        let sessions = svc.sessions.lock().await;
+        let spawn = crate::daemon::fork::spawn_session(
+            &svc,
+            crate::daemon::fork::SpawnRequest {
+                id: "refused".into(),
+                argv: vec![
+                    sh,
+                    "-c".into(),
+                    "trap '' TERM HUP; echo $$ > c.pid; exec sleep 30".into(),
+                ],
+                cwd: Some(temp.path().to_string_lossy().into_owned()),
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+                worktree: None,
+                program: "sh".into(),
+                recipe: None,
+                forked_from: None,
+                handoff: None,
+            },
+        );
+        let child_pid_file = temp.path().join("c.pid");
+        let wait_for_child = async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&child_pid_file)
+                    && let Ok(pid) = contents.trim().parse::<i64>()
+                {
+                    svc.accepting
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    drop(sessions);
+                    return pid;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "spawned child did not publish its pid"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        let (spawn_result, child_pid) = tokio::join!(spawn, wait_for_child);
+        assert!(matches!(spawn_result, Err(ControlError::Conflict(_))));
+        assert!(svc.sessions.lock().await.is_empty());
+        assert!(
+            awaited_process_death(child_pid).await,
+            "refused PTY child {child_pid} survived the spawn refusal"
+        );
     }
 }
 

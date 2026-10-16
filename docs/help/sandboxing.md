@@ -71,8 +71,15 @@ refused whenever the resolved spec requests `read_only_root`, `no_new_privileges
 PID limit, dropped capabilities, sealed home, network-none or network filters,
 an OCI runtime, per-pane CPU/memory limits, or a VPN; Compose cannot enforce
 those restrictions. This applies under every profile, including `open`.
-Compose remains available when none of those restrictions is requested. On
-backends that store the label, a kept container is reused only if its
+Compose remains available when none of those restrictions is requested. Before
+`up`, thegn inspects the effective Compose config and refuses a service that
+binds thegn state, its runtime/control socket dir, credential dirs under `$HOME`
+(`.ssh`, `.aws`, `.gnupg`, `.config/gh`, `.kube`, `.docker`, `.netrc`,
+`.git-credentials`) or a container-engine socket. This includes binds of a parent
+directory, bind-backed named volumes, and file secrets/configs; there is no
+per-repo opt-out. If the config cannot be inspected, launch proceeds with a
+warning and is reported as host-process isolation. Remote placements are not
+checked. On backends that store the label, a kept container is reused only if its
 `thegn.policy` label matches a fingerprint of the whole resolved policy and,
 when sealed, it binds exactly the required mounts; otherwise it is recreated.
 On these backends, a policy change recreates it once, and a container made by

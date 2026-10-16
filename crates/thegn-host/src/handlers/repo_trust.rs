@@ -184,14 +184,14 @@ fn overlay_devcontainer(
     // so retain the native OCI path rather than silently replacing it.
     let user_source_pinned = !sb.image.is_empty() || sb.build.is_some() || sb.compose.is_some();
     let allowed = sb.env_passthrough.clone();
+    let firewall = thegn_core::profile::CredentialFirewall::active();
     let local_env = |key: &str| {
-        allowed
-            .iter()
-            .any(|allowed_key| allowed_key == key)
+        local_env_admitted(&allowed, key, |name| firewall.admits(name))
             .then(|| std::env::var(key).ok())
             .flatten()
     };
-    let allow_local_env = |key: &str| allowed.iter().any(|allowed_key| allowed_key == key);
+    let allow_local_env =
+        |key: &str| local_env_admitted(&allowed, key, |name| firewall.admits(name));
     let ctx = subst_ctx(worktree, &local_env);
     let outcome = devcontainer_overlay::apply_gated_with_policy(
         dc,
@@ -208,7 +208,7 @@ fn overlay_devcontainer(
     for key in &outcome.substitution.blocked_local_env {
         tracing::warn!(
             target: "thegn::config_trust",
-            "devcontainer: localEnv:{key} blocked (not in sandbox.env_passthrough)"
+            "devcontainer: localEnv:{key} blocked (not in sandbox.env_passthrough or not shared with this profile)"
         );
     }
     let source_present = match &dc.source {
@@ -287,10 +287,9 @@ pub(crate) fn devcontainer_lifecycle_steps(
         return Vec::new();
     };
     let allowed = sb.env_passthrough.clone();
+    let firewall = thegn_core::profile::CredentialFirewall::active();
     let local_env = |key: &str| {
-        allowed
-            .iter()
-            .any(|allowed_key| allowed_key == key)
+        local_env_admitted(&allowed, key, |name| firewall.admits(name))
             .then(|| std::env::var(key).ok())
             .flatten()
     };
@@ -411,4 +410,35 @@ fn surface(
             .unwrap_or_else(|| repo_root.to_string())
     );
     let _ = crate::automation_events::emit(db, CLAMP_KIND, &issue_id, &msg, worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+}
+
+fn local_env_admitted(
+    allowed: &[String],
+    key: &str,
+    firewall_admits: impl Fn(&str) -> bool,
+) -> bool {
+    allowed.iter().any(|allowed_key| allowed_key == key) && firewall_admits(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_env_admitted;
+    #[test]
+    fn named_profile_does_not_substitute_unshared_credential() {
+        let allowed = vec!["ANTHROPIC_API_KEY".to_owned(), "SSH_AUTH_SOCK".to_owned()];
+        let named_profile_admits = |key: &str| {
+            key.starts_with("LC_") || key.starts_with("THEGN_") || key == "SSH_AUTH_SOCK"
+        };
+
+        assert!(!local_env_admitted(
+            &allowed,
+            "ANTHROPIC_API_KEY",
+            named_profile_admits
+        ));
+        assert!(local_env_admitted(
+            &allowed,
+            "SSH_AUTH_SOCK",
+            named_profile_admits
+        ));
+    }
 }

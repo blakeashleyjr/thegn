@@ -592,10 +592,41 @@ fn drive_queue_with(
                 AttemptOutcome::Conflict {
                     paths,
                     submodule_conflicts,
-                } => Failure::Conflict {
-                    paths,
-                    submodule_conflicts,
-                },
+                    driver_refusal,
+                } => {
+                    if let Some(reason) = driver_refusal {
+                        let paths_text = conflict_detail(&paths, &submodule_conflicts);
+                        let mut fields = conflict_fields(&paths, &submodule_conflicts);
+                        fields.error_detail = Some(if paths_text.is_empty() {
+                            reason.clone()
+                        } else {
+                            format!("{reason}\n{paths_text}")
+                        });
+                        if let Err(error) =
+                            replace_status(db, &item.worktree, MqStatus::NeedsHuman, &fields)
+                        {
+                            out.persistence_errors.push(format!(
+                                "{}: could not persist driver refusal: {error}",
+                                item.worktree
+                            ));
+                            break 'items;
+                        }
+                        lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Failed);
+                        progress(&DriveStep {
+                            fields: &fields,
+                            worktree: &item.worktree,
+                            branch: &item.branch,
+                            status: MqStatus::NeedsHuman.as_str(),
+                            detail: &reason,
+                        });
+                        out.needs_human.push(item.branch.clone());
+                        break;
+                    }
+                    Failure::Conflict {
+                        paths,
+                        submodule_conflicts,
+                    }
+                }
                 AttemptOutcome::GateFailed { log } => {
                     out.gate_verdicts.push(GateVerdictReport {
                         branch: item.branch.clone(),

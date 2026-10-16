@@ -1358,15 +1358,29 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
         AttemptOutcome::Conflict {
             paths,
             submodule_conflicts,
+            driver_refusal,
         } => {
             let detail =
                 crate::integrate::conflict_details(&paths, &submodule_conflicts).join("\n");
-            let write = record(MqStatus::Deferred, None, Some(&detail), None);
+            let message = driver_refusal
+                .as_ref()
+                .map(|reason| format!("{reason}\n{detail}"))
+                .unwrap_or_else(|| detail.clone());
+            let write = record(
+                if driver_refusal.is_some() {
+                    MqStatus::NeedsHuman
+                } else {
+                    MqStatus::Deferred
+                },
+                None,
+                Some(&detail),
+                driver_refusal.as_deref(),
+            );
             if write.is_ok() {
                 lifecycle(LifecycleEvent::Failed, &branch);
             }
             DriveMsg::Failed(append_write_error(
-                format!("{branch} conflicts: {}", detail.replace('\n', ", ")),
+                format!("{branch} conflicts: {}", message.replace('\n', ", ")),
                 write,
             ))
         }

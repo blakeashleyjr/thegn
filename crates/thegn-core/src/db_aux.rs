@@ -7,12 +7,18 @@
 use crate::db::{Db, ForwardRow, MergeQueueRow, PrQueueRow, ShareRow};
 use crate::models::ContainerEvent;
 use crate::store::{
+    MERGE_CLAIM_ACTIVE, MERGE_CLAIM_LOST, MERGE_CLAIM_MAX_LEASE_MS, MERGE_CLAIM_OWNER_HINT_MAX,
+    MergeAttemptResult, MergeClaim, MergeClaimPhase, MergeClaimRequest, MergeClaimView,
     MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeWrite,
     MergeRegistryIdentity, MergeStatusFields, WorktreeAuxStore,
 };
 use crate::util;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
+use std::hash::BuildHasher;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 #[path = "db_merge_outcome_tests.rs"]
@@ -140,7 +146,133 @@ fn validate_merge_outcome(
 #[path = "db_cleanup_hold_tests.rs"]
 mod cleanup_hold_tests;
 
+#[cfg(test)]
+#[path = "db_merge_claim_tests.rs"]
+mod merge_claim_tests;
+
+static MERGE_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The token is a row ownership identity, not a secret: any database writer can rewrite the row.
+fn mint_claim_token() -> String {
+    let state = std::collections::hash_map::RandomState::new();
+    let counter = MERGE_CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let first = state.hash_one((std::process::id(), nanos, counter));
+    let second = state.hash_one((counter, nanos, std::process::id()));
+    format!(
+        "{:x}",
+        Sha256::digest(format!("{first}:{second}:{nanos}:{counter}").as_bytes())
+    )
+}
+
+fn valid_claim_text(value: &str, max: usize) -> bool {
+    !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
+}
+
+fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeClaim> {
+    let phase: String = row.get(6)?;
+    let phase = MergeClaimPhase::parse(&phase).ok_or_else(|| {
+        rusqlite::Error::InvalidColumnType(6, "claim_phase".to_owned(), rusqlite::types::Type::Text)
+    })?;
+    Ok(MergeClaim {
+        worktree: row.get(0)?,
+        branch: row.get(1)?,
+        repo_root: row.get(2)?,
+        target_branch: row.get(3)?,
+        location: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+        generation: row.get(5)?,
+        phase,
+        lease_until_ms: row.get(7)?,
+        owner_hint: row.get(8)?,
+        owner_token: row.get(9)?,
+    })
+}
+
+fn read_claim(tx: &Connection, worktree: &str) -> Result<Option<MergeClaim>> {
+    Ok(tx
+        .query_row(
+            "SELECT q.worktree,q.branch,w.repo_path,q.target_branch,q.location,q.claim_generation,\
+                q.claim_phase,q.claim_lease_until_ms,q.claim_owner_hint,q.claim_owner \
+         FROM merge_queue q JOIN worktrees w ON w.worktree=q.worktree WHERE q.worktree=?1",
+            [worktree],
+            claim_from_row,
+        )
+        .optional()?)
+}
+
+fn ensure_unclaimed(conn: &Connection, worktree: &str) -> Result<()> {
+    let claimed: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM merge_queue WHERE worktree=?1 AND claim_owner IS NOT NULL)",
+        [worktree],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(!claimed, MERGE_CLAIM_ACTIVE);
+    Ok(())
+}
+
 impl Db {
+    fn admit_merge_claim_tx(
+        &self,
+        request: &MergeClaimRequest,
+        token: &str,
+    ) -> Result<Option<MergeClaim>> {
+        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
+        let now = util::now_ms();
+        let location = merge_location(Some(&request.location));
+        if request.lease_until_ms <= now
+            || request.lease_until_ms.saturating_sub(now) > MERGE_CLAIM_MAX_LEASE_MS
+        {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let identity_matches: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM worktrees WHERE worktree=?1 AND branch=?2 \
+               AND COALESCE(repo_path,'')=?3 \
+               AND CASE WHEN COALESCE(location,'') IN ('','local') THEN '' ELSE location END=?4)",
+            params![
+                request.worktree,
+                request.branch,
+                request.repo_root,
+                location
+            ],
+            |row| row.get(0),
+        )?;
+        if !identity_matches {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let changed = tx.execute(
+            "UPDATE merge_queue SET claim_owner=?1,claim_generation=claim_generation+1, \
+               claim_phase='claimed_no_child',claim_lease_until_ms=?2,claim_owner_hint=?3, \
+               claim_diagnostic=NULL,claim_launch_nonce=NULL WHERE worktree=?4 AND branch=?5 \
+               AND target_branch=?6 \
+               AND ((claim_phase='unclaimed' AND status=?7) OR \
+                    (claim_phase IN ('claimed_no_child','settled') AND claim_lease_until_ms<?9)) \
+               AND CASE WHEN COALESCE(location,'') IN ('','local') THEN '' ELSE location END=?8 \
+               AND claim_generation<9223372036854775807",
+            params![
+                token,
+                request.lease_until_ms,
+                request.owner_hint,
+                request.worktree,
+                request.branch,
+                request.target_branch,
+                request.expected_status,
+                location,
+                now
+            ],
+        )?;
+        let claim = if changed == 1 {
+            read_claim(&tx, &request.worktree)?
+        } else {
+            None
+        };
+        tx.commit()?;
+        Ok(claim)
+    }
+
     /// Enqueue a remotely prepared worktree only while every registry fact
     /// verified before the provider/SSH round trip is still authoritative.
     /// `BEGIN IMMEDIATE` closes the final read/write gap: a concurrent rebind
@@ -168,7 +300,7 @@ impl Db {
                 return Ok(false);
             }
             let now = util::now();
-            conn.execute(
+            let changed = conn.execute(
                 r#"INSERT INTO merge_queue
                      (worktree,branch,target_branch,status,queued_at,updated_at,
                       result_oid,conflict_paths,error_detail,location)
@@ -180,9 +312,11 @@ impl Db {
                      agent_attempts=CASE WHEN merge_queue.status IN
                        ('queued','folding','verifying','agent_running')
                      THEN merge_queue.agent_attempts ELSE 0 END,
-                     location=?5"#,
+                     location=?5
+                   WHERE merge_queue.claim_owner IS NULL"#,
                 params![worktree, branch, target_branch, now, location],
             )?;
+            anyhow::ensure!(changed == 1, MERGE_CLAIM_ACTIVE);
             Ok(true)
         })();
         match &result {
@@ -371,7 +505,7 @@ impl WorktreeAuxStore for Db {
         // correlated subquery (NULL when the worktree isn't registered → treated
         // as local), so the queue self-describes each row's host without a
         // separate write path.
-        self.conn().execute(
+        let changed = self.conn().execute(
             r#"INSERT INTO merge_queue
                  (worktree,branch,target_branch,status,queued_at,updated_at,
                   result_oid,conflict_paths,error_detail,location)
@@ -384,9 +518,11 @@ impl WorktreeAuxStore for Db {
                  agent_attempts=CASE WHEN merge_queue.status IN
                        ('queued','folding','verifying','agent_running')
                      THEN merge_queue.agent_attempts ELSE 0 END,
-                 location=(SELECT location FROM worktrees WHERE worktree=?1)"#,
+                 location=(SELECT location FROM worktrees WHERE worktree=?1)
+               WHERE merge_queue.claim_owner IS NULL"#,
             params![worktree, branch, target_branch, now],
         )?;
+        anyhow::ensure!(changed == 1, MERGE_CLAIM_ACTIVE);
         Ok(())
     }
 
@@ -477,7 +613,7 @@ impl WorktreeAuxStore for Db {
         let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
         let changed = tx.execute(
             "UPDATE merge_queue SET status=?2, updated_at=?3, result_oid=?4, \
-             conflict_paths=?5, error_detail=?6 WHERE worktree=?1",
+             conflict_paths=?5, error_detail=?6 WHERE worktree=?1 AND claim_owner IS NULL",
             params![
                 worktree,
                 status,
@@ -487,6 +623,9 @@ impl WorktreeAuxStore for Db {
                 fields.error_detail
             ],
         )?;
+        if changed == 0 {
+            ensure_unclaimed(&tx, worktree)?;
+        }
         anyhow::ensure!(
             changed == 1,
             "merge status replacement requires one existing row"
@@ -532,13 +671,13 @@ impl WorktreeAuxStore for Db {
                 "landed merge status requires a nonempty result OID"
             );
         }
-        tx.execute(
+        let changed = tx.execute(
             r#"UPDATE merge_queue SET
                  status=?2, updated_at=?3,
                  result_oid=COALESCE(?4, result_oid),
                  conflict_paths=COALESCE(?5, conflict_paths),
                  error_detail=COALESCE(?6, error_detail)
-               WHERE worktree=?1"#,
+               WHERE worktree=?1 AND claim_owner IS NULL"#,
             params![
                 worktree,
                 status,
@@ -548,6 +687,9 @@ impl WorktreeAuxStore for Db {
                 error_detail
             ],
         )?;
+        if changed == 0 {
+            ensure_unclaimed(&tx, worktree)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -579,19 +721,27 @@ impl WorktreeAuxStore for Db {
     }
 
     fn set_merge_target(&self, worktree: &str, target_branch: &str) -> Result<()> {
-        self.conn().execute(
+        let conn = self.conn();
+        let changed = conn.execute(
             r#"UPDATE merge_queue SET target_branch=?2, updated_at=?3
-               WHERE worktree=?1"#,
+               WHERE worktree=?1 AND claim_owner IS NULL"#,
             params![worktree, target_branch, util::now()],
         )?;
+        if changed == 0 {
+            ensure_unclaimed(conn, worktree)?;
+        }
         Ok(())
     }
 
     fn set_merge_agent_attempts(&self, worktree: &str, attempts: u32) -> Result<()> {
-        self.conn().execute(
-            "UPDATE merge_queue SET agent_attempts=?2, updated_at=?3 WHERE worktree=?1",
+        let conn = self.conn();
+        let changed = conn.execute(
+            "UPDATE merge_queue SET agent_attempts=?2, updated_at=?3 WHERE worktree=?1 AND claim_owner IS NULL",
             params![worktree, attempts, util::now()],
         )?;
+        if changed == 0 {
+            ensure_unclaimed(conn, worktree)?;
+        }
         Ok(())
     }
 
@@ -600,7 +750,7 @@ impl WorktreeAuxStore for Db {
             r#"UPDATE merge_queue SET
                  status='queued', agent_attempts=0, updated_at=?2,
                  result_oid=NULL, conflict_paths=NULL, error_detail=NULL
-               WHERE worktree=?1"#,
+               WHERE worktree=?1 AND claim_owner IS NULL"#,
             params![worktree, util::now()],
         )?;
         Ok(n > 0)
@@ -609,10 +759,14 @@ impl WorktreeAuxStore for Db {
     /// Drop a worktree's merge-queue row (e.g. after a clean land is recorded
     /// elsewhere, or the worktree is removed).
     fn remove_merge_entry(&self, worktree: &str) -> Result<()> {
-        self.conn().execute(
-            "DELETE FROM merge_queue WHERE worktree=?1",
+        let conn = self.conn();
+        let changed = conn.execute(
+            "DELETE FROM merge_queue WHERE worktree=?1 AND claim_owner IS NULL",
             params![worktree],
         )?;
+        if changed == 0 {
+            ensure_unclaimed(conn, worktree)?;
+        }
         Ok(())
     }
 
@@ -646,6 +800,164 @@ impl WorktreeAuxStore for Db {
             v.push(row?);
         }
         Ok(v)
+    }
+
+    fn admit_merge_claim(&self, request: &MergeClaimRequest) -> Result<Option<MergeClaim>> {
+        for value in [
+            &request.worktree,
+            &request.branch,
+            &request.repo_root,
+            &request.target_branch,
+        ] {
+            anyhow::ensure!(
+                valid_claim_text(value, 4096),
+                "invalid merge claim identity"
+            );
+        }
+        anyhow::ensure!(
+            request.location.len() <= 4096 && !request.location.chars().any(char::is_control),
+            "invalid merge claim location"
+        );
+        anyhow::ensure!(
+            matches!(
+                request.expected_status.as_str(),
+                "queued" | "deferred" | "gate_failed" | "gate_error" | "needs_human" | "ready"
+            ),
+            "invalid merge claim status"
+        );
+        if let Some(hint) = request.owner_hint.as_deref() {
+            anyhow::ensure!(
+                valid_claim_text(hint, MERGE_CLAIM_OWNER_HINT_MAX),
+                "invalid merge claim owner hint"
+            );
+        }
+        let token = mint_claim_token();
+        self.admit_merge_claim_tx(request, &token)
+    }
+
+    fn observe_merge_claim(&self, worktree: &str) -> Result<Option<MergeClaimView>> {
+        Ok(self.conn().query_row(
+            "SELECT worktree,claim_generation,claim_phase,claim_lease_until_ms,claim_owner_hint \
+             FROM merge_queue WHERE worktree=?1",
+            [worktree],
+            |row| Ok(MergeClaimView {
+                worktree: row.get(0)?, generation: row.get(1)?, phase: row.get(2)?,
+                lease_until_ms: row.get(3)?, owner_hint: row.get(4)?,
+            }),
+        ).optional()?)
+    }
+
+    fn renew_merge_claim(&self, claim: &MergeClaim, lease_until_ms: i64) -> Result<MergeClaim> {
+        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
+        let now = util::now_ms();
+        anyhow::ensure!(
+            lease_until_ms > now && lease_until_ms.saturating_sub(now) <= MERGE_CLAIM_MAX_LEASE_MS,
+            "invalid merge claim lease"
+        );
+        let changed = tx.execute(
+            "UPDATE merge_queue SET claim_lease_until_ms=?1 WHERE worktree=?2 AND claim_owner=?3 \
+             AND claim_generation=?4 AND claim_phase='claimed_no_child' AND claim_lease_until_ms>=?5",
+            params![lease_until_ms, claim.worktree, claim.owner_token, claim.generation, now],
+        )?;
+        anyhow::ensure!(changed == 1, MERGE_CLAIM_LOST);
+        let mut renewed =
+            read_claim(&tx, &claim.worktree)?.ok_or_else(|| anyhow::anyhow!(MERGE_CLAIM_LOST))?;
+        tx.commit()?;
+        renewed.lease_until_ms = lease_until_ms;
+        Ok(renewed)
+    }
+
+    fn settle_merge_claim_no_child(&self, claim: &MergeClaim) -> Result<MergeClaim> {
+        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE merge_queue SET claim_phase='settled' WHERE worktree=?1 AND claim_owner=?2 \
+             AND claim_generation=?3 AND claim_phase='claimed_no_child'",
+            params![claim.worktree, claim.owner_token, claim.generation],
+        )?;
+        anyhow::ensure!(changed == 1, MERGE_CLAIM_LOST);
+        let settled =
+            read_claim(&tx, &claim.worktree)?.ok_or_else(|| anyhow::anyhow!(MERGE_CLAIM_LOST))?;
+        tx.commit()?;
+        Ok(settled)
+    }
+
+    fn release_merge_claim(&self, claim: &MergeClaim) -> Result<()> {
+        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE merge_queue SET claim_owner=NULL,claim_phase='unclaimed',claim_lease_until_ms=NULL, \
+             claim_owner_hint=NULL,claim_launch_nonce=NULL,claim_diagnostic=NULL WHERE worktree=?1 \
+             AND claim_owner=?2 AND claim_generation=?3 AND claim_phase='settled'",
+            params![claim.worktree, claim.owner_token, claim.generation],
+        )?;
+        anyhow::ensure!(changed == 1, MERGE_CLAIM_LOST);
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn consume_merge_agent_attempt(
+        &self,
+        claim: &MergeClaim,
+        max: u32,
+    ) -> Result<MergeAttemptResult> {
+        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
+        let now = util::now_ms();
+        let changed = tx.execute(
+            "UPDATE merge_queue SET agent_attempts=agent_attempts+1,updated_at=?1 WHERE worktree=?2 \
+             AND claim_owner=?3 AND claim_generation=?4 AND claim_phase='claimed_no_child' \
+             AND claim_lease_until_ms>=?5 AND agent_attempts<?6",
+            params![util::now(), claim.worktree, claim.owner_token, claim.generation, now, max],
+        )?;
+        let result =
+            if changed == 1 {
+                MergeAttemptResult::Consumed
+            } else {
+                let row: Option<(Option<i64>, Option<u32>)> = tx.query_row(
+                "SELECT claim_lease_until_ms,agent_attempts FROM merge_queue WHERE worktree=?1 \
+                 AND claim_owner=?2 AND claim_generation=?3 AND claim_phase='claimed_no_child'",
+                params![claim.worktree, claim.owner_token, claim.generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+                if row.is_some_and(|(lease, attempts)| {
+                    lease.is_some_and(|lease| lease >= now) && attempts.unwrap_or_default() >= max
+                }) {
+                    MergeAttemptResult::BudgetExhausted
+                } else {
+                    MergeAttemptResult::ClaimLost
+                }
+            };
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn replace_merge_status_claimed(
+        &self,
+        claim: &MergeClaim,
+        status: &str,
+        fields: &MergeStatusFields,
+    ) -> Result<MergeClaim> {
+        anyhow::ensure!(
+            status != "landed"
+                || fields
+                    .result_oid
+                    .as_deref()
+                    .is_some_and(|oid| !oid.is_empty()),
+            "landed merge status requires a nonempty result OID"
+        );
+        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
+        let now = util::now_ms();
+        let changed = tx.execute(
+            "UPDATE merge_queue SET status=?1,updated_at=?2,result_oid=?3,conflict_paths=?4,error_detail=?5 \
+             WHERE worktree=?6 AND claim_owner=?7 AND claim_generation=?8 \
+             AND (claim_phase='settled' OR \
+                  (claim_phase='claimed_no_child' AND claim_lease_until_ms>=?9))",
+            params![status, util::now(), fields.result_oid, fields.conflict_paths, fields.error_detail,
+                claim.worktree, claim.owner_token, claim.generation, now],
+        )?;
+        anyhow::ensure!(changed == 1, MERGE_CLAIM_LOST);
+        let updated =
+            read_claim(&tx, &claim.worktree)?.ok_or_else(|| anyhow::anyhow!(MERGE_CLAIM_LOST))?;
+        tx.commit()?;
+        Ok(updated)
     }
 
     // --- PR queue (v50) ---------------------------------------------------

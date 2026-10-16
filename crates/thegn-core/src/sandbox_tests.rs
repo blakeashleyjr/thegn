@@ -1893,21 +1893,31 @@ fn identify_orphans_spares_vpn_sidecar_and_profile_containers_of_live_worktrees(
 
 #[test]
 fn identify_orphans_spares_compose_service_containers_of_live_worktrees() {
-    let active = vec!["/wt/feat".to_string()];
+    let active = vec!["/w/my.repo".to_string(), "/w/my-repo".to_string()];
+    let first = container_name("/w/my.repo");
+    let first_hashed =
+        crate::sandbox_compose::hashed_project_name(&first, std::path::Path::new("/w/my.repo"));
+    let first_profile_hashed = crate::sandbox_compose::hashed_project_name(
+        &container_name_with_profile("/w/my.repo", Some("sealed")),
+        std::path::Path::new("/w/my.repo"),
+    );
+    let second_hashed = crate::sandbox_compose::hashed_project_name(
+        &container_name("/w/my-repo"),
+        std::path::Path::new("/w/my-repo"),
+    );
+    let dead_hashed = crate::sandbox_compose::hashed_project_name(
+        &container_name("/w/dead"),
+        std::path::Path::new("/w/dead"),
+    );
     let containers = vec![
-        format!("{}-dev-1", container_name("/wt/feat")),
-        format!("{}_dev_1", container_name("/wt/feat")),
-        format!(
-            "{}-db-2",
-            container_name_with_profile("/wt/feat", Some("sealed"))
-        ),
-        format!("{}-dev-1", container_name("/wt/dead")),
+        format!("{first_hashed}-dev-1"),
+        format!("{first_hashed}_dev_1"),
+        format!("{first_profile_hashed}-db-2"),
+        format!("{second_hashed}_api_1"),
+        format!("{dead_hashed}-dev-1"),
     ];
     let orphans = identify_orphans(&active, &containers);
-    assert_eq!(
-        orphans,
-        vec![format!("{}-dev-1", container_name("/wt/dead"))]
-    );
+    assert_eq!(orphans, vec![format!("{dead_hashed}-dev-1")]);
 }
 
 #[test]
@@ -1953,15 +1963,32 @@ fn compose_down_argv_uses_the_selected_oci_context() {
 #[test]
 fn teardown_argvs_include_compose_project_down() {
     let name = container_name("/wt/feat");
-    let commands = teardown_argvs(Backend::Docker, None, &name);
+    let hashed =
+        crate::sandbox_compose::hashed_project_name(&name, std::path::Path::new("/wt/feat"));
+    let commands = teardown_argvs(Backend::Docker, None, &name, std::slice::from_ref(&hashed));
     assert!(commands.contains(&vec![
         "docker".into(),
         "compose".into(),
         "-p".into(),
-        name,
+        hashed.clone(),
         "down".into(),
         "--remove-orphans".into(),
     ]));
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|argv| argv.contains(&"down".into()))
+            .count(),
+        1
+    );
+    let adopted = teardown_argvs(Backend::Docker, None, &name, &[hashed, name.clone()]);
+    assert_eq!(
+        adopted
+            .iter()
+            .filter(|argv| argv.contains(&"down".into()))
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -3680,4 +3707,218 @@ fn secret_env_file_write_failure_returns_none_and_leaves_nothing() {
                 .starts_with(".secret.tmp-")
         );
     }
+}
+
+#[test]
+fn compose_project_adoption_record_is_owner_checked_and_rejects_symlinks() {
+    let state_home = tempfile::tempdir().unwrap();
+    let mut sandbox = spec(Backend::Docker);
+    sandbox.name = "thegn-collision".into();
+    sandbox.worktree = PathBuf::from("/w/my.repo");
+    let hashed = crate::sandbox_compose::hashed_project_name(&sandbox.name, &sandbox.worktree);
+    let record_dir = state_home.path().join("thegn/compose-projects");
+    std::fs::create_dir_all(&record_dir).unwrap();
+    let record = record_dir.join(format!("{hashed}.adopted"));
+
+    assert_eq!(
+        crate::sandbox_compose::project_for_in(state_home.path(), &sandbox),
+        hashed
+    );
+    std::fs::write(&record, "thegn-collision\n").unwrap();
+    assert_eq!(
+        crate::sandbox_compose::project_for_in(state_home.path(), &sandbox),
+        "thegn-collision"
+    );
+    std::fs::write(&record, "another-project\n").unwrap();
+    assert_eq!(
+        crate::sandbox_compose::project_for_in(state_home.path(), &sandbox),
+        hashed
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let target = record_dir.join("target");
+        std::fs::write(&target, "thegn-collision").unwrap();
+        std::fs::remove_file(&record).unwrap();
+        symlink(target, &record).unwrap();
+        assert_eq!(
+            crate::sandbox_compose::project_for_in(state_home.path(), &sandbox),
+            hashed
+        );
+    }
+}
+
+#[test]
+fn compose_legacy_project_probe_adopts_only_component_owned_projects() {
+    let state_home = tempfile::tempdir().unwrap();
+    let mut sandbox = spec(Backend::Docker);
+    sandbox.name = "thegn-collision".into();
+    sandbox.worktree = PathBuf::from("/w/my.repo");
+    let target = crate::sandbox_compose::ComposeTarget::for_spec(&sandbox).unwrap();
+    let expected_ps = vec![
+        "docker".to_string(),
+        "ps".into(),
+        "-a".into(),
+        "--filter".into(),
+        "label=com.docker.compose.project=thegn-collision".into(),
+        "--format".into(),
+        "{{.Names}}".into(),
+    ];
+    let observed = std::sync::Mutex::new(Vec::new());
+    let project = crate::sandbox_compose::resolve_project_with(
+        state_home.path(),
+        &sandbox,
+        &target,
+        |argv| {
+            observed.lock().unwrap().push(argv.to_vec());
+            if argv == expected_ps.as_slice() {
+                Some((true, "legacy-web-1\n".into()))
+            } else {
+                Some((true, "/w/my.repo/.devcontainer\n".into()))
+            }
+        },
+    );
+    assert_eq!(project, sandbox.name);
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.len(), 2);
+    assert_eq!(observed[0], expected_ps);
+    assert!(observed[1].windows(2).any(|args| {
+        args[0] == "--format"
+            && args[1] == "{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}"
+    }));
+    assert!(observed[1].contains(&"legacy-web-1".to_string()));
+    drop(observed);
+    assert_eq!(
+        crate::sandbox_compose::project_for_in(state_home.path(), &sandbox),
+        sandbox.name
+    );
+
+    let foreign_state = tempfile::tempdir().unwrap();
+    let foreign = crate::sandbox_compose::resolve_project_with(
+        foreign_state.path(),
+        &sandbox,
+        &target,
+        |argv| {
+            if argv == expected_ps.as_slice() {
+                Some((true, "legacy-web-1\n".into()))
+            } else {
+                Some((true, "/w/my-repo/.devcontainer\n".into()))
+            }
+        },
+    );
+    assert_eq!(
+        foreign,
+        crate::sandbox_compose::hashed_project_name(&sandbox.name, &sandbox.worktree)
+    );
+    assert_eq!(
+        crate::sandbox_compose::project_for_in(foreign_state.path(), &sandbox),
+        foreign
+    );
+
+    let failed_state = tempfile::tempdir().unwrap();
+    let failed = crate::sandbox_compose::resolve_project_with(
+        failed_state.path(),
+        &sandbox,
+        &target,
+        |_| None,
+    );
+    assert_eq!(failed, foreign);
+    assert_eq!(
+        crate::sandbox_compose::project_for_in(failed_state.path(), &sandbox),
+        failed
+    );
+
+    let empty_state = tempfile::tempdir().unwrap();
+    let empty =
+        crate::sandbox_compose::resolve_project_with(empty_state.path(), &sandbox, &target, |_| {
+            Some((true, String::new()))
+        });
+    assert_eq!(empty, failed);
+
+    let inspect_failed_state = tempfile::tempdir().unwrap();
+    let inspect_calls = std::cell::Cell::new(0);
+    let inspect_failed = crate::sandbox_compose::resolve_project_with(
+        inspect_failed_state.path(),
+        &sandbox,
+        &target,
+        |_| {
+            let call = inspect_calls.get();
+            inspect_calls.set(call + 1);
+            (call == 0).then(|| (true, "legacy-web-1\n".into()))
+        },
+    );
+    assert_eq!(inspect_failed, failed);
+    assert_eq!(inspect_calls.get(), 2);
+
+    let malformed_state = tempfile::tempdir().unwrap();
+    let malformed_dir = malformed_state.path().join("thegn/compose-projects");
+    std::fs::create_dir_all(&malformed_dir).unwrap();
+    let malformed_record = malformed_dir.join(format!(
+        "{}.adopted",
+        crate::sandbox_compose::hashed_project_name(&sandbox.name, &sandbox.worktree)
+    ));
+    std::fs::write(&malformed_record, "other-project").unwrap();
+    let malformed_calls = std::cell::Cell::new(0);
+    let malformed = crate::sandbox_compose::resolve_project_with(
+        malformed_state.path(),
+        &sandbox,
+        &target,
+        |_| {
+            malformed_calls.set(malformed_calls.get() + 1);
+            None
+        },
+    );
+    assert_eq!(malformed, failed);
+    assert_eq!(malformed_calls.get(), 0);
+
+    let write_failed_state = tempfile::tempdir().unwrap();
+    std::fs::write(
+        write_failed_state.path().join("thegn"),
+        "blocking directory",
+    )
+    .unwrap();
+    let write_failed = crate::sandbox_compose::resolve_project_with(
+        write_failed_state.path(),
+        &sandbox,
+        &target,
+        |argv| {
+            if argv == expected_ps.as_slice() {
+                Some((true, "legacy-web-1\n".into()))
+            } else {
+                Some((true, "/w/my.repo/.devcontainer\n".into()))
+            }
+        },
+    );
+    assert_eq!(write_failed, failed);
+
+    let adopted =
+        crate::sandbox_compose::resolve_project_with(state_home.path(), &sandbox, &target, |_| {
+            panic!("adoption record should suppress repeat probes")
+        });
+    assert_eq!(adopted, sandbox.name);
+}
+
+#[test]
+fn compose_teardown_projects_add_legacy_only_for_adopted_worktree() {
+    let state_home = tempfile::tempdir().unwrap();
+    let worktree = PathBuf::from("/w/my.repo");
+    let legacy = container_name(&worktree.to_string_lossy());
+    let hashed = crate::sandbox_compose::hashed_project_name(&legacy, &worktree);
+    assert_eq!(
+        crate::sandbox_compose::teardown_projects_in(state_home.path(), &worktree),
+        vec![hashed.clone()]
+    );
+    let directory = crate::fsperm::ensure_private_dir_beneath(
+        state_home.path(),
+        std::path::Path::new("thegn/compose-projects"),
+    )
+    .unwrap();
+    directory
+        .write_owner_only_atomic(&format!("{hashed}.adopted"), legacy.as_bytes())
+        .unwrap();
+    assert_eq!(
+        crate::sandbox_compose::teardown_projects_in(state_home.path(), &worktree),
+        vec![hashed, legacy]
+    );
 }

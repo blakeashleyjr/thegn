@@ -57,7 +57,7 @@ pub(crate) fn preflight_exec_argv_with(
             .map_err(|error| error.to_string())?;
         let argv = crate::sandbox_compose::exec_argv(
             &target,
-            &spec.name,
+            &crate::sandbox_compose::project_for(spec),
             &compose,
             workdir.as_deref(),
             body,
@@ -318,7 +318,7 @@ mod tests {
         let workdir = spec.worktree.to_string_lossy().into_owned();
         let pane_path = crate::sandbox_compose::exec_argv(
             &crate::sandbox_compose::ComposeTarget::for_spec(&spec).unwrap(),
-            &spec.name,
+            &crate::sandbox_compose::project_for(&spec),
             &compose,
             Some(&workdir),
             "true",
@@ -356,7 +356,9 @@ mod tests {
         let observed = observed.lock().unwrap();
         let exec = observed.iter().position(|arg| arg == "exec").unwrap();
         assert_eq!(observed[exec - 2].as_str(), "-p");
-        assert_eq!(observed[exec - 1].as_str(), "thegn-x");
+        let project = crate::sandbox_compose::project_for(&spec);
+        assert_eq!(observed[exec - 1], project);
+        assert_ne!(observed[exec - 1], spec.name);
         let after_exec = &observed[exec + 1..];
         assert!(!after_exec.iter().any(|arg| arg == "thegn-x"));
         let service_index = if after_exec.first().is_some_and(|arg| arg == "--workdir") {

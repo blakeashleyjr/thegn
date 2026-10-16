@@ -1,7 +1,7 @@
 //! Branch operations: checkout/create/delete/merge/ff/push/pull/upstream,
 //! plus the nuke-working-tree reset.
 
-use super::{GitBackend, run_w};
+use super::{GitBackend, run_w, run_w_locked, run_w_network};
 use anyhow::Result;
 use thegn_core::git_operand as op;
 use thegn_core::remote::GitLoc;
@@ -45,7 +45,7 @@ pub trait BranchOps: GitBackend {
 
     fn delete_remote_branch(&self, loc: &GitLoc, remote: &str, name: &str) -> Result<()> {
         let (remote, name) = (op::remote_name(remote)?, op::branch_name(name)?);
-        run_w(loc, &[], &["push", remote, "--delete", name]).map(|_| ())
+        run_w_network(loc, &[], &["push", remote, "--delete", name]).map(|_| ())
     }
 
     /// Merge `branch` into the current branch (`--no-edit`); a conflict
@@ -66,15 +66,20 @@ pub trait BranchOps: GitBackend {
     /// Fast-forward a branch to its upstream. The CURRENT branch
     /// fast-forwards via `merge --ff-only @{u}`; any other branch via the
     /// fetch-refspec trick (`git fetch <remote> <b>:<b>`) — no checkout
-    /// needed, and git refuses non-ff updates by default.
+    /// needed, and git refuses non-ff updates by default. Local repositories
+    /// fetch to a private ref first, then update the branch under the lock.
     fn fast_forward(&self, loc: &GitLoc, branch: &str, current: bool, remote: &str) -> Result<()> {
         let branch = op::branch_name(branch)?;
         if current {
             run_w(loc, &[], &["merge", "--ff-only", "@{u}"]).map(|_| ())
         } else {
             let remote = op::remote_name(remote)?;
-            let spec = format!("{branch}:{branch}");
-            run_w(loc, &[], &["fetch", remote, &spec]).map(|_| after_ref_mutation(loc))
+            if !loc.is_remote() && crate::bridge::for_loc(loc).is_none() {
+                fast_forward_local(loc, remote, branch, super::MUTATION_LOCK_WAIT)
+            } else {
+                let spec = format!("{branch}:{branch}");
+                run_w(loc, &[], &["fetch", remote, &spec]).map(|_| after_ref_mutation(loc))
+            }
         }
     }
 
@@ -85,20 +90,22 @@ pub trait BranchOps: GitBackend {
             ForceMode::WithLease => args.push("--force-with-lease"),
             ForceMode::Force => args.push("--force"),
         }
-        run_w(loc, &[], &args).map(|_| ())
+        run_w_network(loc, &[], &args).map(|_| ())
     }
 
     fn push_set_upstream(&self, loc: &GitLoc, remote: &str, branch: &str) -> Result<()> {
         let (remote, branch) = (op::remote_name(remote)?, op::branch_name(branch)?);
-        run_w(loc, &[], &["push", "-u", remote, branch]).map(|_| ())
+        run_w_network(loc, &[], &["push", "-u", remote, branch]).map(|_| ())
     }
 
     fn pull(&self, loc: &GitLoc) -> Result<()> {
+        // Pull combines a network fetch with a merge/rebase, so keep its
+        // existing single locked command until those phases can be split.
         run_w(loc, &[("GIT_EDITOR", ":")], &["pull", "--no-edit"]).map(|_| ())
     }
 
     fn fetch(&self, loc: &GitLoc) -> Result<()> {
-        run_w(loc, &[], &["fetch", "--all", "--prune"]).map(|_| ())
+        run_w_network(loc, &[], &["fetch", "--all", "--prune"]).map(|_| ())
     }
 
     fn set_upstream(&self, loc: &GitLoc, remote: &str, branch: &str) -> Result<()> {
@@ -143,6 +150,55 @@ impl<T: GitBackend + ?Sized> BranchOps for T {}
 
 fn after_ref_mutation(loc: &GitLoc) {
     super::invalidate_glyph_base(loc);
+}
+
+fn fast_forward_local(
+    loc: &GitLoc,
+    remote: &str,
+    branch: &str,
+    lock_wait: std::time::Duration,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static FAST_FORWARD_SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let scratch = format!(
+        "refs/thegn/ff/{}-{}",
+        std::process::id(),
+        FAST_FORWARD_SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let fetch_spec = format!("+refs/heads/{branch}:{scratch}");
+    let update_spec = format!("{scratch}:refs/heads/{branch}");
+    let lock_args = [
+        "fetch",
+        "--no-tags",
+        "--no-recurse-submodules",
+        ".",
+        &update_spec,
+    ];
+
+    let result = fast_forward_local_phases(loc, remote, &fetch_spec, &lock_args, lock_wait);
+
+    if let Err(error) = run_w_network(loc, &[], &["update-ref", "-d", &scratch]) {
+        tracing::debug!(target: "thegn::git", %error, scratch_ref = %scratch, "could not remove fast-forward scratch ref");
+    }
+    result.map(|()| after_ref_mutation(loc))
+}
+
+fn fast_forward_local_phases(
+    loc: &GitLoc,
+    remote: &str,
+    fetch_spec: &str,
+    lock_args: &[&str],
+    lock_wait: std::time::Duration,
+) -> Result<()> {
+    run_w_network(loc, &[], &["fetch", remote, fetch_spec])?;
+    let lock = super::require_mutation_lock_within(
+        std::path::Path::new(&loc.path()),
+        lock_args,
+        lock_wait,
+    )?;
+    run_w_locked(loc, &[], lock_args, &lock)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -580,6 +636,257 @@ mod tests {
         assert_eq!(
             out_in(&clone, &["rev-parse", "--abbrev-ref", "new@{upstream}"]),
             "origin/new"
+        );
+    }
+
+    #[test]
+    fn network_ops_run_without_the_mutation_lock() {
+        use super::super::commit::CommitOps;
+        let repo = TestRepo::new("br-network-unlocked");
+        std::fs::write(repo.dir.join("f.txt"), "one\n").unwrap();
+        git_in(&repo.dir, &["add", "f.txt"]);
+        git_in(
+            &repo.dir,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "c0"],
+        );
+        let clone = with_remote(&repo);
+        ident(&clone);
+        let remote = repo.dir.join("remote.git");
+        let loc = GitLoc::for_worktree(&clone);
+
+        git_in(&clone, &["checkout", "-q", "-b", "feat"]);
+        std::fs::write(clone.join("feat.txt"), "feature\n").unwrap();
+        git_in(&clone, &["add", "feat.txt"]);
+        git_in(
+            &clone,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "feature",
+            ],
+        );
+
+        let lock_path = thegn_core::util::git_common_dir(&clone).join("thegn-git.lock");
+        std::fs::create_dir(lock_path).unwrap();
+
+        CliGit.push_set_upstream(&loc, "origin", "feat").unwrap();
+        assert_eq!(
+            out_in(&remote, &["rev-parse", "refs/heads/feat"]),
+            out_in(&clone, &["rev-parse", "feat"])
+        );
+
+        git_in(
+            &clone,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "second",
+            ],
+        );
+        CliGit.push(&loc, ForceMode::None).unwrap();
+        assert_eq!(
+            out_in(&remote, &["rev-parse", "refs/heads/feat"]),
+            out_in(&clone, &["rev-parse", "feat"])
+        );
+
+        git_in(&clone, &["tag", "v-network", "feat"]);
+        CliGit.push_tag(&loc, "origin", "v-network").unwrap();
+        assert_eq!(
+            out_in(&remote, &["rev-parse", "refs/tags/v-network"]),
+            out_in(&clone, &["rev-parse", "refs/tags/v-network"])
+        );
+
+        CliGit.delete_remote_branch(&loc, "origin", "feat").unwrap();
+        assert!(
+            out_in(
+                &remote,
+                &["for-each-ref", "--format=%(refname)", "refs/heads/feat"]
+            )
+            .is_empty()
+        );
+
+        git_in(
+            &repo.dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "remote advance",
+            ],
+        );
+        let remote_tip = repo.head();
+        git_in(&repo.dir, &["push", "-q", "origin", "main"]);
+        CliGit.fetch(&loc).unwrap();
+        git_in(
+            &clone,
+            &["cat-file", "-e", &format!("{remote_tip}^{{commit}}")],
+        );
+    }
+
+    #[test]
+    fn local_fast_forward_fetches_unlocked_and_updates_the_branch_only_under_the_lock() {
+        let repo = TestRepo::new("br-ff-lock");
+        std::fs::write(repo.dir.join("f.txt"), "one\n").unwrap();
+        git_in(&repo.dir, &["add", "f.txt"]);
+        git_in(
+            &repo.dir,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "c0"],
+        );
+        let clone = with_remote(&repo);
+        git_in(&clone, &["checkout", "-q", "-b", "work"]);
+        let loc = GitLoc::for_worktree(&clone);
+        git_in(
+            &repo.dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "remote tip",
+            ],
+        );
+        git_in(&repo.dir, &["push", "-q", "origin", "main"]);
+        let remote_tip = repo.head();
+        let original_main = out_in(&clone, &["rev-parse", "main"]);
+
+        let held = thegn_core::util::try_lock_git_mutations(&clone).unwrap();
+        let error = super::fast_forward_local(
+            &loc,
+            "origin",
+            "main",
+            std::time::Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("mutation lock"));
+        git_in(
+            &clone,
+            &["cat-file", "-e", &format!("{remote_tip}^{{commit}}")],
+        );
+        assert_eq!(out_in(&clone, &["rev-parse", "main"]), original_main);
+        assert!(
+            out_in(
+                &clone,
+                &["for-each-ref", "--format=%(refname)", "refs/thegn/ff"]
+            )
+            .is_empty()
+        );
+
+        drop(held);
+        super::fast_forward_local(&loc, "origin", "main", super::super::MUTATION_LOCK_WAIT)
+            .unwrap();
+        assert_eq!(out_in(&clone, &["rev-parse", "main"]), remote_tip);
+        assert!(
+            out_in(
+                &clone,
+                &["for-each-ref", "--format=%(refname)", "refs/thegn/ff"]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn local_fast_forward_refuses_a_branch_checked_out_elsewhere() {
+        let repo = TestRepo::new("br-ff-linked");
+        std::fs::write(repo.dir.join("f.txt"), "one\n").unwrap();
+        git_in(&repo.dir, &["add", "f.txt"]);
+        git_in(
+            &repo.dir,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "c0"],
+        );
+        let clone = with_remote(&repo);
+        let loc = GitLoc::for_worktree(&clone);
+        git_in(&clone, &["checkout", "-q", "-b", "work"]);
+        let linked = repo.dir.join("linked");
+        git_in(
+            &clone,
+            &["worktree", "add", "-q", linked.to_str().unwrap(), "main"],
+        );
+        git_in(
+            &repo.dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "remote tip",
+            ],
+        );
+        git_in(&repo.dir, &["push", "-q", "origin", "main"]);
+        let original_main = out_in(&clone, &["rev-parse", "main"]);
+
+        assert!(CliGit.fast_forward(&loc, "main", false, "origin").is_err());
+        assert_eq!(out_in(&clone, &["rev-parse", "main"]), original_main);
+        assert!(
+            out_in(
+                &clone,
+                &["for-each-ref", "--format=%(refname)", "refs/thegn/ff"]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn local_fast_forward_non_fast_forward_refusal_cleans_scratch_ref() {
+        let repo = TestRepo::new("br-ff-non-ff");
+        std::fs::write(repo.dir.join("f.txt"), "one\n").unwrap();
+        git_in(&repo.dir, &["add", "f.txt"]);
+        git_in(
+            &repo.dir,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "c0"],
+        );
+        let clone = with_remote(&repo);
+        git_in(&clone, &["checkout", "-q", "-b", "work"]);
+        let loc = GitLoc::for_worktree(&clone);
+        git_in(
+            &repo.dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "remote advance",
+            ],
+        );
+        git_in(&repo.dir, &["push", "-q", "origin", "main"]);
+        git_in(
+            &clone,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "local divergence",
+            ],
+        );
+        git_in(&clone, &["branch", "-f", "main", "HEAD"]);
+        let old_main = out_in(&clone, &["rev-parse", "main"]);
+
+        assert!(CliGit.fast_forward(&loc, "main", false, "origin").is_err());
+        assert_eq!(out_in(&clone, &["rev-parse", "main"]), old_main);
+        assert!(
+            out_in(
+                &clone,
+                &["for-each-ref", "--format=%(refname)", "refs/thegn/ff"]
+            )
+            .is_empty()
         );
     }
 }

@@ -211,7 +211,10 @@ fn project(candidates: &Candidates, report: &FoldReport) -> Result<Vec<FinalRow>
             },
             None,
             paths,
-            deferred.gate_failed.then(|| report.diagnostics.clone()),
+            deferred
+                .gate_failed
+                .then(|| report.diagnostics.clone())
+                .or_else(|| deferred.driver_refusal.clone()),
         )?;
     }
     Ok(rows)
@@ -399,6 +402,7 @@ mod tests {
                     kind: ConflictKind::Textual,
                     submodule_conflicts: Vec::new(),
                     gate_failed: status == MergeFinalStatus::GateFailed,
+                    driver_refusal: None,
                 }),
             }
             report

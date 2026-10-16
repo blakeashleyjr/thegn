@@ -46,6 +46,14 @@ pub enum GitWheel {
     Ignore,
 }
 
+/// How far a drag sample lies past the two-column zone, measured in rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragOverflow {
+    Inside,
+    Above(usize),
+    Below(usize),
+}
+
 impl GitView {
     /// The context shown in the help bar / cheatsheet title.
     pub fn label(self) -> &'static str {
@@ -861,6 +869,87 @@ impl GitUi {
             }
             GitView::CommitFiles | GitView::Blame => self.click_drill_row(index),
             _ => {}
+        }
+    }
+
+    /// Move a drag target past the visible edge by at most three cursorable
+    /// rows for this pointer-motion sample.
+    pub fn drag_autoscroll_target(&self, edge: usize, overflow: DragOverflow) -> usize {
+        let (distance, down) = match overflow {
+            DragOverflow::Inside => return edge,
+            DragOverflow::Above(distance) => (distance, false),
+            DragOverflow::Below(distance) => (distance, true),
+        };
+        let steps = distance.min(3);
+        match self.focus {
+            GitView::Staging | GitView::PatchBuilding => {
+                let doc = match self.focus {
+                    GitView::Staging => self.stage_doc.as_ref(),
+                    GitView::PatchBuilding => self.patch_doc.as_ref(),
+                    _ => None,
+                };
+                let Some(doc) = doc else {
+                    return edge;
+                };
+                let Some(mut target) = self.staging.as_ref().map(|staging| staging.cursor) else {
+                    return edge;
+                };
+                for _ in 0..steps {
+                    let mut candidate = if down {
+                        target.saturating_add(1)
+                    } else if target == 0 {
+                        return target;
+                    } else {
+                        target - 1
+                    };
+                    let mut found = None;
+                    while candidate < doc.doc.lines.len() {
+                        if staging::cursorable(&doc.doc, candidate) {
+                            found = Some(candidate);
+                            break;
+                        }
+                        if down {
+                            candidate = candidate.saturating_add(1);
+                        } else if candidate == 0 {
+                            break;
+                        } else {
+                            candidate -= 1;
+                        }
+                    }
+                    let Some(candidate) = found else {
+                        break;
+                    };
+                    target = candidate;
+                }
+                target
+            }
+            GitView::CommitFiles => {
+                if self.commit_files.is_empty() {
+                    0
+                } else {
+                    let cursor = self.cur.commit_files.min(self.commit_files.len() - 1);
+                    if down {
+                        cursor
+                            .saturating_add(steps)
+                            .min(self.commit_files.len() - 1)
+                    } else {
+                        cursor.saturating_sub(steps)
+                    }
+                }
+            }
+            GitView::Blame => {
+                if self.blame_rows.is_empty() {
+                    0
+                } else {
+                    let cursor = self.blame_cursor.min(self.blame_rows.len() - 1);
+                    if down {
+                        cursor.saturating_add(steps).min(self.blame_rows.len() - 1)
+                    } else {
+                        cursor.saturating_sub(steps)
+                    }
+                }
+            }
+            _ => edge,
         }
     }
 
@@ -3145,5 +3234,143 @@ mod tests {
                 base: "--root".into(),
             })
         );
+    }
+
+    #[test]
+    fn drag_autoscroll_walks_cursorable_lines() {
+        let path = "src/a.rs";
+        let diff = concat!(
+            "diff --git a/src/a.rs b/src/a.rs\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/src/a.rs\n",
+            "+++ b/src/a.rs\n",
+            "@@ -1,2 +1,3 @@\n one\n+two\n three\n",
+            "@@ -10,1 +11,2 @@\n ten\n+eleven\n",
+        );
+        let doc = staging::build(path, diff);
+        let cursorable: Vec<_> = (0..doc.lines.len())
+            .filter(|index| staging::cursorable(&doc, *index))
+            .collect();
+        let edge = *cursorable.get(3).expect("second hunk body lines exist");
+        let previous = *cursorable.get(2).expect("first hunk has body lines");
+        assert!(
+            !staging::cursorable(&doc, edge - 1),
+            "hunk header is skipped"
+        );
+        let mut git = GitUi {
+            focus: GitView::Staging,
+            staging: Some(StagingUi::new(path)),
+            stage_doc: Some(StageDocState {
+                path: path.into(),
+                pane: StagePane::Unstaged,
+                doc: doc.clone(),
+                diff: diff.into(),
+            }),
+            ..Default::default()
+        };
+        git.staging.as_mut().expect("staging state exists").cursor = edge;
+        assert_eq!(
+            git.drag_autoscroll_target(edge, DragOverflow::Above(1)),
+            previous
+        );
+        let far = git.drag_autoscroll_target(edge, DragOverflow::Above(10));
+        assert_eq!(far, *cursorable.first().expect("first hunk has body lines"));
+        let cursor = git.staging.as_ref().expect("staging state exists").cursor;
+        let cursor_position = cursorable
+            .iter()
+            .position(|line| *line == cursor)
+            .expect("current cursor is on a cursorable line");
+        let far_position = cursorable
+            .iter()
+            .position(|line| *line == far)
+            .expect("target is on a cursorable line");
+        assert_eq!(cursor_position - far_position, 3);
+        let last = *cursorable.last().expect("body lines exist");
+        assert_eq!(
+            git.drag_autoscroll_target(last, DragOverflow::Below(1)),
+            last
+        );
+        assert_eq!(git.drag_autoscroll_target(edge, DragOverflow::Inside), edge);
+    }
+
+    #[test]
+    fn drag_autoscroll_above_samples_step_from_cursor() {
+        let path = "src/a.rs";
+        let diff = concat!(
+            "diff --git a/src/a.rs b/src/a.rs\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/src/a.rs\n",
+            "+++ b/src/a.rs\n",
+            "@@ -1,0 +1,12 @@\n",
+            "+one\n+two\n+three\n+four\n+five\n+six\n",
+            "+seven\n+eight\n+nine\n+ten\n+eleven\n+twelve\n",
+        );
+        let doc = staging::build(path, diff);
+        let cursorable: Vec<_> = (0..doc.lines.len())
+            .filter(|index| staging::cursorable(&doc, *index))
+            .collect();
+        let cursor = *cursorable.get(9).expect("hunk has at least ten body lines");
+        let first_target = *cursorable.get(6).expect("first sample target exists");
+        let second_target = *cursorable.get(3).expect("second sample target exists");
+        let mut git = GitUi {
+            focus: GitView::Staging,
+            staging: Some(StagingUi::new(path)),
+            stage_doc: Some(StageDocState {
+                path: path.into(),
+                pane: StagePane::Unstaged,
+                doc,
+                diff: diff.into(),
+            }),
+            ..Default::default()
+        };
+        git.staging.as_mut().expect("staging state exists").cursor = cursor;
+
+        let first = git.drag_autoscroll_target(cursorable[2], DragOverflow::Above(3));
+        assert_eq!(first, first_target, "first sample steps from the cursor");
+        assert_eq!(
+            cursorable.iter().position(|line| *line == cursor).unwrap()
+                - cursorable.iter().position(|line| *line == first).unwrap(),
+            3,
+            "first sample moves three cursorable lines"
+        );
+
+        git.staging.as_mut().expect("staging state exists").cursor = first;
+        let second = git.drag_autoscroll_target(cursorable[0], DragOverflow::Above(3));
+        assert_eq!(
+            second, second_target,
+            "second sample steps from the updated cursor"
+        );
+        assert_eq!(
+            cursorable.iter().position(|line| *line == first).unwrap()
+                - cursorable.iter().position(|line| *line == second).unwrap(),
+            3,
+            "second sample also moves three cursorable lines"
+        );
+    }
+
+    #[test]
+    fn drag_autoscroll_clamps_lists() {
+        let mut git = GitUi {
+            focus: GitView::CommitFiles,
+            commit_files: (0..5).map(|index| (format!("{index}.rs"), 0, 0)).collect(),
+            ..Default::default()
+        };
+        git.cur.commit_files = 1;
+        assert_eq!(git.drag_autoscroll_target(1, DragOverflow::Below(2)), 3);
+        assert_eq!(git.drag_autoscroll_target(3, DragOverflow::Below(9)), 4);
+        git.focus = GitView::Blame;
+        git.blame_rows = (0..5)
+            .map(|index| crate::panel::BlameRow {
+                sha: "abcdef0".into(),
+                author: "Author".into(),
+                date: 1_700_000_000,
+                lineno: index + 1,
+                content: format!("line {index}"),
+            })
+            .collect();
+        assert_eq!(git.drag_autoscroll_target(2, DragOverflow::Above(5)), 0);
+        git.focus = GitView::CommitFiles;
+        git.commit_files.clear();
+        assert_eq!(git.drag_autoscroll_target(3, DragOverflow::Below(2)), 0);
     }
 }

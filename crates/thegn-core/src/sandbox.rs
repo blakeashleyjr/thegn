@@ -1333,12 +1333,15 @@ fn resolve_placed_with(
     // THE-66: sealed / sealed-tunnel tiers get a default-deny secret posture —
     // the SSH agent socket is dropped from the passthrough even if the config
     // still names it (a sealed pane with the user's agent contradicts the tier).
-    // Explicit `env_passthrough` on those tiers still re-adds it; doctor flags
-    // it. Hardened/open keep whatever the passthrough names.
+    // Explicit `env_passthrough` on those tiers still re-adds it subject to the
+    // profile credential firewall; doctor flags it. Hardened/open keep whatever
+    // the passthrough names admitted by that firewall.
     let seal_agent = profile.seals_agent_socket();
+    let firewall = crate::profile::CredentialFirewall::active();
     let mut env: Vec<(String, String)> = cfg
         .env_passthrough
         .iter()
+        .filter(|k| firewall.admits(k))
         .filter(|k| !(seal_agent && k.as_str() == "SSH_AUTH_SOCK"))
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v)))
         // A dead agent socket is worse than none: every in-sandbox ssh would
@@ -2392,11 +2395,23 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
 /// cleanup when a worktree is closed and only its path is known (no cfg/loc).
 pub fn teardown_by_path(worktree: &str) {
     let name = container_name(worktree);
+    let state_home = util::xdg_state_home();
+    let projects =
+        crate::sandbox_compose::teardown_projects_in(&state_home, std::path::Path::new(worktree));
     let placement = Placement::Local;
     for b in Backend::oci_runtimes() {
         if available(&placement, b) == RuntimeProbe::Present {
-            run_teardown_argvs(&placement, b, teardown_argvs(b, None, &name));
+            run_teardown_argvs(&placement, b, teardown_argvs(b, None, &name, &projects));
         }
+    }
+    let record = state_home.join("thegn/compose-projects").join(format!(
+        "{}.adopted",
+        crate::sandbox_compose::hashed_project_name(&name, std::path::Path::new(worktree))
+    ));
+    if let Err(error) = std::fs::remove_file(record)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!(target: "thegn::sandbox", %error, "unable to remove Compose adoption record");
     }
 }
 
@@ -2414,7 +2429,11 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
     // Try whichever OCI runtimes are available; the container only exists under one.
     for b in Backend::oci_runtimes() {
         if available(&placement, b) == RuntimeProbe::Present {
-            run_teardown_argvs(&placement, b, teardown_argvs(b, oci_host, name));
+            run_teardown_argvs(
+                &placement,
+                b,
+                teardown_argvs(b, oci_host, name, &[name.to_string()]),
+            );
         }
     }
 }
@@ -2446,14 +2465,17 @@ pub(crate) fn teardown_argvs(
     backend: Backend,
     oci_host: Option<&str>,
     name: &str,
+    compose_projects: &[String],
 ) -> Vec<Vec<String>> {
     let agent = agent_container_name(name);
     let vpn = vpn_sidecar_name(name);
     let mut remove = oci_prefix_for(backend, oci_host);
     remove.extend(["rm".into(), "-f".into(), name.into(), agent, vpn]);
     let mut commands = vec![remove];
-    if let Some(down) = crate::sandbox_compose::down_argv_for(backend, oci_host, name) {
-        commands.push(down);
+    for project in compose_projects {
+        if let Some(down) = crate::sandbox_compose::down_argv_for(backend, oci_host, project) {
+            commands.push(down);
+        }
     }
     commands
 }
@@ -2544,7 +2566,7 @@ pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Result<Vec<String>, EnterE
             .then(|| spec.worktree.to_string_lossy().into_owned());
         crate::sandbox_compose::exec_argv(
             &target,
-            &spec.name,
+            &crate::sandbox_compose::project_for(spec),
             &compose,
             workdir.as_deref(),
             &script,
@@ -4036,7 +4058,14 @@ pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> V
     // must not be misread as orphans and force-removed while their worktree lives.
     // Reaping is fail-closed: any container that maps to an active worktree by any
     // of these forms is kept.
-    let active_slugs: Vec<String> = active_worktrees.iter().map(|w| util::slugify(w)).collect();
+    let active_bases: Vec<Vec<String>> = active_worktrees
+        .iter()
+        .map(|worktree| {
+            let slug = util::slugify(worktree);
+            let hashed = format!("{slug}-{}", util::short_hash(worktree, 6));
+            vec![slug, hashed]
+        })
+        .collect();
 
     containers
         .iter()
@@ -4050,30 +4079,34 @@ pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> V
             };
             // Keep plain/profile bases and service-replica suffixes for every
             // active slug; unknown forms remain eligible for orphan cleanup.
-            !active_slugs.iter().any(|slug| {
-                if rest == slug || rest.ends_with(&format!("-{slug}")) {
-                    return true;
-                }
-                let suffix = rest.strip_prefix(slug).or_else(|| {
-                    rest.find(&format!("-{slug}"))
-                        .map(|index| &rest[index + slug.len() + 1..])
-                });
-                let Some(suffix) = suffix else {
-                    return false;
-                };
-                let Some(separator) = suffix.chars().next().filter(|ch| *ch == '-' || *ch == '_')
-                else {
-                    return false;
-                };
-                let service_and_replica = &suffix[separator.len_utf8()..];
-                let Some((service, replica)) = service_and_replica.rsplit_once(separator) else {
-                    return false;
-                };
-                // Known fail-closed over-keep: dead `wt-feat-fix-2` can look
-                // like service `fix` replica 2 while live `wt-feat` exists.
-                !service.is_empty()
-                    && !replica.is_empty()
-                    && replica.bytes().all(|byte| byte.is_ascii_digit())
+            !active_bases.iter().any(|bases| {
+                bases.iter().any(|base| {
+                    if rest == base || rest.ends_with(&format!("-{base}")) {
+                        return true;
+                    }
+                    let suffix = rest.strip_prefix(base).or_else(|| {
+                        rest.find(&format!("-{base}"))
+                            .map(|index| &rest[index + base.len() + 1..])
+                    });
+                    let Some(suffix) = suffix else {
+                        return false;
+                    };
+                    let Some(separator) =
+                        suffix.chars().next().filter(|ch| *ch == '-' || *ch == '_')
+                    else {
+                        return false;
+                    };
+                    let service_and_replica = &suffix[separator.len_utf8()..];
+                    let Some((service, replica)) = service_and_replica.rsplit_once(separator)
+                    else {
+                        return false;
+                    };
+                    // Known fail-closed over-keep: dead `wt-feat-fix-2` can look
+                    // like service `fix` replica 2 while live `wt-feat` exists.
+                    !service.is_empty()
+                        && !replica.is_empty()
+                        && replica.bytes().all(|byte| byte.is_ascii_digit())
+                })
             })
         })
         .cloned()

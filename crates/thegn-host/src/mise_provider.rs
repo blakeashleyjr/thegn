@@ -7,11 +7,11 @@
 //! the event loop wait for a child process.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use termwiz::terminal::TerminalWaker;
@@ -31,6 +31,7 @@ use thegn_core::toolchain_activation::{
     ProviderAnswer, ProviderContext, ProviderProbe, ProviderState, ToolchainProvider,
     compose_activation, config_set_identity, config_set_identity_from_bytes, mise_env_request,
 };
+use thegn_proc::{End, GroupState, Leader, Limits, Stream, Which};
 
 const ORIGIN: &str = "mise";
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -326,61 +327,83 @@ fn executable_available() -> bool {
     thegn_core::util::which_path("mise").is_some()
 }
 
+#[derive(Debug)]
+enum MiseRunFailure {
+    Spawn(String),
+    TimedOut,
+    OutputLimit,
+    DidNotSettle,
+    Cancelled,
+}
+
+fn classify(run: &thegn_proc::Run) -> Result<(bool, &[u8]), MiseRunFailure> {
+    match &run.end {
+        End::Spawn(error) => Err(MiseRunFailure::Spawn(error.to_string())),
+        End::TimedOut => Err(MiseRunFailure::TimedOut),
+        End::OutputLimit(Which::Stdout) => Err(MiseRunFailure::OutputLimit),
+        End::LeaderExited => match &run.leader {
+            Leader::Reaped(status) if run.group != GroupState::Survivors => {
+                Ok((status.success(), &run.stdout.bytes))
+            }
+            _ => Err(MiseRunFailure::DidNotSettle),
+        },
+        End::Supervise(_) => Err(MiseRunFailure::DidNotSettle),
+        End::OutputLimit(Which::Stderr) => Err(MiseRunFailure::OutputLimit),
+        End::Cancelled => Err(MiseRunFailure::Cancelled),
+    }
+}
+
+fn run_mise_child(
+    command: &mut Command,
+    timeout: Duration,
+    stdout_cap: Option<usize>,
+) -> Result<(bool, Vec<u8>), MiseRunFailure> {
+    let limits = Limits {
+        quiesce_after_leader: Some(Duration::ZERO),
+        term_grace: Duration::from_millis(500),
+        reader_grace: Duration::from_millis(250),
+        stdout: stdout_cap.map_or(Stream::Null, |cap| Stream::HeadOrFail { cap }),
+        ..Limits::silent(timeout)
+    };
+    let run = thegn_proc::run(command, &limits, &AtomicBool::new(false));
+    classify(&run).map(|(success, bytes)| (success, bytes.to_vec()))
+}
+
+fn mise_failure_message(
+    failure: MiseRunFailure,
+    start: &str,
+    timeout: &str,
+    failed: &str,
+) -> String {
+    match failure {
+        MiseRunFailure::Spawn(error) => format!("{start}: {error}"),
+        MiseRunFailure::TimedOut => timeout.to_string(),
+        MiseRunFailure::OutputLimit => format!("{failed}: output exceeded its bound"),
+        MiseRunFailure::DidNotSettle | MiseRunFailure::Cancelled => {
+            format!("{failed}: process did not settle")
+        }
+    }
+}
+
 /// Run a target command with a deadline and a bounded stdout capture. This is
-/// the common transport for SSH/provider detection and activation; the launch
-/// path therefore never falls back to an unbounded `Command::output` call.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "target command execution is bounded and only used by off-loop launch resolution"
-)]
+/// the common transport for SSH/provider detection and activation.
 fn run_target_command(
     mut command: Command,
     timeout: Duration,
     max_output: usize,
 ) -> Result<(bool, String), String> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("failed to start target toolchain command: {e}"))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or("target toolchain command stdout unavailable")?;
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut buf = [0u8; 8192];
-        while bytes.len() < max_output {
-            let n = stdout.read(&mut buf).unwrap_or(0);
-            if n == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&buf[..n.min(max_output - bytes.len())]);
-        }
-        bytes
-    });
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|e| format!("target toolchain command failed: {e}"))?
-        {
-            let bytes = reader
-                .join()
-                .map_err(|_| "target toolchain output reader panicked")?;
-            let output = String::from_utf8(bytes)
-                .map_err(|_| "target toolchain command returned invalid UTF-8")?;
-            return Ok((status.success(), output));
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            return Err("target toolchain command timed out".into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let (success, bytes) =
+        run_mise_child(&mut command, timeout, Some(max_output)).map_err(|e| {
+            mise_failure_message(
+                e,
+                "failed to start target toolchain command",
+                "target toolchain command timed out",
+                "target toolchain command failed",
+            )
+        })?;
+    let output =
+        String::from_utf8(bytes).map_err(|_| "target toolchain command returned invalid UTF-8")?;
+    Ok((success, output))
 }
 
 fn target_script(
@@ -668,10 +691,6 @@ pub(crate) fn install_on_target(
 /// Install the active worktree's declared tools after the user has explicitly
 /// approved its current config set. This is intentionally the only install
 /// entry point: launch activation uses shims/cache and never calls it.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the bounded install child runs on an explicit off-loop worker"
-)]
 pub(crate) fn install(cfg: &Config, worktree: &Path, repo_root: &Path) -> Result<(), String> {
     if !worktree.is_dir() {
         return Err("active worktree is unavailable".into());
@@ -702,7 +721,8 @@ pub(crate) fn install(cfg: &Config, worktree: &Path, repo_root: &Path) -> Result
         return Err("toolchain executable is not installed".into());
     }
 
-    let mut child = Command::new("mise")
+    let mut command = Command::new("mise");
+    command
         .arg("install")
         .current_dir(worktree)
         .env_clear()
@@ -711,33 +731,16 @@ pub(crate) fn install(cfg: &Config, worktree: &Path, repo_root: &Path) -> Result
                 key.as_str(),
                 "PATH" | "HOME" | "USER" | "LANG" | "MISE_DATA_DIR" | "XDG_DATA_HOME" | "MISE_ENV"
             )
-        }))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("failed to start toolchain install: {e}"))?;
-    let deadline = Instant::now() + INSTALL_TIMEOUT;
-    loop {
-        if child
-            .try_wait()
-            .map_err(|e| format!("toolchain install failed: {e}"))?
-            .is_some()
-        {
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("toolchain install timed out".into());
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    let status = child
-        .wait()
-        .map_err(|e| format!("toolchain install failed: {e}"))?;
-    status
-        .success()
+        }));
+    let (success, _) = run_mise_child(&mut command, INSTALL_TIMEOUT, None).map_err(|e| {
+        mise_failure_message(
+            e,
+            "failed to start toolchain install",
+            "toolchain install timed out",
+            "toolchain install failed",
+        )
+    })?;
+    success
         .then_some(())
         .ok_or_else(|| "toolchain install failed".into())
 }
@@ -827,12 +830,9 @@ fn parse_env_output(raw: &str) -> Option<ActivationLayer> {
     ))
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the bounded resolver child runs on an explicit off-loop worker"
-)]
 fn run_env(worktree: &Path) -> Result<String, String> {
-    let mut child = Command::new("mise")
+    let mut command = Command::new("mise");
+    command
         .args(["env", "-s", "json"])
         .current_dir(worktree)
         .env_clear()
@@ -841,43 +841,17 @@ fn run_env(worktree: &Path) -> Result<String, String> {
                 k.as_str(),
                 "PATH" | "HOME" | "USER" | "LANG" | "MISE_DATA_DIR" | "XDG_DATA_HOME" | "MISE_ENV"
             )
-        }))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("failed to start toolchain resolver: {e}"))?;
-    let mut stdout = child.stdout.take().ok_or("resolver stdout unavailable")?;
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut buf = [0u8; 8192];
-        while bytes.len() < MAX_OUTPUT {
-            let n = stdout.read(&mut buf).unwrap_or(0);
-            if n == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&buf[..n.min(MAX_OUTPUT - bytes.len())]);
-        }
-        bytes
-    });
-    let deadline = Instant::now() + RESOLVE_TIMEOUT;
-    loop {
-        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            return Err("toolchain environment resolution timed out".into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let status = child.wait().map_err(|e| e.to_string())?;
-    let bytes = reader
-        .join()
-        .map_err(|_| "resolver output reader panicked")?;
-    if !status.success() {
+        }));
+    let (success, bytes) = run_mise_child(&mut command, RESOLVE_TIMEOUT, Some(MAX_OUTPUT))
+        .map_err(|e| {
+            mise_failure_message(
+                e,
+                "failed to start toolchain resolver",
+                "toolchain environment resolution timed out",
+                "toolchain environment resolver failed",
+            )
+        })?;
+    if !success {
         return Err("toolchain environment resolver failed".into());
     }
     String::from_utf8(bytes).map_err(|_| "toolchain resolver returned invalid UTF-8".into())
@@ -885,12 +859,9 @@ fn run_env(worktree: &Path) -> Result<String, String> {
 
 /// Run a bounded, non-interactive informational query. This is used only by
 /// the CLI doctor path; hydration and launch use `status`/the cache above.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the bounded doctor child runs on an explicit off-loop worker"
-)]
 fn run_info(worktree: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
-    let mut child = Command::new("mise")
+    let mut command = Command::new("mise");
+    command
         .args(args)
         .current_dir(worktree)
         .env_clear()
@@ -899,43 +870,16 @@ fn run_info(worktree: &Path, args: &[&str], timeout: Duration) -> Result<String,
                 key.as_str(),
                 "PATH" | "HOME" | "USER" | "LANG" | "MISE_DATA_DIR" | "XDG_DATA_HOME" | "MISE_ENV"
             )
-        }))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or("informational query stdout unavailable")?;
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut buf = [0u8; 4096];
-        while bytes.len() < 16 * 1024 {
-            let n = stdout.read(&mut buf).unwrap_or(0);
-            if n == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&buf[..n.min(16 * 1024 - bytes.len())]);
-        }
-        bytes
-    });
-    let deadline = Instant::now() + timeout;
-    loop {
-        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            return Err("informational query timed out".into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let success = child.wait().map_err(|e| e.to_string())?.success();
-    let output = reader.join().map_err(|_| "informational reader panicked")?;
+        }));
+    let (success, output) =
+        run_mise_child(&mut command, timeout, Some(16 * 1024)).map_err(|e| {
+            mise_failure_message(
+                e,
+                "failed to start informational query",
+                "informational query timed out",
+                "informational query failed",
+            )
+        })?;
     if !success {
         return Err("informational query failed".into());
     }
@@ -1511,5 +1455,82 @@ mod tests {
             .expect("target files should produce an identity");
         assert_eq!(identity.files, vec!["mise.toml"]);
         assert!(!identity.hash.is_empty());
+    }
+
+    #[test]
+    fn mise_child_timeout_kills_a_pipe_holding_grandchild() {
+        use std::time::Instant;
+
+        if !Path::new("/bin/sh").exists() || !Path::new("/proc/self/stat").exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "sleep 30 & echo $! > \"$1\"; sleep 30",
+            "mise-child-test",
+        ]);
+        command.arg(&pidfile);
+        let started = Instant::now();
+        let result = run_target_command(command, Duration::from_millis(300), 64);
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let pid = std::fs::read_to_string(pidfile).unwrap();
+        let child_stat = Path::new("/proc").join(pid.trim()).join("stat");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while let Ok(stat) = std::fs::read_to_string(&child_stat) {
+            let state = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.trim().chars().next());
+            if state == Some('Z') {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "grandchild still running: {stat}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn mise_child_over_cap_is_an_error() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "head -c 4096 /dev/zero"]);
+        let result = run_target_command(command, Duration::from_secs(2), 64);
+        assert!(result.unwrap_err().contains("exceeded"));
+    }
+
+    #[test]
+    fn mise_child_reports_status_output_and_spawn_failure() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let mut successful = Command::new("/bin/sh");
+        successful.args(["-c", "printf ok; exit 0"]);
+        assert_eq!(
+            run_target_command(successful, Duration::from_secs(1), 64).unwrap(),
+            (true, "ok".into())
+        );
+
+        let mut failed = Command::new("/bin/sh");
+        failed.args(["-c", "exit 3"]);
+        assert!(
+            !run_target_command(failed, Duration::from_secs(1), 64)
+                .unwrap()
+                .0
+        );
+
+        let missing = run_target_command(
+            Command::new("/no/such/mise-child"),
+            Duration::from_secs(1),
+            64,
+        );
+        assert!(missing.unwrap_err().contains("start"));
     }
 }

@@ -21,6 +21,8 @@ pub fn next_backoff(current: Duration, remaining: Duration) -> Duration {
 pub enum Stream {
     /// `Stdio::null()`; never read.
     Null,
+    /// Piped and drained to EOF for the whole run; keep only the first `cap` bytes. Never ends the run.
+    Head { cap: usize },
     /// Piped; keep the FIRST bytes. More than `cap` bytes ends the run: End::OutputLimit, group terminated.
     HeadOrFail { cap: usize },
     /// Piped and drained to EOF for the whole run; keep only the newest `cap` bytes. Never ends the run.
@@ -108,20 +110,37 @@ pub enum Leader {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Capture {
-    /// Head (HeadOrFail) or tail (Tail) bytes; empty for Null.
+    /// Head (Head/HeadOrFail) or tail (Tail) bytes; empty for Null.
     pub bytes: Vec<u8>,
     /// Every byte read, retained or not.
     pub total: u64,
-    /// Some bytes were dropped (Tail trimming, aggregate fit) or the HeadOrFail cap was exceeded.
+    /// Some bytes were dropped (Head, Tail trimming, aggregate fit) or the HeadOrFail cap was exceeded.
     pub truncated: bool,
     /// The pipe reached EOF (false: closed by us after reader_grace, a holder escaped the group, or Null).
     pub eof: bool,
 }
 
-fn aggregate_fit(stdout: &mut Capture, stderr: &mut Capture, cap: Option<usize>) {
+fn aggregate_fit(
+    stdout: &mut Capture,
+    stderr: &mut Capture,
+    stdout_stream: Stream,
+    stderr_stream: Stream,
+    cap: Option<usize>,
+) {
     let Some(cap) = cap else { return };
-    while stdout.bytes.len() + stderr.bytes.len() > cap {
-        if stdout.bytes.len() > stderr.bytes.len() {
+    let stdout_tail = matches!(stdout_stream, Stream::Tail { .. });
+    let stderr_tail = matches!(stderr_stream, Stream::Tail { .. });
+    while stdout.bytes.len() + stderr.bytes.len() > cap && (stdout_tail || stderr_tail) {
+        let trim_stdout = match (
+            stdout_tail && !stdout.bytes.is_empty(),
+            stderr_tail && !stderr.bytes.is_empty(),
+        ) {
+            (true, true) => stdout.bytes.len() > stderr.bytes.len(),
+            (true, false) => true,
+            (false, true) => false,
+            (false, false) => break,
+        };
+        if trim_stdout {
             let excess = (stdout.bytes.len() + stderr.bytes.len() - cap).min(stdout.bytes.len());
             stdout.bytes.drain(..excess);
             stdout.truncated = true;
