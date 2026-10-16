@@ -19,7 +19,7 @@ fn server_bytes(responses: &[&[u8]]) -> Vec<u8> {
     bytes
 }
 
-fn shell_command(script: &str, args: &[&str]) -> Command {
+fn shell_command(script: &str, args: &[&str]) -> ProcessCommand {
     let mut command = ProcessCommand::new("sh");
     command.arg("-c").arg(script).arg("sh").args(args);
     command
