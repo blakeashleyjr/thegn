@@ -1611,6 +1611,20 @@ impl Db {
         let before: i64 = self
             .conn()
             .query_row("SELECT COUNT(*) FROM sem_entity", [], |row| row.get(0))?;
+
+        // Count cache sweeps before the semantic walk because its terminal
+        // slice also runs one bounded orphan sweep and does not report its
+        // count. If this cap is reached, that terminal slice may remove up to
+        // one additional budget of cache keys that is not included here.
+        let mut removed_cache_keys = 0;
+        for _ in 0..65 {
+            let removed = self.prune_orphan_worktree_caches(ORPHAN_CACHE_SWEEP_MAX_KEYS)?;
+            removed_cache_keys += removed;
+            if removed < ORPHAN_CACHE_SWEEP_MAX_KEYS {
+                break;
+            }
+        }
+
         let limit = slice_rows.clamp(1, 4096);
         let mut after_rowid = 0;
         let mut total_scanned = 0;
@@ -1622,15 +1636,6 @@ impl Db {
             after_rowid = next_rowid;
             total_scanned += scanned;
             progress(total_scanned);
-        }
-
-        let mut removed_cache_keys = 0;
-        for _ in 0..64 {
-            let removed = self.prune_orphan_worktree_caches(ORPHAN_CACHE_SWEEP_MAX_KEYS)?;
-            removed_cache_keys += removed;
-            if removed < ORPHAN_CACHE_SWEEP_MAX_KEYS {
-                break;
-            }
         }
         let after: i64 = self
             .conn()
@@ -1822,7 +1827,7 @@ mod tests {
     fn prune_stale_caches_to_end_caps_extra_cache_sweeps() {
         let db = Db::open_memory().unwrap();
         let tx = db.conn().unchecked_transaction().unwrap();
-        let total_keys = ORPHAN_CACHE_SWEEP_MAX_KEYS * 65 + 1;
+        let total_keys = ORPHAN_CACHE_SWEEP_MAX_KEYS * 66 + 1;
         for index in 0..total_keys {
             tx.execute(
                 "INSERT INTO worktree_titles(worktree,last_title,updated_at) VALUES(?1,'title',1)",
