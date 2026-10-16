@@ -1875,5 +1875,70 @@ fn disk_volume_row_displays_collapsed_mount_count() {
     assert!(render_text(&overlay, 100, 30).contains("+42"));
 }
 
+#[test]
+fn memory_tab_distinguishes_available_from_truly_free_memory() {
+    let hist = TelemetryHistory::default();
+    let screen = Rect::full(120, 40);
+    let stats = StatsSnapshot {
+        mem_gib: Some((8.0, 32.0)),
+        mem_free_gib: Some(3.0),
+        ..full_snap()
+    };
+    let model = model_with(stats);
+    let ov = open_tab(MonitorTab::Memory, &model, &hist, screen);
+    let cells = ov
+        .body
+        .iter()
+        .find_map(|section| match section {
+            Section::Grid { cells, .. } => Some(cells),
+            _ => None,
+        })
+        .expect("memory breakdown grid");
+    assert!(
+        cells
+            .iter()
+            .any(|(key, value, _)| key == "available" && value == "24.0G")
+    );
+    assert!(
+        cells
+            .iter()
+            .any(|(key, value, _)| key == "free" && value == "3.0G")
+    );
+    assert!(
+        !cells
+            .iter()
+            .any(|(key, value, _)| key == "free" && value == "24.0G")
+    );
+    let text = render_text(&ov, 120, 40);
+    assert!(text.contains("available"), "{text}");
+    assert!(
+        text.contains("24.0G"),
+        "available must be total minus used: {text}"
+    );
+    assert!(text.contains("free"), "{text}");
+    assert!(
+        text.contains("3.0G"),
+        "free must come from mem_free_gib: {text}"
+    );
+    assert!(
+        text.lines()
+            .all(|line| !(line.contains("free") && line.contains("24.0G"))),
+        "available was mislabeled free: {text}"
+    );
+
+    let stats = StatsSnapshot {
+        mem_gib: Some((8.0, 32.0)),
+        mem_free_gib: None,
+        ..full_snap()
+    };
+    let model = model_with(stats);
+    let ov = open_tab(MonitorTab::Memory, &model, &hist, screen);
+    let text = render_text(&ov, 120, 40);
+    assert!(
+        !text.contains("free"),
+        "unknown free memory must omit that cell: {text}"
+    );
+}
+
 #[path = "monitor_cache_tests.rs"]
 mod invalidation_tests;

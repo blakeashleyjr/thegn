@@ -438,10 +438,13 @@ fn memory(cx: &Ctx) -> Vec<Section> {
     if let Some((u, t)) = s.mem_gib {
         cells.push(kv("used", format!("{u:.1}G"), Tok::Slot(S::Text)));
         cells.push(kv(
-            "free",
+            "available",
             format!("{:.1}G", (t - u).max(0.0)),
             Tok::Slot(S::Dim),
         ));
+        if let Some(free) = s.mem_free_gib {
+            cells.push(kv("free", format!("{free:.1}G"), Tok::Slot(S::Dim)));
+        }
         cells.push(kv("total", format!("{t:.0}G"), Tok::Slot(S::Dim)));
         cells.push(kv(
             "in use",

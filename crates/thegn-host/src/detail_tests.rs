@@ -2085,3 +2085,36 @@ fn the_agenda_hit_test_still_finds_the_agenda() {
         "a click on the agenda's first row still selects that event"
     );
 }
+
+#[test]
+fn memory_popup_breakdown_has_available_then_optional_free() {
+    let model = FrameModel {
+        stats: thegn_metrics::StatsSnapshot {
+            mem_gib: Some((8.0, 32.0)),
+            mem_free_gib: Some(3.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let hist = TelemetryHistory::default();
+    let ov = open_detail_for(
+        &BarItemId::Widget("mem".into()),
+        item_at(0),
+        &model,
+        &StatusCtx::new_for_test(&hist),
+    )
+    .expect("memory widget has a detail view");
+    let DetailContent::Sections(detail) = &ov.content else {
+        panic!("expected sectioned memory popup");
+    };
+    let rows = detail
+        .sections
+        .iter()
+        .find_map(|section| match section {
+            Section::KeyVal(rows) => Some(rows),
+            _ => None,
+        })
+        .expect("memory breakdown");
+    let keys: Vec<&str> = rows.iter().map(|(key, _, _)| key.as_str()).collect();
+    assert_eq!(keys, ["used", "total", "available", "free"]);
+}

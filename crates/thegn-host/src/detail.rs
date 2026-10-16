@@ -1606,15 +1606,19 @@ fn widget_detail_inner(
                 },
             ];
             if let Some((u, t)) = s.mem_gib {
-                secs.push(Section::KeyVal(vec![
+                let mut breakdown = vec![
                     ("used".into(), format!("{u:.1}G"), Tok::Slot(S::Text)),
                     ("total".into(), format!("{t:.0}G"), Tok::Slot(S::Dim)),
                     (
-                        "free".into(),
+                        "available".into(),
                         format!("{:.1}G", (t - u).max(0.0)),
                         Tok::Slot(S::Dim),
                     ),
-                ]));
+                ];
+                if let Some(free) = s.mem_free_gib {
+                    breakdown.push(("free".into(), format!("{free:.1}G"), Tok::Slot(S::Dim)));
+                }
+                secs.push(Section::KeyVal(breakdown));
             }
             if let Some((u, t)) = s.swap_gib {
                 secs.push(Section::Sparkrow {
