@@ -685,6 +685,10 @@ pub async fn main(
         &cfg.theme.preset,
     );
     crate::forge_handle::install(&cfg);
+    thegn_core::profile::install_credential_shares(thegn_core::profile::profile_shares(
+        &cfg,
+        &thegn_core::profile::name(),
+    ));
     // Same install as `main.rs`'s subcommand path — the interactive launch does
     // not go through `run_subcommand`, and the tracker panel (`hydrate_tracker`)
     // is exactly where a `keyring:` issue token has to resolve (THE-72).
@@ -833,9 +837,8 @@ pub async fn main(
     );
     crate::snapshot::set_scrollback_lines(cfg.session.scrollback_lines as usize);
     // Open the DB once here so the first frame has the full workspace list
-    // (instead of only live-session entries). The DB open is fast (<1ms on
-    // WAL) and we already touched it in load_or_seed_session — this is a
-    // second handle, not a new migration. None falls back gracefully.
+    // (instead of only live-session entries). Reuse this handle in event_loop
+    // for startup reads, then drop it before the loop. None falls back gracefully.
     let startup_db = thegn_core::db::Db::open().ok(); // best-effort: best-effort cache: startup list only; None falls back gracefully (comment above)
     // Keep a default "local" terminal so the sidebar section stays populated.
     crate::handlers::startup::reseed_default_terminal(startup_db.as_ref());
@@ -1174,6 +1177,7 @@ pub async fn main(
         shutdown,
         event_bus,
         host_cache_port,
+        startup_db,
     )
     .await;
     clipboard.shutdown();
@@ -6700,6 +6704,7 @@ async fn event_loop<T: Terminal>(
     // Bound port of the embedded host nix cache (`None` unless an env opts in), so
     // each provider worktree's reverse tunnel forwards to it.
     host_cache_port: Option<u16>,
+    startup_db: Option<thegn_core::db::Db>,
 ) -> Result<()> {
     crate::worktree_lifecycle::install_refresh(refresh_tx.clone());
     // The worker may have failed before the loop started (including a startup
@@ -7086,7 +7091,6 @@ async fn event_loop<T: Terminal>(
     // `[panel] width` config value.
     let mut panel_cols_pref: Option<usize> = None;
     let mut help_persisted: Option<(String, usize)> = None;
-    let startup_db = thegn_core::db::Db::open().ok();
     if let Some(db) = startup_db.as_ref() {
         sb.load(db, SIDEBAR_SCOPE);
         // The persisted sidebar mode (full/rail/hidden) survives restart.
@@ -7900,8 +7904,11 @@ async fn event_loop<T: Terminal>(
 
     // First-run onboarding wizard (item 489) + the first-launch keymap picker
     // (item 621); the wizard wins when both would arm (it has a keymap step).
-    let (mut onboarding, rebuild) =
-        crate::handlers::onboarding::startup(&mut current_config, &mut active_menu);
+    let (mut onboarding, rebuild) = crate::handlers::onboarding::startup(
+        &mut current_config,
+        &mut active_menu,
+        startup_db.as_ref(),
+    );
     if rebuild {
         keymap = rebuild_keymap(&current_config, &session);
     }
@@ -17595,9 +17602,10 @@ async fn event_loop<T: Terminal>(
                     let my = (m.y as usize).saturating_sub(1);
                     if let Some(rect) = chrome.panel
                         && !model.panel_pending
-                        && let Some(index) =
+                        && let Some((edge, overflow)) =
                             crate::chrome::panel_drill_drag_hit(&model, &panel_ui, rect, mx, my)
                     {
+                        let index = panel_ui.git.drag_autoscroll_target(edge, overflow);
                         let previous_path = panel_ui
                             .git
                             .commit_files

@@ -202,6 +202,9 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
                 d.branch,
                 d.paths.join(", ")
             );
+            if let Some(reason) = &d.driver_refusal {
+                outln!("    {reason}");
+            }
         }
     }
     match &report.gate {

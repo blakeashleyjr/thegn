@@ -94,12 +94,15 @@ pub struct PrQueueConfig {
     /// Opt in to running the fixing agent INSIDE the resolved sandbox (default:
     /// host + the shared resource slice). See [`Self::agent_isolation_floor`].
     pub agent_sandbox: bool,
-    /// Minimum honest isolation class the sandboxed agent task must enter. A
-    /// fail-closed miss is an INFRASTRUCTURE failure — the entry is held, never
-    /// the PR/branch blamed.
+    /// Minimum honest isolation class the sandboxed agent task must enter. The
+    /// queue floor can raise, but never weaken, the `[sandbox]` floor in force
+    /// (default: shared-kernel, refusing on a miss). Set
+    /// `[sandbox].isolation_floor = "off"` or disable `agent_sandbox` to run the
+    /// agent uncontained. A fail-closed miss is an INFRASTRUCTURE failure — the
+    /// entry is held, never the PR/branch blamed.
     pub agent_isolation_floor: crate::config::IsolationFloor,
     /// What happens when `agent_isolation_floor` can't be met: `degrade` (default)
-    /// or `fail`.
+    /// or `fail`. This cannot weaken the `[sandbox]` floor's miss policy.
     pub agent_on_floor_miss: crate::config::OnFloorMiss,
     /// Refill the attempt budget when the PR's head commit changes.
     ///

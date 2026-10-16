@@ -5,20 +5,16 @@
 //! instead — this seam only covers capture (`popup`) and fire-and-forget.
 
 use super::GitBackend;
-use std::io::Read;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc,
-};
-use std::time::{Duration, Instant};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use thegn_core::remote::GitLoc;
+use thegn_proc::{End, GroupState, Leader, Limits, Stream, Which};
 
 pub const CUSTOM_COMMAND_TIMEOUT_SECS: u64 = thegn_core::custom_cmd::DEFAULT_TIMEOUT_SECS;
 const CUSTOM_COMMAND_TIMEOUT: Duration = Duration::from_secs(CUSTOM_COMMAND_TIMEOUT_SECS);
 const STDOUT_LIMIT: usize = 1024 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const READER_GRACE: Duration = Duration::from_secs(2);
 pub const CUSTOM_OUTCOME_EXITED: &str = "exited";
 pub const CUSTOM_OUTCOME_TIMEOUT: &str = "timeout";
@@ -155,7 +151,7 @@ pub trait CustomOps: GitBackend {
 impl<T: GitBackend + ?Sized> CustomOps for T {}
 
 fn run_bounded(
-    command: Command,
+    mut command: Command,
     capture: bool,
     timeout: Duration,
     stdout_limit: usize,
@@ -165,223 +161,63 @@ fn run_bounded(
     if cancel.load(Ordering::Relaxed) {
         return CustomOutcome::Cancelled;
     }
-    let mut command = command;
-    if capture {
-        command.stdout(Stdio::piped());
-    } else {
-        command.stdout(Stdio::null());
-    }
-    command.stderr(Stdio::piped());
-    crate::plugin::proc::set_process_group(&mut command);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(_) => return CustomOutcome::Spawn,
-    };
-    let pid = child.id();
-    let (stdout_rx, stdout_reader) = match child.stdout.take() {
-        Some(stdout) if capture => {
-            let (tx, rx) = mpsc::sync_channel(1);
-            let reader = match std::thread::Builder::new().spawn(move || {
-                let result = read_bounded(stdout, stdout_limit, false);
-                if tx.send(result).is_err() {
-                    tracing::debug!("custom command stdout reader detached");
-                }
-            }) {
-                Ok(reader) => reader,
-                Err(_) => return reap_after_spawn_failure(&mut child, pid, None),
-            };
-            (Some(rx), Some(reader))
-        }
-        _ => (None, None),
-    };
-    let (stderr_rx, stderr_reader) = match child.stderr.take() {
-        Some(stderr) => {
-            let (tx, rx) = mpsc::sync_channel(1);
-            let reader = match std::thread::Builder::new().spawn(move || {
-                let result = read_bounded(stderr, stderr_limit, true);
-                if tx.send(result).is_err() {
-                    tracing::debug!("custom command stderr reader detached");
-                }
-            }) {
-                Ok(reader) => reader,
-                Err(_) => {
-                    return reap_after_spawn_failure(&mut child, pid, stdout_reader);
-                }
-            };
-            (rx, Some(reader))
-        }
-        None => {
-            crate::plugin::proc::kill_group(pid);
-            if child.wait().is_err() {
-                return CustomOutcome::Wait;
-            }
-            if let Some(reader) = stdout_reader
-                && reader.join().is_err()
-            {
-                return CustomOutcome::IncompleteCleanup;
-            }
-            return CustomOutcome::Read;
-        }
-    };
-
-    let deadline = Instant::now() + timeout;
-    let mut timed_out = false;
-    let mut cancelled = false;
-    let status = loop {
-        if cancel.load(Ordering::Relaxed) {
-            cancelled = true;
-            crate::plugin::proc::kill_group(pid);
-            break child.wait();
-        }
-        match crate::plugin::proc::leader_exited_nowait(pid) {
-            Ok(true) => {
-                // Keep the leader unreaped until its process group is gone:
-                // descendants may still hold either output pipe open.
-                crate::plugin::proc::kill_group(pid);
-                break child.wait();
-            }
-            Ok(false) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        crate::plugin::proc::kill_group(pid);
-                        break Ok(status);
-                    }
-                    Ok(None) => {}
-                    Err(error) => break Err(error),
-                }
-            }
-            Err(_) => {
-                crate::plugin::proc::kill_group(pid);
-                if let Err(error) = child.wait() {
-                    tracing::debug!(%error, "custom command reap failed");
-                }
-                return CustomOutcome::Wait;
-            }
-        }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            crate::plugin::proc::kill_group(pid);
-            break child.wait();
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    };
-    let status = match status {
-        Ok(status) => status,
-        Err(_) => {
-            crate::plugin::proc::kill_group(pid);
-            if let Err(error) = child.wait() {
-                tracing::debug!(%error, "custom command reap failed");
-            }
-            return CustomOutcome::Wait;
-        }
-    };
-
-    let reader_deadline = Instant::now() + READER_GRACE;
-    let stdout = match stdout_rx {
-        Some(receiver) => match recv_reader(receiver, reader_deadline) {
-            Ok(result) => result,
-            Err(outcome) => return outcome,
+    let limits = Limits {
+        quiesce_after_leader: Some(Duration::ZERO),
+        reader_grace: READER_GRACE,
+        stdout: if capture {
+            Stream::Head { cap: stdout_limit }
+        } else {
+            Stream::Null
         },
-        None => Ok((Vec::new(), false)),
+        stderr: Stream::Tail { cap: stderr_limit },
+        ..Limits::silent(timeout)
     };
-    let stderr = match recv_reader(stderr_rx, reader_deadline) {
-        Ok(result) => result,
-        Err(outcome) => return outcome,
-    };
-    if let Some(reader) = stdout_reader
-        && reader.join().is_err()
-    {
-        return CustomOutcome::IncompleteCleanup;
-    }
-    if let Some(reader) = stderr_reader
-        && reader.join().is_err()
-    {
-        return CustomOutcome::IncompleteCleanup;
-    }
-    if cancelled {
-        return CustomOutcome::Cancelled;
-    }
-    if timed_out {
-        return CustomOutcome::Timeout;
-    }
-    let (stdout, stdout_truncated) = match stdout {
-        Ok(stdout) => stdout,
-        Err(_) => return CustomOutcome::Read,
-    };
-    let (stderr, _) = match stderr {
-        Ok(stderr) => stderr,
-        Err(_) => return CustomOutcome::Read,
-    };
-    let (stdout, decode_truncated) = bounded_lossy_utf8(&stdout, stdout_limit);
-    let (stderr, _) = bounded_lossy_utf8(&stderr, stderr_limit);
-    CustomOutcome::Exited {
-        status,
-        stdout,
-        stdout_truncated: stdout_truncated || decode_truncated,
-        stderr,
-    }
+    outcome(
+        thegn_proc::run(&mut command, &limits, cancel),
+        capture,
+        stdout_limit,
+        stderr_limit,
+    )
 }
 
-fn reap_after_spawn_failure(
-    child: &mut Child,
-    pid: u32,
-    stdout_reader: Option<std::thread::JoinHandle<()>>,
+fn outcome(
+    run: thegn_proc::Run,
+    capture: bool,
+    stdout_limit: usize,
+    stderr_limit: usize,
 ) -> CustomOutcome {
-    crate::plugin::proc::kill_group(pid);
-    if child.wait().is_err() {
+    if matches!(&run.end, End::Spawn(_)) {
+        return CustomOutcome::Spawn;
+    }
+    if matches!(&run.end, End::Supervise(_)) || matches!(&run.leader, Leader::ReapFailed(_)) {
         return CustomOutcome::Wait;
     }
-    if let Some(reader) = stdout_reader
-        && reader.join().is_err()
-    {
+    if run.group == GroupState::Survivors || matches!(&run.leader, Leader::Detached) {
         return CustomOutcome::IncompleteCleanup;
     }
-    CustomOutcome::Spawn
-}
-
-fn recv_reader(
-    receiver: mpsc::Receiver<std::io::Result<(Vec<u8>, bool)>>,
-    deadline: Instant,
-) -> Result<std::io::Result<(Vec<u8>, bool)>, CustomOutcome> {
-    receiver
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|_| CustomOutcome::IncompleteCleanup)
-}
-
-fn read_bounded(
-    mut reader: impl Read,
-    limit: usize,
-    keep_tail: bool,
-) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut retained = Vec::with_capacity(limit.min(8192));
-    let mut truncated = false;
-    let mut chunk = [0u8; 8192];
-    loop {
-        let count = reader.read(&mut chunk)?;
-        if count == 0 {
-            return Ok((retained, truncated));
-        }
-        if keep_tail {
-            if count >= limit {
-                truncated |= retained.len() + count > limit;
-                retained.clear();
-                retained.extend_from_slice(&chunk[count - limit..count]);
-            } else {
-                let overflow = retained.len().saturating_add(count).saturating_sub(limit);
-                if overflow > 0 {
-                    retained.drain(..overflow);
-                    truncated = true;
+    match &run.end {
+        End::Cancelled => CustomOutcome::Cancelled,
+        End::TimedOut => CustomOutcome::Timeout,
+        End::OutputLimit(Which::Stdout | Which::Stderr) => CustomOutcome::Read,
+        End::LeaderExited => match &run.leader {
+            Leader::Reaped(status) => {
+                if (capture && !run.stdout.eof) || !run.stderr.eof {
+                    return CustomOutcome::IncompleteCleanup;
                 }
-                retained.extend_from_slice(&chunk[..count]);
+                let (stdout, decode_truncated) =
+                    bounded_lossy_utf8(&run.stdout.bytes, stdout_limit);
+                let (stderr, _) = bounded_lossy_utf8(&run.stderr.bytes, stderr_limit);
+                CustomOutcome::Exited {
+                    status: *status,
+                    stdout,
+                    stdout_truncated: run.stdout.truncated || decode_truncated,
+                    stderr,
+                }
             }
-        } else if retained.len() < limit {
-            let keep = (limit - retained.len()).min(count);
-            retained.extend_from_slice(&chunk[..keep]);
-            truncated |= keep < count;
-        } else {
-            truncated = true;
-        }
+            _ => CustomOutcome::Wait,
+        },
+        End::Spawn(_) => CustomOutcome::Spawn,
+        End::Supervise(_) => CustomOutcome::Wait,
     }
 }
 
@@ -429,7 +265,7 @@ fn bounded_lossy_utf8(bytes: &[u8], limit: usize) -> (String, bool) {
 mod tests {
     use super::*;
     use crate::git::{CliGit, testutil::TestRepo};
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Instant};
 
     fn supported() -> bool {
         crate::plugin::proc::bounded_group_termination_supported()
@@ -479,6 +315,137 @@ mod tests {
             }
             other => panic!("expected bounded command output, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn outcome_mapping_precedence_and_incomplete_pipe_are_preserved() {
+        let empty = thegn_proc::Capture::default();
+        let cancelled = thegn_proc::Run {
+            end: End::Cancelled,
+            group: GroupState::Survivors,
+            leader: Leader::Detached,
+            leader_exited_first: false,
+            stdout: empty.clone(),
+            stderr: empty.clone(),
+            containment: thegn_proc::Containment::ProcessGroup,
+        };
+        assert!(matches!(
+            outcome(cancelled, true, STDOUT_LIMIT, STDERR_LIMIT),
+            CustomOutcome::IncompleteCleanup
+        ));
+
+        let supervised = thegn_proc::Run {
+            end: End::Supervise(std::io::Error::other("fixture")),
+            group: GroupState::Unknown,
+            leader: Leader::NotSpawned,
+            leader_exited_first: false,
+            stdout: empty.clone(),
+            stderr: empty.clone(),
+            containment: thegn_proc::Containment::ProcessGroup,
+        };
+        assert!(matches!(
+            outcome(supervised, true, STDOUT_LIMIT, STDERR_LIMIT),
+            CustomOutcome::Wait
+        ));
+
+        let limited = thegn_proc::Run {
+            end: End::OutputLimit(Which::Stdout),
+            group: GroupState::Terminated,
+            leader: Leader::NotSpawned,
+            leader_exited_first: false,
+            stdout: empty.clone(),
+            stderr: empty.clone(),
+            containment: thegn_proc::Containment::ProcessGroup,
+        };
+        assert!(matches!(
+            outcome(limited, true, STDOUT_LIMIT, STDERR_LIMIT),
+            CustomOutcome::Read
+        ));
+
+        let repo = TestRepo::new("custom-outcome-status");
+        let status = match run_bounded(
+            repo.loc().sh_command("true"),
+            true,
+            Duration::from_secs(2),
+            STDOUT_LIMIT,
+            STDERR_LIMIT,
+            &AtomicBool::new(false),
+        ) {
+            CustomOutcome::Exited { status, .. } => status,
+            other => panic!("expected successful fixture command, got {other:?}"),
+        };
+        let escaped_pipe = thegn_proc::Run {
+            end: End::LeaderExited,
+            group: GroupState::Drained,
+            leader: Leader::Reaped(status),
+            leader_exited_first: true,
+            stdout: thegn_proc::Capture {
+                eof: false,
+                ..empty.clone()
+            },
+            stderr: empty,
+            containment: thegn_proc::Containment::ProcessGroup,
+        };
+        assert!(matches!(
+            outcome(escaped_pipe, true, STDOUT_LIMIT, STDERR_LIMIT),
+            CustomOutcome::IncompleteCleanup
+        ));
+    }
+
+    #[test]
+    fn repeated_timeout_and_cancel_cycles_leave_no_descendant() {
+        if !supported() {
+            return;
+        }
+        let repo = TestRepo::new("custom-repeat-cleanup");
+        let markers: Vec<_> = (0..6)
+            .map(|index| repo.dir.join(format!("marker-{index}")))
+            .collect();
+        for (index, marker) in markers.iter().enumerate() {
+            let script = format!("(sleep 1; touch '{}') & sleep 30", marker.display());
+            if index % 2 == 0 {
+                let started = Instant::now();
+                assert!(matches!(
+                    run_bounded(
+                        repo.loc().sh_command(&script),
+                        true,
+                        Duration::from_millis(200),
+                        STDOUT_LIMIT,
+                        STDERR_LIMIT,
+                        &AtomicBool::new(false),
+                    ),
+                    CustomOutcome::Timeout
+                ));
+                assert!(started.elapsed() < Duration::from_secs(3));
+            } else {
+                let command = repo.loc().sh_command(&script);
+                let cancel = Arc::new(AtomicBool::new(false));
+                let worker_cancel = Arc::clone(&cancel);
+                let worker = std::thread::spawn(move || {
+                    run_bounded(
+                        command,
+                        true,
+                        Duration::from_secs(5),
+                        STDOUT_LIMIT,
+                        STDERR_LIMIT,
+                        &worker_cancel,
+                    )
+                });
+                std::thread::sleep(Duration::from_millis(100));
+                cancel.store(true, Ordering::Relaxed);
+                assert!(matches!(
+                    worker.join().expect("cancelled command worker"),
+                    CustomOutcome::Cancelled
+                ));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(markers.iter().all(|marker| !marker.exists()));
+        let (kind, status, stdout, _, _) =
+            CliGit.run_custom(&repo.loc(), "echo ok", true, &AtomicBool::new(false));
+        assert_eq!(kind, CUSTOM_OUTCOME_EXITED);
+        assert!(status.is_some_and(|status| status.success()));
+        assert_eq!(stdout.trim(), "ok");
     }
 
     #[test]

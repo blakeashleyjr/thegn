@@ -70,11 +70,13 @@ pub(crate) mod worktree_rename;
 /// the live keymap from `cfg` (that reassignment stays on the loop). Extracted
 /// from the pinned `run.rs`.
 pub(crate) fn apply_keymap_preset(preset: &str, cfg: &mut thegn_core::config::Config) -> String {
-    use thegn_core::store::WorkspaceStore;
-    // best-effort: the preset also rides `cfg`; a failed persist just re-asks.
-    if let Ok(db) = thegn_core::db::Db::open() {
-        let _ = db.set_ui_state("", "keymap_preset", preset); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-    }
+    let preset_to_store = preset.to_string();
+    crate::db_task::persist(move |db| {
+        use thegn_core::store::WorkspaceStore;
+        if let Err(error) = db.set_ui_state("", "keymap_preset", &preset_to_store) {
+            tracing::debug!(target: "thegn::keymap", %error, "could not persist keymap preset");
+        }
+    });
     cfg.keymap_preset = preset.to_string();
     if preset == "default" {
         "Keymap: thegn defaults".into()

@@ -365,14 +365,14 @@ fn status_for_selected_with_probe(
         .unwrap_or_default();
     let mut folded = sandbox.clone();
     let allowed = sandbox.env_passthrough.clone();
+    let firewall = thegn_core::profile::CredentialFirewall::active();
     let local_env = |key: &str| {
-        allowed
-            .iter()
-            .any(|allowed_key| allowed_key == key)
+        (allowed.iter().any(|allowed_key| allowed_key == key) && firewall.admits(key))
             .then(|| std::env::var(key).ok())
             .flatten()
     };
-    let allow_local_env = |key: &str| allowed.iter().any(|allowed_key| allowed_key == key);
+    let allow_local_env =
+        |key: &str| allowed.iter().any(|allowed_key| allowed_key == key) && firewall.admits(key);
     let ctx = thegn_core::devcontainer::SubstCtx {
         local_workspace_folder: String::new(),
         container_workspace_folder: String::new(),

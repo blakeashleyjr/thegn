@@ -206,7 +206,8 @@ mod db_open_memo;
 /// v80: bind PR queue rows to the forge PR URL observed at enqueue.
 /// v81: shares.generation, the share run that owns the row (THE-340).
 /// v82: bind PR queue keys to forge/project and fence checkout rebinding.
-pub const SCHEMA_VERSION: i64 = 82;
+/// v83: claim and fence merge queue rows before a drain processes them.
+pub const SCHEMA_VERSION: i64 = 83;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1578,6 +1579,7 @@ impl Db {
                     crate::db_migrate::verify_v80_schema(&conn)?;
                     crate::db_migrate::verify_v81_schema(&conn)?;
                     crate::db_migrate::verify_v82_schema(&conn)?;
+                    crate::db_migrate::verify_v83_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2244,6 +2246,7 @@ impl Db {
         crate::db_migrate::migrate_v80(&conn)?;
         crate::db_migrate::migrate_v81(&conn)?;
         crate::db_migrate::migrate_v82(&conn)?;
+        crate::db_migrate::migrate_v83(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2264,6 +2267,7 @@ impl Db {
             crate::db_migrate::verify_v80_schema(&conn)?;
             crate::db_migrate::verify_v81_schema(&conn)?;
             crate::db_migrate::verify_v82_schema(&conn)?;
+            crate::db_migrate::verify_v83_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can

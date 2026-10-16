@@ -671,7 +671,8 @@ fn rpc_error_of(e: PluginApiError) -> RpcError {
         }
         PluginApiError::UndeclaredContribution(_)
         | PluginApiError::ContributionTypeMismatch { .. }
-        | PluginApiError::ContributionChanged(_) => RpcErrorCode::Invalid,
+        | PluginApiError::ContributionChanged(_)
+        | PluginApiError::QuotaExceeded { .. } => RpcErrorCode::Invalid,
         PluginApiError::UnsupportedIo(_) => RpcErrorCode::Unsupported,
         PluginApiError::IncompatibleApi { .. } => RpcErrorCode::Other,
     };
@@ -1936,6 +1937,17 @@ mod tests {
         let error = rpc_error_of(PluginApiError::UnsupportedIo("network".into()));
         assert_eq!(error.code, RpcErrorCode::Unsupported);
         assert!(error.message.contains("network"));
+    }
+
+    #[test]
+    fn quota_exceeded_uses_the_wire_invalid_error_code() {
+        let error = rpc_error_of(PluginApiError::QuotaExceeded {
+            what: "state value",
+            size: 70_000,
+            limit: 65_536,
+        });
+        assert_eq!(error.code, RpcErrorCode::Invalid);
+        assert!(error.message.contains("state value"));
     }
 
     #[test]

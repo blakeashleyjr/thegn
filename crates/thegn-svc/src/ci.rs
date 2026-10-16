@@ -329,18 +329,6 @@ fn run_cli_within(
     cancel: &AtomicBool,
 ) -> Result<String, CiError> {
     use crate::issue::gh_run::run_blocking;
-    if !crate::plugin::proc::bounded_group_termination_supported() {
-        let max_stdout = limits.max_stdout;
-        let (stdout, status, stderr) = run_fallback_bounded(cmd, limits, cancel, move |reader| {
-            read_capped(reader, max_stdout)
-        })?;
-        return if status.success() {
-            Ok(String::from_utf8_lossy(&stdout).into_owned())
-        } else {
-            Err(classify_stderr(&stderr))
-        };
-    }
-
     run_blocking(cmd, limits, cancel).map_err(ci_run_error)
 }
 
@@ -609,6 +597,7 @@ fn read_stderr_checked<R: Read>(mut reader: R, max: usize) -> Result<String, CiE
 
 /// Read no more than `max` bytes, probing one additional byte only to detect
 /// that the producer exceeded the limit.
+#[cfg(test)]
 fn read_capped<R: Read>(mut reader: R, max: usize) -> Result<Vec<u8>, CiError> {
     let mut output = Vec::with_capacity(max.min(64 * 1024));
     let mut chunk = [0u8; 8192];
@@ -632,29 +621,15 @@ fn read_capped<R: Read>(mut reader: R, max: usize) -> Result<Vec<u8>, CiError> {
 
 /// Run a command while bounding stdout before it is buffered in memory.
 fn run_cli_capped(cmd: Command, max: usize, cancel: &AtomicBool) -> Result<String, CiError> {
-    use crate::plugin::proc::bounded_group_termination_supported;
-    if bounded_group_termination_supported() {
-        return run_cli_within(
-            cmd,
-            crate::issue::gh_run::Limits {
-                timeout: CI_CLI_TIMEOUT,
-                max_stdout: max,
-                max_stderr: CI_CLI_MAX_STDERR,
-            },
-            cancel,
-        );
-    }
-    let limits = crate::issue::gh_run::Limits {
-        timeout: CI_CLI_TIMEOUT,
-        max_stdout: max,
-        max_stderr: CI_CLI_MAX_STDERR,
-    };
-    let (output, status, stderr) =
-        run_fallback_bounded(cmd, limits, cancel, move |reader| read_capped(reader, max))?;
-    if !status.success() {
-        return Err(classify_stderr(&stderr));
-    }
-    Ok(String::from_utf8_lossy(&output).into_owned())
+    run_cli_within(
+        cmd,
+        crate::issue::gh_run::Limits {
+            timeout: CI_CLI_TIMEOUT,
+            max_stdout: max,
+            max_stderr: CI_CLI_MAX_STDERR,
+        },
+        cancel,
+    )
 }
 
 /// Run a log-producing command while retaining only its newest complete lines.

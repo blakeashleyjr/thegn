@@ -145,7 +145,7 @@ fn scope_agent_spec(
 /// fails closed instead of entering a sandbox without its required network.
 fn provision_dispatch(
     dispatch: AgentDispatch,
-    provision: &dyn Fn(&thegn_core::sandbox::SandboxSpec) -> Result<(), String>,
+    provision: &dyn Fn(&thegn_core::sandbox::SandboxSpec) -> Result<Option<String>, String>,
 ) -> AgentDispatch {
     let (spec, degraded_warning) = match dispatch {
         AgentDispatch::Run(None) => return AgentDispatch::Run(None),
@@ -163,22 +163,48 @@ fn provision_dispatch(
             spec.name
         ));
     }
-    if let Err(error) = provision(&spec) {
-        return AgentDispatch::InfraHold(format!(
-            "agent sandbox `{}` could not be provisioned: {error}",
-            spec.name
-        ));
+    let provisioning_warning = match provision(&spec) {
+        Ok(warning) => warning,
+        Err(error) => {
+            return AgentDispatch::InfraHold(format!(
+                "agent sandbox `{}` could not be provisioned: {error}",
+                spec.name
+            ));
+        }
+    };
+    match (degraded_warning, provisioning_warning) {
+        (Some(warning), Some(provisioning_warning)) => {
+            AgentDispatch::RunDegraded(Some(spec), format!("{warning}; {provisioning_warning}"))
+        }
+        (Some(warning), None) => AgentDispatch::RunDegraded(Some(spec), warning),
+        (None, Some(warning)) => AgentDispatch::RunDegraded(Some(spec), warning),
+        (None, None) => AgentDispatch::Run(Some(spec)),
     }
-    match degraded_warning {
-        Some(warning) => AgentDispatch::RunDegraded(Some(spec), warning),
-        None => AgentDispatch::Run(Some(spec)),
-    }
+}
+
+fn compose_unverified_warning(
+    spec: &thegn_core::sandbox::SandboxSpec,
+    report: &thegn_core::sandbox_compose::EnsureReport,
+) -> Option<String> {
+    report.compose_unverified.as_ref().map(|reason| {
+        format!(
+            "sandbox {}: Compose config could not be inspected ({reason}); protected host binds were not checked; isolation reported as {}",
+            spec.backend.label(),
+            thegn_core::sandbox_compose::compose_reported_isolation(
+                spec.capabilities().isolation,
+                report
+            )
+            .as_str()
+        )
+    })
 }
 
 /// Resolve a queue agent task's sandbox + floor into a dispatch decision. With
 /// the opt-in off this is always `Run(None)` (host + slice, unchanged). With it
 /// on, the worktree's sandbox is resolved and its honest class compared against
-/// the demanded floor via the pure [`thegn_core::sandbox_floor::agent_task_gate`].
+/// at least the `[sandbox]` floor in force (default: shared-kernel, refusing on
+/// a miss), via the pure [`thegn_core::sandbox_floor::queue_agent_gate`]. The
+/// queue floor can raise that boundary but cannot weaken it.
 /// Before returning a runnable dispatch, this gate ensures the sandbox and
 /// proves it can execute a noninteractive preflight command.
 pub(crate) fn agent_floor_gate(
@@ -189,7 +215,7 @@ pub(crate) fn agent_floor_gate(
     on_miss: thegn_core::config::OnFloorMiss,
 ) -> AgentDispatch {
     use thegn_core::capabilities::IsolationClass;
-    use thegn_core::sandbox_floor::{AgentGate, agent_task_gate};
+    use thegn_core::sandbox_floor::{AgentGate, queue_agent_gate};
     if !sandbox_on {
         return AgentDispatch::Run(None);
     }
@@ -218,14 +244,18 @@ pub(crate) fn agent_floor_gate(
     }
     let resolved = spec.as_ref().map(|s| s.capabilities().isolation);
     let best = resolved.unwrap_or(IsolationClass::HostProcess);
-    let dispatch = match agent_task_gate(true, floor, on_miss, resolved, best) {
+    let dispatch = match queue_agent_gate(&full.sandbox, floor, on_miss, resolved, best) {
         AgentGate::Run => AgentDispatch::Run(spec),
         AgentGate::RunDegraded(w) => AgentDispatch::RunDegraded(spec, w),
         AgentGate::InfraHold(r) => AgentDispatch::InfraHold(r),
     };
     provision_dispatch(dispatch, &|spec| {
-        thegn_core::sandbox::ensure(spec).map_err(|error| format!("{error:#}"))?;
-        thegn_core::sandbox_preflight::preflight_exec(spec)
+        let report =
+            thegn_core::sandbox::ensure_attested(spec, &crate::daemon::compose_guard(&full.daemon))
+                .map_err(|error| format!("{error:#}"))?;
+        let warning = compose_unverified_warning(spec, &report);
+        thegn_core::sandbox_preflight::preflight_exec(spec)?;
+        Ok(warning)
     })
 }
 
@@ -1047,7 +1077,7 @@ mod tests {
         let calls = Cell::new(0);
         let dispatch = provision_dispatch(AgentDispatch::Run(None), &|_| {
             calls.set(calls.get() + 1);
-            Ok(())
+            Ok(None)
         });
         assert!(matches!(dispatch, AgentDispatch::Run(None)));
         assert_eq!(calls.get(), 0);
@@ -1076,7 +1106,7 @@ mod tests {
         let dispatch =
             provision_dispatch(AgentDispatch::RunDegraded(Some(spec), "w".into()), &|_| {
                 calls.set(calls.get() + 1);
-                Ok(())
+                Ok(None)
             });
         assert!(matches!(dispatch, AgentDispatch::RunDegraded(Some(_), warning) if warning == "w"));
         assert_eq!(calls.get(), 1);
@@ -1098,7 +1128,7 @@ mod tests {
         let calls = Cell::new(0);
         let dispatch = provision_dispatch(AgentDispatch::Run(Some(spec)), &|_| {
             calls.set(calls.get() + 1);
-            Ok(())
+            Ok(None)
         });
         assert!(matches!(dispatch, AgentDispatch::InfraHold(reason) if reason.contains("VPN")));
         assert_eq!(calls.get(), 0);
@@ -1209,5 +1239,57 @@ mod tests {
             env,
             vec![("PATH".into(), "/bin".into()), ("LANG".into(), "C".into())]
         );
+    }
+
+    #[test]
+    fn provisioning_warning_degrades_dispatch_and_merges_existing_warning() {
+        let dispatch = provision_dispatch(AgentDispatch::Run(Some(sandbox_spec())), &|_| {
+            Ok(Some("w2".into()))
+        });
+        assert!(
+            matches!(dispatch, AgentDispatch::RunDegraded(Some(_), warning) if warning == "w2")
+        );
+
+        let dispatch = provision_dispatch(
+            AgentDispatch::RunDegraded(Some(sandbox_spec()), "w".into()),
+            &|_| Ok(Some("w2".into())),
+        );
+        assert!(matches!(
+            dispatch,
+            AgentDispatch::RunDegraded(Some(_), warning) if warning == "w; w2"
+        ));
+
+        let dispatch = provision_dispatch(AgentDispatch::Run(Some(sandbox_spec())), &|_| Ok(None));
+        assert!(matches!(dispatch, AgentDispatch::Run(Some(_))));
+    }
+
+    #[test]
+    fn compose_unverified_warning_names_reason_and_reported_isolation() {
+        let spec = sandbox_spec();
+        let warning = compose_unverified_warning(
+            &spec,
+            &thegn_core::sandbox_compose::EnsureReport {
+                compose_unverified: Some("timed out".into()),
+            },
+        )
+        .unwrap();
+        assert!(warning.contains("timed out"));
+        assert!(warning.contains("host-process"));
+        assert!(
+            compose_unverified_warning(
+                &spec,
+                &thegn_core::sandbox_compose::EnsureReport::default()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn queue_agent_provisioning_does_not_use_guardless_ensure() {
+        let production = include_str!("agent_run.rs")
+            .split_once("\nmod tests {")
+            .map(|(production, _)| production)
+            .unwrap();
+        assert!(!production.contains(concat!("sandbox::", "ensure(")));
     }
 }
