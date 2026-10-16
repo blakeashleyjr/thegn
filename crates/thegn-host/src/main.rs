@@ -215,6 +215,7 @@ mod provision_recover;
 mod pty_drain;
 mod push_notify;
 mod queries;
+mod quit_cancel;
 mod rasterize;
 mod reaper_policy;
 mod recorder;
