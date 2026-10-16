@@ -1730,7 +1730,12 @@ fn widget_detail_inner(
             );
             let mut kv = vec![("utilization".into(), format!("{p}%"), Tok::Hue(Hue::Teal))];
             if let Some((u, t)) = s.gpu_mem_mib {
-                kv.push(("vram".into(), format!("{u}/{t} MiB"), Tok::Slot(S::Text)));
+                let label = if s.gpu_mem_shared {
+                    "gpu mem (shared)"
+                } else {
+                    "vram"
+                };
+                kv.push((label.into(), format!("{u}/{t} MiB"), Tok::Slot(S::Text)));
             }
             if let Some(c) = s.gpu_temp_c {
                 kv.push(("temp".into(), format!("{c:.0}°C"), Tok::Slot(S::Dim)));

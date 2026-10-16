@@ -16,6 +16,7 @@ mod coverage;
 mod gpu;
 mod gpu_exec;
 mod gpu_monitor;
+mod gpu_sysfs;
 mod net_medium;
 mod procs;
 mod sample;
@@ -74,12 +75,14 @@ pub struct StatsSnapshot {
     pub reclaim_per_s: Option<f32>,
     /// GPU utilization 0–100 (Linux sysfs / NVIDIA only; absent otherwise).
     pub gpu_pct: Option<u8>,
-    /// GPU memory as (used MiB, total MiB). NVIDIA (`nvidia-smi`) and AMD/Intel
-    /// sysfs (`mem_info_vram_*`) where exposed; absent otherwise.
+    /// GPU memory as (used MiB, total MiB). NVIDIA (`nvidia-smi`) and AMD
+    /// sysfs (`mem_info_vram_*`); APUs include GTT when available.
     pub gpu_mem_mib: Option<(u64, u64)>,
-    /// GPU temperature in °C (NVIDIA only today; absent otherwise).
+    /// True when `gpu_mem_mib` is VRAM+GTT on an APU.
+    pub gpu_mem_shared: bool,
+    /// GPU temperature in °C (absent when unavailable).
     pub gpu_temp_c: Option<f32>,
-    /// GPU board power draw in watts (NVIDIA only today; absent otherwise).
+    /// GPU board power draw in watts (absent when unavailable).
     pub gpu_power_w: Option<f32>,
     /// Network as (rx, tx) bytes/sec summed across non-loopback interfaces.
     pub net_bps: Option<(u64, u64)>,
