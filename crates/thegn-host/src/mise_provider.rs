@@ -1475,7 +1475,7 @@ mod tests {
         command.arg(&pidfile);
         let started = Instant::now();
         let result = run_target_command(command, Duration::from_millis(300), 64);
-        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(3));
         let pid = std::fs::read_to_string(pidfile).unwrap();
         let child_stat = Path::new("/proc").join(pid.trim()).join("stat");
