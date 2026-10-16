@@ -2371,19 +2371,60 @@ pub fn panel_column_at(
     }
 }
 
-/// Resolve a drill row for a drag, clamping samples to the visible content.
+/// Resolve a drill row for a drag and report how far it crossed the content zone.
 pub fn panel_drill_drag_hit(
     model: &FrameModel,
     ui: &crate::panel::PanelUi,
     rect: Rect,
     x: usize,
     y: usize,
-) -> Option<usize> {
+) -> Option<(usize, crate::panel::gitui::DragOverflow)> {
     let frame =
         crate::panel::frame::build_panel(model, ui, rect.cols, rect.rows, model.panel_focused);
-    let (row, col) = if let Some(zone) = frame.col_zone {
+    if let Some(zone) = frame.col_zone {
         if zone.rows.is_empty() || zone.main.is_empty() {
             return None;
+        }
+        let top = rect.y.saturating_add(zone.rows.start);
+        let bottom = rect.y.saturating_add(zone.rows.end - 1);
+        let overflow = if y < top {
+            crate::panel::gitui::DragOverflow::Above(top - y)
+        } else if y > bottom {
+            crate::panel::gitui::DragOverflow::Below(y - bottom)
+        } else {
+            crate::panel::gitui::DragOverflow::Inside
+        };
+        if let crate::panel::gitui::DragOverflow::Above(_) = overflow {
+            return frame
+                .col_hits
+                .iter()
+                .filter(|span| {
+                    zone.rows.contains(&span.row)
+                        && span.cols.start < zone.main.end
+                        && zone.main.start < span.cols.end
+                        && matches!(span.hit, crate::panel::PanelHit::GitDrill(_))
+                })
+                .min_by_key(|span| span.row)
+                .and_then(|span| match span.hit {
+                    crate::panel::PanelHit::GitDrill(index) => Some((index, overflow)),
+                    _ => None,
+                });
+        }
+        if let crate::panel::gitui::DragOverflow::Below(_) = overflow {
+            return frame
+                .col_hits
+                .iter()
+                .filter(|span| {
+                    zone.rows.contains(&span.row)
+                        && span.cols.start < zone.main.end
+                        && zone.main.start < span.cols.end
+                        && matches!(span.hit, crate::panel::PanelHit::GitDrill(_))
+                })
+                .max_by_key(|span| span.row)
+                .and_then(|span| match span.hit {
+                    crate::panel::PanelHit::GitDrill(index) => Some((index, overflow)),
+                    _ => None,
+                });
         }
         let row = y
             .saturating_sub(rect.y)
@@ -2391,28 +2432,26 @@ pub fn panel_drill_drag_hit(
         let col = x
             .saturating_sub(rect.x)
             .clamp(zone.main.start, zone.main.end - 1);
-        (row, Some(col))
-    } else {
-        let row = y
-            .saturating_sub(rect.y)
-            .min(frame.rows.len().saturating_sub(1));
-        (row, None)
-    };
-    if let Some(col) = col {
-        frame
+        let index = frame
             .col_hits
             .iter()
             .find(|span| span.row == row && span.cols.contains(&col))
             .and_then(|span| match span.hit {
                 crate::panel::PanelHit::GitDrill(index) => Some(index),
                 _ => None,
-            })
+            });
+        index.map(|index| (index, overflow))
     } else {
+        let row = y
+            .saturating_sub(rect.y)
+            .min(frame.rows.len().saturating_sub(1));
         frame
             .rows
             .get(row)
             .and_then(|panel_row| match panel_row.hit {
-                Some(crate::panel::PanelHit::GitDrill(index)) => Some(index),
+                Some(crate::panel::PanelHit::GitDrill(index)) => {
+                    Some((index, crate::panel::gitui::DragOverflow::Inside))
+                }
                 _ => None,
             })
     }

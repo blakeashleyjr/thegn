@@ -17602,9 +17602,10 @@ async fn event_loop<T: Terminal>(
                     let my = (m.y as usize).saturating_sub(1);
                     if let Some(rect) = chrome.panel
                         && !model.panel_pending
-                        && let Some(index) =
+                        && let Some((edge, overflow)) =
                             crate::chrome::panel_drill_drag_hit(&model, &panel_ui, rect, mx, my)
                     {
+                        let index = panel_ui.git.drag_autoscroll_target(edge, overflow);
                         let previous_path = panel_ui
                             .git
                             .commit_files
