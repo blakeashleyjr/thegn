@@ -45,6 +45,7 @@ mod compat;
 mod complete;
 mod completions_health;
 mod compositor;
+mod fold_cancel;
 mod gate_capture;
 // THE-505 process-source capture, wired through `config_startup`.
 mod config_capture;

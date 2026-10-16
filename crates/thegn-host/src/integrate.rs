@@ -568,6 +568,10 @@ fn run_driver_command(command: std::process::Command, timeout: Duration) -> Driv
             reason: "subprocess deadline exceeded".into(),
             log,
         },
+        crate::gate_capture::CaptureResult::Cancelled { log } => DriverRun::Failed {
+            reason: "cancelled".into(),
+            log,
+        },
         crate::gate_capture::CaptureResult::Infrastructure { reason, log } => {
             DriverRun::Failed { reason, log }
         }
@@ -1283,6 +1287,7 @@ pub(crate) enum GateErrorClass {
     Preparation,
     Signing,
     SourceMoved,
+    Cancelled,
 }
 
 impl GateErrorClass {
@@ -1297,6 +1302,7 @@ impl GateErrorClass {
             Self::Preparation => "preparation",
             Self::Signing => "signing",
             Self::SourceMoved => "source_moved",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -1388,11 +1394,17 @@ fn bisect_offender(
         diagnostics,
         budget,
     } = diagnosis;
+    if crate::fold_cancel::requested() {
+        return Err(BisectAborted(cancelled_gate_verdict(GatePhase::Gate)).into());
+    }
     // A red base says nothing about any candidate. Establish this before any
     // prefix can be blamed; retain its diagnostic alongside the union failure.
     let base_verdict = if let Some(verdict) = budget.base_verdicts.get(base).cloned() {
         verdict
     } else {
+        if crate::fold_cancel::requested() {
+            return Err(BisectAborted(cancelled_gate_verdict(GatePhase::Gate)).into());
+        }
         let Some(()) = budget.take_gate(diagnostics) else {
             return Ok(None);
         };
@@ -1421,6 +1433,9 @@ fn bisect_offender(
     }
     let mut prefix: Vec<Branch> = Vec::new();
     for branch in landed {
+        if crate::fold_cancel::requested() {
+            return Err(BisectAborted(cancelled_gate_verdict(GatePhase::Preparation)).into());
+        }
         if budget.exhausted() {
             budget.record_exhaustion(diagnostics);
             return Ok(None);
@@ -1432,6 +1447,9 @@ fn bisect_offender(
         let plan = fold::fold(adapter, base, prefix.clone(), &cfg.regenerate_paths, opts)
             .map_err(|error| aborted_bisect(error, diagnostics))?;
         if plan.advanced() {
+            if crate::fold_cancel::requested() {
+                return Err(BisectAborted(cancelled_gate_verdict(GatePhase::Gate)).into());
+            }
             let Some(()) = budget.take_gate(diagnostics) else {
                 return Ok(None);
             };
@@ -1460,6 +1478,20 @@ fn bisect_offender(
         }
     }
     Ok(None)
+}
+
+fn cancelled_gate_verdict(phase: GatePhase) -> GateVerdict {
+    let reason = match phase {
+        GatePhase::Preparation => "integration cancelled".to_string(),
+        GatePhase::Setup => "gate_setup_command cancelled".to_string(),
+        GatePhase::Gate => "gate_command cancelled".to_string(),
+    };
+    GateVerdict::Error {
+        reason,
+        log: String::new(),
+        phase,
+        class: GateErrorClass::Cancelled,
+    }
 }
 
 struct DiagnosisState<'a> {
@@ -1830,6 +1862,27 @@ fn run_fold_admitted(
     );
 
     loop {
+        if crate::fold_cancel::requested() {
+            let empty = empty_plan(&original);
+            let mut report = build_report(
+                &target_branch,
+                &original,
+                &empty,
+                &gate_offenders,
+                GateOutcome::Errored {
+                    reason: "integration cancelled".into(),
+                    phase: Some(GatePhase::Preparation),
+                    class: Some(GateErrorClass::Cancelled),
+                },
+                cas_attempts,
+                &diagnostics,
+            );
+            report.unprepared = candidates
+                .iter()
+                .map(|branch| branch.name.clone())
+                .collect();
+            return Ok(report);
+        }
         if let Err(error) = adapter.history.revalidate() {
             return Ok(history_failure_report(
                 &target_branch,
@@ -1894,6 +1947,22 @@ fn run_fold_admitted(
             }
         };
 
+        if crate::fold_cancel::requested() {
+            return Ok(build_report(
+                &target_branch,
+                &original,
+                &plan,
+                &gate_offenders,
+                GateOutcome::Errored {
+                    reason: "integration cancelled".into(),
+                    phase: Some(GatePhase::Preparation),
+                    class: Some(GateErrorClass::Cancelled),
+                },
+                cas_attempts,
+                &diagnostics,
+            ));
+        }
+
         if let Err(error) = adapter.history.revalidate() {
             return Ok(history_failure_report(
                 &target_branch,
@@ -1926,6 +1995,21 @@ fn run_fold_admitted(
 
         // Test-gate the union before blessing it.
         let gate = if gate_on {
+            if crate::fold_cancel::requested() {
+                return Ok(build_report(
+                    &target_branch,
+                    &original,
+                    &plan,
+                    &gate_offenders,
+                    GateOutcome::Errored {
+                        reason: "integration cancelled".into(),
+                        phase: Some(GatePhase::Gate),
+                        class: Some(GateErrorClass::Cancelled),
+                    },
+                    cas_attempts,
+                    &diagnostics,
+                ));
+            }
             let verdict = diagnosed_gate(
                 repo_root,
                 &plan.final_tip,
@@ -2041,6 +2125,26 @@ fn run_fold_admitted(
         } else {
             GateOutcome::Skipped
         };
+
+        if crate::fold_cancel::requested() {
+            return Ok(build_report(
+                &target_branch,
+                &original,
+                &plan,
+                &gate_offenders,
+                GateOutcome::Errored {
+                    reason: "integration cancelled".into(),
+                    phase: Some(if gate_on {
+                        GatePhase::Gate
+                    } else {
+                        GatePhase::Preparation
+                    }),
+                    class: Some(GateErrorClass::Cancelled),
+                },
+                cas_attempts,
+                &diagnostics,
+            ));
+        }
 
         // Green (or no gate) → atomically advance the target ref.
         if let Err(error) = adapter.history.revalidate() {
@@ -2287,6 +2391,14 @@ fn attempt_land_admitted(
     let gate_on = cfg.gate_on && !cfg.gate_command.is_empty();
     let mut cas_attempts = 0u32;
     loop {
+        if crate::fold_cancel::requested() {
+            return Ok(AttemptOutcome::GateError {
+                reason: "integration cancelled".into(),
+                log: String::new(),
+                phase: GatePhase::Preparation,
+                class: GateErrorClass::Cancelled,
+            });
+        }
         adapter.history.revalidate()?;
         source_history.revalidate()?;
         let base = CliGit.rev_parse(&loc, &target_ref)?;
@@ -2325,6 +2437,14 @@ fn attempt_land_admitted(
                 });
             }
         };
+        if crate::fold_cancel::requested() {
+            return Ok(AttemptOutcome::GateError {
+                reason: "integration cancelled".into(),
+                log: String::new(),
+                phase: GatePhase::Preparation,
+                class: GateErrorClass::Cancelled,
+            });
+        }
         adapter.history.revalidate()?;
         source_history.revalidate()?;
         if !plan.advanced() {
@@ -2341,6 +2461,14 @@ fn attempt_land_admitted(
         }
         let folded_tip = plan.final_tip.clone();
         if gate_on {
+            if crate::fold_cancel::requested() {
+                return Ok(AttemptOutcome::GateError {
+                    reason: "integration cancelled".into(),
+                    log: String::new(),
+                    phase: GatePhase::Gate,
+                    class: GateErrorClass::Cancelled,
+                });
+            }
             let verdict = adapter
                 .history
                 .checked(|| gate_tip(repo_root, &folded_tip, cfg))?;
@@ -2364,6 +2492,18 @@ fn attempt_land_admitted(
                     });
                 }
             }
+        }
+        if crate::fold_cancel::requested() {
+            return Ok(AttemptOutcome::GateError {
+                reason: "integration cancelled".into(),
+                log: String::new(),
+                phase: if gate_on {
+                    GatePhase::Gate
+                } else {
+                    GatePhase::Preparation
+                },
+                class: GateErrorClass::Cancelled,
+            });
         }
         adapter.history.revalidate()?;
         source_history.revalidate()?;
@@ -2684,6 +2824,28 @@ mod tests {
             gate_reuse_worktree: false,
             ..MergeQueueConfig::default()
         }
+    }
+
+    #[test]
+    fn cancelled_fold_holds_without_advancing_the_target() {
+        let repo = Repo::new("cancelled-fold");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "a.txt", "a\n");
+        let before = repo.out(&["rev-parse", "main"]);
+        let _scope = crate::fold_cancel::scope(|| true);
+        let report = run_fold(&cfg("true"), &repo.dir, repo.branch_set()).unwrap();
+        assert!(!report.advanced);
+        assert!(matches!(
+            &report.gate,
+            GateOutcome::Errored {
+                class: Some(GateErrorClass::Cancelled),
+                ..
+            }
+        ));
+        assert_eq!(repo.out(&["rev-parse", "main"]), before);
+        assert!(report.deferred.iter().all(|branch| !branch.gate_failed));
     }
 
     fn gate_that_moves_branch(repo: &Repo, branch: &str) -> String {
@@ -4132,6 +4294,66 @@ mod tests {
     }
 
     #[test]
+    fn cancel_between_prefixes_blames_no_branch() {
+        let repo = Repo::new("prefix-cancel");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "one.txt", "one\n");
+        repo.feature("b2", "two.txt", "two\n");
+        repo.feature("b3", "three.txt", "three\n");
+        repo.feature("b4", "bad.txt", "bad\n");
+        let counter = repo.dir.join("gate-count");
+        let command = format!(
+            "printf x >> {}; test ! -e bad.txt",
+            thegn_core::util::sh_quote(&counter.to_string_lossy()),
+        );
+        let config = cfg(&command);
+        if !repo.gate_supported_or_refused(&config) {
+            return;
+        }
+        std::fs::write(&counter, "").unwrap();
+        let adapter = PlumbingAdapter {
+            history: CanonicalHistory::capture(&repo.dir).unwrap(),
+            loc: GitLoc::Local(repo.dir.clone()),
+            repo_root: repo.dir.clone(),
+            regenerate_paths: Vec::new(),
+            regenerate_command: String::new(),
+            sign: false,
+            rerere: false,
+        };
+        let count_path = counter.clone();
+        let _scope = crate::fold_cancel::scope(move || {
+            std::fs::metadata(&count_path).is_ok_and(|metadata| metadata.len() >= 2)
+        });
+        let mut diagnostics = String::new();
+        let mut budget = DiagnosisBudget::new(8, Duration::from_secs(3600));
+        let error = bisect_offender(
+            &repo.dir,
+            &adapter,
+            &repo.out(&["rev-parse", "main"]),
+            &repo.branch_set(),
+            &config,
+            &land_opts(&config, "main"),
+            &mut DiagnosisState {
+                diagnostics: &mut diagnostics,
+                budget: &mut budget,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error
+                .downcast_ref::<BisectAborted>()
+                .map(|aborted| &aborted.0),
+            Some(GateVerdict::Error {
+                class: GateErrorClass::Cancelled,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read_to_string(counter).unwrap().len(), 2);
+    }
+
+    #[test]
     fn diagnosis_deadline_bounds_an_active_prefix_gate() {
         let repo = Repo::new("prefix-deadline");
         if !repo.history_supported_or_refused() {
@@ -5178,6 +5400,7 @@ mod tests {
             GateErrorClass::Preparation,
             GateErrorClass::Signing,
             GateErrorClass::SourceMoved,
+            GateErrorClass::Cancelled,
         ]
         .map(GateErrorClass::as_str);
         assert_eq!(
@@ -5192,6 +5415,7 @@ mod tests {
                 "preparation",
                 "signing",
                 "source_moved",
+                "cancelled",
             ]
         );
     }

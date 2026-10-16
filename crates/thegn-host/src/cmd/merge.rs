@@ -756,6 +756,8 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
         }
     }
     let mut steps = Vec::new();
+    let guard = crate::platform::InterruptGuard::install();
+    let _scope = crate::fold_cancel::scope(move || guard.fired());
     let out = merge_driver::drive_queue(mq, cfg, &root, &db, items, |step: &DriveStep| {
         if !crate::merge_notify::collect_step(&mut steps, step, json) {
             return;

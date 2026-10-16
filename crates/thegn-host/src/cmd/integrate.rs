@@ -175,6 +175,8 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
         }
     }
 
+    let guard = crate::platform::InterruptGuard::install();
+    let _scope = crate::fold_cancel::scope(move || guard.fired());
     let report = integrate::run_selected_fold(mq, &repo_root, &cands, override_gpg)?;
     // Explicit integration authorizes the listed candidates, not expiry of
     // unrelated historical worktrees. Cleanup remains an explicit sweep action.
