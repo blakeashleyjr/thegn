@@ -1,6 +1,6 @@
 //! Bounded database maintenance on the existing background disk worker.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use termwiz::terminal::TerminalWaker;
@@ -9,6 +9,8 @@ use thegn_core::{MaintenanceStep, VacuumError, plan_maintenance};
 
 const MAX_AUTO_ATTEMPTS: u32 = 3;
 const MIB: u64 = 1024 * 1024;
+const PRUNE_SLICES_PER_ROUND: usize = 8;
+const PRUNE_SLICE_ROWS: usize = 512;
 
 struct NoticeTarget {
     tx: tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
@@ -23,6 +25,7 @@ fn notice_target() -> &'static Mutex<Option<NoticeTarget>> {
 static ARMED: AtomicBool = AtomicBool::new(false);
 static AUTO_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 static TOO_LARGE_NOTED: AtomicBool = AtomicBool::new(false);
+static PRUNE_CURSOR: AtomicI64 = AtomicI64::new(0);
 
 pub(crate) fn install_notice(
     tx: tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
@@ -68,6 +71,7 @@ pub(crate) fn run_round(db: &Db) {
         &AUTO_ATTEMPTS,
         &TOO_LARGE_NOTED,
         Duration::from_secs(5),
+        &PRUNE_CURSOR,
     );
 }
 
@@ -77,10 +81,15 @@ fn run_round_with(
     attempts: &AtomicU32,
     too_large_noted: &AtomicBool,
     busy: Duration,
+    prune_cursor: &AtomicI64,
 ) {
     if !armed {
         return;
     }
+    // This may overlap the once-per-process semantic sweep on the first
+    // background disk round. Both perform idempotent bounded transactions and
+    // SQLite's busy timeout handles brief contention.
+    prune_round(db, prune_cursor, PRUNE_SLICES_PER_ROUND);
     let space = match db.space() {
         Ok(space) => space,
         Err(error) => {
@@ -118,6 +127,37 @@ fn run_round_with(
         }
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "state database maintenance failed"),
+    }
+}
+
+fn prune_round(db: &Db, cursor: &AtomicI64, slices: usize) {
+    let mut scanned_entities = 0;
+    let mut completed_slices = 0;
+    for _ in 0..slices {
+        let after_rowid = cursor.load(Ordering::Acquire);
+        match db.prune_stale_cache_slice(after_rowid, PRUNE_SLICE_ROWS) {
+            Ok((scanned, next_rowid)) => {
+                completed_slices += 1;
+                scanned_entities += scanned;
+                if scanned == 0 {
+                    cursor.store(0, Ordering::Release);
+                    break;
+                }
+                cursor.store(next_rowid, Ordering::Release);
+            }
+            Err(error) => {
+                tracing::warn!(target: "thegn::db", %error, "stale cache prune step failed");
+                break;
+            }
+        }
+    }
+    if completed_slices > 0 {
+        tracing::debug!(
+            target: "thegn::db",
+            slices = completed_slices,
+            scanned_entities,
+            "stale cache prune step completed"
+        );
     }
 }
 
@@ -169,7 +209,8 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tempfile::Builder;
     use thegn_core::AutoVacuum;
-    use thegn_core::store::NotificationStore;
+    use thegn_core::semantic::EntityKind;
+    use thegn_core::store::{NotificationStore, SemEntityRow, SemanticStore};
 
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -183,6 +224,19 @@ mod tests {
     fn round_is_inert_until_armed() {
         let _guard = TEST_LOCK.lock().unwrap();
         let (_dir, db) = temp_db();
+        db.replace_file_entities(
+            "/gone/wt/a.rs",
+            &[SemEntityRow {
+                id: "unarmed-entity".into(),
+                file: "/gone/wt/a.rs".into(),
+                name: "unarmed".into(),
+                kind: EntityKind::Function,
+                start_line: 1,
+                end_line: 1,
+                source_hash: "hash".into(),
+            }],
+        )
+        .unwrap();
         let message = "x".repeat(8192);
         let ids: Vec<i64> = (0..1100)
             .map(|index| {
@@ -201,8 +255,75 @@ mod tests {
             &AtomicU32::new(0),
             &AtomicBool::new(false),
             Duration::from_millis(20),
+            &AtomicI64::new(0),
         );
         assert_eq!(db.space().unwrap().freelist_count, before.freelist_count);
+        assert_eq!(db.entities_under("/gone/wt").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn armed_round_prunes_orphan_semantic_rows() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let (_dir, db) = temp_db();
+        db.replace_file_entities(
+            "/gone/wt/a.rs",
+            &[SemEntityRow {
+                id: "armed-entity".into(),
+                file: "/gone/wt/a.rs".into(),
+                name: "armed".into(),
+                kind: EntityKind::Function,
+                start_line: 1,
+                end_line: 1,
+                source_hash: "hash".into(),
+            }],
+        )
+        .unwrap();
+        let cursor = AtomicI64::new(0);
+
+        run_round_with(
+            &db,
+            true,
+            &AtomicU32::new(0),
+            &AtomicBool::new(false),
+            Duration::from_millis(20),
+            &cursor,
+        );
+
+        assert!(db.entities_under("/gone/wt").unwrap().is_empty());
+    }
+
+    #[test]
+    fn prune_round_resets_cursor_at_terminal_and_bounds_slices() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let (_dir, db) = temp_db();
+        let entities: Vec<SemEntityRow> = (0..=PRUNE_SLICE_ROWS)
+            .map(|index| SemEntityRow {
+                id: format!("entity-{index}"),
+                file: "/gone/wt/a.rs".into(),
+                name: format!("item-{index}"),
+                kind: EntityKind::Function,
+                start_line: 1,
+                end_line: 1,
+                source_hash: "hash".into(),
+            })
+            .collect();
+        db.replace_file_entities("/gone/wt/a.rs", &entities)
+            .unwrap();
+        let cursor = AtomicI64::new(0);
+
+        prune_round(&db, &cursor, 1);
+        assert!(cursor.load(Ordering::Acquire) > 0);
+        assert_eq!(db.entities_under("/gone/wt").unwrap().len(), 1);
+
+        for _ in 0..3 {
+            if cursor.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            prune_round(&db, &cursor, 1);
+        }
+
+        assert_eq!(cursor.load(Ordering::Acquire), 0);
+        assert!(db.entities_under("/gone/wt").unwrap().is_empty());
     }
 
     #[test]
