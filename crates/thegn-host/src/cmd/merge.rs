@@ -1017,11 +1017,18 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
         AttemptOutcome::Conflict {
             paths,
             submodule_conflicts,
+            driver_refusal,
         } => {
             lifecycle(LifecycleEvent::Failed);
             let detail =
                 crate::integrate::conflict_details(&paths, &submodule_conflicts).join(", ");
-            outln!("✗ {branch} conflicts: {detail}");
+            outln!(
+                "✗ {branch} conflicts: {detail}{}",
+                driver_refusal
+                    .as_ref()
+                    .map(|reason| format!("\n{reason}"))
+                    .unwrap_or_default()
+            );
             failure = Some(format!("land failed: {branch} conflicts"));
         }
         AttemptOutcome::GateFailed { .. } => {
