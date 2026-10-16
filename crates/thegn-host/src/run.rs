@@ -496,6 +496,14 @@ pub async fn main(
             "raised RLIMIT_NOFILE"
         );
     }
+    let malloc_cap = crate::mem::arena_cap();
+    tracing::info!(
+        target: "thegn::startup",
+        since_start_ms = start.elapsed().as_millis() as u64,
+        malloc_arena_max = malloc_cap.max,
+        malloc_arena_cap_applied = malloc_cap.applied,
+        "malloc arena cap"
+    );
 
     // Arm the in-process sampling profiler (no-op unless built `--features
     // profiling`): SIGUSR2 toggles a flamegraph capture from the live process.
@@ -7485,11 +7493,9 @@ async fn event_loop<T: Terminal>(
     // is on. Emits a `thegn::perf` rollup every `report_interval()`.
     let mut loop_perf = crate::perf::LoopPerf::new();
     let perf_interval = crate::perf::report_interval();
-    // Idle-memory bookkeeping: `last_activity` is bumped on every frame that
-    // actually renders; once it ages past the idle threshold a wake hands freed
-    // glibc arena pages back to the OS (throttled via `last_trim`). See `mem`.
+    // Idle-memory trim checks share a process-wide limiter with scan-drain
+    // trims. `last_activity` is bumped on every frame that actually renders.
     let mut last_activity = std::time::Instant::now();
-    let mut last_trim = std::time::Instant::now();
     // Telemetry-panel "Loop" sub-block: while the section is open we force perf
     // accounting on (restoring the prior state on close) and roll up faster so
     // the live graphs move. `perf_was_on` remembers the pre-open state.
@@ -15041,7 +15047,7 @@ async fn event_loop<T: Terminal>(
             // An idle wake is the right moment to return freed arena pages to
             // the OS (self-throttled; no-op until the loop has been idle a
             // while). Keeps RSS receding after a build/test burst.
-            crate::mem::trim_if_idle(last_activity, &mut last_trim);
+            crate::mem::trim_if_idle(last_activity);
         }
         if should_render {
             // A real frame: the loop is active, so defer any idle trim.
