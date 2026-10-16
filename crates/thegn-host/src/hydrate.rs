@@ -490,9 +490,7 @@ impl ContainerDemand {
     ) -> Self {
         if monitor_containers_visible || sandbox_section_open {
             Self::Detail
-        } else if monitor_open {
-            Self::Summary
-        } else if panel_open && active_oci {
+        } else if monitor_open || (panel_open && active_oci) {
             Self::Summary
         } else {
             Self::None
