@@ -108,6 +108,19 @@ pub(crate) fn socket_path(dcfg: &thegn_core::config::DaemonConfig) -> PathBuf {
     )
 }
 
+/// Compose must not make the live daemon control directory reachable.
+pub(crate) fn compose_guard(
+    dcfg: &thegn_core::config::DaemonConfig,
+) -> thegn_core::sandbox_compose::ComposeGuard {
+    let extra = socket_path(dcfg)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .into_iter()
+        .collect::<Vec<_>>();
+    thegn_core::sandbox_compose::ComposeGuard::for_host(&extra)
+}
+
 /// Whether pane startup can safely route to a daemon endpoint. This deliberately
 /// performs only metadata checks and a legacy connect probe; it never creates a
 /// directory on the UI thread.
@@ -1709,5 +1722,19 @@ mod tests {
         assert_eq!(idle_exit_window(0, false), None, "0 = never");
         assert_eq!(idle_exit_window(1800, true), None, "serve never idle-exits");
         assert_eq!(idle_exit_window(0, true), None);
+    }
+
+    #[test]
+    fn compose_guard_protects_custom_socket_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let control_dir = temp.path().join("ctl");
+        let config = thegn_core::config::DaemonConfig {
+            socket: control_dir.join("daemon.sock").display().to_string(),
+            ..Default::default()
+        };
+
+        let guard = compose_guard(&config);
+
+        assert!(guard.protected.contains(&control_dir));
     }
 }
