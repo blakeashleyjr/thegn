@@ -114,8 +114,8 @@ pub(crate) fn begin(flag: &'static AtomicBool, what: &'static str) -> Option<Rou
     }
 }
 
-pub(crate) static DISK_LANE: Lane = Lane::new("thegn-measure-disk");
-pub(crate) static LOC_LANE: Lane = Lane::new("thegn-measure-loc");
+pub(crate) static DISK_LANE: Lane = Lane::new("thegn-msr-disk");
+pub(crate) static LOC_LANE: Lane = Lane::new("thegn-msr-loc");
 
 /// Kick both scans now: startup, a worktree created, a workspace added, a
 /// worktree switched to.
@@ -350,7 +350,7 @@ mod lane_tests {
 
     #[test]
     fn lane_runs_jobs_on_one_named_thread() {
-        static LANE: Lane = Lane::new("thegn-measure-test-one");
+        static LANE: Lane = Lane::new("thegn-msr-one");
         let (tx, rx) = mpsc::channel();
         for _ in 0..2 {
             let tx = tx.clone();
@@ -368,12 +368,12 @@ mod lane_tests {
         let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let second = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(first, second);
-        assert_eq!(first.1.as_deref(), Some("thegn-measure-test-one"));
+        assert_eq!(first.1.as_deref(), Some("thegn-msr-one"));
     }
 
     #[test]
     fn lane_full_queue_refuses_without_blocking() {
-        static LANE: Lane = Lane::new("thegn-measure-test-full");
+        static LANE: Lane = Lane::new("thegn-msr-full");
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::channel();
@@ -399,7 +399,7 @@ mod lane_tests {
 
     #[test]
     fn lane_survives_a_panicking_job() {
-        static LANE: Lane = Lane::new("thegn-measure-test-panic");
+        static LANE: Lane = Lane::new("thegn-msr-panic");
         assert_eq!(
             LANE.submit(Box::new(|| panic!("expected lane test panic"))),
             crate::sched::Admission::Admitted

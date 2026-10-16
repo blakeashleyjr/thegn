@@ -418,7 +418,11 @@ impl StatsSampler {
             self.sys.refresh_processes_specifics(
                 ProcessesToUpdate::Some(&pids),
                 true, // remove requested PIDs that exited since the last sample
-                ProcessRefreshKind::nothing().with_cpu().with_memory(),
+                // nothing() keeps tasks on; we never read them.
+                ProcessRefreshKind::nothing()
+                    .with_cpu()
+                    .with_memory()
+                    .without_tasks(),
             );
             if let Some(p) = self.sys.process(self.self_pid) {
                 snap.self_rss_bytes = Some(p.memory());
@@ -802,5 +806,34 @@ mod tests {
             ("NAND CH0 temp".into(), 29.0),
         ];
         assert_eq!(cpu_temp(&apple), Some(37.2));
+    }
+
+    #[test]
+    fn tracked_refresh_skips_tasks_but_keeps_cpu_and_memory() {
+        if !std::path::Path::new("/proc/self/task").exists() {
+            return;
+        }
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let helper = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            std::thread::park();
+        });
+        ready_rx.recv().unwrap();
+
+        let mut sampler = StatsSampler::new(std::env::temp_dir());
+        sampler.sample();
+        sampler.sample();
+        let pids = refresh_pid_list(sampler.self_pid, sampler.daemon_pid, &sampler.tracked);
+
+        helper.thread().unpark();
+        helper.join().unwrap();
+
+        assert!(
+            sampler.sys.processes().len() <= pids.len(),
+            "tracked refresh retained tasks or unrelated processes: {} entries for {} PIDs",
+            sampler.sys.processes().len(),
+            pids.len()
+        );
     }
 }
