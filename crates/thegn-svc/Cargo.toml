@@ -45,6 +45,7 @@ protox.workspace = true
 
 [dependencies]
 thegn-core.workspace = true
+thegn-proc.workspace = true
 anyhow.workspace = true
 ignore.workspace = true
 serde.workspace = true
