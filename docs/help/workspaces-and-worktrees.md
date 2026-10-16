@@ -110,6 +110,10 @@ aliases; their chords do not change.
 - Deleting from disk is always an explicit second step in the [[sidebar]]
   delete menu — nothing destructive rides on a single keystroke.
 
+From the sidebar delete menu, the worktree row and its pipeline rows disappear
+at once, and focus moves on. If removal fails, the row returns in place and
+the status line says `Worktree delete failed for <path>: <reason>`.
+
 New worktrees live under `~/.thegn/worktrees/<repo>/<label>--<digest>` by
 default; `worktree_mode = "in_repo"` keeps them in `<repo>/.worktrees`. The
 label is a readable slug of the branch; the 64-hex digest is derived from the

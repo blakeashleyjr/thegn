@@ -22,7 +22,7 @@ Every forge operation (pull-request status, list, search, create, merge, draft/a
 
 ### Requirement: GitHub degrades native to CLI
 
-The GitHub forge SHALL be a ladder of a native GraphQL layer (over the shared tracker HTTP client) above the `gh` CLI layer. The native layer MUST answer only the operations it implements and MUST fall through (`NotConfigured`, `Unsupported`) when it has no token, the location is remote, or its circuit breaker is open; `Auth`, `NotFound`, `RateLimited` and `Transient` answers are final and MUST NOT be retried on the CLI layer.
+The GitHub forge SHALL be a ladder of a native GraphQL layer (over the shared tracker HTTP client) above the `gh` CLI layer. The native layer MUST answer only the operations it implements and MUST fall through (`NotConfigured`, `Unsupported`) when it has no token, the location is remote, or its circuit breaker was opened by transport failures. When the circuit holds an API-side error (`RateLimited` or another HTTP/body failure), the native layer SHALL return it for `pr_status`/`pr_list` and for `issue_rows`/`search_prs` on a local `github.com` origin; GitHub pollers and Actions run listing do not spawn `gh`. `Auth`, `NotFound`, `RateLimited` and `Transient` answers are final and MUST NOT be retried on the CLI layer. HTTP 401/403/429, 5xx responses, and undecodable 2xx bodies count as circuit failures. The circuit opens after three consecutive failures for 60 seconds, doubles its duration for each further failure up to 900 seconds, and adds up to 20% deterministic jitter. A usable `Retry-After` opens it immediately for that delay.
 
 #### Scenario: No token falls through
 
@@ -33,6 +33,11 @@ The GitHub forge SHALL be a ladder of a native GraphQL layer (over the shared tr
 
 - **WHEN** the native layer reports an authentication error
 - **THEN** the ladder returns that error without running `gh`
+
+#### Scenario: An open circuit holds the gh pollers
+
+- **WHEN** the circuit is open on a 5xx or rate-limit error and `issue_rows` is called for a local `github.com` worktree
+- **THEN** the held error is returned and `gh` is not run
 
 ### Requirement: Forge errors are seam errors
 
