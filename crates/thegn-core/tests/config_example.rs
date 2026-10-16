@@ -255,8 +255,24 @@ fn example_config_parses_as_config() {
     }
 }
 
+/// Values that intentionally illustrate an example instead of the schema
+/// default. Each entry must name a schema-defaulted field and its comment must
+/// say that it is an example or optional value.
+const ILLUSTRATIVE_PLUGIN_VALUES: &[(&str, &str)] = &[
+    // RUST_LOG demonstrates pass-through environment configuration.
+    ("plugins", "env"),
+    // The source label gives the sample status contribution useful metadata.
+    ("plugins.contributions", "metadata"),
+];
+
+fn plugin_schema_properties(schema: &Value) -> &serde_json::Map<String, Value> {
+    schema["properties"]
+        .as_object()
+        .expect("plugin schema has properties")
+}
+
 #[test]
-fn plugin_example_block_round_trips() {
+fn plugin_example_block_agrees_with_the_schema() {
     let path = example_path();
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
@@ -275,52 +291,163 @@ fn plugin_example_block_round_trips() {
         })
         .collect::<Vec<_>>()
         .join("\n");
+
+    let mut example_keys = BTreeSet::new();
+    let mut comments = std::collections::BTreeMap::new();
+    let mut table = "plugins";
+    for line in block.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[[plugins.contributions]]" {
+            table = "plugins.contributions";
+            continue;
+        }
+        let Some((assignment, comment)) = trimmed.split_once('#') else {
+            continue;
+        };
+        let Some((key, _value)) = assignment.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        example_keys.insert((table, key));
+        comments.insert((table, key), comment.trim());
+    }
+
     let config: thegn_core::config::Config =
         toml::from_str(&block).expect("commented plugin example deserializes as Config");
     assert_eq!(config.plugins.len(), 1);
     let spec = &config.plugins[0];
     assert_eq!(spec.manifest.contributions.len(), 1);
 
-    let minimal: thegn_core::plugin_api::PluginSpec = toml::from_str(
-        r#"
-id = "minimal"
-name = "Minimal plugin"
-version = "0.1.0"
-api = "0.3.0"
-command = ["/path/to/plugin"]
-
-[[contributions]]
-id = "minimal-status"
-extension_point = "StatusBarSegment"
-label = "Minimal status"
-"#,
-    )
-    .expect("minimal plugin spec deserializes");
     let contribution = &spec.manifest.contributions[0];
-    let minimal_contribution = &minimal.manifest.contributions[0];
-    assert_eq!(spec.cwd, minimal.cwd, "cwd example default");
-    assert_eq!(
-        spec.timeout_secs, minimal.timeout_secs,
-        "timeout example default"
-    );
-    assert_eq!(spec.scopes, minimal.scopes, "scopes example default");
-    assert_eq!(spec.mode, minimal.mode, "mode example default");
-    assert_eq!(spec.enabled, minimal.enabled, "enabled example default");
-    assert_eq!(
-        spec.trusted_native, minimal.trusted_native,
-        "trusted_native example default"
-    );
-    assert_eq!(
-        spec.manifest.capabilities, minimal.manifest.capabilities,
-        "capabilities example default"
-    );
-    assert_eq!(contribution.cadence, minimal_contribution.cadence);
     assert_eq!(spec.manifest.api, thegn_core::plugin_api::API_VERSION);
 
     let encoded = serde_json::to_value(spec).expect("plugin spec serializes to JSON");
     let decoded: thegn_core::plugin_api::PluginSpec =
         serde_json::from_value(encoded).expect("plugin spec deserializes from JSON");
     assert_eq!(decoded, *spec, "plugin spec JSON round trip is lossless");
+
+    let plugin_schema =
+        serde_json::to_value(schemars::schema_for!(thegn_core::plugin_api::PluginSpec))
+            .expect("plugin schema serializes");
+    let contribution_schema =
+        serde_json::to_value(schemars::schema_for!(thegn_core::plugin_api::Contribution))
+            .expect("contribution schema serializes");
+    let plugin_properties = plugin_schema_properties(&plugin_schema);
+    let contribution_properties = plugin_schema_properties(&contribution_schema);
+    for (table, key) in ILLUSTRATIVE_PLUGIN_VALUES {
+        assert!(
+            matches!(*table, "plugins" | "plugins.contributions"),
+            "stale illustrative plugin table {table}.{key}"
+        );
+    }
+
+    for (table, schema, properties) in [
+        ("plugins", &plugin_schema, plugin_properties),
+        (
+            "plugins.contributions",
+            &contribution_schema,
+            contribution_properties,
+        ),
+    ] {
+        let mut expected = properties
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if table == "plugins" {
+            expected.remove("contributions");
+        }
+        let actual = example_keys
+            .iter()
+            .filter_map(|(found_table, key)| (*found_table == table).then_some(*key))
+            .collect::<BTreeSet<_>>();
+        let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+        let unknown = actual.difference(&expected).copied().collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "example is missing {table} schema keys: {missing:?}"
+        );
+        assert!(
+            unknown.is_empty(),
+            "example documents unknown {table} key: {unknown:?}"
+        );
+
+        let required = schema["required"]
+            .as_array()
+            .expect("plugin schema has required list")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>();
+        let serialized = if table == "plugins" {
+            serde_json::to_value(spec).expect("plugin spec serializes")
+        } else {
+            serde_json::to_value(contribution).expect("contribution serializes")
+        };
+        for key in &expected {
+            let comment = comments
+                .get(&(table, *key))
+                .unwrap_or_else(|| panic!("example key {table}.{key} has no trailing comment"));
+            assert_eq!(
+                comment.contains("(required)"),
+                required.contains(key),
+                "required marker for {table}.{key} must match schema"
+            );
+            let illustrative = ILLUSTRATIVE_PLUGIN_VALUES.contains(&(table, *key));
+            if let Some(default) = properties[*key].get("default")
+                && illustrative
+            {
+                assert!(
+                    comment.contains("default") || comment.contains("Optional"),
+                    "illustrative {table}.{key} comment must identify its value as default or Optional"
+                );
+            } else if let Some(default) = properties[*key].get("default") {
+                assert_eq!(
+                    serialized.get(*key),
+                    Some(default),
+                    "{table}.{key} must equal its schema default"
+                );
+            } else {
+                assert!(
+                    !illustrative,
+                    "illustrative entry {table}.{key} has no schema default"
+                );
+                if !required.contains(key) {
+                    assert!(
+                        comment.contains("Optional"),
+                        "non-required, non-defaulted {table}.{key} must say Optional"
+                    );
+                }
+            }
+        }
+        for (illustrative_table, illustrative_key) in ILLUSTRATIVE_PLUGIN_VALUES {
+            if *illustrative_table == table {
+                assert!(
+                    properties
+                        .get(*illustrative_key)
+                        .and_then(|property| property.get("default"))
+                        .is_some(),
+                    "stale illustrative plugin value {illustrative_table}.{illustrative_key}"
+                );
+            }
+        }
+    }
+
+    let env = spec.env.keys().collect::<Vec<_>>();
+    assert!(env.iter().all(|key| !thegn_core::redact::is_sensitive(key)));
+    let metadata = contribution.metadata.keys().collect::<Vec<_>>();
+    assert!(
+        metadata
+            .iter()
+            .all(|key| !thegn_core::redact::is_sensitive(key))
+    );
+    assert!(block.contains("do not put secrets here"));
+
+    let support = thegn_core::plugin_api::HOST_EXTENSION_SUPPORT
+        .iter()
+        .find(|row| row.extension_point.wire_name() == contribution.extension_point.wire_name())
+        .expect("example extension point exists in host support table");
+    assert_eq!(support.state, thegn_core::plugin_api::SupportState::Wired);
+    assert!(support.cadences.contains(&contribution.cadence.kind()));
+    assert!(support.modes.contains(&spec.mode));
 }
 
 #[test]
