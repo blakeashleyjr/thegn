@@ -1676,6 +1676,74 @@ mod tests {
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
     }
+
+    #[test]
+    fn consecutive_polls_reuse_one_connection() {
+        use axum::extract::ConnectInfo;
+        use std::collections::HashSet;
+        use std::net::{SocketAddr, TcpListener};
+        use std::sync::Mutex;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let peers = Arc::new(Mutex::new(HashSet::<SocketAddr>::new()));
+        let route_peers = Arc::clone(&peers);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let app = Router::new().fallback(any(
+                    move |ConnectInfo(peer): ConnectInfo<SocketAddr>| {
+                        let route_peers = Arc::clone(&route_peers);
+                        async move {
+                            route_peers.lock().unwrap().insert(peer);
+                            let payload = json!({"data": {"issues": {
+                                "nodes": [list_item(1)],
+                                "pageInfo": {"hasNextPage": false, "endCursor": null}
+                            }}});
+                            let mut response =
+                                (StatusCode::OK, Body::from(payload.to_string())).into_response();
+                            response.headers_mut().insert(
+                                reqwest::header::CONTENT_TYPE,
+                                HeaderValue::from_static("application/json"),
+                            );
+                            response
+                        }
+                    },
+                ));
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move {
+                    shutdown_rx.await.unwrap();
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        for _ in 0..2 {
+            let backend = LinearBackend::new_for_test(
+                "linear-secret".into(),
+                Some("team-1".into()),
+                Arc::new(TrackerHttpBudget::with_permits(1)),
+                &format!("http://{address}"),
+            );
+            let result =
+                super::super::block_on_tracker(backend.list_issues(&IssueFilter::default()));
+            assert!(matches!(result, Ok(Ok(issues)) if issues.len() == 1));
+        }
+
+        shutdown_tx.send(()).unwrap();
+        server_thread.join().unwrap();
+        assert_eq!(peers.lock().unwrap().len(), 1);
+    }
 }
 
 #[cfg(test)]
