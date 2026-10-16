@@ -1705,21 +1705,21 @@ mod tests {
         repo.out(&["config", "filter.c.required", "true"]);
 
         let gr = discover_for_status(&repo.dir).unwrap();
-        assert_eq!(gr.config_snapshot().string("filter.a.process"), None);
-        assert_eq!(gr.config_snapshot().string("filter.b.process"), Some("cat"));
-        assert_eq!(gr.config_snapshot().string("filter.c.process"), Some("cat"));
+        assert_eq!(gr.config_snapshot().string("filter.a.process").map(|v| v.to_string()), None);
+        assert_eq!(gr.config_snapshot().string("filter.b.process").map(|v| v.to_string()), Some("cat".to_string()));
+        assert_eq!(gr.config_snapshot().string("filter.c.process").map(|v| v.to_string()), Some("cat".to_string()));
 
         let unrelated_filter = TestRepo::new("reroute-unrelated-filter");
         unrelated_filter.out(&["config", "filter.d.process", "cat"]);
         let before = gix::discover(&unrelated_filter.dir).unwrap();
         assert_eq!(
-            before.config_snapshot().string("filter.d.process"),
-            Some("cat")
+            before.config_snapshot().string("filter.d.process").map(|v| v.to_string()),
+            Some("cat".to_string())
         );
         let after = discover_for_status(&unrelated_filter.dir).unwrap();
         assert_eq!(
-            after.config_snapshot().string("filter.d.process"),
-            Some("cat")
+            after.config_snapshot().string("filter.d.process").map(|v| v.to_string()),
+            Some("cat".to_string())
         );
     }
 }
