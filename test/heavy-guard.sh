@@ -53,7 +53,7 @@ scan=$(printf '%s' "$cmd" |
 # `--command`/`exec`/`time` count as command boundaries too: around here these
 # gates are almost always reached as `nix develop --command just test`, and a
 # guard that only sees the leading token would miss every real invocation.
-heavy_re='(^|[;&|(]|&&|--command|[[:space:]](exec|time|nice))[[:space:]]*(just[[:space:]]+(test|test-doc|ci|ci-local|coverage|coverage-html|lint|bench|bench-micro|e2e|doc-check)([[:space:]]|$)|cargo[[:space:]]+llvm-cov)'
+heavy_re='(^|[;&|(]|&&|--command|[[:space:]](exec|time|nice))[[:space:]]*(just[[:space:]]+(test|test-doc|test-windows-wine|ci|ci-local|coverage|coverage-html|lint|bench|bench-micro|e2e|doc-check)([[:space:]]|$)|cargo[[:space:]]+llvm-cov)'
 workspace_re='cargo[[:space:]]+(build|check|clippy|test|nextest[[:space:]]+run)([[:space:]]|$).*--workspace'
 
 # The one case blanking quotes would otherwise hide: a gate handed to a shell as
@@ -61,7 +61,7 @@ workspace_re='cargo[[:space:]]+(build|check|clippy|test|nextest[[:space:]]+run)(
 # Matched on the RAW text, but only behind an actual shell NAME plus a -c-ish
 # flag — that is what keeps it from colliding with `grep -c "just test"`, which
 # has a flag but no shell.
-runner_re='(bash|sh|zsh|dash)[[:space:]]+-[a-z]*c[[:space:]]*.*(just[[:space:]]+(test|test-doc|ci|ci-local|coverage|lint|bench|e2e|doc-check)([[:space:]]|"|$)|cargo[[:space:]]+llvm-cov)'
+runner_re='(bash|sh|zsh|dash)[[:space:]]+-[a-z]*c[[:space:]]*.*(just[[:space:]]+(test|test-doc|test-windows-wine|ci|ci-local|coverage|lint|bench|e2e|doc-check)([[:space:]]|"|$)|cargo[[:space:]]+llvm-cov)'
 
 if printf '%s' "$scan" | grep -qE "$heavy_re" ||
   printf '%s' "$scan" | grep -qE "$workspace_re" ||
