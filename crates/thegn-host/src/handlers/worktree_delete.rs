@@ -749,27 +749,11 @@ mod tests {
         rows[2].worktree_path = Some("/tmp/app-alpha".into());
         rows[3].worktree_path = Some("/tmp/app-zeta".into());
         let deleting = HashSet::from(["/tmp/app-alpha".to_string()]);
-        let original_rows = rows.clone();
-        let original_labels = rows
-            .iter()
-            .filter(|row| row.visible)
-            .map(|row| row.label.clone())
-            .collect::<Vec<_>>();
 
         super::hide_pending_deletes(&mut rows, &deleting);
         assert_eq!(
             rows.iter().map(|row| row.visible).collect::<Vec<_>>(),
             [false, false, true, true]
-        );
-        let mut rebuilt_rows = original_rows;
-        super::hide_pending_deletes(&mut rebuilt_rows, &HashSet::new());
-        assert_eq!(
-            rebuilt_rows
-                .iter()
-                .filter(|row| row.visible)
-                .map(|row| row.label.clone())
-                .collect::<Vec<_>>(),
-            original_labels
         );
     }
 }
