@@ -1720,8 +1720,12 @@ fn sidebar_e_toggles_wide_expand_and_persists() {
     // The flag round-trips through the DB: re-expand, then a fresh state
     // loaded from the same scope comes back expanded.
     let _ = press(&mut sb, 'e', &mut model, &session); // best-effort: test: the keypress effect is the point; the assert below checks it
-    let db = thegn_core::db::Db::open().unwrap();
+    let rows = crate::handlers::sidebar_persist::read_sidebar_state_from_writer().unwrap();
     let mut reloaded = SidebarState::default();
+    let db = thegn_core::db::Db::open_memory().unwrap();
+    for (key, value) in rows {
+        db.set_ui_state(SIDEBAR_SCOPE, &key, &value).unwrap();
+    }
     reloaded.load(&db, SIDEBAR_SCOPE);
     assert!(reloaded.expanded, "expanded state restored from the DB");
 
@@ -1766,8 +1770,12 @@ fn sidebar_i_cycles_row_detail_and_persists() {
     assert!(!model.status.is_empty(), "the mode change is announced");
 
     // Round-trips through the DB.
-    let db = thegn_core::db::Db::open().unwrap();
+    let rows = crate::handlers::sidebar_persist::read_sidebar_state_from_writer().unwrap();
     let mut reloaded = SidebarState::default();
+    let db = thegn_core::db::Db::open_memory().unwrap();
+    for (key, value) in rows {
+        db.set_ui_state(SIDEBAR_SCOPE, &key, &value).unwrap();
+    }
     reloaded.load(&db, SIDEBAR_SCOPE);
     assert_eq!(reloaded.focus_detail_override, Some(FocusDetail::Cursor));
 
@@ -1829,13 +1837,13 @@ fn workspace_pin_persists_globally_not_per_active_workspace() {
 
     // The pin is written to the GLOBAL scope, NOT the active workspace's
     // (`/tmp/app`) scope — the heart of the fix.
-    let db = thegn_core::db::Db::open().unwrap();
-    let global = db.ui_state_in_scope(SIDEBAR_SCOPE).unwrap();
+    let global = crate::handlers::sidebar_persist::read_sidebar_state_from_writer().unwrap();
     assert!(
         global.iter().any(|(k, v)| k == "pin:lib" && v == "1"),
         "pin saved in the global sidebar scope",
     );
-    let ws_scoped = db.ui_state_in_scope(&session.id).unwrap();
+    let ws_scoped =
+        crate::handlers::sidebar_persist::read_ui_state_from_writer(session.id.clone()).unwrap();
     assert!(
         !ws_scoped.iter().any(|(k, _)| k == "pin:lib"),
         "pin must NOT be saved under the active workspace's scope",
@@ -1844,6 +1852,10 @@ fn workspace_pin_persists_globally_not_per_active_workspace() {
     // It reloads from the global scope — independent of which workspace is
     // active at startup (the cross-workspace failure mode).
     let mut reloaded = SidebarState::default();
+    let db = thegn_core::db::Db::open_memory().unwrap();
+    for (key, value) in global {
+        db.set_ui_state(SIDEBAR_SCOPE, &key, &value).unwrap();
+    }
     reloaded.load(&db, SIDEBAR_SCOPE);
     assert!(
         reloaded.view.pins.contains(&"lib".to_string()),

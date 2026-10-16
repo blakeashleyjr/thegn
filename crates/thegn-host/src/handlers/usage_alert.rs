@@ -47,7 +47,7 @@ pub(crate) fn observe_and_route(
     accounts: &[AccountUsage],
     cfg: &UsageAlertsConfig,
     toasts: &mut crate::toast::Toasts,
-    notify_state: &crate::notify::NotifyState,
+    notify_state: &std::sync::Arc<crate::notify::NotifyState>,
 ) -> bool {
     let events = state.observe(accounts, cfg, now_ms());
     if events.is_empty() {
@@ -65,21 +65,17 @@ pub(crate) fn observe_and_route(
         // The inbox is a separate opt-in (`[usage.alerts] notify`), and a
         // recovery never goes in it — an entry saying "you are no longer near
         // your limit" is not something anyone comes back to read.
-        if cfg.notify
-            && ev.level != AlertLevel::Ok
-            && let Ok(db) = thegn_core::db::Db::open()
-        {
+        if cfg.notify && ev.level != AlertLevel::Ok {
             // `ev.key()` is per account+window, so a standing alert's periodic
             // repeat updates one inbox row instead of stacking a new one every
             // `repeat_secs` for as long as the window is hot.
-            crate::notify::record(
-                &db,
-                notify_state,
-                NotificationKind::UsageLimit.as_str(),
-                &ev.key(),
-                &msg,
-                "",
-            );
+            let notify_state = std::sync::Arc::clone(notify_state);
+            let key = ev.key();
+            let message = msg.clone();
+            let kind = NotificationKind::UsageLimit.as_str().to_string();
+            crate::db_task::persist(move |db| {
+                crate::notify::record(db, &notify_state, &kind, &key, &message, "");
+            });
         }
     }
     true
@@ -109,5 +105,54 @@ mod tests {
         assert_eq!(priority(&ev(AlertLevel::Warn)), Priority::Notice);
         // A recovery must never raise a flag.
         assert_eq!(priority(&ev(AlertLevel::Ok)), Priority::Info);
+    }
+
+    #[test]
+    fn opted_in_alert_does_not_block_on_a_held_write_lock() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let state_home = tempfile::Builder::new()
+            .prefix("tg-usage-alert-lock-")
+            .tempdir()
+            .unwrap();
+        let state_path = state_home.path().to_string_lossy().into_owned();
+        let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", &state_path)]);
+        let db = thegn_core::db::Db::open().unwrap();
+        drop(db);
+        let lock = rusqlite::Connection::open(state_home.path().join("thegn/thegn.db")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let notify_state = crate::notify::NotifyState::new(
+            thegn_core::config::Config::default().notifications,
+            String::new(),
+            waker,
+        );
+        let account = AccountUsage::ok(
+            "claude",
+            "work",
+            None,
+            vec![thegn_core::usage::UsageWindow::new("5h", 95.0, None)],
+        );
+        let cfg = UsageAlertsConfig {
+            used: thegn_core::resource_alert::AlertRule {
+                warn: 90.0,
+                critical: 100.0,
+            },
+            ..UsageAlertsConfig::default()
+        };
+        let mut alerts = UsageAlertState::new();
+        let mut toasts = crate::toast::Toasts::default();
+
+        let started = std::time::Instant::now();
+        let announced =
+            observe_and_route(&mut alerts, &[account], &cfg, &mut toasts, &notify_state);
+        assert!(announced);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+
+        lock.execute_batch("ROLLBACK").unwrap();
+        assert!(crate::db_task::flush(std::time::Duration::from_secs(10)));
     }
 }
