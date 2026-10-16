@@ -18,6 +18,7 @@ mod branch;
 mod cherry;
 mod commit;
 mod custom;
+pub mod filter_process;
 mod native_diff;
 mod patch;
 mod plumbing;
