@@ -188,10 +188,16 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
         AttemptOutcome::Conflict {
             paths,
             submodule_conflicts,
+            driver_refusal,
         } => {
             let detail =
                 crate::integrate::conflict_details(&paths, &submodule_conflicts).join(", ");
-            anyhow::bail!("{branch} conflicts with {target}: {detail}");
+            anyhow::bail!(
+                "{branch} conflicts with {target}: {detail}{}",
+                driver_refusal
+                    .map(|reason| format!("\n{reason}"))
+                    .unwrap_or_default()
+            );
         }
         AttemptOutcome::GateFailed { log } => {
             // Name what failed. The gate already captured its log; discarding it
