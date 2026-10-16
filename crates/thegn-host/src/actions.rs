@@ -982,7 +982,7 @@ pub(crate) fn run_pr_view_action(
         let forge = forges.for_loc(&loc);
         let cur = PrRef::Current;
         let res: Result<(), ForgeError> = match action {
-            A::Merge { method } => forge.merge_pr(&loc, cur, method, false, false),
+            A::Merge { method } => forge.merge_pr(&loc, cur, method, false, None, false),
             A::Approve => forge.submit_review(
                 &loc,
                 cur,

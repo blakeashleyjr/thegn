@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
-use thegn_core::db::{Db, PrQueueRow};
+use thegn_core::db::{Db, PrQueueRow, PrRebind};
 use thegn_core::outln;
 use thegn_core::store::WorktreeAuxStore;
 
@@ -35,6 +35,15 @@ pub enum Action {
         /// PR without a worktree is watched but cannot be agent-fixed.
         #[arg(long)]
         worktree: Option<String>,
+    },
+    /// Explicitly re-authorize a queued PR identity or checkout.
+    Rebind {
+        #[arg(long)]
+        pr: u64,
+        #[arg(long, conflicts_with = "no_worktree")]
+        worktree: Option<String>,
+        #[arg(long)]
+        no_worktree: bool,
     },
     /// Remove a pull request from the queue.
     Rm {
@@ -91,6 +100,11 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
         Action::List { json } => list(json),
         Action::Add { pr, worktree } => add(cfg, pr, worktree),
+        Action::Rebind {
+            pr,
+            worktree,
+            no_worktree,
+        } => rebind(pr, worktree, no_worktree),
         Action::Rm { number } => rm(number),
         Action::Clear => clear(),
         Action::Drain { json } => drain(cfg, json),
@@ -245,12 +259,122 @@ fn bind_checkout(
 }
 
 fn rm(number: u64) -> Result<()> {
-    let root = repo_root()?;
-    let key = PrQueueRow::make_key(&root.to_string_lossy(), number);
+    let root = repo_root()?
+        .canonicalize()
+        .context("canonicalize repo root")?;
     let db = Db::open()?;
+    let mut matches: Vec<_> = pr_driver::rows_for_repo(&db, &root)
+        .into_iter()
+        .filter(|row| row.number == number)
+        .collect();
+    anyhow::ensure!(!matches.is_empty(), "PR #{number} is not in the queue");
+    anyhow::ensure!(
+        matches.len() == 1,
+        "PR #{number} is ambiguous; matching queue keys: {}",
+        matches
+            .iter()
+            .map(|row| row.key.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let key = matches.remove(0).key;
     db.remove_pr_entry(&key)?;
     outln!("Removed PR #{number} from the queue.");
     Ok(())
+}
+
+fn rebind(number: u64, worktree: Option<String>, no_worktree: bool) -> Result<()> {
+    let root = repo_root()?
+        .canonicalize()
+        .context("canonicalize repo root")?;
+    let db = Db::open()?;
+    let rows = pr_driver::rows_for_repo(&db, &root);
+    let old = rebind_target(&rows, number)?;
+    let explicit = worktree.is_some();
+    let wt_path = if no_worktree {
+        None
+    } else {
+        Some(
+            super::resolve_worktree(worktree)
+                .canonicalize()
+                .context("canonicalize PR worktree")?,
+        )
+    };
+    let query_path = wt_path.as_deref().unwrap_or(root.as_path());
+    let loc = thegn_core::remote::GitLoc::from_db(&query_path.to_string_lossy(), None);
+    let forge_handle = crate::forge_handle::get();
+    let forge = forge_handle.for_loc(&loc);
+    let status = forge
+        .pr_status(&loc, thegn_core::forge::PrRef::Number(number))
+        .map_err(|error| anyhow::anyhow!("could not resolve PR #{number}: {}", error.describe()))?;
+    let wt_main = wt_path.as_deref().and_then(integrate::main_checkout);
+    let wt_branch = wt_path.as_deref().and_then(|path| {
+        thegn_core::remote::GitLoc::from_db(&path.to_string_lossy(), None).git_out(&[
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD",
+        ])
+    });
+    let binding_worktree = if let Some(path) = &wt_path {
+        bind_checkout(
+            &root,
+            path,
+            explicit,
+            wt_main.as_deref(),
+            wt_branch.as_deref(),
+            &status.head_ref_name,
+        )?
+        .map(|path| path.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+    let old_key = old.key.clone();
+    let branch = if binding_worktree.is_some() {
+        wt_branch
+            .clone()
+            .unwrap_or_else(|| status.head_ref_name.clone())
+    } else {
+        status.head_ref_name.clone()
+    };
+    let new_key = db.rebind_pr(
+        &old_key,
+        &PrRebind {
+            worktree: binding_worktree,
+            branch,
+            base_branch: status.base_ref_name,
+            forge: forge.id().to_owned(),
+            pr_url: status.url,
+        },
+    )?;
+    let rebound = db
+        .list_pr_queue()?
+        .into_iter()
+        .find(|row| row.key == new_key)
+        .context("rebound PR queue row disappeared")?;
+    outln!(
+        "Rebound PR #{number}: {old_key} → {} (checkout generation {}).",
+        new_key,
+        rebound.checkout_gen
+    );
+    Ok(())
+}
+
+fn rebind_target(rows: &[PrQueueRow], number: u64) -> Result<&PrQueueRow> {
+    let matches: Vec<_> = rows.iter().filter(|row| row.number == number).collect();
+    anyhow::ensure!(
+        !matches.is_empty(),
+        "PR #{number} is not in the queue; add it before rebinding"
+    );
+    anyhow::ensure!(
+        matches.len() == 1,
+        "PR #{number} has multiple queue identities: {}",
+        matches
+            .iter()
+            .map(|row| row.key.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(matches[0])
 }
 
 fn clear() -> Result<()> {
@@ -353,8 +477,9 @@ fn drain(cfg: &Config, json: bool) -> Result<()> {
         outln!("Warning: {w}");
     }
     outln!(
-        "Done: {} merged, {} auto-merge armed, {} ready, {} still blocked, {} need a human, {} left the queue.",
+        "Done: {} merged, {} merge requested, {} auto-merge armed, {} ready, {} still blocked, {} need a human, {} left the queue.",
         out.merged.len(),
+        out.merge_requested.len(),
         out.auto_merge_armed.len(),
         out.ready.len(),
         out.blocked.len(),
@@ -369,6 +494,7 @@ fn drain(cfg: &Config, json: bool) -> Result<()> {
 fn drain_json(out: &pr_driver::PrOutcome) -> serde_json::Value {
     serde_json::json!({
         "merged": out.merged,
+        "merge_requested": out.merge_requested,
         "auto_merge_armed": out.auto_merge_armed,
         "ready": out.ready,
         "blocked": out.blocked,
@@ -383,6 +509,58 @@ fn drain_json(out: &pr_driver::PrOutcome) -> serde_json::Value {
 #[cfg(test)]
 mod bind_checkout_tests {
     use super::*;
+
+    #[test]
+    fn rebind_requires_an_existing_row_and_a_matching_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let wt = repo.canonicalize().unwrap();
+        let loc = thegn_core::remote::GitLoc::Local(wt.clone());
+        assert!(loc.git_out(&["checkout", "-b", "feat"]).is_none());
+        let branch = loc.git_out(&["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(branch.as_deref(), Some("feat"));
+        let root = integrate::main_checkout(&wt).unwrap();
+        let db = Db::open_at(&dir.path().join("queue.db")).unwrap();
+        assert!(rebind_target(&db.list_pr_queue().unwrap(), 7).is_err());
+
+        db.enqueue_pr(
+            &root.to_string_lossy(),
+            7,
+            Some(&wt.to_string_lossy()),
+            "feat",
+            "main",
+            "github",
+        )
+        .unwrap();
+        let rows = db.list_pr_queue().unwrap();
+        assert_eq!(rebind_target(&rows, 7).unwrap().number, 7);
+        let binding = bind_checkout(&root, &wt, true, Some(&root), branch.as_deref(), "feat")
+            .unwrap()
+            .expect("matching checkout branch remains bound");
+        assert_eq!(binding, wt);
+        let row = rows.first().unwrap();
+        let key = db
+            .rebind_pr(
+                &row.key,
+                &PrRebind {
+                    worktree: Some(wt.to_string_lossy().into_owned()),
+                    branch: branch.unwrap(),
+                    base_branch: "main".into(),
+                    forge: "github".into(),
+                    pr_url: "https://github.com/me/repo/pull/7".into(),
+                },
+            )
+            .unwrap();
+        let rebound = db
+            .list_pr_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.key == key)
+            .unwrap();
+        assert_eq!(rebound.branch, "feat");
+    }
 
     #[test]
     fn binding_requires_repo_ownership_and_matches_branch_or_is_number_only() {
@@ -444,12 +622,24 @@ mod bind_checkout_tests {
     #[expect(clippy::disallowed_methods)]
     fn init_repo(path: &Path) {
         thegn_core::fsperm::restrict_dir_to_owner(path).unwrap();
-        let status = thegn_core::util::git_cmd(path)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .args(["init"])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        let git = |args: &[&str]| {
+            let status = thegn_core::util::git_cmd(path)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "git {args:?} failed in {}",
+                path.display()
+            );
+        };
+        git(&["-c", "commit.gpgsign=false", "init"]);
+        git(&["config", "user.email", "queue-test@example.invalid"]);
+        git(&["config", "user.name", "Queue Test"]);
+        std::fs::write(path.join("tracked"), "fixture\n").unwrap();
+        git(&["add", "tracked"]);
+        git(&["-c", "commit.gpgsign=false", "commit", "-m", "fixture"]);
     }
 
     #[test]
@@ -519,5 +709,16 @@ mod drain_json_tests {
         let json = drain_json(&out);
         assert_eq!(json["merged"], serde_json::json!([]));
         assert_eq!(json["auto_merge_armed"], serde_json::json!([42]));
+    }
+
+    #[test]
+    fn merge_requested_is_additive_in_drain_json() {
+        let out = PrOutcome {
+            merge_requested: vec![42],
+            ..Default::default()
+        };
+        let json = drain_json(&out);
+        assert_eq!(json["merge_requested"], serde_json::json!([42]));
+        assert_eq!(json["merged"], serde_json::json!([]));
     }
 }
