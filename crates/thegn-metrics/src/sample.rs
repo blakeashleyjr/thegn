@@ -13,10 +13,7 @@ use sysinfo::{
 
 use crate::gpu_monitor::GpuMonitor;
 use crate::thermal::ThermalProbe;
-use crate::{
-    ChildGroup, DiskInfo, DiskKind, NetMedium, StatsSnapshot, disk_space, read_battery,
-    read_battery_power,
-};
+use crate::{ChildGroup, DiskInfo, DiskKind, NetMedium, StatsSnapshot, disk_space};
 
 /// Refresh the slow tier (frequency / temperatures / disks) once every N
 /// samples. At the host's default ~1s cadence that is roughly every 5s — these
@@ -55,6 +52,7 @@ pub struct StatsSampler {
     /// How temperatures are read. `Components` on Linux/Intel; the Apple-vendor
     /// HID sensors on Apple silicon, where `Components` is empty.
     thermal: ThermalProbe,
+    battery: crate::battery::BatteryReader,
     disk_path: std::path::PathBuf,
     tick: u64,
     /// CPU usage needs a delta; the first sample only primes it.
@@ -200,6 +198,9 @@ impl StatsSampler {
             comps: Components::new_with_refreshed_list(),
             gpu: GpuMonitor::new(),
             thermal: ThermalProbe::probe(),
+            battery: crate::battery::BatteryReader::new(std::path::PathBuf::from(
+                "/sys/class/power_supply",
+            )),
             disk_path,
             tick: 0,
             cpu_primed: false,
@@ -332,9 +333,10 @@ impl StatsSampler {
         // shared ticker. (The
         // subprocess cost predates macOS: the nvidia arm has always spawned one
         // per tick.)
-        let psu = std::path::Path::new("/sys/class/power_supply");
-        snap.battery = read_battery(psu);
-        (snap.battery_power_w, snap.battery_eta_secs) = read_battery_power(psu);
+        let battery = self.battery.sample(now);
+        snap.battery = battery.battery;
+        snap.battery_power_w = battery.power_w;
+        snap.battery_eta_secs = battery.eta_secs;
         let gpu = self.gpu.sample(slow);
         snap.gpu_pct = gpu.util_pct;
         snap.gpu_mem_mib = gpu.mem_mib;
