@@ -4328,17 +4328,15 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
                 let mut router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
                 // Provider-as-plugin: append live plugin issue providers.
                 crate::plugin_providers::extend_issue_router(&mut router);
-                if router.is_configured()
-                    && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                {
+                if router.is_configured() {
                     let patch = thegn_core::issue::IssuePatch {
                         status: Some(thegn_core::issue::IssueStatus::Done),
                         ..Default::default()
                     };
                     for id in &linked {
-                        if let Err(e) = rt.block_on(router.update_issue(id, &patch)) {
+                        if let Ok(Err(e)) =
+                            thegn_svc::issue::block_on_tracker(router.update_issue(id, &patch))
+                        {
                             tracing::warn!(target: "thegn::issues", error = %e, "failed to move linked issue {id} to Done on merge");
                         }
                     }
@@ -4912,14 +4910,11 @@ pub(crate) fn spawn_my_work_refresh(
         let mut router = thegn_svc::issue::IssueRouter::from_config_at(&issues_cfg, Some(&cwd));
         // Provider-as-plugin: append live plugin issue providers.
         crate::plugin_providers::extend_issue_router(&mut router);
-        if router.is_configured()
-            && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-        {
+        if router.is_configured() {
             let mut filter = thegn_core::issue::IssueFilter::my_open(issues_cfg.max_issues.max(1));
             filter.repo = nwo.clone(); // GitHub repo scope; other providers ignore it.
-            if let Ok(issues) = rt.block_on(router.list_issues(&filter)) {
+            if let Ok(Ok(issues)) = thegn_svc::issue::block_on_tracker(router.list_issues(&filter))
+            {
                 for i in issues {
                     // Tag GitHub issues with the repo for display; Linear/Jira
                     // scope by team/project, so leave their repo blank.
