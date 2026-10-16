@@ -1422,6 +1422,97 @@ pub(crate) fn verify_v81_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v82: persist forge/project identity and checkout generation for PR queue rows.
+pub(crate) fn migrate_v82(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "pr_queue", "forge_host") {
+        conn.execute("ALTER TABLE pr_queue ADD COLUMN forge_host TEXT", [])?;
+    }
+    if !has_column(conn, "pr_queue", "project") {
+        conn.execute("ALTER TABLE pr_queue ADD COLUMN project TEXT", [])?;
+    }
+    if !has_column(conn, "pr_queue", "checkout_gen") {
+        conn.execute(
+            "ALTER TABLE pr_queue ADD COLUMN checkout_gen INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    let tx = conn.unchecked_transaction()?;
+    let rows = {
+        let mut stmt =
+            tx.prepare("SELECT key,repo_root,number,pr_url,status,forge FROM pr_queue")?;
+        let mapped = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            ))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (old_key, root, number, url, status, forge) in rows {
+        if let Some(identity) = url
+            .as_deref()
+            .filter(|url| crate::pr_queue::pr_url_number_matches(url, number.max(0) as u64))
+            .and_then(crate::forge::model::repo_identity_from_pr_url)
+        {
+            let host = identity.host.to_ascii_lowercase();
+            let project = identity.path.to_ascii_lowercase();
+            let new_key = crate::db::PrQueueRow::make_key(
+                &root,
+                &forge,
+                Some(&identity),
+                number.max(0) as u64,
+            );
+            tx.execute(
+                "UPDATE pr_queue SET key=?2,forge_host=?3,project=?4 WHERE key=?1",
+                params![old_key, new_key, host, project],
+            )?;
+        } else if status == "needs_human" {
+            tx.execute(
+                "UPDATE pr_queue SET detail=?2 WHERE key=?1",
+                params![old_key, format!("verification required (queued before v82 identity keys); run `thegn pr queue rebind --pr {}`", number.max(0))],
+            )?;
+        } else if !matches!(status.as_str(), "merged" | "closed") {
+            tx.execute("UPDATE pr_queue SET status='needs_human',blocker='needs_human',detail=?2 WHERE key=?1", params![old_key, format!("verification required (queued before v82 identity keys); run `thegn pr queue rebind --pr {}`", number.max(0))])?;
+        }
+    }
+    tx.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_pr_queue_identity ON pr_queue(repo_root,forge,forge_host,project,number) WHERE project IS NOT NULL;")?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub(crate) fn verify_v82_schema(conn: &Connection) -> Result<()> {
+    for column in ["forge_host", "project", "checkout_gen"] {
+        if !has_column(conn, "pr_queue", column) {
+            bail!("schema v82 migration did not add pr_queue.{column}");
+        }
+    }
+    let index_shape = conn
+        .query_row(
+            "SELECT \"unique\",partial FROM pragma_index_list('pr_queue') WHERE name='idx_pr_queue_identity'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    if index_shape != Some((1, 1)) {
+        bail!("schema v82 migration did not add the unique partial PR identity index");
+    }
+    let columns = {
+        let mut stmt = conn.prepare(
+            "SELECT name FROM pragma_index_info('idx_pr_queue_identity') ORDER BY seqno",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if columns != ["repo_root", "forge", "forge_host", "project", "number"] {
+        bail!("schema v82 PR identity index has unexpected columns");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -3763,5 +3854,66 @@ mod tests {
         )
         .unwrap();
         assert!(verify_v69_schema(&conn).is_err());
+    }
+
+    #[test]
+    fn v82_rekeys_bound_rows_holds_ambiguous_rows_once_and_verifies_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE pr_queue(key TEXT PRIMARY KEY,repo_root TEXT NOT NULL,number INTEGER NOT NULL,forge TEXT,status TEXT NOT NULL,blocker TEXT,detail TEXT,pr_url TEXT);
+            INSERT INTO pr_queue VALUES('r#7','r',7,'github','watching',NULL,NULL,'https://github.com/Acme/Repo/pull/7');
+            INSERT INTO pr_queue VALUES('r#8','r',8,'github','watching',NULL,NULL,NULL);
+            INSERT INTO pr_queue VALUES('r#9','r',9,'github','merged',NULL,NULL,NULL);
+            INSERT INTO pr_queue VALUES('r#10','r',10,'github','needs_human',NULL,'old v80 hint',NULL);
+            INSERT INTO pr_queue VALUES('r#11','r',11,'github','watching',NULL,NULL,'https://github.com/acme/repo/pull/12');").unwrap();
+        assert!(super::verify_v82_schema(&conn).is_err());
+        super::migrate_v82(&conn).unwrap();
+        super::migrate_v82(&conn).unwrap();
+        super::verify_v82_schema(&conn).unwrap();
+        let bound: (String, Option<String>, Option<String>, i64) = conn
+            .query_row(
+                "SELECT key,forge_host,project,checkout_gen FROM pr_queue WHERE number=7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            bound,
+            (
+                "r#github:github.com/acme/repo#7".into(),
+                Some("github.com".into()),
+                Some("acme/repo".into()),
+                0
+            )
+        );
+        let held: (String, String) = conn
+            .query_row(
+                "SELECT status,detail FROM pr_queue WHERE number=8",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(held.0, "needs_human");
+        assert!(held.1.contains("thegn pr queue rebind --pr 8"));
+        let settled: String = conn
+            .query_row("SELECT status FROM pr_queue WHERE number=9", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(settled, "merged");
+        let held_detail: String = conn
+            .query_row("SELECT detail FROM pr_queue WHERE number=10", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(held_detail.contains("thegn pr queue rebind --pr 10"));
+        let mismatch: (String, String) = conn
+            .query_row(
+                "SELECT status,detail FROM pr_queue WHERE number=11",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(mismatch.0, "needs_human");
+        assert!(mismatch.1.contains("thegn pr queue rebind --pr 11"));
     }
 }

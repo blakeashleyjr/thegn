@@ -1086,8 +1086,6 @@ fn pr_queue_enqueue_update_list_and_remove() {
     let db = db();
     assert!(db.list_pr_queue().unwrap().is_empty());
 
-    db.enqueue_pr("/repo", 7, Some("/wt/a"), "feat-a", "main", "github")
-        .unwrap();
     db.enqueue_bound_pr(
         "/repo",
         7,
@@ -1098,8 +1096,7 @@ fn pr_queue_enqueue_update_list_and_remove() {
         "https://github.com/me/repo/pull/7",
     )
     .unwrap();
-    // Same number in a DIFFERENT repo is a distinct row — the key is repo+number,
-    // so two repos' PR #7 must not collide.
+    // Same number in a DIFFERENT repo is a distinct row.
     db.enqueue_pr("/other", 7, None, "feat-x", "main", "github")
         .unwrap();
     let q = db.list_pr_queue().unwrap();
@@ -1112,8 +1109,11 @@ fn pr_queue_enqueue_update_list_and_remove() {
             .find(|r| r.key == key)
             .unwrap()
     };
-    let k = PrQueueRow::make_key("/repo", 7);
-    assert_eq!(k, "/repo#7");
+    let identity =
+        crate::forge::model::repo_identity_from_pr_url("https://github.com/me/repo/pull/7")
+            .unwrap();
+    let k = PrQueueRow::make_key("/repo", "github", Some(&identity), 7);
+    assert_eq!(k, "/repo#github:github.com/me/repo#7");
     let a = by(&k);
     assert_eq!(a.status, "watching");
     assert_eq!(a.number, 7);
@@ -1154,38 +1154,151 @@ fn pr_queue_enqueue_update_list_and_remove() {
     db.set_pr_agent_attempts(&k, 2).unwrap();
     assert_eq!(by(&k).agent_attempts, 2);
 
-    // Re-queueing resets the row, but KEEPS a worktree the caller didn't supply
-    // — dropping it would silently disable agent handoff for that PR.
-    db.enqueue_pr("/repo", 7, None, "feat-a", "main", "github")
-        .unwrap();
-    let a = by(&k);
-    assert_eq!(a.status, "watching");
-    assert_eq!(a.agent_attempts, 0);
-    assert!(a.blocker.is_none() && a.detail.is_none());
-    assert_eq!(a.worktree.as_deref(), Some("/wt/a"), "worktree survives");
+    db.enqueue_bound_pr(
+        "/repo",
+        7,
+        Some("/wt/a"),
+        "feat-a",
+        "main",
+        "github",
+        "https://github.com/me/repo/pull/7",
+    )
+    .unwrap();
+    let reset = by(&k);
+    assert_eq!(reset.status, "watching");
+    assert_eq!(reset.agent_attempts, 0);
+    assert!(reset.blocker.is_none() && reset.detail.is_none());
     assert_eq!(
-        a.pr_url.as_deref(),
-        Some("https://github.com/me/repo/pull/7")
+        reset.worktree.as_deref(),
+        Some("/wt/a"),
+        "worktree survives"
     );
+
+    db.enqueue_pr("/legacy", 8, Some("/wt/legacy"), "legacy", "main", "github")
+        .unwrap();
+    let legacy_key = PrQueueRow::make_key("/legacy", "github", None, 8);
+    db.set_pr_agent_attempts(&legacy_key, 2).unwrap();
+    db.update_pr_status(&legacy_key, "blocked_ci", Some("ci"), Some("failed"), None)
+        .unwrap();
+    db.enqueue_pr("/legacy", 8, None, "legacy", "main", "github")
+        .unwrap();
+    let legacy = db
+        .list_pr_queue()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.key == legacy_key)
+        .unwrap();
+    assert_eq!(
+        legacy.worktree.as_deref(),
+        Some("/wt/legacy"),
+        "COALESCE preserves worktree"
+    );
+    assert_eq!(legacy.status, "watching");
+    assert_eq!(legacy.agent_attempts, 0);
+    assert!(legacy.blocker.is_none() && legacy.detail.is_none());
+
+    assert!(
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            Some("/wt/b"),
+            "feat-a",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/7",
+        )
+        .is_err(),
+        "checkout changes require explicit rebind"
+    );
+
+    db.remove_pr_entry(&k).unwrap();
+    assert_eq!(db.list_pr_queue().unwrap().len(), 2);
+}
+
+#[test]
+fn bound_enqueue_projects_and_explicit_rebind_generation() {
+    let db = db();
+    db.enqueue_bound_pr(
+        "/repo",
+        7,
+        Some("/wt/a"),
+        "feat",
+        "main",
+        "github",
+        "https://github.com/acme/one/pull/7",
+    )
+    .unwrap();
     db.enqueue_bound_pr(
         "/repo",
         7,
         Some("/wt/b"),
-        "feat-b",
+        "feat",
         "main",
         "github",
-        "https://github.com/other/repo/pull/7",
+        "https://github.com/acme/two/pull/7",
     )
     .unwrap();
-    let a = by(&k);
-    assert_eq!(a.worktree.as_deref(), Some("/wt/b"));
+    let before = db.list_pr_queue().unwrap();
     assert_eq!(
-        a.pr_url.as_deref(),
-        Some("https://github.com/other/repo/pull/7")
+        before.len(),
+        2,
+        "same number in two projects has distinct authority keys"
     );
-
-    db.remove_pr_entry(&k).unwrap();
-    assert_eq!(db.list_pr_queue().unwrap().len(), 1);
+    let first = before
+        .iter()
+        .find(|row| row.project.as_deref() == Some("acme/one"))
+        .unwrap();
+    let first_key = first.key.clone();
+    db.set_pr_agent_attempts(&first_key, 2).unwrap();
+    assert!(
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            Some("/wt/changed"),
+            "feat",
+            "main",
+            "github",
+            "https://github.com/acme/one/pull/7"
+        )
+        .is_err()
+    );
+    let new_key = db
+        .rebind_pr(
+            &first_key,
+            &PrRebind {
+                worktree: Some("/wt/changed".into()),
+                branch: "feat".into(),
+                base_branch: "main".into(),
+                forge: "github".into(),
+                pr_url: "https://github.com/acme/one/pull/7".into(),
+            },
+        )
+        .unwrap();
+    let row = db
+        .list_pr_queue()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.key == new_key)
+        .unwrap();
+    assert_eq!(row.checkout_gen, 1);
+    assert_eq!(
+        row.agent_attempts, 2,
+        "rebind does not refill the agent budget"
+    );
+    assert!(
+        db.rebind_pr(
+            &new_key,
+            &PrRebind {
+                worktree: Some("/wt/changed".into()),
+                branch: "feat".into(),
+                base_branch: "main".into(),
+                forge: "github".into(),
+                pr_url: "https://github.com/acme/two/pull/7".into(),
+            }
+        )
+        .is_err(),
+        "an existing identity cannot be stolen by rebind"
+    );
 }
 
 #[test]
@@ -5858,4 +5971,63 @@ fn issue_link_worktrees_lists_every_link() {
     assert!(links.contains(&("linear:ABC-1".into(), "/wt/one".into())));
     assert!(links.contains(&("linear:ABC-1".into(), "/wt/two".into())));
     assert!(links.contains(&("github:acme/2".into(), "/wt/three".into())));
+}
+
+#[test]
+fn bound_enqueue_validates_identity_absorbs_legacy_and_rebind_validates_rows() {
+    let db = db();
+    assert!(
+        db.enqueue_bound_pr("/repo", 7, None, "feat", "main", "github", "bad-url")
+            .is_err()
+    );
+    assert!(
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            None,
+            "feat",
+            "main",
+            "github",
+            "https://github.com/acme/repo/pull/8"
+        )
+        .is_err()
+    );
+    let legacy_key = PrQueueRow::make_key("/repo", "github", None, 7);
+    db.enqueue_pr("/repo", 7, None, "feat", "main", "github")
+        .unwrap();
+    db.enqueue_bound_pr(
+        "/repo",
+        7,
+        None,
+        "feat",
+        "main",
+        "github",
+        "https://github.com/acme/repo/pull/7",
+    )
+    .unwrap();
+    let rows = db.list_pr_queue().unwrap();
+    assert_eq!(rows.len(), 1, "binding absorbs the legacy unbound row");
+    assert_ne!(rows[0].key, legacy_key);
+    let missing = db.rebind_pr(
+        "/missing",
+        &PrRebind {
+            worktree: None,
+            branch: "feat".into(),
+            base_branch: "main".into(),
+            forge: "github".into(),
+            pr_url: "https://github.com/acme/repo/pull/7".into(),
+        },
+    );
+    assert!(missing.is_err());
+    let mismatch = db.rebind_pr(
+        &rows[0].key,
+        &PrRebind {
+            worktree: None,
+            branch: "feat".into(),
+            base_branch: "main".into(),
+            forge: "github".into(),
+            pr_url: "https://github.com/acme/repo/pull/8".into(),
+        },
+    );
+    assert!(mismatch.is_err());
 }

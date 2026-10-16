@@ -143,6 +143,7 @@ impl Forge for Ladder<dyn Forge> {
         pr: PrRef,
         method: MergeMethod,
         delete_branch: bool,
+        expected_head: Option<&str>,
         auto: bool,
     ) -> Result<(), ForgeError> {
         forward!(self, "merge_pr", |l| l.merge_pr(
@@ -150,6 +151,7 @@ impl Forge for Ladder<dyn Forge> {
             pr,
             method,
             delete_branch,
+            expected_head,
             auto
         ))
     }
@@ -556,6 +558,7 @@ mod tests {
             _: PrRef,
             _: MergeMethod,
             _: bool,
+            _: Option<&str>,
             _: bool,
         ) -> Result<(), ForgeError> {
             self.calls.lock().unwrap().push("merge");
@@ -598,8 +601,15 @@ mod tests {
         assert_eq!(l.pr_status(&loc(), PrRef::Current).unwrap().number, 99);
         // An op only the CLI layer has: Unsupported on native falls through.
         assert!(
-            l.merge_pr(&loc(), PrRef::Current, MergeMethod::Squash, false, false)
-                .is_ok()
+            l.merge_pr(
+                &loc(),
+                PrRef::Current,
+                MergeMethod::Squash,
+                false,
+                None,
+                false
+            )
+            .is_ok()
         );
         assert!(l.resolve_review_thread(&loc(), "thread", "reply").is_ok());
         assert!(l.caps().resolve_review_thread);

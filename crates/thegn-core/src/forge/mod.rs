@@ -330,16 +330,26 @@ pub trait Forge: Probe + Send + Sync {
         unsupported!("create_pr")
     }
 
-    /// `auto = true` asks the forge to merge once its own rules allow.
+    /// `auto = true` asks the forge to merge once its own rules allow. When
+    /// `expected_head` is Some, implementations must refuse to merge a different
+    /// head. An implementation that cannot enforce this atomically must return
+    /// `ForgeError::Unsupported("merge_pr expected head")`, never merge unfenced.
+    /// `None` keeps the provider's ordinary PR selection without head fencing;
+    /// interactive callers use this weaker mode for compatibility.
     fn merge_pr(
         &self,
         _loc: &GitLoc,
         _pr: PrRef,
         _method: MergeMethod,
         _delete_branch: bool,
+        expected_head: Option<&str>,
         _auto: bool,
     ) -> Result<(), ForgeError> {
-        unsupported!("merge_pr")
+        if expected_head.is_some() {
+            unsupported!("merge_pr expected head")
+        } else {
+            unsupported!("merge_pr")
+        }
     }
 
     fn set_draft(&self, _loc: &GitLoc, _pr: PrRef, _draft: bool) -> Result<(), ForgeError> {
@@ -563,7 +573,7 @@ mod tests {
             Err(ForgeError::Unsupported("pr_diff"))
         );
         assert_eq!(
-            f.merge_pr(&l, PrRef::Current, MergeMethod::Squash, false, false),
+            f.merge_pr(&l, PrRef::Current, MergeMethod::Squash, false, None, false),
             Err(ForgeError::Unsupported("merge_pr"))
         );
         assert!(matches!(
