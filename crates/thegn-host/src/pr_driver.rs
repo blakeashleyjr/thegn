@@ -2749,7 +2749,7 @@ mod tests {
         let mut pending = failing_ci_pr("head-b");
         pending.status_check_rollup[0].status = "IN_PROGRESS".into();
         pending.status_check_rollup[0].conclusion = None;
-        let forge = FakeForge::new(Some(pending));
+        let forge = FakeForge::new(Some(pending)).with_rerun_count(1);
         let row = db.list_pr_queue().unwrap().remove(0);
         drive_queue(
             &config,
