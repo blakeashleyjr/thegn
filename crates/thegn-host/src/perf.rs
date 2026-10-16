@@ -14,7 +14,7 @@
 //!   * [`CpuLedger`] / [`measure`] — per-subsystem thread-CPU accounting for the
 //!     off-thread producers (hydration, stats, metrics, …), summed across the
 //!     `spawn_blocking` pool via atomics.
-//!   * [`thread_cpu_ns`] — `CLOCK_THREAD_CPUTIME_ID` wrapper (0 where unsupported).
+//!   * [`thread_cpu_ns`] — platform thread-clock wrapper (0 where unsupported).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -194,29 +194,10 @@ pub fn request_stop_after(
     Some(ms)
 }
 
-// ---------------------------------------------------------------------------
-// Thread CPU clock.
-// ---------------------------------------------------------------------------
-
-/// Calling thread's consumed CPU time in nanoseconds, or `0` where the clock is
-/// unavailable. Uses `CLOCK_THREAD_CPUTIME_ID` so an I/O-blocked producer (a
-/// gix fan-out waiting on the filesystem) reports the CPU it actually burned,
-/// not the wall-clock it spent blocked.
-#[cfg(unix)]
+/// Calling thread's consumed CPU time, or `0` where the clock is unavailable.
 #[inline]
 pub fn thread_cpu_ns() -> u64 {
-    match nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID) {
-        Ok(ts) => (ts.tv_sec() as u64)
-            .wrapping_mul(1_000_000_000)
-            .wrapping_add(ts.tv_nsec() as u64),
-        Err(_) => 0,
-    }
-}
-
-#[cfg(not(unix))]
-#[inline]
-pub fn thread_cpu_ns() -> u64 {
-    0
+    crate::platform::cpu_clock::thread_cpu_ns()
 }
 
 // ---------------------------------------------------------------------------
@@ -254,10 +235,12 @@ pub enum Subsys {
     Relayout,
     /// CPU on scoped hydration/panel fan-out threads, separate from the parent.
     HydrateChild,
+    /// CPU spent running glyph scan-pool jobs.
+    Scan,
 }
 
 impl Subsys {
-    pub const ALL: [Subsys; 15] = [
+    pub const ALL: [Subsys; 16] = [
         Subsys::Hydrate,
         Subsys::Pr,
         Subsys::Issues,
@@ -273,6 +256,7 @@ impl Subsys {
         Subsys::Rows,
         Subsys::Relayout,
         Subsys::HydrateChild,
+        Subsys::Scan,
     ];
     pub const N: usize = Self::ALL.len();
 
@@ -294,7 +278,48 @@ impl Subsys {
             Subsys::Rows => "rows",
             Subsys::Relayout => "relayout",
             Subsys::HydrateChild => "hydrate-child",
+            Subsys::Scan => "scan",
         }
+    }
+
+    /// These spans are nested on the event-loop thread and already counted by
+    /// its process/loop CPU totals, so they stay visible but are not summed.
+    pub(crate) fn on_loop(self) -> bool {
+        matches!(
+            self,
+            Subsys::Switch | Subsys::SwitchPrep | Subsys::Drawer | Subsys::Rows | Subsys::Relayout
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct CpuAttribution {
+    pub(crate) process_ms: f64,
+    pub(crate) loop_ms: f64,
+    pub(crate) scan_ms: f64,
+    pub(crate) children_ms: f64,
+    pub(crate) unattributed_ms: f64,
+}
+
+pub(crate) fn cpu_attribution(
+    process_ns: u64,
+    loop_ns: u64,
+    children_ns: u64,
+    ledger: &[(u64, u64); Subsys::N],
+) -> CpuAttribution {
+    let off_loop_ns = Subsys::ALL
+        .iter()
+        .filter(|sub| !sub.on_loop())
+        .fold(0u64, |sum, sub| sum.saturating_add(ledger[*sub as usize].0));
+    CpuAttribution {
+        process_ms: process_ns as f64 / 1.0e6,
+        loop_ms: loop_ns as f64 / 1.0e6,
+        scan_ms: ledger[Subsys::Scan as usize].0 as f64 / 1.0e6,
+        children_ms: children_ns as f64 / 1.0e6,
+        unattributed_ms: process_ns
+            .saturating_sub(loop_ns)
+            .saturating_sub(off_loop_ns) as f64
+            / 1.0e6,
     }
 }
 
@@ -611,6 +636,9 @@ pub struct LoopPerf {
     /// thread time), so the rollup samples the monotonic counter in
     /// `thegn_svc::git` and reports the rate. See `git::git_spawn_count`.
     pub git_spawns_t0: u64,
+    proc_cpu_t0: u64,
+    child_cpu_t0: u64,
+    loop_cpu_t0: u64,
     /// Wall-clock the loop spent awake (not blocked in `poll_input`) this
     /// interval — drives the idle ratio.
     pub busy: Duration,
@@ -647,6 +675,9 @@ impl LoopPerf {
             pty_chunks: 0,
             pty_budget_hits: 0,
             git_spawns_t0: thegn_svc::git::git_spawn_count(),
+            proc_cpu_t0: crate::platform::cpu_clock::process_cpu_ns(),
+            child_cpu_t0: crate::platform::cpu_clock::reaped_children_cpu_ns(),
+            loop_cpu_t0: thread_cpu_ns(),
             busy: Duration::ZERO,
             report_t0: Instant::now(),
         }
@@ -863,6 +894,9 @@ impl LoopPerf {
         self.pty_chunks = 0;
         self.pty_budget_hits = 0;
         self.git_spawns_t0 = thegn_svc::git::git_spawn_count();
+        self.proc_cpu_t0 = crate::platform::cpu_clock::process_cpu_ns();
+        self.child_cpu_t0 = crate::platform::cpu_clock::reaped_children_cpu_ns();
+        self.loop_cpu_t0 = thread_cpu_ns();
         self.busy = Duration::ZERO;
         self.report_t0 = Instant::now();
     }
@@ -944,6 +978,13 @@ pub struct PerfSnapshot {
     /// Per-subsystem CPU ms this interval, in [`Subsys::ALL`] order.
     #[allow(dead_code)] // surfaced by the Telemetry overlay's per-subsystem breakdown
     pub cpu_ms: [f64; Subsys::N],
+    pub cpu_process_ms: f64,
+    pub cpu_loop_ms: f64,
+    pub cpu_scan_ms: f64,
+    /// Reaped children only; CPU appears when a child is reaped, not while it runs.
+    pub cpu_children_reaped_ms: f64,
+    /// Process CPU not attributed to the loop thread or measured off-loop spans.
+    pub cpu_unattributed_ms: f64,
 }
 
 impl LoopPerf {
@@ -963,6 +1004,12 @@ impl LoopPerf {
             .as_secs_f64()
             .max(1e-9);
         let cpu = CPU.take();
+        let cpu_totals = cpu_attribution(
+            crate::platform::cpu_clock::process_cpu_ns().saturating_sub(self.proc_cpu_t0),
+            thread_cpu_ns().saturating_sub(self.loop_cpu_t0),
+            crate::platform::cpu_clock::reaped_children_cpu_ns().saturating_sub(self.child_cpu_t0),
+            &cpu,
+        );
         let mut cpu_ms = [0.0f64; Subsys::N];
         for i in 0..Subsys::N {
             cpu_ms[i] = cpu[i].0 as f64 / 1.0e6;
@@ -1019,6 +1066,11 @@ impl LoopPerf {
             log_dropped_total,
             log_oldest_ms,
             cpu_ms,
+            cpu_process_ms: cpu_totals.process_ms,
+            cpu_loop_ms: cpu_totals.loop_ms,
+            cpu_scan_ms: cpu_totals.scan_ms,
+            cpu_children_reaped_ms: cpu_totals.children_ms,
+            cpu_unattributed_ms: cpu_totals.unattributed_ms,
         };
 
         // Cumulative since process start, not per-interval: the worst open is a
@@ -1051,6 +1103,11 @@ impl LoopPerf {
             hydrate_calls = snap.hydrate_calls,
             hydrate_child_calls = snap.hydrate_child_calls,
             cpu_hydrate_child_ms = cpu_ms[Subsys::HydrateChild as usize],
+            cpu_process_ms = snap.cpu_process_ms,
+            cpu_loop_ms = snap.cpu_loop_ms,
+            cpu_scan_ms = snap.cpu_scan_ms,
+            cpu_children_reaped_ms = snap.cpu_children_reaped_ms,
+            cpu_unattributed_ms = snap.cpu_unattributed_ms,
             wakes_per_s = snap.wakes_per_s,
             renders_per_s = snap.renders_per_s,
             pane_frames_per_s = snap.pane_frames_per_s,
@@ -1287,6 +1344,53 @@ mod tests {
         // take() resets, so a second read is all zeros.
         let second = ledger.take();
         assert_eq!(second[Subsys::Hydrate as usize], (0, 0));
+    }
+
+    #[test]
+    fn cpu_attribution_subtracts_loop_and_off_loop_ledger_only() {
+        let mut ledger = [(0, 0); Subsys::N];
+        ledger[Subsys::Hydrate as usize].0 = 20_000_000;
+        ledger[Subsys::HydrateChild as usize].0 = 5_000_000;
+        ledger[Subsys::Scan as usize].0 = 30_000_000;
+        ledger[Subsys::Switch as usize].0 = 4_000_000;
+        ledger[Subsys::SwitchPrep as usize].0 = 6_000_000;
+        let result = cpu_attribution(100_000_000, 10_000_000, 7_000_000, &ledger);
+        assert_eq!(result.process_ms, 100.0);
+        assert_eq!(result.loop_ms, 10.0);
+        assert_eq!(result.scan_ms, 30.0);
+        assert_eq!(result.children_ms, 7.0);
+        assert_eq!(result.unattributed_ms, 35.0);
+    }
+
+    #[test]
+    fn cpu_attribution_saturates_when_ledger_exceeds_process() {
+        let mut ledger = [(0, 0); Subsys::N];
+        ledger[Subsys::Hydrate as usize].0 = 80;
+        ledger[Subsys::Scan as usize].0 = 40;
+        let result = cpu_attribution(100, 10, 0, &ledger);
+        assert_eq!(result.unattributed_ms, 0.0);
+    }
+
+    #[test]
+    fn on_loop_classification_is_pinned() {
+        let on_loop: Vec<_> = Subsys::ALL
+            .iter()
+            .copied()
+            .filter(|sub| sub.on_loop())
+            .collect();
+        assert_eq!(
+            on_loop,
+            [
+                Subsys::Switch,
+                Subsys::SwitchPrep,
+                Subsys::Drawer,
+                Subsys::Rows,
+                Subsys::Relayout,
+            ]
+        );
+        assert!(!Subsys::Scan.on_loop());
+        assert_eq!(Subsys::Scan.label(), "scan");
+        assert_eq!(Subsys::ALL[Subsys::N - 1], Subsys::Scan);
     }
 
     #[test]
