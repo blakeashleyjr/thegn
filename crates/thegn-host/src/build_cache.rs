@@ -11,10 +11,12 @@
 //! Extracted from `agent.rs` (pinned at its god-file ratchet ceiling).
 
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 use thegn_core::config::{Config, SandboxCompilerCache};
 use thegn_core::sandbox::{Backend, Mount, SandboxSpec};
+use thegn_proc::Limits;
 
 const CACHE_ENDPOINT_VARS: &[&str] = &[
     "SCCACHE_SERVER_UDS",
@@ -308,34 +310,13 @@ fn status_with_timeout(argv: &[String], timeout: Duration) -> bool {
     let Some((program, args)) = argv.split_first() else {
         return false;
     };
-    let Ok(mut child) = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return false;
+    let mut command = Command::new(program);
+    command.args(args);
+    let limits = Limits {
+        quiesce_after_leader: Some(Duration::ZERO),
+        ..Limits::silent(timeout)
     };
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                std::thread::spawn(move || {
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "detached reap runs off the compositor/event loop"
-                    )]
-                    let _ = child.wait();
-                });
-                return false;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(_) => return false,
-        }
-    }
+    thegn_proc::run(&mut command, &limits, &AtomicBool::new(false)).success()
 }
 
 /// Apply the sole sandbox compiler-cache authority after all build, dev-shell,
@@ -1134,5 +1115,62 @@ mod tests {
             .expect("valid volume names"),
             Duration::from_secs(10),
         ));
+    }
+    #[test]
+    fn status_probe_maps_exit_status_and_spawn_failure() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        assert!(status_with_timeout(
+            &["true".into()],
+            Duration::from_secs(1)
+        ));
+        assert!(!status_with_timeout(
+            &["/bin/sh".into(), "-c".into(), "exit 4".into()],
+            Duration::from_secs(1),
+        ));
+        assert!(!status_with_timeout(
+            &["/no/such/status-probe".into()],
+            Duration::from_secs(1),
+        ));
+        assert!(!status_with_timeout(&[], Duration::from_secs(1)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn status_probe_timeout_kills_the_probe_group() {
+        use std::time::Instant;
+
+        if !Path::new("/bin/sh").exists() || !Path::new("/proc/self/stat").exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "sleep 30 & echo $! > \"$1\"; sleep 30".into(),
+            "status-probe-test".into(),
+            pidfile.to_string_lossy().into_owned(),
+        ];
+        let started = Instant::now();
+        assert!(!status_with_timeout(&argv, Duration::from_millis(200)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let pid = std::fs::read_to_string(pidfile).unwrap();
+        let child_stat = Path::new("/proc").join(pid.trim()).join("stat");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while let Ok(stat) = std::fs::read_to_string(&child_stat) {
+            let state = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.trim().chars().next());
+            if state == Some('Z') {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "grandchild still running: {stat}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
