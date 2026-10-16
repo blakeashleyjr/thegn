@@ -39,6 +39,13 @@ impl SysRead for RealFs {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct SlowReading {
+    mem_mib: Option<(u64, u64)>,
+    temp_c: Option<f32>,
+    power_w: Option<f32>,
+}
+
 struct Card {
     device: PathBuf,
     runtime_status: PathBuf,
@@ -51,7 +58,7 @@ struct Card {
     temp: Option<PathBuf>,
     power: Option<PathBuf>,
     resolved: bool,
-    slow: Option<(Option<(u64, u64)>, Option<f32>, Option<f32>)>,
+    slow: Option<SlowReading>,
 }
 
 pub(crate) struct GpuSysfs {
@@ -153,12 +160,13 @@ impl GpuSysfs {
             if slow {
                 card.slow = Some(read_slow(&*self.io, card));
             }
-            let (mem_mib, temp_c, power_w) = card.slow.unwrap_or((None, None, None));
+            let slow_reading = card.slow.unwrap_or_default();
+            let mem_mib = slow_reading.mem_mib;
             let reading = GpuReading {
                 util_pct: util,
                 mem_mib,
-                temp_c,
-                power_w,
+                temp_c: slow_reading.temp_c,
+                power_w: slow_reading.power_w,
                 mem_shared: card.apu && mem_mib.is_some(),
             };
             if let Some(util) = util
@@ -257,7 +265,7 @@ fn bytes_mib(io: &dyn SysRead, path: &Path) -> Option<u64> {
         .map(|bytes| bytes / (1024 * 1024))
 }
 
-fn read_slow(io: &dyn SysRead, card: &Card) -> (Option<(u64, u64)>, Option<f32>, Option<f32>) {
+fn read_slow(io: &dyn SysRead, card: &Card) -> SlowReading {
     let vram_used = bytes_mib(io, &card.vram_used);
     let mem_mib = if card.apu {
         match (
@@ -288,7 +296,11 @@ fn read_slow(io: &dyn SysRead, card: &Card) -> (Option<(u64, u64)>, Option<f32>,
             .and_then(|value| value.trim().parse::<f32>().ok())
             .map(|value| value / 1_000_000.0)
     });
-    (mem_mib, temp_c, power_w)
+    SlowReading {
+        mem_mib,
+        temp_c,
+        power_w,
+    }
 }
 
 #[cfg(test)]
@@ -457,8 +469,10 @@ mod tests {
         put(dir.path(), "card0/device/power/runtime_status", "active\n");
         let first = gpu.sample(true);
         let reads_after_slow = io.reads.load(Ordering::Relaxed);
+        put(dir.path(), "card0/device/mem_info_vram_used", "209715200\n");
+        put(dir.path(), "card0/device/mem_info_gtt_used", "2147483648\n");
         let cached = gpu.sample(false);
-        assert!(io.reads.load(Ordering::Relaxed) - reads_after_slow < 4);
+        assert_eq!(io.reads.load(Ordering::Relaxed) - reads_after_slow, 2);
         assert_eq!(cached.mem_mib, first.mem_mib);
     }
 }
