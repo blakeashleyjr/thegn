@@ -96,10 +96,7 @@ mod linux {
                     if !rediscovered {
                         self.discover(now);
                     }
-                    match self.read_sample(false) {
-                        Ok(reading) => reading,
-                        Err(()) => BatteryReading::default(),
-                    }
+                    self.read_sample(false).unwrap_or_default()
                 }
             }
         }
@@ -209,10 +206,7 @@ mod linux {
                 };
                 #[cfg(not(test))]
                 let power_result = read_num(&battery.power_now, &mut buffer, &mut self.counters);
-                let power_now = match power_result {
-                    Ok(value) => value,
-                    Err(()) => None,
-                };
+                let power_now = power_result.unwrap_or_default();
                 let need_current_voltage =
                     power_now.is_none() || (energy_now.is_none() && charge_now.is_some());
                 let current_now = if need_current_voltage {
@@ -417,10 +411,7 @@ mod linux {
         buffer: &mut [u8],
         counters: &mut Counters,
     ) -> Option<u64> {
-        match read_num(file, buffer, counters) {
-            Ok(value) => value,
-            Err(()) => None,
-        }
+        read_num(file, buffer, counters).unwrap_or_default()
     }
 
     fn read_capacity(
@@ -444,10 +435,7 @@ mod linux {
         buffer: &mut [u8],
         counters: &mut Counters,
     ) -> Option<i64> {
-        match read_signed(file, buffer, counters) {
-            Ok(value) => value,
-            Err(()) => None,
-        }
+        read_signed(file, buffer, counters).unwrap_or_default()
     }
 
     fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
