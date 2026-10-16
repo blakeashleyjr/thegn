@@ -94,7 +94,7 @@ fn parse_arena_max(raw: Option<&str>) -> i32 {
 /// Cap the process's glibc arena count before worker threads start.
 pub fn tune_allocator() {
     let _epoch = EPOCH.get_or_init(Instant::now);
-    let raw = std::env::var("THEGN_MALLOC_ARENA_MAX").ok();
+    let raw = std::env::var_os("THEGN_MALLOC_ARENA_MAX").and_then(|value| value.into_string().ok());
     let max = parse_arena_max(raw.as_deref());
     ARENA_MAX.store(max, Ordering::Relaxed);
     let applied = max > 0 && set_arena_max(max);
