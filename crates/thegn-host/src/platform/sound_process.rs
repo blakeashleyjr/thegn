@@ -339,7 +339,6 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod test_support {
     pub(crate) const UNIX: bool = cfg!(unix);
-    pub(crate) const HAS_PROC: bool = cfg!(target_os = "linux");
 
     /// A real terminal waker (backed by a pty); the other ends must outlive it.
     #[cfg(unix)]
