@@ -54,9 +54,8 @@ confirms; run status again. A finish taking over 2 seconds reports truncated
 with `recording finalization timed out; writer may still be flushing`. If the
 writer completes late while the session lives, status is updated with the real
 result. With neither flag the command reports status. The control verb is
-`sessions.record` (HTTP/gRPC/CLI only —
-never MCP or plugins, so an agent can't silently bug another session), and it
-needs a **write**-scoped token.
+`sessions.record` (HTTP/gRPC/CLI only — never MCP or plugins, so an agent
+can't silently bug another session), and it needs a **write**-scoped token.
 
 Recordings are terminal output and can contain whatever secrets a tool printed,
 so files are written `0600` under a `0700` directory (`[recording] dir`, default

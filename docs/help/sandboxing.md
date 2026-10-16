@@ -80,11 +80,12 @@ directory, bind-backed named volumes, and file secrets/configs; there is no
 per-repo opt-out. If the config cannot be inspected, launch proceeds with a
 warning and is reported as host-process isolation. Remote placements are not
 checked. Queue-agent sandboxes get the same protected-bind check, including the
-daemon control-socket directory. If their Compose config cannot be inspected,
-the agent runs degraded with a warning. On backends that store the label, a
-kept container is reused only if its
-`thegn.policy` label matches a fingerprint of the whole resolved policy and,
-when sealed, it binds exactly the required mounts; otherwise it is recreated.
+daemon control-socket directory; a protected bind is refused and the queue
+dispatch is held. If their Compose config cannot be inspected, the agent runs
+degraded with a warning. On backends that store the label, a kept container is
+reused only if its `thegn.policy` label matches a fingerprint of the whole
+resolved policy and, when sealed, it binds exactly the required mounts;
+otherwise it is recreated.
 On these backends, a policy change recreates it once, and a container made by
 an older thegn is recreated once after upgrade. The one tolerated extra
 is the devenv `/nix` bind, and only while devenv is still on: turn devenv off and
@@ -334,8 +335,10 @@ placement is out of scope (reported `provider-managed`, never counted as a
 tier). A repo-root `.thegn.toml` may only **raise** the floor, never lower it.
 With `agent_sandbox` on, a queue agent is held to at least the `[sandbox]`
 isolation floor in force (default: shared-kernel, refusing on a miss). The
-queue floor can raise that requirement, but `degrade` cannot weaken it. Opt
-out with `[sandbox] isolation_floor = "off"` or `agent_sandbox = false`.
+queue floor (`agent_isolation_floor`) can raise that requirement, but
+`degrade` cannot weaken it. A fail-closed miss holds the entry as an
+infrastructure failure and never marks the branch failed. Opt out with
+`[sandbox] isolation_floor = "off"` or `agent_sandbox = false`.
 
 ## Choosing per worktree
 
@@ -484,9 +487,9 @@ Cleanup is always explicit — thegn never prunes on a schedule.
   adopted only when its Compose working directory is inside the worktree; a
   legacy project with a working directory outside it is never adopted and
   starts under the new name. It also removes VPN secret staging directories
-  for sidecars it
-  removes, plus staging directories older than an hour whose sidecar is gone
-  when at least one runtime could be listed; symlinks are never followed.
+  for sidecars it removes, plus staging directories older than an hour whose
+  sidecar is gone when at least one runtime could be listed; symlinks are
+  never followed.
   Safe to run any time.
 - `thegn sandbox prune` reclaims **thegn-owned (`thegn-` name family) stopped
   containers**, and `thegn.managed` images and volumes. On a terminal it

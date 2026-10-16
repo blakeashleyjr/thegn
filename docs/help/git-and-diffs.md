@@ -63,8 +63,9 @@ drill view is open, when it does nothing.
 With a rebase base marked, `r` rebases the commits after the mark onto the
 selected branch. In staging and patch, dragging across lines selects a range
 like `v`; narrow Half keeps the stacked behaviour.
-Dragging past the top or bottom of the detail column scrolls it by up to three
-lines per pointer movement; a still pointer does not scroll.
+In the fused two-column view, dragging past the top or bottom of the main
+column moves the cursor by up to three lines per pointer movement; a still
+pointer does not scroll.
 
 ### stash
 
@@ -171,9 +172,11 @@ id in `[keybinds]`:
 
 Because each worktree is its own checkout, these never touch a branch you
 are not looking at — which is what makes running several at once safe.
-Push, fetch and fast-forward network transfers run outside the git lock, so a
-slow push or fetch does not block other git actions in the repo. Only the local
-branch update is locked; pull remains locked.
+Push and fetch run outside the git lock, so a slow transfer does not block
+other git actions. A current-branch fast-forward uses a locked
+`merge --ff-only`; a local fast-forward of a non-current branch downloads
+unlocked and locks only the branch update. Pull and fast-forwards on remote
+worktrees stay locked.
 
 ## Rollback
 
