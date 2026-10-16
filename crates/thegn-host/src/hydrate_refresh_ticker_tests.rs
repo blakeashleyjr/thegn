@@ -351,27 +351,61 @@ fn container_delivery_gates_on_set_and_footprint_change() {
 #[test]
 fn container_demand_resolves_from_visible_surfaces() {
     use ContainerDemand::{Detail, None as Nothing, Summary};
-    // (panel, monitor, sandbox section, active worktree OCI-backed) -> demand
-    assert_eq!(ContainerDemand::resolve(false, false, false, true), Nothing);
-    assert_eq!(ContainerDemand::resolve(true, false, false, true), Summary);
+    // (panel, monitor, monitor Containers tab, sandbox section, active OCI) -> demand
+    assert_eq!(
+        ContainerDemand::resolve(false, false, false, false, true),
+        Nothing
+    );
+    assert_eq!(
+        ContainerDemand::resolve(true, false, false, false, true),
+        Summary
+    );
     // Panel open but the active worktree is not container-backed: no listing.
-    assert_eq!(ContainerDemand::resolve(true, false, false, false), Nothing);
-    assert_eq!(ContainerDemand::resolve(true, true, false, false), Detail);
-    assert_eq!(ContainerDemand::resolve(false, true, false, false), Detail);
+    assert_eq!(
+        ContainerDemand::resolve(true, false, false, false, false),
+        Nothing
+    );
+    assert_eq!(
+        ContainerDemand::resolve(true, true, true, false, false),
+        Detail
+    );
+    assert_eq!(
+        ContainerDemand::resolve(false, true, true, false, false),
+        Detail
+    );
+    // Another monitor tab keeps Containers present at Summary cadence.
+    assert_eq!(
+        ContainerDemand::resolve(false, true, false, false, false),
+        Summary
+    );
+    assert_eq!(
+        ContainerDemand::resolve(true, true, false, false, false),
+        Summary
+    );
+    assert_eq!(
+        ContainerDemand::resolve(false, true, true, false, false),
+        Detail
+    );
     // The Sandbox section body (machine-global rows) needs 5 s, any backend.
-    assert_eq!(ContainerDemand::resolve(true, false, true, false), Detail);
-    assert_eq!(ContainerDemand::resolve(true, false, true, true), Detail);
+    assert_eq!(
+        ContainerDemand::resolve(true, false, false, true, false),
+        Detail
+    );
+    assert_eq!(
+        ContainerDemand::resolve(true, false, false, true, true),
+        Detail
+    );
 }
 
 #[test]
 fn switching_to_an_oci_worktree_with_the_panel_open_lists_promptly() {
     let mut fixture = Fixture::start(&configured());
     // Non-OCI active worktree, panel open: nothing listed.
-    fixture.set_demand(ContainerDemand::resolve(true, false, false, false));
+    fixture.set_demand(ContainerDemand::resolve(true, false, false, false, false));
     fixture.advance_to(35);
     assert!(fixture.observed.lock().unwrap().containers.is_empty());
     // Switch to an OCI-backed worktree: prompt listing on the next slot.
-    fixture.set_demand(ContainerDemand::resolve(true, false, false, true));
+    fixture.set_demand(ContainerDemand::resolve(true, false, false, false, true));
     fixture.advance_to(36);
     assert_eq!(fixture.observed.lock().unwrap().containers, vec![36]);
 }
@@ -379,7 +413,7 @@ fn switching_to_an_oci_worktree_with_the_panel_open_lists_promptly() {
 #[test]
 fn sandbox_section_demand_lists_at_the_detail_cadence() {
     let mut fixture = Fixture::start(&configured());
-    fixture.set_demand(ContainerDemand::resolve(true, false, true, false));
+    fixture.set_demand(ContainerDemand::resolve(true, false, false, true, false));
     fixture.advance_to(11);
     assert_eq!(fixture.observed.lock().unwrap().containers, vec![1, 11]);
 }
@@ -741,4 +775,16 @@ fn refresh_ticker_runs_on_its_named_thread() {
         Some(TICKER_THREAD_NAME)
     );
     fixture.finish();
+}
+
+#[test]
+fn monitor_on_another_tab_lists_at_summary_cadence_until_containers_is_shown() {
+    let mut fixture = Fixture::start(&configured());
+    fixture.set_demand(ContainerDemand::resolve(false, true, false, false, false));
+    fixture.advance_to(11);
+    assert_eq!(fixture.observed.lock().unwrap().containers, vec![1]);
+
+    fixture.set_demand(ContainerDemand::resolve(false, true, true, false, false));
+    fixture.advance_to(12);
+    assert_eq!(fixture.observed.lock().unwrap().containers, vec![1, 12]);
 }
