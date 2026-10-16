@@ -383,8 +383,8 @@ fn container_demand_resolves_from_visible_surfaces() {
         Summary
     );
     assert_eq!(
-        ContainerDemand::resolve(false, true, true, false, false),
-        Detail
+        ContainerDemand::resolve(true, true, false, false, true),
+        Summary
     );
     // The Sandbox section body (machine-global rows) needs 5 s, any backend.
     assert_eq!(
