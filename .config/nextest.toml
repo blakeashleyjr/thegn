@@ -68,3 +68,28 @@ git-subprocess = { max-threads = 6 }
 # Re-add a module here when it starts shelling out to real `git`.
 filter = 'test(/worktree::tests::/) | test(/wizard::tests::worker_/) | test(/git::tests::/) | test(e2e_cargo_real_repo)'
 test-group = 'git-subprocess'
+
+# `just test-windows-wine`: the workspace tests cross-compiled for
+# x86_64-pc-windows-gnu and run under Wine (test/wine-runner.sh). Inherits
+# everything above from `default` (state isolation, timeouts, groups).
+#
+# `default-filter` is the Wine skip list. Every entry is a test that is
+# correct on real Windows (or not yet known to be wrong there) but cannot pass
+# under Wine, with the Wine limitation that causes it. A test that fails
+# because thegn is WRONG on Windows, or because the test itself assumes Linux,
+# does NOT belong here — that is a product bug, tracked as an issue, and
+# hiding it would make this gate lie. A filter that stops matching is silent
+# (see the git-subprocess note above), so prune entries when their test moves.
+#
+# Current entries, all one cause: Wine maps the host's Unix root as drive Z:
+# and resolves `/bin/sh`, `/proc/self/fd` etc. through it, so a test guard of
+# the form `Path::new("/bin/sh").exists()` is TRUE under Wine (it is false on
+# real Windows, where these tests return early and pass). The test then spawns
+# `sh`, which a Windows CreateProcess cannot run. The guards would be better as
+# `cfg!(unix)`; until then they are skipped here, not on real Windows.
+[profile.wine]
+default-filter = '''
+all()
+- (package(thegn-media) & test(/^helper::tests::(completes_and_captures|grandchild_dies_with_the_tree|infinite_stderr_is_capped|infinite_stdout_is_capped|never_exit_times_out_and_is_reaped|cancelling_the_future_kills_the_tree)$/))
+- (package(thegn-metrics) & test(=sample::tests::reaped_tracked_process_is_pruned_and_its_proc_fd_is_released))
+'''

@@ -496,6 +496,14 @@ pub async fn main(
             "raised RLIMIT_NOFILE"
         );
     }
+    let malloc_cap = crate::mem::arena_cap();
+    tracing::info!(
+        target: "thegn::startup",
+        since_start_ms = start.elapsed().as_millis() as u64,
+        malloc_arena_max = malloc_cap.max,
+        malloc_arena_cap_applied = malloc_cap.applied,
+        "malloc arena cap"
+    );
 
     // Arm the in-process sampling profiler (no-op unless built `--features
     // profiling`): SIGUSR2 toggles a flamegraph capture from the live process.
@@ -940,7 +948,8 @@ pub async fn main(
         tokio_mpsc::unbounded_channel::<Result<thegn_core::config::Config, String>>();
 
     let config_waker = waker.clone();
-    std::thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-cfg-watch", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
         if let Some(parent) = config_path.parent() {
             // TRAILING-edge debounce (audit run.rs:744): the notify callback only
             // *signals* an event arrived; a coalescing recv loop below waits for
@@ -1931,7 +1940,8 @@ pub(crate) fn forget_worktree_group(
     // is never blocked by a slow container runtime).
     if !group.path.is_empty() {
         let path = group.path.clone();
-        std::thread::spawn(move || {
+        thegn_core::thread_name::spawn_named("thegn-teardown", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             // De-register the ephemeral VPN node (if any) before its sidecar is
             // removed, unmount any worktree projection (sshfs/sync), then tear
             // down the worktree's containers (which `rm -f`s the `-tgvpn`
@@ -7485,11 +7495,9 @@ async fn event_loop<T: Terminal>(
     // is on. Emits a `thegn::perf` rollup every `report_interval()`.
     let mut loop_perf = crate::perf::LoopPerf::new();
     let perf_interval = crate::perf::report_interval();
-    // Idle-memory bookkeeping: `last_activity` is bumped on every frame that
-    // actually renders; once it ages past the idle threshold a wake hands freed
-    // glibc arena pages back to the OS (throttled via `last_trim`). See `mem`.
+    // Idle-memory trim checks share a process-wide limiter with scan-drain
+    // trims. `last_activity` is bumped on every frame that actually renders.
     let mut last_activity = std::time::Instant::now();
-    let mut last_trim = std::time::Instant::now();
     // Telemetry-panel "Loop" sub-block: while the section is open we force perf
     // accounting on (restoring the prior state on close) and roll up faster so
     // the live graphs move. `perf_was_on` remembers the pre-open state.
@@ -13213,17 +13221,23 @@ async fn event_loop<T: Terminal>(
             loop_perf.tick(crate::perf::WakeSource::Watcher);
             if watched_worktree.as_deref() == Some(path.as_path()) {
                 if let Some(old) = diff_watcher.replace(nw) {
-                    drop(std::thread::spawn(move || {
-                        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                        drop(old);
-                    }));
+                    drop(thegn_core::thread_name::spawn_named(
+                        "thegn-wdrop",
+                        move || {
+                            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                            drop(old);
+                        },
+                    ));
                 }
             } else {
                 // A stale registration can also hold a large inotify set.
-                drop(std::thread::spawn(move || {
-                    crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                    drop(nw);
-                }));
+                drop(thegn_core::thread_name::spawn_named(
+                    "thegn-wdrop",
+                    move || {
+                        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                        drop(nw);
+                    },
+                ));
             }
         }
 
@@ -14530,6 +14544,7 @@ async fn event_loop<T: Terminal>(
         let container_demand_now = crate::hydrate::ContainerDemand::resolve(
             chrome.panel.is_some(),
             monitor.is_some(),
+            monitor.as_ref().is_some_and(|m| m.shows_containers()),
             sandbox_section_now,
             thegn_core::sandbox::Backend::parse(&model.active_sandbox_backend)
                 .is_some_and(|b| b.is_oci()),
@@ -14970,7 +14985,7 @@ async fn event_loop<T: Terminal>(
         {
             toast_wake_armed = Some(at);
             let wk = waker.clone();
-            std::thread::spawn(move || {
+            thegn_core::thread_name::spawn_named("thegn-toast", move || {
                 std::thread::sleep(
                     at.saturating_duration_since(std::time::Instant::now())
                         + std::time::Duration::from_millis(50),
@@ -15041,7 +15056,7 @@ async fn event_loop<T: Terminal>(
             // An idle wake is the right moment to return freed arena pages to
             // the OS (self-throttled; no-op until the loop has been idle a
             // while). Keeps RSS receding after a build/test burst.
-            crate::mem::trim_if_idle(last_activity, &mut last_trim);
+            crate::mem::trim_if_idle(last_activity);
         }
         if should_render {
             // A real frame: the loop is active, so defer any idle trim.

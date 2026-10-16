@@ -29,7 +29,14 @@ fn full_snap() -> StatsSnapshot {
         gpu_temp_c: Some(55.0),
         gpu_power_w: Some(80.0),
         net_bps: Some((5_000, 900)),
-        net_ifaces: vec![("eth0".into(), 5_000, 900)],
+        net_ifaces: vec![thegn_metrics::NetIface {
+            name: "eth0".into(),
+            rx_bps: 5_000,
+            tx_bps: 900,
+            kind: thegn_metrics::IfaceKind::Ethernet,
+            up: Some(true),
+            physical: true,
+        }],
         battery: Some((77, false)),
         battery_power_w: Some(12.5),
         battery_eta_secs: Some(7200),
@@ -42,7 +49,9 @@ fn full_snap() -> StatsSnapshot {
             read_bps: 1024,
             write_bps: 2048,
             kind: thegn_metrics::DiskKind::Ssd,
-        }],
+            extra_mounts: 0,
+        }]
+        .into(),
         temps: vec![("coretemp".into(), 61.0), ("nvme".into(), 44.0)],
         load_avg: Some((1.5, 1.2, 0.9)),
         uptime_secs: Some(90_000),
@@ -416,6 +425,21 @@ fn pausing_reduces_the_sampling_gate_and_closing_clears_it() {
     assert!(!wants_live_stats(false, None));
     // The panel's telemetry section still forces it independently.
     assert!(wants_live_stats(true, None));
+}
+
+#[test]
+fn only_the_containers_tab_shows_containers() {
+    let model = model_with(full_snap());
+    let hist = history(120, NOW_MS);
+    let screen = Rect::full(120, 40);
+    let mut ov = open_tab(MonitorTab::Cpu, &model, &hist, screen);
+    assert!(!ov.shows_containers());
+
+    ov = open_tab(MonitorTab::Containers, &model, &hist, screen);
+    assert!(ov.shows_containers());
+    assert_eq!(ch(&mut ov, ' '), MonitorOutcome::PrefsChanged);
+    assert!(ov.is_paused());
+    assert!(ov.shows_containers());
 }
 
 #[test]
@@ -1860,5 +1884,264 @@ fn process_confirmation_keeps_its_identity_while_ranks_change() {
     // Do not confirm: the fixture validates the target, never sends a signal.
 }
 
+#[test]
+fn disk_volume_row_displays_collapsed_mount_count() {
+    let mut stats = full_snap();
+    let mut disks = stats.disks.to_vec();
+    disks[0].extra_mounts = 42;
+    disks[0].mount = "/var/lib/containers/storage".into();
+    stats.disks = disks.into();
+    let model = model_with(stats);
+    let hist = history(120, NOW_MS);
+    let overlay = open_tab(MonitorTab::Disk, &model, &hist, SHORT);
+    assert!(render_text(&overlay, 100, 30).contains("+42"));
+}
+
+#[test]
+fn memory_tab_distinguishes_available_from_truly_free_memory() {
+    let hist = TelemetryHistory::default();
+    let screen = Rect::full(120, 40);
+    let stats = StatsSnapshot {
+        mem_gib: Some((8.0, 32.0)),
+        mem_free_gib: Some(3.0),
+        ..full_snap()
+    };
+    let model = model_with(stats);
+    let ov = open_tab(MonitorTab::Memory, &model, &hist, screen);
+    let cells = ov
+        .body
+        .iter()
+        .find_map(|section| match section {
+            Section::Grid { cells, .. } => Some(cells),
+            _ => None,
+        })
+        .expect("memory breakdown grid");
+    assert!(
+        cells
+            .iter()
+            .any(|(key, value, _)| key == "available" && value == "24.0G")
+    );
+    assert!(
+        cells
+            .iter()
+            .any(|(key, value, _)| key == "free" && value == "3.0G")
+    );
+    assert!(
+        !cells
+            .iter()
+            .any(|(key, value, _)| key == "free" && value == "24.0G")
+    );
+    let text = render_text(&ov, 120, 40);
+    assert!(text.contains("available"), "{text}");
+    assert!(
+        text.contains("24.0G"),
+        "available must be total minus used: {text}"
+    );
+    assert!(text.contains("free"), "{text}");
+    assert!(
+        text.contains("3.0G"),
+        "free must come from mem_free_gib: {text}"
+    );
+    assert!(
+        text.lines()
+            .all(|line| !(line.contains("free") && line.contains("24.0G"))),
+        "available was mislabeled free: {text}"
+    );
+
+    let stats = StatsSnapshot {
+        mem_gib: Some((8.0, 32.0)),
+        mem_free_gib: None,
+        ..full_snap()
+    };
+    let model = model_with(stats);
+    let ov = open_tab(MonitorTab::Memory, &model, &hist, screen);
+    let text = render_text(&ov, 120, 40);
+    assert!(
+        !text.contains("free"),
+        "unknown free memory must omit that cell: {text}"
+    );
+}
+
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test reaps its harmless child process"
+)]
+fn process_confirmation_refuses_changed_live_process_identity() {
+    use std::process::Command;
+
+    struct FixtureChild(std::process::Child);
+
+    impl Drop for FixtureChild {
+        fn drop(&mut self) {
+            match self.0.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(%error, "could not check monitor fixture before cleanup")
+                }
+            }
+            if let Err(error) = self.0.kill() {
+                tracing::debug!(%error, "could not kill monitor fixture during cleanup");
+            }
+            if let Err(error) = self.0.wait() {
+                tracing::debug!(%error, "could not reap monitor fixture during cleanup");
+            }
+        }
+    }
+
+    let mut child = FixtureChild(
+        Command::new(std::env::current_exe().expect("test executable path"))
+            .args(["--exact", "monitor::tests::identity_sleep_fixture"])
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("THEGN_SIGNAL_IDENTITY_FIXTURE", "1")
+            .spawn()
+            .expect("spawn identity fixture"),
+    );
+    let pid = child.0.id();
+    let start_time = 1;
+    let h = TelemetryHistory::default();
+    let screen = Rect::full(100, 24);
+    let mut m = model_with_n_procs(1);
+    m.procs.procs[0].pid = pid;
+    m.procs.procs[0].start_time = start_time;
+    let mut ov = open_tab(MonitorTab::Procs, &m, &h, screen);
+    ch(&mut ov, 'x');
+    ch(&mut ov, 'y');
+    assert!(ov.status.as_deref().unwrap().contains("process changed"));
+    assert!(ov.last_termed.is_none());
+    assert!(child.0.try_wait().expect("check child status").is_none());
+    child.0.kill().expect("kill fixture child after mismatch");
+    child.0.wait().expect("reap fixture child after mismatch");
+}
+
+#[test]
+fn identity_sleep_fixture() {
+    if std::env::var_os("THEGN_SIGNAL_IDENTITY_FIXTURE").is_some() {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+}
+
 #[path = "monitor_cache_tests.rs"]
 mod invalidation_tests;
+
+#[test]
+fn network_tab_keeps_and_ghosts_idle_and_down_interfaces() {
+    let stats = StatsSnapshot {
+        net_bps: Some((250, 100)),
+        net_bps_all: Some((400, 150)),
+        net_ifaces: vec![
+            thegn_metrics::NetIface {
+                name: "enp95s0".into(),
+                rx_bps: 0,
+                tx_bps: 0,
+                kind: thegn_metrics::IfaceKind::Ethernet,
+                up: Some(false),
+                physical: true,
+            },
+            thegn_metrics::NetIface {
+                name: "wg0".into(),
+                rx_bps: 0,
+                tx_bps: 0,
+                kind: thegn_metrics::IfaceKind::Wireguard,
+                up: Some(true),
+                physical: false,
+            },
+            thegn_metrics::NetIface {
+                name: "wlan0".into(),
+                rx_bps: 250,
+                tx_bps: 100,
+                kind: thegn_metrics::IfaceKind::Wifi,
+                up: Some(true),
+                physical: true,
+            },
+        ],
+        ..Default::default()
+    };
+    let model = model_with(stats);
+    let history = TelemetryHistory::default();
+    let screen = Rect::full(100, 24);
+    let overlay = open_tab(MonitorTab::Network, &model, &history, screen);
+    let table = overlay
+        .body
+        .iter()
+        .find_map(|section| match section {
+            Section::Table(table) => Some(table),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        table.header.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["iface", "kind", "state", "rx", "tx"]
+    );
+    assert_eq!(table.rows.len(), 3);
+    for row in &table.rows[..2] {
+        assert!(
+            row.iter()
+                .all(|cell| cell_tone(cell) == Tok::Slot(S::Ghost))
+        );
+    }
+    assert!(
+        table.rows[2]
+            .iter()
+            .any(|cell| cell_tone(cell) != Tok::Slot(S::Ghost))
+    );
+    assert!(overlay.body.iter().any(|section| matches!(section,
+        Section::Heading { note: Some(note), .. } if note == "3, 1 down"
+    )));
+    assert!(overlay.body.iter().any(|section| matches!(section,
+        Section::KeyVal(values) if values.iter().any(|(key, _, _)| key == "all links")
+    )));
+}
+
+#[test]
+fn gpu_monitor_labels_shared_memory_and_preserves_vram_for_discrete_cards() {
+    fn labels(shared: bool) -> Vec<String> {
+        let hist = history(10, NOW_MS);
+        let mut stats = full_snap();
+        stats.gpu_mem_shared = shared;
+        let model = model_with(stats);
+        let tab = super::build::tab(super::build::TabInput {
+            tab: MonitorTab::Gpu,
+            model: &model,
+            hist: &hist,
+            prefs: TabPrefs::default(),
+            cols: 120,
+            now_ms: NOW_MS,
+            sel: 0,
+            filter: "",
+            filtering: false,
+            tree: false,
+            proc_sort: ProcSort::default(),
+            proc_desc: false,
+            proc_rows: &[],
+            disk_rows: &[],
+            disk_eta: None,
+        });
+        tab.sections
+            .into_iter()
+            .flat_map(|section| match section {
+                crate::sections::Section::Grid { cells, .. } => cells
+                    .into_iter()
+                    .map(|(label, _, _)| label)
+                    .collect::<Vec<_>>(),
+                crate::sections::Section::Sparkrow { label, .. } => vec![label],
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    let shared = labels(true);
+    assert!(shared.contains(&"gpu mem (shared)".to_owned()));
+    assert!(shared.contains(&"gpu mem used".to_owned()));
+    assert!(shared.contains(&"gpu mem".to_owned()));
+    assert!(
+        !shared
+            .iter()
+            .any(|label| label == "vram" || label == "vram used")
+    );
+    let discrete = labels(false);
+    assert!(discrete.contains(&"vram".to_owned()));
+    assert!(discrete.contains(&"vram used".to_owned()));
+}

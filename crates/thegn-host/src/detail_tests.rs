@@ -1073,7 +1073,24 @@ fn model_full() -> FrameModel {
             gpu_temp_c: Some(55.0),
             gpu_power_w: Some(60.0),
             net_bps: Some((1024, 2048)),
-            net_ifaces: vec![("eth0".into(), 1024, 2048), ("wlan0".into(), 512, 256)],
+            net_ifaces: vec![
+                thegn_metrics::NetIface {
+                    name: "eth0".into(),
+                    rx_bps: 1024,
+                    tx_bps: 2048,
+                    kind: thegn_metrics::IfaceKind::Ethernet,
+                    up: Some(true),
+                    physical: true,
+                },
+                thegn_metrics::NetIface {
+                    name: "wlan0".into(),
+                    rx_bps: 512,
+                    tx_bps: 256,
+                    kind: thegn_metrics::IfaceKind::Wifi,
+                    up: Some(true),
+                    physical: true,
+                },
+            ],
             battery: Some((72, false)),
             battery_power_w: Some(12.5),
             disks: vec![
@@ -1084,6 +1101,7 @@ fn model_full() -> FrameModel {
                     read_bps: 1_500_000,
                     write_bps: 200_000,
                     kind: thegn_metrics::DiskKind::Ssd,
+                    extra_mounts: 0,
                 },
                 thegn_metrics::DiskInfo {
                     name: "sda1".into(),
@@ -1092,8 +1110,10 @@ fn model_full() -> FrameModel {
                     read_bps: 0,
                     write_bps: 0,
                     kind: thegn_metrics::DiskKind::Hdd,
+                    extra_mounts: 0,
                 },
-            ],
+            ]
+            .into(),
             ..Default::default()
         },
         ..Default::default()
@@ -2081,4 +2101,37 @@ fn the_agenda_hit_test_still_finds_the_agenda() {
         Some(calendar::layout::CalHit::AgendaRow(0)),
         "a click on the agenda's first row still selects that event"
     );
+}
+
+#[test]
+fn memory_popup_breakdown_has_available_then_optional_free() {
+    let model = FrameModel {
+        stats: thegn_metrics::StatsSnapshot {
+            mem_gib: Some((8.0, 32.0)),
+            mem_free_gib: Some(3.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let hist = TelemetryHistory::default();
+    let ov = open_detail_for(
+        &BarItemId::Widget("mem".into()),
+        item_at(0),
+        &model,
+        &StatusCtx::new_for_test(&hist),
+    )
+    .expect("memory widget has a detail view");
+    let DetailContent::Sections(detail) = &ov.content else {
+        panic!("expected sectioned memory popup");
+    };
+    let rows = detail
+        .sections
+        .iter()
+        .find_map(|section| match section {
+            Section::KeyVal(rows) => Some(rows),
+            _ => None,
+        })
+        .expect("memory breakdown");
+    let keys: Vec<&str> = rows.iter().map(|(key, _, _)| key.as_str()).collect();
+    assert_eq!(keys, ["used", "total", "available", "free"]);
 }

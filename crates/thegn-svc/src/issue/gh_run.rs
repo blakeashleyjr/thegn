@@ -230,7 +230,7 @@ where
     let stderr = child.stderr.take();
     let (tx, rx) = mpsc::channel::<ReaderMessage<T>>();
     let tx_out = tx.clone();
-    std::thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-gh-out", move || {
         let result = match stdout {
             Some(mut stream) => {
                 let value = consume(&mut stream);
@@ -244,7 +244,7 @@ where
             tracing::debug!("gh stdout reader detached: run already gave up");
         }
     });
-    std::thread::spawn(move || {
+    thegn_core::thread_name::spawn_named("thegn-gh-err", move || {
         let result = match stderr {
             Some(stream) => read_capped_result(stream, limits.max_stderr),
             None => Err("stderr pipe was not available".to_owned()),

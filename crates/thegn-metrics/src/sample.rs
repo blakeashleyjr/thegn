@@ -6,17 +6,18 @@
 
 use std::time::Instant;
 
+#[cfg(not(target_os = "linux"))]
+use sysinfo::Disks;
 use sysinfo::{
-    Components, CpuRefreshKind, Disks, MemoryRefreshKind, Networks, Pid, ProcessRefreshKind,
-    ProcessesToUpdate, RefreshKind, System,
+    Components, MemoryRefreshKind, Networks, Pid, ProcessRefreshKind, ProcessesToUpdate,
+    RefreshKind, System,
 };
 
+#[cfg(not(target_os = "linux"))]
+use crate::DiskKind;
 use crate::gpu_monitor::GpuMonitor;
 use crate::thermal::ThermalProbe;
-use crate::{
-    ChildGroup, DiskInfo, DiskKind, NetMedium, StatsSnapshot, disk_space, read_battery,
-    read_battery_power,
-};
+use crate::{ChildGroup, DiskInfo, NetMedium, StatsSnapshot, disk_space};
 
 /// Refresh the slow tier (frequency / temperatures / disks) once every N
 /// samples. At the host's default ~1s cadence that is roughly every 5s — these
@@ -49,16 +50,22 @@ impl SystemInfo {
 pub struct StatsSampler {
     sys: System,
     nets: Networks,
+    #[cfg(not(target_os = "linux"))]
     disks: Disks,
+    #[cfg(target_os = "linux")]
+    disk_aggregate: crate::disk_aggregate::DiskAggregate,
     comps: Components,
     gpu: GpuMonitor,
     /// How temperatures are read. `Components` on Linux/Intel; the Apple-vendor
     /// HID sensors on Apple silicon, where `Components` is empty.
     thermal: ThermalProbe,
+    battery: crate::battery::BatteryReader,
     disk_path: std::path::PathBuf,
     tick: u64,
     /// CPU usage needs a delta; the first sample only primes it.
     cpu_primed: bool,
+    cpu_freq: crate::cpu_freq::CpuFreqProbe,
+    last_cpu_freq: Option<u64>,
     /// This process's PID — always watched for the daemon/status modal.
     self_pid: Pid,
     /// The pane-daemon's PID once the host resolves it (`None` = unknown).
@@ -75,27 +82,21 @@ pub struct StatsSampler {
     /// When the network counters were last read (for bytes/sec).
     prev_net: Instant,
     /// When disk IO counters were last read (for bytes/sec).
+    #[cfg(not(target_os = "linux"))]
     prev_disk: Instant,
     /// Previous `pgsteal_direct` reading and when, for the direct-reclaim RATE.
     /// `None` until the first sample — a monotonic counter cannot yield a rate
     /// without a predecessor, and reporting the raw total would be meaningless.
     prev_reclaim: Option<(u64, Instant)>,
+    vmstat: crate::vmstat::VmstatReader,
     /// Cached slow-tier results, reused between refreshes.
-    last_disks: Vec<DiskInfo>,
+    last_disks: std::sync::Arc<[DiskInfo]>,
+    #[cfg(not(target_os = "linux"))]
+    last_disk_io: Option<(u64, u64)>,
     last_temps: Vec<(String, f32)>,
     last_net_medium: NetMedium,
-}
-
-/// `pgsteal_direct` from `/proc/vmstat` — pages reclaimed synchronously since
-/// boot. `None` off Linux, or if the field is absent (it has moved between
-/// kernel versions, so a missing field degrades to "not observed" rather than
-/// to zero).
-#[cfg(target_os = "linux")]
-fn read_pgsteal_direct() -> Option<u64> {
-    let s = std::fs::read_to_string("/proc/vmstat").ok()?;
-    s.lines()
-        .find_map(|l| l.strip_prefix("pgsteal_direct "))
-        .and_then(|v| v.trim().parse().ok())
+    net_classes: std::collections::BTreeMap<String, crate::net_kind::IfaceClass>,
+    net_up: std::collections::BTreeMap<String, bool>,
 }
 
 /// Parse Linux `/proc/net/route`, returning every interface tied for the
@@ -128,58 +129,45 @@ pub(crate) fn parse_default_route(contents: &str) -> Vec<String> {
 
 #[cfg(target_os = "linux")]
 pub fn probe_net_path() -> crate::MediumSelection {
-    use crate::{IfaceFact, MediumSelection, NetMedium, select_medium_explained};
-    use std::collections::BTreeSet;
-    use std::path::Path;
+    let mut cache = std::collections::BTreeMap::new();
+    probe_net_links(&mut cache).0
+}
 
-    let routes = match std::fs::read_to_string("/proc/net/route") {
-        Ok(text) => parse_default_route(&text),
-        Err(_) => return MediumSelection::probe_unavailable(),
-    };
-    let mut names = BTreeSet::new();
-    if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
-        for entry in entries.flatten() {
-            names.insert(entry.file_name().to_string_lossy().into_owned());
+#[cfg(target_os = "linux")]
+fn probe_net_links(
+    cache: &mut std::collections::BTreeMap<String, crate::net_kind::IfaceClass>,
+) -> (
+    crate::MediumSelection,
+    std::collections::BTreeMap<String, bool>,
+) {
+    match std::fs::read_to_string("/proc/net/route") {
+        Ok(routes) => {
+            let routes = parse_default_route(&routes);
+            crate::net_kind::probe_links_at(std::path::Path::new("/sys/class/net"), &routes, cache)
         }
+        Err(_) => (
+            crate::MediumSelection::probe_unavailable(),
+            std::collections::BTreeMap::new(),
+        ),
     }
-    names.extend(routes.iter().cloned());
+}
 
-    let facts = names
-        .into_iter()
-        .map(|name| {
-            let root = Path::new("/sys/class/net").join(&name);
-            let medium = if root.join("wireless").exists() || root.join("phy80211").exists() {
-                NetMedium::Wifi
-            } else if std::fs::read_to_string(root.join("type"))
-                .is_ok_and(|kind| kind.trim() == "1")
-                && root.join("device").exists()
-            {
-                NetMedium::Ethernet
-            } else {
-                NetMedium::Unknown
-            };
-            let up = std::fs::read_to_string(root.join("operstate"))
-                .is_ok_and(|state| state.trim() == "up");
-            IfaceFact {
-                default_route: routes.iter().any(|route| route == &name),
-                name,
-                medium,
-                up,
-            }
-        })
-        .collect::<Vec<_>>();
-    select_medium_explained(&facts)
+#[cfg(not(target_os = "linux"))]
+fn probe_net_links(
+    _cache: &mut std::collections::BTreeMap<String, crate::net_kind::IfaceClass>,
+) -> (
+    crate::MediumSelection,
+    std::collections::BTreeMap<String, bool>,
+) {
+    (
+        crate::MediumSelection::probe_unavailable(),
+        std::collections::BTreeMap::new(),
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn probe_net_path() -> crate::MediumSelection {
     crate::MediumSelection::probe_unavailable()
-}
-
-/// No `/proc/vmstat` here; the metric is reported as unobserved.
-#[cfg(not(target_os = "linux"))]
-fn read_pgsteal_direct() -> Option<u64> {
-    None
 }
 
 impl StatsSampler {
@@ -189,30 +177,46 @@ impl StatsSampler {
         // Only the subsystems we read; processes are deliberately excluded.
         let sys = System::new_with_specifics(
             RefreshKind::nothing()
-                .with_cpu(CpuRefreshKind::nothing().with_cpu_usage().with_frequency())
+                .with_cpu(crate::cpu_freq::cpu_refresh_kind())
                 .with_memory(MemoryRefreshKind::everything()),
         );
         let now = Instant::now();
         StatsSampler {
             sys,
             nets: Networks::new_with_refreshed_list(),
+            #[cfg(not(target_os = "linux"))]
             disks: Disks::new_with_refreshed_list(),
+            #[cfg(target_os = "linux")]
+            disk_aggregate: crate::disk_aggregate::DiskAggregate::new(),
             comps: Components::new_with_refreshed_list(),
             gpu: GpuMonitor::new(),
             thermal: ThermalProbe::probe(),
+            battery: crate::battery::BatteryReader::new(std::path::PathBuf::from(
+                "/sys/class/power_supply",
+            )),
             disk_path,
             tick: 0,
             cpu_primed: false,
+            cpu_freq: crate::cpu_freq::CpuFreqProbe::discover(std::path::Path::new(
+                "/sys/devices/system/cpu",
+            )),
+            last_cpu_freq: None,
             self_pid: Pid::from_u32(std::process::id()),
             daemon_pid: None,
             proc_primed: false,
             tracked: Vec::new(),
             prev_net: now,
+            #[cfg(not(target_os = "linux"))]
             prev_disk: now,
             prev_reclaim: None,
-            last_disks: Vec::new(),
+            vmstat: crate::vmstat::VmstatReader::new(),
+            last_disks: std::sync::Arc::from([]),
+            #[cfg(not(target_os = "linux"))]
+            last_disk_io: None,
             last_temps: Vec::new(),
             last_net_medium: NetMedium::Unknown,
+            net_classes: std::collections::BTreeMap::new(),
+            net_up: std::collections::BTreeMap::new(),
         }
     }
 
@@ -253,6 +257,9 @@ impl StatsSampler {
         let slow = self.tick.is_multiple_of(SLOW_EVERY);
 
         // --- CPU (every tick; needs a delta, so the first sample primes it) ---
+        if slow {
+            self.last_cpu_freq = self.cpu_freq.read_mhz(&mut self.sys);
+        }
         self.sys.refresh_cpu_usage();
         if self.cpu_primed {
             snap.cpu_pct = Some(pct_u8(self.sys.global_cpu_usage()));
@@ -262,19 +269,10 @@ impl StatsSampler {
                 .iter()
                 .map(|c| pct_u8(c.cpu_usage()))
                 .collect();
-            let freqs: Vec<u64> = self
-                .sys
-                .cpus()
-                .iter()
-                .map(|c| c.frequency())
-                .filter(|f| *f > 0)
-                .collect();
-            if !freqs.is_empty() {
-                snap.cpu_freq_mhz = Some(freqs.iter().sum::<u64>() / freqs.len() as u64);
-            }
         } else {
             self.cpu_primed = true;
         }
+        snap.cpu_freq_mhz = self.last_cpu_freq;
 
         // --- Memory + swap (every tick) ---
         self.sys.refresh_memory();
@@ -282,6 +280,7 @@ impl StatsSampler {
         let total = self.sys.total_memory();
         if total > 0 {
             snap.mem_gib = Some((gib(self.sys.used_memory()), gib(total)));
+            snap.mem_free_gib = Some(gib(self.sys.free_memory()));
         }
         let swap_total = self.sys.total_swap();
         if swap_total > 0 {
@@ -294,7 +293,7 @@ impl StatsSampler {
         // monotonic since boot. The first sample only primes: no predecessor
         // means no rate, and an absent signal must stay absent rather than
         // become a comfortable zero.
-        if let Some(cur) = read_pgsteal_direct() {
+        if let Some(cur) = self.vmstat.pgsteal_direct() {
             if let Some((prev, at)) = self.prev_reclaim {
                 let dt = now.duration_since(at).as_secs_f32().max(0.001);
                 snap.reclaim_per_s = Some(cur.saturating_sub(prev) as f32 / dt);
@@ -306,21 +305,27 @@ impl StatsSampler {
         self.nets.refresh(false);
         let dt_net = now.duration_since(self.prev_net).as_secs_f64().max(0.001);
         self.prev_net = now;
-        let mut sum_rx = 0u64;
-        let mut sum_tx = 0u64;
-        for (name, data) in self.nets.iter() {
-            if name == "lo" || name.starts_with("lo") {
-                continue;
-            }
-            let rx = (data.received() as f64 / dt_net) as u64;
-            let tx = (data.transmitted() as f64 / dt_net) as u64;
-            sum_rx += rx;
-            sum_tx += tx;
-            if rx > 0 || tx > 0 {
-                snap.net_ifaces.push((name.to_string(), rx, tx));
-            }
+        #[cfg(target_os = "linux")]
+        if self.net_classes.is_empty() {
+            let (network, up) = probe_net_links(&mut self.net_classes);
+            self.last_net_medium = network.medium;
+            self.net_up = up;
         }
-        snap.net_bps = Some((sum_rx, sum_tx));
+        let (ifaces, physical, all) = crate::net_kind::aggregate(
+            self.nets.iter().map(|(name, data)| {
+                (
+                    name.as_str(),
+                    (data.received() as f64 / dt_net) as u64,
+                    (data.transmitted() as f64 / dt_net) as u64,
+                )
+            }),
+            &self.net_classes,
+            &self.net_up,
+            cfg!(target_os = "linux"),
+        );
+        snap.net_ifaces = ifaces;
+        snap.net_bps = Some(physical);
+        snap.net_bps_all = Some(all);
 
         // --- Battery + GPU + disk-free ---
         // Battery and disk-free are cheap file reads every tick. GPU depends on
@@ -332,12 +337,14 @@ impl StatsSampler {
         // shared ticker. (The
         // subprocess cost predates macOS: the nvidia arm has always spawned one
         // per tick.)
-        let psu = std::path::Path::new("/sys/class/power_supply");
-        snap.battery = read_battery(psu);
-        (snap.battery_power_w, snap.battery_eta_secs) = read_battery_power(psu);
+        let battery = self.battery.sample(now);
+        snap.battery = battery.battery;
+        snap.battery_power_w = battery.power_w;
+        snap.battery_eta_secs = battery.eta_secs;
         let gpu = self.gpu.sample(slow);
         snap.gpu_pct = gpu.util_pct;
         snap.gpu_mem_mib = gpu.mem_mib;
+        snap.gpu_mem_shared = gpu.mem_shared;
         snap.gpu_temp_c = gpu.temp_c;
         snap.gpu_power_w = gpu.power_w;
         if let Some((total, avail, pct)) = disk_space(&self.disk_path) {
@@ -347,7 +354,9 @@ impl StatsSampler {
 
         // --- Slow tier (every SLOW_EVERY-th tick): frequency, temps, disks ---
         if slow {
-            self.last_net_medium = probe_net_path().medium;
+            let (network, up) = probe_net_links(&mut self.net_classes);
+            self.last_net_medium = network.medium;
+            self.net_up = up;
             // Apple silicon publishes no SMC components, so `Components` comes
             // back empty there and the temperature row silently vanished. Ask
             // whichever backend the probe selected; `Components` stays the
@@ -367,36 +376,64 @@ impl StatsSampler {
                 }
             };
 
+            #[cfg(not(target_os = "linux"))]
             let dt_disk = now.duration_since(self.prev_disk).as_secs_f64().max(0.001);
-            self.prev_disk = now;
-            self.disks.refresh(false);
-            self.last_disks = self
-                .disks
-                .iter()
-                .map(|d| {
-                    let total = d.total_space();
-                    let free_pct = if total > 0 {
-                        ((d.available_space() as f64 / total as f64) * 100.0).round() as u8
-                    } else {
-                        0
-                    };
-                    let usage = d.usage();
-                    DiskInfo {
-                        name: d.name().to_string_lossy().into_owned(),
-                        mount: d.mount_point().to_string_lossy().into_owned(),
-                        free_pct: free_pct.min(100),
-                        read_bps: (usage.read_bytes as f64 / dt_disk) as u64,
-                        write_bps: (usage.written_bytes as f64 / dt_disk) as u64,
-                        kind: match d.kind() {
-                            sysinfo::DiskKind::HDD => DiskKind::Hdd,
-                            sysinfo::DiskKind::SSD => DiskKind::Ssd,
-                            _ => DiskKind::Unknown,
-                        },
-                    }
-                })
-                .collect();
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.prev_disk = now;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.disks.refresh(false);
+                self.last_disks = crate::disk_aggregate::dedupe_by_name(
+                    self.disks
+                        .iter()
+                        .map(|d| {
+                            let total = d.total_space();
+                            let free_pct = if total > 0 {
+                                ((d.available_space() as f64 / total as f64) * 100.0).round() as u8
+                            } else {
+                                0
+                            };
+                            let usage = d.usage();
+                            DiskInfo {
+                                name: d.name().to_string_lossy().into_owned(),
+                                mount: d.mount_point().to_string_lossy().into_owned(),
+                                free_pct: free_pct.min(100),
+                                read_bps: (usage.read_bytes as f64 / dt_disk) as u64,
+                                write_bps: (usage.written_bytes as f64 / dt_disk) as u64,
+                                kind: match d.kind() {
+                                    sysinfo::DiskKind::HDD => DiskKind::Hdd,
+                                    sysinfo::DiskKind::SSD => DiskKind::Ssd,
+                                    _ => DiskKind::Unknown,
+                                },
+                                extra_mounts: 0,
+                            }
+                        })
+                        .collect(),
+                )
+                .into();
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.last_disk_io = if self.last_disks.is_empty() {
+                    None
+                } else {
+                    Some(self.last_disks.iter().fold((0u64, 0u64), |(r, w), d| {
+                        (r.saturating_add(d.read_bps), w.saturating_add(d.write_bps))
+                    }))
+                };
+            }
         }
-        snap.disks = self.last_disks.clone();
+        #[cfg(target_os = "linux")]
+        {
+            (snap.disk_io, self.last_disks) = self.disk_aggregate.sample(slow, now);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            snap.disk_io = self.last_disk_io;
+        }
+        snap.disks = std::sync::Arc::clone(&self.last_disks);
         snap.net_medium = self.last_net_medium;
         snap.temps = self.last_temps.clone();
         snap.cpu_temp_c = cpu_temp(&snap.temps);
@@ -707,10 +744,10 @@ mod tests {
         // This exercises sysinfo's Linux /proc handle cache. Other platforms
         // have no /proc fd links to inspect, and the targeted refresh behavior
         // is already covered by the platform-independent sampler tests.
-        let fd_dir = std::path::Path::new("/proc/self/fd");
-        if !fd_dir.is_dir() {
+        if !cfg!(target_os = "linux") {
             return;
         }
+        let fd_dir = std::path::Path::new("/proc/self/fd");
 
         let mut child = ChildGuard(
             std::process::Command::new("sh")
@@ -810,7 +847,7 @@ mod tests {
 
     #[test]
     fn tracked_refresh_skips_tasks_but_keeps_cpu_and_memory() {
-        if !std::path::Path::new("/proc/self/task").exists() {
+        if !cfg!(target_os = "linux") {
             return;
         }
 

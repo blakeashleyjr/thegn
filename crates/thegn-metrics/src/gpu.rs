@@ -1,24 +1,26 @@
 //! GPU utilization — the one metric sysinfo does not provide. Linux exposes it
-//! via sysfs (`amdgpu`/`i915`: `gpu_busy_percent`) or `nvidia-smi`; macOS via
+//! via sysfs (`amdgpu`: `gpu_busy_percent`) or `nvidia-smi`; macOS via
 //! IOKit accelerator statistics, read with `ioreg` (no root, unlike
 //! `powermetrics`). Where none of those answer, the monitor
 //! ([`crate::gpu_monitor`]) reports no reading and the widget hides — the same behaviour as a Linux box
 //! with no detectable GPU.
 //!
-//! Utilization is the only field every backend fills. VRAM comes from sysfs and
-//! nvidia-smi; temperature and power only from nvidia-smi. macOS reports
-//! utilization alone: unified memory means there is no VRAM to speak of, and
-//! temperature/power need root.
+//! Utilization is the only field every backend fills. Memory comes from sysfs
+//! and `nvidia-smi`; AMD sysfs and NVIDIA also expose temperature and power.
+//! macOS reports utilization alone: unified memory means there is no VRAM to
+//! speak of, and temperature/power need root.
 
 /// A GPU sample: utilization plus the extras a richer detail popup shows. Every
-/// field is `Option` — a backend fills what it can (sysfs util is universal;
+/// field is `Option` — a backend fills what it can (sysfs util is available;
 /// VRAM/temp/power depend on the vendor path) and the rest render as absent.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct GpuReading {
     /// Utilization 0–100.
     pub util_pct: Option<u8>,
-    /// (used, total) VRAM in MiB.
+    /// (used, total) GPU memory in MiB; APUs include both VRAM and GTT.
     pub mem_mib: Option<(u64, u64)>,
+    /// Memory includes both VRAM and GTT because this is an APU.
+    pub mem_shared: bool,
     /// Core temperature in °C.
     pub temp_c: Option<f32>,
     /// Board power draw in watts.
@@ -34,45 +36,6 @@ pub(crate) const NVIDIA_QUERY_ARGS: [&str; 2] = [
     "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
     "--format=csv,noheader,nounits",
 ];
-
-/// The amdgpu/i915 `gpu_busy_percent` file, if any card exposes one. Two
-/// directory reads, no subprocess — safe on the caller's thread.
-pub(crate) fn find_sysfs() -> Option<std::path::PathBuf> {
-    let cards = std::fs::read_dir("/sys/class/drm").ok()?;
-    cards
-        .flatten()
-        .map(|c| c.path().join("device/gpu_busy_percent"))
-        .find(|p| p.is_file())
-}
-
-/// Read a sample from sysfs: a handful of cheap file reads.
-pub(crate) fn read_sysfs(path: &std::path::Path) -> GpuReading {
-    let util_pct = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|v| v.trim().parse::<u8>().ok());
-    // VRAM counters live beside gpu_busy_percent in the device dir, in bytes;
-    // convert to MiB. temp/power would need hwmon walking, which sysfs lays out
-    // inconsistently, so leave them absent.
-    let dev = path.parent();
-    let vram = |name: &str| -> Option<u64> {
-        let d = dev?;
-        std::fs::read_to_string(d.join(name))
-            .ok()?
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .map(|b| b / (1024 * 1024))
-    };
-    let mem_mib = match (vram("mem_info_vram_used"), vram("mem_info_vram_total")) {
-        (Some(u), Some(t)) if t > 0 => Some((u, t)),
-        _ => None,
-    };
-    GpuReading {
-        util_pct,
-        mem_mib,
-        ..Default::default()
-    }
-}
 
 /// Parse `Device Utilization %` out of `ioreg -c IOAccelerator` output.
 ///
@@ -132,6 +95,7 @@ pub(crate) fn parse_nvidia(out: &str) -> Option<GpuReading> {
     Some(GpuReading {
         util_pct: Some(util_pct),
         mem_mib,
+        mem_shared: false,
         temp_c: f32f(3),
         power_w: f32f(4),
     })

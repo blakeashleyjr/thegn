@@ -16,6 +16,9 @@
 //! A test that mutates an env var but forgets to restore it leaks process-global
 //! state into every test that runs afterward; the guard makes that impossible.
 
+use crate::sandbox_backend::{HostOs, host_os};
+use std::path::{Path, PathBuf};
+
 #[cfg(any(test, feature = "test-utils"))]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -137,9 +140,146 @@ impl Drop for EnvGuard {
     }
 }
 
+/// A temporary directory reached through a symlink, for path tests that need
+/// the spelling supplied by a caller to differ from the kernel's resolved path.
+#[cfg(any(test, feature = "test-utils"))]
+pub struct SymlinkedTempDir {
+    _temp: tempfile::TempDir,
+    link: PathBuf,
+    real: PathBuf,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl SymlinkedTempDir {
+    pub fn path(&self) -> &Path {
+        &self.link
+    }
+
+    pub fn real_path(&self) -> &Path {
+        &self.real
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn symlinked_tempdir() -> SymlinkedTempDir {
+    let temp = tempfile::tempdir().expect("temporary symlink fixture");
+    let real = temp.path().join("real");
+    std::fs::create_dir(&real).expect("create real fixture directory");
+    let link = if cfg!(unix) {
+        let link = temp.path().join("link");
+        symlink_directory(&real, &link).expect("create symlink fixture");
+        Some(link)
+    } else {
+        None
+    };
+    let real = std::fs::canonicalize(real).expect("canonicalize fixture directory");
+    let link = link.unwrap_or_else(|| real.clone());
+    SymlinkedTempDir {
+        _temp: temp,
+        link,
+        real,
+    }
+}
+
+#[cfg(all(unix, any(test, feature = "test-utils")))]
+fn symlink_directory(real: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(real, link)
+}
+
+#[cfg(all(not(unix), any(test, feature = "test-utils")))]
+fn symlink_directory(_real: &Path, _link: &Path) -> std::io::Result<()> {
+    // std has no portable unprivileged directory-symlink API.
+    Ok(())
+}
+
+/// Environment pairs that the given OS's home/config/state resolvers read.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn state_env_for(os: HostOs, root: &Path) -> Vec<(&'static str, PathBuf)> {
+    match os {
+        HostOs::Windows => vec![
+            ("USERPROFILE", root.to_path_buf()),
+            ("APPDATA", root.join("AppData").join("Roaming")),
+            ("LOCALAPPDATA", root.join("AppData").join("Local")),
+        ],
+        _ => vec![
+            ("HOME", root.to_path_buf()),
+            ("XDG_CONFIG_HOME", root.join(".config")),
+            ("XDG_STATE_HOME", root.join(".local/state")),
+        ],
+    }
+}
+
+/// Union of environment pairs needed to isolate either supported resolver arm.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn state_env_all(root: &Path) -> Vec<(&'static str, PathBuf)> {
+    vec![
+        ("HOME", root.to_path_buf()),
+        ("XDG_CONFIG_HOME", root.join(".config")),
+        ("XDG_STATE_HOME", root.join(".local/state")),
+        ("USERPROFILE", root.to_path_buf()),
+        ("APPDATA", root.join("AppData").join("Roaming")),
+        ("LOCALAPPDATA", root.join("AppData").join("Local")),
+    ]
+}
+
+/// Private filesystem roots and environment for a test that writes state.
+#[cfg(any(test, feature = "test-utils"))]
+pub struct IsolatedState {
+    _env: EnvGuard,
+    temp: tempfile::TempDir,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl IsolatedState {
+    pub fn new() -> Self {
+        let temp = tempfile::tempdir().expect("private isolated state dir");
+        crate::fsperm::restrict_dir_to_owner(temp.path()).expect("restrict isolated state dir");
+        let mut vars = state_env_all(temp.path());
+        vars.push(("THEGN_DIR", temp.path().join(".thegn")));
+        let strings: Vec<_> = vars
+            .iter()
+            .map(|(key, value)| (*key, value.to_str().expect("state path is UTF-8")))
+            .collect();
+        let env = EnvGuard::set(&strings);
+        Self { _env: env, temp }
+    }
+
+    pub fn root(&self) -> &Path {
+        self.temp.path()
+    }
+
+    pub fn state_home(&self) -> PathBuf {
+        let state = crate::util::xdg_state_home();
+        let expected = match host_os() {
+            HostOs::Windows => self.root().join("AppData").join("Local"),
+            _ => self.root().join(".local/state"),
+        };
+        debug_assert_eq!(state, expected);
+        state
+    }
+
+    pub fn config_home(&self) -> PathBuf {
+        crate::util::xdg_config_home()
+    }
+
+    pub fn thegn_dir(&self) -> PathBuf {
+        self.root().join(".thegn")
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl Default for IsolatedState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ambient_roots_from, is_real_state_path};
+    use super::{
+        IsolatedState, ambient_roots_from, is_real_state_path, state_env_for, symlinked_tempdir,
+    };
+    use crate::sandbox_backend::HostOs;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
@@ -234,5 +374,61 @@ mod tests {
         let path = temp.path().join("other/thegn.db");
 
         assert!(!is_real_state_path(&path, Path::new("/h"), &[]));
+    }
+
+    #[test]
+    fn symlinked_tempdir_exposes_link_and_kernel_paths() {
+        let temp = symlinked_tempdir();
+        let file = temp.path().join("written-through-link");
+        std::fs::write(&file, "fixture").unwrap();
+        assert_eq!(
+            std::fs::read(temp.real_path().join("written-through-link")).unwrap(),
+            b"fixture"
+        );
+        if cfg!(unix) {
+            assert_ne!(temp.path(), temp.real_path());
+            assert_eq!(
+                std::fs::canonicalize(temp.path()).unwrap(),
+                temp.real_path()
+            );
+            let built = temp.path().join("written-through-link");
+            let canonicalized = std::fs::canonicalize(&file).unwrap();
+            assert!(!canonicalized.starts_with(temp.path()));
+            assert!(!built.starts_with(temp.real_path()));
+        } else {
+            assert_eq!(temp.path(), temp.real_path());
+            assert_eq!(
+                std::fs::canonicalize(temp.path()).unwrap(),
+                temp.real_path()
+            );
+        }
+    }
+
+    #[test]
+    fn state_environment_isolates_every_os_resolver() {
+        let root = Path::new("/isolated/state-root");
+        for os in [HostOs::Linux, HostOs::MacOs, HostOs::Windows, HostOs::Other] {
+            let values: Vec<_> = state_env_for(os, root)
+                .into_iter()
+                .map(|(key, value)| (key, value.into_os_string()))
+                .collect();
+            let lookup = |key: &str| {
+                values
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| value.clone())
+            };
+            assert!(crate::util::home_for(os, &lookup).starts_with(root));
+            assert!(crate::util::xdg_config_home_for(os, &lookup).starts_with(root));
+            assert!(crate::util::xdg_state_home_for(os, &lookup).starts_with(root));
+        }
+    }
+
+    #[test]
+    fn isolated_state_sets_all_state_roots() {
+        let state = IsolatedState::new();
+        assert!(state.state_home().starts_with(state.root()));
+        assert!(state.config_home().starts_with(state.root()));
+        assert!(state.thegn_dir().starts_with(state.root()));
     }
 }

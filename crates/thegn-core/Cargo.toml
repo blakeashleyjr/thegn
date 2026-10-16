@@ -8,7 +8,7 @@ license.workspace = true
 description = "thegn substrate-agnostic core: state, git, sandbox, config, theme"
 
 [features]
-test-utils = []
+test-utils = ["dep:tempfile"]
 
 # `cfg(kani)` (the `#[cfg(kani)]` proof module in `termcaps.rs`, run via
 # `just verify-kani`) is declared as a known cfg in the workspace lints.
@@ -31,6 +31,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 toml.workspace = true
+tempfile = { workspace = true, optional = true }
 url.workspace = true
 # Comment/format-preserving config authoring (config_write.rs): the write half of
 # `thegn env create` / `config set`, so the setup UI edits config.toml in place

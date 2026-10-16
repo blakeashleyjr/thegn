@@ -2,7 +2,9 @@
 //! `termcaps.rs` and the `sandbox*` family are platform *tables* by design and
 //! are excluded; everything else pins in `test/platform-cfg-core-ratchet.txt`.
 
-use crate::test_support::ratchet::{file_ratchet, has_platform_cfg};
+use crate::test_support::ratchet::{
+    file_ratchet, has_platform_cfg, sets_state_env_directly, state_env_test_body,
+};
 
 #[test]
 fn platform_cfgs_are_pinned() {
@@ -35,5 +37,32 @@ fn host_key_literals_stay_in_the_chokepoint() {
          (UserDeclared / ManagedFresh / LoopbackTunneled / SandboxBootstrap) and \
          let it build the `-o` args. Do not write a StrictHostKeyChecking / \
          UserKnownHostsFile / HostKeyAlias literal at a call site.",
+    );
+}
+
+#[test]
+fn state_env_ratchet_tracks_direct_test_environment_writes() {
+    file_ratchet(
+        env!("CARGO_MANIFEST_DIR"),
+        "state-env-core-ratchet.txt",
+        &["testenv.rs", "test_support/ratchet.rs"],
+        |key, body| state_env_test_body(key, body).is_some_and(sets_state_env_directly),
+        "Tests that mutate HOME/XDG or Windows user-state variables should use \
+         testenv::IsolatedState and state_env_for so isolation works on every OS.",
+    );
+}
+
+#[test]
+fn threads_are_named_ratchet() {
+    file_ratchet(
+        env!("CARGO_MANIFEST_DIR"),
+        "thread-name-core-ratchet.txt",
+        &[],
+        |key, body| {
+            !crate::test_support::thread_spawn::is_test_module_file(key)
+                && crate::test_support::thread_spawn::spawns_unnamed_thread(body)
+        },
+        "Name production threads with `crate::thread_name::spawn_named` so their \
+         task comm identifies their role. Keep the allowlist empty.",
     );
 }

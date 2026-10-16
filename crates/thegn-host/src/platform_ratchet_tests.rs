@@ -3,7 +3,9 @@
 //! two render chokepoints. Each allowlist under `test/` is shrink-only and
 //! explains its rule in its header.
 
-use thegn_core::test_support::ratchet::{file_ratchet, has_platform_cfg};
+use thegn_core::test_support::ratchet::{
+    file_ratchet, has_platform_cfg, sets_state_env_directly, state_env_test_body,
+};
 
 const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
 
@@ -78,11 +80,52 @@ fn long_lived_threads_declare_a_qos_class() {
         "thread-qos-ratchet.txt",
         // qos.rs itself spawns threads in its own tests.
         &["platform/"],
-        |_, body| body.contains("thread::Builder::new()") && !body.contains("qos::set_self"),
+        |_, body| undeclared_named_thread(body),
         "A named long-lived thread must declare its scheduler class with \
          `crate::platform::qos::set_self(...)` as the first statement in its \
          body (CLAUDE.md; see platform/qos.rs). Add the declaration, or — with \
          a written reason on its line — pin the file.",
+    );
+}
+
+fn undeclared_named_thread(body: &str) -> bool {
+    (body.contains("thread::Builder::new()") || body.contains("spawn_named("))
+        && !body.contains("qos::set_self")
+}
+
+#[test]
+fn undeclared_named_thread_covers_builders_and_spawn_named() {
+    let cases = [
+        ("thread::Builder::new()", true),
+        ("spawn_named(\"thegn-x\", f)", true),
+        (
+            "thread::Builder::new(); qos::set_self(Qos::Background)",
+            false,
+        ),
+        (
+            "spawn_named(\"thegn-x\", f); qos::set_self(Qos::Background)",
+            false,
+        ),
+    ];
+
+    for (body, expected) in cases {
+        assert_eq!(undeclared_named_thread(body), expected, "{body}");
+    }
+}
+
+#[test]
+fn threads_are_named_ratchet() {
+    file_ratchet(
+        MANIFEST,
+        "thread-name-host-ratchet.txt",
+        // proc_workload_alloc.rs is compiled only from main.rs's cfg(test) module (line 209).
+        &["proc_workload_alloc.rs"],
+        |key, body| {
+            !thegn_core::test_support::thread_spawn::is_test_module_file(key)
+                && thegn_core::test_support::thread_spawn::spawns_unnamed_thread(body)
+        },
+        "Name production threads with `thegn_core::thread_name::spawn_named`. \
+         Each allowlist entry needs a QoS decision alongside its name.",
     );
 }
 
@@ -98,5 +141,17 @@ fn glyph_literals_go_through_active_glyphs() {
         "Box-drawing and block glyphs must come from `caps::active_glyphs()` so \
          the ASCII fallback (`[theme] glyphs = ascii`, non-UTF-8 locales) still \
          renders. Use the GlyphSet field instead of the literal.",
+    );
+}
+
+#[test]
+fn state_env_ratchet_tracks_direct_test_environment_writes() {
+    file_ratchet(
+        MANIFEST,
+        "state-env-host-ratchet.txt",
+        &["testenv.rs", "test_support/ratchet.rs"],
+        |key, body| state_env_test_body(key, body).is_some_and(sets_state_env_directly),
+        "Tests that mutate HOME/XDG or Windows user-state variables should use \
+         testenv::IsolatedState and state_env_for so isolation works on every OS.",
     );
 }
