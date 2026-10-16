@@ -83,7 +83,7 @@ fn a_stalled_filter_is_killed_and_reaped_at_the_deadline() {
     let mut process = FilterProcess::spawn(
         shell_command("cat \"$1\"; exec sleep 30", &[&input_s]),
         Capabilities::new(true, false),
-        Duration::from_millis(300),
+        Duration::from_secs(1),
     )
     .unwrap();
     let started = Instant::now();

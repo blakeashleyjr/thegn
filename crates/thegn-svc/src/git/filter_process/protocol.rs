@@ -343,10 +343,10 @@ impl FilterClient {
 fn read_status_list<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, ProtocolError> {
     let mut status = None;
     while let Some(line) = read_line(reader)? {
-        if let Some(value) = line.strip_prefix(b"status=") {
-            if status.replace(value.to_vec()).is_some() {
-                return Err(ProtocolError::Protocol("duplicate status".into()));
-            }
+        if let Some(value) = line.strip_prefix(b"status=")
+            && status.replace(value.to_vec()).is_some()
+        {
+            return Err(ProtocolError::Protocol("duplicate status".into()));
         }
     }
     Ok(status)
@@ -375,7 +375,14 @@ mod tests {
     fn handshake_bytes_are_exact_and_never_request_delay() {
         let (result, written) = client(&[SERVER, CAPS].concat(), Capabilities::new(true, true));
         assert!(result.is_ok());
-        assert_eq!(written, b"0016git-filter-client\n000eversion=2\n00000015capability=clean\n0016capability=smudge\n0000");
+        assert_eq!(
+            written,
+            [
+                b"0016git-filter-client\n000eversion=2\n".as_slice(),
+                b"00000015capability=clean\n0016capability=smudge\n0000",
+            ]
+            .concat()
+        );
         assert!(
             !written
                 .windows(b"capability=delay".len())
@@ -393,7 +400,7 @@ mod tests {
     #[test]
     fn handshake_rejects_wrong_welcome_version_extra_version_and_missing_flush() {
         for server in [
-            b"0010not-a-server\n000eversion=2\n0000".as_slice(),
+            b"0011not-a-server\n000eversion=2\n0000".as_slice(),
             b"0016git-filter-server\n000eversion=3\n0000".as_slice(),
             b"0016git-filter-server\n000eversion=2\n000eversion=2\n0000".as_slice(),
             b"0016git-filter-server\n000eversion=2\n".as_slice(),
@@ -415,7 +422,7 @@ mod tests {
 
     #[test]
     fn clean_round_trip_writes_exact_request_and_reads_response() {
-        let response = b"0013status=success\n0009HELLO00000000";
+        let response = b"0013status=success\n00000009HELLO00000000";
         let (client, _) = client(
             &full_server(b"0015capability=clean\n0000", response),
             Capabilities::new(true, false),
@@ -444,7 +451,7 @@ mod tests {
 
     #[test]
     fn empty_content_and_empty_success_output_are_valid() {
-        let response = b"0013status=success\n00000000";
+        let response = b"0013status=success\n000000000000";
         let (client, _) = client(
             &full_server(b"0015capability=clean\n0000", response),
             Capabilities::new(true, false),
@@ -458,7 +465,7 @@ mod tests {
                 .unwrap(),
             Outcome::Success(Vec::new())
         );
-        assert_eq!(writer, b"0012command=clean\n000epathname=x\n00000000");
+        assert_eq!(writer, b"0012command=clean\n000fpathname=x\n00000000");
     }
 
     #[test]
@@ -469,7 +476,7 @@ mod tests {
         );
         let mut client = client.unwrap();
         let content = vec![b'x'; MAX_PKT_DATA + 3];
-        let mut reader = Cursor::new(b"0013status=error\n0000".to_vec());
+        let mut reader = Cursor::new(b"0011status=error\n0000".to_vec());
         let mut writer = Vec::new();
         assert_eq!(
             client
@@ -478,7 +485,7 @@ mod tests {
             Outcome::Error
         );
         assert_eq!(
-            &writer[writer.len() - (MAX_PKT_DATA + 3 + 16)..writer.len() - 4],
+            &writer[writer.len() - (MAX_PKT_DATA + 3 + 12)..writer.len() - 4],
             &[b"fff0".as_slice(), &vec![b'x'; MAX_PKT_DATA], b"0007xxx"].concat()
         );
         assert!(write_pkt(&mut Vec::new(), &vec![b'x'; MAX_PKT_DATA + 1]).is_err());
@@ -500,7 +507,7 @@ mod tests {
             Outcome::Error
         );
         let mut after =
-            Cursor::new(b"0013status=success\n0007abc00000011status=error\n0000".to_vec());
+            Cursor::new(b"0013status=success\n00000007abc00000011status=error\n0000".to_vec());
         assert_eq!(
             client
                 .request(&mut after, &mut writer, Command::Clean, "x", &[], 10)
@@ -530,7 +537,7 @@ mod tests {
             Outcome::Abort
         );
         assert_eq!(writer.len(), previous);
-        let mut smudge_response = Cursor::new(b"0013status=success\n00000000".to_vec());
+        let mut smudge_response = Cursor::new(b"0013status=success\n000000000000".to_vec());
         assert_eq!(
             client
                 .request(
@@ -587,7 +594,7 @@ mod tests {
         );
         let mut client = client.unwrap();
         let mut reader =
-            Cursor::new(b"000bfoo=bar\n0013status=success\n0009HELLO00000000".to_vec());
+            Cursor::new(b"000cfoo=bar\n0013status=success\n00000009HELLO00000000".to_vec());
         let mut writer = Vec::new();
         assert!(matches!(
             client.request(&mut reader, &mut writer, Command::Clean, "x", &[], 4),
@@ -621,9 +628,11 @@ mod tests {
         ] {
             assert!(read_pkt(&mut Cursor::new(bytes)).is_err());
         }
-        assert!(
-            matches!(read_pkt(&mut Cursor::new(b"0007ab")), Err(error) if error.kind() == io::ErrorKind::UnexpectedEof)
-        );
+        let truncated = b"0007ab";
+        assert!(matches!(
+            read_pkt(&mut Cursor::new(truncated)),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
         assert_eq!(
             read_pkt(&mut Cursor::new(b"0007ABc")).unwrap(),
             Pkt::Data(b"ABc".to_vec())
