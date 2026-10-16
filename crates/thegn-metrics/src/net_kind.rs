@@ -50,6 +50,7 @@ pub struct NetIface {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 pub(crate) struct IfaceClass {
     pub kind: IfaceKind,
     pub bond_slave: bool,
@@ -57,6 +58,7 @@ pub(crate) struct IfaceClass {
     pub medium: NetMedium,
 }
 
+#[cfg_attr(not(any(test, target_os = "linux")), expect(dead_code))]
 pub(crate) fn classify_at(root: &Path, name: &str) -> IfaceClass {
     let iface = root.join(name);
     let kind_text = std::fs::read_to_string(iface.join("type")).unwrap_or_default();
@@ -107,6 +109,7 @@ pub(crate) fn classify_at(root: &Path, name: &str) -> IfaceClass {
     }
 }
 
+#[cfg_attr(not(any(test, target_os = "linux")), expect(dead_code))]
 pub(crate) fn link_state_at(root: &Path, name: &str) -> (bool, bool) {
     let iface = root.join(name);
     let operstate = std::fs::read_to_string(iface.join("operstate")).unwrap_or_default();
@@ -124,12 +127,12 @@ pub(crate) fn link_state_at(root: &Path, name: &str) -> (bool, bool) {
     )
 }
 
+#[cfg_attr(not(any(test, target_os = "linux")), expect(dead_code))]
 pub(crate) fn probe_links_at(
     root: &Path,
-    route_text: &str,
+    routes: &[String],
     cache: &mut BTreeMap<String, IfaceClass>,
 ) -> (MediumSelection, BTreeMap<String, bool>) {
-    let routes = crate::sample::parse_default_route(route_text);
     let mut available = BTreeSet::new();
     if let Ok(entries) = std::fs::read_dir(root) {
         available.extend(
@@ -190,6 +193,7 @@ pub(crate) fn aggregate<'a>(
                     class.kind,
                     IfaceKind::Ethernet | IfaceKind::Wifi | IfaceKind::Other | IfaceKind::Bond
                 ) && !class.bond_slave
+                    && up.get(name) != Some(&false)
             })
         };
         if is_physical {
@@ -210,6 +214,7 @@ pub(crate) fn aggregate<'a>(
         });
     }
     rows.sort_by(|left, right| left.name.cmp(&right.name));
+    // Down links carry no traffic; if every physical link is down, the fallback still reports all links.
     if classified && !rows.iter().any(|row| row.physical) {
         physical = all;
     }
@@ -257,7 +262,8 @@ mod tests {
         iface(root, "enp95s0", "1", "", "down", "0x1003");
         std::fs::create_dir(root.join("enp95s0/device")).unwrap();
         iface(root, "lo", "772", "", "unknown", "0x9");
-        let (selection, up) = probe_links_at(root, &route("wlan0"), &mut BTreeMap::new());
+        let routes = crate::sample::parse_default_route(&route("wlan0"));
+        let (selection, up) = probe_links_at(root, &routes, &mut BTreeMap::new());
         assert_eq!(selection.medium, NetMedium::Wifi);
         let mut classes = BTreeMap::new();
         for name in ["wlan0", "wg0-mullvad", "enp95s0", "lo"] {
@@ -277,7 +283,7 @@ mod tests {
         );
         assert_eq!(
             rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
-            ["enp95s0", "wlan0", "wg0-mullvad"]
+            ["enp95s0", "wg0-mullvad", "wlan0"]
         );
         assert_eq!(
             rows.iter()
@@ -347,6 +353,22 @@ mod tests {
         assert!(!fallback_rows[0].physical);
         assert_eq!(fallback, fallback_all);
         assert_eq!(fallback, (7, 8));
+
+        let netns_root = tempfile::tempdir().unwrap();
+        let root = netns_root.path();
+        iface(root, "eth0", "1", "", "up", "0x1003");
+        let classes = BTreeMap::from([("eth0".to_owned(), classify_at(root, "eth0"))]);
+        assert_eq!(classes["eth0"].kind, IfaceKind::Unknown);
+        assert!(!classes["eth0"].has_device);
+        let (netns_rows, netns_physical, netns_all) = aggregate(
+            [("eth0", 9, 12)].into_iter(),
+            &classes,
+            &BTreeMap::from([("eth0".to_owned(), true)]),
+            true,
+        );
+        assert!(!netns_rows[0].physical);
+        assert_eq!(netns_physical, netns_all);
+        assert_eq!(netns_physical, (9, 12));
     }
 
     #[test]
@@ -358,23 +380,25 @@ mod tests {
         std::fs::create_dir(root.join("wlan0/wireless")).unwrap();
         iface(root, "wg0", "65534", "wireguard", "unknown", "0x1091");
         let mut cache = BTreeMap::new();
-        let (wifi, up) = probe_links_at(root, &route("wlan0"), &mut cache);
+        let routes = crate::sample::parse_default_route(&route("wlan0"));
+        let (wifi, up) = probe_links_at(root, &routes, &mut cache);
         assert_eq!(wifi.reason, crate::MediumReason::DefaultRoute);
         assert_eq!(wifi.medium, NetMedium::Wifi);
         assert!(up["wg0"]);
-        let wg = probe_links_at(root, &route("wg0"), &mut cache).0;
+        let routes = crate::sample::parse_default_route(&route("wg0"));
+        let wg = probe_links_at(root, &routes, &mut cache).0;
         assert_eq!(wg.reason, crate::MediumReason::DefaultRouteNotPhysical);
         std::fs::remove_dir_all(root.join("wlan0/wireless")).unwrap();
+        let routes = crate::sample::parse_default_route(&route("wlan0"));
         assert_eq!(
-            probe_links_at(root, &route("wlan0"), &mut cache).0.medium,
+            probe_links_at(root, &routes, &mut cache).0.medium,
             NetMedium::Wifi
         );
         std::fs::remove_dir_all(root.join("wlan0")).unwrap();
-        probe_links_at(
-            root,
+        let routes = crate::sample::parse_default_route(
             "Iface Destination Gateway Flags RefCnt Use Metric Mask\n",
-            &mut cache,
         );
+        probe_links_at(root, &routes, &mut cache);
         assert!(!cache.contains_key("wlan0"));
     }
 
