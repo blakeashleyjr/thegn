@@ -437,6 +437,7 @@ fn failed_conflict_write_falls_back_to_gate_error_and_stops_drain() {
                 Ok(AttemptOutcome::Conflict {
                     paths: vec!["src/a.rs".into()],
                     submodule_conflicts: Vec::new(),
+                    driver_refusal: None,
                 })
             },
             floor: |_: &str| panic!("notify-only"),
@@ -553,6 +554,7 @@ fn actual_conflict_paths_are_separate_from_submodule_context() {
                     ours_sha: "abc123".into(),
                     theirs_sha: "def456".into(),
                 }],
+                driver_refusal: None,
             }),
             attempts,
         );
@@ -681,6 +683,7 @@ fn infrastructure_hold_stops_after_one_attempt_and_admission_without_spending_bu
                 Ok(AttemptOutcome::Conflict {
                     paths: vec!["a.rs".into()],
                     submodule_conflicts: vec![],
+                    driver_refusal: None,
                 })
             },
             floor: |_worktree: &str| {
@@ -738,6 +741,7 @@ fn remote_and_unparseable_locations_hold_before_local_fixer_dispatch() {
                     Ok(AttemptOutcome::Conflict {
                         paths: vec!["conflict.rs".into()],
                         submodule_conflicts: vec![],
+                        driver_refusal: None,
                     })
                 },
                 floor: |worktree: &str| panic!("remote identifier reached local floor: {worktree}"),
@@ -791,6 +795,7 @@ fn remote_identifier_collision_leaves_local_directory_untouched() {
                 Ok(AttemptOutcome::Conflict {
                     paths: vec!["conflict.rs".into()],
                     submodule_conflicts: vec![],
+                    driver_refusal: None,
                 })
             },
             floor: |path: &str| panic!("remote identifier reached local floor: {path}"),
@@ -1033,6 +1038,7 @@ impl RetryFailure {
             Self::Conflict => AttemptOutcome::Conflict {
                 paths: vec!["src/conflict.rs".into(), "second.txt".into()],
                 submodule_conflicts: vec![],
+                driver_refusal: None,
             },
             Self::RedGate => AttemptOutcome::GateFailed {
                 log: "private-red-gate: compilation failed".into(),
@@ -1400,4 +1406,45 @@ fn gate_error_never_admits_agent_and_next_item_still_reaches_ready() {
     assert_eq!(fixture.row("next").result_oid.as_deref(), Some(READY_OID));
     fixture.close();
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn driver_refusal_goes_to_needs_human_without_the_agent() {
+    let fixture = AuditFixture::new(&[("refused", 0)]);
+    let cfg = MergeQueueConfig {
+        agent_max_attempts: 2,
+        ..agent_config()
+    };
+    let mut observed = Vec::new();
+    let mut panel = crate::panel::PanelData::default();
+    let out = drive_queue_with(
+        &cfg,
+        &Config::default(),
+        fixture.root.path(),
+        &fixture.db,
+        vec![fixture.item("refused")],
+        |step| fixture.progress(step, &mut panel, &mut observed),
+        DriveActions {
+            attempt: |_branch: &str, _location: &thegn_core::remote::GitLoc| {
+                Ok(AttemptOutcome::Conflict {
+                    paths: vec!["data.txt".into()],
+                    submodule_conflicts: Vec::new(),
+                    driver_refusal: Some("custom merge driver not run by folds: data.txt (merge=takeours); resolve by hand".into()),
+                })
+            },
+            floor: |_worktree: &str| panic!("a driver refusal must not admit the agent"),
+            runner: unexpected_runner,
+        },
+    );
+    assert_eq!(out.needs_human, ["refused"]);
+    let saved = fixture.row("refused");
+    assert_eq!(saved.status, "needs_human");
+    assert_eq!(saved.agent_attempts, 0);
+    assert!(
+        saved
+            .error_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("merge=takeours"))
+    );
+    fixture.close();
 }
