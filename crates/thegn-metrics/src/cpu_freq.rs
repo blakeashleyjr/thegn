@@ -127,7 +127,7 @@ impl CpuFreqProbe {
 
 #[cfg(test)]
 mod tests {
-    use super::{CpuFreqProbe, mean_mhz, parse_khz};
+    use super::{mean_mhz, parse_khz};
 
     #[test]
     fn parse_khz_handles_valid_and_invalid_sysfs_values() {
@@ -146,7 +146,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     mod linux {
-        use super::CpuFreqProbe;
+        use crate::cpu_freq::CpuFreqProbe;
         use std::fs;
         use std::path::Path;
         use tempfile::tempdir;
