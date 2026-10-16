@@ -44,6 +44,8 @@ use thegn_core::config::Config;
 const QUEUE_COMMANDS: usize = 64;
 const MAX_CHUNK_BYTES: usize = 16 * 1024;
 pub(super) const FINISH_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const LATE_TIMEOUT_REASON: &str =
+    "recording finalization timed out; writer may still be flushing";
 const GLOBAL_INFLIGHT_BYTES: usize = 8 * 1024 * 1024;
 
 static RECORDING_INFLIGHT: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
@@ -53,7 +55,7 @@ fn next_generation() -> u64 {
     NEXT_RECORDING_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
-type LateCompletion = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Finished>>>>;
+type LateCompletion = Arc<Mutex<Option<tokio::sync::mpsc::WeakUnboundedSender<Finished>>>>;
 
 fn global_inflight() -> Arc<AtomicUsize> {
     Arc::clone(RECORDING_INFLIGHT.get_or_init(|| Arc::new(AtomicUsize::new(0))))
@@ -498,24 +500,11 @@ impl Recorder {
     fn wait_finished(mut self, timeout: Duration) -> Finished {
         let outcome = self.result.recv_timeout(timeout);
         match outcome {
-            Ok(mut finished) => {
-                if self
-                    .worker
-                    .take()
-                    .is_some_and(|worker| worker.join().is_err())
-                    && finished.truncated.is_none()
-                {
-                    finished.truncated = Some("recording writer panicked".to_string());
-                }
-                finished.dropped_bytes = finished
-                    .dropped_bytes
-                    .max(self.state.dropped_bytes.load(Ordering::Acquire));
-                finished
-            }
+            Ok(finished) => self.settle(finished),
             Err(error) => {
                 drop(self.worker.take()); // worker keeps its file and finishes independently
                 let reason = if matches!(error, mpsc::RecvTimeoutError::Timeout) {
-                    "recording finalization timed out; writer may still be flushing"
+                    "recording finish deadline elapsed; writer may still be flushing"
                 } else {
                     "recording writer stopped without a completion result"
                 };
@@ -529,6 +518,21 @@ impl Recorder {
                 }
             }
         }
+    }
+
+    fn settle(&mut self, mut finished: Finished) -> Finished {
+        if self
+            .worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err())
+            && finished.truncated.is_none()
+        {
+            finished.truncated = Some("recording writer panicked".to_string());
+        }
+        finished.dropped_bytes = finished
+            .dropped_bytes
+            .max(self.state.dropped_bytes.load(Ordering::Acquire));
+        finished
     }
 
     /// Close admission immediately and perform the bounded wait away from the
@@ -554,53 +558,31 @@ impl Recorder {
         timeout: Duration,
     ) {
         match self.result.recv_timeout(timeout) {
-            Ok(mut finished) => {
-                if self
-                    .worker
-                    .take()
-                    .is_some_and(|worker| worker.join().is_err())
-                    && finished.truncated.is_none()
-                {
-                    finished.truncated = Some("recording writer panicked".to_string());
-                }
-                finished.dropped_bytes = finished
-                    .dropped_bytes
-                    .max(self.state.dropped_bytes.load(Ordering::Acquire));
-                send_completion(&completed, finished);
+            Ok(finished) => {
+                send_completion(&completed, self.settle(finished));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let timeout_result = self.timeout_finished();
                 let mut late = match self.late.lock() {
                     Ok(slot) => slot,
                     Err(error) => {
                         tracing::debug!(target: "thegn::daemon", "recording late-completion slot poisoned: {error}");
-                        send_completion(&completed, timeout_result);
+                        send_completion(&completed, self.worker_stopped_finished());
                         return;
                     }
                 };
                 match self.result.try_recv() {
-                    Ok(mut finished) => {
-                        if self
-                            .worker
-                            .take()
-                            .is_some_and(|worker| worker.join().is_err())
-                            && finished.truncated.is_none()
-                        {
-                            finished.truncated = Some("recording writer panicked".to_string());
-                        }
-                        finished.dropped_bytes = finished
-                            .dropped_bytes
-                            .max(self.state.dropped_bytes.load(Ordering::Acquire));
-                        send_completion(&completed, finished);
+                    Ok(finished) => {
+                        drop(late);
+                        send_completion(&completed, self.settle(finished));
                     }
                     Err(mpsc::TryRecvError::Empty) => {
                         // Publish timeout first while holding the slot lock. The
                         // worker cannot select the late route until this send.
-                        send_completion(&completed, timeout_result);
-                        *late = Some(completed);
+                        send_completion(&completed, self.timeout_finished());
+                        *late = Some(completed.downgrade());
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        send_completion(&completed, timeout_result);
+                        send_completion(&completed, self.worker_stopped_finished());
                     }
                 }
                 drop(late);
@@ -616,9 +598,7 @@ impl Recorder {
         Finished {
             path: self.path.clone(),
             capped: self.state.capped(),
-            truncated: Some(
-                "recording finalization timed out; writer may still be flushing".to_string(),
-            ),
+            truncated: Some(LATE_TIMEOUT_REASON.to_string()),
             dropped_bytes: self.state.dropped_bytes.load(Ordering::Acquire),
             generation: self.generation,
             late: false,
@@ -667,8 +647,18 @@ fn dispatch_finished(
     };
     if let Some(completed) = slot.as_ref() {
         finished.late = true;
-        if let Err(error) = completed.send(finished) {
-            tracing::debug!(target: "thegn::daemon", "recording late-completion receiver dropped: {error}");
+        if let Some(completed) = completed.upgrade() {
+            if let Err(error) = completed.send(finished) {
+                tracing::debug!(target: "thegn::daemon", "recording late-completion receiver dropped: {error}");
+            }
+        } else {
+            tracing::debug!(
+                target: "thegn::daemon",
+                generation = finished.generation,
+                path = %finished.path.display(),
+                truncated = ?finished.truncated,
+                "recording actor is gone; late completion is logged only"
+            );
         }
     } else if let Err(error) = result_tx.send(finished) {
         tracing::debug!(target: "thegn::daemon", "recording completion receiver dropped: {error}");
@@ -1465,5 +1455,45 @@ mod tests {
         let text = std::fs::read_to_string(&fin.path).unwrap();
         let header: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         assert_eq!(header["version"], 2);
+    }
+
+    #[test]
+    fn late_completion_slot_does_not_keep_actor_mailbox_alive() {
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let late: LateCompletion = Arc::new(Mutex::new(Some(completed_tx.downgrade())));
+        let weak = late
+            .lock()
+            .expect("late slot lock")
+            .as_ref()
+            .expect("late sender")
+            .clone();
+        drop(completed_tx);
+
+        let (result_tx, result_rx) = mpsc::channel();
+        dispatch_finished(
+            Finished {
+                path: PathBuf::from("late.cast"),
+                capped: false,
+                truncated: None,
+                dropped_bytes: 0,
+                generation: 1,
+                late: false,
+            },
+            &result_tx,
+            &late,
+        );
+
+        assert!(
+            weak.upgrade().is_none(),
+            "the late slot must not own the actor mailbox"
+        );
+        assert!(matches!(
+            completed_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
     }
 }
