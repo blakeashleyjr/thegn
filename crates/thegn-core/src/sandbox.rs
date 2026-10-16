@@ -2276,25 +2276,12 @@ pub fn ensure_attested(
     if let Some(compose) = launchable.compose_spec() {
         return crate::sandbox_compose::up_and_verify(launchable, &compose, guard);
     }
-    ensure_noncompose(spec)?;
+    ensure_noncompose(launchable)?;
     Ok(crate::sandbox_compose::EnsureReport::default())
 }
 
 fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
-    let spec = &*launchable(spec).map_err(anyhow::Error::new)?;
     if !spec.backend.is_oci() {
-        return Ok(());
-    }
-
-    if let Some(compose) = spec.compose_spec() {
-        // `docker compose -f … -p <name> up -d [service runServices…]`. The
-        // project name is the sandbox name, so the pane's `compose exec` (see
-        // `enter_argv`) targets the same project.
-        crate::sandbox_compose::up_and_verify(
-            spec,
-            &compose,
-            &crate::sandbox_compose::ComposeGuard::for_host(&[]),
-        )?;
         return Ok(());
     }
 
