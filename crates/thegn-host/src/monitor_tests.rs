@@ -1868,21 +1868,37 @@ fn process_confirmation_keeps_its_identity_while_ranks_change() {
 fn process_confirmation_refuses_changed_live_process_identity() {
     use std::process::Command;
 
-    let mut child = Command::new(std::env::current_exe().expect("test executable path"))
-        .args(["--exact", "monitor_tests::identity_sleep_fixture"])
-        .env("THEGN_SIGNAL_IDENTITY_FIXTURE", "1")
-        .spawn()
-        .expect("spawn identity fixture");
-    let pid = child.id();
-    let mut sampler = thegn_metrics::ProcSampler::new(usize::MAX);
-    let start_time = sampler
-        .sample()
-        .procs
-        .into_iter()
-        .find(|row| row.pid == pid)
-        .expect("fixture child appears in sample")
-        .start_time
-        .saturating_add(1);
+    struct FixtureChild(std::process::Child);
+
+    impl Drop for FixtureChild {
+        fn drop(&mut self) {
+            match self.0.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(%error, "could not check monitor fixture before cleanup")
+                }
+            }
+            if let Err(error) = self.0.kill() {
+                tracing::debug!(%error, "could not kill monitor fixture during cleanup");
+            }
+            if let Err(error) = self.0.wait() {
+                tracing::debug!(%error, "could not reap monitor fixture during cleanup");
+            }
+        }
+    }
+
+    let mut child = FixtureChild(
+        Command::new(std::env::current_exe().expect("test executable path"))
+            .args(["--exact", "monitor::tests::identity_sleep_fixture"])
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("THEGN_SIGNAL_IDENTITY_FIXTURE", "1")
+            .spawn()
+            .expect("spawn identity fixture"),
+    );
+    let pid = child.0.id();
+    let start_time = 1;
     let h = TelemetryHistory::default();
     let screen = Rect::full(100, 24);
     let mut m = model_with_n_procs(1);
@@ -1893,9 +1909,9 @@ fn process_confirmation_refuses_changed_live_process_identity() {
     ch(&mut ov, 'y');
     assert!(ov.status.as_deref().unwrap().contains("process changed"));
     assert!(ov.last_termed.is_none());
-    assert!(child.try_wait().expect("check child status").is_none());
-    child.kill().expect("kill fixture child after mismatch");
-    child.wait().expect("reap fixture child after mismatch");
+    assert!(child.0.try_wait().expect("check child status").is_none());
+    child.0.kill().expect("kill fixture child after mismatch");
+    child.0.wait().expect("reap fixture child after mismatch");
 }
 
 #[test]
