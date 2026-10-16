@@ -337,7 +337,7 @@ fn plugin_example_block_agrees_with_the_schema() {
     for (table, key) in ILLUSTRATIVE_PLUGIN_VALUES {
         assert!(
             matches!(*table, "plugins" | "plugins.contributions"),
-            "stale illustrative plugin table {table}.{key}"
+            "stale illustrative table {table}.{key}; allowed: plugins, plugins.contributions"
         );
     }
 
