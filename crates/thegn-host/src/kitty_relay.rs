@@ -69,26 +69,41 @@ pub enum Piece {
     Rejected,
 }
 
-/// Merge the frame's queued graphics sequences into one OOB blob. A single
-/// sequence (the common video case, up to several MiB) is moved through with
-/// no copy; several are concatenated into one exactly-sized allocation.
-pub(crate) fn coalesce_gfx(mut seqs: Vec<Vec<u8>>) -> Vec<u8> {
-    if seqs.len() == 1 {
-        return seqs.pop().unwrap_or_default();
+/// Merge the newest suffix of complete graphics sequences that fits the OOB
+/// budget. A single sequence is moved without copying; several are joined into
+/// one exactly-sized allocation. Sequences are never split.
+pub(crate) fn coalesce_gfx_within(mut seqs: Vec<Vec<u8>>, limit: usize) -> (Vec<u8>, bool) {
+    let mut kept_bytes = 0usize;
+    let mut kept_start = seqs.len();
+    for (index, seq) in seqs.iter().enumerate().rev() {
+        let Some(total) = kept_bytes.checked_add(seq.len()) else {
+            break;
+        };
+        if seq.len() > limit || total > limit {
+            break;
+        }
+        kept_bytes = total;
+        kept_start = index;
     }
-    let total = seqs.iter().map(Vec::len).sum();
-    let mut blob = Vec::with_capacity(total);
-    for g in &seqs {
-        blob.extend_from_slice(g);
+    let truncated = kept_start != 0;
+    if kept_start == seqs.len() {
+        return (Vec::new(), truncated);
     }
-    blob
+    if kept_start + 1 == seqs.len() {
+        return (seqs.pop().unwrap_or_default(), truncated);
+    }
+    let mut blob = Vec::with_capacity(kept_bytes);
+    for seq in &seqs[kept_start..] {
+        blob.extend_from_slice(seq);
+    }
+    (blob, truncated)
 }
 
 /// Hard limit on a complete APC, including introducer and ST. Oversize APCs
 /// are discarded through their terminator; their tail is never ordinary text.
 const MAX_APC_BYTES: usize = 4 * 1024 * 1024;
-/// Leave room for the CUP prefix added by `pty_drain` so an admitted logical
-/// transfer always fits the writer's 4 MiB OOB message ceiling.
+/// Leave room for the CUP prefix added by `pty_drain` so every emitted display
+/// unit, single- or multi-chunk, always fits the writer's 4 MiB OOB ceiling.
 const MAX_TRANSFER_BYTES: usize = MAX_APC_BYTES - 64;
 const MAX_TRANSFER_CHUNKS: usize = 4096;
 /// Text is emitted incrementally even when the caller supplies a huge slice.
@@ -401,7 +416,11 @@ impl KittyRelay {
             }
             Piece::GfxDisplay(bytes) => {
                 self.drop_transfer(reservation, &mut None);
-                emit(Piece::GfxDisplay(bytes));
+                if bytes.len() > MAX_TRANSFER_BYTES {
+                    emit(Piece::Rejected);
+                } else {
+                    emit(Piece::GfxDisplay(bytes));
+                }
             }
             Piece::Rejected => {
                 self.drop_transfer(None, &mut None);
@@ -1063,15 +1082,74 @@ pub fn outer_supports_kitty_graphics() -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn coalesce_gfx_moves_single_and_sizes_multi_exactly() {
+    fn coalesce_gfx_within_keeps_newest_whole_suffix_under_limit() {
         let one = vec![1u8, 2, 3];
         let ptr = one.as_ptr();
-        let out = super::coalesce_gfx(vec![one]);
+        let (out, truncated) = super::coalesce_gfx_within(vec![one], 3);
         assert_eq!(out.as_ptr(), ptr, "single sequence must not be copied");
-        let out = super::coalesce_gfx(vec![vec![1, 2], vec![3], vec![4, 5]]);
-        assert_eq!(out, [1, 2, 3, 4, 5]);
-        assert_eq!(out.capacity(), 5, "one exactly-sized allocation");
-        assert!(super::coalesce_gfx(Vec::new()).is_empty());
+        assert!(!truncated);
+
+        let (out, truncated) = super::coalesce_gfx_within(vec![vec![1], vec![2, 3], vec![4]], 8);
+        assert_eq!(out, [1, 2, 3, 4]);
+        assert_eq!(out.capacity(), 4, "one exactly-sized allocation");
+        assert!(!truncated);
+
+        let (out, truncated) = super::coalesce_gfx_within(vec![vec![7; 3], vec![8; 3]], 4);
+        assert_eq!(out, [8; 3]);
+        assert!(truncated);
+
+        let (out, truncated) = super::coalesce_gfx_within(vec![vec![1; 5]], 4);
+        assert!(out.is_empty());
+        assert!(truncated);
+
+        let cases = [
+            (
+                vec![vec![1], vec![2, 3], vec![4, 5, 6]],
+                16,
+                vec![1, 2, 3, 4, 5, 6],
+            ),
+            (
+                vec![vec![1, 2], vec![3], vec![4, 5]],
+                5,
+                vec![1, 2, 3, 4, 5],
+            ),
+            (
+                vec![vec![1, 2], vec![3, 4], vec![5, 6]],
+                4,
+                vec![3, 4, 5, 6],
+            ),
+            (vec![vec![1], vec![2, 3], vec![4, 5]], 3, vec![4, 5]),
+            (vec![vec![1, 2, 3]], 2, vec![]),
+        ];
+        for (units, limit, expected) in cases {
+            let (out, _) = super::coalesce_gfx_within(units, limit);
+            assert_eq!(out, expected);
+            assert!(out.len() <= limit);
+        }
+    }
+
+    #[test]
+    fn truncated_coalesce_is_deleted_then_newest_unit_retries_as_one_draw() {
+        let limit = crate::frame_writer::OOB_QUEUE_BYTES;
+        let first = vec![1; 4 * 1024 * 1024 - 128];
+        let second = vec![2; 4 * 1024 * 1024 - 128];
+        let (draw, truncated) = super::coalesce_gfx_within(vec![first, second.clone()], limit);
+        assert!(truncated);
+        assert_eq!(draw, second);
+
+        let mut pending = crate::preview_retry::PendingCornerOob::default();
+        pending.require_delete();
+        let mut submitted = Vec::new();
+        pending.offer_draw(draw, true, |bytes| {
+            if bytes.len() > limit {
+                Err(bytes)
+            } else {
+                submitted.push(bytes);
+                Ok(())
+            }
+        });
+        assert_eq!(submitted, [super::delete_all(), second]);
+        assert!(!pending.blocks_output(true));
     }
 
     use super::*;
@@ -1364,6 +1442,60 @@ mod tests {
             relay.feed(&apc("Ga=T,i=999,f=24,s=1,v=1;AQID")).as_slice(),
             [Piece::GfxDisplay(_)]
         ));
+    }
+
+    #[test]
+    fn oversized_single_chunk_display_is_rejected_and_releases_fresh_id() {
+        let mut relay = KittyRelay::new();
+        for child_id in 1..=15 {
+            let display = format!("Ga=T,i={child_id},f=24,s=1,v=1;AQID");
+            assert!(matches!(
+                relay.feed(&apc(&display)).as_slice(),
+                [Piece::GfxDisplay(_)]
+            ));
+        }
+
+        let encoded_len = MAX_TRANSFER_BYTES - 8;
+        assert_eq!(encoded_len % 4, 0);
+        let height = encoded_len / 4;
+        let payload = "A".repeat(encoded_len);
+        let oversized = apc(&format!("Ga=T,i=999,f=24,s=1,v={height};{payload}"));
+        assert!(oversized.len() <= MAX_APC_BYTES);
+        assert_eq!(relay.feed(&oversized), [Piece::Rejected]);
+        assert!(matches!(
+            relay.feed(&apc("Ga=T,i=999,f=24,s=1,v=1;AQID")).as_slice(),
+            [Piece::GfxDisplay(_)]
+        ));
+    }
+
+    #[test]
+    fn near_cap_accepted_single_chunk_plus_cup_fits_oob_budget() {
+        let payload = "A".repeat(MAX_APC_BYTES);
+        let mut encoded_len = MAX_TRANSFER_BYTES - 128;
+        let mut largest = None;
+        loop {
+            let height = encoded_len / 4;
+            let seq = apc(&format!(
+                "Ga=T,f=24,s=1,v={height};{}",
+                &payload[..encoded_len]
+            ));
+            if seq.len() > MAX_APC_BYTES {
+                break;
+            }
+            assert_eq!(encoded_len % 4, 0);
+            let mut relay = KittyRelay::new();
+            match relay.feed(&seq).as_slice() {
+                [Piece::GfxDisplay(bytes)] => largest = Some(bytes.clone()),
+                [Piece::Rejected] => break,
+                pieces => panic!("unexpected near-cap result: {pieces:?}"),
+            }
+            encoded_len += 4;
+        }
+        let bytes = largest.expect("at least one near-cap single-chunk display is admitted");
+        let cup = cup((u16::MAX, u16::MAX), (0, 0));
+        assert!(bytes.len() > MAX_TRANSFER_BYTES - 128);
+        assert!(bytes.len() <= MAX_TRANSFER_BYTES);
+        assert!(bytes.len() + cup.len() <= crate::frame_writer::OOB_QUEUE_BYTES);
     }
 
     #[test]
