@@ -175,6 +175,14 @@ queue MUST survive across invocations.
 - **WHEN** a user runs `pr queue rm <number>` or `pr queue clear`
 - **THEN** the named entry (or every entry for the repo) is removed
 
+Rebinding a row's verified identity or checkout SHALL require the explicit
+`pr queue rebind` command.
+
+#### Scenario: Re-adding with a changed checkout is refused
+
+- **WHEN** a user adds a queued PR whose bound checkout has changed
+- **THEN** the add is refused and directs the user to `pr queue rebind --pr <number>`
+
 ### Requirement: Queued pull requests are polled and classified off the event loop
 
 thegn SHALL refresh each queued pull request's remote state on a bounded
@@ -266,6 +274,15 @@ SHALL never merge when configured to stop at ready.
 - **WHEN** `require_approval` is set and a queued pull request has green checks but
   no approving review
 - **THEN** it is not merged and is reported as awaiting review
+
+Every direct or auto-merge SHALL be fenced to the evaluated PR head; a forge
+that cannot fence the head SHALL refuse the merge.
+
+#### Scenario: A head that moved before the merge is not merged
+
+- **WHEN** the PR head changes after evaluation and before the merge
+- **THEN** the PR is not merged, the row returns to watching, and thegn reports
+  that the head moved before the merge and is refreshing
 
 ### Requirement: The PR queue is driven from the CLI and visible in the UI
 

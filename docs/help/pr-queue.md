@@ -40,8 +40,10 @@ have no recorded identity and are held for a human; re-add the PR with
 Press `r` on a settled row to re-verify it with the forge selected from the
 repository root. For a row without a recorded identity, this binds the verified
 PR URL and starts watching again. If the fetched PR does not match a bound
-identity or forge, re-watch is refused; deliberately rebind it with
-`thegn pr queue add --pr 42`.
+identity or forge, re-watch is refused. Use `thegn pr queue rebind --pr 42` to
+verify and rebind it, with
+`--worktree <path>` or `--no-worktree` to set its checkout. Adding a row whose
+checkout changed is refused and names this rebind command.
 
 ## What blocks a PR
 
@@ -76,7 +78,12 @@ directly when thegn's own gates pass; `"ready"` never merges and just
 tells you.
 
 A draft is never merged, and neither is a PR without its approval when
-`require_approval` is set.
+`require_approval` is set. Before merging, rerunning checks, or waking an agent,
+thegn re-attests the row identity, PR head, and bound checkout. A merge is pinned
+to the head it evaluated; if the head moved, the row returns to watching with
+`head moved from <old> to <new> before the merge; refreshing`. A forge that
+cannot pin the head refuses the merge. Drain counts merged, merge requested
+(waiting for forge confirmation), and auto-merge armed separately.
 
 ## The agent
 
@@ -161,4 +168,5 @@ In the section: `a` add · `x` remove · `r` re-watch a settled row after forge
 verification ·
 `h` handle a queued review task · `c` clear after a second press · `D` refresh
 now · `o` open in a browser. CLI equivalents for queue rows are
-`thegn pr queue add|rm|clear|drain|list|status`, all with `--json`.
+`thegn pr queue add|rm|clear|rebind|drain|list|status`; `list`, `drain`, and
+`status` take `--json`.
