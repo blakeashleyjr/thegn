@@ -23,3 +23,5 @@ sample.rs
 thermal.rs
 # cpu_freq.rs — Linux held sysfs CPU frequency reader; sysinfo frequency fallback elsewhere.
 cpu_freq.rs
+# vmstat.rs — Linux /proc/vmstat held-fd pread reader; the reader is absent elsewhere.
+vmstat.rs
